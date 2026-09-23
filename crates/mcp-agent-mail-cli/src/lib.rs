@@ -1856,22 +1856,22 @@ pub enum FileReservationsCommand {
         /// Extension in seconds, clamped to 60..=31536000 (default: 1800).
         #[arg(long, default_value_t = 1800)]
         extend_seconds: i64,
-        /// Restrict renewal to specific paths.
-        #[arg(long)]
+        /// Restrict renewal to specific paths (`--paths a b` or repeated `--paths a --paths b`).
+        #[arg(long, num_args = 1..)]
         paths: Vec<String>,
-        /// Restrict renewal to specific reservation IDs.
-        #[arg(long)]
+        /// Restrict renewal to specific reservation IDs (`--ids 1 2`, `--ids 1,2`, or repeated).
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
         ids: Vec<i64>,
     },
     /// Release file reservations.
     Release {
         project: String,
         agent: String,
-        /// Restrict release to specific paths.
-        #[arg(long)]
+        /// Restrict release to specific paths (`--paths a b` or repeated `--paths a --paths b`).
+        #[arg(long, num_args = 1..)]
         paths: Vec<String>,
-        /// Restrict release to specific reservation IDs.
-        #[arg(long)]
+        /// Restrict release to specific reservation IDs (`--ids 1 2`, `--ids 1,2`, or repeated).
+        #[arg(long, num_args = 1.., value_delimiter = ',')]
         ids: Vec<i64>,
     },
     /// Check for conflicts on proposed paths without creating reservations.
@@ -4376,6 +4376,70 @@ where
     }
 }
 
+/// Per-callsite rate limit for repeated storage-engine warnings (br-kp1in.26).
+///
+/// FrankenSQLite logs some configuration facts at WARN on every connection open
+/// (e.g. `WAL-FEC requires a caller-owned native runtime`: ~8,000 identical
+/// lines per 20 minutes of ordinary load, burying real warnings). This filter
+/// lets each `fsqlite*` WARN call site through at most once per window; other
+/// targets and levels are untouched, and ERROR is never limited. It applies to
+/// the fmt layer only, so counting layers still observe every event.
+#[derive(Debug, Default)]
+pub struct DependencyWarnRateLimit {
+    last_emitted: std::sync::Mutex<
+        std::collections::HashMap<tracing::callsite::Identifier, std::time::Instant>,
+    >,
+}
+
+impl DependencyWarnRateLimit {
+    /// Minimum spacing between two emissions of the same call site.
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn is_limited_callsite(meta: &tracing::Metadata<'_>) -> bool {
+        meta.is_event()
+            && *meta.level() == tracing::Level::WARN
+            && meta.target().starts_with("fsqlite")
+    }
+
+    fn admit_at(&self, meta: &tracing::Metadata<'_>, now: std::time::Instant) -> bool {
+        if !Self::is_limited_callsite(meta) {
+            return true;
+        }
+        let mut last = self
+            .last_emitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match last.get(&meta.callsite()) {
+            Some(previous) if now.saturating_duration_since(*previous) < Self::WINDOW => false,
+            _ => {
+                last.insert(meta.callsite(), now);
+                true
+            }
+        }
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for DependencyWarnRateLimit {
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        self.admit_at(meta, std::time::Instant::now())
+    }
+
+    fn callsite_enabled(
+        &self,
+        meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if Self::is_limited_callsite(meta) {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::always()
+        }
+    }
+}
+
 fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -4394,7 +4458,10 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
             .with_target(false)
             .with_ansi(crate::output::is_tty())
             .compact()
-            .with_filter(filter);
+            .with_filter(tracing_subscriber::filter::FilterExt::and(
+                filter,
+                DependencyWarnRateLimit::default(),
+            ));
 
         // Ignore double-init errors when tests or host processes already set a subscriber.
         let _ = tracing_subscriber::registry()
@@ -8516,11 +8583,28 @@ pub fn prepare_runtime_server_startup_with_takeover(
     takeover: bool,
 ) -> CliResult<()> {
     config.validate_user_env_authority()?;
+    raise_server_fd_soft_limit();
     run_runtime_server_startup_prep_with(
         config,
         |cfg| auto_clear_db_blockers_with_takeover(cfg, takeover),
         run_startup_database_self_heal,
     )
+}
+
+/// br-kp1in.17: servers raise their soft `RLIMIT_NOFILE` toward the hard limit
+/// so the systemd-default 1,024 cannot exhaust under ordinary load. Defense in
+/// depth only; descriptor leaks are fixed at their source (br-8r6dl).
+fn raise_server_fd_soft_limit() {
+    use mcp_agent_mail_core::metrics::{SERVER_FD_SOFT_LIMIT_TARGET, raise_fd_soft_limit};
+    match raise_fd_soft_limit(SERVER_FD_SOFT_LIMIT_TARGET) {
+        Some((before, after)) if after > before => {
+            tracing::info!(before, after, "raised soft RLIMIT_NOFILE for the server");
+        }
+        Some(_) => {}
+        None => tracing::warn!(
+            "could not raise soft RLIMIT_NOFILE; the server keeps the inherited limit"
+        ),
+    }
 }
 fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
@@ -9714,9 +9798,9 @@ fn mark_all_read_direct(
     let rt = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+    let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
     rt.block_on(async {
         let ctx = context::AsyncCliContext::open()?;
-        let cx = asupersync::Cx::for_request();
         mark_all_read_direct_with_pool(
             &cx,
             &ctx.pool,
@@ -19238,7 +19322,7 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
                 .map_err(|error| {
                     CliError::Other(format!("failed to build ATC simulate runtime: {error}"))
                 })?;
-            let cx = asupersync::Cx::for_request();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             let stream = outcome_to_result(runtime.block_on(async {
                 mcp_agent_mail_db::atc_queries::replay(&cx, read_db.pool(), range).await
             }))?;
@@ -21506,10 +21590,10 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
     conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply base init PRAGMAs: {e}")))?;
 
-    let cx = asupersync::Cx::for_request();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
+    let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
 
     let outcome = rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await });
 
@@ -38043,7 +38127,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     Some(&server_config.storage_root),
                     "mail inbox",
                 )?;
-                let cx = asupersync::Cx::for_request();
+                let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
                 let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
                 let pid = proj.id.unwrap_or(0);
                 let agent = resolve_agent_async(&cx, read_pool.pool(), pid, &agent_name).await?;
@@ -38155,7 +38239,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -38228,7 +38312,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -38401,7 +38485,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     "mail search",
                 )
             })?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
@@ -39119,7 +39203,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
 
             reject_local_registration_if_proof_gate_enabled("agents create")?;
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
@@ -39204,7 +39288,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let agents = match mcp_agent_mail_db::queries::list_active_agents_bounded(
@@ -39290,7 +39374,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
+            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
             let row = match mcp_agent_mail_db::queries::get_agent(
@@ -39356,7 +39440,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             if !std::path::Path::new(&project_key).is_absolute()
                 && let Ok(ctx) = context::AsyncCliContext::open()
             {
-                let cx = asupersync::Cx::for_request();
+                let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
                 if let Ok(proj) = resolve_project_async(&cx, &ctx.pool, &project_key).await
                     && proj.human_key != project_key
                 {
@@ -39475,7 +39559,7 @@ async fn handle_agents_reap(
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
     let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let payload = agents_reap_payload(&cx, &ctx.pool, stale_days, project_key, dry_run).await?;
     render_agents_reap_payload(&payload, fmt, dry_run, stale_days);
     Ok(())
@@ -42798,6 +42882,7 @@ StartLimitIntervalSec=300
 Type=notify
 NotifyAccess=main
 TimeoutStartSec=300
+LimitNOFILE=65536
 ExecStart={exec_args}
 WorkingDirectory={working_dir}
 Restart=on-failure
@@ -42948,6 +43033,11 @@ fn build_launchd_plist_content(
     </dict>
     <key>ThrottleInterval</key>
     <integer>30</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>10240</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>{log_dir}/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -44864,6 +44954,12 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             !unit.contains("HTTP_BEARER_TOKEN"),
             "unit must omit HTTP_BEARER_TOKEN when auth is disabled or no token is configured"
         );
+        // br-kp1in.17: the systemd user default (1,024) exhausted within a minute
+        // of mixed load on v0.3.36; the unit must request a real limit.
+        assert!(
+            unit.contains("\nLimitNOFILE=65536\n"),
+            "unit must raise the descriptor limit: {unit}"
+        );
     }
 
     #[test]
@@ -44970,6 +45066,12 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         assert!(
             plist.contains("<key>WorkingDirectory</key>"),
             "plist must contain WorkingDirectory key"
+        );
+        assert!(
+            plist.contains(
+                "<key>SoftResourceLimits</key>\n    <dict>\n        <key>NumberOfFiles</key>\n        <integer>10240</integer>"
+            ),
+            "plist must raise the descriptor limit (br-kp1in.17): {plist}"
         );
         assert!(
             plist.contains("<string>/Users/dev/projects/myapp</string>"),
@@ -45171,6 +45273,95 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         let directives = noisy_dependency_log_clamp_directives();
         assert!(directives.contains(&"jit_compile=error"));
         assert!(directives.contains(&"execute_statement_dispatch=error"));
+    }
+
+    /// (target, level, callsite metadata) of one admitted event.
+    type AdmittedEvent = (String, tracing::Level, &'static tracing::Metadata<'static>);
+
+    /// Captures every event its filter admits.
+    #[derive(Clone, Default)]
+    struct AdmittedEvents(std::sync::Arc<std::sync::Mutex<Vec<AdmittedEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmittedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((meta.target().to_string(), *meta.level(), meta));
+        }
+    }
+
+    /// br-kp1in.26: a WARN emitted on every connection open must not flood the
+    /// log, while engine errors and Agent Mail's own warnings stay complete.
+    #[test]
+    fn dependency_warn_rate_limit_emits_each_engine_warn_callsite_once() {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let seen = AdmittedEvents::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(seen.clone().with_filter(DependencyWarnRateLimit::default()));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..100 {
+                tracing::warn!(
+                    target: "fsqlite_core::connection",
+                    "WAL-FEC requires a caller-owned native runtime"
+                );
+            }
+            for _ in 0..3 {
+                tracing::warn!(target: "fsqlite_core::connection", "another engine warning");
+            }
+            for _ in 0..5 {
+                tracing::warn!(target: "mcp_agent_mail_db", "agent mail's own warning");
+            }
+            for _ in 0..4 {
+                tracing::error!(target: "fsqlite_core::connection", "engine error");
+            }
+        });
+
+        let seen = seen.0.lock().unwrap();
+        let count = |target: &str, level: tracing::Level| {
+            seen.iter()
+                .filter(|(t, l, _)| t == target && *l == level)
+                .count()
+        };
+        assert_eq!(
+            count("fsqlite_core::connection", tracing::Level::WARN),
+            2,
+            "exactly one line per distinct engine WARN call site"
+        );
+        assert_eq!(count("mcp_agent_mail_db", tracing::Level::WARN), 5);
+        assert_eq!(count("fsqlite_core::connection", tracing::Level::ERROR), 4);
+    }
+
+    #[test]
+    fn dependency_warn_rate_limit_readmits_a_callsite_after_the_window() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let seen = AdmittedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "fsqlite_wal", "periodic engine warning");
+            tracing::warn!(target: "mcp_agent_mail_storage", "own warning");
+        });
+        let seen = seen.0.lock().unwrap();
+        let engine = seen[0].2;
+        let own = seen[1].2;
+
+        let limit = DependencyWarnRateLimit::default();
+        let t0 = std::time::Instant::now();
+        let window = DependencyWarnRateLimit::WINDOW;
+        assert!(limit.admit_at(engine, t0));
+        assert!(!limit.admit_at(engine, t0 + window - std::time::Duration::from_secs(1)));
+        assert!(limit.admit_at(engine, t0 + window));
+        // Never limited, even back to back.
+        assert!(limit.admit_at(own, t0));
+        assert!(limit.admit_at(own, t0));
     }
 
     #[test]
@@ -65080,6 +65271,88 @@ startup_timeout_sec = 42
                 assert_eq!(ids, vec![10, 20]);
             }
             other => panic!("expected Release, got {other:?}"),
+        }
+    }
+
+    /// GH#329: `--paths a b` / `--ids 1 2` used to fail argv parsing, so a caller
+    /// that believed it released several holds released nothing.
+    #[test]
+    fn clap_parses_file_reservations_release_multi_value_forms() {
+        let parse = |args: &[&str]| -> (Vec<String>, Vec<i64>) {
+            let mut argv = vec!["am", "file_reservations", "release", "proj", "BlueLake"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv)
+                .unwrap_or_else(|err| panic!("{args:?} must parse: {err}"))
+                .command
+                .expect("expected command")
+            {
+                Commands::FileReservations {
+                    action: FileReservationsCommand::Release { paths, ids, .. },
+                } => (paths, ids),
+                other => panic!("expected Release, got {other:?}"),
+            }
+        };
+
+        assert_eq!(parse(&["--paths", "a", "b"]).0, vec!["a", "b"]);
+        assert_eq!(parse(&["--paths", "a", "--paths", "b"]).0, vec!["a", "b"]);
+        assert_eq!(parse(&["--ids", "1", "2"]).1, vec![1, 2]);
+        assert_eq!(parse(&["--ids", "1,2", "3"]).1, vec![1, 2, 3]);
+        assert_eq!(parse(&["--ids", "1", "--ids", "2"]).1, vec![1, 2]);
+        let (paths, ids) = parse(&["--paths", "x/**", "y.rs", "--ids", "7", "8"]);
+        assert_eq!(paths, vec!["x/**", "y.rs"]);
+        assert_eq!(ids, vec![7, 8]);
+        // Brace-alternation globs contain commas; paths must never be split on them.
+        assert_eq!(parse(&["--paths", "src/{a,b}/**"]).0, vec!["src/{a,b}/**"]);
+
+        // Negative: a non-numeric id is still a usage error, never a silent no-op.
+        assert!(
+            Cli::try_parse_from([
+                "am",
+                "file_reservations",
+                "release",
+                "proj",
+                "BlueLake",
+                "--ids",
+                "1",
+                "two"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clap_parses_file_reservations_renew_multi_value_forms() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "file_reservations",
+            "renew",
+            "proj",
+            "BlueLake",
+            "--paths",
+            "a",
+            "b",
+            "--ids",
+            "4,5",
+            "6",
+            "--extend-seconds",
+            "900",
+        ])
+        .expect("multi-value renew must parse");
+        match cli.command.expect("expected command") {
+            Commands::FileReservations {
+                action:
+                    FileReservationsCommand::Renew {
+                        extend_seconds,
+                        paths,
+                        ids,
+                        ..
+                    },
+            } => {
+                assert_eq!(paths, vec!["a", "b"]);
+                assert_eq!(ids, vec![4, 5, 6]);
+                assert_eq!(extend_seconds, 900);
+            }
+            other => panic!("expected Renew, got {other:?}"),
         }
     }
 
@@ -86500,10 +86773,9 @@ async fn post_jsonrpc_request(
             .map(|(name, value)| (name.to_string(), value)),
     );
 
-    // Production request-scoped Cx, not the test-only `Cx::for_testing()`
-    // constructor — matching every other production call site in this crate
-    // (and the asupersync guidance that `for_testing` is harness material).
-    let cx = asupersync::Cx::for_request();
+    // Production request-scoped Cx minted from the running runtime (asupersync
+    // 0.5 makes both `Cx::for_testing()` and `Cx::for_request()` test-only).
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let request =
         Box::pin(products_http_client().request(&cx, Method::Post, server_url, headers, body));
     let response = match timeout(wall_now(), Duration::from_secs(timeout_seconds), request).await {
@@ -87520,7 +87792,10 @@ async fn call_send_message_tool_locally(
     topic: Option<&str>,
     sender_token: Option<&str>,
 ) -> CliResult<serde_json::Value> {
-    let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+    let ctx = McpContext::new(
+        mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
+        1,
+    );
     let payload = mcp_agent_mail_tools::messaging::send_message(
         &ctx,
         project_key.to_string(),
@@ -87553,7 +87828,10 @@ async fn call_reply_message_tool_locally(
     body: &str,
     to_names: Option<&[String]>,
 ) -> CliResult<serde_json::Value> {
-    let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+    let ctx = McpContext::new(
+        mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
+        1,
+    );
     let payload = mcp_agent_mail_tools::messaging::reply_message(
         &ctx,
         project_key.to_string(),
@@ -87950,7 +88228,7 @@ async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let server_url = local_server_url(&config);
     let bearer = config.http_bearer_token.as_deref();
 
-    let cx = asupersync::Cx::for_request();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let canonical_read_pool;
     let live_pool;
     let pool = match classify_products_pool_mode(&action) {
@@ -89327,7 +89605,7 @@ async fn apply_agent_start_fix(report: &AgentStartReport) -> CliResult<AgentStar
 
     reject_local_registration_if_proof_gate_enabled("agent-start --fix")?;
     let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let project = resolve_project_async(&cx, &ctx.pool, &report.project.key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = outcome_to_result(
@@ -91360,10 +91638,10 @@ fn handle_tooling_db_init(db: PathBuf, storage_root: PathBuf, json_mode: bool) -
     })
     .map_err(|err| CliError::Other(format!("cannot create DB pool: {err}")))?;
 
-    let cx = asupersync::Cx::for_request();
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|err| CliError::Other(format!("failed to build runtime: {err}")))?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
 
     match runtime.block_on(async { pool.acquire(&cx).await }) {
         asupersync::Outcome::Ok(conn) => drop(conn),

@@ -2377,6 +2377,31 @@ enum HttpHealthProbeFailure {
     Transport { error: String, elapsed_ms: u128 },
 }
 
+/// Request-scoped [`Cx`] for production code (br-kp1in.31).
+///
+/// Asupersync 0.5 made `Cx::for_request*` test-only (br-asupersync-ovztin):
+/// those constructors minted an ambient all-capability context with no
+/// runtime drivers. Production contexts must come from a runtime so they carry
+/// its drivers and capability mask. Inside a runtime (HTTP tasks,
+/// `Runtime::block_on` bodies) this uses the runtime driving the current
+/// thread. Elsewhere it mints from `fastmcp_core`'s per-thread runtime, which
+/// is exactly the runtime a subsequent `fastmcp_core::block_on` on this thread
+/// drives, so timers and I/O registered through the context stay live.
+/// The CLI uses it too; every production crate enables `test-internals` only
+/// as a dev-dependency, so this is the one sanctioned way to mint a context.
+pub fn runtime_request_cx(budget: Budget) -> Cx {
+    if let Some(cx) =
+        Runtime::current_handle().and_then(|handle| handle.try_request_cx_with_budget(budget).ok())
+    {
+        return cx;
+    }
+    block_on(async move {
+        Runtime::current_handle()
+            .expect("fastmcp_core::block_on installs its per-thread runtime as current")
+            .request_cx_with_budget(budget)
+    })
+}
+
 /// Synchronously probe whether a live Agent Mail HTTP server is answering
 /// `/healthz` on the configured `http_host:http_port`.
 ///
@@ -2398,8 +2423,8 @@ pub fn probe_http_healthz_blocking(config: &mcp_agent_mail_core::Config) -> bool
         // only for provably-dead holders elsewhere).
         return false;
     };
+    let cx = rt.request_cx_with_budget(Budget::INFINITE);
     rt.block_on(async {
-        let cx = Cx::for_request_with_budget(Budget::INFINITE);
         let client = build_probe_http_client();
         probe_http_healthz(&cx, config, &client).await.is_ok()
     })
@@ -6999,7 +7024,7 @@ fn append_atc_experience_for_effect(
     };
     let stratum_key = atc_experience_stratum_key(&row);
     let feature_vector_size = atc_feature_vector_size(&row);
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::append_atc_experience(
         &cx, pool, &row,
     )) {
@@ -7253,7 +7278,7 @@ fn capture_atc_execution_result(
     // Transition: Planned → Dispatched (effect was handed to executor).
     // If this fails, we still attempt the second transition because an
     // orphaned experience stuck in Planned is worse than skipping a step.
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
         pool,
@@ -7282,7 +7307,7 @@ fn capture_atc_execution_result(
 
     // Transition: Dispatched → Executed/Failed/Throttled/Suppressed/Skipped.
     let context_patch = atc_execution_context_patch(&capture, execution_mode, status, ts_micros);
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
         pool,
@@ -7398,7 +7423,7 @@ fn promote_executed_experience_to_open_for_resolution(
         return true;
     }
 
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
         &cx,
         pool,
@@ -7465,7 +7490,7 @@ fn sweep_open_experiences_for_resolution(
         return;
     }
 
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     let started_at = Instant::now();
     let mut rows_resolved = 0_u64;
     let mut ack_overdue_rows_resolved = 0_u64;
@@ -7747,7 +7772,7 @@ fn sweep_open_experiences_for_resolution(
             if let Some(outcome) =
                 resolve_reservation_experience(experience, resolution_anchor_micros, now_micros)
             {
-                let cx = Cx::for_request_with_budget(Budget::INFINITE);
+                let cx = runtime_request_cx(Budget::INFINITE);
                 match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
                     &cx,
                     pool,
@@ -7793,7 +7818,7 @@ fn sweep_open_experiences_for_resolution(
         {
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            let cx = runtime_request_cx(Budget::INFINITE);
             match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
                 &cx,
                 pool,
@@ -7833,7 +7858,7 @@ fn sweep_open_experiences_for_resolution(
             }
         } else if age_micros > resolution_window_micros {
             // Resolution window elapsed without activity signal → expire.
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            let cx = runtime_request_cx(Budget::INFINITE);
             match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
                 &cx,
                 pool,
@@ -7979,7 +8004,7 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
     }
 
     let now_micros = mcp_agent_mail_db::now_micros();
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
 
     // Fetch up to 20 open conflict experiences for this agent.
     let open_experiences = match block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
@@ -8035,7 +8060,7 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             continue;
         }
 
-        let cx2 = Cx::for_request_with_budget(Budget::INFINITE);
+        let cx2 = runtime_request_cx(Budget::INFINITE);
         if let asupersync::Outcome::Err(error) =
             block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
                 &cx2,
@@ -8063,7 +8088,7 @@ fn ensure_atc_executor_identity(
     if ensured_projects.contains(project_key) {
         return Ok(());
     }
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime.block_on(async {
         let pool =
@@ -8118,7 +8143,7 @@ fn execute_atc_advisory_effect(
     project_key: &str,
 ) -> Result<(), String> {
     ensure_atc_executor_identity(runtime, ensured_projects, project_key)?;
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
@@ -8155,7 +8180,7 @@ fn execute_atc_probe_effect(
     project_key: &str,
 ) -> Result<(), String> {
     ensure_atc_executor_identity(runtime, ensured_projects, project_key)?;
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
@@ -8190,7 +8215,7 @@ fn execute_atc_release_effect(
     effect: &atc::AtcEffectPlan,
     project_key: &str,
 ) -> Result<(), String> {
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let ctx = McpContext::new(cx, 1);
     runtime
         .block_on(async {
@@ -8706,7 +8731,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             && let Some(pool) = atc_db_pool.as_ref()
             && now_micros >= next_rollup_refresh_micros
         {
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            let cx = runtime_request_cx(Budget::INFINITE);
             match block_on(mcp_agent_mail_db::atc_queries::refresh_rollups(
                 &cx,
                 pool,
@@ -12202,7 +12227,7 @@ impl HttpState {
             let deadline = wall_now() + Duration::from_secs(self.request_timeout_secs);
             Budget::new().with_deadline(deadline)
         };
-        Cx::for_request_with_budget(budget)
+        runtime_request_cx(budget)
     }
 
     async fn check_bearer_auth_with_cx(
@@ -12675,7 +12700,7 @@ to skip auth for local requests.</p>
             let deadline = wall_now() + std::time::Duration::from_secs(self.request_timeout_secs);
             Budget::new().with_deadline(deadline)
         };
-        let cx = Cx::for_request_with_budget(budget);
+        let cx = runtime_request_cx(budget);
 
         let redis = self.rate_limit_redis_client(&cx).await;
         let has_redis = redis.is_some();
@@ -13703,7 +13728,7 @@ fn append_atc_hot_path_observation_row(
     let started_at = Instant::now();
     let stratum_key = atc_experience_stratum_key(row);
     let feature_vector_size = atc_feature_vector_size(row);
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::append_atc_experience(
         &cx, pool, row,
     )) {
@@ -14673,7 +14698,7 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     }
 
     let started_at = Instant::now();
-    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let cx = runtime_request_cx(Budget::INFINITE);
     let mut experience = None;
     for attempt in 1..=2_u8 {
         match block_on(
@@ -17907,6 +17932,76 @@ mod tests {
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Await one timer registered on `cx`'s own timer driver (not the ambient
+    /// one), completing only when that driver fires it.
+    fn await_timer_on_cx_driver(
+        cx: &Cx,
+        delay_nanos: u64,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        let driver = cx
+            .timer_driver()
+            .expect("runtime-backed context has a timer driver");
+        let deadline = driver.now().saturating_add_nanos(delay_nanos);
+        let mut timer = None;
+        std::future::poll_fn(move |task_cx| {
+            if driver.now() >= deadline {
+                return std::task::Poll::Ready(());
+            }
+            if timer.is_none() {
+                timer = Some(driver.register(deadline, task_cx.waker().clone()));
+            }
+            std::task::Poll::Pending
+        })
+    }
+
+    /// br-kp1in.31: production request contexts come from a runtime and carry
+    /// its drivers, outside a runtime (fastmcp's per-thread runtime) and inside
+    /// one (the runtime driving the thread), with the caller's budget intact,
+    /// and timers registered through them actually fire.
+    #[test]
+    fn runtime_request_cx_is_runtime_backed_and_keeps_its_budget() {
+        const TIMER_NANOS: u64 = 20_000_000;
+        let deadline_budget = Budget::INFINITE.with_deadline(asupersync::Time::from_secs(30));
+
+        assert!(
+            Runtime::current_handle().is_none(),
+            "precondition: test thread is not inside a runtime"
+        );
+        let outside = runtime_request_cx(deadline_budget);
+        assert_eq!(outside.budget().deadline, deadline_budget.deadline);
+        assert!(!outside.is_cancel_requested());
+        assert!(
+            outside.timer_driver().is_some(),
+            "a context minted outside a runtime must still carry live drivers"
+        );
+        let started = std::time::Instant::now();
+        block_on(await_timer_on_cx_driver(&outside, TIMER_NANOS));
+        assert!(
+            started.elapsed() >= std::time::Duration::from_nanos(TIMER_NANOS),
+            "the timer completed only once its driver fired it"
+        );
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let started = std::time::Instant::now();
+        let inside = runtime.block_on(async {
+            assert!(Runtime::current_handle().is_some());
+            let inside = runtime_request_cx(Budget::INFINITE);
+            await_timer_on_cx_driver(&inside, TIMER_NANOS).await;
+            inside
+        });
+        assert!(started.elapsed() >= std::time::Duration::from_nanos(TIMER_NANOS));
+        assert_eq!(inside.budget().deadline, None);
+        assert!(inside.timer_driver().is_some());
+
+        // Contrast: the test-only ambient constructor the production code used
+        // to call is driverless (and absent from non-test builds entirely).
+        assert!(
+            Cx::for_request_with_budget(Budget::INFINITE)
+                .timer_driver()
+                .is_none()
+        );
+    }
     static DISPATCH_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
     static COMPOSE_WRITE_BARRIER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);

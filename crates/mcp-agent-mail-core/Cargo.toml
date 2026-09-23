@@ -32,8 +32,10 @@ sha2.workspace = true
 hex.workspace = true
 fs2.workspace = true
 globset.workspace = true
-# `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`.
-nix = { workspace = true, features = ["fs"] }
+# `fs` feature provides `nix::sys::statvfs` for inode probes in `host_health`;
+# `resource` provides the safe `setrlimit` used to raise the server's soft
+# RLIMIT_NOFILE at startup (br-kp1in.17).
+nix = { workspace = true, features = ["fs", "resource"] }
 rustix.workspace = true
 tracing.workspace = true
 # Regular (not dev) dependency: `config::with_isolated_default_storage_root_for_test`

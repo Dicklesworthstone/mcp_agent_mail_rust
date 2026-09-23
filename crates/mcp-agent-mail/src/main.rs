@@ -728,7 +728,10 @@ fn main() {
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
-        .with_filter(filter);
+        .with_filter(tracing_subscriber::filter::FilterExt::and(
+            filter,
+            mcp_agent_mail_cli::DependencyWarnRateLimit::default(),
+        ));
     tracing_subscriber::registry()
         .with(fmt_layer)
         .with(GitSegfaultRetryTuiLayer)

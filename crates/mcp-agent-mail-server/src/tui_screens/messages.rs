@@ -4055,7 +4055,7 @@ fn run_message_search_via_service(
     let pool_cfg = DbPoolConfig::from_env();
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
         .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
-    let cx = Cx::for_request();
+    let cx = crate::runtime_request_cx(asupersync::Budget::INFINITE);
     match block_on(mcp_agent_mail_db::search_service::execute_search_simple(
         &cx, &pool, query,
     )) {

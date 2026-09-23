@@ -2159,7 +2159,7 @@ pub fn archive_backlog_flush_blocking(timeout: Duration) -> bool {
 /// Live archive-materialization lag: how far the git archive trails the
 /// authoritative DB. `oldest_unmaterialized_us` is the age of the oldest write
 /// that has landed in the DB but not yet in the archive (max of the retry
-/// backlog and the commit coalescer), and the depth counters are the current
+/// backlog, the commit coalescer and the in-flight WBQ batch), and the depth counters are the current
 /// unmaterialized-write backlog. Surfaced via `health_check` (br-hpv61 ask #1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveLagSnapshot {
@@ -2189,9 +2189,66 @@ pub struct ArchiveLagSnapshot {
     /// journal write failed). Nonzero means the archive is not crash-safe for
     /// those ops until they drain; the DB stays authoritative (br-ack-fast).
     pub ephemeral_total: u64,
+    /// Ops waiting in the write-behind queue channel (not yet dequeued).
+    #[serde(default)]
+    pub wbq_depth: u64,
+    /// Age (microseconds) of the oldest op in the batch the WBQ drain is
+    /// executing right now, 0 when no batch is in flight. The queue is FIFO, so
+    /// while a batch is in flight this is the oldest unmaterialized WBQ write.
+    #[serde(default)]
+    pub wbq_inflight_oldest_age_us: u64,
+    /// How long (microseconds) the drain has been executing its current batch,
+    /// 0 when idle. A value that keeps growing means the drain is stuck.
+    #[serde(default)]
+    pub wbq_inflight_execution_us: u64,
+}
+
+/// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
+/// now; 0 when no batch is in flight (br-kp1in.23).
+static WBQ_INFLIGHT_SINCE_US: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock µs at which the oldest op of the in-flight WBQ batch was
+/// enqueued; 0 when no batch is in flight.
+static WBQ_INFLIGHT_OLDEST_ENQUEUED_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the drain is about to execute `batch` (non-empty).
+fn wbq_mark_batch_in_flight(batch: &[WbqOpEnvelope]) {
+    let oldest_age_us = batch
+        .iter()
+        .map(|envelope| duration_as_micros_u64(envelope.enqueued_at.elapsed()))
+        .max()
+        .unwrap_or(0);
+    let now_us = now_micros_u64();
+    WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(now_us.saturating_sub(oldest_age_us), Ordering::Relaxed);
+    WBQ_INFLIGHT_SINCE_US.store(now_us.max(1), Ordering::Relaxed);
+}
+
+/// Record that the drain finished its in-flight batch.
+fn wbq_clear_batch_in_flight() {
+    WBQ_INFLIGHT_SINCE_US.store(0, Ordering::Relaxed);
+    WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(0, Ordering::Relaxed);
+}
+
+/// `(oldest in-flight op age, in-flight execution time)` in µs at `now_us`.
+fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
+    let age_since = |stamp: u64| {
+        if stamp == 0 {
+            0
+        } else {
+            now_us.saturating_sub(stamp)
+        }
+    };
+    (
+        age_since(WBQ_INFLIGHT_OLDEST_ENQUEUED_US.load(Ordering::Relaxed)),
+        age_since(WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed)),
+    )
 }
 
 /// Snapshot the live archive-materialization lag for `health_check`.
+///
+/// `oldest_unmaterialized_us` covers the retry backlog, the commit coalescer
+/// AND the batch the WBQ drain is executing. Before br-kp1in.23 the WBQ was
+/// omitted, so a drain blocked mid-batch with thousands of queued writes
+/// reported 0 ms of lag (observed 2026-09-23).
 #[must_use]
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
     let backlog = &*ARCHIVE_BACKLOG;
@@ -2199,12 +2256,23 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
     let (coalescer_pending, coalescer_oldest_age_us) = COMMIT_COALESCER.get().map_or((0, 0), |c| {
         (c.pending_requests(), c.oldest_pending_age_us())
     });
+    let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) =
+        wbq_inflight_ages_us(now_micros_u64());
+    let wbq_depth = mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_depth
+        .load();
     ArchiveLagSnapshot {
         backlog_depth,
         backlog_oldest_age_us,
         coalescer_pending,
         coalescer_oldest_age_us,
-        oldest_unmaterialized_us: backlog_oldest_age_us.max(coalescer_oldest_age_us),
+        oldest_unmaterialized_us: backlog_oldest_age_us
+            .max(coalescer_oldest_age_us)
+            .max(wbq_inflight_oldest_age_us),
+        wbq_depth,
+        wbq_inflight_oldest_age_us,
+        wbq_inflight_execution_us,
         enqueued_total: backlog.enqueued_total.load(Ordering::Relaxed),
         drained_total: backlog.drained_total.load(Ordering::Relaxed),
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
@@ -2966,6 +3034,9 @@ fn wbq_drain_loop(
             metrics.storage.wbq_over_80_since_us.set(0);
         }
 
+        if !batch.is_empty() {
+            wbq_mark_batch_in_flight(&batch);
+        }
         let mut errors = 0usize;
         let mut idx = 0usize;
         while idx < batch.len() {
@@ -3026,6 +3097,7 @@ fn wbq_drain_loop(
         }
 
         metrics.storage.wbq_drained_total.add(drained_u64);
+        wbq_clear_batch_in_flight();
         metrics
             .storage
             .wbq_errors_total
@@ -3076,6 +3148,7 @@ fn wbq_drain_loop(
                     metrics.storage.wbq_over_80_since_us.set(0);
                 }
 
+                wbq_mark_batch_in_flight(std::slice::from_ref(&envelope));
                 let r = wbq_execute_op(&envelope.op, "wbq-drain");
                 let latency_us = u64::try_from(
                     envelope
@@ -3087,6 +3160,7 @@ fn wbq_drain_loop(
                 .unwrap_or(u64::MAX);
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
                 metrics.storage.wbq_drained_total.inc();
+                wbq_clear_batch_in_flight();
                 if let Err(error) = r {
                     // Same exhausted-retry semantics as the main drain
                     // branch — failures here are also rows the API
@@ -17852,6 +17926,71 @@ mod tests {
             WbqEnqueueResult::Enqueued,
             "wbq_enqueue should accept ops when worker is running"
         );
+    }
+
+    /// br-kp1in.23: a WBQ drain blocked mid-batch must show up as archive lag.
+    /// Holding the process-global publication fence reproduces the observed
+    /// 2026-09-23 shape (drain thread parked on a futex) without timing tricks.
+    #[test]
+    fn archive_lag_reports_wbq_batch_blocked_in_flight() {
+        wbq_start();
+        let fence = ArchiveMutationGuard::begin();
+        assert_eq!(
+            wbq_enqueue(wbq_test_clear_signal_op("lag-inflight")),
+            WbqEnqueueResult::Enqueued
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while archive_lag_snapshot().wbq_inflight_execution_us == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "drain never dequeued the op while the fence was held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(1_200));
+
+        let stuck = archive_lag_snapshot();
+        assert!(
+            stuck.wbq_inflight_execution_us >= 1_000_000,
+            "a batch blocked for >1 s must report its execution time: {stuck:?}"
+        );
+        assert!(
+            stuck.wbq_inflight_oldest_age_us >= stuck.wbq_inflight_execution_us,
+            "the oldest in-flight op was enqueued before its batch was dequeued: {stuck:?}"
+        );
+        assert!(
+            stuck.oldest_unmaterialized_us >= stuck.wbq_inflight_oldest_age_us,
+            "overall lag must include the blocked WBQ batch: {stuck:?}"
+        );
+
+        drop(fence);
+        assert_eq!(
+            wbq_flush_status(),
+            WbqFlushOutcome::Drained,
+            "releasing the fence must let the blocked batch drain"
+        );
+        let after = archive_lag_snapshot();
+        assert_eq!(
+            (
+                after.wbq_inflight_execution_us,
+                after.wbq_inflight_oldest_age_us
+            ),
+            (0, 0),
+            "completed batches must not keep reporting lag: {after:?}"
+        );
+    }
+
+    #[test]
+    fn wbq_inflight_ages_are_zero_without_a_batch_and_saturate() {
+        wbq_clear_batch_in_flight();
+        assert_eq!(wbq_inflight_ages_us(1_000_000), (0, 0));
+        WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(400, Ordering::Relaxed);
+        WBQ_INFLIGHT_SINCE_US.store(900, Ordering::Relaxed);
+        assert_eq!(wbq_inflight_ages_us(1_000), (600, 100));
+        // A clock step backwards never produces a huge bogus age.
+        assert_eq!(wbq_inflight_ages_us(100), (0, 0));
+        wbq_clear_batch_in_flight();
     }
 
     #[test]

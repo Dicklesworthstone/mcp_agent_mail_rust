@@ -69,6 +69,10 @@ fn status_envelope() -> RobotEnvelope<StatusData> {
                 remaining_seconds: 3600,
                 remaining: Some("1h".to_string()),
                 granted_at: Some("2026-01-02T03:00:00Z".to_string()),
+                // Skipped when absent, so the frozen snapshot is unchanged.
+                granted_ts: None,
+                expires_ts: None,
+                granted_age_seconds: None,
             }],
             top_threads: vec![ThreadSummary {
                 id: "br-robot-golden".to_string(),

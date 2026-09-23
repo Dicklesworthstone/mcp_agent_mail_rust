@@ -560,12 +560,51 @@ fn reservations_prove_shared_scope_for_contact(
     })
 }
 
+/// br-kp1in.15: find a non-blocked contact of `sender` in ANOTHER project whose
+/// name matches `agent_name_norm`. Returns `(project_id, canonical_name)`.
+///
+/// `send_message` only delivers within one project. Before this check, a send
+/// to a cross-project contact's name silently auto-registered a same-name
+/// placeholder in the sender's project and reported the message as persisted,
+/// so the caller believed the linked peer had it.
+async fn cross_project_contact_named(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    sender_id: i64,
+    agent_name_norm: &str,
+) -> McpResult<Option<(i64, String)>> {
+    let (outgoing, incoming) = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_contacts(ctx.cx(), pool, project_id, sender_id).await,
+    )?;
+    let peers = outgoing
+        .iter()
+        .map(|link| (link.b_project_id, link.b_agent_id, link.status.as_str()))
+        .chain(
+            incoming
+                .iter()
+                .map(|link| (link.a_project_id, link.a_agent_id, link.status.as_str())),
+        );
+    for (peer_project_id, peer_agent_id, status) in peers {
+        if peer_project_id == project_id || status.eq_ignore_ascii_case("blocked") {
+            continue;
+        }
+        if let Outcome::Ok(peer) =
+            mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), pool, peer_agent_id).await
+            && peer.name.eq_ignore_ascii_case(agent_name_norm)
+        {
+            return Ok(Some((peer_project_id, peer.name)));
+        }
+    }
+    Ok(None)
+}
+
 async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
     project_id: i64,
     agent_name: &str,
-    _sender: &mcp_agent_mail_db::AgentRow,
+    sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
     let agent_name = agent_name.trim();
@@ -586,6 +625,40 @@ async fn resolve_or_register_agent(
             if config.messaging_auto_register_recipients
                 && !config.messaging_fail_closed_send_profile =>
         {
+            // br-kp1in.15: never mint a same-name placeholder for a peer the
+            // sender reaches through a cross-project contact link.
+            if let Some(sender_id) = sender.id
+                && let Some((peer_project_id, peer_name)) =
+                    cross_project_contact_named(ctx, pool, project_id, sender_id, &agent_name_norm)
+                        .await?
+            {
+                let peer_project = match mcp_agent_mail_db::queries::get_project_by_id(
+                    ctx.cx(),
+                    pool,
+                    peer_project_id,
+                )
+                .await
+                {
+                    Outcome::Ok(project) => project.human_key,
+                    _ => format!("project #{peer_project_id}"),
+                };
+                return Err(legacy_tool_error(
+                    "CROSS_PROJECT_RECIPIENT",
+                    format!(
+                        "Recipient '{peer_name}' is not registered in this project; it is your \
+                         contact in project '{peer_project}'. send_message only delivers within \
+                         one project, so nothing was sent (previously this created a same-name \
+                         placeholder here and the peer never received it). Register that agent \
+                         in this project, or coordinate from a project you both belong to."
+                    ),
+                    false,
+                    json!({
+                        "recipient": peer_name,
+                        "recipient_project": peer_project,
+                        "cross_project_messaging_supported": false,
+                    }),
+                ));
+            }
             // Proof gate (fail-closed): auto-registering an unknown recipient
             // here cannot carry a signed `registration_proof` bundle, so when
             // the gate is enabled we refuse instead of minting an unproven
@@ -2056,7 +2129,7 @@ async fn try_replay_message(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- Delivery is scoped to one project: a name that is not registered here but is your contact in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -5817,10 +5890,9 @@ mod tests {
                         );
                     }
                     replay_queued_ack_intents(&ctx, &pool, &config).await;
-                    assert!(
-                        crate::degraded_intents::read_queued_ack_intents(&config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                        Vec::new()
                     );
 
                     // Independently inspect recipient rows. Neither a different
@@ -5971,10 +6043,9 @@ mod tests {
                 2
             );
             replay_queued_ack_intents(&ctx, &pool, &config).await;
-            assert!(
-                crate::degraded_intents::read_queued_ack_intents(&config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                Vec::new()
             );
             let retried = queries::acknowledge_message_idempotent(
                 &cx,

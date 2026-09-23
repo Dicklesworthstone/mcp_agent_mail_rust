@@ -823,12 +823,16 @@ impl EmbeddingJobRunner {
     ) -> SearchResult<JobResult> {
         if self.bind_model {
             let selected = self.embedder.model_info();
+            // `ModelInfo` names its identity `id`; an embedding records it as `model_id`.
+            let same_model = embedding.model_id == selected.id;
             if !selected.available
                 || selected.tier == ModelTier::Hash
-                || embedding.model_id != selected.id
+                || !same_model
                 || embedding.tier != selected.tier
                 || embedding.dimension != selected.dimension
-                || embedding.vector.len() != selected.dimension
+                // Equivalent to comparing with `selected.dimension`: the
+                // previous clause already requires both dimensions to agree.
+                || embedding.vector.len() != embedding.dimension
                 || embedding.vector.is_empty()
                 || embedding.vector.iter().any(|value| !value.is_finite())
             {

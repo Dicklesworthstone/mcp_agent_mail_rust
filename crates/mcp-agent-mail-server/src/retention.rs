@@ -1529,7 +1529,7 @@ mod tests {
 
         // Knob off + report enabled: counts age/receipt eligibility without deletion.
         let mut config = Config {
-            database_url: pool_config.database_url.clone(),
+            database_url: pool_config.database_url,
             storage_root,
             retention_report_enabled: true,
             retention_max_age_days: 30,

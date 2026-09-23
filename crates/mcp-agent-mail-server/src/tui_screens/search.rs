@@ -3844,7 +3844,7 @@ fn run_unified_search(
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| format!("failed to initialize async runtime: {e}"))?;
-    let cx = asupersync::Cx::for_request();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let options = SearchOptions {
         scope_ctx: None,
         redaction_policy: None,

@@ -102,9 +102,9 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
     );
     // Use infinite budget — static export is a batch CLI operation, not a
     // request-scoped handler. Individual DB queries have their own timeouts
-    // via pool acquire. Using for_request_with_budget (not for_testing) to
-    // get proper production Cx lineage for tracing/observability.
-    let cx = Cx::for_request_with_budget(asupersync::Budget::INFINITE);
+    // via pool acquire. A runtime-minted context (not for_testing) gives proper
+    // production Cx lineage for tracing/observability.
+    let cx = crate::runtime_request_cx(asupersync::Budget::INFINITE);
     let mut files = BTreeMap::new();
 
     // ── 1. Enumerate projects ───────────────────────────────────────

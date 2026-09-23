@@ -1879,10 +1879,14 @@ impl SemanticBridge {
             return Vec::new();
         }
         let selected = self.embedder.model_info();
-        if embedding.model_id != selected.id
+        // `ModelInfo` names its identity `id`; an embedding records it as `model_id`.
+        let same_model = embedding.model_id == selected.id;
+        if !same_model
             || embedding.tier != selected.tier
             || embedding.dimension != selected.dimension
-            || embedding.vector.len() != selected.dimension
+            // Equivalent to comparing with `selected.dimension`: the previous
+            // clause already requires both dimensions to agree.
+            || embedding.vector.len() != embedding.dimension
             || embedding.vector.iter().any(|value| !value.is_finite())
         {
             return Vec::new();
@@ -8961,7 +8965,8 @@ mod tests {
         let bridge =
             SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder.clone());
         bridge.refresh_worker.shutdown();
-        if let Some(worker) = bridge.worker.lock().unwrap().take() {
+        let worker = bridge.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
             worker.join().unwrap();
         }
 
@@ -9045,7 +9050,8 @@ mod tests {
                 .store(dimension, std::sync::atomic::Ordering::Release);
             let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
             bridge.refresh_worker.shutdown();
-            if let Some(worker) = bridge.worker.lock().unwrap().take() {
+            let worker = bridge.worker.lock().unwrap().take();
+            if let Some(worker) = worker {
                 worker.join().unwrap();
             }
             assert!(bridge.enqueue_document(7003, SearchDocKind::Message, Some(77), "new", "body"));

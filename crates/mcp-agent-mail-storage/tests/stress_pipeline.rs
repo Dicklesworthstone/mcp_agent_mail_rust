@@ -31,7 +31,7 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2185,8 +2185,10 @@ fn stress_150_agent_message_storm() {
 // This is the most realistic simulation of "100 agents on one machine".
 // ===========================================================================
 
+// Un-ignored 2026-09-23 (br-kp1in.30): the fsqlite 0.3.0 concurrent-open schema
+// visibility regression it was parked on is gone under the pinned 0.4.4 engine;
+// it passed in 105.9 s on e7744d7a under the stress_pipeline nextest override.
 #[test]
-#[ignore = "fsqlite 0.3.0 concurrent-open schema-visibility regression: threads hit 'no such table: messages' (committed schema not visible across concurrent same-file opens); reproduced in isolation; upstream frankensqlite bd-a5zj5/bd-xva84 (css) / br-w98zw; un-ignore on fsqlite bump"]
 fn stress_100_agent_full_lifecycle() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(tmp.path());
@@ -3416,13 +3418,48 @@ fn stress_sustained_100_agents_60s() {
         })
         .collect();
 
+    // Progress every 5 s through the worker phase AND the final flush, so a
+    // stall is attributable (br-kp1in.30: this 60 s test once ran 600 s with no
+    // output; classify drain stall vs slowness from these lines).
+    let progress_stop = Arc::new(AtomicBool::new(false));
+    let progress_phase = Arc::new(AtomicU64::new(0)); // 0 = workers, 1 = flushing
+    let progress = {
+        let stop = Arc::clone(&progress_stop);
+        let phase = Arc::clone(&progress_phase);
+        let ops_done = Arc::clone(&ops_done);
+        let errors = Arc::clone(&errors);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                let wbq = wbq_stats();
+                eprintln!(
+                    "[endurance-progress] t={:>4}s phase={} ops_ok={} errors={} wbq_enqueued={} wbq_drained={} wbq_errors={}",
+                    start.elapsed().as_secs(),
+                    if phase.load(Ordering::Relaxed) == 0 {
+                        "workers"
+                    } else {
+                        "flush"
+                    },
+                    ops_done.load(Ordering::Relaxed),
+                    errors.load(Ordering::Relaxed),
+                    wbq.enqueued,
+                    wbq.drained,
+                    wbq.errors,
+                );
+            }
+        })
+    };
+
     for h in handles {
         let mut lats = h.join().expect("endurance worker panicked");
         all_latencies.append(&mut lats);
     }
 
+    progress_phase.store(1, Ordering::Relaxed);
     flush_async_commits();
     wbq_flush();
+    progress_stop.store(true, Ordering::Relaxed);
+    progress.join().expect("progress reporter panicked");
 
     let elapsed = start.elapsed();
     let rss_after = rss_kb();

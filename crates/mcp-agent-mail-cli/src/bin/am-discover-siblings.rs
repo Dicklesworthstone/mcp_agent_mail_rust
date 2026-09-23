@@ -32,9 +32,9 @@ fn run(args: &Args) -> CliResult<serde_json::Value> {
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| CliError::Other(format!("discovery runtime: {error}")))?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     runtime.block_on(async {
         let context = AsyncCliContext::open()?;
-        let cx = asupersync::Cx::for_request();
         match refresh_project_sibling_suggestions(&cx, &context.pool, args.project_id).await {
             Outcome::Ok(summary) => Ok(serde_json::json!({
                 "schema_version": 1,

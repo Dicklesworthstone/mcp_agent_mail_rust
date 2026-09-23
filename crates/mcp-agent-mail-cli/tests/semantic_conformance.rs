@@ -561,6 +561,102 @@ fn sc_file_reservations_release_db_parity() {
     assert_eq!(active, 0, "reservation should be released (0 active)");
 }
 
+/// SC-6b (GH#329): multi-value `--paths a b` / `--ids 3 4` release exactly the
+/// named leases. Before the fix both forms failed argv parsing, so the caller
+/// released nothing while believing its holds were gone.
+#[test]
+fn sc_file_reservations_release_multi_value_db_parity() {
+    let env = TestEnv::new();
+    let conn = init_schema(&env.db_path);
+    insert_project(&conn, 1, "test-proj", "/tmp/test-proj");
+    insert_agent(&conn, 1, 1, "BlueLake", "claude-code", "opus-4.6");
+    let now = mcp_agent_mail_db::timestamps::now_micros();
+    for (id, pattern) in [
+        (1, "src/**"),
+        (2, "tests/**"),
+        (3, "docs/**"),
+        (4, "Cargo.toml"),
+    ] {
+        conn.execute_sync(
+            "INSERT INTO file_reservations (\
+                id, project_id, agent_id, path_pattern, exclusive, reason, \
+                created_ts, expires_ts, released_ts\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(id),
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::Text(pattern.to_string()),
+                SqlValue::BigInt(1),
+                SqlValue::Text("gh329".to_string()),
+                SqlValue::BigInt(now),
+                SqlValue::BigInt(now + 3_600_000_000),
+                SqlValue::Null,
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let active_patterns = |env: &TestEnv| -> Vec<String> {
+        env.open_conn()
+            .query_sync(
+                "SELECT path_pattern FROM file_reservations \
+                 WHERE agent_id = 1 AND released_ts IS NULL ORDER BY id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get_named::<String>("path_pattern").unwrap())
+            .collect()
+    };
+
+    let out = run_am(
+        &env.base_env(),
+        &[
+            "file_reservations",
+            "release",
+            "test-proj",
+            "BlueLake",
+            "--paths",
+            "src/**",
+            "tests/**",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "multi-value --paths release failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        active_patterns(&env),
+        vec!["docs/**", "Cargo.toml"],
+        "exactly the two named paths must be released"
+    );
+
+    let out = run_am(
+        &env.base_env(),
+        &[
+            "file_reservations",
+            "release",
+            "test-proj",
+            "BlueLake",
+            "--ids",
+            "3",
+            "4",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "multi-value --ids release failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        active_patterns(&env).is_empty(),
+        "both named ids must be released"
+    );
+}
+
 /// SC-7: CLI contacts reject produces "blocked" status like MCP respond_contact(approved=false).
 #[test]
 fn sc_contacts_reject_db_parity() {

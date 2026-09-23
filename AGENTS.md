@@ -181,6 +181,12 @@ We do not care about backwards compatibility—we're in early development with n
 # Check for compiler errors and warnings (workspace-wide)
 cargo check --workspace --all-targets
 
+# Check the PRODUCTION feature graph (no dev-dependencies). `--all-targets`
+# unifies dev-only features (e.g. asupersync `test-internals`) into the
+# library build and can hide code that does not compile for release/install
+# builds (br-kp1in.31: main was unshippable for 6 days with every gate green).
+cargo check --workspace --lib --bins
+
 # Check for clippy lints (pedantic + nursery are enabled)
 cargo clippy --workspace --all-targets -- -D warnings
 

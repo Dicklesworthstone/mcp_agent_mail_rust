@@ -305,6 +305,9 @@ wc -l "${SOAK_TREND}"
 2. Or run individual gates:
    ```bash
    RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --locked --workspace --all-targets
+   # Production feature graph (no dev-dependencies): --all-targets can mask
+   # code that only compiles with dev-only features (br-kp1in.31).
+   RCH_REQUIRE_REMOTE=1 rch exec -- cargo check --locked --workspace --lib --bins
    RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --locked --workspace --all-targets -- -D warnings
    RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked --workspace
    cargo fmt --check

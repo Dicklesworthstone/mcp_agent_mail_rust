@@ -2753,7 +2753,7 @@ fn resolve_text_filter_thread_ids(
             return None;
         }
     };
-    let cx = asupersync::Cx::for_request();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
 
     let query = mcp_agent_mail_db::search_planner::SearchQuery {
         text: trimmed.to_string(),

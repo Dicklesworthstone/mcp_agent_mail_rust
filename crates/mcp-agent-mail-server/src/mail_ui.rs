@@ -67,7 +67,7 @@ pub fn dispatch(
     // Standalone callers (including static export) retain a real 30-second
     // budget. The live HTTP server calls `dispatch_with_cx` with its own
     // timeout-linked context so cancellation crosses the blocking boundary.
-    let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+    let cx = crate::runtime_request_cx(Budget::with_deadline_secs(30));
     dispatch_with_cx(path, query, method, body, &cx)
 }
 

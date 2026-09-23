@@ -2615,8 +2615,10 @@ pub const fn pool_timeout_ms_from_setting(value: u64) -> u64 {
 /// ## Why max is capped at 32 — FrankenSQLite concurrent-writer contract
 ///
 /// FrankenSQLite's page-level MVCC has a hard concurrency contract:
-/// **>= 10 concurrent autocommit writers is UNSUPPORTED** (known corruption
-/// bug bd-9inpb, P0 open), and the swarm-tested multi-process bound is
+/// **>= 10 concurrent autocommit writers was UNSUPPORTED** (corruption bug
+/// bd-9inpb; the pinned engine's own `br_q37ep_index_update_churn_corruption`
+/// test records the bd-9inpb fix, but no Agent Mail swarm run has re-qualified
+/// the bound since — br-kp1in.16), and the swarm-tested multi-process bound is
 /// **N <= 32 short-lived writers**. The old heuristic (`cpus * 12`, up to 200
 /// — 168 connections on a 14-core machine) invited unsupported writer
 /// concurrency under multi-agent load and is a plausible contributor to the

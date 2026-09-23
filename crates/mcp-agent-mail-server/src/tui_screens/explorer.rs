@@ -735,7 +735,7 @@ impl MailExplorerScreen {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .map_err(|e| format!("search filter runtime init failed: {e}"))?;
-        let cx = asupersync::Cx::for_request();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
 
         let query = mcp_agent_mail_db::search_planner::SearchQuery {
             text: text_filter.to_string(),

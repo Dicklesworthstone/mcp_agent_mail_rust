@@ -931,6 +931,56 @@ pub const fn read_fd_limits() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
+/// Soft `RLIMIT_NOFILE` a server process requests at startup (br-kp1in.17).
+///
+/// The systemd user-unit default soft limit is 1,024; on 2026-09-23 a v0.3.36
+/// server exhausted it within a minute of mixed load and a long-lived daemon
+/// exhausted 2,048 within a day. Raising toward the (usually far higher) hard
+/// limit is defense in depth, not a fix for a leak.
+pub const SERVER_FD_SOFT_LIMIT_TARGET: u64 = 65_536;
+
+/// Soft limit to request: raise toward `target`, never above `hard`, and never
+/// lower an already higher soft limit.
+#[must_use]
+pub const fn desired_fd_soft_limit(soft: u64, hard: u64, target: u64) -> u64 {
+    let capped = if target < hard { target } else { hard };
+    if soft >= capped { soft } else { capped }
+}
+
+/// Raise this process's soft `RLIMIT_NOFILE` toward `target`.
+///
+/// Returns `(before, after)` soft limits, or `None` when the limit cannot be
+/// read or no increase could be applied.
+#[cfg(unix)]
+#[must_use]
+pub fn raise_fd_soft_limit(target: u64) -> Option<(u64, u64)> {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    /// macOS rejects soft limits above `OPEN_MAX` even when hard is unlimited.
+    const MACOS_OPEN_MAX: u64 = 10_240;
+
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+    let desired = desired_fd_soft_limit(soft, hard, target);
+    if desired == soft {
+        return Some((soft, soft));
+    }
+    if setrlimit(Resource::RLIMIT_NOFILE, desired, hard).is_ok() {
+        return Some((soft, desired));
+    }
+    let fallback = desired_fd_soft_limit(soft, hard, MACOS_OPEN_MAX);
+    if fallback > soft && setrlimit(Resource::RLIMIT_NOFILE, fallback, hard).is_ok() {
+        return Some((soft, fallback));
+    }
+    None
+}
+
+/// Raise this process's soft `RLIMIT_NOFILE` (unsupported platform stub).
+#[cfg(not(unix))]
+#[must_use]
+pub const fn raise_fd_soft_limit(_target: u64) -> Option<(u64, u64)> {
+    None
+}
+
 /// Count open file descriptors for the current process.
 ///
 /// Linux counts `/proc/self/fd` entries; other platforms (and unreadable
@@ -2422,6 +2472,40 @@ pub fn timeout_diagnostics_snapshot(client_deadline_us: u64) -> TimeoutDiagnosti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desired_fd_soft_limit_raises_toward_target_within_hard_and_never_lowers() {
+        assert_eq!(desired_fd_soft_limit(1_024, 1_048_576, 65_536), 65_536);
+        assert_eq!(
+            desired_fd_soft_limit(1_024, 4_096, 65_536),
+            4_096,
+            "capped by hard"
+        );
+        assert_eq!(
+            desired_fd_soft_limit(100_000, 1_048_576, 65_536),
+            100_000,
+            "an already higher soft limit is never lowered"
+        );
+        assert_eq!(desired_fd_soft_limit(65_536, 65_536, 65_536), 65_536);
+    }
+
+    /// br-kp1in.17: the real syscall path raises the soft limit by one step and
+    /// reports it; asking for less than the current soft limit changes nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raise_fd_soft_limit_applies_and_never_lowers() {
+        let (Some(soft), Some(hard)) = read_fd_limits() else {
+            panic!("/proc/self/limits must expose Max open files on Linux");
+        };
+        assert_eq!(
+            raise_fd_soft_limit(soft.saturating_sub(1)),
+            Some((soft, soft))
+        );
+        if soft < hard {
+            assert_eq!(raise_fd_soft_limit(soft + 1), Some((soft, soft + 1)));
+            assert_eq!(read_fd_limits().0, Some(soft + 1));
+        }
+    }
 
     #[test]
     fn timeout_diagnostics_names_only_a_stage_that_exceeded_the_budget() {

@@ -334,7 +334,7 @@ pub fn atc_sync_population_from_db(
                 .unwrap_or(i64::MAX)
                 .saturating_mul(1_000_000);
         let population_limit = mcp_agent_mail_core::config::atc_population_limit();
-        let cx = asupersync::Cx::for_request_with_budget(asupersync::Budget::INFINITE);
+        let cx = crate::runtime_request_cx(asupersync::Budget::INFINITE);
         match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_atc_population_snapshot(
             &cx,
             pool,

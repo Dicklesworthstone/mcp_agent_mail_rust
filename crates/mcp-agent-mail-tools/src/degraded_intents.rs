@@ -950,7 +950,7 @@ mod tests {
             append_jsonl(&config, ACK_INTENT_LOG_FILE, ACK_INTENT_LOCK_FILE, &record)
                 .expect("unsupported record fixture");
         }
-        assert!(read_queued_ack_intents(&config).unwrap().is_empty());
+        assert_eq!(read_queued_ack_intents(&config).unwrap(), Vec::new());
     }
 
     #[test]

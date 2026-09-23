@@ -241,6 +241,7 @@ pub mod tool_util {
                 | "CONTACT_REQUIRED"
                 | "CONTACT_BLOCKED"
                 | "CONTACTS_ONLY"
+                | "CROSS_PROJECT_RECIPIENT"
                 // Feature-disabled refusals.
                 | "BROADCAST_DISABLED"
                 | "FEATURE_DISABLED"
@@ -3086,6 +3087,7 @@ mod tests {
             "EMPTY_PATHS",
             "CONTACT_REQUIRED",
             "CONTACT_BLOCKED",
+            "CROSS_PROJECT_RECIPIENT",
             "BROADCAST_DISABLED",
             "FEATURE_DISABLED",
             "WORKTREES_DISABLED",

@@ -1251,8 +1251,18 @@ pub struct ReservationEntry {
     pub remaining_seconds: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining: Option<String>,
+    /// Humanized grant age ("1h ago") for human-facing formats.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<String>,
+    /// Absolute grant time, RFC 3339 UTC (GH#330: machine-usable timestamps).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_ts: Option<String>,
+    /// Absolute expiry time, RFC 3339 UTC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_ts: Option<String>,
+    /// Seconds since the grant, as an integer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_age_seconds: Option<i64>,
 }
 
 /// Expiry bucket highlighting reservation TTL herds.
@@ -5385,7 +5395,7 @@ fn build_status_with_phase(
     let my_reservations = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
             &format!(
-                "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts, fr.id
+                "SELECT fr.path_pattern, fr.\"exclusive\", fr.created_ts, fr.expires_ts, fr.id
                  FROM file_reservations fr
                  WHERE fr.project_id = ? AND fr.agent_id = ? AND ({active_reservation_predicate})
                    AND fr.expires_ts > ?
@@ -5405,6 +5415,7 @@ fn build_status_with_phase(
         })
         .map(|r| {
             let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
+            let created: Option<i64> = r.get_named("created_ts").ok();
             ReservationEntry {
                 agent: None,
                 path: r.get_named("path_pattern").unwrap_or_default(),
@@ -5412,6 +5423,9 @@ fn build_status_with_phase(
                 remaining_seconds: remaining_seconds_from_micros(now_us, expires),
                 remaining: None,
                 granted_at: None,
+                granted_ts: created.map(mcp_agent_mail_db::micros_to_iso),
+                expires_ts: Some(mcp_agent_mail_db::micros_to_iso(expires)),
+                granted_age_seconds: created.map(|ts| age_seconds_from_micros(now_us, ts)),
             }
         })
         .collect()
@@ -7747,7 +7761,7 @@ fn execute_robot_search_query(
     pool: &mcp_agent_mail_db::DbPool,
     query: &mcp_agent_mail_db::search_planner::SearchQuery,
 ) -> Result<mcp_agent_mail_db::search_planner::SearchResponse, CliError> {
-    let cx = asupersync::Cx::for_request();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
 
     match runtime.block_on(async {
         mcp_agent_mail_db::search_service::execute_search_simple(&cx, pool, query).await
@@ -8514,6 +8528,9 @@ fn build_reservations(
             remaining_seconds,
             remaining: Some(format_remaining(remaining_seconds)),
             granted_at: Some(format_age(created_age)),
+            granted_ts: Some(mcp_agent_mail_db::micros_to_iso(created_ts)),
+            expires_ts: Some(mcp_agent_mail_db::micros_to_iso(expires_ts)),
+            granted_age_seconds: Some(created_age),
         };
 
         all_active.push(entry.clone());
@@ -12052,7 +12069,10 @@ where
     Fut: std::future::Future<Output = McpResult<String>>,
 {
     let payload = crate::context::run_async(async move {
-        let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+        let ctx = McpContext::new(
+            mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
+            1,
+        );
         call(ctx).await.map_err(navigate_mcp_error_to_cli_error)
     })?;
     navigate_json_result(resource_type, payload, project_scope)
@@ -19141,6 +19161,9 @@ mod tests {
                 remaining_seconds: 2400,
                 remaining: Some("40m".into()),
                 granted_at: Some("2h ago".into()),
+                granted_ts: Some("2026-02-16T08:00:00.000000Z".into()),
+                expires_ts: Some("2026-02-16T10:40:00.000000Z".into()),
+                granted_age_seconds: Some(7200),
             }],
             all_active: vec![
                 ReservationEntry {
@@ -19150,6 +19173,9 @@ mod tests {
                     remaining_seconds: 2400,
                     remaining: Some("40m".into()),
                     granted_at: Some("2h ago".into()),
+                    granted_ts: Some("2026-02-16T08:00:00.000000Z".into()),
+                    expires_ts: Some("2026-02-16T10:40:00.000000Z".into()),
+                    granted_age_seconds: Some(7200),
                 },
                 ReservationEntry {
                     agent: Some("RedFox".into()),
@@ -19158,6 +19184,9 @@ mod tests {
                     remaining_seconds: 300,
                     remaining: Some("5m \u{26a0}".into()),
                     granted_at: Some("55m ago".into()),
+                    granted_ts: Some("2026-02-16T09:05:00.000000Z".into()),
+                    expires_ts: Some("2026-02-16T10:05:00.000000Z".into()),
+                    granted_age_seconds: Some(3300),
                 },
             ],
             conflicting_active: vec![],
@@ -19174,6 +19203,9 @@ mod tests {
                 remaining_seconds: 300,
                 remaining: Some("5m \u{26a0}".into()),
                 granted_at: Some("55m ago".into()),
+                granted_ts: Some("2026-02-16T09:05:00.000000Z".into()),
+                expires_ts: Some("2026-02-16T10:05:00.000000Z".into()),
+                granted_age_seconds: Some(3300),
             }],
             playbooks: vec![ReservationPlaybook {
                 id: "reservation-conflict-1".into(),
@@ -25493,6 +25525,51 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    /// GH#330: JSON consumers get absolute RFC 3339 grant/expiry times and an
+    /// integer age, not only the humanized "1h ago" string.
+    #[test]
+    fn build_reservations_exposes_absolute_grant_and_expiry_times() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let created_us = now_us - 5_400_000_000; // granted 90 minutes ago
+        let expires_us = now_us + 1_800_000_000;
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 1, 'src/**', 1, 'gh330', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(expires_us),
+            ],
+        )
+        .expect("insert reservation");
+
+        let (data, _) = build_reservations(&conn, 1, "proj", None, false, false, None)
+            .expect("build reservations");
+        assert_eq!(data.all_active.len(), 1);
+        let json = serde_json::to_value(&data.all_active[0]).expect("serialize entry");
+
+        let granted = json["granted_ts"].as_str().expect("granted_ts is a string");
+        assert_eq!(granted, mcp_agent_mail_db::micros_to_iso(created_us));
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(granted).is_ok(),
+            "granted_ts must be RFC 3339: {granted}"
+        );
+        let expires = json["expires_ts"].as_str().expect("expires_ts is a string");
+        assert_eq!(expires, mcp_agent_mail_db::micros_to_iso(expires_us));
+        let age = json["granted_age_seconds"]
+            .as_i64()
+            .expect("granted_age_seconds is an integer");
+        assert!(
+            (5_390..=5_460).contains(&age),
+            "age should be ~5400 s, got {age}"
+        );
+        assert!(json["remaining_seconds"].as_i64().is_some_and(|s| s > 0));
+        // The humanized field stays for human formats; it is no longer the only
+        // representation of the grant time.
+        assert!(json["granted_at"].as_str().is_some());
     }
 
     #[test]

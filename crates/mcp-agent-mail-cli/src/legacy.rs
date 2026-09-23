@@ -1174,10 +1174,10 @@ fn migrate_sqlite_db(path: &Path) -> CliResult<Vec<String>> {
     conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
         .map_err(|e| CliError::Other(format!("failed to apply base init PRAGMAs: {e}")))?;
 
-    let cx = asupersync::Cx::for_request();
     let rt = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
+    let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
     match rt.block_on(async { schema::migrate_to_latest_base(&cx, &conn).await }) {
         asupersync::Outcome::Ok(ids) => {
             normalize_legacy_agent_lifecycle_timestamps(&conn)?;

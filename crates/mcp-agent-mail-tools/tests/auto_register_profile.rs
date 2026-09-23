@@ -10,7 +10,9 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
-use mcp_agent_mail_tools::{ensure_project, register_agent, send_message};
+use mcp_agent_mail_tools::{
+    ensure_project, list_agents, macro_contact_handshake, register_agent, send_message,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -152,5 +154,116 @@ fn auto_registered_recipient_gets_an_archived_profile() {
         assert_eq!(profile["name"], "CobaltRobin");
         assert_eq!(profile["program"], "unknown");
         assert_eq!(profile["model"], "unknown");
+    });
+}
+
+/// br-kp1in.15: after a cross-project contact handshake, sending to the linked
+/// agent's name used to auto-register a same-name placeholder in the SENDER's
+/// project and report the message persisted while the real peer received
+/// nothing. It must now refuse with `CROSS_PROJECT_RECIPIENT` and write nothing,
+/// and the handshake must say its welcome was not delivered.
+#[test]
+fn send_to_cross_project_contact_is_refused_instead_of_misdelivered() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project_a = format!("/tmp/xproj-a-{}", unique_suffix());
+        let project_b = format!("/tmp/xproj-b-{}", unique_suffix());
+        for (project, name) in [(&project_a, "GreenCastle"), (&project_b, "BronzeHare")] {
+            ensure_project(&ctx, project.clone(), None)
+                .await
+                .expect("ensure_project");
+            register_agent(
+                &ctx,
+                project.clone(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some(name.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("register agent");
+        }
+
+        let handshake = macro_contact_handshake(
+            &ctx,
+            project_a.clone(),
+            Some("GreenCastle".to_string()),
+            Some("BronzeHare".to_string()),
+            None,
+            None,
+            Some(project_b.clone()),
+            Some("cross-repo work".to_string()),
+            Some(true),
+            None,
+            Some("hello".to_string()),
+            Some("welcome across repos".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("cross-project handshake");
+        let handshake: Value = serde_json::from_str(&handshake).expect("handshake JSON");
+        assert!(handshake["welcome_message"].is_null(), "{handshake}");
+        assert!(
+            handshake["welcome_skipped_reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("cross_project_messaging_unsupported")),
+            "the skipped welcome must be reported: {handshake}"
+        );
+
+        let err = send_message(
+            &ctx,
+            project_a.clone(),
+            "GreenCastle".to_string(),
+            vec!["BronzeHare".to_string()],
+            "to the linked peer".to_string(),
+            "body".to_string(),
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            None, // importance
+            None, // ack_required
+            None, // thread_id
+            None, // topic
+            None, // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
+            None, // idempotency_key
+        )
+        .await
+        .expect_err("a cross-project contact name must not be auto-registered locally");
+        assert_eq!(
+            mcp_agent_mail_tools::tool_util::tool_error_code(&err),
+            Some("CROSS_PROJECT_RECIPIENT"),
+            "{err:?}"
+        );
+
+        let agents_a: Value = serde_json::from_str(
+            &list_agents(&ctx, project_a.clone(), None, None)
+                .await
+                .expect("list agents in A"),
+        )
+        .expect("agents JSON");
+        let names: Vec<&str> = agents_a
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .filter_map(|agent| agent["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["GreenCastle"],
+            "no BronzeHare placeholder may be created in the sender's project"
+        );
     });
 }
