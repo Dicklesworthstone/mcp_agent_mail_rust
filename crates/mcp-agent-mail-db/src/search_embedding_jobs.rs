@@ -640,6 +640,7 @@ pub struct EmbeddingJobRunner {
     queue: Arc<EmbeddingQueue>,
     embedder: Arc<dyn Embedder>,
     index: Arc<RwLock<VectorIndex>>,
+    bind_model: bool,
     metrics: Arc<JobMetrics>,
 }
 
@@ -657,8 +658,17 @@ impl EmbeddingJobRunner {
             queue,
             embedder,
             index,
+            bind_model: false,
             metrics: Arc::new(JobMetrics::new()),
         }
+    }
+
+    /// Pin the index to the first available real model, allowing an empty index
+    /// created before model discovery to adopt that model's output dimension.
+    #[must_use]
+    pub fn with_model_binding(mut self) -> Self {
+        self.bind_model = true;
+        self
     }
 
     /// Get the metrics.
@@ -678,6 +688,12 @@ impl EmbeddingJobRunner {
     ///
     /// This is used by the refresh worker to enforce per-cycle processing bounds.
     pub fn process_batch_limit(&self, batch_size: usize) -> SearchResult<BatchResult> {
+        // An optional model may become available long after startup. Retain the
+        // bounded queue, including its deduplication and backpressure, until it
+        // is ready instead of consuming requests as hash-only successes/skips.
+        if !self.embedder.is_ready() {
+            return Ok(BatchResult::default());
+        }
         let effective_batch_size = batch_size.max(1).min(self.config.batch_size);
         let batch = self.queue.drain_batch(effective_batch_size);
         if batch.is_empty() {
@@ -746,6 +762,15 @@ impl EmbeddingJobRunner {
                 "embedder returned more vectors than requested; dropping extras"
             );
         }
+        drop(index);
+
+        if result.succeeded > 0 {
+            // Queries may have cached lexical fallback or an empty semantic
+            // response before these documents acquired real vectors.
+            crate::search_service::invalidate_search_cache(
+                crate::search_cache::InvalidationTrigger::IndexUpdate,
+            );
+        }
 
         result.elapsed = start.elapsed();
         self.metrics.record_batch(&result);
@@ -790,13 +815,29 @@ impl EmbeddingJobRunner {
     }
 
     /// Process a single embedding request.
-    #[allow(clippy::unused_self)]
     fn process_single(
         &self,
         index: &mut VectorIndex,
         req: &EmbeddingRequest,
         embedding: EmbeddingResult,
     ) -> SearchResult<JobResult> {
+        if self.bind_model {
+            let selected = self.embedder.model_info();
+            if !selected.available
+                || selected.tier == ModelTier::Hash
+                || embedding.model_id != selected.id
+                || embedding.tier != selected.tier
+                || embedding.dimension != selected.dimension
+                || embedding.vector.len() != selected.dimension
+                || embedding.vector.is_empty()
+                || embedding.vector.iter().any(|value| !value.is_finite())
+            {
+                return Err(crate::search_error::SearchError::InvalidQuery(
+                    "Embedding does not match the selected model's identity and dimension"
+                        .to_owned(),
+                ));
+            }
+        }
         // Skip hash-only embeddings for vector index
         if embedding.is_hash_only() {
             return Ok(JobResult::Skipped {
@@ -818,7 +859,11 @@ impl EmbeddingJobRunner {
 
         // Build index entry and upsert
         let entry = IndexEntry::new(&embedding.vector, metadata);
-        index.upsert(entry)?;
+        if self.bind_model {
+            index.upsert_model_bound(entry)?;
+        } else {
+            index.upsert(entry)?;
+        }
 
         Ok(JobResult::Success {
             doc_id: req.doc_id,

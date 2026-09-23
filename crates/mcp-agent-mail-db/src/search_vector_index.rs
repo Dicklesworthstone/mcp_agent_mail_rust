@@ -314,6 +314,9 @@ impl Default for VectorIndexConfig {
 #[derive(Debug)]
 pub struct VectorIndex {
     config: VectorIndexConfig,
+    /// Optional single-model binding used by the live embedding pipeline.
+    /// A model's identity is independent of its output dimension.
+    bound_model_id: Option<String>,
     entries: Vec<IndexEntry>,
     /// Map from (`doc_id`, `doc_kind`) to index position
     doc_index: HashMap<(i64, DocKind), usize>,
@@ -331,6 +334,7 @@ impl VectorIndex {
     pub fn new(config: VectorIndexConfig) -> Self {
         Self {
             config,
+            bound_model_id: None,
             entries: Vec::new(),
             doc_index: HashMap::new(),
         }
@@ -341,6 +345,21 @@ impl VectorIndex {
     /// # Errors
     /// Returns `SearchError::InvalidQuery` if the vector dimension doesn't match.
     pub fn upsert(&mut self, entry: IndexEntry) -> SearchResult<()> {
+        if self.bound_model_id.is_some()
+            && (entry.vector.is_empty() || entry.vector.iter().any(|value| !value.is_finite()))
+        {
+            return Err(SearchError::InvalidQuery(
+                "A model-bound index requires a finite, non-empty embedding".to_owned(),
+            ));
+        }
+        if let Some(model_id) = &self.bound_model_id
+            && entry.metadata.model_id != *model_id
+        {
+            return Err(SearchError::InvalidQuery(format!(
+                "Vector model mismatch: expected {model_id}, got {}",
+                entry.metadata.model_id
+            )));
+        }
         if entry.vector.len() != self.config.dimension {
             return Err(SearchError::InvalidQuery(format!(
                 "Vector dimension mismatch: expected {}, got {}",
@@ -370,6 +389,45 @@ impl VectorIndex {
         }
 
         Ok(())
+    }
+
+    /// Bind the live index to the first real embedding's model and dimension.
+    ///
+    /// An empty, unbound index may have been constructed before model discovery
+    /// succeeded. Only that state may adopt a different dimension. Once bound,
+    /// even clearing every document retains the vector-space identity.
+    pub(crate) fn upsert_model_bound(&mut self, entry: IndexEntry) -> SearchResult<()> {
+        if entry.metadata.model_id.is_empty()
+            || entry.vector.is_empty()
+            || entry.vector.iter().any(|value| !value.is_finite())
+        {
+            return Err(SearchError::InvalidQuery(
+                "A model-bound index requires an identified, finite, non-empty embedding"
+                    .to_owned(),
+            ));
+        }
+        if self.bound_model_id.is_none() {
+            if self.entries.is_empty() {
+                self.config.dimension = entry.vector.len();
+            } else if entry.vector.len() != self.config.dimension
+                || self
+                    .entries
+                    .iter()
+                    .any(|existing| existing.metadata.model_id != entry.metadata.model_id)
+            {
+                return Err(SearchError::InvalidQuery(
+                    "Cannot bind a populated index to a different vector space".to_owned(),
+                ));
+            }
+            self.bound_model_id = Some(entry.metadata.model_id.clone());
+        }
+        self.upsert(entry)
+    }
+
+    /// Model identity pinned by the live embedding pipeline, if it is ready.
+    #[must_use]
+    pub fn bound_model_id(&self) -> Option<&str> {
+        self.bound_model_id.as_deref()
     }
 
     /// Remove a vector from the index.
@@ -713,6 +771,93 @@ mod tests {
         let entry = make_entry(1, DocKind::Message, &[1.0, 0.0]); // Wrong dimension
         let result = index.upsert(entry);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn model_binding_adopts_late_dimension_and_rejects_other_vector_spaces() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            max_vectors: 7,
+            ..Default::default()
+        });
+        index
+            .upsert_model_bound(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(index.config().dimension, 3);
+        assert_eq!(index.config().max_vectors, 7);
+        assert_eq!(index.bound_model_id(), Some("test-model"));
+
+        let foreign_model = IndexEntry::new(
+            &[1.0, 0.0, 0.0],
+            VectorMetadata::new(2, DocKind::Message, "different-model-same-dimension"),
+        );
+        assert!(index.upsert_model_bound(foreign_model.clone()).is_err());
+        assert!(index.upsert(foreign_model).is_err());
+        for value in [f32::NAN, f32::INFINITY] {
+            assert!(
+                index
+                    .upsert(make_entry(4, DocKind::Message, &[value; 3]))
+                    .is_err()
+            );
+        }
+        assert!(
+            index
+                .upsert_model_bound(make_entry(3, DocKind::Message, &[1.0, 0.0]))
+                .is_err()
+        );
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.search(&[1.0, 0.0, 0.0], 3, None).unwrap()[0].doc_id,
+            1
+        );
+
+        index.clear();
+        assert_eq!(index.bound_model_id(), Some("test-model"));
+        assert!(
+            index
+                .upsert_model_bound(make_entry(3, DocKind::Message, &[1.0, 0.0]))
+                .is_err()
+        );
+        assert_eq!(index.config().dimension, 3);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn model_binding_does_not_reinterpret_existing_or_invalid_vectors() {
+        let mut index = VectorIndex::new(VectorIndexConfig {
+            dimension: 3,
+            ..Default::default()
+        });
+        for vector in [Vec::new(), vec![f32::NAN; 3]] {
+            assert!(
+                index
+                    .upsert_model_bound(make_entry(1, DocKind::Message, &vector))
+                    .is_err()
+            );
+            assert_eq!(index.bound_model_id(), None);
+            assert_eq!(index.config().dimension, 3);
+        }
+        index
+            .upsert(make_entry(1, DocKind::Message, &[1.0, 0.0, 0.0]))
+            .unwrap();
+        assert!(
+            index
+                .upsert_model_bound(IndexEntry::new(
+                    &[1.0, 0.0, 0.0],
+                    VectorMetadata::new(2, DocKind::Message, "foreign"),
+                ))
+                .is_err()
+        );
+        assert!(
+            index
+                .upsert_model_bound(make_entry(2, DocKind::Message, &[1.0, 0.0]))
+                .is_err()
+        );
+        assert_eq!(index.bound_model_id(), None);
+        assert_eq!(index.len(), 1);
+        index
+            .upsert_model_bound(make_entry(2, DocKind::Message, &[0.0, 1.0, 0.0]))
+            .unwrap();
+        assert_eq!(index.bound_model_id(), Some("test-model"));
     }
 
     // ── Search ──

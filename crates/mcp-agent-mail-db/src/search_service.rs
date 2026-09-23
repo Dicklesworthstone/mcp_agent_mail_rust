@@ -1572,10 +1572,15 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     }
     let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
-    crate::search_v3::with_backfill_source_retry(|| {
-        crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
-    })
-    .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    let backfill =
+        || crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()));
+    #[cfg(feature = "tantivy-engine")]
+    let result = crate::search_v3::with_backfill_source_retry(backfill);
+    // The feature-disabled bridge already defines a no-op backfill. It has no
+    // native source connection to retry and no Tantivy retry helper to call.
+    #[cfg(not(feature = "tantivy-engine"))]
+    let result = backfill();
+    result.map_err(|err| map_bridge_bootstrap_error(&err))?;
     mark_lexical_backfill_ran(&sqlite_key)?;
     Ok(())
 }
@@ -1671,56 +1676,80 @@ static SEMANTIC_BRIDGE: OnceLock<Option<Arc<SemanticBridge>>> = OnceLock::new();
 #[cfg(feature = "hybrid")]
 #[derive(Debug)]
 struct AutoInitSemanticEmbedder {
-    info: ModelInfo,
+    selected: OnceLock<ModelInfo>,
+    unavailable: ModelInfo,
     hash_fallback: HashEmbedder,
 }
 
 #[cfg(feature = "hybrid")]
 impl AutoInitSemanticEmbedder {
     fn new() -> Self {
-        let dimension = get_two_tier_context().config().fast_dimension;
         Self {
-            info: ModelInfo::new(
-                "auto-init-semantic-fast",
-                "Auto-Init Semantic Fast",
-                ModelTier::Fast,
-                dimension,
+            selected: OnceLock::new(),
+            unavailable: ModelInfo::new(
+                "unavailable",
+                "Semantic model unavailable",
+                ModelTier::Hash,
+                0,
                 4096,
-            )
-            .with_available(true),
+            ),
             hash_fallback: HashEmbedder::new(),
         }
+    }
+
+    fn selected_model(&self) -> &ModelInfo {
+        if let Some(info) = self.selected.get() {
+            return info;
+        }
+        let ctx = get_two_tier_context();
+        let available = ctx
+            .fast_info()
+            .map(|info| (info, ModelTier::Fast))
+            .or_else(|| ctx.quality_info().map(|info| (info, ModelTier::Quality)));
+        available.map_or(&self.unavailable, |(info, tier)| {
+            // Successful model discovery is sticky. Both document and query
+            // embeddings use this identity, including if another tier appears
+            // later or an embedding attempt transiently fails.
+            self.selected.get_or_init(|| {
+                ModelInfo::new(&info.id, &info.id, tier, info.dimension, 4096).with_available(true)
+            })
+        })
     }
 }
 
 #[cfg(feature = "hybrid")]
 impl Embedder for AutoInitSemanticEmbedder {
     fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
+        let info = self.selected_model();
+        if !info.available {
+            return self.hash_fallback.embed(text);
+        }
         let ctx = get_two_tier_context();
         let start = std::time::Instant::now();
-        if let Ok(vector) = ctx.embed_fast(text) {
-            return Ok(EmbeddingResult::new(
-                vector,
-                self.info.id.clone(),
-                ModelTier::Fast,
-                start.elapsed(),
-                crate::search_canonical::content_hash(text),
-            ));
+        let vector = match info.tier {
+            ModelTier::Fast => ctx.embed_fast(text)?,
+            ModelTier::Quality => ctx.embed_quality(text)?,
+            ModelTier::Hash => return self.hash_fallback.embed(text),
+        };
+        if vector.len() != info.dimension {
+            return Err(crate::search_error::SearchError::InvalidQuery(format!(
+                "Model {} returned dimension {}, expected {}",
+                info.id,
+                vector.len(),
+                info.dimension
+            )));
         }
-        if let Ok(vector) = ctx.embed_quality(text) {
-            return Ok(EmbeddingResult::new(
-                vector,
-                "auto-init-semantic-quality".to_string(),
-                ModelTier::Quality,
-                start.elapsed(),
-                crate::search_canonical::content_hash(text),
-            ));
-        }
-        self.hash_fallback.embed(text)
+        Ok(EmbeddingResult::new(
+            vector,
+            info.id.clone(),
+            info.tier,
+            start.elapsed(),
+            crate::search_canonical::content_hash(text),
+        ))
     }
 
     fn model_info(&self) -> &ModelInfo {
-        &self.info
+        self.selected_model()
     }
 }
 
@@ -1729,6 +1758,8 @@ impl Embedder for AutoInitSemanticEmbedder {
 pub struct SemanticBridge {
     /// The vector index holding document embeddings.
     index: Arc<RwLock<VectorIndex>>,
+    /// Shared, model-pinned embedder for both documents and queries.
+    embedder: Arc<dyn Embedder>,
     /// The model registry for obtaining embedders.
     registry: Arc<RwLock<ModelRegistry>>,
     /// Queue of pending embedding work.
@@ -1755,12 +1786,10 @@ impl SemanticBridge {
         let registry = Arc::new(RwLock::new(ModelRegistry::new(RegistryConfig::default())));
         let job_config = EmbeddingJobConfig::default();
         let queue = Arc::new(EmbeddingQueue::with_config(job_config.clone()));
-        let runner = Arc::new(EmbeddingJobRunner::new(
-            job_config,
-            queue.clone(),
-            embedder,
-            index.clone(),
-        ));
+        let runner = Arc::new(
+            EmbeddingJobRunner::new(job_config, queue.clone(), embedder.clone(), index.clone())
+                .with_model_binding(),
+        );
         let worker_cfg = RefreshWorkerConfig {
             refresh_interval_ms: 250,
             rebuild_on_startup: false,
@@ -1778,6 +1807,7 @@ impl SemanticBridge {
 
         Self {
             index,
+            embedder,
             registry,
             queue,
             runner,
@@ -1786,7 +1816,8 @@ impl SemanticBridge {
         }
     }
 
-    /// Create a semantic bridge with default configuration (384-dim for `MiniLM`).
+    /// Create a semantic bridge using the available model's dimension.
+    /// An empty index adopts the first real model if discovery succeeds later.
     #[must_use]
     pub fn default_config() -> Self {
         let ctx = get_two_tier_context();
@@ -1824,15 +1855,21 @@ impl SemanticBridge {
     /// Check if the bridge has any real embedder (beyond hash fallback).
     #[must_use]
     pub fn has_real_embedder(&self) -> bool {
-        self.registry().has_real_embedder() || get_two_tier_context().is_available()
+        let info = self.embedder.model_info();
+        if !self.embedder.is_ready() || info.tier == ModelTier::Hash {
+            return false;
+        }
+        let index = self.index();
+        index
+            .bound_model_id()
+            .is_none_or(|id| id == info.id && index.config().dimension == info.dimension)
     }
 
     /// Search for semantically similar documents.
     ///
     /// Embeds the query text and performs vector similarity search.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
-        let embedder = AutoInitSemanticEmbedder::new();
-        let embedding = match embedder.embed(&query.text) {
+        let embedding = match self.embedder.embed(&query.text) {
             Ok(result) => result,
             Err(e) => {
                 tracing::warn!(
@@ -1850,12 +1887,26 @@ impl SemanticBridge {
             );
             return Vec::new();
         }
+        let selected = self.embedder.model_info();
+        if embedding.model_id != selected.id
+            || embedding.tier != selected.tier
+            || embedding.dimension != selected.dimension
+            || embedding.vector.len() != selected.dimension
+            || embedding.vector.iter().any(|value| !value.is_finite())
+        {
+            return Vec::new();
+        }
 
         // Build filter from query
-        let filter = build_vector_filter(query);
+        let filter = build_vector_filter(query).with_model(&embedding.model_id);
 
         // Search the index
         let index = self.index();
+        if index.bound_model_id() != Some(embedding.model_id.as_str())
+            || index.config().dimension != embedding.dimension
+        {
+            return Vec::new();
+        }
         let hits = match index.search(&embedding.vector, limit, Some(&filter)) {
             Ok(h) => h,
             Err(e) => {
@@ -1996,12 +2047,13 @@ fn build_vector_filter(query: &SearchQuery) -> VectorFilter {
         filter = filter.with_project(pid);
     }
 
-    let doc_kinds = vec![match query.doc_kind {
-        DocKind::Message => SearchDocKind::Message,
-        DocKind::Agent => SearchDocKind::Agent,
-        DocKind::Project => SearchDocKind::Project,
-        DocKind::Thread => SearchDocKind::Thread,
-    }];
+    let doc_kinds = match query.doc_kind {
+        DocKind::Message => vec![SearchDocKind::Message],
+        DocKind::Agent => vec![SearchDocKind::Agent],
+        DocKind::Project => vec![SearchDocKind::Project],
+        // Thread queries hydrate matching messages from their canonical IDs.
+        DocKind::Thread => vec![SearchDocKind::Message, SearchDocKind::Thread],
+    };
     filter = filter.with_doc_kinds(doc_kinds);
     filter
 }
@@ -2880,6 +2932,81 @@ fn try_two_tier_search_with_cx(
     } else {
         None
     }
+}
+
+/// Retrieve semantic candidates from the progressive index and the live job index.
+/// Normal message/agent writes feed `SemanticBridge`; those completed embeddings
+/// must be available to hybrid and auto searches as well as explicit semantic mode.
+#[cfg(feature = "hybrid")]
+fn semantic_search_with_cx(cx: &Cx, query: &SearchQuery, limit: usize) -> TwoTierSearchOutcome {
+    let mut outcome = try_two_tier_search_with_cx(cx, query, limit).unwrap_or_default();
+    outcome.results.retain(|result| {
+        query
+            .project_id
+            .is_none_or(|id| result.project_id == Some(id))
+            && (result.doc_kind == query.doc_kind
+                || (query.doc_kind == DocKind::Thread && result.doc_kind == DocKind::Message))
+    });
+    if cx.checkpoint().is_ok()
+        && let Some(bridge) = get_or_init_semantic_bridge()
+    {
+        outcome.results =
+            fuse_semantic_candidates(outcome.results, bridge.search(query, limit), limit);
+    }
+    if cx.checkpoint().is_err() {
+        outcome.results.clear();
+    }
+    outcome
+}
+
+/// Merge ranked semantic sources without comparing their raw score scales.
+/// A document present in both indexes receives one reciprocal-rank contribution
+/// from each; duplicate identities within a source never increase its weight.
+#[cfg(feature = "hybrid")]
+fn fuse_semantic_candidates(
+    mut progressive: Vec<SearchResult>,
+    mut live: Vec<SearchResult>,
+    limit: usize,
+) -> Vec<SearchResult> {
+    if progressive.is_empty() {
+        live.truncate(limit);
+        return live;
+    }
+    if live.is_empty() {
+        progressive.truncate(limit);
+        return progressive;
+    }
+    let mut fused: HashMap<(DocKind, Option<i64>, i64), SearchResult> = HashMap::new();
+    for source in [progressive, live] {
+        let mut seen = HashSet::new();
+        for (rank, mut result) in source.into_iter().take(limit).enumerate() {
+            let key = (result.doc_kind, result.project_id, result.id);
+            if !seen.insert(key) {
+                continue;
+            }
+            let rank = f64::from(u32::try_from(rank.saturating_add(1)).unwrap_or(u32::MAX));
+            let contribution = 1.0 / (crate::search_fusion::DEFAULT_RRF_K + rank);
+            result.score = Some(contribution);
+            fused
+                .entry(key)
+                .and_modify(|existing| {
+                    existing.score = Some(existing.score.unwrap_or(0.0) + contribution);
+                })
+                .or_insert(result);
+        }
+    }
+    let mut results = fused.into_values().collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        right
+            .score
+            .unwrap_or(0.0)
+            .total_cmp(&left.score.unwrap_or(0.0))
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.doc_kind.as_str().cmp(right.doc_kind.as_str()))
+            .then_with(|| left.project_id.cmp(&right.project_id))
+    });
+    results.truncate(limit);
+    results
 }
 
 #[cfg(feature = "hybrid")]
@@ -4511,14 +4638,7 @@ pub async fn execute_search(
         #[cfg(feature = "hybrid")]
         {
             let candidate_limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-            let mut raw_results = try_two_tier_search_with_cx(cx, query, candidate_limit)
-                .map_or_else(Vec::new, |outcome| outcome.results);
-
-            if raw_results.is_empty()
-                && let Some(bridge) = get_or_init_semantic_bridge()
-            {
-                raw_results = bridge.search(query, candidate_limit);
-            }
+            let mut raw_results = semantic_search_with_cx(cx, query, candidate_limit).results;
             raw_results =
                 match canonicalize_message_results(cx, pool, query, raw_results, false).await {
                     Outcome::Ok(results) => results,
@@ -4589,10 +4709,12 @@ pub async fn execute_search(
         let (semantic_results, two_tier_telemetry) = if plan.derivation.budget.semantic_limit == 0 {
             (Vec::new(), None)
         } else {
-            try_two_tier_search_with_cx(cx, &candidate_query, plan.derivation.budget.semantic_limit)
-                .map_or((Vec::new(), None), |outcome| {
-                    (outcome.results, Some(outcome.telemetry))
-                })
+            let outcome = semantic_search_with_cx(
+                cx,
+                &candidate_query,
+                plan.derivation.budget.semantic_limit,
+            );
+            (outcome.results, Some(outcome.telemetry))
         };
         #[cfg(not(feature = "hybrid"))]
         let semantic_results: Vec<SearchResult> = Vec::new();
@@ -8771,6 +8893,9 @@ mod tests {
     #[derive(Debug)]
     struct FixedSemanticTestEmbedder {
         info: ModelInfo,
+        ready: std::sync::atomic::AtomicBool,
+        model_changed: std::sync::atomic::AtomicBool,
+        output_dimension: std::sync::atomic::AtomicUsize,
     }
 
     #[cfg(feature = "hybrid")]
@@ -8785,6 +8910,9 @@ mod tests {
                     4096,
                 )
                 .with_available(true),
+                ready: std::sync::atomic::AtomicBool::new(true),
+                model_changed: std::sync::atomic::AtomicBool::new(false),
+                output_dimension: std::sync::atomic::AtomicUsize::new(dimension),
             }
         }
     }
@@ -8792,9 +8920,24 @@ mod tests {
     #[cfg(feature = "hybrid")]
     impl Embedder for FixedSemanticTestEmbedder {
         fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
+            if !self.is_ready() {
+                return HashEmbedder::new().embed(text);
+            }
+            let model_id = if self
+                .model_changed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                "another-model-same-dimension".to_string()
+            } else {
+                self.info.id.clone()
+            };
             Ok(EmbeddingResult::new(
-                vec![0.42_f32; self.info.dimension],
-                self.info.id.clone(),
+                vec![
+                    0.42_f32;
+                    self.output_dimension
+                        .load(std::sync::atomic::Ordering::Acquire)
+                ],
+                model_id,
                 ModelTier::Fast,
                 Duration::from_millis(1),
                 crate::search_canonical::content_hash(text),
@@ -8804,18 +8947,25 @@ mod tests {
         fn model_info(&self) -> &ModelInfo {
             &self.info
         }
+
+        fn is_ready(&self) -> bool {
+            self.ready.load(std::sync::atomic::Ordering::Acquire)
+        }
     }
 
     #[cfg(feature = "hybrid")]
     #[test]
     fn semantic_bridge_pipeline_runs_enqueue_process_and_index_search() {
-        let bridge = SemanticBridge::new_with_embedder(
-            VectorIndexConfig {
-                dimension: 4,
-                ..Default::default()
-            },
-            Arc::new(FixedSemanticTestEmbedder::new(4)),
-        );
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let bridge =
+            SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder.clone());
+        bridge.refresh_worker.shutdown();
+        if let Some(worker) = bridge.worker.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
 
         assert!(bridge.enqueue_document(
             7001,
@@ -8826,9 +8976,21 @@ mod tests {
         ));
         let before = bridge.queue_stats();
         assert_eq!(before.pending_count, 1);
+        assert!(!bridge.has_real_embedder());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.queue_stats().pending_count, 1);
+        assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
+        assert_eq!(bridge.index().config().dimension, 384);
 
+        let cache_epoch = global_search_cache().current_epoch();
+        embedder
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
         let processed = bridge.refresh_worker.run_cycle();
         assert_eq!(processed, 1);
+        assert!(global_search_cache().current_epoch() > cache_epoch);
+        assert_eq!(bridge.index().config().dimension, 4);
+        assert_eq!(bridge.index().bound_model_id(), Some("fixed-semantic-test"));
 
         let after = bridge.queue_stats();
         assert_eq!(after.pending_count, 0);
@@ -8847,6 +9009,377 @@ mod tests {
             hits.iter().any(|hit| hit.doc_id == 7001),
             "indexed document should be retrievable from vector index"
         );
+        let query = SearchQuery::messages("Bridge Body", 77);
+        assert_eq!(bridge.search(&query, 8)[0].id, 7001);
+        let thread_query = SearchQuery {
+            doc_kind: DocKind::Thread,
+            ..query.clone()
+        };
+        assert_eq!(bridge.search(&thread_query, 8)[0].id, 7001);
+        assert!(
+            bridge
+                .search(&SearchQuery::messages("Bridge Body", 78), 8)
+                .is_empty()
+        );
+
+        // Equal dimensions do not make a different model's vectors comparable.
+        embedder
+            .model_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(bridge.search(&query, 8).is_empty());
+        assert!(bridge.enqueue_document(7002, SearchDocKind::Message, Some(77), "new", "body"));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 1);
+        assert_eq!(bridge.metrics_snapshot().total_retryable, 1);
+        assert_eq!(bridge.index().len(), 1);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_bridge_rejects_unselected_model_before_first_index_write() {
+        for (wrong_model, dimension) in [(true, 4), (false, 3)] {
+            let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+            embedder
+                .model_changed
+                .store(wrong_model, std::sync::atomic::Ordering::Release);
+            embedder
+                .output_dimension
+                .store(dimension, std::sync::atomic::Ordering::Release);
+            let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
+            bridge.refresh_worker.shutdown();
+            if let Some(worker) = bridge.worker.lock().unwrap().take() {
+                worker.join().unwrap();
+            }
+            assert!(bridge.enqueue_document(7003, SearchDocKind::Message, Some(77), "new", "body"));
+            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+            assert_eq!(bridge.metrics_snapshot().total_succeeded, 0);
+            assert_eq!(bridge.metrics_snapshot().total_retryable, 1);
+            assert_eq!(bridge.index().bound_model_id(), None);
+            assert_eq!(bridge.index().config().dimension, 384);
+            assert!(bridge.index().is_empty());
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_candidates_fuse_both_sources_without_raw_score_comparison() {
+        let progressive = scored_results_to_search_results(vec![
+            make_scored(1, 1000.0),
+            make_scored(2, 900.0),
+            make_scored(2, 800.0),
+        ]);
+        let live = scored_results_to_search_results(vec![make_scored(2, 0.8), make_scored(3, 0.7)]);
+        let fused = fuse_semantic_candidates(progressive, live, 8);
+        assert_eq!(
+            fused.iter().map(|result| result.id).collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
+        assert!((fused[0].score.unwrap() - (1.0 / 61.0 + 1.0 / 62.0)).abs() < f64::EPSILON);
+        let tied = fuse_semantic_candidates(
+            scored_results_to_search_results(vec![make_scored(8, 1000.0)]),
+            scored_results_to_search_results(vec![make_scored(7, 0.1)]),
+            1,
+        );
+        assert_eq!(tied.len(), 1);
+        assert_eq!(tied[0].id, 7);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    #[ignore = "requires registered potion bytes; set AM_TEST_POTION_DIR and run explicitly"]
+    #[allow(clippy::too_many_lines)]
+    fn semantic_bridge_recovers_queued_documents_after_real_model_installation() {
+        use crate::search_model2vec::MODEL_POTION_128M;
+        use crate::search_vector_index::{IndexEntry, VectorMetadata};
+
+        const CHILD: &str = "AM_TEST_SEMANTIC_RECOVERY_CHILD";
+        const VERIFIED: &str =
+            "real late model completed queued jobs and scoped semantic/hybrid/auto search";
+        let model_source = PathBuf::from(
+            std::env::var("AM_TEST_POTION_DIR")
+                .expect("AM_TEST_POTION_DIR must name the registered potion model directory"),
+        );
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let broken = root.path().join("broken");
+            std::fs::create_dir(&broken).unwrap();
+            for file in ["tokenizer.json", "model.safetensors"] {
+                std::fs::write(broken.join(file), b"incomplete installation").unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "search_service::tests::semantic_bridge_recovers_queued_documents_after_real_model_installation",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("AM_TEST_POTION_DIR", model_source.canonicalize().unwrap())
+                .env("FRANKENSEARCH_MODEL_DIR", &broken)
+                .env_remove("FRANKENSEARCH_DATA_DIR")
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("AM_SEARCH_RERANK_ENABLED", "false")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "isolated real bridge recovery failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains(VERIFIED),
+                "child ran no recovery proof: {stdout}"
+            );
+            println!("{VERIFIED}");
+            return;
+        }
+
+        let context = get_two_tier_context();
+        assert_eq!(context.availability(), TwoTierAvailability::None);
+        let bridge = get_or_init_semantic_bridge().unwrap();
+        assert_eq!(bridge.index().config().dimension, 384);
+        assert_eq!(bridge.index().bound_model_id(), None);
+        assert!(!bridge.has_real_embedder());
+
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "late-model.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let (project_id, scope) = runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/late-model-visible")
+                .await.into_result().unwrap();
+            let foreign = crate::queries::ensure_project(&cx, &pool, "/late-model-foreign")
+                .await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let foreign_id = foreign.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let blocked = crate::queries::register_agent(
+                &cx, &pool, project_id, "RedStone", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let outsider = crate::queries::register_agent(
+                &cx, &pool, foreign_id, "GreenField", "codex", "test", None, None, None,
+            ).await.into_result().unwrap();
+            let scope = ScopeContext {
+                viewer: Some(ViewerIdentity { project_id, agent_id: sender.id.unwrap() }),
+                viewer_project_ids: vec![project_id],
+                sender_policies: vec![SenderPolicy {
+                    project_id,
+                    agent_id: blocked.id.unwrap(),
+                    policy: ContactPolicyKind::BlockAll,
+                }],
+                approved_contacts: Vec::new(),
+                recipient_map: Vec::new(),
+            };
+            let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            for (id, pid, sender_id, subject, body) in [
+                (7101, project_id, sender.id.unwrap(), "mailbox recovery", "repair the mail delivery service"),
+                (7102, project_id, blocked.id.unwrap(), "restricted sender", "privateblockedpayload"),
+                (7103, foreign_id, outsider.id.unwrap(), "foreign project", "privateforeignpayload"),
+            ] {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, ?, ?, ?, ?, 1000000)",
+                    &[Value::BigInt(id), Value::BigInt(pid), Value::BigInt(sender_id),
+                      Value::Text(subject.to_string()), Value::Text(body.to_string())],
+                ).unwrap();
+                assert!(enqueue_semantic_document(DocKind::Message, id, Some(pid), subject, body));
+            }
+            let query = SearchQuery::messages("mailbox recovery", project_id);
+            for engine in [SearchEngine::Lexical, SearchEngine::Hybrid, SearchEngine::Auto] {
+                let response = execute_search(&cx, &pool, &query, &SearchOptions {
+                    scope_ctx: Some(scope.clone()), search_engine: Some(engine), ..Default::default()
+                }).await.into_result().unwrap();
+                assert_eq!(response.results.len(), 1, "lexical fallback before model: {engine:?}");
+                assert_eq!(response.results[0].result.id, 7101);
+            }
+            // Cache an empty semantic response and lexical miss before promotion.
+            let semantic_query = SearchQuery::messages("restore communications", project_id);
+            for engine in [SearchEngine::Semantic, SearchEngine::Hybrid, SearchEngine::Auto] {
+                let response = execute_search(&cx, &pool, &semantic_query, &SearchOptions {
+                    scope_ctx: Some(scope.clone()), search_engine: Some(engine), ..Default::default()
+                }).await.into_result().unwrap();
+                assert!(response.results.is_empty());
+            }
+            (project_id, scope)
+        });
+        assert_eq!(bridge.queue_stats().pending_count, 3);
+        assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
+        assert_eq!(bridge.metrics_snapshot().total_failed, 0);
+        let cache_epoch = global_search_cache().current_epoch();
+
+        let installed = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
+            .join("mcp-agent-mail/models")
+            .join(MODEL_POTION_128M);
+        std::fs::create_dir_all(&installed).unwrap();
+        for file in ["tokenizer.json", "model.safetensors"] {
+            std::fs::copy(model_source.join(file), installed.join(file)).unwrap();
+        }
+        // The production worker, discovery cooldown, queue and runner all remain
+        // live. No global reset, model substitution or manual index insertion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while bridge.metrics_snapshot().total_succeeded < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live indexing did not recover: {:?}",
+                bridge.metrics_snapshot()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(Arc::ptr_eq(&bridge, &get_semantic_bridge().unwrap()));
+        assert!(std::ptr::eq(context, get_two_tier_context()));
+        assert!(bridge.has_real_embedder());
+        assert_eq!(bridge.queue_stats().pending_count, 0);
+        assert_eq!(bridge.queue_stats().retry_count, 0);
+        assert_eq!(bridge.metrics_snapshot().total_skipped, 0);
+        assert_eq!(bridge.metrics_snapshot().total_failed, 0);
+        assert!(global_search_cache().current_epoch() > cache_epoch);
+        let info = context.fast_info().unwrap();
+        assert_eq!(info.id, MODEL_POTION_128M);
+        assert_eq!(info.dimension, 256);
+        let embedding = bridge.embedder.embed("restore communications").unwrap();
+        assert!(!embedding.is_hash_only());
+        assert_eq!(embedding.model_id, info.id);
+        assert_eq!(embedding.dimension, info.dimension);
+        assert!(embedding.vector.iter().all(|value| value.is_finite()));
+        assert!(
+            (embedding
+                .vector
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                - 1.0)
+                .abs()
+                < 0.000_01
+        );
+        {
+            let mut index = bridge.index_mut();
+            assert_eq!(index.config().dimension, info.dimension);
+            assert_eq!(index.bound_model_id(), Some(info.id.as_str()));
+            assert_eq!(index.len(), 3);
+            for id in [7101, 7102, 7103] {
+                let entry = index.get(id, SearchDocKind::Message).unwrap();
+                assert_eq!(entry.metadata.model_id, info.id);
+                assert_eq!(entry.vector.len(), info.dimension);
+            }
+            assert!(
+                index
+                    .upsert(IndexEntry::new(
+                        &embedding.vector,
+                        VectorMetadata::new(7198, SearchDocKind::Message, "foreign-model")
+                    ))
+                    .is_err()
+            );
+            assert!(
+                index
+                    .upsert(IndexEntry::new(
+                        &[0.5; 384],
+                        VectorMetadata::new(7199, SearchDocKind::Message, &info.id)
+                    ))
+                    .is_err()
+            );
+            assert_eq!(index.len(), 3);
+        }
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let query = SearchQuery::messages("restore communications", project_id);
+            for engine in [
+                SearchEngine::Semantic,
+                SearchEngine::Hybrid,
+                SearchEngine::Auto,
+            ] {
+                let response = execute_search(
+                    &cx,
+                    &pool,
+                    &query,
+                    &SearchOptions {
+                        scope_ctx: Some(scope.clone()),
+                        search_engine: Some(engine),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert_eq!(
+                    response.results.len(),
+                    1,
+                    "real semantic candidates must serve {engine:?}"
+                );
+                assert_eq!(response.results[0].result.id, 7101);
+                assert_eq!(
+                    response.results[0].result.body,
+                    "repair the mail delivery service"
+                );
+                let wire = serde_json::to_string(&response).unwrap();
+                assert!(!wire.contains("privateblockedpayload"));
+                assert!(!wire.contains("privateforeignpayload"));
+            }
+            let lexical = execute_search(
+                &cx,
+                &pool,
+                &query,
+                &SearchOptions {
+                    search_engine: Some(SearchEngine::Lexical),
+                    ..Default::default()
+                },
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert!(
+                lexical.results.is_empty(),
+                "semantic proof must not be satisfied by lexical hits"
+            );
+
+            // Populate both real indexes: one shared document, one progressive
+            // only document and one newer live-job-only document. A non-empty
+            // progressive result set must not hide accepted live write jobs.
+            let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            for (id, subject, body) in [
+                (7104, "routing repair", "fix the message transport"),
+                (7105, "sender queue", "latest mailbox status"),
+            ] {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, ?, ?, ?, ?, 2000000)",
+                    &[Value::BigInt(id), Value::BigInt(project_id),
+                      Value::BigInt(scope.viewer.unwrap().agent_id),
+                      Value::Text(subject.to_string()), Value::Text(body.to_string())],
+                ).unwrap();
+            }
+            let progressive = get_or_init_two_tier_bridge().unwrap();
+            progressive.add_document(7101, DocKind::Message, Some(project_id),
+                "mailbox recovery repair the mail delivery service").unwrap();
+            progressive.add_document(7104, DocKind::Message, Some(project_id),
+                "routing repair fix the message transport").unwrap();
+            assert!(enqueue_semantic_document(DocKind::Message, 7105, Some(project_id),
+                "sender queue", "latest mailbox status"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while bridge.metrics_snapshot().total_succeeded < 4 {
+                assert!(std::time::Instant::now() < deadline, "new live job failed to complete");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(progressive.index().len(), 2);
+            for engine in [SearchEngine::Semantic, SearchEngine::Hybrid, SearchEngine::Auto] {
+                let response = execute_search(&cx, &pool, &query, &SearchOptions {
+                    scope_ctx: Some(scope.clone()), search_engine: Some(engine), ..Default::default()
+                }).await.into_result().unwrap();
+                let mut ids = response.results.iter().map(|row| row.result.id).collect::<Vec<_>>();
+                ids.sort_unstable();
+                assert_eq!(ids, [7101, 7104, 7105], "both real semantic indexes must contribute once: {engine:?}");
+                let wire = serde_json::to_string(&response).unwrap();
+                assert!(!wire.contains("privateblockedpayload"));
+                assert!(!wire.contains("privateforeignpayload"));
+            }
+        });
+        println!("{VERIFIED}");
     }
 
     #[cfg(feature = "hybrid")]
