@@ -1984,6 +1984,9 @@ pub async fn file_reservation_paths(
     // missed (e.g. due to a stale WAL read snapshot — Bug #86), convert
     // the ResourceBusy error into a structured conflict response instead
     // of propagating an opaque MCP error.
+    #[cfg(test)]
+    tests::after_reservation_precheck().await;
+
     let mut idempotent_replay = replayed_rows.is_some();
     let (granted_rows, conflicts) = if let Some(rows) = replayed_rows {
         // Conflict information is a fresh observation, while the grants are
@@ -3207,6 +3210,22 @@ mod tests {
     static RESERVATION_TEST_LOCK: Mutex<()> = Mutex::new(());
     static RESERVATION_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+    type ReservationInterleaving = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    thread_local! {
+        // Schedule a real competing transaction after the tool's snapshot and
+        // before its write transaction. No database result is substituted.
+        static AFTER_RESERVATION_PRECHECK: std::cell::RefCell<Option<ReservationInterleaving>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) async fn after_reservation_precheck() {
+        let action = AFTER_RESERVATION_PRECHECK.with_borrow_mut(Option::take);
+        if let Some(action) = action {
+            action.await;
+        }
+    }
+
     fn unique_suffix() -> u64 {
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3319,6 +3338,7 @@ mod tests {
                 ],
                 || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                    AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| *hook = None);
                     mcp_agent_mail_storage::wbq_flush();
                     mcp_agent_mail_storage::flush_async_commits();
                     let stats = mcp_agent_mail_storage::wbq_stats();
@@ -3433,6 +3453,88 @@ mod tests {
             .expect("reservation tool succeeds"),
         )
         .expect("reservation response JSON")
+    }
+
+    #[test]
+    fn reservation_key_records_empty_grants_after_database_conflict_race() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-key-race-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let caller = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let peer_id = peer.id.expect("peer id");
+                let config = Config::get();
+                let peer_pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                    database_url: config.database_url.clone(),
+                    storage_root: Some(config.storage_root.clone()),
+                    run_migrations: false,
+                    ..Default::default()
+                })
+                .expect("independent peer connections to the same real database");
+                let peer_cx = cx.clone();
+                AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
+                    *hook = Some(Box::pin(async move {
+                        create_test_reservation(
+                            &peer_cx,
+                            &peer_pool,
+                            project_id,
+                            peer_id,
+                            "src/raced.rs",
+                            3600,
+                            true,
+                        )
+                        .await;
+                    }));
+                });
+                let ctx = McpContext::new(cx.clone(), 1);
+                let paths = ["src/raced.rs"];
+                let first = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("conflict-race"),
+                )
+                .await;
+                assert_eq!(first["granted"], json!([]));
+                assert_eq!(first["conflicts"][0]["holders"][0]["agent"], peer.name);
+                assert!(AFTER_RESERVATION_PRECHECK.with_borrow(|hook| hook.is_none()));
+
+                release_file_reservations(&ctx, project_key.clone(), peer.name, None, None)
+                    .await
+                    .expect("release the racing peer's lease");
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("active rows after peer release");
+                assert!(active.is_empty());
+                let replay = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &caller.name,
+                    &paths,
+                    Some("conflict-race"),
+                )
+                .await;
+                assert_eq!(
+                    replay["granted"], first["granted"],
+                    "retry must not acquire the newly freed path: {replay}"
+                );
+                assert_eq!(replay["idempotent_replay"], true);
+                assert_eq!(replay["conflicts"], json!([]));
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("active rows after retry");
+                assert!(
+                    active.is_empty(),
+                    "retry must leave the database unmodified"
+                );
+            });
+        });
     }
 
     #[test]
