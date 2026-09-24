@@ -215,6 +215,12 @@
       "status": "warn"
     },
     {
+      "category": "live_incident",
+      "check": "server_descriptors",
+      "detail": "<SERVER_DESCRIPTORS_SUMMARY>",
+      "status": "warn"
+    },
+    {
       "category": "environment",
       "check": "timestamp_format",
       "detail": "Skipped timestamp format probe: read-only doctor check avoids WAL-capable DB opens",
@@ -259,8 +265,8 @@
     "finding_counts": {
       "critical": 0,
       "info": 0,
-      "total": 17,
-      "warning": 17
+      "total": 18,
+      "warning": 18
     },
     "generated_at": "<GENERATED_AT>",
     "headline": "All doctor checks passed.",
@@ -317,7 +323,7 @@
     "category_breakdown": {
       "archive_hygiene_findings": 4,
       "environment_findings": 7,
-      "live_incident_findings": 6
+      "live_incident_findings": 7
     },
     "database_fix_strategy": null,
     "overall_status": "warn",
@@ -329,6 +335,6 @@
       "status": "warn"
     },
     "secondary_fail_count": 0,
-    "secondary_warning_count": 16
+    "secondary_warning_count": 17
   }
 }

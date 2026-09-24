@@ -402,6 +402,15 @@ fn build_detector_list() -> Vec<Detector> {
             false,
         ),
         det(
+            "server_descriptors",
+            "runtime_processes",
+            "P1",
+            "Listener descriptor headroom: open descriptors vs soft RLIMIT_NOFILE, and a low soft limit",
+            10,
+            false,
+            true,
+        ),
+        det(
             "server_http_health",
             "runtime_processes",
             "P1",

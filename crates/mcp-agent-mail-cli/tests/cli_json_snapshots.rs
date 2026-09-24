@@ -241,6 +241,12 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                                 Value::String("<SERVER_PROCESS_CPU_SUMMARY>".to_string()),
                             );
                         }
+                        "server_descriptors" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<SERVER_DESCRIPTORS_SUMMARY>".to_string()),
+                            );
+                        }
                         "db_file_sanity"
                             if out.get("detail").and_then(Value::as_str).is_some_and(
                                 |detail| {

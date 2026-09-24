@@ -1342,7 +1342,22 @@ pub fn is_writer_held_elsewhere(error: &str) -> bool {
     error.contains(WRITER_HELD_ELSEWHERE)
 }
 
-fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWriter, String> {
+/// What to do when another process holds the index writer lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterBusyPolicy {
+    /// Back off and retry: the holder is usually a short-lived peer.
+    Retry,
+    /// Report [`WRITER_HELD_ELSEWHERE`] at once. For the CLI's best-effort
+    /// live refresh the holder is normally the running server, which keeps
+    /// the writer for its whole lifetime, so retrying only added 1.55 s of
+    /// sleep to every `am robot search` (br-kp1in.18).
+    FailFast,
+}
+
+fn acquire_writer_with_retry(
+    index: &tantivy::Index,
+    busy: WriterBusyPolicy,
+) -> Result<tantivy::IndexWriter, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
     loop {
@@ -1351,16 +1366,17 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
         {
             Ok(writer) => return Ok(writer),
             Err(e) => {
+                let lock_busy = matches!(
+                    e,
+                    tantivy::TantivyError::LockFailure(
+                        tantivy::directory::error::LockError::LockBusy,
+                        _
+                    )
+                );
+                if lock_busy && (retries == 0 || busy == WriterBusyPolicy::FailFast) {
+                    return Err(format!("{WRITER_HELD_ELSEWHERE}: {e}"));
+                }
                 if retries == 0 {
-                    if matches!(
-                        e,
-                        tantivy::TantivyError::LockFailure(
-                            tantivy::directory::error::LockError::LockBusy,
-                            _
-                        )
-                    ) {
-                        return Err(format!("{WRITER_HELD_ELSEWHERE}: {e}"));
-                    }
                     return Err(format!("Tantivy writer error (after retries): {e}"));
                 }
                 retries -= 1;
@@ -1375,6 +1391,14 @@ fn with_tantivy_writer<T>(
     bridge: &TantivyBridge,
     operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
 ) -> Result<T, String> {
+    with_tantivy_writer_policy(bridge, WriterBusyPolicy::Retry, operation)
+}
+
+fn with_tantivy_writer_policy<T>(
+    bridge: &TantivyBridge,
+    busy: WriterBusyPolicy,
+    operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
+) -> Result<T, String> {
     let mut slot = match bridge.writer.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -1386,7 +1410,7 @@ fn with_tantivy_writer<T>(
         }
     };
     if slot.is_none() {
-        *slot = Some(acquire_writer_with_retry(bridge.index())?);
+        *slot = Some(acquire_writer_with_retry(bridge.index(), busy)?);
     }
     let writer = slot
         .as_mut()
@@ -1555,7 +1579,13 @@ pub(crate) fn backfill_read_only_live(db_url: &str, index_dir: &Path) -> Result<
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     with_backfill_source_retry(|| {
-        backfill_into_bridge_locked_with_opener(&bridge, db_url, None, open_read_only_backfill_conn)
+        backfill_into_bridge_locked_with_opener(
+            &bridge,
+            db_url,
+            None,
+            open_read_only_backfill_conn,
+            WriterBusyPolicy::FailFast,
+        )
     })?;
     Ok(())
 }
@@ -1623,7 +1653,13 @@ fn backfill_into_bridge_locked(
     db_url: &str,
     identity_path: Option<&str>,
 ) -> Result<(usize, usize), String> {
-    backfill_into_bridge_locked_with_opener(bridge, db_url, identity_path, open_backfill_conn)
+    backfill_into_bridge_locked_with_opener(
+        bridge,
+        db_url,
+        identity_path,
+        open_backfill_conn,
+        WriterBusyPolicy::Retry,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1632,6 +1668,7 @@ fn backfill_into_bridge_locked_with_opener(
     db_url: &str,
     identity_path: Option<&str>,
     open_connection: fn(&str) -> Result<crate::DbConnGuard, String>,
+    writer_busy: WriterBusyPolicy,
 ) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
 
@@ -1667,7 +1704,7 @@ fn backfill_into_bridge_locked_with_opener(
         }
         let index_stats = fetch_index_message_stats(bridge)?;
         if index_stats.count > 0 {
-            with_tantivy_writer(bridge, |writer| {
+            with_tantivy_writer_policy(bridge, writer_busy, |writer| {
                 writer
                     .delete_all_documents()
                     .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
@@ -1848,7 +1885,7 @@ fn backfill_into_bridge_locked_with_opener(
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
     let scan_start_after = last_id;
-    let total_indexed = with_tantivy_writer(bridge, |writer| {
+    let total_indexed = with_tantivy_writer_policy(bridge, writer_busy, |writer| {
         if matches!(plan, BackfillPlan::FullRebuild) {
             writer
                 .delete_all_documents()
@@ -2770,6 +2807,45 @@ mod tests {
     fn index_messages_batch_empty_returns_zero() {
         let result = index_messages_batch(":memory:", &[]);
         assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn busy_writer_fails_fast_only_under_the_fail_fast_policy() {
+        // br-kp1in.18: the CLI's live refresh used to sleep through five
+        // backoffs (1.55 s) for a writer the running server never releases.
+        let dir = tempfile::tempdir().expect("index dir");
+        let holder = TantivyBridge::open_scoped(dir.path(), false).expect("holder index");
+        let contender = TantivyBridge::open_scoped(dir.path(), false).expect("contender index");
+        let held = acquire_writer_with_retry(holder.index(), WriterBusyPolicy::Retry)
+            .expect("holder takes the writer");
+
+        let started = std::time::Instant::now();
+        let Err(error) = acquire_writer_with_retry(contender.index(), WriterBusyPolicy::FailFast)
+        else {
+            panic!("the writer is held, fail-fast must not acquire it");
+        };
+        assert!(is_writer_held_elsewhere(&error), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fail-fast must not back off: {:?}",
+            started.elapsed()
+        );
+
+        let started = std::time::Instant::now();
+        let Err(error) = acquire_writer_with_retry(contender.index(), WriterBusyPolicy::Retry)
+        else {
+            panic!("the writer is still held, retry must not acquire it");
+        };
+        assert!(is_writer_held_elsewhere(&error), "{error}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1_500),
+            "the retry policy keeps its backoff for short-lived holders: {:?}",
+            started.elapsed()
+        );
+
+        drop(held);
+        acquire_writer_with_retry(contender.index(), WriterBusyPolicy::FailFast)
+            .expect("a released writer is acquired under fail-fast too");
     }
 
     #[test]

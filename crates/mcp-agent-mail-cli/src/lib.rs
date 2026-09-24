@@ -16170,8 +16170,13 @@ fn resolve_canonical_snapshot_source_path(
     storage_root_is_explicit: bool,
     context: &str,
 ) -> CliResult<CanonicalSnapshotSource> {
-    let archive = collect_doctor_archive_inventory(storage_root);
-    let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
+    // br-kp1in.18: every CLI canonical read (robot search, ...) passes here.
+    // The full inventory opens and parses every archive message file, so
+    // judge first from the filename-only probe; parse only when the probe
+    // cannot prove the live DB covers the archive (10k messages: 10,012
+    // file opens per `am robot search` before this).
+    let probe = collect_doctor_archive_cheap_probe(storage_root);
+    let archive_has_state = probe.counts != DoctorInventoryCounts::default();
     let candidate_display = source_candidate.display().to_string();
     let candidate_path = PathBuf::from(source_candidate);
     let archive_authoritative_for_path = doctor_archive_is_authoritative_for_sqlite_path(
@@ -16209,16 +16214,19 @@ fn resolve_canonical_snapshot_source_path(
 
             match db_inventory {
                 Ok(db_inventory) => {
-                    if archive_has_state
+                    let archive = (archive_has_state
+                        && !doctor_db_covers_archive_cheap_probe(&probe, &db_inventory))
+                    .then(|| collect_doctor_archive_inventory(storage_root));
+                    if let Some(archive) = archive.as_ref()
+                        && archive.counts() != DoctorInventoryCounts::default()
                         && doctor_archive_is_authoritative_for_db(
-                            &archive,
+                            archive,
                             &db_inventory,
                             &opened_path,
                             storage_root,
                             storage_root_is_explicit,
                         )
-                        && let Some(detail) =
-                            doctor_archive_db_drift_detail(&archive, &db_inventory)
+                        && let Some(detail) = doctor_archive_db_drift_detail(archive, &db_inventory)
                     {
                         tracing::warn!(
                             operation = context,
@@ -29327,6 +29335,7 @@ struct DoctorServerFixDiagnostics {
     http_check: DoctorFixCheck,
     rpc_check: DoctorFixCheck,
     process_check: DoctorFixCheck,
+    descriptor_check: DoctorFixCheck,
     restart_recommended: bool,
 }
 
@@ -29347,6 +29356,7 @@ const DOCTOR_PRIMARY_CHECK_PRIORITY: &[&str] = &[
     "archive_db_parity",
     "foreign_key_integrity",
     "server_port",
+    "server_descriptors",
     "server_process_cpu",
     "server_http_health",
     "server_jsonrpc_health",
@@ -29361,6 +29371,7 @@ const DOCTOR_DATABASE_INCIDENT_CHECKS: &[&str] = &[
 ];
 const DOCTOR_SERVER_INCIDENT_CHECKS: &[&str] = &[
     "server_port",
+    "server_descriptors",
     "server_process_cpu",
     "server_http_health",
     "server_jsonrpc_health",
@@ -30060,6 +30071,122 @@ fn collect_doctor_server_runtime_diagnostics(config: &Config) -> DoctorServerRun
     }
 }
 
+/// br-kp1in.17: soft `RLIMIT_NOFILE` below which a long-lived server is
+/// expected to run out of descriptors under ordinary multi-agent load (the
+/// systemd default of 1,024 hit EMFILE in under 60 s on 2026-09-23).
+const DOCTOR_SERVER_NOFILE_SOFT_FLOOR: u64 = 8_192;
+
+/// One listener's descriptor usage, read from `/proc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorDescriptorSample {
+    pid: u32,
+    /// Soft `RLIMIT_NOFILE`; `None` when unlimited.
+    soft_limit: Option<u64>,
+    open: usize,
+}
+
+/// Soft "Max open files" limit from `/proc/<pid>/limits` text:
+/// `Some(None)` = unlimited, `None` = no parseable row.
+fn parse_proc_limits_nofile_soft(limits: &str) -> Option<Option<u64>> {
+    let row = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))?;
+    match row.split_whitespace().next()? {
+        "unlimited" => Some(None),
+        soft => soft.parse().ok().map(Some),
+    }
+}
+
+fn sample_listener_descriptors(pid: u32) -> Result<DoctorDescriptorSample, String> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits"))
+        .map_err(|error| format!("pid {pid}: cannot read its limits: {error}"))?;
+    let soft_limit = parse_proc_limits_nofile_soft(&limits)
+        .ok_or_else(|| format!("pid {pid}: no parseable 'Max open files' limit"))?;
+    let open = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map_err(|error| format!("pid {pid}: cannot list its descriptors: {error}"))?
+        .count();
+    Ok(DoctorDescriptorSample {
+        pid,
+        soft_limit,
+        open,
+    })
+}
+
+/// Grade descriptor headroom across the listener samples; the worst wins.
+fn doctor_descriptor_check(samples: &[Result<DoctorDescriptorSample, String>]) -> DoctorFixCheck {
+    const RANK: [&str; 3] = ["ok", "warn", "fail"];
+    let mut worst = 0;
+    let mut details = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let (rank, detail) = match sample {
+            Err(error) => (1, format!("could not sample descriptors ({error})")),
+            Ok(DoctorDescriptorSample {
+                pid,
+                soft_limit: None,
+                open,
+            }) => (0, format!("pid {pid}: {open} open, no soft limit")),
+            Ok(DoctorDescriptorSample {
+                pid,
+                soft_limit: Some(soft),
+                open,
+            }) => {
+                let open = u64::try_from(*open).unwrap_or(u64::MAX);
+                let percent = open.saturating_mul(100) / (*soft).max(1);
+                let usage = format!("pid {pid}: {open} of {soft} descriptors open ({percent}%)");
+                if percent >= 90 {
+                    (
+                        2,
+                        format!(
+                            "{usage}; exhaustion is imminent (RESOURCE_BUSY/EMFILE next): restart the server through its supervisor and upgrade to a build with the descriptor-leak fix"
+                        ),
+                    )
+                } else if percent >= 70 {
+                    (
+                        1,
+                        format!("{usage}; headroom is low, plan a supervised restart"),
+                    )
+                } else if *soft < DOCTOR_SERVER_NOFILE_SOFT_FLOOR {
+                    (
+                        1,
+                        format!(
+                            "{usage}; soft limit is below {DOCTOR_SERVER_NOFILE_SOFT_FLOOR}: set LimitNOFILE=65536 (`am service install` renders it) or run a build that raises it at startup"
+                        ),
+                    )
+                } else {
+                    (0, usage)
+                }
+            }
+        };
+        worst = worst.max(rank);
+        details.push(detail);
+    }
+    DoctorFixCheck {
+        status: RANK[worst],
+        detail: details.join("; "),
+    }
+}
+
+fn doctor_server_descriptor_check(listener_pids: &[u32]) -> DoctorFixCheck {
+    if !cfg!(target_os = "linux") {
+        return DoctorFixCheck {
+            status: "ok",
+            detail: "Descriptor headroom check skipped: it reads /proc, which this platform lacks"
+                .to_string(),
+        };
+    }
+    if listener_pids.is_empty() {
+        return DoctorFixCheck {
+            status: "warn",
+            detail: "No listener PID available to sample descriptor headroom".to_string(),
+        };
+    }
+    let samples: Vec<_> = listener_pids
+        .iter()
+        .map(|pid| sample_listener_descriptors(*pid))
+        .collect();
+    doctor_descriptor_check(&samples)
+}
+
 fn doctor_server_diagnostics(config: &Config) -> DoctorServerFixDiagnostics {
     let runtime = collect_doctor_server_runtime_diagnostics(config);
     let restart_recommended = runtime.restart_recommended();
@@ -30159,6 +30286,7 @@ fn doctor_server_diagnostics(config: &Config) -> DoctorServerFixDiagnostics {
             detail: runtime.jsonrpc_health.detail().to_string(),
         },
         process_check,
+        descriptor_check: doctor_server_descriptor_check(&runtime.listener_pids),
         restart_recommended,
     }
 }
@@ -30799,6 +30927,28 @@ impl DoctorArchiveCheapProbe {
         };
         self.ambiguous |= other.ambiguous;
     }
+}
+
+/// True when a populated DB is provably at least as complete as the archive on
+/// every drift-classifier signal, judged from the cheap probe alone: counts
+/// (the probe counts message FILES, an upper bound on the deduplicated logical
+/// count), the highest canonical message id, and per-project identities. Then
+/// `doctor_archive_db_drift_detail` cannot report a lag and the full,
+/// per-message-parsing inventory is unnecessary. An ambiguous probe proves
+/// nothing.
+fn doctor_db_covers_archive_cheap_probe(
+    probe: &DoctorArchiveCheapProbe,
+    db: &DoctorDbInventory,
+) -> bool {
+    db.counts.messages > 0
+        && !probe.ambiguous
+        && db.counts.projects >= probe.counts.projects
+        && db.counts.agents >= probe.counts.agents
+        && db.counts.messages >= probe.counts.messages
+        && db.max_message_id >= probe.latest_message_id.unwrap_or(0)
+        && probe.project_identities.iter().all(|archive_identity| {
+            doctor_archive_identity_matches_db(archive_identity, &db.project_identities)
+        })
 }
 
 /// Collect the cheap archive probe across every project directory.
@@ -35050,6 +35200,12 @@ fn handle_doctor_check_with_target(
             "check": "server_process_cpu",
             "status": server_diagnostics.process_check.status,
             "detail": server_diagnostics.process_check.detail,
+        }));
+
+        checks.push(serde_json::json!({
+            "check": "server_descriptors",
+            "status": server_diagnostics.descriptor_check.status,
+            "detail": server_diagnostics.descriptor_check.detail,
         }));
         server_diagnostics
     };
@@ -57702,6 +57858,73 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn parse_proc_limits_nofile_soft_reads_the_soft_column() {
+        let limits = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max cpu time              unlimited            unlimited            seconds   \n\
+                      Max open files            1024                 1048576              files     \n";
+        assert_eq!(parse_proc_limits_nofile_soft(limits), Some(Some(1024)));
+        assert_eq!(
+            parse_proc_limits_nofile_soft("Max open files  unlimited  unlimited  files\n"),
+            Some(None)
+        );
+        assert_eq!(
+            parse_proc_limits_nofile_soft("Max processes  10  10  processes\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn doctor_descriptor_check_grades_headroom_and_low_limits() {
+        // br-kp1in.17.
+        let s = |pid, soft_limit, open| {
+            Ok(DoctorDescriptorSample {
+                pid,
+                soft_limit,
+                open,
+            })
+        };
+        // The live host on 2026-09-23 (13,886 of 32,768) has headroom now.
+        assert_eq!(
+            doctor_descriptor_check(&[s(1, Some(32_768), 13_886)]).status,
+            "ok"
+        );
+        let fail = doctor_descriptor_check(&[s(2, Some(1_024), 950)]);
+        assert_eq!(fail.status, "fail");
+        assert!(
+            fail.detail.contains("950 of 1024") && fail.detail.contains("imminent"),
+            "{}",
+            fail.detail
+        );
+        assert_eq!(
+            doctor_descriptor_check(&[s(3, Some(32_768), 25_000)]).status,
+            "warn"
+        );
+        // A low soft limit warns even while nearly idle.
+        let low = doctor_descriptor_check(&[s(4, Some(1_024), 40)]);
+        assert_eq!(low.status, "warn");
+        assert!(low.detail.contains("below 8192"), "{}", low.detail);
+        assert_eq!(doctor_descriptor_check(&[s(5, None, 10)]).status, "ok");
+        assert_eq!(
+            doctor_descriptor_check(&[Err("pid 6: gone".to_string())]).status,
+            "warn"
+        );
+        // The worst listener decides.
+        assert_eq!(
+            doctor_descriptor_check(&[s(7, Some(65_536), 10), s(8, Some(1_024), 1_000)]).status,
+            "fail"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sample_listener_descriptors_reads_a_live_process_and_refuses_a_missing_one() {
+        let sample = sample_listener_descriptors(std::process::id()).expect("sample own /proc");
+        assert!(sample.open > 0, "{sample:?}");
+        assert!(sample.soft_limit.is_none_or(|soft| soft > 0), "{sample:?}");
+        assert!(sample_listener_descriptors(u32::MAX).is_err());
+    }
+
+    #[test]
     fn doctor_server_fix_summary_includes_jsonrpc_probe_detail() {
         let diagnostics = DoctorServerFixDiagnostics {
             port_status: mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer,
@@ -57720,6 +57943,10 @@ startup_timeout_sec = 42
             process_check: DoctorFixCheck {
                 status: "warn",
                 detail: "cpu high".to_string(),
+            },
+            descriptor_check: DoctorFixCheck {
+                status: "ok",
+                detail: "descriptors ok".to_string(),
             },
             restart_recommended: true,
         };
@@ -62800,6 +63027,74 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn db_covers_archive_cheap_probe_only_when_every_signal_agrees() {
+        // br-kp1in.18: the canonical-read resolver and the robot lag gate skip
+        // the per-message archive parse only on this predicate.
+        let identity = DoctorProjectIdentity {
+            slug: Some("demo".to_string()),
+            human_key: Some("/tmp/demo".to_string()),
+        };
+        let probe = DoctorArchiveCheapProbe {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 2,
+                messages: 10,
+            },
+            latest_message_id: Some(10),
+            project_identities: std::collections::BTreeSet::from([identity.clone()]),
+            ambiguous: false,
+        };
+        let db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 1,
+                agents: 2,
+                messages: 12,
+            },
+            max_message_id: 12,
+            project_identities: std::collections::BTreeSet::from([identity]),
+        };
+        assert!(doctor_db_covers_archive_cheap_probe(&probe, &db));
+
+        let ambiguous = DoctorArchiveCheapProbe {
+            ambiguous: true,
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(&ambiguous, &db));
+        let newer_archive_id = DoctorArchiveCheapProbe {
+            latest_message_id: Some(13),
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(
+            &newer_archive_id,
+            &db
+        ));
+        let more_archive_files = DoctorArchiveCheapProbe {
+            counts: DoctorInventoryCounts {
+                messages: 13,
+                ..probe.counts.clone()
+            },
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(
+            &more_archive_files,
+            &db
+        ));
+        let foreign_project = DoctorArchiveCheapProbe {
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("other".to_string()),
+                human_key: Some("/tmp/other".to_string()),
+            }]),
+            ..probe.clone()
+        };
+        assert!(!doctor_db_covers_archive_cheap_probe(&foreign_project, &db));
+        let empty_db = DoctorDbInventory::default();
+        assert!(!doctor_db_covers_archive_cheap_probe(
+            &DoctorArchiveCheapProbe::default(),
+            &empty_db
+        ));
+    }
+
+    #[test]
     fn collect_doctor_archive_cheap_probe_flags_unparsable_canonical_filename_as_ambiguous() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("projects").join("demo-project");
@@ -64564,6 +64859,10 @@ startup_timeout_sec = 42
             process_check: DoctorFixCheck {
                 status: "warn",
                 detail: "No listener PID sample available for 127.0.0.1:8765".to_string(),
+            },
+            descriptor_check: DoctorFixCheck {
+                status: "warn",
+                detail: "No listener PID available to sample descriptor headroom".to_string(),
             },
             restart_recommended: false,
         };
@@ -73671,6 +73970,7 @@ startup_timeout_sec = 42
                 "server_http_health",
                 "server_jsonrpc_health",
                 "server_process_cpu",
+                "server_descriptors",
             ] {
                 assert!(
                     checks.iter().any(|c| c["check"].as_str() == Some(check)),

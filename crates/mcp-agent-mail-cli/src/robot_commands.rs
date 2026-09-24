@@ -3623,23 +3623,7 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
 
     match crate::collect_doctor_db_inventory(&local.conn) {
         Ok(db) => {
-            if db.counts.messages > 0
-                && !probe.ambiguous
-                && db.counts.projects >= probe.counts.projects
-                && db.counts.agents >= probe.counts.agents
-                && db.counts.messages >= probe.counts.messages
-                && db.max_message_id >= probe.latest_message_id.unwrap_or(0)
-                && probe.project_identities.iter().all(|archive_identity| {
-                    crate::doctor_archive_identity_matches_db(
-                        archive_identity,
-                        &db.project_identities,
-                    )
-                })
-            {
-                // The populated local DB is at least as complete as the
-                // archive on every drift-classifier signal (`counts.messages`
-                // counts files, an upper bound on the archive's deduplicated
-                // logical count; max ids and identities match exactly).
+            if crate::doctor_db_covers_archive_cheap_probe(&probe, &db) {
                 // Skip the expensive per-message parse.
                 return Ok(local);
             }
@@ -15701,6 +15685,37 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let process_owner_degraded =
                 !process_owner_divergences.is_empty() || process_owner_respawn.is_some();
 
+            // br-kp1in.17: descriptor headroom of the live mailbox owner(s),
+            // graded like `am doctor check`'s server_descriptors. Descriptor
+            // exhaustion is what took v0.3.36 servers down.
+            // This CLI holds the mailbox while it runs; sample only the others.
+            let self_pid = std::process::id();
+            let owner_pids: Vec<u32> = process_owner
+                .actual_owner_pids()
+                .into_iter()
+                .filter(|pid| *pid != self_pid)
+                .collect();
+            let descriptors = (!owner_pids.is_empty())
+                .then(|| crate::doctor_server_descriptor_check(&owner_pids));
+            let descriptors_status = descriptors.as_ref().map(|check| check.status);
+            let descriptors_unhealthy = descriptors_status == Some("fail");
+            let descriptors_degraded = descriptors_status == Some("warn");
+            probes.push(HealthProbe {
+                name: "server_descriptors".into(),
+                status: match descriptors_status {
+                    None => "skip",
+                    Some("fail") => "fail",
+                    Some("warn") => "degraded",
+                    Some(_) => "ok",
+                }
+                .into(),
+                latency_ms: 0.0,
+                detail: descriptors.map_or_else(
+                    || "no live mailbox owner process to sample".to_string(),
+                    |check| check.detail,
+                ),
+            });
+
             // Overall health
             let overall = if !db_ok
                 || db_file_sanity_unhealthy
@@ -15708,6 +15723,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || archive_db_parity_unhealthy
                 || search_index_unhealthy
                 || backpressure_unhealthy
+                || descriptors_unhealthy
             {
                 "unhealthy"
             } else if db_file_sanity_degraded
@@ -15720,6 +15736,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || disk.pressure != mcp_agent_mail_core::disk::DiskPressure::Ok
                 || tui_liveness_stalled
                 || process_owner_degraded
+                || descriptors_degraded
             {
                 "degraded"
             } else {
