@@ -327,6 +327,7 @@ fn assert_exact_replay(fresh: &Value, replay: &str) {
     assert_eq!(&replay, fresh);
 }
 
+#[allow(clippy::too_many_lines)]
 async fn attachment_replay_case(cx: Cx, storage_root: String, is_reply: bool) {
     let ctx = McpContext::new(cx, 1);
     let project_key = format!("{storage_root}/workspace");

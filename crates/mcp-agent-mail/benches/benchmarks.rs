@@ -89,15 +89,14 @@ fn seed_fixtures(fixtures: &Fixtures) {
 
                 // New fastmcp API: the request budget rides the ambient Cx
                 // inside McpContext (Budget::INFINITE here).
-                let _ = router
-                    .handle_tools_call(
-                        &McpContext::new(cx.clone(), req_id),
-                        params,
-                        SessionState::new(),
-                        None,
-                        None,
-                    )
-                    .expect("tool call should succeed during seeding");
+                let _ = block_on(router.handle_tools_call(
+                    &McpContext::new(cx.clone(), req_id),
+                    params,
+                    SessionState::new(),
+                    None,
+                    None,
+                ))
+                .expect("tool call should succeed during seeding");
                 req_id += 1;
             }
         }
@@ -176,15 +175,14 @@ fn bench_tools(c: &mut Criterion) {
             |b, params| {
                 let mut req_id: u64 = 1;
                 b.iter(|| {
-                    let out = router
-                        .handle_tools_call(
-                            &McpContext::new(cx.clone(), req_id),
-                            params.clone(),
-                            SessionState::new(),
-                            None,
-                            None,
-                        )
-                        .expect("tool call");
+                    let out = block_on(router.handle_tools_call(
+                        &McpContext::new(cx.clone(), req_id),
+                        params.clone(),
+                        SessionState::new(),
+                        None,
+                        None,
+                    ))
+                    .expect("tool call");
                     req_id = req_id.wrapping_add(1);
                     black_box(out);
                 });

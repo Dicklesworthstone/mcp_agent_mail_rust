@@ -559,7 +559,17 @@ fn probe_release_guard(root: &Path, blocked: bool) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn reservation_release_background_repair_survives_reopen_without_client_reads() {
+    use asupersync::{Cx, Outcome};
+    use fastmcp_core::block_on;
+    use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
+    use mcp_agent_mail_db::{DbPoolConfig, create_pool, micros_to_iso, now_micros};
+    use mcp_agent_mail_storage::recovery::reservation_reconcile::{
+        ReservationReconcileCursor, reconcile_reservation_releases,
+    };
+    use std::sync::atomic::AtomicBool;
+
     // Isolate the actual global archive queue and mutation fence used by the
     // failed release writer; no other test may flush this fixture's Git work.
     if std::env::var("AM_RELEASE_REOPEN_TEST_CHILD").as_deref() != Ok("1") {
@@ -579,14 +589,6 @@ fn reservation_release_background_repair_survives_reopen_without_client_reads() 
         );
         return;
     }
-    use asupersync::{Cx, Outcome};
-    use fastmcp_core::block_on;
-    use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
-    use mcp_agent_mail_db::{DbPoolConfig, create_pool, micros_to_iso, now_micros};
-    use mcp_agent_mail_storage::recovery::reservation_reconcile::{
-        ReservationReconcileCursor, reconcile_reservation_releases,
-    };
-    use std::sync::atomic::AtomicBool;
 
     mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
         let temp = tempfile::tempdir().unwrap();

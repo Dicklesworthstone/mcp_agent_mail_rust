@@ -389,7 +389,7 @@ fn current_cursor_boundary(
         (Occur::Must, Box::new(identity_query)),
         (Occur::Must, query.box_clone()),
     ]);
-    let addresses = searcher.search(&boundary_query, &TopDocs::with_limit(1))?;
+    let addresses = searcher.search(&boundary_query, &TopDocs::with_limit(1).order_by_score())?;
     let Some((_, address)) = addresses.first() else {
         return Ok((cursor.score, cursor.id));
     };

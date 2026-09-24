@@ -12879,9 +12879,20 @@ to skip auth for local requests.</p>
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
-            // self_ref not set or HttpState already dropped — fall back to inline sync.
+            // self_ref not set or HttpState already dropped — fall back to a
+            // synchronous dispatch. Run it on a scoped worker thread, as the
+            // normal path runs it on a dispatch thread: the router handlers
+            // are async and `dispatch_inner_with_cx` drives them with
+            // `fastmcp_core::block_on`, which refuses to nest inside a bridge
+            // that may already be polling this future.
             let id = request.id.clone();
-            return match self.dispatch_inner(request) {
+            let outcome = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.dispatch_inner(request))
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            });
+            return match outcome {
                 Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
                 Err(err) => {
                     id.map(|req_id| JsonRpcResponse::error(Some(req_id), JsonRpcError::from(err)))
@@ -13075,14 +13086,16 @@ to skip auth for local requests.</p>
                 // Request id and budget now travel inside `request_ctx`; the
                 // trailing options are the notification sender and the
                 // BidirectionalSenders handle, neither of which this custom
-                // dispatch layer drives.
-                let result = self.router.handle_tools_call(
+                // dispatch layer drives. FastMCP 03b52745 made the router
+                // handlers async (it no longer blocks inside the library);
+                // drive them here exactly as its former sync wrappers did.
+                let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
                     SessionState::new(),
                     None,
                     None,
-                );
+                ));
                 dispatch_checkpoint(cx, cancel)?;
 
                 let (queries, query_time_ms, per_table_sorted) =
@@ -13240,13 +13253,13 @@ to skip auth for local requests.</p>
                 // Extract format from resource URI query params (TOON support)
                 let format_value = extract_format_from_uri(&params.uri);
                 dispatch_checkpoint(cx, cancel)?;
-                let out = self.router.handle_resources_read(
+                let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
                     SessionState::new(),
                     None,
                     None,
-                )?;
+                ))?;
                 dispatch_checkpoint(cx, cancel)?;
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
                 apply_toon_to_content(
@@ -13268,13 +13281,13 @@ to skip auth for local requests.</p>
             }
             "prompts/get" => {
                 let params: fastmcp_protocol::GetPromptParams = parse_params(request.params)?;
-                let out = self.router.handle_prompts_get(
+                let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
                     SessionState::new(),
                     None,
                     None,
-                )?;
+                ))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tasks/list" | "tasks/get" | "tasks/cancel" | "tasks/submit" => {
@@ -18532,19 +18545,18 @@ mod tests {
             .expect("failing test tool must be admitted");
 
         let cx = Cx::for_testing();
-        let result = router
-            .handle_tools_call(
-                &McpContext::new(cx, 1),
-                CallToolParams {
-                    name: "failing".to_string(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                },
-                SessionState::new(),
-                None,
-                None,
-            )
-            .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
+        let result = block_on(router.handle_tools_call(
+            &McpContext::new(cx, 1),
+            CallToolParams {
+                name: "failing".to_string(),
+                arguments: Some(serde_json::json!({})),
+                meta: None,
+            },
+            SessionState::new(),
+            None,
+            None,
+        ))
+        .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
 
         assert!(result.is_error);
         let LegacyContent::Text { text, .. } = &result.content[0] else {

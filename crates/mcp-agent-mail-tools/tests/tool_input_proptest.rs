@@ -290,7 +290,13 @@ fn assert_tool_input_decode_no_panic(
             };
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let request_ctx = McpContext::new(Cx::for_testing(), 1);
-                router.handle_tools_call(&request_ctx, params, SessionState::new(), None, None)
+                fastmcp_core::block_on(router.handle_tools_call(
+                    &request_ctx,
+                    params,
+                    SessionState::new(),
+                    None,
+                    None,
+                ))
             }));
 
             let result = result.map_err(|payload| {

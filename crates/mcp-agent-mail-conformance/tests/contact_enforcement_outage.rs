@@ -105,13 +105,13 @@ fn call_tool(
         meta: None,
     };
     *req_id += 1;
-    let result = router.handle_tools_call(
+    let result = fastmcp_core::block_on(router.handle_tools_call(
         &McpContext::new(cx.clone(), *req_id),
         params,
         SessionState::new(),
         None,
         None,
-    );
+    ));
     match result {
         Ok(resp) => {
             if resp.is_error {

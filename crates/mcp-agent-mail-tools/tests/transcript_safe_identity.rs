@@ -204,8 +204,9 @@ fn dispatch_accepts_return_registration_token_false() {
             meta: None,
         };
         let request_ctx = McpContext::new(cx, 2);
-        let result =
-            router.handle_tools_call(&request_ctx, params, SessionState::new(), None, None);
+        let result = router
+            .handle_tools_call(&request_ctx, params, SessionState::new(), None, None)
+            .await;
         let call_result = result.expect("create_agent_identity dispatch must not error");
         let text = tool_result_text(&call_result.content);
         let payload = parse(&text);
@@ -267,6 +268,7 @@ fn send_message_null_auto_contact_contract() {
         let request_ctx = McpContext::new(cx.clone(), 2);
         let call_result = router
             .handle_tools_call(&request_ctx, params, SessionState::new(), None, None)
+            .await
             .expect(
                 "explicit null auto_contact_if_blocked must be accepted: fastmcp \
                  0.7.1 publishes nullable Option<T> schemas and treats null as \
@@ -302,6 +304,7 @@ fn send_message_null_auto_contact_contract() {
                 None,
                 None,
             )
+            .await
             .expect("send_message with omitted auto_contact_if_blocked must succeed");
         let text = tool_result_text(&call_result.content);
         let payload = parse(&text);

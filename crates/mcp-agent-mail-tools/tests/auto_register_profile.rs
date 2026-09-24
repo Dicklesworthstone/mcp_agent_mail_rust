@@ -348,7 +348,7 @@ fn archive_delivery_files(storage_root: &str) -> BTreeMap<PathBuf, Vec<u8>> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if !path.file_name().is_some_and(|name| name == ".git") {
+                if path.file_name().is_none_or(|name| name != ".git") {
                     walk(&path, files);
                 }
             } else {
@@ -364,6 +364,7 @@ fn archive_delivery_files(storage_root: &str) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn default_reply_preserves_foreign_sender_identity_before_any_delivery_effects() {
     run_with_storage(|cx, storage_root| async move {
         let ctx = McpContext::new(cx.clone(), 1);
@@ -519,13 +520,14 @@ fn default_reply_preserves_foreign_sender_identity_before_any_delivery_effects()
             assert_eq!(peek_inbox(&ctx, &project_b, "CobaltRobin").await.len(), 2);
             assert_eq!(peek_inbox(&ctx, &project_b, "SilverFox").await.len(), 2);
             if scenario != "blocked" {
-                assert!(peek_inbox(&ctx, &project_b, "GreenCastle").await.is_empty());
+                assert_eq!(peek_inbox(&ctx, &project_b, "GreenCastle").await.len(), 0);
             }
         }
     });
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn committed_default_reply_replays_before_changed_parent_identity_is_refused() {
     run_with_storage(|cx, storage_root| async move {
         let ctx = McpContext::new(cx.clone(), 1);
@@ -599,10 +601,10 @@ fn committed_default_reply_replays_before_changed_parent_identity_is_refused() {
         mcp_agent_mail_storage::wbq_flush();
         let before_counts = delivery_counts(&cx).await;
         let before_archive = archive_delivery_files(&storage_root);
-        let replay: Value = serde_json::from_str(&reply().await.expect("committed reply replay"))
+        let replayed: Value = serde_json::from_str(&reply().await.expect("committed reply replay"))
             .expect("replayed reply JSON");
-        assert_eq!(replay["id"], original["id"]);
-        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replayed["id"], original["id"]);
+        assert_eq!(replayed["idempotent_replay"], true);
         let fresh_err = reply_message(
             &ctx,
             project,
