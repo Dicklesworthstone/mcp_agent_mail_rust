@@ -6664,3 +6664,101 @@ fn doctor_repair_dry_run_exits_zero() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- Service install: descriptor limit (br-kp1in.17) ----
+
+/// `am service install` renders `LimitNOFILE=65536` into the systemd user unit,
+/// and re-running it over a unit from an older release (the installer's upgrade
+/// path runs exactly this) replaces that unit instead of keeping its limit-less
+/// content, then reloads and restarts so the new limit takes effect. A fake
+/// `systemctl` on PATH records the calls; no real service is touched.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
+    let env = TestEnv::new();
+    let fake_bin = env.tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
+    let systemctl_log = env.tmp.path().join("systemctl.log");
+    let systemctl = fake_bin.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n",
+            systemctl_log.display()
+        ),
+    )
+    .expect("write fake systemctl");
+    set_executable(&systemctl);
+    let runtime_dir = env.tmp.path().join("run");
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+
+    let mut service_env = env.base_env();
+    service_env.extend(env.hermetic_env());
+    service_env.retain(|(key, _)| key != "PATH");
+    service_env.extend([
+        (
+            "PATH".to_string(),
+            format!("{}:/usr/local/bin:/usr/bin:/bin", fake_bin.display()),
+        ),
+        (
+            "XDG_RUNTIME_DIR".to_string(),
+            runtime_dir.display().to_string(),
+        ),
+        (
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            format!("unix:path={}/bus", runtime_dir.display()),
+        ),
+        ("AM_INTERFACE_MODE".to_string(), "cli".to_string()),
+    ]);
+    let unit_path = env.home_dir.join(".config/systemd/user/agent-mail.service");
+    let install = || {
+        let out = run_am_hermetic(
+            &service_env,
+            Some(env.tmp.path()),
+            &["service", "install", "--port", "18999", "--no-auth"],
+        );
+        assert!(
+            out.status.success(),
+            "service install failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&unit_path).expect("rendered unit")
+    };
+
+    let fresh = install();
+    assert_eq!(
+        fresh.matches("\nLimitNOFILE=65536\n").count(),
+        1,
+        "fresh unit: {fresh}"
+    );
+
+    // An older release's unit: same service, no descriptor limit.
+    let older = fresh.replace("LimitNOFILE=65536\n", "");
+    assert!(
+        !older.contains("LimitNOFILE"),
+        "fixture must lack the limit"
+    );
+    std::fs::write(&unit_path, &older).expect("write older unit");
+    std::fs::write(&systemctl_log, "").expect("reset systemctl log");
+
+    let upgraded = install();
+    assert_eq!(
+        upgraded.matches("\nLimitNOFILE=65536\n").count(),
+        1,
+        "upgraded unit: {upgraded}"
+    );
+    let calls = std::fs::read_to_string(&systemctl_log).expect("systemctl log");
+    let daemon_reload = calls
+        .lines()
+        .position(|line| line == "--user daemon-reload")
+        .unwrap_or_else(|| panic!("no daemon-reload: {calls}"));
+    let restart = calls
+        .lines()
+        .position(|line| line == "--user restart agent-mail.service")
+        .unwrap_or_else(|| panic!("no restart: {calls}"));
+    assert!(
+        daemon_reload < restart,
+        "reload must precede restart: {calls}"
+    );
+}
