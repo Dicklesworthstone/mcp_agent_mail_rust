@@ -1169,6 +1169,53 @@ fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String
     Ok(u64::try_from(count_i64).unwrap_or(0))
 }
 
+/// Whether every source change since a scan began was a new message the scan
+/// was never meant to cover (br-kp1in.18): the rewrite counter is unchanged,
+/// each revision added exactly one row, and the scanned id range
+/// `(after, max]` still holds exactly the rows the scan indexed. Message ids
+/// are allocated before commit, so a late commit inside the range is possible
+/// and is caught by the range count. Read in one snapshot; any doubt answers
+/// `false`, which keeps the strict source-changed refusal.
+fn only_appends_outside_scanned_range(
+    seal: &DbConn,
+    start: Option<LexicalChangeClock>,
+    rows_at_start: u64,
+    (after, max): (i64, i64),
+    indexed_in_range: usize,
+) -> Result<bool, String> {
+    let Some(start) = start else {
+        return Ok(false);
+    };
+    seal.execute_sync("BEGIN DEFERRED", &[])
+        .map_err(|error| format!("backfill seal snapshot: {error}"))?;
+    let verdict = (|| {
+        let Some(now) = lexical_change_clock(seal)? else {
+            return Ok(false);
+        };
+        if now.rewrite_revision != start.rewrite_revision || now.revision < start.revision {
+            return Ok(false);
+        }
+        let rows_now = fetch_db_message_stats(seal)?.count;
+        let revision_delta = u64::try_from(now.revision - start.revision).unwrap_or(u64::MAX);
+        if rows_now.checked_sub(rows_at_start) != Some(revision_delta) {
+            return Ok(false);
+        }
+        let rows_in_range = query_sync_with_lock_retry(
+            seal,
+            "backfill seal range count",
+            "SELECT COUNT(*) AS count FROM messages WHERE id > ? AND id <= ?",
+            &[Value::BigInt(after), Value::BigInt(max)],
+        )
+        .map_err(|error| format!("backfill seal range count failed: {error}"))?
+        .first()
+        .and_then(|row| row.get_named::<i64>("count").ok())
+        .and_then(|count| usize::try_from(count).ok());
+        Ok(rows_in_range == Some(indexed_in_range))
+    })();
+    let _ = seal.execute_sync("COMMIT", &[]);
+    verdict
+}
+
 /// An incremental plan resuming after a still-valid marker, if the marker
 /// recorded a complete index and the rows it covered are all still present.
 /// Callers must already have proven the source append-only since the marker.
@@ -1284,6 +1331,17 @@ std::thread_local! {
 /// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
 /// for writers. In concurrent environments, this can fail. We retry a few times
 /// with exponential backoff to handle writers from older binaries or external tools.
+/// Prefix of the error returned when another process holds the index writer:
+/// normally the running server, which keeps the live index current itself.
+pub(crate) const WRITER_HELD_ELSEWHERE: &str = "Tantivy index writer is held by another process";
+
+/// Whether a lexical refresh failed only because another process owns the
+/// index writer (br-kp1in.18). The index stays available in that case.
+#[must_use]
+pub fn is_writer_held_elsewhere(error: &str) -> bool {
+    error.contains(WRITER_HELD_ELSEWHERE)
+}
+
 fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWriter, String> {
     let mut retries = 5;
     let mut delay = std::time::Duration::from_millis(50);
@@ -1294,6 +1352,15 @@ fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWri
             Ok(writer) => return Ok(writer),
             Err(e) => {
                 if retries == 0 {
+                    if matches!(
+                        e,
+                        tantivy::TantivyError::LockFailure(
+                            tantivy::directory::error::LockError::LockBusy,
+                            _
+                        )
+                    ) {
+                        return Err(format!("{WRITER_HELD_ELSEWHERE}: {e}"));
+                    }
                     return Err(format!("Tantivy writer error (after retries): {e}"));
                 }
                 retries -= 1;
@@ -1780,6 +1847,7 @@ fn backfill_into_bridge_locked_with_opener(
         BackfillPlan::Incremental { start_after_id } => start_after_id,
         BackfillPlan::Skip | BackfillPlan::FullRebuild => 0_i64,
     };
+    let scan_start_after = last_id;
     let total_indexed = with_tantivy_writer(bridge, |writer| {
         if matches!(plan, BackfillPlan::FullRebuild) {
             writer
@@ -1895,7 +1963,16 @@ fn backfill_into_bridge_locked_with_opener(
                 return Err(BACKFILL_SOURCE_CHANGED.to_string());
             }
         }
-        if lexical_change_clock(&seal)? != change_clock
+        let seal_clock = lexical_change_clock(&seal)?;
+        let source_unchanged_for_scan = seal_clock == change_clock
+            || only_appends_outside_scanned_range(
+                &seal,
+                change_clock,
+                db_stats.count,
+                (scan_start_after, scan_max_id),
+                total_indexed,
+            )?;
+        if !source_unchanged_for_scan
             || crate::queries::db_generation_id_conn(&seal) != db_generation
             || db_fingerprint.is_some_and(|initial| {
                 sqlite_file_backfill_fingerprint(db_path)
@@ -3574,6 +3651,80 @@ mod tests {
         assert_eq!(results[0].title, "deferrednotification");
         assert_eq!(backfill_from_db(&path).unwrap(), (0, 2));
         reset_bridge_for_tests();
+    }
+
+    /// br-kp1in.18: a message appended beyond the scanned id range while a
+    /// backfill runs no longer rejects the whole scan (under steady writes a
+    /// rebuild used to fail every retry); a message committed INSIDE the
+    /// already-scanned range still does, because the scan missed it.
+    #[test]
+    fn backfill_seal_accepts_appends_beyond_its_range_but_not_inside_it() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (late_id, accepted) in [(5_000_i64, true), (3_000_i64, false)] {
+            reset_bridge_for_tests();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let index_dir = tempfile::TempDir::new().unwrap();
+            let db_path = create_test_db(
+                tmp.path(),
+                &[(1, "originalsubject", "originalbody", "normal", "thread-one")],
+            );
+            let conn = DbConn::open_file(&db_path).unwrap();
+            for migration in crate::schema::schema_migrations()
+                .into_iter()
+                .filter(|migration| migration.id.starts_with("v29_"))
+            {
+                conn.execute_sync(&migration.up, &[]).unwrap();
+            }
+            init_bridge(index_dir.path()).unwrap();
+            assert_eq!(backfill_from_db(&db_path).unwrap(), (1, 0));
+            // A multi-page pure append with a gap at 3,000 (an id allocated
+            // but not yet committed when the next scan starts).
+            conn.execute_sync("BEGIN IMMEDIATE", &[]).unwrap();
+            for id in (2..=4_102).filter(|id| *id != 3_000) {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, 1, 1, 'appendedsubject', 'appendedbody', 1000000)",
+                    &[Value::BigInt(id)],
+                )
+                .unwrap();
+            }
+            conn.execute_sync("COMMIT", &[]).unwrap();
+            let committed = std::rc::Rc::new(std::cell::Cell::new(false));
+            BACKFILL_SCAN_OBSERVER.with(|observer| {
+                let committed = committed.clone();
+                *observer.borrow_mut() = Some(Box::new(move |indexed| {
+                    if indexed >= 4_000 && !committed.replace(true) {
+                        conn.execute_sync(
+                            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                             VALUES (?, 1, 1, 'latearrival', 'committed during the scan', 2000000)",
+                            &[Value::BigInt(late_id)],
+                        )
+                        .expect("commit during the real backfill scan");
+                    }
+                }));
+            });
+            let result = backfill_from_db(&db_path);
+            BACKFILL_SCAN_OBSERVER.with(|observer| {
+                observer.borrow_mut().take();
+            });
+            assert!(
+                committed.get(),
+                "the concurrent commit must actually happen"
+            );
+            if accepted {
+                assert_eq!(result.unwrap(), (4_100, 0), "late_id={late_id}");
+                // The next pass picks the append up incrementally.
+                assert_eq!(backfill_from_db(&db_path).unwrap(), (1, 0));
+            } else {
+                assert!(
+                    result.unwrap_err().contains("source changed during scan"),
+                    "a commit inside the scanned range must not be published as covered"
+                );
+            }
+            reset_bridge_for_tests();
+        }
     }
 
     /// br-kp1in.18: deliveries skipped by live indexing (source lock busy)

@@ -1144,7 +1144,7 @@ fn robot_search_index_health_from_config(
 fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
     match health.state.as_str() {
         "fresh" | "in_memory" => "ok",
-        "delayed" | "partial" => "degraded",
+        "delayed" | "partial" | "unverified" => "degraded",
         _ => "fail",
     }
 }
@@ -15230,13 +15230,27 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             env._meta.project = Some(project_slug);
             env = enrich_envelope_with_search_index_alert(env, search_index.as_ref());
             if let Some(error) = live_refresh_error {
-                env = env.with_alert(
-                    "warn",
-                    format!(
-                        "Live lexical refresh failed; results use the private snapshot: {error}"
-                    ),
-                    Some("am robot health --format json".to_string()),
-                );
+                let error = error.to_string();
+                // br-kp1in.18: the running server owning the index writer is the
+                // normal state, not a fault; say so instead of alarming.
+                env = if mcp_agent_mail_db::search_v3::is_writer_held_elsewhere(&error) {
+                    env.with_alert(
+                        "info",
+                        "Live lexical refresh failed: the index writer is held by another process \
+                         (normally the running server, which keeps the live index current); \
+                         results use the private snapshot"
+                            .to_string(),
+                        None,
+                    )
+                } else {
+                    env.with_alert(
+                        "warn",
+                        format!(
+                            "Live lexical refresh failed; results use the private snapshot: {error}"
+                        ),
+                        Some("am robot health --format json".to_string()),
+                    )
+                };
             }
             format_output(&env, format)?
         }

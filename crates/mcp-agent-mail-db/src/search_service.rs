@@ -996,7 +996,9 @@ fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
 /// Read-only snapshot of the lexical Search V3 backfill/index state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LexicalBackfillHealth {
-    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `in_memory`, or `unavailable`.
+    /// Stable state label: `fresh`, `partial`, `stale`, `delayed`, `unverified`
+    /// (another process owns the index writer, so this process could not
+    /// refresh or verify it), `in_memory`, or `unavailable`.
     pub state: String,
     /// Current SQLite identity used to scope the process-global lexical bridge.
     pub db_identity: String,
@@ -1173,6 +1175,35 @@ fn lexical_backfill_health_with_affinity(
         .ok()
         .and_then(|state| state.get(&sqlite_key).cloned());
     if let Some(Err(error)) = cached_bootstrap {
+        // br-kp1in.18: another process (normally the running server) owning
+        // the index writer is not a broken index. This process just could not
+        // verify or refresh it: unverified, neither fresh nor unavailable.
+        if crate::search_v3::is_writer_held_elsewhere(&error) {
+            return (
+                LexicalBackfillHealth {
+                    state: "unverified".to_string(),
+                    db_identity: db_identity.clone(),
+                    index_dir: index_dir_display,
+                    indexed_messages: 0,
+                    source_messages: None,
+                    skipped_messages: 0,
+                    last_backfill_at_micros: None,
+                    rebuild_in_progress: false,
+                    active_db_identity: active_db_identity.clone(),
+                    stale_reason: Some(format!(
+                        "this process could not refresh the live lexical index because \
+                         another process (normally the running server, which maintains it) \
+                         holds its writer: {error}"
+                    )),
+                    safe_remediation: Some(
+                        "Check live index freshness through the running server (`am robot health`); \
+                         searches from this process use a private snapshot"
+                            .to_string(),
+                    ),
+                },
+                LexicalIndexAffinity::Drift,
+            );
+        }
         return (
             LexicalBackfillHealth {
                 state: "unavailable".to_string(),

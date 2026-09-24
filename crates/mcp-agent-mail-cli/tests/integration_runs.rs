@@ -3963,6 +3963,21 @@ fn robot_search_locked_live_index_returns_private_results_with_refresh_alert() {
         robot_search_index_state(&result, "locked index health"),
         "fresh"
     );
+    // br-kp1in.18: a writer held by another process (the running server) is
+    // the normal state; the index is stale for a moment, never "unavailable",
+    // and nothing is raised as an error on a healthy system.
+    assert_ne!(
+        robot_search_index_state(&result, "locked index health"),
+        "unavailable"
+    );
+    assert!(
+        !result["_alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert["severity"] == "error"),
+        "a writer held elsewhere must not raise an error alert: {result}"
+    );
     assert!(
         result["_alerts"].as_array().unwrap().iter().any(|alert| {
             let summary = alert["summary"].as_str().unwrap_or_default();
