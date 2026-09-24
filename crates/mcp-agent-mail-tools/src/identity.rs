@@ -818,6 +818,7 @@ fn compute_health_verdicts(
     pool_present: bool,
     semantic: &SemanticReadinessResponse,
     integrity: &mcp_agent_mail_db::IntegrityMetrics,
+    archive_drain_stall: Option<&str>,
 ) -> HealthVerdicts {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
@@ -854,6 +855,19 @@ fn compute_health_verdicts(
 
     let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
         HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else if let Some(stall) = archive_drain_stall {
+        // br-kp1in.23: write-behind lag is tolerable only while it converges.
+        // A drain that completes nothing leaves every queued write without an
+        // archive copy indefinitely, so parity is broken, not lagging.
+        HealthVerdict::new(
+            Red,
+            true,
+            format!(
+                "archive write-behind drain stalled ({stall}); queued archive writes will not \
+                 land until the drain recovers ({})",
+                semantic.detail
+            ),
+        )
     } else {
         // Never assert bare alignment: the git archive legitimately trails the
         // live SQLite index under write-behind flush, so a green parity verdict
@@ -1205,10 +1219,23 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
+    // br-kp1in.23: state the absolute gap. A DB far ahead of the archive is
+    // either archive writes still queued (see queues.archive_lag) or writes
+    // that never landed; it must not read as "aligned".
+    let db_ahead_by =
+        db_message_count.saturating_sub(u64::try_from(archive_message_count).unwrap_or(u64::MAX));
+    let alignment = if db_ahead_by == 0 {
+        "Archive and sqlite inventory are aligned".to_string()
+    } else {
+        format!(
+            "sqlite is ahead of the archive by {db_ahead_by} message(s) (queued archive writes or \
+             writes that never landed; compare queues.archive_lag)"
+        )
+    };
     semantic_readiness_response(
         "ok",
         format!(
-            "Archive and sqlite inventory are aligned enough for health_check: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
+            "{alignment}: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
             archive.projects,
             archive.agents,
             archive.unique_message_ids,
@@ -1958,11 +1985,22 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
+    let archive_drain_stall = archive_wbq_drain_stalled.then(|| {
+        format!(
+            "wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms, \
+             critical bound {} ms",
+            archive_lag.wbq_depth,
+            archive_lag.wbq_inflight_execution_us / 1_000,
+            archive_lag.wbq_since_progress_us / 1_000,
+            archive_lag_critical_us / 1_000
+        )
+    });
     let verdicts = compute_health_verdicts(
         config,
         pool.is_some(),
         &semantic_readiness,
         &integrity_metrics,
+        archive_drain_stall.as_deref(),
     );
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
@@ -1977,7 +2015,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     }
     // Archive lag past the configured bounds degrades readiness (never green)
     // without flipping the top-level `status` to "error": a lagging archive is
-    // eventual-consistency degradation, not a down critical subsystem.
+    // eventual-consistency degradation, not a down critical subsystem. A
+    // stalled drain is not converging and is already red in archive_db_parity.
     if archive_lag_oldest_us >= archive_lag_critical_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Red);
     } else if archive_lag_oldest_us >= archive_lag_warn_us {
@@ -3818,6 +3857,7 @@ mod tests {
                 "sqlite schema missing required health_check tables: agents, messages",
             ),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.write_health.status, "red");
         assert!(verdicts.write_health.critical);
@@ -3843,6 +3883,7 @@ mod tests {
                 "sqlite connectivity probe failed during health_check: file is not a database",
             ),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -3862,6 +3903,7 @@ mod tests {
                 "archive inventory is ahead of the sqlite index (archive projects=2 ...)",
             ),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert_eq!(
@@ -3878,6 +3920,7 @@ mod tests {
             false,
             &semantic("fail", "database pool bootstrap failed"),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -3894,6 +3937,7 @@ mod tests {
             true,
             &semantic("ok", "aligned"),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.db_health.status, "green");
         assert_eq!(verdicts.write_health.status, "green");
@@ -3923,6 +3967,7 @@ mod tests {
             true,
             &semantic("ok", drift_detail),
             &healthy_integrity_metrics(),
+            None,
         );
         assert_eq!(verdicts.archive_db_parity.status, "green");
         assert!(
@@ -3935,6 +3980,53 @@ mod tests {
         assert_ne!(
             verdicts.archive_db_parity.detail, "git archive and sqlite index are aligned",
             "must not assert bare alignment over visibly unequal counts"
+        );
+    }
+
+    #[test]
+    fn stalled_archive_drain_makes_parity_red_and_critical() {
+        // br-kp1in.23: 2026-09-23 instance A held 3,453 queued archive writes
+        // with zero drain progress while every critical verdict stayed green.
+        let config = Config::from_env();
+        let drift_detail = "sqlite is ahead of the archive by 3235 message(s)";
+        let stalled = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("ok", drift_detail),
+            &healthy_integrity_metrics(),
+            Some("wbq depth 3453, no completed op for 900000 ms"),
+        );
+        assert_eq!(stalled.archive_db_parity.status, "red");
+        assert!(stalled.archive_db_parity.critical);
+        assert!(
+            stalled.archive_db_parity.detail.contains("drain stalled")
+                && stalled.archive_db_parity.detail.contains("wbq depth 3453")
+                && stalled.archive_db_parity.detail.contains(drift_detail),
+            "the stall verdict must name the stall and keep the inventory: {}",
+            stalled.archive_db_parity.detail
+        );
+        assert_eq!(
+            stalled.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+        assert!(
+            stalled
+                .failing_names()
+                .contains(&"archive_db_parity".to_string())
+        );
+
+        // The same inventory with a draining queue is tolerated write-behind lag.
+        let draining = compute_health_verdicts(
+            &config,
+            true,
+            &semantic("ok", drift_detail),
+            &healthy_integrity_metrics(),
+            None,
+        );
+        assert_eq!(draining.archive_db_parity.status, "green");
+        assert_eq!(
+            draining.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Green
         );
     }
 
@@ -4877,6 +4969,14 @@ body
                         .as_str()
                         .is_some_and(|detail| !detail.contains("archive inventory is ahead")),
                     "health_check should not false-fail on metadata-only archive drift when the DB has newer messages: {value}"
+                );
+                // br-kp1in.23: the DB-ahead gap is stated as a number, never
+                // as "aligned".
+                let detail = value["semantic_readiness"]["detail"].as_str().unwrap_or("");
+                assert!(
+                    detail.contains("sqlite is ahead of the archive by 1 message(s)")
+                        && !detail.contains("aligned"),
+                    "health_check must report the absolute DB-archive gap: {value}"
                 );
                 assert!(
                     value.get("recovery").is_none(),

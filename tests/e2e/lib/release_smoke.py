@@ -567,6 +567,7 @@ def phase_soak(arm: Arm, state: dict, c: list) -> dict:
     fds_max = 0
     zombies_max = 0
     samples: list = []  # (t, drained_total, depth) or (t, None, error)
+    lag: dict = {}  # t -> (drain_stalled, critical_threshold_ms, archive_db_parity status)
     while time.time() < stop:
         time.sleep(SOAK_WINDOW_SECS)
         try:
@@ -575,7 +576,14 @@ def phase_soak(arm: Arm, state: dict, c: list) -> dict:
             wbq = h["queues"]["wbq"]
             zombies_max = max(zombies_max,
                               h["timeout_diagnostics"]["blocking_dispatch_zombies"])
-            samples.append((time.time(), wbq["drained_total"], wbq["depth"]))
+            t = time.time()
+            samples.append((t, wbq["drained_total"], wbq["depth"]))
+            # An older control binary may lack these fields; it then simply
+            # cannot pass the agreement check, without disturbing the others.
+            al = h["queues"].get("archive_lag", {})
+            if "drain_stalled" in al and "critical_threshold_ms" in al:
+                lag[t] = (al["drain_stalled"], al["critical_threshold_ms"],
+                          h.get("verdicts", {}).get("archive_db_parity", {}).get("status"))
         except Exception as ex:
             samples.append((time.time(), None, f"{type(ex).__name__}: {ex}"[:200]))
     for t in ts:
@@ -592,6 +600,26 @@ def phase_soak(arm: Arm, state: dict, c: list) -> dict:
         elif prev[2] > 0 and cur[1] <= prev[1]:
             bad_windows.append({"t": round(cur[0]), "drained_total": cur[1],
                                 "depth_at_open": prev[2], "depth_at_close": cur[2]})
+    # br-kp1in.23: health's stall verdict must agree with the WBQ counters in
+    # both directions. Progress inside a window shorter than the critical bound
+    # means "not stalled"; queued work with no progress for longer than the
+    # bound (plus one window of sampling slack) means "stalled" and red parity.
+    lag_disagree = []
+    last_progress_t = samples[0][0] if samples else 0.0
+    for prev, cur in zip(samples, samples[1:]):
+        if prev[1] is None or cur[1] is None or cur[0] not in lag:
+            continue
+        stalled, critical_ms, parity = lag[cur[0]]
+        window_s = cur[0] - prev[0]
+        if cur[1] > prev[1]:
+            last_progress_t = cur[0]
+            if stalled and window_s * 1000 < critical_ms:
+                lag_disagree.append({"t": round(cur[0]), "want": "not stalled",
+                                     "drained": [prev[1], cur[1]]})
+        elif cur[2] > 0 and (cur[0] - last_progress_t) * 1000 > critical_ms + window_s * 1000:
+            if not stalled or parity != "red":
+                lag_disagree.append({"t": round(cur[0]), "want": "stalled+red parity",
+                                     "got": [stalled, parity], "depth": cur[2]})
     q = sorted(read_lat)
     read_p99 = q[min(len(q) - 1, int(len(q) * 0.99))] if q else None
     log_text = arm.server_log.read_text(errors="replace")
@@ -603,6 +631,9 @@ def phase_soak(arm: Arm, state: dict, c: list) -> dict:
     check(c, f"WBQ drained_total advances in every {SOAK_WINDOW_SECS}s window with queued work",
           len(samples) >= 2 and not bad_windows,
           f"samples={len(samples)} bad={bad_windows[:5]}")
+    check(c, "health archive_lag stall verdict agrees with the WBQ counters",
+          len(lag) >= 2 and not lag_disagree,
+          f"lag_samples={len(lag)} disagree={lag_disagree[:5]}")
     check(c, f"fetch_inbox p99 <= {FETCH_INBOX_P99_BUDGET_S}s under write load",
           read_p99 is not None and read_p99 <= FETCH_INBOX_P99_BUDGET_S,
           f"p99={read_p99} n={len(q)}")
