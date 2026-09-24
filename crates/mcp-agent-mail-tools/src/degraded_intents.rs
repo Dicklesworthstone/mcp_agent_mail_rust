@@ -11,8 +11,8 @@
 //! ## Intent log layout (one JSONL file per verb)
 //!
 //! - `release_file_reservations.jsonl` — release intents (writer lives in
-//!   [`crate::reservations`]; this module exposes a read-only view used by the
-//!   `am robot status` surface).
+//!   [`crate::reservations`]; this module supplies the verified snapshot used
+//!   by both automatic replay and the `am robot status` surface).
 //! - `acknowledge_message.jsonl` — ack intents (full writer + reader live
 //!   here, used by [`crate::messaging::acknowledge_message`]).
 //!
@@ -33,10 +33,10 @@
 //! Publication and snapshot completion revalidate retained directory/file
 //! handles: an observed replacement is not a durable receipt or an empty queue.
 //!
-//! NOTE: [`crate::reservations`] still carries its own private copy of the
-//! release-intent writer/reader for its automatic replay-on-success path.
-//! Migrating it onto this shared surface is tracked as a follow-up so that the
-//! single mutation chokepoint work (Track F) is not disturbed.
+//! Release mutation and replay-marker publication remain in
+//! [`crate::reservations`]. Both replay and diagnostics use this reader, so an
+//! unsupported release schema must fail the entire snapshot: it is neither an
+//! unrestricted release instruction nor evidence that the queue is empty.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -70,6 +70,8 @@ pub const RELEASE_INTENT_LOG_FILE: &str = "release_file_reservations.jsonl";
 pub const RELEASE_INTENT_KIND: &str = "release_file_reservations_intent";
 /// Release-intent replay marker kind.
 pub const RELEASE_INTENT_REPLAY_KIND: &str = "release_file_reservations_replay";
+/// Release schema understood by this reader (matches the reservation writer).
+const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
 
 /// Original unkeyed ack-intent schema version.
 pub const ACK_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -714,7 +716,32 @@ pub fn read_queued_ack_intents(config: &Config) -> std::io::Result<Vec<QueuedAck
     Ok(outstanding.into_intents())
 }
 
-// ── Release-intent read-only view (for the robot status surface) ─────────────
+// ── Release-intent snapshots (shared by replay and robot status) ────────────
+
+/// A content hash proves integrity, not that this reader understands the scope
+/// or terminal semantics of a record. Never reinterpret a newer schema using
+/// v1's optional filters, or silently drop it and report an empty queue.
+fn ensure_supported_release_schema(record: &Value) -> std::io::Result<()> {
+    if !matches!(
+        record.get("kind").and_then(Value::as_str),
+        Some(RELEASE_INTENT_KIND | RELEASE_INTENT_REPLAY_KIND)
+    ) {
+        return Ok(());
+    }
+    let version = record.get("schema_version").and_then(Value::as_u64);
+    if version == Some(u64::from(RELEASE_INTENT_SCHEMA_VERSION)) {
+        return Ok(());
+    }
+    // Do not echo arbitrary journal values into diagnostics: a malformed
+    // version may itself contain a large string or private request data.
+    let version = version.map_or_else(|| "missing or non-integer".to_string(), |v| v.to_string());
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "release journal has unsupported schema_version ({version}); expected {RELEASE_INTENT_SCHEMA_VERSION}; queued release scope is unknown, replay stopped and journal preserved"
+        ),
+    ))
+}
 
 fn release_intent_hash_payload(record: &Value) -> Value {
     json!({
@@ -762,8 +789,9 @@ fn release_replay_record_has_valid_hash(record: &Value) -> bool {
 
 /// Read all outstanding release intents in first-append order.
 ///
-/// Read-only view for the `am robot status` surface; the authoritative
-/// replay-on-success path lives in [`crate::reservations`].
+/// Shared by robot status and the replay-on-success path in
+/// [`crate::reservations`]. An unsupported release record fails the snapshot
+/// before any queued mutation is authorized; the journal is left unchanged.
 pub fn read_queued_release_intents(
     config: &Config,
 ) -> std::io::Result<Vec<QueuedReleaseIntentView>> {
@@ -772,6 +800,7 @@ pub fn read_queued_release_intents(
     };
     let mut outstanding = OutstandingIntents::new();
     while let Some(value) = reader.next_record()? {
+        ensure_supported_release_schema(&value)?;
         match value.get("kind").and_then(Value::as_str) {
             Some(RELEASE_INTENT_REPLAY_KIND)
                 if value
@@ -1222,7 +1251,144 @@ mod tests {
         (intent_id, content_sha256)
     }
 
-    const RELEASE_INTENT_SCHEMA_VERSION: u32 = 1;
+    fn unsupported_release_versions() -> Vec<Option<Value>> {
+        vec![
+            None,
+            Some(Value::Null),
+            Some(json!("1")),
+            Some(json!(1.0)),
+            Some(json!(true)),
+            Some(json!(-1)),
+            Some(json!(0)),
+            Some(json!(2)),
+            Some(json!(u64::MAX)),
+        ]
+    }
+
+    #[test]
+    fn release_intent_reader_rejects_hash_valid_unsupported_schemas_without_losing_evidence() {
+        for version in unsupported_release_versions() {
+            for has_known_intent in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let config = test_config(tmp.path());
+                if has_known_intent {
+                    write_release_intent_fixture(&config, 1, json!(["src/**"]), Value::Null);
+                }
+                let mut record = json!({
+                    "kind": RELEASE_INTENT_KIND,
+                    "created_ts": 2,
+                    "project_key": "/abs/project",
+                    "agent_name": "BlueLake",
+                    "paths": null,
+                    "file_reservation_ids": null,
+                    "failure": {"stage": "release_reservations", "error_detail": "busy"},
+                });
+                if let Some(version) = &version {
+                    record["schema_version"] = version.clone();
+                }
+                let hash = hash_json_value(&release_intent_hash_payload(&record));
+                record["intent_id"] = json!(&hash[..16]);
+                record["content_sha256"] = json!(hash);
+                // These records pass the old integrity and typed-view checks.
+                // Without schema admission, their null filters authorize all
+                // of the agent's pre-cutoff leases under v1 semantics.
+                assert!(record_has_valid_intent_hash(&record, release_intent_hash_payload));
+                assert!(serde_json::from_value::<QueuedReleaseIntentView>(record.clone()).is_ok());
+                let path = append_jsonl(
+                    &config,
+                    RELEASE_INTENT_LOG_FILE,
+                    ".release_file_reservations.jsonl.lock",
+                    &record,
+                )
+                .unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let error = read_queued_release_intents(&config)
+                    .expect_err("unsupported scope must not become a replayable or empty queue");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("unsupported schema_version"));
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn release_intent_reader_rejects_unsupported_replay_marker_schemas() {
+        for version in unsupported_release_versions() {
+            for status in [REPLAY_STATUS_REPLAYED, REPLAY_STATUS_ABANDONED, REPLAY_STATUS_FAILED] {
+                let tmp = tempfile::tempdir().unwrap();
+                let config = test_config(tmp.path());
+                let (id, hash) =
+                    write_release_intent_fixture(&config, 1, Value::Null, json!([42]));
+                let mut marker = json!({
+                    "kind": RELEASE_INTENT_REPLAY_KIND,
+                    "intent_id": id,
+                    "intent_content_sha256": hash,
+                    "replayed_ts": 2,
+                    "status": status,
+                    "released": 0,
+                    "error_detail": null,
+                });
+                if let Some(version) = &version {
+                    marker["schema_version"] = version.clone();
+                }
+                marker["content_sha256"] =
+                    json!(hash_json_value(&release_replay_hash_payload(&marker)));
+                assert!(release_replay_record_has_valid_hash(&marker));
+                let path = append_jsonl(
+                    &config,
+                    RELEASE_INTENT_LOG_FILE,
+                    ".release_file_reservations.jsonl.lock",
+                    &marker,
+                )
+                .unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let error = read_queued_release_intents(&config)
+                    .expect_err("an unknown marker cannot clear or authorize queued work");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn release_intent_reader_preserves_supported_filter_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let filters = [
+            (Value::Null, Value::Null),
+            (json!([]), Value::Null),
+            (Value::Null, json!([])),
+            (json!(["literal,comma.rs", "src/{one,two}.rs"]), json!([1, 2])),
+        ];
+        for (index, (paths, ids)) in filters.iter().enumerate() {
+            write_release_intent_fixture(
+                &config,
+                i64::try_from(index).unwrap(),
+                paths.clone(),
+                ids.clone(),
+            );
+        }
+        let queued = read_queued_release_intents(&config).unwrap();
+        assert_eq!(queued.len(), filters.len());
+        for (intent, (paths, ids)) in queued.iter().zip(&filters) {
+            assert_eq!(serde_json::to_value(&intent.paths).unwrap(), *paths);
+            assert_eq!(serde_json::to_value(&intent.file_reservation_ids).unwrap(), *ids);
+        }
+    }
+
+    #[test]
+    fn release_schema_admission_is_scoped_and_redacts_malformed_values() {
+        for record in [json!(null), json!({}), json!({"kind": "other", "schema_version": 99})] {
+            ensure_supported_release_schema(&record).unwrap();
+        }
+        let error = ensure_supported_release_schema(&json!({
+            "kind": RELEASE_INTENT_KIND,
+            "schema_version": "private-journal-value",
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("missing or non-integer"));
+        assert!(!error.to_string().contains("private-journal-value"));
+    }
 
     #[test]
     fn release_intent_reader_round_trip_and_replay_clear() {

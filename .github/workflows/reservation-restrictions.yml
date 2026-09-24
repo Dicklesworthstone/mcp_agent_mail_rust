@@ -8,6 +8,7 @@ on:
       - 'crates/mcp-agent-mail-cli/src/lib.rs'
       - 'crates/mcp-agent-mail-cli/tests/file_reservations_argument_compat.rs'
       - 'crates/mcp-agent-mail-tools/src/reservations.rs'
+      - 'crates/mcp-agent-mail-tools/src/degraded_intents.rs'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
   workflow_dispatch:
@@ -43,6 +44,8 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
           rustc --version
       - uses: Swatinem/rust-cache@v2
+      - name: Run durable reservation recovery regressions
+        run: cargo test --locked -p mcp-agent-mail-tools --lib degraded_intents -- --test-threads=1
       - name: Run public argument-compatibility regressions
         run: cargo test --locked -p mcp-agent-mail-cli --test file_reservations_argument_compat
       - name: Run native CLI reservation regressions
