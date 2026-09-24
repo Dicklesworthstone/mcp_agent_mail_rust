@@ -114,11 +114,11 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
         .to_string()
 }
 
-/// Count canonical message `.md` artifacts on disk (those under a `messages`
-/// directory), which is what `try_write_message_archive` dispatches. Inbox/outbox
-/// copies live under `agents/`, so they are not counted.
-fn count_canonical_messages(storage_root: &str) -> usize {
-    fn walk(dir: &Path, count: &mut usize) {
+/// Identify canonical messages at `projects/<slug>/messages/YYYY/MM/<file>.md`.
+/// Thread digests under `messages/threads/` are distinct archive artifacts;
+/// they remain covered by the full delivery-file snapshot below.
+fn canonical_message_paths(storage_root: &str) -> BTreeMap<i64, PathBuf> {
+    fn walk(root: &Path, dir: &Path, messages: &mut BTreeMap<i64, PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -129,17 +129,50 @@ fn count_canonical_messages(storage_root: &str) -> usize {
                 if path.file_name().is_some_and(|n| n == ".git") {
                     continue;
                 }
-                walk(&path, count);
-            } else if path.extension().is_some_and(|ext| ext == "md")
-                && path.components().any(|c| c.as_os_str() == "messages")
-            {
-                *count += 1;
+                walk(root, &path, messages);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("archive-relative fixture path");
+                let components: Vec<_> = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_str().expect("UTF-8 fixture path"))
+                    .collect();
+                let ["projects", _, "messages", year, month, _] = components.as_slice() else {
+                    continue;
+                };
+                assert!(year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()));
+                assert!(month.len() == 2 && month.bytes().all(|byte| byte.is_ascii_digit()));
+                let (metadata, _) = mcp_agent_mail_storage::read_message_file(&path)
+                    .expect("canonical message frontmatter");
+                let message_id = metadata["id"].as_i64().expect("canonical message ID");
+                assert!(message_id > 0);
+                let filename_id = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.rsplit_once("__"))
+                    .and_then(|(_, id)| id.parse::<i64>().ok());
+                assert_eq!(
+                    filename_id,
+                    Some(message_id),
+                    "filename/frontmatter ID mismatch"
+                );
+                let previous = messages.insert(message_id, path);
+                assert!(
+                    previous.is_none(),
+                    "duplicate canonical artifact for message {message_id}"
+                );
             }
         }
     }
-    let mut count = 0;
-    walk(Path::new(storage_root), &mut count);
-    count
+    let mut messages = BTreeMap::new();
+    let root = Path::new(storage_root);
+    walk(root, root, &mut messages);
+    messages
+}
+
+fn count_canonical_messages(storage_root: &str) -> usize {
+    canonical_message_paths(storage_root).len()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,10 +372,39 @@ async fn attachment_replay_case(cx: Cx, storage_root: String, is_reply: bool) {
     mcp_agent_mail_storage::wbq_flush();
     let files = snapshot_delivery_files(&storage_root);
     let inbox = inbox_snapshot(&ctx, &project_key).await;
+    let accepted_id = fresh["deliveries"][0]["payload"]["id"].as_i64().unwrap();
+    let mut expected_ids: Vec<_> = parent.into_iter().chain([accepted_id]).collect();
+    expected_ids.sort_unstable();
+    let canonical = canonical_message_paths(&storage_root);
+    assert_eq!(canonical.keys().copied().collect::<Vec<_>>(), expected_ids);
     assert_eq!(
         count_canonical_messages(&storage_root),
         if is_reply { 2 } else { 1 }
     );
+    if let Some(parent_id) = parent {
+        let digest_name = format!("{parent_id}.md");
+        let digests: Vec<_> = files
+            .iter()
+            .filter(|(path, _)| {
+                path.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "threads")
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name == digest_name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            digests.len(),
+            1,
+            "the first reply must create its separate thread digest"
+        );
+        assert!(
+            std::str::from_utf8(digests[0].1)
+                .unwrap()
+                .contains(&format!("__{accepted_id}.md"))
+        );
+    }
 
     let retained = source.with_extension("retained.bin");
     std::fs::rename(&source, &retained).unwrap();
@@ -361,6 +423,7 @@ async fn attachment_replay_case(cx: Cx, storage_root: String, is_reply: bool) {
         .expect("retry must use the accepted attachment metadata");
     assert_exact_replay(&fresh, &replay);
     mcp_agent_mail_storage::wbq_flush();
+    assert_eq!(canonical_message_paths(&storage_root), canonical);
     assert_eq!(snapshot_delivery_files(&storage_root), files);
     assert_eq!(inbox_snapshot(&ctx, &project_key).await, inbox);
     assert_eq!(std::fs::read(retained).unwrap(), original_bytes);

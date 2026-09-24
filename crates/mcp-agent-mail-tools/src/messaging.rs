@@ -3363,6 +3363,43 @@ effective_free_bytes={free}"
             .await,
     )?;
 
+    // Contact notices live in the recipient's project but retain the remote
+    // sender's global identity. Reducing that identity to a bare name would
+    // redirect an implicit reply to an unrelated local namesake (or create a
+    // placeholder if the contact was subsequently blocked). An explicit `to`
+    // remains an intentional local reroute; committed retries were handled
+    // above before this new-delivery check.
+    if to.is_none() && original_sender.project_id != project_id {
+        // Even project path aliases can contain distinct same-name agents.
+        // Parent visibility through an alias does not establish recipient identity.
+        tracing::debug!(
+            project_id,
+            message_id,
+            recipient = %original_sender.name,
+            recipient_project_id = original_sender.project_id,
+            rule = "default_reply_preserves_sender_project",
+            "cross-project default reply refused before recipient resolution"
+        );
+        return Err(legacy_tool_error(
+            "CROSS_PROJECT_RECIPIENT",
+            format!(
+                "The original sender '{}' belongs to another project. Replies only deliver \
+                 within one project, so nothing was sent. An agent with the same name here \
+                 is not the original sender. Coordinate in a shared project, or provide \
+                 an explicit 'to' list to intentionally address local agents \
+                 (use 'to': [] for CC/BCC-only delivery).",
+                original_sender.name,
+            ),
+            false,
+            json!({
+                "message_id": message_id,
+                "recipient": original_sender.name,
+                "recipient_source": "original_sender",
+                "cross_project_messaging_supported": false,
+            }),
+        ));
+    }
+
     // Determine thread_id: use original's thread_id, or the original message id as string.
     // Defense-in-depth: sanitize in case legacy data contains invalid characters.
     let fallback_tid = message_id.to_string();
@@ -5782,13 +5819,14 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().expect("unavailable database fixture");
-        let blocked_parent = tmp.path().join("database-parent-is-a-file");
+        let fixture_root = tmp.path().canonicalize().expect("canonical fixture root");
+        let blocked_parent = fixture_root.join("database-parent-is-a-file");
         std::fs::write(&blocked_parent, b"unavailable database parent").expect("blocked parent");
-        let unavailable_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
-            &blocked_parent.join("mailbox.sqlite3"),
-        );
-        let archive = tmp.path().join("archive");
-        let live_database = tmp.path().join("live-mailbox.sqlite3");
+        let unavailable_database = blocked_parent.join("mailbox.sqlite3");
+        let unavailable_url =
+            mcp_agent_mail_core::disk::sqlite_url_from_path(&unavailable_database);
+        let archive = fixture_root.join("archive");
+        let live_database = fixture_root.join("live-mailbox.sqlite3");
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &unavailable_url),
@@ -5852,6 +5890,21 @@ mod tests {
                     };
 
                     let ctx = McpContext::new(cx.clone(), 1);
+                    // Pool construction is lazy: the filesystem obstruction
+                    // must surface on the first connection acquire, which the
+                    // public tool performs while resolving its project.
+                    let unavailable_pool = get_db_pool().expect("construct lazy unavailable pool");
+                    assert_eq!(Path::new(unavailable_pool.sqlite_path()), unavailable_database);
+                    let unavailable_error = match unavailable_pool.acquire(&cx).await {
+                        Outcome::Err(error) => error.to_string(),
+                        Outcome::Ok(_) => panic!("a file cannot serve as the database parent directory"),
+                        Outcome::Cancelled(_) => panic!("outage probe was cancelled"),
+                        Outcome::Panicked(_) => panic!("outage probe panicked"),
+                    };
+                    assert!(unavailable_error.contains(blocked_parent.to_str().unwrap()),
+                        "connection failure must name the obstructed database path: {unavailable_error}");
+                    assert!(!unavailable_database.exists());
+                    drop(unavailable_pool);
                     // These are actual tool calls with a genuinely unavailable
                     // configured DB path. Recovery below uses the independently
                     // seeded live mailbox, without an unkeyed fallback or stub.
@@ -5882,11 +5935,13 @@ mod tests {
                         .expect("queued requests");
                     assert_eq!(queued.len(), 3);
                     for intent in &queued {
-                        assert_eq!(intent.failure.stage, "get_db_pool");
+                        assert_eq!(intent.failure.stage, "resolve_project");
+                        assert!(intent.failure.error_detail.contains(blocked_parent.to_str().unwrap()),
+                            "queued failure must be caused by the same filesystem obstruction");
                         assert_eq!(
                             intent.idempotency,
                             Some(ack_retry_claim(&intent.agent_name, intent.message_id, KEY)),
-                            "pool-open failure must preserve the normalized original retry claim"
+                            "connection-open failure must preserve the normalized original retry claim"
                         );
                     }
                     replay_queued_ack_intents(&ctx, &pool, &config).await;
@@ -5973,6 +6028,7 @@ mod tests {
             std::fs::read(blocked_parent).unwrap(),
             b"unavailable database parent"
         );
+        assert!(!unavailable_database.exists());
     }
 
     #[test]
