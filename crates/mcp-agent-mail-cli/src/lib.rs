@@ -19761,13 +19761,33 @@ fn emit_proxied_file_reservations_output(
                 ));
             }
         }
-        FileReservationsCommand::Renew { .. } => {
+        FileReservationsCommand::Renew { paths, ids, .. } => {
             let rows = payload
                 .get("file_reservations")
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             output::success(&format!("Renewed {} reservation(s).", rows.len()));
+            // br-kp1in.24 / GH#329: name the requested ids that renewed nothing.
+            if paths.is_empty() && !ids.is_empty() {
+                let renewed: std::collections::BTreeSet<i64> = rows
+                    .iter()
+                    .filter_map(|row| row.get("id").and_then(serde_json::Value::as_i64))
+                    .collect();
+                let missed: Vec<String> = ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|id| !renewed.contains(id))
+                    .map(ToString::to_string)
+                    .collect();
+                if !missed.is_empty() {
+                    output::warn(&format!(
+                        "Reservation id(s) {} renewed nothing: not found, released, or not held by this agent.",
+                        missed.join(", ")
+                    ));
+                }
+            }
             let mut table = output::CliTable::new(vec!["ID", "PATTERN", "NEW EXPIRES"]);
             for r in &rows {
                 let id = r.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
@@ -19787,7 +19807,12 @@ fn emit_proxied_file_reservations_output(
             }
             table.render();
         }
-        FileReservationsCommand::Release { project, agent, .. } => {
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => {
             if payload.get("queued").and_then(serde_json::Value::as_bool) == Some(true)
                 || payload.get("status").and_then(serde_json::Value::as_str) == Some("queued")
             {
@@ -19805,6 +19830,17 @@ fn emit_proxied_file_reservations_output(
             output::success(&format!(
                 "Released {released} reservation(s) for {agent} in {project}."
             ));
+            // br-kp1in.24 / GH#329: an explicit id that released nothing must
+            // not pass silently; the caller would believe the lease is gone.
+            let distinct_ids = ids.iter().collect::<std::collections::BTreeSet<_>>().len();
+            let requested = i64::try_from(distinct_ids).unwrap_or(i64::MAX);
+            if paths.is_empty() && released < requested {
+                output::warn(&format!(
+                    "{} of {requested} requested reservation id(s) released nothing: not found, \
+                     already released, or not held by {agent}.",
+                    requested - released
+                ));
+            }
         }
         _ => {}
     }
@@ -30951,6 +30987,20 @@ fn doctor_db_covers_archive_cheap_probe(
         })
 }
 
+/// The full archive inventory for a drift decision against `db`, or `None`
+/// when there is no archive or the filename-only probe already proves the DB
+/// covers it (then no drift can be reported and parsing every message file
+/// would be wasted work).
+fn doctor_archive_inventory_for_drift(
+    storage_root: &Path,
+    probe: Option<&DoctorArchiveCheapProbe>,
+    db: &DoctorDbInventory,
+) -> Option<DoctorArchiveInventory> {
+    let probe = probe?;
+    (!doctor_db_covers_archive_cheap_probe(probe, db))
+        .then(|| collect_doctor_archive_inventory(storage_root))
+}
+
 /// Collect the cheap archive probe across every project directory.
 fn collect_doctor_archive_cheap_probe(storage_root: &Path) -> DoctorArchiveCheapProbe {
     let mut probe = DoctorArchiveCheapProbe::default();
@@ -32266,7 +32316,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     storage_root_is_explicit: bool,
     archive_root: &Path,
     archive_available: bool,
-    archive_inventory: Option<DoctorArchiveInventory>,
+    archive_probe: Option<&DoctorArchiveCheapProbe>,
     archive_reconstruct_available: bool,
 ) -> CliResult<DoctorDatabaseFixStrategy> {
     let opened = match open_db_for_doctor_check_read_only_with_context(database_url) {
@@ -32320,7 +32370,6 @@ fn doctor_database_fix_strategy_read_only_probes(
     }
 
     if archive_available {
-        let archive = archive_inventory.clone().unwrap_or_default();
         let db = match collect_doctor_db_inventory_canonical(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
@@ -32331,14 +32380,16 @@ fn doctor_database_fix_strategy_read_only_probes(
                 ));
             }
         };
-        if doctor_archive_is_authoritative_for_db(
-            &archive,
-            &db,
-            Path::new(&opened.opened_path),
-            storage_root,
-            storage_root_is_explicit,
-        ) && let Some(strategy) =
-            doctor_reconstruct_strategy_for_archive_drift(&archive, &db, archive_root)
+        if let Some(archive) = doctor_archive_inventory_for_drift(storage_root, archive_probe, &db)
+            && doctor_archive_is_authoritative_for_db(
+                &archive,
+                &db,
+                Path::new(&opened.opened_path),
+                storage_root,
+                storage_root_is_explicit,
+            )
+            && let Some(strategy) =
+                doctor_reconstruct_strategy_for_archive_drift(&archive, &db, archive_root)
         {
             return Ok(strategy);
         }
@@ -32497,11 +32548,13 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
 
     let archive_root = storage_root.join("projects");
     let archive_available = path_is_real_directory(&archive_root);
-    let archive_inventory =
-        archive_available.then(|| collect_doctor_archive_inventory(storage_root));
-    let archive_has_state = archive_inventory
+    // br-kp1in.18: `am doctor health` (run at every agent session start)
+    // judges from the filename-only probe; the per-message parse happens only
+    // for a drift decision the probe cannot settle.
+    let archive_probe = archive_available.then(|| collect_doctor_archive_cheap_probe(storage_root));
+    let archive_has_state = archive_probe
         .as_ref()
-        .is_some_and(|inventory| inventory.counts() != DoctorInventoryCounts::default());
+        .is_some_and(|probe| probe.counts != DoctorInventoryCounts::default());
     let resolved_path = resolve_sqlite_runtime_path(&configured_path);
     let resolved = Path::new(&resolved_path);
     let storage_root_is_explicit = storage_root_is_effectively_explicit(storage_root);
@@ -32616,7 +32669,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             storage_root_is_explicit,
             &archive_root,
             archive_available,
-            archive_inventory,
+            archive_probe.as_ref(),
             archive_reconstruct_available,
         );
     }
@@ -32668,7 +32721,6 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     }
 
     if archive_available {
-        let archive = archive_inventory.clone().unwrap_or_default();
         let db = match collect_doctor_db_inventory(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
@@ -32679,14 +32731,17 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                 ));
             }
         };
-        if doctor_archive_is_authoritative_for_db(
-            &archive,
-            &db,
-            resolved,
-            storage_root,
-            storage_root_is_explicit,
-        ) && let Some(strategy) =
-            doctor_reconstruct_strategy_for_archive_drift(&archive, &db, &archive_root)
+        if let Some(archive) =
+            doctor_archive_inventory_for_drift(storage_root, archive_probe.as_ref(), &db)
+            && doctor_archive_is_authoritative_for_db(
+                &archive,
+                &db,
+                resolved,
+                storage_root,
+                storage_root_is_explicit,
+            )
+            && let Some(strategy) =
+                doctor_reconstruct_strategy_for_archive_drift(&archive, &db, &archive_root)
         {
             return Ok(strategy);
         }
@@ -69943,6 +69998,83 @@ startup_timeout_sec = 42
             released.is_some(),
             "released_ts must be set after overlap release"
         );
+    }
+
+    #[test]
+    fn integration_file_reservations_release_reports_ids_that_released_nothing() {
+        // br-kp1in.24 / GH#329: `--ids 1 999999` used to print only
+        // "Released 1 reservation(s)", hiding that 999999 released nothing.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let release = |ids: Vec<i64>| {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.sqlite3");
+            drop(seed_acks_and_reservations_db(&db_path));
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let result = run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Release {
+                    project: "test-proj".to_string(),
+                    agent: "BlueLake".to_string(),
+                    paths: vec![],
+                    ids,
+                },
+            );
+            let output = capture.drain_to_string();
+            assert!(result.is_ok(), "release failed: {result:?}");
+            output
+        };
+
+        // A duplicate of a released id is not an extra miss.
+        let output = release(vec![1, 999_999, 1]);
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(
+            output.contains("1 of 2 requested reservation id(s) released nothing"),
+            "{output}"
+        );
+
+        let output = release(vec![1]);
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(!output.contains("released nothing"), "{output}");
+    }
+
+    #[test]
+    fn integration_file_reservations_renew_names_ids_that_renewed_nothing() {
+        // br-kp1in.24 / GH#329, renew side.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let renew = |ids: Vec<i64>| {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.sqlite3");
+            drop(seed_acks_and_reservations_db(&db_path));
+            let capture = ftui_runtime::StdioCapture::install().unwrap();
+            let result = run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Renew {
+                    project: "test-proj".to_string(),
+                    agent: "BlueLake".to_string(),
+                    extend_seconds: 600,
+                    paths: vec![],
+                    ids,
+                },
+            );
+            let output = capture.drain_to_string();
+            assert!(result.is_ok(), "renew failed: {result:?}");
+            output
+        };
+
+        let output = renew(vec![1, 424_242]);
+        assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
+        assert!(
+            output.contains("Reservation id(s) 424242 renewed nothing"),
+            "{output}"
+        );
+
+        let output = renew(vec![1]);
+        assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
+        assert!(!output.contains("renewed nothing"), "{output}");
     }
 
     #[test]
