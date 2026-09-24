@@ -80,7 +80,7 @@ ARG AM_REF=main
 ARG SIBLING_REF=main
 ARG SIBLING_FALLBACK_REF=main
 # Keep in lock-step with FRANKENSEARCH_COMMIT in .github/workflows/dist.yml.
-ARG FRANKENSEARCH_COMMIT=dd093fb230404ab08be2ed6f27776ed6c4796485
+ARG FRANKENSEARCH_COMMIT=616c9a7a6bdada97d81f760808996911ba3be294
 
 # Clone the sibling checkouts that /Cargo.toml still resolves through a `path`,
 # so they're cached separately from the project source layer.

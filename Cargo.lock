@@ -169,7 +169,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -180,7 +180,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -755,7 +755,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -772,7 +772,7 @@ dependencies = [
  "maybe-owned",
  "rustix 1.1.5",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -852,6 +852,7 @@ dependencies = [
  "cipher",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1142,9 +1143,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.1"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
 ]
@@ -1637,7 +1638,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1798,7 +1799,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2139,8 +2140,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.6.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.6.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "asupersync 0.5.0",
  "frankensearch-core",
@@ -2155,8 +2156,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "asupersync 0.5.0",
  "compact_str 0.10.0",
@@ -2171,8 +2172,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "asupersync 0.5.0",
  "frankensearch-core",
@@ -2188,8 +2189,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fusion"
-version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "ahash",
  "asupersync 0.5.0",
@@ -2208,8 +2209,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2231,8 +2232,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-lexical"
-version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "asupersync 0.5.0",
  "frankensearch-core",
@@ -2245,8 +2246,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-quill"
-version = "0.3.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2272,8 +2273,8 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.4.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=dd093fb230404ab08be2ed6f27776ed6c4796485#dd093fb230404ab08be2ed6f27776ed6c4796485"
+version = "0.4.1"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=616c9a7a6bdada97d81f760808996911ba3be294#616c9a7a6bdada97d81f760808996911ba3be294"
 dependencies = [
  "asupersync 0.5.0",
  "bytemuck",
@@ -4792,7 +4793,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5745,7 +5746,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5985,7 +5986,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6430,7 +6431,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6844,7 +6845,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7288,7 +7289,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7463,7 +7464,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7880,7 +7881,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8656,7 +8657,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

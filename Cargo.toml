@@ -139,11 +139,12 @@ socketpair = { version = "=0.19.8", default-features = false }
 # FRANKENSEARCH_COMMIT and the container/source-installer provenance record.
 # The reranker consumes the caller's Cx, so its runtime must move together
 # with SQLModel and FastMCP to Asupersync 0.5.
-frankensearch = { version = "0.6.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485", default-features = false, features = ["lexical-tantivy"] }
-frankensearch-core = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485" }
-frankensearch-embed = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485", default-features = false }
-frankensearch-index = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485" }
-frankensearch-fusion = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "dd093fb230404ab08be2ed6f27776ed6c4796485" }
+# This revision also shares FastMCP's exact rustix 1.1.5 requirement.
+frankensearch = { version = "0.6.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "616c9a7a6bdada97d81f760808996911ba3be294", default-features = false, features = ["lexical-tantivy"] }
+frankensearch-core = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "616c9a7a6bdada97d81f760808996911ba3be294" }
+frankensearch-embed = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "616c9a7a6bdada97d81f760808996911ba3be294", default-features = false }
+frankensearch-index = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "616c9a7a6bdada97d81f760808996911ba3be294" }
+frankensearch-fusion = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "616c9a7a6bdada97d81f760808996911ba3be294" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
