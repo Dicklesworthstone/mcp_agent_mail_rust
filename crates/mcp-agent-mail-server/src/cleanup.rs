@@ -2070,8 +2070,17 @@ mod tests {
         };
         // Preserve the table and its data while making the actual mail query
         // unavailable. No mocked outcome and no mutation of an operator DB.
-        if let Err(error) =
-            conn.execute_sync("ALTER TABLE messages RENAME TO cleanup_saved_messages", &[])
+        // DDL on a pooled FrankenSQLite connection runs in an explicit
+        // transaction, as production DDL does (begin_immediate_tx): an
+        // autocommit ALTER there is refused as stale_schema_change_snapshot
+        // even with no concurrent writer, while a fresh connection or an
+        // explicit transaction succeeds (br-t31jg item 5).
+        if let Err(error) = conn
+            .execute_raw("BEGIN IMMEDIATE")
+            .and_then(|()| {
+                conn.execute_raw("ALTER TABLE messages RENAME TO cleanup_saved_messages")
+            })
+            .and_then(|()| conn.execute_raw("COMMIT"))
         {
             // Preserve the original failure while exposing the engine's
             // validation reason on this same connection, before it is dropped.
@@ -2108,7 +2117,11 @@ mod tests {
                 panic!("reacquire fixture connection panicked: {payload:?}")
             }
         };
-        conn.execute_sync("ALTER TABLE cleanup_saved_messages RENAME TO messages", &[])
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .and_then(|()| {
+                conn.execute_raw("ALTER TABLE cleanup_saved_messages RENAME TO messages")
+            })
+            .and_then(|()| conn.execute_raw("COMMIT"))
             .expect("restore mail evidence");
         drop(conn);
         assert_eq!(
