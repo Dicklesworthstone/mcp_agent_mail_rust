@@ -487,6 +487,126 @@ thread_local! {
     static ARCHIVE_MUTATION_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Who holds `ARCHIVE_PUBLICATION_FENCE` (br-kp1in.29/.13). Every archive
+/// writer serializes on the fence; a 2026-09-24 stack capture of a wedged
+/// drain showed all of them queued on it while no thread held it on its
+/// stack, so the holder is recorded instead of inferred from stacks.
+struct FenceHolderRecord {
+    thread: String,
+    site: &'static std::panic::Location<'static>,
+    since: Instant,
+}
+
+static FENCE_HOLDER: Mutex<Option<FenceHolderRecord>> = Mutex::new(None);
+
+/// A contended fence wait at least this long is reported with its blocker.
+const FENCE_WAIT_REPORT_AFTER: Duration = Duration::from_secs(2);
+
+/// The current holder of the archive publication fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveFenceHolder {
+    /// Holding thread, as `name (ThreadId(n))`.
+    pub thread: String,
+    /// Source location (`file:line:column`) that acquired the fence.
+    pub site: String,
+    /// How long the fence has been held.
+    pub held_for: Duration,
+}
+
+impl std::fmt::Display for ArchiveFenceHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at {} for {} ms",
+            self.thread,
+            self.site,
+            self.held_for.as_millis()
+        )
+    }
+}
+
+/// The current holder of the archive publication fence, if any. Stall
+/// watchdogs and health report it, so a blocked archive drain names the
+/// holder that blocks it.
+#[must_use]
+pub fn archive_publication_fence_holder() -> Option<ArchiveFenceHolder> {
+    let record = FENCE_HOLDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    record.as_ref().map(|record| ArchiveFenceHolder {
+        thread: record.thread.clone(),
+        site: record.site.to_string(),
+        held_for: record.since.elapsed(),
+    })
+}
+
+/// Report text for a contended fence wait, or `None` below the threshold.
+fn fence_contention_report(
+    waited: Duration,
+    waiter: &std::panic::Location<'_>,
+    blocker: Option<&ArchiveFenceHolder>,
+) -> Option<String> {
+    (waited >= FENCE_WAIT_REPORT_AFTER).then(|| {
+        let blocker = blocker.map_or_else(|| "an unrecorded holder".to_string(), ToString::to_string);
+        format!(
+            "archive publication fence contended: {waiter} waited {} ms; held by {blocker} when the wait began",
+            waited.as_millis()
+        )
+    })
+}
+
+/// A held archive publication fence. The holder record is set after the lock
+/// is taken and cleared before it is released, so it is never stale.
+struct FenceLease {
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl FenceLease {
+    #[track_caller]
+    fn acquire() -> Self {
+        let site = std::panic::Location::caller();
+        let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let blocker = archive_publication_fence_holder();
+                let started = Instant::now();
+                let guard = ARCHIVE_PUBLICATION_FENCE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(report) =
+                    fence_contention_report(started.elapsed(), site, blocker.as_ref())
+                {
+                    tracing::warn!("{report}");
+                }
+                guard
+            }
+        };
+        let thread = std::thread::current();
+        *FENCE_HOLDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FenceHolderRecord {
+            thread: format!(
+                "{} ({:?})",
+                thread.name().unwrap_or("<unnamed>"),
+                thread.id()
+            ),
+            site,
+            since: Instant::now(),
+        });
+        Self { guard: Some(guard) }
+    }
+}
+
+impl Drop for FenceLease {
+    fn drop(&mut self) {
+        *FENCE_HOLDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        drop(self.guard.take());
+    }
+}
+
 /// File name of the persisted per-repo mutation epoch token, stored inside the
 /// archive's Git directory so it is never visible to `git status` and never
 /// tracked. Content: one format-version byte (`'1'`) followed by a random
@@ -611,7 +731,7 @@ fn read_archive_epoch_token(git_dir: &Path) -> Option<String> {
 }
 
 struct ArchiveMutationGuard {
-    fence: Option<std::sync::MutexGuard<'static, ()>>,
+    fence: Option<FenceLease>,
     /// Mutated path anchoring the persisted epoch rewrite; `Some` only for the
     /// outermost guard of a window that was opened with `begin_at`. The
     /// enclosing repo is re-resolved on each edge so a window that CREATES the
@@ -620,6 +740,7 @@ struct ArchiveMutationGuard {
 }
 
 impl ArchiveMutationGuard {
+    #[track_caller]
     fn begin() -> Self {
         Self::begin_inner(None)
     }
@@ -628,21 +749,25 @@ impl ArchiveMutationGuard {
     /// at or beneath the mutated archive). In addition to the in-process
     /// epoch/fence, the outermost guard rewrites the persisted per-repo epoch
     /// token on both edges so readers in other processes observe the window.
+    #[track_caller]
     fn begin_at(path: &Path) -> Self {
         Self::begin_inner(Some(path))
     }
 
+    #[track_caller]
     fn begin_inner(anchor: Option<&Path>) -> Self {
         let outermost = ARCHIVE_MUTATION_DEPTH.with(|depth| {
             let outermost = depth.get() == 0;
             depth.set(depth.get().saturating_add(1));
             outermost
         });
-        let fence = outermost.then(|| {
-            ARCHIVE_PUBLICATION_FENCE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        // Not a closure: #[track_caller] does not propagate through closures,
+        // and the lease records the caller of `begin`/`begin_at`.
+        let fence = if outermost {
+            Some(FenceLease::acquire())
+        } else {
+            None
+        };
         let epoch_anchor = if outermost {
             anchor.map(Path::to_path_buf)
         } else {
@@ -678,6 +803,7 @@ impl Drop for ArchiveMutationGuard {
 
 /// Run a non-blocking snapshot publication check while physical archive
 /// mutations are excluded. The callback must not initiate an archive write.
+#[track_caller]
 pub fn with_archive_snapshot_publication_fence<T>(publish: impl FnOnce() -> T) -> T {
     // Latent self-deadlock guard (concurrency audit F3): the publication fence
     // is a plain, NON-reentrant `Mutex`. A thread already inside an
@@ -693,9 +819,7 @@ pub fn with_archive_snapshot_publication_fence<T>(publish: impl FnOnce() -> T) -
          ArchiveMutationGuard window; the fence mutex is non-reentrant and \
          this self-deadlocks"
     );
-    let _fence = ARCHIVE_PUBLICATION_FENCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _fence = FenceLease::acquire();
     publish()
 }
 
@@ -13153,6 +13277,96 @@ mod tests {
                 ("AM_ALLOW_HOME_STORAGE_ROOT", allow_home_storage_root),
             ]
         }
+    }
+
+    /// br-kp1in.29/.13: while a guard holds the publication fence the holder
+    /// record names that thread and its `begin` call site; a contending
+    /// thread takes over the record after the handoff.
+    #[test]
+    fn archive_fence_holder_names_the_holding_thread_and_call_site() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::Builder::new()
+            .name("fence-holder-probe".to_string())
+            .spawn(move || {
+                let begin_line = line!() + 1;
+                let guard = ArchiveMutationGuard::begin();
+                held_tx.send(begin_line).expect("report the begin line");
+                release_rx.recv().expect("wait for release");
+                drop(guard);
+            })
+            .expect("spawn fence holder");
+        let begin_line = held_rx.recv().expect("fence held");
+        let current =
+            archive_publication_fence_holder().expect("a held fence has a recorded holder");
+        assert!(
+            current.thread.starts_with("fence-holder-probe ("),
+            "{current}"
+        );
+        assert!(
+            current.site.contains(&format!("lib.rs:{begin_line}:")),
+            "{current}"
+        );
+
+        // A contender blocks (the WouldBlock path) and records itself once
+        // the holder releases.
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::Builder::new()
+            .name("fence-waiter-probe".to_string())
+            .spawn(move || {
+                let guard = ArchiveMutationGuard::begin();
+                waiter_tx
+                    .send(archive_publication_fence_holder())
+                    .expect("report the new holder");
+                drop(guard);
+            })
+            .expect("spawn fence waiter");
+        std::thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        let after_handoff = waiter_rx.recv().expect("waiter acquired the fence");
+        waiter.join().expect("waiter thread");
+        assert!(
+            after_handoff.is_some_and(|holder| holder.thread.starts_with("fence-waiter-probe (")),
+            "the contender must be recorded after the handoff"
+        );
+        assert!(
+            archive_publication_fence_holder().is_none_or(|holder| {
+                !holder.thread.starts_with("fence-holder-probe")
+                    && !holder.thread.starts_with("fence-waiter-probe")
+            }),
+            "a released lease must not stay recorded"
+        );
+    }
+
+    #[test]
+    fn fence_contention_report_names_the_blocker_only_past_the_threshold() {
+        let waiter = std::panic::Location::caller();
+        let blocker = ArchiveFenceHolder {
+            thread: "commit-coalesce (ThreadId(7))".to_string(),
+            site: "crates/example.rs:10:5".to_string(),
+            held_for: Duration::from_secs(3),
+        };
+        assert_eq!(
+            fence_contention_report(
+                FENCE_WAIT_REPORT_AFTER - Duration::from_millis(1),
+                waiter,
+                Some(&blocker)
+            ),
+            None
+        );
+        let report = fence_contention_report(Duration::from_millis(2_500), waiter, Some(&blocker))
+            .expect("a wait past the threshold is reported");
+        assert!(report.contains("waited 2500 ms"), "{report}");
+        assert!(
+            report.contains(
+                "held by commit-coalesce (ThreadId(7)) at crates/example.rs:10:5 for 3000 ms"
+            ),
+            "{report}"
+        );
+        let unknown = fence_contention_report(FENCE_WAIT_REPORT_AFTER, waiter, None)
+            .expect("reported even without a recorded holder");
+        assert!(unknown.contains("an unrecorded holder"), "{unknown}");
     }
 
     #[test]

@@ -1986,9 +1986,15 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
     let archive_drain_stall = archive_wbq_drain_stalled.then(|| {
+        // br-kp1in.29/.13: every archive writer serializes on the publication
+        // fence; naming its holder makes a stalled drain self-diagnosing.
+        let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder()
+            .map_or_else(String::new, |holder| {
+                format!("; archive publication fence held by {holder}")
+            });
         format!(
             "wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms, \
-             critical bound {} ms",
+             critical bound {} ms{fence_holder}",
             archive_lag.wbq_depth,
             archive_lag.wbq_inflight_execution_us / 1_000,
             archive_lag.wbq_since_progress_us / 1_000,
