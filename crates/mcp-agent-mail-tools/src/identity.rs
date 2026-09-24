@@ -1552,8 +1552,12 @@ pub struct ArchiveLagHealthResponse {
     /// How long the WBQ drain has been executing its current batch, ms.
     #[serde(default)]
     pub wbq_inflight_execution_ms: u64,
-    /// True when one WBQ batch has been executing past the critical bound:
-    /// the drain is stuck, not merely behind.
+    /// How long queued WBQ work has waited without a completed op, ms.
+    #[serde(default)]
+    pub wbq_since_progress_ms: u64,
+    /// True when one WBQ batch has been executing past the critical bound, or
+    /// queued work has seen no completed op for that long (dead drain): the
+    /// drain is stuck, not merely behind.
     #[serde(default)]
     pub drain_stalled: bool,
 }
@@ -1934,10 +1938,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let archive_lag_warn_us = mcp_agent_mail_storage::archive_lag_warn_threshold_us();
     let archive_lag_critical_us = mcp_agent_mail_storage::archive_lag_critical_threshold_us();
     let archive_lag_oldest_us = archive_lag.oldest_unmaterialized_us;
-    // br-kp1in.23: one batch executing past the critical bound means the drain
-    // is blocked (observed 2026-09-23: zero progress while thousands queued).
-    let archive_wbq_drain_stalled =
-        archive_lag.wbq_inflight_execution_us >= archive_lag_critical_us;
+    // br-kp1in.23: one batch executing past the critical bound, or queued work
+    // with no completed op for that long (e.g. a dead drain thread), means the
+    // drain is blocked (observed 2026-09-23: zero progress while thousands queued).
+    let archive_wbq_drain_stalled = archive_lag.wbq_inflight_execution_us
+        >= archive_lag_critical_us
+        || archive_lag.wbq_since_progress_us >= archive_lag_critical_us;
 
     // Refresh the cached health level (pressure-derived) from live metrics.
     let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
@@ -2007,12 +2013,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "archive_lag".to_string(),
             level: archive_lag_level.to_string(),
             detail: format!(
-                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms{}",
+                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms{}",
                 archive_lag_oldest_us / 1_000,
                 archive_lag_warn_us / 1_000,
                 archive_lag_critical_us / 1_000,
                 archive_lag.wbq_depth,
                 archive_lag.wbq_inflight_execution_us / 1_000,
+                archive_lag.wbq_since_progress_us / 1_000,
                 if archive_wbq_drain_stalled {
                     " — DRAIN STALLED"
                 } else {
@@ -2147,6 +2154,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                         archive_lag.wbq_inflight_oldest_age_us,
                     ),
                     wbq_inflight_execution_ms: us_to_ms_ceil(archive_lag.wbq_inflight_execution_us),
+                    wbq_since_progress_ms: us_to_ms_ceil(archive_lag.wbq_since_progress_us),
                     drain_stalled: archive_wbq_drain_stalled,
                 },
             }

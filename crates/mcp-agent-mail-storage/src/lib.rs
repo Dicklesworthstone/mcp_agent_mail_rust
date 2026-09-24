@@ -985,6 +985,9 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     let channel_capacity = config.wbq_channel_capacity;
     let drain_batch_cap = config.wbq_drain_batch_cap;
     let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
+    // A (re)started drain is the progress baseline: salvaged ops it never
+    // drains still read as stalled (br-kp1in.23).
+    WBQ_LAST_PROGRESS_US.store(now_micros_u64().max(1), Ordering::Relaxed);
 
     // br-b9x63: a dead drain thread leaves its buffered ops in the old
     // channel. Salvage them into the fresh channel instead of silently
@@ -1079,6 +1082,15 @@ fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
     metrics.storage.wbq_enqueued_total.inc();
 
     let depth = op_depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if depth == 1 {
+        // The queue was empty: waiting starts now, not at the last drained op.
+        let _ = WBQ_BACKLOG_SINCE_US.compare_exchange(
+            0,
+            now_micros_u64().max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
     // GH#225: the gauge must be updated with a commuting delta, not
     // `set(depth)`. A racing enqueue/drain pair can otherwise apply their
     // `set`s out of order, permanently stranding the gauge one above the
@@ -2201,6 +2213,11 @@ pub struct ArchiveLagSnapshot {
     /// 0 when idle. A value that keeps growing means the drain is stuck.
     #[serde(default)]
     pub wbq_inflight_execution_us: u64,
+    /// How long (microseconds) queued WBQ work has waited without the drain
+    /// completing a single op; 0 when the queue is empty. Unlike the in-flight
+    /// age this also grows when the drain thread is dead or never dequeues.
+    #[serde(default)]
+    pub wbq_since_progress_us: u64,
 }
 
 /// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
@@ -2226,6 +2243,43 @@ fn wbq_mark_batch_in_flight(batch: &[WbqOpEnvelope]) {
 fn wbq_clear_batch_in_flight() {
     WBQ_INFLIGHT_SINCE_US.store(0, Ordering::Relaxed);
     WBQ_INFLIGHT_OLDEST_ENQUEUED_US.store(0, Ordering::Relaxed);
+}
+
+/// Wall-clock µs of the drain's last completed op (or its start); 0 = never.
+static WBQ_LAST_PROGRESS_US: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock µs at which the queue last went from empty to non-empty;
+/// 0 while it is empty.
+static WBQ_BACKLOG_SINCE_US: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the drain completed ops, leaving `depth_after` queued.
+fn wbq_note_drain_progress(depth_after: u64) {
+    WBQ_LAST_PROGRESS_US.store(now_micros_u64().max(1), Ordering::Relaxed);
+    if depth_after == 0 {
+        WBQ_BACKLOG_SINCE_US.store(0, Ordering::Relaxed);
+    }
+}
+
+/// How long queued work has waited without the drain completing an op.
+///
+/// Measured from the later of the last completed op and the moment the queue
+/// became non-empty, so the first enqueue after a long idle period is not a
+/// stall. Unknown anchors report 0 rather than a false stall.
+const fn wbq_since_progress_us(
+    now_us: u64,
+    depth: u64,
+    last_progress_us: u64,
+    backlog_since_us: u64,
+) -> u64 {
+    let anchor = if last_progress_us > backlog_since_us {
+        last_progress_us
+    } else {
+        backlog_since_us
+    };
+    if depth == 0 || anchor == 0 {
+        0
+    } else {
+        now_us.saturating_sub(anchor)
+    }
 }
 
 /// `(oldest in-flight op age, in-flight execution time)` in µs at `now_us`.
@@ -2256,23 +2310,33 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
     let (coalescer_pending, coalescer_oldest_age_us) = COMMIT_COALESCER.get().map_or((0, 0), |c| {
         (c.pending_requests(), c.oldest_pending_age_us())
     });
-    let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) =
-        wbq_inflight_ages_us(now_micros_u64());
+    let now_us = now_micros_u64();
+    let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) = wbq_inflight_ages_us(now_us);
     let wbq_depth = mcp_agent_mail_core::global_metrics()
         .storage
         .wbq_depth
         .load();
+    let wbq_since_progress_us = wbq_since_progress_us(
+        now_us,
+        wbq_depth,
+        WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
+        WBQ_BACKLOG_SINCE_US.load(Ordering::Relaxed),
+    );
     ArchiveLagSnapshot {
         backlog_depth,
         backlog_oldest_age_us,
         coalescer_pending,
         coalescer_oldest_age_us,
+        // Queued work that has not advanced for this long is at least this
+        // stale, even when no batch is in flight (dead or idle drain).
         oldest_unmaterialized_us: backlog_oldest_age_us
             .max(coalescer_oldest_age_us)
-            .max(wbq_inflight_oldest_age_us),
+            .max(wbq_inflight_oldest_age_us)
+            .max(wbq_since_progress_us),
         wbq_depth,
         wbq_inflight_oldest_age_us,
         wbq_inflight_execution_us,
+        wbq_since_progress_us,
         enqueued_total: backlog.enqueued_total.load(Ordering::Relaxed),
         drained_total: backlog.drained_total.load(Ordering::Relaxed),
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
@@ -3098,6 +3162,7 @@ fn wbq_drain_loop(
 
         metrics.storage.wbq_drained_total.add(drained_u64);
         wbq_clear_batch_in_flight();
+        wbq_note_drain_progress(op_depth.load(Ordering::Relaxed));
         metrics
             .storage
             .wbq_errors_total
@@ -3161,6 +3226,7 @@ fn wbq_drain_loop(
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
                 metrics.storage.wbq_drained_total.inc();
                 wbq_clear_batch_in_flight();
+                wbq_note_drain_progress(op_depth.load(Ordering::Relaxed));
                 if let Err(error) = r {
                     // Same exhausted-retry semantics as the main drain
                     // branch — failures here are also rows the API
@@ -17991,6 +18057,34 @@ mod tests {
         // A clock step backwards never produces a huge bogus age.
         assert_eq!(wbq_inflight_ages_us(100), (0, 0));
         wbq_clear_batch_in_flight();
+    }
+
+    /// br-kp1in.23: queued work with no completed op is a stall even when no
+    /// batch is in flight (dead drain), but a fresh backlog after a long idle
+    /// period is not.
+    #[test]
+    fn wbq_since_progress_measures_waiting_work_not_idle_time() {
+        // Empty queue: never a stall, however old the last progress.
+        assert_eq!(wbq_since_progress_us(10_000_000, 0, 1, 0), 0);
+        // Drain dead since it started at t=1 s with salvaged work queued.
+        assert_eq!(
+            wbq_since_progress_us(61_000_000, 5, 1_000_000, 0),
+            60_000_000
+        );
+        // Idle for an hour, then one op enqueued 2 ms ago: 2 ms, not an hour.
+        assert_eq!(
+            wbq_since_progress_us(3_600_002_000, 1, 1, 3_600_000_000),
+            2_000
+        );
+        // Steady load: measured from the last completed op.
+        assert_eq!(
+            wbq_since_progress_us(5_000_500, 40, 5_000_000, 1_000_000),
+            500
+        );
+        // No anchor at all: report nothing rather than a bogus stall.
+        assert_eq!(wbq_since_progress_us(5_000_000, 3, 0, 0), 0);
+        // Clock stepped backwards: saturate at 0.
+        assert_eq!(wbq_since_progress_us(10, 3, 1_000, 0), 0);
     }
 
     #[test]

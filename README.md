@@ -815,7 +815,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
 | `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
-| `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
+| `am robot reservations` | Reservation view with conflict/expiry awareness; JSON entries carry absolute `granted_ts`/`expires_ts` (RFC 3339 UTC) and integer `remaining_seconds`/`granted_age_seconds` next to the humanized `remaining` | `--all`, `--conflicts`, `--expiring`, `--agent` |
 | `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
 | `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
