@@ -121,7 +121,7 @@ walkdir = "2"
 tantivy = { git = "https://github.com/quickwit-oss/tantivy", rev = "1f32c1a8af0eb9d68bd3f5576caf20941364b657" }
 indexmap = "2"
 nix = "0.31.3"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 url = "2.5.8"
 signal-hook = "0.4.4"
 winsafe = { version = "=0.0.29", features = ["kernel"] }
@@ -194,16 +194,17 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Preserve GH321 proposal negotiation on FastMCP's Asupersync 0.5 line;
-# registry 0.10.0 predates this fix. Keep all framework crates together.
-fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
-fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1c2e5e4b61a839ebcc430e7bacbc94d4d3205102" }
+# Preserve GH321 proposal negotiation and GH332 empty-extension-header admission
+# on FastMCP's Asupersync 0.5 line; registry 0.10.0 predates both fixes.
+# Keep all framework crates together.
+fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
+fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
 # Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
 # The mailbox uses the separate 0.4.4 compatibility revision below.
