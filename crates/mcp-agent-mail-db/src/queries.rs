@@ -3961,7 +3961,8 @@ async fn cleanup_committed_message_after_consistency_failure(
 /// Maximum retry attempts for MVCC write conflicts (`BEGIN CONCURRENT`
 /// page-level collisions) and plain `SQLite` write contention.
 ///
-/// Read once from `FSQLITE_CONCURRENT_RETRIES` env var; default 16.
+/// Read once from `Config::fsqlite_concurrent_retries` (`FSQLITE_CONCURRENT_RETRIES`,
+/// default 16, one parse shared with the rest of the config surface).
 ///
 /// History:
 ///   - 5  → 8: exponential backoff (25ms..2s) gets ~5s total budget to
@@ -3977,10 +3978,7 @@ async fn cleanup_committed_message_after_consistency_failure(
 ///     abandons the blocking thread. The retry count is unchanged; see
 ///     [`mvcc_backoff`] for the full budget arithmetic.
 static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-    std::env::var("FSQLITE_CONCURRENT_RETRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+    u32::try_from(mcp_agent_mail_core::Config::get().fsqlite_concurrent_retries).unwrap_or(u32::MAX)
 });
 
 /// Global counter: total MVCC retries performed.
@@ -7852,8 +7850,8 @@ async fn elect_message_id_in_tx(
 /// recipient INSERTs) into a single transaction with 1 fsync.
 ///
 /// On MVCC write conflicts (`BEGIN CONCURRENT` page collision), the entire
-/// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 5)
-/// with exponential backoff (10–200 ms).
+/// transaction is retried up to `FSQLITE_CONCURRENT_RETRIES` times (default 16)
+/// with the exponential backoff described at `mvcc_backoff`.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients(
     cx: &Cx,

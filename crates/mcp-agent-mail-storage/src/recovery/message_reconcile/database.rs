@@ -45,9 +45,25 @@ pub struct ReconcileCursor {
     // A byte budget can admit only one message. Resume with the opposite lane
     // after the last consumed item, not unconditionally with new-mail catch-up.
     next_lane_is_history: bool,
+    // Rows created before this instant (µs) predate the reconciling process's
+    // own write-behind queue, so they cannot still be in flight there and need
+    // no grace period. 0 = always apply the grace.
+    settled_before_us: i64,
 }
 
 impl ReconcileCursor {
+    /// Cursor for a reconciler whose process accepted no writes before
+    /// `settled_before_us`. After a crash, the mail that the dead process
+    /// committed but never archived is then eligible on the first pass instead
+    /// of waiting behind a 16-ids-per-pass walk of healthy recent mail.
+    #[must_use]
+    pub fn settled_before(settled_before_us: i64) -> Self {
+        Self {
+            settled_before_us,
+            ..Self::default()
+        }
+    }
+
     fn advance(&mut self, id: i64, tail: bool) {
         if tail {
             self.tail_after = Some(self.tail_after.unwrap_or(0).max(id));
@@ -197,6 +213,7 @@ fn select_ids(
     if identity != cursor.source_identity {
         *cursor = ReconcileCursor {
             source_identity: identity,
+            settled_before_us: cursor.settled_before_us,
             ..Default::default()
         };
     }
@@ -661,7 +678,9 @@ pub fn reconcile_message_batch(
         );
     }
     validate_pool_binding(pool, config)?;
-    let cutoff = mcp_agent_mail_db::now_micros().saturating_sub(NORMAL_ARCHIVE_GRACE_US);
+    let cutoff = mcp_agent_mail_db::now_micros()
+        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
+        .max(cursor.settled_before_us);
     let selected = select_ids(cx, pool, cursor, cutoff)?;
     let mut seen = HashSet::new();
     for (id, tail) in selected {
@@ -1685,6 +1704,38 @@ mod tests {
                     ..Config::default()
                 },
             );
+        });
+    }
+
+    /// br-kp1in.14: mail committed moments before a crash is repaired on the
+    /// restarted reconciler's first pass. The 30 s grace still shields rows
+    /// that this process's own write-behind queue may be writing.
+    #[test]
+    fn rows_predating_the_reconciling_process_skip_the_in_flight_grace() {
+        retention_fixture(3, |cx, pool, config| {
+            let committed_just_before_crash = mcp_agent_mail_db::now_micros();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE messages SET created_ts = {committed_just_before_crash}"
+            ))
+            .unwrap();
+            drop(conn);
+            let stop = AtomicBool::new(false);
+
+            let mut in_process = ReconcileCursor::default();
+            let shielded =
+                reconcile_message_batch(cx, pool, config, &mut in_process, &stop).unwrap();
+            assert_eq!(
+                (shielded.scanned, shielded.repaired),
+                (0, 0),
+                "rows this process may still be writing wait out the grace"
+            );
+
+            let mut restarted = ReconcileCursor::settled_before(committed_just_before_crash + 1);
+            let first = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert_eq!(first.repaired, 3, "{first:?}");
+            let again = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert_eq!(again.repaired, 0, "{again:?}");
         });
     }
 

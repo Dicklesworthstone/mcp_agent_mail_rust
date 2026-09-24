@@ -1872,6 +1872,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     // materialization. The retention worker also reconciles DB-only messages
     // without requiring a client read or retry, matching HTTP/TUI startup.
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::anchor_settled_writes();
     retention::start(config);
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
@@ -4121,6 +4122,7 @@ fn run_http_supervised(
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::anchor_settled_writes();
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
     atc::init_global_atc(config);
@@ -4213,6 +4215,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
+    retention::anchor_settled_writes();
     atc::init_global_atc(config);
     start_atc_operator_runtime(config);
 

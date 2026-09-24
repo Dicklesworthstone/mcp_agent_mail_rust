@@ -670,7 +670,7 @@ All configuration via environment variables. Key variables:
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` (legacy URL form, accepted and normalized; resolves to `./storage.sqlite3` relative to the working directory) | SQLite connection URL |
+| `DATABASE_URL` | `<STORAGE_ROOT>/storage.sqlite3` (the legacy `sqlite+aiosqlite:///./storage.sqlite3` default is re-derived inside `STORAGE_ROOT`; explicit relative paths resolve against the working directory) | SQLite connection URL |
 | `STORAGE_ROOT` | XDG-aware (legacy fallback to `~/.mcp_agent_mail_git_mailbox_repo`) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer an isolated `STORAGE_ROOT` for test/repro runs. |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |

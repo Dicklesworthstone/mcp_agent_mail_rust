@@ -103,25 +103,30 @@ fn resolve_early_dispatch(
     Ok(EarlyDispatch::Mcp)
 }
 
-const fn default_mcp_log_filter() -> &'static str {
-    concat!(
-        "warn,",
-        "mcp_agent_mail=info,",
-        "mcp_agent_mail_server=info,",
-        "mcp_agent_mail_core=info,",
-        "mcp_agent_mail_db=info,",
-        "mcp_agent_mail_storage=info,",
-        "mcp_agent_mail_tools=info,",
-        "fsqlite_core::connection=warn,",
-        "fsqlite_mvcc::observability=warn,",
-        "fsqlite_mvcc::gc=warn,",
-        "fsqlite_mvcc::rebase=warn,",
-        "mvcc=warn,",
-        "checkpoint=warn,",
-        "fsqlite.storage_wiring=warn,",
-        "fsqlite_wal::checkpoint_executor=warn,",
-        "fsqlite_vdbe::jit=warn,",
-        "fsqlite_vdbe::engine=warn",
+/// Agent Mail's own crates log at `log_level` (the canonical `LOG_LEVEL` from
+/// `Config`, br-kp1in.20); dependencies stay at `warn` unless it is stricter.
+fn default_mcp_log_filter(log_level: &str) -> String {
+    if mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level) {
+        return log_level.to_string();
+    }
+    format!(
+        "warn,\
+         mcp_agent_mail={log_level},\
+         mcp_agent_mail_server={log_level},\
+         mcp_agent_mail_core={log_level},\
+         mcp_agent_mail_db={log_level},\
+         mcp_agent_mail_storage={log_level},\
+         mcp_agent_mail_tools={log_level},\
+         fsqlite_core::connection=warn,\
+         fsqlite_mvcc::observability=warn,\
+         fsqlite_mvcc::gc=warn,\
+         fsqlite_mvcc::rebase=warn,\
+         mvcc=warn,\
+         checkpoint=warn,\
+         fsqlite.storage_wiring=warn,\
+         fsqlite_wal::checkpoint_executor=warn,\
+         fsqlite_vdbe::jit=warn,\
+         fsqlite_vdbe::engine=warn"
     )
 }
 
@@ -152,17 +157,23 @@ fn allow_noisy_dependency_logs() -> bool {
     })
 }
 
-fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool) -> EnvFilter {
+/// `RUST_LOG`, when set, replaces the `LOG_LEVEL`-derived default.
+fn build_mcp_log_filter(suppress_runtime_logs_for_tui: bool, log_level: &str) -> EnvFilter {
+    let from_rust_log = env::var_os("RUST_LOG").is_some();
     let mut filter = if suppress_runtime_logs_for_tui {
         EnvFilter::new("off")
     } else {
         EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter()))
+            .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter(log_level)))
     };
     if suppress_runtime_logs_for_tui {
         return filter;
     }
-    if allow_noisy_dependency_logs() {
+    // The warn-level clamps would loosen a stricter LOG_LEVEL for dependencies.
+    if allow_noisy_dependency_logs()
+        || (!from_rust_log
+            && mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level))
+    {
         return filter;
     }
     for raw in noisy_dependency_log_clamp_directives() {
@@ -724,7 +735,7 @@ fn main() {
     let suppress_runtime_logs_for_tui = matches!(&cli.command, Some(Commands::Serve { no_tui, .. }) if !*no_tui)
         && config.tui_enabled
         && std::io::stdout().is_terminal();
-    let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui);
+    let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui, &config.log_level);
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
@@ -1010,10 +1021,28 @@ mod tests {
 
     #[test]
     fn default_mcp_log_filter_includes_fsqlite_noise_suppressors() {
-        let filter = default_mcp_log_filter();
+        let filter = default_mcp_log_filter("info");
         assert!(filter.contains("mvcc=warn"));
         assert!(filter.contains("checkpoint=warn"));
         assert!(filter.contains("fsqlite.storage_wiring=warn"));
+    }
+
+    /// br-kp1in.20: `LOG_LEVEL` drives the server binary's default filter.
+    #[test]
+    fn default_mcp_log_filter_follows_log_level() {
+        let debug = default_mcp_log_filter("debug");
+        assert!(
+            debug.starts_with("warn,"),
+            "dependencies stay at warn: {debug}"
+        );
+        assert!(debug.contains("mcp_agent_mail=debug"));
+        assert!(debug.contains("mcp_agent_mail_server=debug"));
+        assert!(
+            !debug.contains("=info"),
+            "no crate is left at the old default: {debug}"
+        );
+        assert_eq!(default_mcp_log_filter("error"), "error");
+        assert_eq!(default_mcp_log_filter("off"), "off");
     }
 
     #[test]

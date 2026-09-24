@@ -4440,7 +4440,7 @@ impl<S> tracing_subscriber::layer::Filter<S> for DependencyWarnRateLimit {
     }
 }
 
-fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
+fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool, log_level: &str) {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -4448,7 +4448,7 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
-        let filter = build_release_log_filter(suppress_runtime_logs_for_tui);
+        let filter = build_release_log_filter(suppress_runtime_logs_for_tui, log_level);
 
         // The env filter is scoped to the fmt layer ONLY so the drop_close
         // counter keeps observing fsqlite warnings even when the filter is
@@ -4471,19 +4471,33 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {
     });
 }
 
-fn build_release_log_filter(suppress_runtime_logs_for_tui: bool) -> tracing_subscriber::EnvFilter {
+/// `log_level` is the canonical `LOG_LEVEL` from `Config` (br-kp1in.20).
+/// `RUST_LOG` replaces it only when `AM_ALLOW_DEBUG_STARTUP_LOGS` is set.
+fn build_release_log_filter(
+    suppress_runtime_logs_for_tui: bool,
+    log_level: &str,
+) -> tracing_subscriber::EnvFilter {
+    let from_rust_log = !suppress_runtime_logs_for_tui
+        && env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS")
+        && std::env::var_os("RUST_LOG").is_some();
     let mut filter = if suppress_runtime_logs_for_tui {
         // Never emit tracing lines while the interactive TUI owns stdout/stderr.
         // This prevents log spam from corrupting alternate-screen rendering.
         tracing_subscriber::EnvFilter::new("off")
-    } else if env_var_is_truthy("AM_ALLOW_DEBUG_STARTUP_LOGS") {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_release_log_filter()))
+    } else if from_rust_log {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(default_release_log_filter(log_level))
+        })
     } else {
-        tracing_subscriber::EnvFilter::new(default_release_log_filter())
+        tracing_subscriber::EnvFilter::new(default_release_log_filter(log_level))
     };
 
-    if suppress_runtime_logs_for_tui || allow_noisy_dependency_logs() {
+    // The warn-level clamps would loosen a stricter LOG_LEVEL for dependencies.
+    if suppress_runtime_logs_for_tui
+        || allow_noisy_dependency_logs()
+        || (!from_rust_log
+            && mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level))
+    {
         return filter;
     }
 
@@ -4496,27 +4510,32 @@ fn build_release_log_filter(suppress_runtime_logs_for_tui: bool) -> tracing_subs
     filter
 }
 
-fn default_release_log_filter() -> &'static str {
-    concat!(
-        "warn,",
-        "mcp_agent_mail_cli=info,",
-        "mcp_agent_mail_server=info,",
-        "mcp_agent_mail_core=info,",
-        "mcp_agent_mail_db=info,",
-        "mcp_agent_mail_storage=info,",
-        "mcp_agent_mail_tools=info,",
-        "fsqlite_core::connection=warn,",
-        "fsqlite_mvcc::observability=warn,",
-        "fsqlite_mvcc::gc=warn,",
-        "fsqlite_mvcc::rebase=warn,",
-        "mvcc=warn,",
-        "checkpoint=warn,",
-        "fsqlite.storage_wiring=warn,",
-        "fsqlite_wal::checkpoint_executor=warn,",
-        "fsqlite_vdbe::jit=warn,",
-        "fsqlite_vdbe::engine=warn,",
-        "jit_compile=error,",
-        "execute_statement_dispatch=error",
+/// Agent Mail's own crates log at `log_level`; dependencies stay at `warn`
+/// (with the known-noisy engine targets pinned) unless `log_level` is stricter.
+fn default_release_log_filter(log_level: &str) -> String {
+    if mcp_agent_mail_core::config::log_level_silences_dependency_warnings(log_level) {
+        return log_level.to_string();
+    }
+    format!(
+        "warn,\
+         mcp_agent_mail_cli={log_level},\
+         mcp_agent_mail_server={log_level},\
+         mcp_agent_mail_core={log_level},\
+         mcp_agent_mail_db={log_level},\
+         mcp_agent_mail_storage={log_level},\
+         mcp_agent_mail_tools={log_level},\
+         fsqlite_core::connection=warn,\
+         fsqlite_mvcc::observability=warn,\
+         fsqlite_mvcc::gc=warn,\
+         fsqlite_mvcc::rebase=warn,\
+         mvcc=warn,\
+         checkpoint=warn,\
+         fsqlite.storage_wiring=warn,\
+         fsqlite_wal::checkpoint_executor=warn,\
+         fsqlite_vdbe::jit=warn,\
+         fsqlite_vdbe::engine=warn,\
+         jit_compile=error,\
+         execute_statement_dispatch=error"
     )
 }
 
@@ -7560,7 +7579,7 @@ fn handle_serve_http(
         config.tui_enabled = false;
     }
     let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
-    apply_release_logging_defaults(suppress_runtime_logs_for_tui);
+    apply_release_logging_defaults(suppress_runtime_logs_for_tui, &config.log_level);
 
     // A healthy service remains the mailbox owner unless the operator says
     // otherwise. On a terminal the coexistence choice is explicit (br-mljnz):
@@ -9429,8 +9448,8 @@ pub fn run_stdio_server(config: &Config) -> std::io::Result<()> {
 }
 
 fn handle_serve_stdio() -> CliResult<()> {
-    apply_release_logging_defaults(false);
     let config = Config::from_env();
+    apply_release_logging_defaults(false, &config.log_level);
     prepare_runtime_server_startup(&config)?;
     let result = run_stdio_server(&config);
     let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
@@ -45260,7 +45279,7 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
 
     #[test]
     fn default_release_log_filter_includes_fsqlite_noise_suppressors() {
-        let filter = default_release_log_filter();
+        let filter = default_release_log_filter("info");
         assert!(filter.contains("mvcc=warn"));
         assert!(filter.contains("checkpoint=warn"));
         assert!(filter.contains("fsqlite.storage_wiring=warn"));
@@ -45337,6 +45356,61 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         );
         assert_eq!(count("mcp_agent_mail_db", tracing::Level::WARN), 5);
         assert_eq!(count("fsqlite_core::connection", tracing::Level::ERROR), 4);
+    }
+
+    /// br-kp1in.20: `LOG_LEVEL` (canonicalized by `Config`) sets Agent Mail's
+    /// own threshold; dependencies stay at `warn` unless it is stricter.
+    #[test]
+    fn log_level_sets_agent_mail_threshold_and_stricter_levels_silence_dependencies() {
+        use tracing::Level;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        fn admitted(log_level: &str) -> Vec<(String, Level)> {
+            let seen = AdmittedEvents::default();
+            let subscriber = tracing_subscriber::registry().with(
+                seen.clone()
+                    .with_filter(build_release_log_filter(false, log_level)),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "mcp_agent_mail_server", "own debug");
+                tracing::info!(target: "mcp_agent_mail_server", "own info");
+                tracing::warn!(target: "mcp_agent_mail_server", "own warn");
+                tracing::error!(target: "mcp_agent_mail_server", "own error");
+                tracing::debug!(target: "some_dependency", "dependency debug");
+                tracing::warn!(target: "some_dependency", "dependency warn");
+                tracing::warn!(target: "fsqlite_core::connection", "engine warn");
+            });
+            let seen = seen.0.lock().unwrap();
+            seen.iter()
+                .map(|(target, level, _)| (target.clone(), *level))
+                .collect()
+        }
+        let own = |level| ("mcp_agent_mail_server".to_string(), level);
+        let dependency_warns = [
+            ("some_dependency".to_string(), Level::WARN),
+            ("fsqlite_core::connection".to_string(), Level::WARN),
+        ];
+
+        let mut expected = vec![own(Level::INFO), own(Level::WARN), own(Level::ERROR)];
+        expected.extend(dependency_warns.clone());
+        assert_eq!(
+            admitted("info"),
+            expected,
+            "the default keeps today's filter"
+        );
+
+        let mut expected = vec![own(Level::DEBUG), own(Level::INFO), own(Level::WARN)];
+        expected.push(own(Level::ERROR));
+        expected.extend(dependency_warns);
+        assert_eq!(
+            admitted("debug"),
+            expected,
+            "debug opens Agent Mail's own logs, never dependency debug output"
+        );
+
+        assert_eq!(admitted("error"), vec![own(Level::ERROR)]);
+        assert_eq!(admitted("off"), Vec::new());
     }
 
     #[test]

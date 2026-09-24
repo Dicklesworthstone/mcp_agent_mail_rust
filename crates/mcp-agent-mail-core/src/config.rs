@@ -371,7 +371,8 @@ pub struct Config {
     /// (single-writer) unless you have a specific need for concurrent
     /// writers and have tested your workload.
     pub fsqlite_concurrent_mode: bool,
-    /// Max retries on MVCC page-level conflict at COMMIT (default: 5).
+    /// Max retries on MVCC page-level conflict or plain write contention
+    /// (default: 16; the single source for the db crate's retry loop).
     pub fsqlite_concurrent_retries: u64,
 
     // Storage
@@ -733,11 +734,10 @@ pub struct Config {
     /// WBQ enqueue timeout in milliseconds (default 100).
     pub wbq_enqueue_timeout_ms: u64,
 
-    // Git commit coalescer tuning
-    /// Coalescer flush interval in milliseconds (default 50, min 5).
-    pub coalescer_flush_ms: u64,
-    /// Max operations batched per git commit (default 10).
-    pub coalescer_max_batch_size: usize,
+    // Git commit coalescer tuning. The flush interval and batch size
+    // (`AM_ARCHIVE_BATCH_MS` / `AM_ARCHIVE_BATCH_EVENTS`, legacy aliases
+    // `AM_COALESCER_FLUSH_MS` / `AM_COALESCER_MAX_BATCH_SIZE`) are parsed once,
+    // by the storage crate that consumes them.
     /// Max parallel commit workers (default 32).
     pub coalescer_max_workers: usize,
     /// Per-repo coalescer queue depth (default 512).
@@ -1587,7 +1587,7 @@ impl Default for Config {
             integrity_check_interval_hours: 1,
 
             fsqlite_concurrent_mode: false,
-            fsqlite_concurrent_retries: 5,
+            fsqlite_concurrent_retries: 16,
 
             // Storage
             storage_root: default_storage_root_path(),
@@ -1819,7 +1819,7 @@ impl Default for Config {
             output_format_default: None,
 
             // Logging
-            log_level: "INFO".to_string(),
+            log_level: "info".to_string(),
             log_rich_enabled: true,
             log_tool_calls_enabled: true,
             log_tool_calls_result_max_chars: 2000,
@@ -1904,8 +1904,6 @@ impl Default for Config {
             wbq_enqueue_timeout_ms: 100,
 
             // Coalescer tuning
-            coalescer_flush_ms: 50,
-            coalescer_max_batch_size: 10,
             coalescer_max_workers: 32,
             coalescer_queue_cap: 512,
         }
@@ -2736,7 +2734,14 @@ impl Config {
 
         // Logging
         if let Some(v) = env_value("LOG_LEVEL") {
-            config.log_level = v;
+            match normalize_log_level(&v) {
+                Some(level) => config.log_level = level.to_string(),
+                None => eprintln!(
+                    "[warn] LOG_LEVEL={v:?} is not one of trace, debug, info, warn, error, off; \
+                     using '{}'",
+                    config.log_level,
+                ),
+            }
         }
         config.log_rich_enabled = env_bool("LOG_RICH_ENABLED", config.log_rich_enabled);
         config.log_tool_calls_enabled =
@@ -3046,13 +3051,6 @@ impl Config {
             env_u64("AM_WBQ_ENQUEUE_TIMEOUT_MS", config.wbq_enqueue_timeout_ms).clamp(10, 30_000);
 
         // Coalescer tuning
-        config.coalescer_flush_ms =
-            env_u64("AM_COALESCER_FLUSH_MS", config.coalescer_flush_ms).clamp(5, 5_000);
-        config.coalescer_max_batch_size = env_usize(
-            "AM_COALESCER_MAX_BATCH_SIZE",
-            config.coalescer_max_batch_size,
-        )
-        .clamp(1, 500);
         config.coalescer_max_workers =
             env_usize("AM_COALESCER_MAX_WORKERS", config.coalescer_max_workers).clamp(1, 128);
         config.coalescer_queue_cap =
@@ -4196,6 +4194,28 @@ pub fn process_env_value(key: &str) -> Option<String> {
         return Some(v);
     }
     env::var(key).ok()
+}
+
+/// Canonical tracing level for a `LOG_LEVEL` value: case-insensitive, and the
+/// Python-era `WARNING`, `CRITICAL` and `FATAL` spellings are accepted.
+#[must_use]
+pub fn normalize_log_level(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "trace" => Some("trace"),
+        "debug" => Some("debug"),
+        "info" => Some("info"),
+        "warn" | "warning" => Some("warn"),
+        "error" | "critical" | "fatal" => Some("error"),
+        "off" | "none" => Some("off"),
+        _ => None,
+    }
+}
+
+/// Whether `LOG_LEVEL` is stricter than the `warn` floor dependencies normally
+/// log at, so it must silence their warnings too.
+#[must_use]
+pub fn log_level_silences_dependency_warnings(level: &str) -> bool {
+    matches!(level, "error" | "off")
 }
 
 /// Read a value from the real environment first, then the user-global env file,
@@ -7950,5 +7970,31 @@ mod tests {
         let _guard = TestEnvOverrideGuard::set(&[("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "abc")]);
         let config = Config::from_env();
         assert_eq!(config.archive_maintenance_interval_secs, 1800);
+    }
+
+    /// br-kp1in.20: `LOG_LEVEL` is parsed once into a canonical tracing level.
+    #[test]
+    fn log_level_normalizes_python_spellings_and_rejects_unknown_values() {
+        for (raw, expected) in [
+            ("INFO", "info"),
+            (" Debug ", "debug"),
+            ("WARNING", "warn"),
+            ("warn", "warn"),
+            ("CRITICAL", "error"),
+            ("off", "off"),
+        ] {
+            let _guard = TestEnvOverrideGuard::set(&[("LOG_LEVEL", raw)]);
+            assert_eq!(Config::from_env().log_level, expected, "LOG_LEVEL={raw:?}");
+        }
+        let _guard = TestEnvOverrideGuard::set(&[("LOG_LEVEL", "loud")]);
+        assert_eq!(
+            Config::from_env().log_level,
+            "info",
+            "an unknown level keeps the default instead of producing an unusable filter"
+        );
+        assert!(log_level_silences_dependency_warnings("error"));
+        assert!(log_level_silences_dependency_warnings("off"));
+        assert!(!log_level_silences_dependency_warnings("warn"));
+        assert!(!log_level_silences_dependency_warnings("debug"));
     }
 }

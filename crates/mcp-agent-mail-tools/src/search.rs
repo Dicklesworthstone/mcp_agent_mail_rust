@@ -1280,15 +1280,8 @@ pub async fn summarize_thread(
             let system = llm::multi_thread_system_prompt();
             let user = llm::multi_thread_user_prompt(&thread_context);
 
-            match llm::complete_system_user(
-                ctx.cx(),
-                system,
-                &user,
-                llm_model.as_deref(),
-                Some(config.llm_temperature),
-                Some(config.llm_max_tokens),
-            )
-            .await
+            match llm::complete_system_user(ctx.cx(), config, system, &user, llm_model.as_deref())
+                .await
             {
                 Ok(output) => {
                     if let Some(parsed) = llm::parse_json_safely(&output.content) {
@@ -1346,15 +1339,8 @@ pub async fn summarize_thread(
             let system = llm::single_thread_system_prompt();
             let user = llm::single_thread_user_prompt(&msg_tuples);
 
-            match llm::complete_system_user(
-                ctx.cx(),
-                system,
-                &user,
-                llm_model.as_deref(),
-                Some(config.llm_temperature),
-                Some(config.llm_max_tokens),
-            )
-            .await
+            match llm::complete_system_user(ctx.cx(), config, system, &user, llm_model.as_deref())
+                .await
             {
                 Ok(output) => {
                     if let Some(parsed) = llm::parse_json_safely(&output.content) {

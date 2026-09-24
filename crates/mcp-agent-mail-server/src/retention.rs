@@ -57,6 +57,17 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+/// Wall-clock µs after which this process may have accepted writes
+/// (br-kp1in.14): messages created earlier cannot be in its write-behind queue.
+static SETTLED_BEFORE_US: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Record, once per process, that startup recovery has finished and the server
+/// is about to accept writes. Call on every serving path before serving; the
+/// first worker start is the fallback anchor.
+pub fn anchor_settled_writes() {
+    let _ = SETTLED_BEFORE_US.get_or_init(mcp_agent_mail_db::now_micros);
+}
+
 const fn maintenance_worker_enabled(config: &Config, repair_enabled: bool) -> bool {
     config.retention_report_enabled
         || config.quota_enabled
@@ -96,12 +107,17 @@ pub fn start(config: &Config) {
     }
     if worker.is_none() {
         let config = config.clone();
+        // Anchored before this process serves any write and kept for its life
+        // (a restarted worker does not restart the write-behind queue): older
+        // rows cannot be in flight here, so crash-lost mail is repairable on
+        // the first pass.
+        let settled_before_us = *SETTLED_BEFORE_US.get_or_init(mcp_agent_mail_db::now_micros);
         SHUTDOWN.store(false, Ordering::Release);
         match std::thread::Builder::new()
             .name("retention-quota".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
-                retention_loop(&config);
+                retention_loop(&config, settled_before_us);
             }) {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -151,14 +167,14 @@ fn retention_pool_config(config: &Config) -> DbPoolConfig {
     pool_config
 }
 
-fn retention_loop(config: &Config) {
+fn retention_loop(config: &Config, settled_before_us: i64) {
     let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
     let repair_enabled = message_archive_reconcile::enabled(config);
     let poll_interval = maintenance_poll_interval(interval, repair_enabled);
     let startup_delay = poll_interval.min(Duration::from_secs(10));
     let needs_db = message_retention_needs_db(config) || repair_enabled;
     let mut pool: Option<DbPool> = None;
-    let mut cursor = ReconcileCursor::default();
+    let mut cursor = ReconcileCursor::settled_before(settled_before_us);
     let mut agent_cursor = AgentReconcileCursor::default();
     let mut prune_cursor = ArchivePruneCursor::default();
     let mut last_report: Option<Instant> = None;

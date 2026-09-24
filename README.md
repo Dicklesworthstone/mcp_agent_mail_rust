@@ -1095,13 +1095,13 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
 | `HTTP_ALLOWED_HOSTS` | (none) | Comma-separated extra `Host:` header values the HTTP listener accepts, in addition to the bind host, its loopback variant, and `localhost`. Set this (or pass repeatable `serve-http --allowed-host <HOST>`) to reach the `/mail` web UI via a hostname or reverse proxy instead of getting an HTTP 421. Empty by default (loopback-only). |
-| `DATABASE_URL` | `sqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
+| `DATABASE_URL` | `<STORAGE_ROOT>/storage.sqlite3` | SQLite connection URL. Unset, the database lives inside `STORAGE_ROOT`; an explicit relative path is resolved against the working directory |
 | `AM_CACHE_PROFILE` | `balanced` | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB` | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
 | `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Permit `/tmp`-style project roots in the default global mailbox archive. Prefer a per-run `STORAGE_ROOT` instead. |
-| `LOG_LEVEL` | `info` | Minimum log level |
+| `LOG_LEVEL` | `info` | Minimum level for Agent Mail's own logs: `trace`, `debug`, `info`, `warn`, `error` or `off` (`WARNING`/`CRITICAL` accepted). Dependencies log at `warn` unless `LOG_LEVEL` is stricter. `RUST_LOG`, when set, replaces it for `mcp-agent-mail` (and for `am` with `AM_ALLOW_DEBUG_STARTUP_LOGS=1`) |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
 | `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
 | `AM_TUI_TOAST_ENABLED` | `true` | Enable toast notifications |
@@ -1288,7 +1288,7 @@ This table resolves the three-way ambiguity:
 | `$XDG_CONFIG_HOME/mcp-agent-mail/config.env` | Canonical env file (installer writes here) | `~/.config/mcp-agent-mail/config.env` on most Linux systems |
 | `$XDG_CONFIG_HOME/mcp-agent-mail/.env` | Compatibility env file | Checked when `config.env` is absent |
 | `~/.mcp_agent_mail/.env` | Legacy env file | Checked after XDG paths |
-| `./storage.sqlite3` | Runtime database (`DATABASE_URL` default) | Relative to working directory, or absolute if configured |
+| `<STORAGE_ROOT>/storage.sqlite3` | Runtime database (`DATABASE_URL` default) | Inside the archive root unless `DATABASE_URL` is set |
 
 The `STORAGE_ROOT` resolution logic: if the legacy path `~/.mcp_agent_mail_git_mailbox_repo/`
 exists on disk, it is used for backward compatibility. Otherwise the XDG data

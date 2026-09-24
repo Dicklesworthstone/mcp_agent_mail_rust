@@ -411,15 +411,7 @@ pub async fn macro_prepare_thread(
         let system = llm::single_thread_system_prompt();
         let user = llm::single_thread_user_prompt(&msg_tuples);
 
-        match llm::complete_system_user(
-            ctx.cx(),
-            system,
-            &user,
-            llm_model.as_deref(),
-            Some(config.llm_temperature),
-            Some(config.llm_max_tokens),
-        )
-        .await
+        match llm::complete_system_user(ctx.cx(), config, system, &user, llm_model.as_deref()).await
         {
             Ok(output) => {
                 if let Some(parsed) = llm::parse_json_safely(&output.content) {
@@ -643,7 +635,7 @@ pub async fn macro_file_reservation_cycle(
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Request contact permissions and optionally auto-approve plus send a welcome message."
+    description = "Request contact permissions and optionally auto-approve plus send a welcome message.\n\nA cross-project handshake (`to_project`) links the contact but sends no welcome, because `send_message` delivers within one project; the response then carries `welcome_skipped_reason`."
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn macro_contact_handshake(

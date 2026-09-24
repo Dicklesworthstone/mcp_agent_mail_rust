@@ -400,18 +400,21 @@ fn get_http_client() -> &'static asupersync::http::h1::HttpClient {
 
 /// Call an OpenAI-compatible chat completion endpoint.
 ///
-/// Sends system + user messages and extracts the response content.
-/// On failure with the primary model, retries with `choose_best_available_model`
-/// if that yields a different model.
+/// Sends system + user messages and extracts the response content. The model
+/// is the per-call `model_override` if given, else `LLM_DEFAULT_MODEL`
+/// (`config.llm_default_model`); temperature and token limits come from
+/// `config`. On failure with the primary model, retries with
+/// `choose_best_available_model` if that yields a different model.
 pub async fn complete_system_user(
     cx: &asupersync::Cx,
+    config: &mcp_agent_mail_core::Config,
     system: &str,
     user: &str,
-    model: Option<&str>,
-    temperature: Option<f64>,
-    max_tokens: Option<u32>,
+    model_override: Option<&str>,
 ) -> Result<LlmOutput, LlmError> {
-    let resolved = model.map_or_else(|| resolve_model_alias(DEFAULT_MODEL), resolve_model_alias);
+    let resolved = resolve_model_alias(model_override.unwrap_or(&config.llm_default_model));
+    let temperature = Some(config.llm_temperature);
+    let max_tokens = Some(config.llm_max_tokens);
 
     // Conformance-test-only fixture mode (see block comment near EOF).
     if conformance_fixture_mode_enabled() {
@@ -1823,6 +1826,47 @@ mod tests {
         // return a non-empty string (either from env or DEFAULT_MODEL).
         let result = choose_best_available_model("auto");
         assert_ne!(result, "");
+    }
+
+    /// br-kp1in.20: without a per-call override the request uses
+    /// `LLM_DEFAULT_MODEL` (`config.llm_default_model`), not a compiled-in
+    /// model. Observed through the provider-key refusal, which happens before
+    /// any network I/O (or through the stub's echo when stub mode is on).
+    #[test]
+    fn complete_system_user_requests_the_configured_default_model() {
+        let Some(provider) = ["xai", "groq", "deepseek", "openrouter"]
+            .into_iter()
+            .find(|p| get_env_var(&format!("{}_API_KEY", p.to_ascii_uppercase())).is_none())
+        else {
+            eprintln!("skipped: every candidate provider has an API key; a call would go out");
+            return;
+        };
+        let config = mcp_agent_mail_core::Config {
+            llm_default_model: format!("{provider}/configured-default"),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let requested = |model_override: Option<&str>| {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            let outcome = runtime.block_on(async {
+                let cx = asupersync::Cx::current().expect("runtime installs a context");
+                complete_system_user(&cx, &config, "system", "user", model_override).await
+            });
+            match outcome {
+                Ok(output) => output.model,
+                Err(LlmError::NoApiKey(model)) => model,
+                Err(other) => panic!("expected a pre-network refusal, got {other}"),
+            }
+        };
+
+        assert_eq!(requested(None), config.llm_default_model);
+        let per_call = format!("{provider}/per-call-override");
+        assert_eq!(
+            requested(Some(&per_call)),
+            per_call,
+            "a per-call model still wins"
+        );
     }
 
     // ── apply_multi_thread_thread_revisions ──────────────────────────
