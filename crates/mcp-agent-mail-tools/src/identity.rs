@@ -809,6 +809,33 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
     }
 }
 
+fn archive_drain_stall_detail(
+    lag: &mcp_agent_mail_storage::ArchiveLagSnapshot,
+    critical_us: u64,
+) -> Option<String> {
+    (lag.wbq_inflight_execution_us >= critical_us
+        || lag.wbq_since_progress_us >= critical_us
+        || lag.coalescer_since_progress_us >= critical_us)
+        .then(|| {
+            // Preserve the publication-fence diagnosis for both the WBQ and
+            // coalescer: either worker can be blocked by the same holder.
+            let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder()
+                .map_or_else(String::new, |holder| {
+                    format!("; archive publication fence held by {holder}")
+                });
+            format!(
+                "wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; \
+                 coalescer pending {}, no committed request for {} ms; critical bound {} ms{fence_holder}",
+                lag.wbq_depth,
+                lag.wbq_inflight_execution_us / 1_000,
+                lag.wbq_since_progress_us / 1_000,
+                lag.coalescer_pending,
+                lag.coalescer_since_progress_us / 1_000,
+                critical_us / 1_000,
+            )
+        })
+}
+
 /// Decompose the bundled health signals into independent verdicts
 /// (br-bvq1x.3.1 / C1). The strict roll-up over the critical verdicts is what
 /// prevents a green top-level result from coexisting with a broken write or
@@ -1559,6 +1586,10 @@ pub struct ArchiveLagHealthResponse {
     pub coalescer_pending: u64,
     /// Age of the oldest uncommitted coalescer request, milliseconds.
     pub coalescer_oldest_age_ms: u64,
+    /// Longest interval without a committed request among repositories with
+    /// queued or in-flight coalescer work, milliseconds.
+    #[serde(default)]
+    pub coalescer_since_progress_ms: u64,
     /// Age of the oldest unmaterialized archive write overall, milliseconds.
     pub oldest_unmaterialized_ms: u64,
     /// Lifetime totals for the retry backlog.
@@ -1588,7 +1619,7 @@ pub struct ArchiveLagHealthResponse {
     #[serde(default)]
     pub wbq_since_progress_ms: u64,
     /// True when one WBQ batch has been executing past the critical bound, or
-    /// queued work has seen no completed op for that long (dead drain): the
+    /// pending WBQ/coalescer work has seen no completed op for that long: the
     /// drain is stuck, not merely behind.
     #[serde(default)]
     pub drain_stalled: bool,
@@ -1973,9 +2004,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // br-kp1in.23: one batch executing past the critical bound, or queued work
     // with no completed op for that long (e.g. a dead drain thread), means the
     // drain is blocked (observed 2026-09-23: zero progress while thousands queued).
-    let archive_wbq_drain_stalled = archive_lag.wbq_inflight_execution_us
-        >= archive_lag_critical_us
-        || archive_lag.wbq_since_progress_us >= archive_lag_critical_us;
+    let archive_drain_stall = archive_drain_stall_detail(&archive_lag, archive_lag_critical_us);
+    let archive_drain_stalled = archive_drain_stall.is_some();
 
     // Refresh the cached health level (pressure-derived) from live metrics.
     let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
@@ -1985,22 +2015,6 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
-    let archive_drain_stall = archive_wbq_drain_stalled.then(|| {
-        // br-kp1in.29/.13: every archive writer serializes on the publication
-        // fence; naming its holder makes a stalled drain self-diagnosing.
-        let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder()
-            .map_or_else(String::new, |holder| {
-                format!("; archive publication fence held by {holder}")
-            });
-        format!(
-            "wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms, \
-             critical bound {} ms{fence_holder}",
-            archive_lag.wbq_depth,
-            archive_lag.wbq_inflight_execution_us / 1_000,
-            archive_lag.wbq_since_progress_us / 1_000,
-            archive_lag_critical_us / 1_000
-        )
-    });
     let verdicts = compute_health_verdicts(
         config,
         pool.is_some(),
@@ -2063,14 +2077,16 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "archive_lag".to_string(),
             level: archive_lag_level.to_string(),
             detail: format!(
-                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms{}",
+                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; coalescer pending {}, no committed request for {} ms{}",
                 archive_lag_oldest_us / 1_000,
                 archive_lag_warn_us / 1_000,
                 archive_lag_critical_us / 1_000,
                 archive_lag.wbq_depth,
                 archive_lag.wbq_inflight_execution_us / 1_000,
                 archive_lag.wbq_since_progress_us / 1_000,
-                if archive_wbq_drain_stalled {
+                archive_lag.coalescer_pending,
+                archive_lag.coalescer_since_progress_us / 1_000,
+                if archive_drain_stalled {
                     " — DRAIN STALLED"
                 } else {
                     ""
@@ -2195,6 +2211,9 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     backlog_oldest_age_ms: us_to_ms_ceil(archive_lag.backlog_oldest_age_us),
                     coalescer_pending: archive_lag.coalescer_pending,
                     coalescer_oldest_age_ms: us_to_ms_ceil(archive_lag.coalescer_oldest_age_us),
+                    coalescer_since_progress_ms: us_to_ms_ceil(
+                        archive_lag.coalescer_since_progress_us,
+                    ),
                     oldest_unmaterialized_ms: us_to_ms_ceil(archive_lag_oldest_us),
                     backlog_enqueued_total: archive_lag.enqueued_total,
                     backlog_drained_total: archive_lag.drained_total,
@@ -2212,7 +2231,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     ),
                     wbq_inflight_execution_ms: us_to_ms_ceil(archive_lag.wbq_inflight_execution_us),
                     wbq_since_progress_ms: us_to_ms_ceil(archive_lag.wbq_since_progress_us),
-                    drain_stalled: archive_wbq_drain_stalled,
+                    drain_stalled: archive_drain_stalled,
                 },
             }
         }),
@@ -4033,6 +4052,46 @@ mod tests {
         assert_eq!(
             draining.rollup_level(),
             mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn stalled_coalescer_with_empty_wbq_makes_parity_red_and_critical() {
+        let lag = mcp_agent_mail_storage::ArchiveLagSnapshot {
+            coalescer_pending: 1,
+            coalescer_oldest_age_us: 900_000_000,
+            coalescer_since_progress_us: 900_000_000,
+            ..Default::default()
+        };
+        let detail = archive_drain_stall_detail(&lag, 30_000_000)
+            .expect("a stuck Git commit is a stalled archive drain even with an empty WBQ");
+        let verdicts = compute_health_verdicts(
+            &Config::from_env(),
+            true,
+            &semantic("ok", "archive files and sqlite messages are aligned"),
+            &healthy_integrity_metrics(),
+            Some(&detail),
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert!(verdicts.archive_db_parity.critical);
+        assert!(
+            verdicts
+                .archive_db_parity
+                .detail
+                .contains("coalescer pending 1")
+        );
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Red
+        );
+
+        let progressing = mcp_agent_mail_storage::ArchiveLagSnapshot {
+            coalescer_since_progress_us: 1_000,
+            ..lag
+        };
+        assert!(
+            archive_drain_stall_detail(&progressing, 30_000_000).is_none(),
+            "old requests with recent commit progress remain ordinary catch-up lag"
         );
     }
 

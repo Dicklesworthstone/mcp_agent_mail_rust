@@ -1201,19 +1201,15 @@ pub fn wbq_start() {
     wbq_start_inner(wbq);
 }
 
-fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
+fn wbq_reserve_enqueue(op_depth: &AtomicU64) {
     let metrics = mcp_agent_mail_core::global_metrics();
-    metrics.storage.wbq_enqueued_total.inc();
 
     let depth = op_depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     if depth == 1 {
         // The queue was empty: waiting starts now, not at the last drained op.
-        let _ = WBQ_BACKLOG_SINCE_US.compare_exchange(
-            0,
-            now_micros_u64().max(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        // A rejected admission may have left an older anchor while depth was
+        // zero, so every empty-to-nonempty transition replaces it.
+        WBQ_BACKLOG_SINCE_US.store(now_micros_u64().max(1), Ordering::Relaxed);
     }
     // GH#225: the gauge must be updated with a commuting delta, not
     // `set(depth)`. A racing enqueue/drain pair can otherwise apply their
@@ -1233,6 +1229,53 @@ fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Pause only the calling producer after the real channel publication, so
+    // tests can let the real drain finish before the enqueue call returns.
+    static WBQ_AFTER_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn wbq_try_send_counted(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    op_depth: &AtomicU64,
+    msg: WbqMsg,
+) -> std::result::Result<(), std::sync::mpsc::TrySendError<WbqMsg>> {
+    // Account for the op BEFORE the receiver can observe it. Incrementing
+    // after try_send lets a fast drain subtract from zero; saturating counters
+    // then strand a phantom queued op and eventually report a false stall.
+    wbq_reserve_enqueue(op_depth);
+    let result = sender.try_send(msg);
+    let metrics = mcp_agent_mail_core::global_metrics();
+    if result.is_ok() {
+        #[cfg(test)]
+        WBQ_AFTER_PUBLISH_TEST_HOOK.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+        metrics.storage.wbq_enqueued_total.inc();
+    } else {
+        // Full/disconnected channels never acquired this op. Undo its
+        // reservation before retrying or returning it to synchronous fallback.
+        let depth_after = op_depth
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                Some(depth.saturating_sub(1))
+            })
+            .unwrap_or(0)
+            .saturating_sub(1);
+        metrics.storage.wbq_depth.sub_saturating(1);
+        let cap = u64::try_from(Config::get().wbq_channel_capacity).unwrap_or(u64::MAX);
+        let threshold = cap.saturating_mul(80).saturating_div(100);
+        if threshold == 0 || depth_after < threshold {
+            metrics.storage.wbq_over_80_since_us.set(0);
+        }
+    }
+    result
+}
+
 fn wbq_enqueue_with_sender(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
@@ -1244,11 +1287,8 @@ fn wbq_enqueue_with_sender(
     };
 
     let msg = WbqMsg::Op(envelope);
-    match sender.try_send(msg) {
-        Ok(()) => {
-            wbq_record_enqueue_success(op_depth);
-            WbqEnqueueResult::Enqueued
-        }
+    match wbq_try_send_counted(sender, op_depth, msg) {
+        Ok(()) => WbqEnqueueResult::Enqueued,
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
         Err(std::sync::mpsc::TrySendError::Full(msg)) => {
             // Backpressure: queue is temporarily full. Block briefly to avoid
@@ -1265,11 +1305,8 @@ fn wbq_enqueue_with_sender(
             let mut backoff = Duration::from_millis(1);
             let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
             loop {
-                match sender.try_send(cur) {
-                    Ok(()) => {
-                        wbq_record_enqueue_success(op_depth);
-                        break WbqEnqueueResult::Enqueued;
-                    }
+                match wbq_try_send_counted(sender, op_depth, cur) {
+                    Ok(()) => break WbqEnqueueResult::Enqueued,
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         break WbqEnqueueResult::QueueUnavailable;
                     }
@@ -2307,6 +2344,10 @@ pub struct ArchiveLagSnapshot {
     pub coalescer_pending: u64,
     /// Age (microseconds) of the oldest uncommitted coalescer request, 0 if none.
     pub coalescer_oldest_age_us: u64,
+    /// Longest interval without a successful commit among repositories with
+    /// pending coalescer work, including requests a worker has already dequeued.
+    #[serde(default)]
+    pub coalescer_since_progress_us: u64,
     /// Age (microseconds) of the oldest unmaterialized archive write overall.
     pub oldest_unmaterialized_us: u64,
     /// Lifetime count of ops queued into the retry backlog.
@@ -2431,9 +2472,11 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
     let backlog = &*ARCHIVE_BACKLOG;
     let (backlog_depth, backlog_oldest_age_us) = backlog.backlog_state();
-    let (coalescer_pending, coalescer_oldest_age_us) = COMMIT_COALESCER.get().map_or((0, 0), |c| {
-        (c.pending_requests(), c.oldest_pending_age_us())
-    });
+    let (coalescer_pending, coalescer_lag) = COMMIT_COALESCER
+        .get()
+        .map_or((0, CoalescerLagState::default()), |c| {
+            (c.pending_requests(), c.lag_state())
+        });
     let now_us = now_micros_u64();
     let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) = wbq_inflight_ages_us(now_us);
     let wbq_depth = mcp_agent_mail_core::global_metrics()
@@ -2450,11 +2493,12 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         backlog_depth,
         backlog_oldest_age_us,
         coalescer_pending,
-        coalescer_oldest_age_us,
+        coalescer_oldest_age_us: coalescer_lag.oldest_age_us,
+        coalescer_since_progress_us: coalescer_lag.since_progress_us,
         // Queued work that has not advanced for this long is at least this
         // stale, even when no batch is in flight (dead or idle drain).
         oldest_unmaterialized_us: backlog_oldest_age_us
-            .max(coalescer_oldest_age_us)
+            .max(coalescer_lag.oldest_age_us)
             .max(wbq_inflight_oldest_age_us)
             .max(wbq_since_progress_us),
         wbq_depth,
@@ -4548,8 +4592,54 @@ struct RepoQueue {
     retry_after: Mutex<Option<Instant>>,
     /// Consecutive commit failures used to calculate per-repo retry backoff.
     failure_streak: AtomicU64,
+    /// Worker-owned requests stay visible after leaving the queue or spill.
+    /// Progress belongs to this repository: another repository's successful
+    /// commits must not hide a stalled worker here.
+    progress: Mutex<CoalescerRepoProgress>,
     /// Per-repo metrics for observability.
     metrics: RepoCommitMetrics,
+}
+
+#[derive(Default)]
+struct CoalescerRepoProgress {
+    inflight_oldest: Option<Instant>,
+    last_completed: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CoalescerLagState {
+    oldest_age_us: u64,
+    since_progress_us: u64,
+}
+
+impl RepoQueue {
+    /// Publish ownership before releasing the queue/spill mutex, so a health
+    /// reader cannot see the request disappear during the worker handoff.
+    fn mark_inflight(&self, oldest: Instant) {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.inflight_oldest = Some(
+            progress
+                .inflight_oldest
+                .map_or(oldest, |current| current.min(oldest)),
+        );
+    }
+
+    fn note_commit_progress(&self) {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_completed = Some(Instant::now());
+    }
+
+    fn set_inflight_oldest(&self, oldest: Option<Instant>) {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inflight_oldest = oldest;
+    }
 }
 
 /// Spill state for a single repo (replaces the per-shard `HashMap`<`PathBuf`, _>).
@@ -4601,6 +4691,7 @@ impl Default for RepoQueue {
             last_serviced_us: AtomicU64::new(0),
             retry_after: Mutex::new(None),
             failure_streak: AtomicU64::new(0),
+            progress: Mutex::new(CoalescerRepoProgress::default()),
             metrics: RepoCommitMetrics::default(),
         }
     }
@@ -5201,39 +5292,60 @@ impl CommitCoalescer {
     }
 
     /// Age (microseconds) of the oldest archive request still waiting to be
-    /// committed across all per-repo queues and spill buffers, or 0 if none.
+    /// committed across all per-repo queues, spill buffers and in-flight
+    /// batches, or 0 if none.
     /// Used by [`archive_lag_snapshot`] to report commit-lag as unmaterialized
     /// archive age.
     #[must_use]
     pub fn oldest_pending_age_us(&self) -> u64 {
+        self.lag_state().oldest_age_us
+    }
+
+    fn lag_state(&self) -> CoalescerLagState {
+        let now = Instant::now();
         let repos = self
             .repos
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut oldest: Option<Instant> = None;
+        let mut lag = CoalescerLagState::default();
         for rq in repos.values() {
-            {
-                let queue = rq
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(front) = queue.front() {
-                    oldest = Some(oldest.map_or(front.enqueued_at, |o| o.min(front.enqueued_at)));
-                }
+            // Keep all three ownership locations locked together. In
+            // particular, a failed commit can move from in-flight back into
+            // the queue while this snapshot is being sampled.
+            let queue = rq
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let spill = rq
+                .spill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
+            if let Some(repo) = spill.inner.as_ref() {
+                oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
+                    o.min(repo.earliest_enqueued_at)
+                }));
             }
-            {
-                let spill = rq
-                    .spill
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(repo) = spill.inner.as_ref() {
-                    oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
-                        o.min(repo.earliest_enqueued_at)
-                    }));
-                }
+            let progress = rq
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(inflight) = progress.inflight_oldest {
+                oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
+            }
+            if let Some(oldest) = oldest {
+                lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                    now.saturating_duration_since(oldest),
+                ));
+                let last_progress = progress
+                    .last_completed
+                    .map_or(oldest, |completed| completed.max(oldest));
+                lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
+                    now.saturating_duration_since(last_progress),
+                ));
             }
         }
-        oldest.map_or(0, |instant| duration_as_micros_u64(instant.elapsed()))
+        lag
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -5480,10 +5592,16 @@ fn coalescer_pool_worker(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
-                let (guard, _) = cvar
+                let (guard, timeout) = cvar
                     .wait_timeout(wake_tokens, idle_wait)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 wake_tokens = guard;
+                if timeout.timed_out() {
+                    // A consumed/lost notification must not park pending
+                    // commits forever. Recheck repository readiness even
+                    // without a wake token after the bounded safety interval.
+                    break;
+                }
             }
             if *wake_tokens > 0 {
                 *wake_tokens -= 1;
@@ -5612,13 +5730,34 @@ fn self_process_repo(
     // RAII guard to ensure processing flag is cleared even on panic
     struct ProcessingGuard<'a> {
         rq: &'a Arc<RepoQueue>,
+        repos: &'a Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
+        work_cv: &'a Arc<(Mutex<u64>, std::sync::Condvar)>,
+        worker_count: usize,
     }
     impl Drop for ProcessingGuard<'_> {
         fn drop(&mut self) {
+            // PanicGuard restores uncommitted work before this guard drops.
+            // Release the claim before waking peers; otherwise a peer can
+            // consume the notification while the repository is unselectable.
+            self.rq.set_inflight_oldest(None);
             self.rq.processing.store(false, Ordering::Release);
+            let more_work = self
+                .repos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|repo| repo.depth.load(Ordering::Relaxed) > 0);
+            if more_work {
+                coalescer_signal_worker(self.work_cv, self.worker_count);
+            }
         }
     }
-    let _guard = ProcessingGuard { rq };
+    let _guard = ProcessingGuard {
+        rq,
+        repos,
+        work_cv,
+        worker_count,
+    };
 
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
@@ -5645,6 +5784,13 @@ fn self_process_repo(
             }
         }
         if !batch.is_empty() {
+            rq.mark_inflight(
+                batch
+                    .iter()
+                    .map(|request| request.enqueued_at)
+                    .min()
+                    .expect("a non-empty batch has an oldest request"),
+            );
             coalescer_depth_decrement(&rq.depth, batch.len() as u64);
         }
         q.is_empty()
@@ -5660,8 +5806,6 @@ fn self_process_repo(
 
     struct PanicGuard<'a> {
         rq: &'a RepoQueue,
-        work_cv: &'a Arc<(Mutex<u64>, std::sync::Condvar)>,
-        worker_count: usize,
         pending_batch: Vec<CoalescerCommitFields>,
         inflight_batch: Option<Vec<CoalescerCommitFields>>,
         pending_spilled: Option<CoalescerSpilledWork>,
@@ -5670,22 +5814,18 @@ fn self_process_repo(
     impl Drop for PanicGuard<'_> {
         fn drop(&mut self) {
             if std::thread::panicking() {
-                if coalescer_restore_drained_work_on_panic(
+                coalescer_restore_drained_work_on_panic(
                     self.rq,
                     &mut self.pending_batch,
                     &mut self.inflight_batch,
                     &mut self.pending_spilled,
                     &mut self.inflight_spilled,
-                ) {
-                    coalescer_signal_worker(self.work_cv, self.worker_count);
-                }
+                );
             }
         }
     }
     let mut panic_guard = PanicGuard {
         rq,
-        work_cv,
-        worker_count,
         pending_batch: batch,
         inflight_batch: None,
         pending_spilled: spilled_work,
@@ -5762,6 +5902,7 @@ fn self_process_repo(
             }
 
             if outcome.committed_requests > 0 {
+                rq.note_commit_progress();
                 coalescer_update_pending(pending_requests, outcome.committed_requests);
                 coalescer_note_commit_success(rq);
             }
@@ -5772,6 +5913,19 @@ fn self_process_repo(
             }
         }
         panic_guard.inflight_batch = None;
+        rq.set_inflight_oldest(
+            panic_guard
+                .pending_batch
+                .iter()
+                .map(|request| request.enqueued_at)
+                .chain(
+                    panic_guard
+                        .pending_spilled
+                        .as_ref()
+                        .map(|work| work.earliest_enqueued_at),
+                )
+                .min(),
+        );
     }
 
     if let Some(work) = panic_guard.pending_spilled.take() {
@@ -5788,6 +5942,7 @@ fn self_process_repo(
 
         let metrics = mcp_agent_mail_core::global_metrics();
         if outcome.committed_requests > 0 {
+            rq.note_commit_progress();
             metrics
                 .storage
                 .commit_drained_total
@@ -5825,22 +5980,10 @@ fn self_process_repo(
         panic_guard.inflight_spilled = None;
     }
 
-    // Release processing lock (via guard drop) + update last_serviced timestamp
+    // ProcessingGuard releases the claim and then wakes peers, including on
+    // panic after PanicGuard has restored unfinished work.
     rq.last_serviced_us
         .store(now_micros_u64(), Ordering::Relaxed);
-
-    // If any repo still has work, wake another worker
-    let more_work = {
-        let repos_guard = repos
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        repos_guard
-            .values()
-            .any(|r| r.depth.load(Ordering::Relaxed) > 0)
-    };
-    if more_work {
-        coalescer_signal_worker(work_cv, worker_count);
-    }
 
     had_failure
 }
@@ -5930,6 +6073,7 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
     if repo.pending_requests == 0 {
         return None;
     }
+    rq.mark_inflight(repo.earliest_enqueued_at);
     coalescer_depth_decrement(&rq.depth, repo.pending_requests);
     Some(CoalescerSpilledWork {
         repo_root: repo_root.to_path_buf(),
@@ -18951,6 +19095,247 @@ mod tests {
     }
 
     #[test]
+    fn archive_lag_reports_coalescer_batch_blocked_in_flight() {
+        if !isolated_coalescer_regression(
+            "tests::archive_lag_reports_coalescer_batch_blocked_in_flight",
+        ) {
+            return;
+        }
+
+        let coalescer = get_commit_coalescer();
+        for spill in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            fs::write(tmp.path().join("pending.txt"), b"archive durability\n").unwrap();
+            let mut config = test_config(tmp.path());
+            config.coalescer_queue_cap = if spill { 0 } else { 32 };
+
+            // Exercise the real Git path after the worker takes ownership.
+            // The publication fence blocks commit_paths_lockfree before Git
+            // can publish the file, with no WBQ or retry-backlog operations.
+            let fence = ArchiveMutationGuard::begin();
+            coalescer.enqueue(
+                tmp.path().to_path_buf(),
+                &config,
+                "pending archive commit".to_string(),
+                vec!["pending.txt".to_string()],
+            );
+            let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(tmp.path()));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !rq.processing.load(Ordering::Acquire) || rq.depth.load(Ordering::Relaxed) != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "coalescer never acquired the batch"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            let stuck = archive_lag_snapshot();
+            assert_eq!(stuck.coalescer_pending, 1, "{stuck:?}");
+            assert_eq!((stuck.wbq_depth, stuck.backlog_depth), (0, 0));
+            assert!(stuck.coalescer_oldest_age_us >= 1_000, "{stuck:?}");
+            assert!(stuck.coalescer_since_progress_us >= 1_000, "{stuck:?}");
+            assert!(stuck.oldest_unmaterialized_us >= stuck.coalescer_oldest_age_us);
+            assert!(
+                repo.head().is_err(),
+                "the blocked request must not be committed yet"
+            );
+
+            drop(fence);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while coalescer.pending_requests() != 0 || rq.processing.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "released batch did not commit");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let tree = repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap();
+            let entry = tree.get_path(Path::new("pending.txt")).unwrap();
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                b"archive durability\n"
+            );
+            let drained = archive_lag_snapshot();
+            assert_eq!(drained.coalescer_pending, 0);
+            assert_eq!(drained.coalescer_oldest_age_us, 0);
+            assert_eq!(drained.coalescer_since_progress_us, 0);
+        }
+    }
+
+    #[test]
+    fn coalescer_worker_recovers_pending_work_without_wake_token() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_worker_recovers_pending_work_without_wake_token",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("recovered.txt"), b"recovered wake\n").unwrap();
+        let rq = Arc::new(RepoQueue::default());
+        coalescer_requeue_requests(
+            &rq,
+            vec![CoalescerCommitFields {
+                enqueued_at: Instant::now(),
+                enqueued_wall: Utc::now(),
+                git_author_name: "Recovery".to_string(),
+                git_author_email: "recovery@example.com".to_string(),
+                message: "recover a consumed wake notification".to_string(),
+                rel_paths: vec!["recovered.txt".to_string()],
+            }],
+        );
+        let repos = Arc::new(Mutex::new(HashMap::from([(tmp.path().to_path_buf(), rq)])));
+        // This is the state left when a peer consumes the notification before
+        // the old worker releases processing: pending work, no wake token.
+        let work_cv = Arc::new((Mutex::new(0), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicU64::new(1));
+        let worker_cv = Arc::clone(&work_cv);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_pending = Arc::clone(&pending);
+        let worker = std::thread::Builder::new()
+            .name("coalescer-lost-wake-regression".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || {
+                coalescer_pool_worker(
+                    repos,
+                    worker_cv,
+                    worker_shutdown,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(CommitQueueStats::default())),
+                    Arc::new(Mutex::new(VecDeque::new())),
+                    worker_pending,
+                    Duration::from_millis(10),
+                    1,
+                );
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pending.load(Ordering::Relaxed) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let drained = pending.load(Ordering::Relaxed) == 0;
+        shutdown.store(true, Ordering::Release);
+        work_cv.1.notify_all();
+        worker
+            .join()
+            .expect("worker exits after bounded regression");
+        assert!(
+            drained,
+            "the idle safety probe must drain work without another enqueue or flush"
+        );
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("recovered.txt")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"recovered wake\n"
+        );
+    }
+
+    #[test]
+    fn coalescer_failed_commit_retains_lag_and_recovers_without_enqueue() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_failed_commit_retains_lag_and_recovers_without_enqueue",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("retry.txt"), b"retained request\n").unwrap();
+        let coalescer = get_commit_coalescer();
+        // Opening a repository fails until Git initialization below. The
+        // original request must survive this real failure and retry itself.
+        coalescer.enqueue(
+            tmp.path().to_path_buf(),
+            &test_config(tmp.path()),
+            "retry after archive initialization".to_string(),
+            vec!["retry.txt".to_string()],
+        );
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(tmp.path()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rq.metrics.errors_total.load(Ordering::Relaxed) == 0
+            || rq.processing.load(Ordering::Acquire)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not expose the failed commit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let failed = archive_lag_snapshot();
+        assert_eq!(failed.coalescer_pending, 1);
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 1);
+        assert!(failed.coalescer_oldest_age_us > 0, "{failed:?}");
+        assert!(failed.coalescer_since_progress_us > 0, "{failed:?}");
+
+        let repo = Repository::init(tmp.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coalescer.pending_requests() != 0 || rq.processing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "retained request never retried successfully"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("retry.txt")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"retained request\n"
+        );
+        assert_eq!(coalescer.lag_state(), CoalescerLagState::default());
+    }
+
+    fn isolated_coalescer_regression(test_name: &str) -> bool {
+        const CHILD: &str = "AM_TEST_COALESCER_PROGRESS_CASE";
+        if std::env::var(CHILD).ok().as_deref() == Some(test_name) {
+            return true;
+        }
+        // These tests hold a process-wide archive fence or exercise the global
+        // health snapshot. A fresh process isolates other tests' workers and
+        // keeps all archive recovery state under a temporary storage root.
+        let isolated = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .env("STORAGE_ROOT", isolated.path())
+            .env("AM_ARCHIVE_BATCH_EVENTS", "1")
+            .env("AM_COALESCER_MAX_WORKERS", "2")
+            .output()
+            .expect("run isolated coalescer regression");
+        assert!(
+            output.status.success(),
+            "{test_name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "the exact child selector must execute one regression: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        false
+    }
+
+    #[test]
     fn commit_coalescer_oldest_pending_age_tracks_enqueue() {
         // Long flush interval so the worker cannot drain during the test window.
         let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
@@ -19220,6 +19605,128 @@ mod tests {
         assert_eq!(result, WbqEnqueueResult::Enqueued);
         assert_eq!(op_depth.load(Ordering::Relaxed), 1);
         let _ = rx.recv_timeout(Duration::from_millis(20));
+    }
+
+    #[test]
+    fn wbq_enqueue_accounting_precedes_observable_work() {
+        const CHILD: &str = "AM_TEST_WBQ_PUBLICATION_ACCOUNTING";
+        const COMPLETED: &str = "WBQ publication accounting verified";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_enqueue_accounting_precedes_observable_work",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        // Global health counters must belong only to this real producer/drain
+        // pair; a fresh process prevents another test's WBQ from masking drift.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_path = config
+            .notifications_signals_dir
+            .join("projects/accounting/agents/BlueLake.signal");
+        let wbq = new_write_behind_queue();
+        wbq_start_inner(&wbq);
+        let sender = wbq_sender_clone(&wbq).unwrap();
+        let flush_sender = sender.clone();
+        let depth = Arc::clone(&wbq.op_depth);
+        let observed_signal = signal_path.clone();
+        WBQ_AFTER_PUBLISH_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+                wbq_send_control_with_deadline(&flush_sender, WbqMsg::Flush(done_tx), deadline)
+                    .expect("flush must enter the live channel");
+                done_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("real drain must finish before the producer resumes");
+                assert!(observed_signal.is_file(), "the actual write must have run");
+                assert_eq!(depth.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    mcp_agent_mail_core::global_metrics()
+                        .storage
+                        .wbq_depth
+                        .load(),
+                    0,
+                );
+            }));
+        });
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &sender,
+                wbq.op_depth.as_ref(),
+                WriteOp::NotificationSignal {
+                    config,
+                    project_slug: "accounting".to_string(),
+                    agent_name: "BlueLake".to_string(),
+                    metadata: None,
+                },
+            ),
+            WbqEnqueueResult::Enqueued,
+        );
+        assert!(signal_path.is_file());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(archive_lag_snapshot().wbq_since_progress_us, 0);
+        assert_eq!(wbq_stats().enqueued, 1);
+        assert_eq!(wbq_stats().drained, 1);
+
+        wbq_send_control_with_deadline(
+            &sender,
+            WbqMsg::Shutdown,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let handle = wbq.drain_handle.lock().take().unwrap();
+        handle.join().expect("drain must shut down cleanly");
+
+        // A disconnected publication and a full-channel timeout roll back
+        // their accounting without changing accepted/drained totals.
+        let (disconnected, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        let rejected_depth = AtomicU64::new(0);
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &disconnected,
+                &rejected_depth,
+                wbq_test_clear_signal_op("accounting-disconnected"),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+        );
+        let (full, receiver) = std::sync::mpsc::sync_channel(1);
+        full.try_send(WbqMsg::Flush(std::sync::mpsc::sync_channel(1).0))
+            .unwrap();
+        assert_eq!(
+            wbq_enqueue_with_sender(
+                &full,
+                &rejected_depth,
+                wbq_test_clear_signal_op("accounting-full"),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+        );
+        assert!(matches!(receiver.try_recv(), Ok(WbqMsg::Flush(_))));
+        assert_eq!(rejected_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(archive_lag_snapshot().wbq_since_progress_us, 0);
+        assert_eq!(wbq_stats().enqueued, 1);
+        assert_eq!(wbq_stats().drained, 1);
+        println!("{COMPLETED}");
     }
 
     #[test]
