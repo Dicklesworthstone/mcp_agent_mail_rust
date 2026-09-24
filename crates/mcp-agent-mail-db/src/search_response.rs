@@ -340,10 +340,15 @@ impl PartialOrd for LexicalRank {
 
 #[cfg(feature = "tantivy-engine")]
 impl Ord for LexicalRank {
+    /// Higher score ranks first; among equal scores the LOWER document id
+    /// ranks first. That is the (score desc, id asc) order the SQL planner
+    /// (`m.id ASC`) and search_service's cursor pagination use: a page
+    /// boundary that selected the highest tied ids instead made the next
+    /// cursor page skip every remaining tie (br-t31jg).
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
             .total_cmp(&other.score)
-            .then_with(|| self.doc_id.cmp(&other.doc_id))
+            .then_with(|| other.doc_id.cmp(&self.doc_id))
     }
 }
 
@@ -1127,7 +1132,7 @@ mod tests {
             let config = ResponseConfig::default();
             let results = execute_search(&index, &AllQuery, &handles, &[], 100, 2, false, &config);
             assert_eq!(results.hits.len(), 1);
-            assert_eq!(results.hits[0].doc_id, 1);
+            assert_eq!(results.hits[0].doc_id, 3);
         }
 
         #[test]
@@ -1137,7 +1142,7 @@ mod tests {
             let results = execute_search(&index, &AllQuery, &handles, &[], 2, 1, false, &config);
             let ids: Vec<i64> = results.hits.iter().map(|hit| hit.doc_id).collect();
             assert_eq!(results.total_count, 3);
-            assert_eq!(ids, vec![2, 1]);
+            assert_eq!(ids, vec![2, 3]);
         }
 
         #[test]
@@ -1327,15 +1332,16 @@ mod tests {
         #[test]
         fn deterministic_tiebreaking() {
             let (index, handles) = setup_index();
-            // AllQuery gives same score to all docs — tie-breaking by ID desc
+            // AllQuery gives same score to all docs — tie-breaking by ID asc,
+            // the order the SQL planner and cursor pagination use.
             let config = ResponseConfig::default();
             let results = execute_search(&index, &AllQuery, &handles, &[], 100, 0, false, &config);
-            // After tie-breaking: IDs should be in descending order
+            // After tie-breaking: IDs should be in ascending order
             for window in results.hits.windows(2) {
                 if (window[0].score - window[1].score).abs() < f64::EPSILON {
                     assert!(
-                        window[0].doc_id >= window[1].doc_id,
-                        "Expected {} >= {} for tie-breaking",
+                        window[0].doc_id <= window[1].doc_id,
+                        "Expected {} <= {} for tie-breaking",
                         window[0].doc_id,
                         window[1].doc_id
                     );
@@ -1356,7 +1362,7 @@ mod tests {
                 assert_eq!(results.explain.as_ref().unwrap().hits.len(), 1);
                 ids.push(results.hits[0].doc_id);
             }
-            assert_eq!(ids, vec![3, 2, 1]);
+            assert_eq!(ids, vec![1, 2, 3]);
         }
 
         #[test]
@@ -1390,7 +1396,7 @@ mod tests {
                 assert_eq!(results.total_count, 15);
                 paged_ids.extend(results.hits.iter().map(|hit| hit.doc_id));
             }
-            assert_eq!(paged_ids, (1i64..=15).rev().collect::<Vec<_>>());
+            assert_eq!(paged_ids, (1i64..=15).collect::<Vec<_>>());
         }
 
         #[test]
@@ -1432,7 +1438,7 @@ mod tests {
                 assert_eq!(hit.score.to_bits(), expected_scores[&id]);
                 ids.push(hit.doc_id);
             }
-            assert_eq!(ids, vec![1, 3, 2]);
+            assert_eq!(ids, vec![1, 2, 3]);
         }
 
         #[test]
@@ -1473,7 +1479,7 @@ mod tests {
         fn oversized_limits_are_bounded_by_snapshot_size() {
             let (index, handles) = setup_index();
             let config = ResponseConfig::default();
-            for (offset, expected) in [(0, vec![3, 2, 1]), (1, vec![2, 1]), (2, vec![1])] {
+            for (offset, expected) in [(0, vec![1, 2, 3]), (1, vec![2, 3]), (2, vec![3])] {
                 let result = execute_search(
                     &index,
                     &AllQuery,
@@ -1504,8 +1510,11 @@ mod tests {
                 score: 1.0,
                 doc_id: 2,
             };
-            assert!(higher_score > higher_id);
-            assert!(higher_id > lower_id);
+            assert!(higher_score > lower_id);
+            assert!(
+                lower_id > higher_id,
+                "among equal scores the lower id ranks first"
+            );
             for score in [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN] {
                 let rank = LexicalRank { score, doc_id: 1 };
                 let equivalent = LexicalRank {
