@@ -1169,6 +1169,33 @@ fn fetch_db_tail_count(conn: &DbConn, start_after_id: i64) -> Result<u64, String
     Ok(u64::try_from(count_i64).unwrap_or(0))
 }
 
+/// An incremental plan resuming after a still-valid marker, if the marker
+/// recorded a complete index and the rows it covered are all still present.
+/// Callers must already have proven the source append-only since the marker.
+fn marker_resume_plan(
+    conn: &DbConn,
+    db: MessageStats,
+    state: Option<&BackfillState>,
+) -> Result<Option<BackfillPlan>, String> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    if state.db_stats.count == 0 || state.index_stats != state.db_stats {
+        return Ok(None);
+    }
+    let Ok(marker_max_id) = i64::try_from(state.db_stats.max_id) else {
+        return Ok(None);
+    };
+    let rows_through_marker = db
+        .count
+        .saturating_sub(fetch_db_tail_count(conn, marker_max_id)?);
+    Ok(
+        (rows_through_marker == state.db_stats.count).then_some(BackfillPlan::Incremental {
+            start_after_id: marker_max_id,
+        }),
+    )
+}
+
 fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, String> {
     let reader = manual_index_reader(bridge.index())
         .map_err(|e| format!("backfill index reader error: {e}"))?;
@@ -1691,7 +1718,19 @@ fn backfill_into_bridge_locked_with_opener(
         // inserts as appends: INSERT OR REPLACE can preserve count/max-ID
         // without firing a DELETE trigger. Already-ingested pure appends may
         // legitimately yield Skip here.
-        choose_backfill_plan(&conn, db_stats, index_stats)?
+        match choose_backfill_plan(&conn, db_stats, index_stats)? {
+            BackfillPlan::FullRebuild => {
+                // br-kp1in.18: live indexing skips a delivery while another
+                // operation holds the source lock, leaving holes above the
+                // marker that the tail count reads as damage. Rows up to the
+                // marker are unchanged (append-only clock) and were fully
+                // indexed when it was written, so re-ingesting everything after
+                // it repairs the holes; upserts make overlap harmless.
+                marker_resume_plan(&conn, db_stats, previous_state.as_ref())?
+                    .unwrap_or(BackfillPlan::FullRebuild)
+            }
+            plan => plan,
+        }
     };
 
     if matches!(plan, BackfillPlan::Skip) {
@@ -3535,6 +3574,80 @@ mod tests {
         assert_eq!(results[0].title, "deferrednotification");
         assert_eq!(backfill_from_db(&path).unwrap(), (0, 2));
         reset_bridge_for_tests();
+    }
+
+    /// br-kp1in.18: deliveries skipped by live indexing (source lock busy)
+    /// leave holes above the marker; the next backfill re-ingests only the rows
+    /// after the marker instead of rebuilding the whole index, unless the
+    /// marker itself recorded an incomplete index.
+    #[test]
+    fn skipped_live_deliveries_resume_from_marker_instead_of_full_rebuild() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for marker_complete in [true, false] {
+            reset_bridge_for_tests();
+            let source = tempfile::tempdir().unwrap();
+            let index = tempfile::tempdir().unwrap();
+            let path = create_test_db(
+                source.path(),
+                &[
+                    (1, "alpha", "first body", "normal", "thread-one"),
+                    (2, "beta", "second body", "normal", "thread-one"),
+                    (3, "gamma", "third body", "normal", "thread-one"),
+                ],
+            );
+            let conn = DbConn::open_file(&path).unwrap();
+            for migration in crate::schema::schema_migrations()
+                .into_iter()
+                .filter(|migration| migration.id.starts_with("v29_"))
+            {
+                conn.execute_sync(&migration.up, &[]).unwrap();
+            }
+            init_bridge(index.path()).unwrap();
+            // Ingesting passes report (documents indexed, 0).
+            assert_eq!(backfill_from_db(&path).unwrap(), (3, 0));
+            let bridge = get_bridge().unwrap();
+            if !marker_complete {
+                let marker_path = backfill_state_path(&bridge);
+                let mut marker: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+                marker["index_stats"]["count"] = serde_json::json!(2);
+                std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            }
+            for id in 4..=6 {
+                conn.execute_sync(
+                    &format!(
+                        "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES ({id}, 1, 1, 'appended{id}', 'appended body {id}', {id}000000)"
+                    ),
+                    &[],
+                )
+                .unwrap();
+            }
+            // Deliveries 4 and 5 were skipped while the source lock was busy;
+            // 6 was indexed live.
+            assert_eq!(index_message(&path, 6), Ok(true));
+            let expected = if marker_complete { (3, 0) } else { (6, 0) };
+            assert_eq!(
+                backfill_from_db(&path).unwrap(),
+                expected,
+                "marker_complete={marker_complete}: resume after the marker, never trust an incomplete one"
+            );
+            let hits = search_database(
+                &path,
+                index.path(),
+                &PlannerQuery {
+                    text: "appended4".to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![4]);
+            reset_bridge_for_tests();
+        }
     }
 
     #[test]
