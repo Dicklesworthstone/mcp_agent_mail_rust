@@ -10,9 +10,16 @@ description = "CLI tool for MCP Agent Mail (am binary)"
 # Distributed as binary-only via dist.yml + curl|bash installer.
 # Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
 publish = false
+# All integration tests link into ONE binary (tests/it.rs) instead of one ~0.7 GB
+# binary per file (br-kp1in.28); tests/it.rs checks every tests/*.rs is declared.
+autotests = false
 
 # [lints] workspace = true is deferred for this crate: it is ~140k lines and the
 # pedantic/nursery burn-down is tracked in br-sox5q. Its root still forbids unsafe.
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
 
 [[bin]]
 name = "am"
@@ -97,4 +104,5 @@ portable = [
 # construct `Cx::for_testing()`; the release build excludes dev-deps and keeps
 # the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
 asupersync = { workspace = true, features = ["test-internals"] }
+mcp-agent-mail-test-helpers.workspace = true
 similar.workspace = true

@@ -13,7 +13,7 @@
 //!
 //! Run:
 //! ```sh
-//! cargo test -p mcp-agent-mail-server --test pty_e2e_search -- --nocapture
+//! cargo test -p mcp-agent-mail-server --test it pty_e2e_search:: -- --nocapture
 //! ```
 
 #![forbid(unsafe_code)]

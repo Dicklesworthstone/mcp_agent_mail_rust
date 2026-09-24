@@ -85,21 +85,23 @@ slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
 # br-ivgot: the inline modal and Mermaid timing tests need the same isolation
 # as the dedicated TUI performance binary. Their 1ms/10ms assertions remain
 # unchanged; this reserves runner capacity, not CPU time from other processes.
+# Integration tests live in one `it` binary per crate (br-kp1in.28), so a former
+# test binary `<name>` is selected as `binary_id(<crate>::it) & test(/^<name>::/)`.
 # ---------------------------------------------------------------------------
 [[profile.default.overrides]]
 filter = '''
-binary_id(mcp-agent-mail-storage::stress_pipeline)
-| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
-| binary_id(mcp-agent-mail-db::load_concurrency)
-| binary_id(mcp-agent-mail-db::load_bench)
-| binary_id(mcp-agent-mail-db::stress)
+(binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline::/))
+| (binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline_known_bad_git::/))
+| (binary_id(mcp-agent-mail-db::it) & test(/^load_concurrency::/))
+| (binary_id(mcp-agent-mail-db::it) & test(/^load_bench::/))
+| (binary_id(mcp-agent-mail-db::it) & test(/^stress::/))
 | test(native_http_transport_gate)
 | test(native_share_archive_transport_gate)
 | test(native_tui_transport_gate)
 | test(native_security_privacy_gate)
 | test(rapid_key_sequences_no_panic)
-| binary_id(mcp-agent-mail-server::tui_perf_baselines)
-| binary_id(mcp-agent-mail-server::golden_snapshots)
+| (binary_id(mcp-agent-mail-server::it) & test(/^tui_perf_baselines::/))
+| (binary_id(mcp-agent-mail-server::it) & test(/^golden_snapshots::/))
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 '''
@@ -122,8 +124,8 @@ slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
 # isolated-run reality — still finite, so a genuine hang dies in minutes.
 [[profile.default.overrides]]
 filter = '''
-binary_id(mcp-agent-mail-storage::stress_pipeline)
-| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
+(binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline::/))
+| (binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline_known_bad_git::/))
 | test(swarm_load_lab_ci_smoke_writes_slo_artifacts)
 | test(native_http_transport_gate)
 | test(native_share_archive_transport_gate)
@@ -154,18 +156,18 @@ slow-timeout = { period = "180s", terminate-after = 6, grace-period = "10s" }
 # Same load-lab isolation + watchdogs under CI (overrides do not inherit).
 [[profile.ci.overrides]]
 filter = '''
-binary_id(mcp-agent-mail-storage::stress_pipeline)
-| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
-| binary_id(mcp-agent-mail-db::load_concurrency)
-| binary_id(mcp-agent-mail-db::load_bench)
-| binary_id(mcp-agent-mail-db::stress)
+(binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline::/))
+| (binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline_known_bad_git::/))
+| (binary_id(mcp-agent-mail-db::it) & test(/^load_concurrency::/))
+| (binary_id(mcp-agent-mail-db::it) & test(/^load_bench::/))
+| (binary_id(mcp-agent-mail-db::it) & test(/^stress::/))
 | test(native_http_transport_gate)
 | test(native_share_archive_transport_gate)
 | test(native_tui_transport_gate)
 | test(native_security_privacy_gate)
 | test(rapid_key_sequences_no_panic)
-| binary_id(mcp-agent-mail-server::tui_perf_baselines)
-| binary_id(mcp-agent-mail-server::golden_snapshots)
+| (binary_id(mcp-agent-mail-server::it) & test(/^tui_perf_baselines::/))
+| (binary_id(mcp-agent-mail-server::it) & test(/^golden_snapshots::/))
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 '''
@@ -178,8 +180,8 @@ slow-timeout = { period = "300s", terminate-after = 5, grace-period = "15s" }
 
 [[profile.ci.overrides]]
 filter = '''
-binary_id(mcp-agent-mail-storage::stress_pipeline)
-| binary_id(mcp-agent-mail-storage::stress_pipeline_known_bad_git)
+(binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline::/))
+| (binary_id(mcp-agent-mail-storage::it) & test(/^stress_pipeline_known_bad_git::/))
 | test(swarm_load_lab_ci_smoke_writes_slo_artifacts)
 | test(native_http_transport_gate)
 | test(native_share_archive_transport_gate)

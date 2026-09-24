@@ -14,7 +14,7 @@
     deprecated
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};

@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;

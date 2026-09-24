@@ -3730,7 +3730,7 @@ fn doctor_support_bundle_adversarial_redaction_writes_report() {
         "leaked_forbidden_labels": leaked.clone(),
         "retained_present": retained_present,
         "missing_retained_labels": missing_retained.clone(),
-        "repro": "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs doctor_support_bundle_adversarial_redaction_writes_report -- --nocapture"
+        "repro": "rch exec -- cargo test -p mcp-agent-mail-cli --test it integration_runs::doctor_support_bundle_adversarial_redaction_writes_report -- --nocapture"
     });
     write_json_artifact(&run_root, "redaction_report.json", &report);
     write_text_artifact(
@@ -4119,8 +4119,8 @@ fn startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstr
     write_text_artifact(
         &run_root,
         "repro.txt",
-        "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
-         startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct -- --nocapture\n",
+        "rch exec -- cargo test -p mcp-agent-mail-cli --test it \
+         integration_runs::startup_recovery_crash_replay_writes_artifacts_and_smokes_repair_and_reconstruct -- --nocapture\n",
     );
     write_text_artifact(
         &run_root,
@@ -5248,7 +5248,7 @@ fn robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only() {
     write_text_artifact(
         &run_root,
         "repro.txt",
-        "rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only -- --nocapture\n",
+        "rch exec -- cargo test -p mcp-agent-mail-cli --test it integration_runs::robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only -- --nocapture\n",
     );
     eprintln!(
         "stale handoff dashboard artifact root: {}",

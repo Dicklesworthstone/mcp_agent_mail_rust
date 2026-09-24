@@ -182,7 +182,12 @@ fn run_parent() {
 
     let spawn_worker = |name: &'static str| {
         let mut child = Command::new(&exe)
-            .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+            .args([
+                "--exact",
+                &mcp_agent_mail_test_helpers::libtest_path!(TEST_NAME),
+                "--test-threads=1",
+                "--nocapture",
+            ])
             .env("MAGENTAROBIN_ID_WORKER_DB", db_path.display().to_string())
             .env("MAGENTAROBIN_ID_WORKER_NAME", name)
             .env("MAGENTAROBIN_ID_WORKER_GATE", gate.display().to_string())

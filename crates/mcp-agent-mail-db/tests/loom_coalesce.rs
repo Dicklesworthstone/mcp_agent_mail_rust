@@ -20,7 +20,7 @@
 //! # Running
 //!
 //! ```sh
-//! cargo test --features loom-tests -p mcp-agent-mail-db --test loom_coalesce
+//! cargo test --features loom-tests -p mcp-agent-mail-db --test it loom_coalesce::
 //! ```
 
 #![cfg(feature = "loom-tests")]

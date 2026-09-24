@@ -6,12 +6,12 @@
 //!
 //! Run (30-second default):
 //! ```
-//! cargo test -p mcp-agent-mail-server --test tui_soak_replay -- --ignored --nocapture
+//! cargo test -p mcp-agent-mail-server --test it tui_soak_replay:: -- --ignored --nocapture
 //! ```
 //!
 //! Extended (5 minutes):
 //! ```
-//! SOAK_DURATION_SECS=300 cargo test -p mcp-agent-mail-server --test tui_soak_replay -- --ignored --nocapture
+//! SOAK_DURATION_SECS=300 cargo test -p mcp-agent-mail-server --test it tui_soak_replay:: -- --ignored --nocapture
 //! ```
 
 #![forbid(unsafe_code)]

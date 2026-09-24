@@ -281,7 +281,9 @@ fn run_crash_probe(storage_root: &Path) -> CrashProbeSummary {
     let mut child = Command::new(current_exe())
         .arg("--ignored")
         .arg("--exact")
-        .arg("archive_fsync_matrix_child_writer")
+        .arg(mcp_agent_mail_test_helpers::libtest_path!(
+            "archive_fsync_matrix_child_writer"
+        ))
         .arg("--nocapture")
         .env("AM_FSYNC_MATRIX_CHILD", "1")
         .env("AM_FSYNC_MATRIX_CHILD_ROOT", &root)

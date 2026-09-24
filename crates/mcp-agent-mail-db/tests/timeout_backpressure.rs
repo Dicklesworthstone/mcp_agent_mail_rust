@@ -20,7 +20,7 @@
     clippy::redundant_clone
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Budget, Cx, Outcome, Time};
 use mcp_agent_mail_core::backpressure::{

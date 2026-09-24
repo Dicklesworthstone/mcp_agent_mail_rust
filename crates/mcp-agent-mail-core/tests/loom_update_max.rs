@@ -17,7 +17,7 @@
 //! # Running
 //!
 //! ```sh
-//! cargo test --features loom-tests -p mcp-agent-mail-core --test loom_update_max
+//! cargo test --features loom-tests -p mcp-agent-mail-core --test it loom_update_max::
 //! ```
 
 #![cfg(feature = "loom-tests")]

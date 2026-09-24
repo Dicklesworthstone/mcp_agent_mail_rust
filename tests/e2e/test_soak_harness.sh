@@ -400,7 +400,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 1: Building test binaries ---"
 fi
-if ! run_soak_cargo test -p mcp-agent-mail-db --test sustained_load --no-run 2>&1; then
+if ! run_soak_cargo test -p mcp-agent-mail-db --test it --no-run 2>&1; then
     echo "FAIL: Build failed"
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
         e2e_fail "build (mcp-agent-mail-db)"
@@ -408,7 +408,7 @@ if ! run_soak_cargo test -p mcp-agent-mail-db --test sustained_load --no-run 2>&
     fi
     exit 2
 fi
-if ! run_soak_cargo test -p mcp-agent-mail-server --test tui_soak_replay --no-run 2>&1; then
+if ! run_soak_cargo test -p mcp-agent-mail-server --test it --no-run 2>&1; then
     echo "FAIL: Build failed"
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
         e2e_fail "build (mcp-agent-mail-server)"
@@ -428,7 +428,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 2: Multi-project DB soak (${SUSTAINED_LOAD_SECS}s) ---"
 fi
-if run_soak_cargo test -p mcp-agent-mail-db --test sustained_load multi_project_soak_replay -- --ignored --nocapture 2>&1; then
+if run_soak_cargo test -p mcp-agent-mail-db --test it sustained_load::multi_project_soak_replay -- --ignored --nocapture 2>&1; then
     echo "PASS: multi_project_soak_replay"
     PASS=$((PASS + 1))
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
@@ -449,7 +449,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 3: TUI soak replay (${SOAK_DURATION_SECS}s) ---"
 fi
-if run_soak_cargo test -p mcp-agent-mail-server --test tui_soak_replay soak_replay_empty_state -- --ignored --nocapture 2>&1; then
+if run_soak_cargo test -p mcp-agent-mail-server --test it tui_soak_replay::soak_replay_empty_state -- --ignored --nocapture 2>&1; then
     echo "PASS: soak_replay_empty_state"
     PASS=$((PASS + 1))
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
@@ -470,7 +470,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 4: TUI rapid screen cycling ---"
 fi
-if run_soak_cargo test -p mcp-agent-mail-server --test tui_soak_replay soak_rapid_screen_cycling -- --nocapture 2>&1; then
+if run_soak_cargo test -p mcp-agent-mail-server --test it tui_soak_replay::soak_rapid_screen_cycling -- --nocapture 2>&1; then
     echo "PASS: soak_rapid_screen_cycling"
     PASS=$((PASS + 1))
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
@@ -491,7 +491,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 5: TUI per-screen stability ---"
 fi
-if run_soak_cargo test -p mcp-agent-mail-server --test tui_soak_replay soak_per_screen_stability -- --nocapture 2>&1; then
+if run_soak_cargo test -p mcp-agent-mail-server --test it tui_soak_replay::soak_per_screen_stability -- --nocapture 2>&1; then
     echo "PASS: soak_per_screen_stability"
     PASS=$((PASS + 1))
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
@@ -512,7 +512,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 6: TUI degradation check ---"
 fi
-if run_soak_cargo test -p mcp-agent-mail-server --test tui_soak_replay soak_no_degradation -- --nocapture 2>&1; then
+if run_soak_cargo test -p mcp-agent-mail-server --test it tui_soak_replay::soak_no_degradation -- --nocapture 2>&1; then
     echo "PASS: soak_no_degradation"
     PASS=$((PASS + 1))
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
@@ -533,7 +533,7 @@ if [[ "$HAS_E2E_LIB" -eq 1 ]]; then
 else
     echo "--- Phase 7: TUI search typing stress ---"
 fi
-if run_soak_cargo test -p mcp-agent-mail-server --test tui_soak_replay soak_search_typing_stress -- --nocapture 2>&1; then
+if run_soak_cargo test -p mcp-agent-mail-server --test it tui_soak_replay::soak_search_typing_stress -- --nocapture 2>&1; then
     echo "PASS: soak_search_typing_stress"
     PASS=$((PASS + 1))
     if [[ "$HAS_E2E_LIB" -eq 1 ]]; then

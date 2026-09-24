@@ -7,7 +7,7 @@
 //! pooled write) against a scratch database and audits page accounting with
 //! canonical SQLite at each stage so a regression names the stage that leaked.
 
-mod common;
+use crate::common;
 
 use asupersync::Cx;
 use mcp_agent_mail_db::{CanonicalDbConn, DbPoolConfig, create_pool};

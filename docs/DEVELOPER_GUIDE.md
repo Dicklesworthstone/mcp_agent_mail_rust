@@ -378,7 +378,7 @@ Use this as the contributor contract for `br-3vwi.11.3`-class changes.
 - Never expose blocked cross-project data in raw or preview forms.
 - Keep deny/redact audit semantics consistent with scope policy.
 - Validate with:
-  - `cargo test -p mcp-agent-mail-db --test scope_policy_property -- --nocapture`
+  - `cargo test -p mcp-agent-mail-db --test it scope_policy_property:: -- --nocapture`
   - `tests/e2e/test_security_privacy.sh`
 
 ### 3) Markdown sanitization invariants
@@ -402,8 +402,8 @@ Use this as the contributor contract for `br-3vwi.11.3`-class changes.
 | Change type | Required commands | Evidence artifacts to link in bead/comment |
 |-------------|-------------------|--------------------------------------------|
 | Search behavior/query dialect | `bash tests/e2e/test_search_cockpit.sh` | `tests/artifacts/search_cockpit/<timestamp>/case_*.txt`, `bundle.json` |
-| Scope/redaction policy | `cargo test -p mcp-agent-mail-db --test scope_policy_property -- --nocapture` and `bash tests/e2e/test_security_privacy.sh` | `tests/artifacts/security_privacy/<timestamp>/case_01_search_scope.txt`, `case_09_secret_body.txt` |
-| Search V3 CI contract (mandatory suites + diagnostics) | `bash tests/e2e/test_search_v3_stdio.sh`, `bash tests/e2e/test_search_v3_http.sh`, `bash tests/e2e/test_search_v3_shadow_parity.sh`, `bash tests/e2e/test_search_v3_resilience.sh`, `bash tests/e2e/test_search_v3_load_concurrency.sh`, plus `cargo test -p mcp-agent-mail-db --test filter_pagination --test logging_redaction --test diversity_dedup --test timeout_backpressure -- --nocapture` | `tests/artifacts/search_v3_*/<timestamp>/summary.json`, `tests/artifacts/search_v3/<suite>/<timestamp>/...`, `tests/artifacts/search_v3_ci/*.log` |
+| Scope/redaction policy | `cargo test -p mcp-agent-mail-db --test it scope_policy_property:: -- --nocapture` and `bash tests/e2e/test_security_privacy.sh` | `tests/artifacts/security_privacy/<timestamp>/case_01_search_scope.txt`, `case_09_secret_body.txt` |
+| Search V3 CI contract (mandatory suites + diagnostics) | `bash tests/e2e/test_search_v3_stdio.sh`, `bash tests/e2e/test_search_v3_http.sh`, `bash tests/e2e/test_search_v3_shadow_parity.sh`, `bash tests/e2e/test_search_v3_resilience.sh`, `bash tests/e2e/test_search_v3_load_concurrency.sh`, plus `cargo test -p mcp-agent-mail-db --test it -- filter_pagination:: logging_redaction:: diversity_dedup:: timeout_backpressure:: --nocapture` | `tests/artifacts/search_v3_*/<timestamp>/summary.json`, `tests/artifacts/search_v3/<suite>/<timestamp>/...`, `tests/artifacts/search_v3_ci/*.log` |
 | Widget/screen interaction changes | `bash tests/e2e/test_tui_interactions.sh` and `bash tests/e2e/test_tui_compat_matrix.sh` | `tests/artifacts/tui_interactions/<timestamp>/trace/analytics_widgets_timeline.tsv`, matrix profile captures |
 | Markdown rendering/sanitization | `cargo test -p mcp-agent-mail-server markdown -- --nocapture` and `bash tests/e2e/test_mail_ui.sh` | mail UI and security/privacy artifacts showing sanitized output |
 | E2E harness/artifact format changes | `bash tests/e2e/test_artifacts_schema.sh` | `tests/artifacts/artifacts_schema/<timestamp>/bundle.json` |
@@ -424,10 +424,10 @@ bash tests/e2e/test_search_v3_shadow_parity.sh
 bash tests/e2e/test_search_v3_resilience.sh
 bash tests/e2e/test_search_v3_load_concurrency.sh
 
-cargo test -p mcp-agent-mail-db --test filter_pagination -- --nocapture
-cargo test -p mcp-agent-mail-db --test logging_redaction -- --nocapture
-cargo test -p mcp-agent-mail-db --test diversity_dedup -- --nocapture
-cargo test -p mcp-agent-mail-db --test timeout_backpressure -- --nocapture
+cargo test -p mcp-agent-mail-db --test it filter_pagination:: -- --nocapture
+cargo test -p mcp-agent-mail-db --test it logging_redaction:: -- --nocapture
+cargo test -p mcp-agent-mail-db --test it diversity_dedup:: -- --nocapture
+cargo test -p mcp-agent-mail-db --test it timeout_backpressure:: -- --nocapture
 
 source scripts/e2e_lib.sh
 e2e_validate_bundle_tree tests/artifacts

@@ -88,7 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p mcp-agent-mail-db --test nocase_backup_compat public_proactive_backup_publishes_a_strict_nocase_snapshot -- --exact 2>&1 | tee "$RUNNER_TEMP/gh326-evidence/public-backup.log"
+          cargo test --locked -p mcp-agent-mail-db --test it nocase_backup_compat::public_proactive_backup_publishes_a_strict_nocase_snapshot -- --exact 2>&1 | tee "$RUNNER_TEMP/gh326-evidence/public-backup.log"
           grep -q '1 passed; 0 failed' "$RUNNER_TEMP/gh326-evidence/public-backup.log"
       - name: Seal the tested candidate
         id: candidate

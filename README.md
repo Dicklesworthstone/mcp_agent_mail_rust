@@ -1545,8 +1545,8 @@ Release evidence for robot/doctor fields must prove the installed `am` binary, n
 
 ```bash
 AM_INSTALLED_BINARY_PARITY_BIN=/path/to/installed/am \
-  rch exec -- cargo test -p mcp-agent-mail-cli --test integration_runs \
-  installed_binary_parity_probe_compares_source_and_installed_am -- --ignored --nocapture
+  rch exec -- cargo test -p mcp-agent-mail-cli --test it \
+  integration_runs::installed_binary_parity_probe_compares_source_and_installed_am -- --ignored --nocapture
 ```
 
 The gate writes `tests/artifacts/installed_binary_parity/<run>/parity_report.json` with one pass/fail row per required JSON path, redacted source/installed values, value-mismatch status, and redacted command metadata. If the candidate lacks fields that source tests rely on, or returns different required values, the report is red and the release is not closed. A local direct `am doctor check --json` or `am robot ... --format json` probe is useful for quick inspection, but it is not sufficient release evidence unless paired with this parity report and an `rch exec -- ...` cargo proof.
@@ -1669,7 +1669,7 @@ cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
 cargo bench -p mcp-agent-mail-db --bench search_v3_bench
 
 # Load / soak validation
-cargo test -p mcp-agent-mail-db --test sustained_load -- --ignored --nocapture
+cargo test -p mcp-agent-mail-db --test it sustained_load:: -- --ignored --nocapture
 ```
 
 Hardware, kernel, and build profile matter. Treat these as checked-in reference baselines, not universal promises.

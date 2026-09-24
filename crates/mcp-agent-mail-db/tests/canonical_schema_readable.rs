@@ -12,7 +12,7 @@
 //! 5015af7f0); this test pins the fix at the CONSUMER boundary so a future
 //! fsqlite pin regression is caught in `mcp_agent_mail_rust`'s own suite.
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::{CanonicalDbConn, DbConn};

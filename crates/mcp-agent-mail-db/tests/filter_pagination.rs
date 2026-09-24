@@ -17,7 +17,7 @@
     clippy::identity_op
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};

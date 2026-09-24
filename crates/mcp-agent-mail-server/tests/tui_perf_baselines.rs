@@ -8,7 +8,7 @@
 //! Run with budget enforcement:
 //! ```
 //! MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
-//!   cargo test -p mcp-agent-mail-server --test tui_perf_baselines --release
+//!   cargo test -p mcp-agent-mail-server --test it tui_perf_baselines:: --release
 //! ```
 
 #![forbid(unsafe_code)]

@@ -83,7 +83,7 @@ fn committed_coverage_matrix_is_in_sync() {
     let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "missing {} ({e}); generate it with \
-             `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli --test reliability_coverage_ci`",
+             `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli --test it reliability_coverage_ci::`",
             path.display()
         )
     });
@@ -91,6 +91,6 @@ fn committed_coverage_matrix_is_in_sync() {
     assert_eq!(
         actual, expected,
         "docs/RELIABILITY_COVERAGE_MATRIX.md is stale; regenerate with \
-         `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli --test reliability_coverage_ci`"
+         `UPDATE_GOLDEN=1 cargo test -p mcp-agent-mail-cli --test it reliability_coverage_ci::`"
     );
 }

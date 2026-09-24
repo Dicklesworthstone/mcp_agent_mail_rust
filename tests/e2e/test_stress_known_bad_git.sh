@@ -27,12 +27,12 @@ run_scenario() {
   mkdir -p "$dir"
   log_event info "$scenario" "scenario started" '{"filter":"'"$filter"'"}'
   set +e
-  cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git "$filter" -- --nocapture \
+  cargo test -p mcp-agent-mail-storage --test it "stress_pipeline_known_bad_git::$filter" -- --nocapture \
     >"$dir/stdout.log" 2>"$dir/stderr.log"
   local status=$?
   set -e
   printf '%s\n' "$status" > "$dir/exit"
-  printf '#!/usr/bin/env bash\nset -euo pipefail\ncargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git %q -- --nocapture\n' "$filter" > "$dir/replay.sh"
+  printf '#!/usr/bin/env bash\nset -euo pipefail\ncargo test -p mcp-agent-mail-storage --test it %q -- --nocapture\n' "stress_pipeline_known_bad_git::$filter" > "$dir/replay.sh"
   chmod +x "$dir/replay.sh"
   if [[ "$status" -eq 0 ]]; then
     log_event pass "$scenario" "scenario passed" '{"exit":0}'

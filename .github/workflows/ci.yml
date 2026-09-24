@@ -195,7 +195,7 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Mode matrix harness (Rust)
-        run: cargo test -p mcp-agent-mail-cli --test mode_matrix_harness -- --nocapture
+        run: cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_matrix.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -412,7 +412,7 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Semantic conformance suite
-        run: cargo test -p mcp-agent-mail-cli --test semantic_conformance -- --nocapture
+        run: cargo test -p mcp-agent-mail-cli --test it semantic_conformance:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_conform.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -470,7 +470,7 @@ jobs:
           cargo build -p mcp-agent-mail
 
       - name: Perf + security regression suite
-        run: cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture
+        run: cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_perf.sqlite3"
           STORAGE_ROOT: "/tmp/ci_storage"
@@ -748,7 +748,7 @@ jobs:
             local test_name="$1"
             local log_file="tests/artifacts/search_v3_ci/${test_name}.log"
             echo "::group::${test_name}"
-            if cargo test -p mcp-agent-mail-db --test "${test_name}" -- --nocapture 2>&1 | tee "${log_file}"; then
+            if cargo test -p mcp-agent-mail-db --test it "${test_name}::" -- --nocapture 2>&1 | tee "${log_file}"; then
               echo "PASS: ${test_name}"
             else
               echo "FAIL: ${test_name}"
@@ -999,7 +999,7 @@ jobs:
         run: cargo build -p mcp-agent-mail-cli
 
       - name: Verify help snapshots
-        run: cargo test -p mcp-agent-mail-cli --test help_snapshots -- --nocapture
+        run: cargo test -p mcp-agent-mail-cli --test it help_snapshots:: -- --nocapture
         env:
           COLUMNS: "120"
           DATABASE_URL: "sqlite:///tmp/ci_snap.sqlite3"
@@ -1296,7 +1296,7 @@ jobs:
         run: cargo build --workspace
 
       - name: Chaos circuit-breaker tests
-        run: cargo test -p mcp-agent-mail-db --test stress chaos_ -- --nocapture
+        run: cargo test -p mcp-agent-mail-db --test it stress::chaos_ -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"
@@ -1306,7 +1306,7 @@ jobs:
           HTTP_PATH: "/mcp/"
 
       - name: Fault injection integration tests
-        run: cargo test -p mcp-agent-mail-db --test fault_injection -- --nocapture
+        run: cargo test -p mcp-agent-mail-db --test it fault_injection:: -- --nocapture
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"
@@ -1318,8 +1318,8 @@ jobs:
       - name: Stress + pool exhaustion under failure
         run: |
           set -euo pipefail
-          cargo test -p mcp-agent-mail-db --test stress -- --nocapture 2>&1 | tee /tmp/chaos_stress.log
-          cargo test -p mcp-agent-mail-db --test pool_exhaustion -- --nocapture 2>&1 | tee /tmp/chaos_pool.log
+          cargo test -p mcp-agent-mail-db --test it stress:: -- --skip coalesce_stress:: --nocapture 2>&1 | tee /tmp/chaos_stress.log
+          cargo test -p mcp-agent-mail-db --test it pool_exhaustion:: -- --nocapture 2>&1 | tee /tmp/chaos_pool.log
         env:
           DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
           STORAGE_ROOT: "/tmp/ci_chaos_storage"
@@ -1332,7 +1332,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          CHAOS_COUNT="$(cargo test -p mcp-agent-mail-db --test stress chaos_ -- --list 2>/dev/null | grep -c '::.*: test$' || echo 0)"
+          CHAOS_COUNT="$(cargo test -p mcp-agent-mail-db --test it stress::chaos_ -- --list 2>/dev/null | grep -c '^stress::chaos_.*: test$' || true)"
           echo "Chaos circuit-breaker tests: ${CHAOS_COUNT}"
           if [ "${CHAOS_COUNT}" -lt 5 ]; then
             echo "FAIL: expected at least 5 chaos tests, got ${CHAOS_COUNT}"

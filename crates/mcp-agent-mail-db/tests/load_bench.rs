@@ -17,7 +17,7 @@
 //! # Running
 //!
 //! ```sh
-//! cargo test -p mcp-agent-mail-db --test load_bench -- --ignored --nocapture
+//! cargo test -p mcp-agent-mail-db --test it load_bench:: -- --ignored --nocapture
 //! ```
 
 #![allow(
@@ -29,7 +29,7 @@
     clippy::needless_collect
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::config::CacheProfile;
@@ -842,9 +842,9 @@ const fn operator_startup_trace_fixture() -> SwarmCapacityTraceFixture {
 
 fn swarm_capacity_reproduction_commands() -> Vec<String> {
     vec![
-        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test load_bench swarm_load_lab_ci_smoke_writes_slo_artifacts -- --nocapture".to_string(),
-        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test load_bench load_scenario_a_registration_storm -- --ignored --nocapture".to_string(),
-        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test load_bench load_scenario_c_mixed_workload -- --ignored --nocapture".to_string(),
+        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test it load_bench::swarm_load_lab_ci_smoke_writes_slo_artifacts -- --nocapture".to_string(),
+        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test it load_bench::load_scenario_a_registration_storm -- --ignored --nocapture".to_string(),
+        "CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_capacity rch exec -- cargo test -p mcp-agent-mail-db --test it load_bench::load_scenario_c_mixed_workload -- --ignored --nocapture".to_string(),
     ]
 }
 

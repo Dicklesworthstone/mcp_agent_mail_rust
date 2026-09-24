@@ -25,8 +25,8 @@
 #        queue (covered by DB-backed integration tests; see the case comment).
 #   F4 — the 196-reservation-audit regression corpus is present, well-formed,
 #        and covers the required drift modes (full replay semantics run
-#        in-process: `cargo test -p mcp-agent-mail-tools --test
-#        reservation_regression_fixtures`).
+#        in-process: `cargo test -p mcp-agent-mail-tools --test it
+#        reservation_regression_fixtures::`).
 #   F5 — acquire failure classification: `file_reservation_paths` against a
 #        mailbox whose reservation index is unreadable fails CLOSED with the
 #        `reservation_acquire` context (cause classification + `do_not_edit`)
@@ -447,7 +447,7 @@ if [ -f "${F4_MANIFEST}" ]; then
     else
         e2e_fail "F4: ${MISSING_RECIPES} manifest-referenced recipe file(s) missing"
     fi
-    e2e_log "F4: full replay semantics run in-process: cargo test -p mcp-agent-mail-tools --test reservation_regression_fixtures"
+    e2e_log "F4: full replay semantics run in-process: cargo test -p mcp-agent-mail-tools --test it reservation_regression_fixtures::"
 else
     e2e_fail "F4: reservation regression manifest missing at ${F4_MANIFEST}"
 fi

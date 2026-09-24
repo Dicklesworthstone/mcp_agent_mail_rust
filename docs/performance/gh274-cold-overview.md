@@ -75,7 +75,7 @@ test in `integration_runs`. Correct commands are:
 
 ```sh
 cargo test -p mcp-agent-mail-cli --lib robot::overview::tests -- --nocapture
-cargo test -p mcp-agent-mail-cli --test integration_runs robot_overview_cold_processes -- --nocapture
+cargo test -p mcp-agent-mail-cli --test it integration_runs::robot_overview_cold_processes -- --nocapture
 cargo test --release -p mcp-agent-mail-cli --lib benchmark_linear_overview_against_current_main -- --ignored --nocapture
 ```
 
@@ -166,7 +166,7 @@ order and compares the actual old/new Rust helpers on one indexed fixture.
 
 ```sh
 cargo test -p mcp-agent-mail-cli --lib robot::overview -- --nocapture
-cargo test -p mcp-agent-mail-cli --test integration_runs robot_overview_cold_processes -- --nocapture
+cargo test -p mcp-agent-mail-cli --test it integration_runs::robot_overview_cold_processes -- --nocapture
 cargo test --release -p mcp-agent-mail-cli --lib benchmark_sparse_recipient_counts_against_pending_row_scan -- --ignored --nocapture
 ```
 
@@ -261,7 +261,7 @@ and counts-only reservation helpers on the same indexed DbConn fixture.
 
 ```sh
 cargo test -p mcp-agent-mail-cli --lib robot::overview -- --nocapture
-cargo test -p mcp-agent-mail-cli --test integration_runs robot_overview_cold_processes -- --nocapture
+cargo test -p mcp-agent-mail-cli --test it integration_runs::robot_overview_cold_processes -- --nocapture
 cargo test --release -p mcp-agent-mail-cli --lib benchmark_counts_reservations_against_full_collection -- --ignored --nocapture
 ```
 

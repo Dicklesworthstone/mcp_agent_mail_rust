@@ -1,7 +1,7 @@
 //! br-3ibsu: Native harness adapter for share/archive-heavy E2E suites.
 //!
 //! Current phase: managed adapter.
-//! - Native runner entrypoint is Rust (`cargo test --test share_archive_harness`).
+//! - Native runner entrypoint is Rust (`cargo test -p mcp-agent-mail-cli --test it share_archive_harness::`).
 //! - Scenario execution delegates to shell suites (`share`, `share_verify_live`, `archive`).
 //! - Harness captures deterministic metadata and copies legacy artifacts.
 

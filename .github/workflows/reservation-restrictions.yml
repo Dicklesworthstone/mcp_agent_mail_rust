@@ -47,7 +47,7 @@ jobs:
       - name: Run durable reservation recovery regressions
         run: cargo test --locked -p mcp-agent-mail-tools --lib degraded_intents -- --test-threads=1
       - name: Run public argument-compatibility regressions
-        run: cargo test --locked -p mcp-agent-mail-cli --test file_reservations_argument_compat
+        run: cargo test --locked -p mcp-agent-mail-cli --test it file_reservations_argument_compat::
       - name: Run native CLI reservation regressions
         run: cargo test --locked -p mcp-agent-mail-cli --lib file_reservations -- --test-threads=1
       - name: Check production feature graph

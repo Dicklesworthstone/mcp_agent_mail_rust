@@ -10,6 +10,13 @@ description = "Git archive storage backend for MCP Agent Mail"
 # Distributed as binary-only via dist.yml + curl|bash installer.
 # Workspace depends on unpublished sibling path crates, so cargo publish is not viable.
 publish = false
+# All integration tests link into ONE binary (tests/it.rs) instead of one ~0.7 GB
+# binary per file (br-kp1in.28); tests/it.rs checks every tests/*.rs is declared.
+autotests = false
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
 
 [dependencies]
 serde.workspace = true
@@ -44,6 +51,7 @@ portable = ["mcp-agent-mail-db/portable"]
 # the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
+mcp-agent-mail-test-helpers.workspace = true
 toml.workspace = true
 
 [[bench]]

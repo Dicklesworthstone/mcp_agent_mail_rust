@@ -59,8 +59,8 @@ e2e_step_start "run_alien_render_loop"
 ALIEN_STDOUT="${E2E_ARTIFACT_DIR}/alien_render_loop_stdout.txt"
 ALIEN_STDERR="${E2E_ARTIFACT_DIR}/alien_render_loop_stderr.txt"
 set +e
-e2e_run_cargo test -p mcp-agent-mail-server --test alien_integration \
-    alien_e2e_bayesian_render_loop_telemetry_from_mail_app_view -- --nocapture \
+e2e_run_cargo test -p mcp-agent-mail-server --test it \
+    alien_integration::alien_e2e_bayesian_render_loop_telemetry_from_mail_app_view -- --nocapture \
     >"$ALIEN_STDOUT" 2>"$ALIEN_STDERR"
 alien_rc=$?
 set -e
@@ -85,8 +85,8 @@ PERF_STDOUT="${E2E_ARTIFACT_DIR}/tui_perf_stdout.txt"
 PERF_STDERR="${E2E_ARTIFACT_DIR}/tui_perf_stderr.txt"
 set +e
 MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
-    e2e_run_cargo test -p mcp-agent-mail-server --test tui_perf_baselines \
-    -- z_perf_baseline_report --nocapture \
+    e2e_run_cargo test -p mcp-agent-mail-server --test it \
+    -- tui_perf_baselines::z_perf_baseline_report --nocapture \
     >"$PERF_STDOUT" 2>"$PERF_STDERR"
 perf_rc=$?
 set -e

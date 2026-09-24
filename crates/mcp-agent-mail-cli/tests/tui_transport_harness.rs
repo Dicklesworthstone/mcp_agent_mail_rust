@@ -1,7 +1,7 @@
 //! br-3c7vp: Native harness adapter for TUI interaction-heavy E2E suites.
 //!
 //! Current phase: managed adapter.
-//! - Native runner entrypoint is Rust (`cargo test --test tui_transport_harness`).
+//! - Native runner entrypoint is Rust (`cargo test -p mcp-agent-mail-cli --test it tui_transport_harness::`).
 //! - Scenario execution delegates to shell suites (`tui_interaction`, `tui_interactions`,
 //!   `tui_compat_matrix`, `tui_startup`).
 //! - Harness captures deterministic metadata and copies legacy artifacts.

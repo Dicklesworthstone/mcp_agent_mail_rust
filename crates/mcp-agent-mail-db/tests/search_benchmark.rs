@@ -20,7 +20,7 @@
     clippy::redundant_clone
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::queries;

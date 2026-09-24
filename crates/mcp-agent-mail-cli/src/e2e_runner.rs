@@ -1021,8 +1021,11 @@ impl Runner {
             "test",
             "-p",
             "mcp-agent-mail-cli",
+            // One `it` binary per crate (br-kp1in.28): select the former
+            // test binary by its module prefix.
             "--test",
-            "http_transport_harness",
+            "it",
+            "http_transport_harness::",
             "--",
             "--nocapture",
         ]);
@@ -1049,7 +1052,8 @@ impl Runner {
             "-p",
             "mcp-agent-mail-cli",
             "--test",
-            "share_archive_harness",
+            "it",
+            "share_archive_harness::",
             "--",
             "--nocapture",
         ]);
@@ -1076,7 +1080,8 @@ impl Runner {
             "-p",
             "mcp-agent-mail-cli",
             "--test",
-            "mode_matrix_harness",
+            "it",
+            "mode_matrix_harness::",
             "--",
             "--nocapture",
         ]);
@@ -1101,7 +1106,8 @@ impl Runner {
             "-p",
             "mcp-agent-mail-cli",
             "--test",
-            "security_privacy_harness",
+            "it",
+            "security_privacy_harness::",
             "--",
             "--nocapture",
         ]);
@@ -1126,7 +1132,8 @@ impl Runner {
             "-p",
             "mcp-agent-mail-cli",
             "--test",
-            "tui_accessibility_harness",
+            "it",
+            "tui_accessibility_harness::",
             "--",
             "--nocapture",
         ]);
@@ -1153,7 +1160,8 @@ impl Runner {
             "-p",
             "mcp-agent-mail-cli",
             "--test",
-            "tui_transport_harness",
+            "it",
+            "tui_transport_harness::",
             "--",
             "--nocapture",
         ]);

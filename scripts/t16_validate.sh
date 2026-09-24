@@ -56,9 +56,9 @@ for arg in "$@"; do
             echo "  cargo test -p mcp-agent-mail-server --lib"
             echo ""
             echo "Phase 3 — Rust Snapshot/Integration Tests"
-            echo "  cargo test -p mcp-agent-mail-server --test golden_snapshots"
-            echo "  cargo test -p mcp-agent-mail-server --test golden_markdown_snapshots"
-            echo "  cargo test -p mcp-agent-mail-server --test pty_e2e_search"
+            echo "  cargo test -p mcp-agent-mail-server --test it golden_snapshots::"
+            echo "  cargo test -p mcp-agent-mail-server --test it golden_markdown_snapshots::"
+            echo "  cargo test -p mcp-agent-mail-server --test it pty_e2e_search::"
             echo ""
             echo "Phase 4 — E2E Shell Suites (dependency order)"
             echo "  test_logging_contract.sh       (br-1xt0m.1.13.13)"
@@ -264,7 +264,7 @@ if [ "$E2E_ONLY" = "0" ] && [ "$PERF_ONLY" = "0" ] && [ "$ABORT" = "0" ]; then
     for test_name in golden_snapshots golden_markdown_snapshots pty_e2e_search; do
         if [ "$ABORT" = "1" ] && [ "$FAIL_FAST" = "1" ]; then break; fi
         set +e
-        run_cargo_cmd "snapshot/${test_name}" test -p mcp-agent-mail-server --test "$test_name"
+        run_cargo_cmd "snapshot/${test_name}" test -p mcp-agent-mail-server --test it "${test_name}::"
         set -e
     done
     check_abort || true

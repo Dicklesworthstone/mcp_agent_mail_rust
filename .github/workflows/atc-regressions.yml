@@ -54,6 +54,6 @@ jobs:
       - name: Run server ATC tests including the admission boundary
         run: cargo test --locked -p mcp-agent-mail-server --lib atc -- --nocapture
       - name: Run real-engine public notification regressions
-        run: cargo test --locked -p mcp-agent-mail-server --test atc_notification_admission -- --nocapture
+        run: cargo test --locked -p mcp-agent-mail-server --test it atc_notification_admission:: -- --nocapture
       - name: Verify validation did not rewrite production sources
         run: git diff --exit-code

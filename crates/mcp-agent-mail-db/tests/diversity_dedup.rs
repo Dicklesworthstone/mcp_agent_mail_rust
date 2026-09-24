@@ -22,7 +22,7 @@
     clippy::uninlined_format_args
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

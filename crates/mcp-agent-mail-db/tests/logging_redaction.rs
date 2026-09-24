@@ -17,7 +17,7 @@
     clippy::too_many_arguments
 )]
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

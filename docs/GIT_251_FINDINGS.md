@@ -202,26 +202,26 @@ measure the retry layer without touching the live mailbox.
 
 ```bash
 # Clean baseline. Always runs.
-cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
-  scenario_a_clean_baseline -- --nocapture
+cargo test -p mcp-agent-mail-storage --test it \
+  stress_pipeline_known_bad_git::scenario_a_clean_baseline -- --nocapture
 
 # Synthetic racer. No real buggy git binary required.
 AM_TEST_GIT_251=1 \
-cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
-  scenario_b_synthetic_racer -- --nocapture
+cargo test -p mcp-agent-mail-storage --test it \
+  stress_pipeline_known_bad_git::scenario_b_synthetic_racer -- --nocapture
 
 # Real 2.51.0 binary. Requires an installed buggy git.
 AM_TEST_GIT_251=1 \
 AM_GIT_BINARY=/path/to/git-2.51.0 \
-cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
-  scenario_c_real_2510_gated -- --nocapture
+cargo test -p mcp-agent-mail-storage --test it \
+  stress_pipeline_known_bad_git::scenario_c_real_2510_gated -- --nocapture
 
 # Negative control: verifies flock is load-bearing.
 AM_TEST_GIT_251=1 \
 AM_GIT_BINARY=/path/to/git-2.51.0 \
 AM_GIT_FLOCK_DISABLED=1 \
-cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
-  scenario_d_real_2510_no_flock_gated -- --nocapture
+cargo test -p mcp-agent-mail-storage --test it \
+  stress_pipeline_known_bad_git::scenario_d_real_2510_no_flock_gated -- --nocapture
 ```
 
 Each scenario writes postmortem artifacts under

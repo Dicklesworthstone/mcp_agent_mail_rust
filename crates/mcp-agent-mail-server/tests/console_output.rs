@@ -1,5 +1,4 @@
-mod common;
-
+use crate::common;
 use mcp_agent_mail_server::console::{
     BannerParams, ConsoleEventBuffer, ConsoleEventKind, ConsoleEventSeverity,
     STARTUP_STATE_JSON_BEGIN, STARTUP_STATE_JSON_END, StartupJsonRenderOptions, StartupStateJson,

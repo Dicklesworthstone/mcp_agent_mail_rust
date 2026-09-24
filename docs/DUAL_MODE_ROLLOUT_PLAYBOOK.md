@@ -69,15 +69,15 @@ Use `docs/RELEASE_CHECKLIST.md` as the canonical sign-off ledger.
   ```
 - [ ] Mode matrix harness: 22 CLI-allow + 16 MCP-deny + 2 MCP-allow pass
   ```bash
-  cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
+  cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness::
   ```
 - [ ] Semantic conformance: 10 SC tests pass
   ```bash
-  cargo test -p mcp-agent-mail-cli --test semantic_conformance
+  cargo test -p mcp-agent-mail-cli --test it semantic_conformance::
   ```
 - [ ] Perf/security: 13 tests pass, p95 < budget
   ```bash
-  cargo test -p mcp-agent-mail-cli --test perf_security_regressions
+  cargo test -p mcp-agent-mail-cli --test it perf_security_regressions::
   ```
 - [ ] E2E dual-mode: 84+ assertions pass
   ```bash
@@ -85,7 +85,7 @@ Use `docs/RELEASE_CHECKLIST.md` as the canonical sign-off ledger.
   ```
 - [ ] Help snapshots match golden fixtures
   ```bash
-  cargo test -p mcp-agent-mail-cli --test help_snapshots
+  cargo test -p mcp-agent-mail-cli --test it help_snapshots::
   ```
 - [ ] Clippy clean: `cargo clippy --workspace -- -D warnings`
 - [ ] Manual smoke test: start both binaries, verify denial and help

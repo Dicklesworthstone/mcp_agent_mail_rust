@@ -4,13 +4,13 @@
 //! memory leaks, cache degradation, pool connection aging, WAL growth.
 //!
 //! Run:
-//!   cargo test --test sustained_load -- --ignored --nocapture
+//!   cargo test -p mcp-agent-mail-db --test it sustained_load:: -- --ignored --nocapture
 //!
 //! Extended (300 seconds, per bead spec):
-//!   SUSTAINED_LOAD_SECS=300 cargo test --test sustained_load -- --ignored --nocapture
+//!   SUSTAINED_LOAD_SECS=300 cargo test -p mcp-agent-mail-db --test it sustained_load:: -- --ignored --nocapture
 //!
 //! Custom rate:
-//!   SUSTAINED_LOAD_RPS=200 SUSTAINED_LOAD_SECS=60 cargo test --test sustained_load -- --ignored --nocapture
+//!   SUSTAINED_LOAD_RPS=200 SUSTAINED_LOAD_SECS=60 cargo test -p mcp-agent-mail-db --test it sustained_load:: -- --ignored --nocapture
 
 #![allow(
     clippy::needless_collect,
@@ -29,7 +29,7 @@
     clippy::missing_const_for_fn
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::metrics::Log2Histogram;
@@ -709,7 +709,7 @@ fn sustained_100_rps_load_test() {
 // - Threshold rules for leak/drift/degradation detection
 //
 // Run:
-//   cargo test --test sustained_load multi_project_soak -- --ignored --nocapture
+//   cargo test -p mcp-agent-mail-db --test it sustained_load::multi_project_soak -- --ignored --nocapture
 //
 // Configuration:
 //   SOAK_SEED=42                  Deterministic operation sequence (default: 0)

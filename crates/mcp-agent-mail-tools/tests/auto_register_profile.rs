@@ -4,8 +4,6 @@
 //! in the Git archive too, or DB and archive agent inventories drift by one and
 //! a reconstruct cannot recreate it.
 
-#![recursion_limit = "256"]
-
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;

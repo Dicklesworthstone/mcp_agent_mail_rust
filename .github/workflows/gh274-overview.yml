@@ -31,7 +31,7 @@ jobs:
       - name: Live collector correctness and work bounds
         run: cargo test --release -p mcp-agent-mail-cli --lib robot::overview::tests -- --nocapture
       - name: Actual CLI cold-process mutation regression
-        run: cargo test --release -p mcp-agent-mail-cli --test integration_runs robot_overview_cold_processes -- --nocapture
+        run: cargo test --release -p mcp-agent-mail-cli --test it integration_runs::robot_overview_cold_processes -- --nocapture
       - name: Native collector comparison (not CLI startup)
         env:
           AM_OVERVIEW_BENCH_MESSAGES_PER_PROJECT: '48'

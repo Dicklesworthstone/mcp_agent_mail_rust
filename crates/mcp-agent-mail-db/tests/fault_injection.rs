@@ -1171,7 +1171,11 @@ fn run_permission_test_unprivileged(test_name: &str) -> bool {
         "permission child must actually drop root privileges"
     );
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test_name, "--nocapture"])
+        .args([
+            "--exact",
+            &mcp_agent_mail_test_helpers::libtest_path!(test_name),
+            "--nocapture",
+        ])
         .uid(65534)
         .gid(65534)
         .env("AM_PERMISSION_TEST_CHILD", "1")

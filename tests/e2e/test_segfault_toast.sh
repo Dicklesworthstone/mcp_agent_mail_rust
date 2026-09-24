@@ -52,7 +52,7 @@ run_cargo_case() {
 }
 
 run_cargo_case "s1_server_integration_badge_and_toast" \
-    test -p mcp-agent-mail-server --test segfault_toast -- --nocapture
+    test -p mcp-agent-mail-server --test it segfault_toast:: -- --nocapture
 
 run_cargo_case "s2_inline_unit_formatter_and_rate_limit" \
     test -p mcp-agent-mail-server segfault_toast -- --nocapture

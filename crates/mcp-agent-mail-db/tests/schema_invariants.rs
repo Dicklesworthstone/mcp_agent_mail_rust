@@ -11,7 +11,7 @@
     clippy::uninlined_format_args
 )]
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::path::PathBuf;

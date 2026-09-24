@@ -2013,7 +2013,7 @@ pub enum VerifyLane {
     E2eStdio,
     /// `rch exec -- cargo bench -p mcp-agent-mail-cli -- --help`
     BenchQuick,
-    /// `rch exec -- cargo test -p mcp-agent-mail-cli --test reliability_coverage_ci`
+    /// `rch exec -- cargo test -p mcp-agent-mail-cli --test it reliability_coverage_ci::`
     ReliabilityCoverage,
 }
 
@@ -78624,7 +78624,8 @@ impl VerifyLane {
                 "-p",
                 "mcp-agent-mail-cli",
                 "--test",
-                "reliability_coverage_ci",
+                "it",
+                "reliability_coverage_ci::",
             ],
         }
         .into_iter()

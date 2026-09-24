@@ -285,9 +285,9 @@ am ci
 am ci --quick
 
 # Individual suites:
-cargo test -p mcp-agent-mail-cli --test mode_matrix_harness
-cargo test -p mcp-agent-mail-cli --test semantic_conformance
-cargo test -p mcp-agent-mail-cli --test perf_security_regressions
+cargo test -p mcp-agent-mail-cli --test it mode_matrix_harness::
+cargo test -p mcp-agent-mail-cli --test it semantic_conformance::
+cargo test -p mcp-agent-mail-cli --test it perf_security_regressions::
 am e2e run --project . dual_mode
 ```
 

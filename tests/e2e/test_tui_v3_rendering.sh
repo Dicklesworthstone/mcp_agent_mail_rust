@@ -417,7 +417,7 @@ run_render_case \
     "Timeline Ctrl+S/Ctrl+L/Delete preset lifecycle persists and reloads filters" \
     "Timeline filter state: verbosity/kind/source saved to screen_filter_presets.json, reloaded, and deleted." \
     "Preset store captures values, load restores them, and delete removes all timeline presets." \
-    test -p mcp-agent-mail-server --test pty_e2e_search timeline_preset_shortcuts_persist_and_reload_filters -- --nocapture
+    test -p mcp-agent-mail-server --test it pty_e2e_search::timeline_preset_shortcuts_persist_and_reload_filters -- --nocapture
 
 # Case 7c
 run_render_case \
@@ -512,7 +512,7 @@ else
         run_cargo_with_rch_only \
             "case10_tree_perf_budget/perf_budget" \
             "${CASE10_LOG_B}" \
-            test -p mcp-agent-mail-server --test tui_perf_baselines perf_screen_render_80x24 -- --nocapture
+            test -p mcp-agent-mail-server --test it tui_perf_baselines::perf_screen_render_80x24 -- --nocapture
         case10_rc_b=$?
         set -e
         unset MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS

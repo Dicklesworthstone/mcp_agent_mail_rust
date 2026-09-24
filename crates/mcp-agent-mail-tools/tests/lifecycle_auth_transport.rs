@@ -16,8 +16,6 @@
 //! - a supplied-but-wrong token is refused on both transports, and a malformed
 //!   `call_transport` is a typed `INVALID_ARGUMENT` refusal.
 
-#![recursion_limit = "256"]
-
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;

@@ -4,7 +4,7 @@
 //! the `common::block_on` spin-loop executor, fixing the hang caused by the
 //! runtime's `thread::park()` mechanism.
 
-mod common;
+use crate::common;
 
 use asupersync::Outcome;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};

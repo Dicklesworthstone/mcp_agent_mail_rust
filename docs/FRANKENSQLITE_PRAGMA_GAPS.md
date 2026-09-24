@@ -20,7 +20,7 @@ runs identical probes through canonical SQLite and FrankenSQLite against the sam
 fixtures (the L1 corpus plus a no-FK bootstrap DB) and diffs the verdicts:
 
 ```bash
-cargo test -p mcp-agent-mail-db --test frankensqlite_pragma_conformance -- --nocapture
+cargo test -p mcp-agent-mail-db --test it frankensqlite_pragma_conformance:: -- --nocapture
 # report written to $CARGO_TARGET_TMPDIR/frankensqlite_pragma_conformance_report.json
 ```
 

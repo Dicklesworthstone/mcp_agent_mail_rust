@@ -98,7 +98,7 @@ BUILD_LOG="${E2E_ARTIFACT_DIR}/diagnostics/build_perf.log"
 mkdir -p "$(dirname "$BUILD_LOG")"
 
 set +e
-e2e_run_cargo test -p mcp-agent-mail-server --test tui_perf_baselines --no-run \
+e2e_run_cargo test -p mcp-agent-mail-server --test it --no-run \
     2>"$BUILD_LOG"
 build_rc=$?
 set -e
@@ -128,8 +128,8 @@ BASELINE_STDERR="${E2E_ARTIFACT_DIR}/perf_baselines_stderr.txt"
 
 set +e
 MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
-    e2e_run_cargo test -p mcp-agent-mail-server --test tui_perf_baselines \
-    -- z_perf_baseline_report --nocapture \
+    e2e_run_cargo test -p mcp-agent-mail-server --test it \
+    -- tui_perf_baselines::z_perf_baseline_report --nocapture \
     >"$BASELINE_OUTPUT" 2>"$BASELINE_STDERR"
 baseline_rc=$?
 set -e
@@ -330,7 +330,7 @@ e2e_step_start "build_soak_test"
 
 SOAK_BUILD_LOG="${E2E_ARTIFACT_DIR}/diagnostics/build_soak.log"
 set +e
-e2e_run_cargo test -p mcp-agent-mail-server --test tui_soak_replay --no-run \
+e2e_run_cargo test -p mcp-agent-mail-server --test it --no-run \
     2>"$SOAK_BUILD_LOG"
 soak_build_rc=$?
 set -e
@@ -354,8 +354,8 @@ SOAK_STDERR="${E2E_ARTIFACT_DIR}/soak_stderr.txt"
 
 set +e
 SOAK_DURATION_SECS="${SOAK_DURATION_SECS:-10}" \
-    e2e_run_cargo test -p mcp-agent-mail-server --test tui_soak_replay \
-    -- soak_replay_empty_state --ignored --nocapture \
+    e2e_run_cargo test -p mcp-agent-mail-server --test it \
+    -- tui_soak_replay::soak_replay_empty_state --ignored --nocapture \
     >"$SOAK_OUTPUT" 2>"$SOAK_STDERR"
 soak_rc=$?
 set -e

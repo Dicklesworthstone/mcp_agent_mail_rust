@@ -12,7 +12,7 @@
     clippy::similar_names
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

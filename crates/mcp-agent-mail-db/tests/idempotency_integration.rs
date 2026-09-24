@@ -15,7 +15,7 @@
 
 #![allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
 
-mod common;
+use crate::common;
 
 use asupersync::Outcome;
 use mcp_agent_mail_db::queries;

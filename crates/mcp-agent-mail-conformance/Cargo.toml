@@ -8,13 +8,17 @@ repository.workspace = true
 authors.workspace = true
 description = "Conformance test harness for MCP Agent Mail"
 publish = false
+# All integration tests (and the workspace-level tests/docs_drift_ci.rs) link
+# into ONE binary (tests/it.rs) instead of one ~0.7 GB binary per file
+# (br-kp1in.28); tests/it.rs checks every tests/*.rs is declared.
+autotests = false
 
 [lints]
 workspace = true
 
 [[test]]
-name = "docs_drift_ci"
-path = "../../tests/docs_drift_ci.rs"
+name = "it"
+path = "tests/it.rs"
 
 [dependencies]
 serde.workspace = true
@@ -44,3 +48,4 @@ tempfile.workspace = true
 regex.workspace = true
 sha1.workspace = true
 proptest.workspace = true
+mcp-agent-mail-test-helpers.workspace = true

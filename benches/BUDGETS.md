@@ -136,7 +136,7 @@ Targets based on initial baseline (2026-02-05). Budgets are 2x the measured base
 Guardrails for migrated command surfaces are enforced by:
 
 ```bash
-cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture
+cargo test -p mcp-agent-mail-cli --test it perf_guardrails:: -- --nocapture
 ```
 
 Artifacts are emitted under:
@@ -587,7 +587,7 @@ Headless rendering using `ftui-harness` with `Frame::new()` (no terminal I/O).
 
 ```bash
 MCP_AGENT_MAIL_BENCH_ENFORCE_BUDGETS=1 \
-  cargo test -p mcp-agent-mail-server --test tui_perf_baselines --release
+  cargo test -p mcp-agent-mail-server --test it tui_perf_baselines:: --release
 ```
 
 Artifacts: `tests/artifacts/tui/perf_baselines/<timestamp>/summary.json`

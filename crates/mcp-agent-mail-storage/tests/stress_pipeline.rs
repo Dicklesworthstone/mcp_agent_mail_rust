@@ -10,8 +10,8 @@
 //!
 //! Run:
 //! ```bash
-//! cargo test -p mcp-agent-mail-storage --test stress_pipeline -- --nocapture
-//! cargo test -p mcp-agent-mail-storage --test stress_pipeline -- --ignored --nocapture
+//! cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --nocapture
+//! cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --ignored --nocapture
 //! ```
 
 #![allow(
@@ -1092,7 +1092,7 @@ fn stress_wbq_saturation_and_backpressure() {
 // ===========================================================================
 
 #[test]
-#[ignore] // Heavy test — run manually: cargo test --test stress_pipeline -- --ignored --nocapture
+#[ignore] // Heavy test — run manually: cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --ignored --nocapture
 fn stress_pool_exhaustion_with_archive_writes() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(tmp.path());
@@ -1308,7 +1308,7 @@ fn stress_pool_exhaustion_with_archive_writes() {
 // ===========================================================================
 
 #[test]
-#[ignore] // Heavy test — run: cargo test --test stress_pipeline -- --ignored --nocapture
+#[ignore] // Heavy test — run: cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --ignored --nocapture
 fn stress_sustained_mixed_workload_30s() {
     let duration_secs: u64 = std::env::var("STRESS_DURATION_SECS")
         .ok()
@@ -2825,7 +2825,7 @@ fn stress_multi_project_120_agents() {
 // ===========================================================================
 
 #[test]
-#[ignore] // Very heavy: cargo test --test stress_pipeline -- --ignored --nocapture
+#[ignore] // Very heavy: cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --ignored --nocapture
 fn stress_200_agent_pool_exhaustion_torture() {
     let tmp = TempDir::new().unwrap();
     let config = test_config(tmp.path());
@@ -3097,7 +3097,7 @@ fn stress_200_agent_pool_exhaustion_torture() {
 // ===========================================================================
 
 #[test]
-#[ignore] // Very heavy: cargo test --test stress_pipeline -- --ignored --nocapture
+#[ignore] // Very heavy: cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --ignored --nocapture
 fn stress_sustained_100_agents_60s() {
     let duration_secs: u64 = std::env::var("STRESS_DURATION_SECS")
         .ok()

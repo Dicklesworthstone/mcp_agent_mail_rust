@@ -129,7 +129,7 @@ am e2e run --project . cli
 ### 2.8 Stress Tests
 
 ```bash
-RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-db --test stress
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-db -E 'binary_id(mcp-agent-mail-db::it) & test(/^stress::/)'
 # Expected: all 9 stress scenarios pass (concurrent agents, pool exhaustion, etc.)
 ```
 
@@ -184,8 +184,8 @@ am share deploy verify-live https://example.github.io/agent-mail \
 ```bash
 am e2e run --project . tui_full_traversal
 am e2e run --project . soak_harness
-RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_security_regressions
-RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_guardrails
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^perf_security_regressions::/)'
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^perf_guardrails::/)'
 # Expected: no regressions, no budget failures
 ```
 

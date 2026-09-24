@@ -15,7 +15,7 @@
     clippy::cast_possible_truncation
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::pool::{DbPool, DbPoolConfig};

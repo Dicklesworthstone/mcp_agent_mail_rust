@@ -16,7 +16,10 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
 
 - [ ] Resolve release-blocking bugs and run workspace check, strict Clippy,
   formatting, full nextest, and the real transport/recovery/installer gates.
-  A build refusal, skipped dependency, or interrupted run is not a pass.
+  A build refusal, skipped dependency, or interrupted run is not a pass. The
+  default-feature `cargo nextest run --locked --workspace` fits one 64-core host
+  (one integration-test binary per crate, br-kp1in.28: ~26 GB of target, ~35 min),
+  so an unavailable build fleet is not a reason to substitute selected suites.
 - [ ] Build both `am` and `mcp-agent-mail` for Linux x86_64 GNU, Linux aarch64
   GNU, Linux x86_64 musl, macOS aarch64, macOS x86_64, and Windows x86_64 MSVC.
   Retain native execution receipts; cross-compilation alone is not native proof.
@@ -41,7 +44,8 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
 
 The runtime router, `TOOL_CLUSTER_MAP`, `ALL_SCREEN_IDS`, the Clap command tree,
 and Cargo workspace membership are the inventory authorities. Run the existing
-`docs_drift_ci` conformance target against the candidate rather than relying on
+`docs_drift_ci` conformance tests (`cargo test -p mcp-agent-mail-conformance --test it docs_drift_ci::`)
+against the candidate rather than relying on
 literal counts in an old release checklist. `am robot tui-dump` and the top-level
 `am tui-dump` route share the same implementation; the alias is not another robot verb.
 
@@ -65,7 +69,7 @@ literal counts in an old release checklist. `am robot tui-dump` and the top-leve
 | Security/privacy | Pass rate = `100%` (`fail=0`) for `E2E security/privacy` | `am e2e run --project . security_privacy` and CI gate report | `tests/artifacts/security_privacy/*/*` |
 | Accessibility | Pass rate = `100%` (`fail=0`) for `E2E TUI accessibility` | `am e2e run --project . tui_a11y` and CI gate report | `tests/artifacts/tui_a11y/*/*` |
 | Cross-platform native command portability | Pass rate = `100%` (`fail=0`) for native command matrix on Linux/macOS/Windows | Native command matrix executed on admitted RCH workers | `tests/artifacts/cli/native_command_matrix/<os>/summary.json` |
-| Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test perf_security_regressions -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test perf_guardrails -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
+| Performance budgets | `perf_security_regressions=status:pass` + `perf_guardrails=status:pass` with no budget/delta violations | `cargo test -p mcp-agent-mail-cli --test it perf_security_regressions:: -- --nocapture`, `cargo test -p mcp-agent-mail-cli --test it perf_guardrails:: -- --nocapture`, and CI gate report | `tests/artifacts/cli/perf_security/*`, `tests/artifacts/cli/perf_guardrails/*`, benchmark artifacts |
 | Determinism | Golden/export checks report zero mismatches | `am golden verify` and static export tests | `benches/golden/checksums.sha256`, `tests/artifacts/share/*/*` |
 | Reliability incident-corpus regression | `release_ready=true` in `release_scorecard.json` (every reliability suite `fail=0` AND every historical incident class pass with fresh corpus evidence) | `am e2e run --project . --tag reliability --release-scorecard` | `tests/artifacts/release_scorecard/<ts>/release_scorecard.json`, `tests/artifacts/incident_corpus/<ts>/scorecard.json` |
 | Automation/governance | CI report has `decision=\"go\"`, `release_eligible=true`, unified release health has `decision=\"go\"` or explicitly waived blockers, and sign-off row completed | `am ci --report tests/artifacts/ci/gate_report.json`, then `am release health --report tests/artifacts/release/health.json ...` | `tests/artifacts/ci/gate_report.json`, `tests/artifacts/release/health.json`, sign-off ledger row |
@@ -185,23 +189,23 @@ jq '.release_ready, .problems' tests/artifacts/release_scorecard/*/release_score
 
 - [x] Mode matrix harness: 22 CLI-allow + 16 MCP-deny + 2 MCP-allow
   ```bash
-  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test mode_matrix_harness
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^mode_matrix_harness::/)'
   ```
 - [x] Semantic conformance: 10 SC tests (DB parity, validation, drift report)
   ```bash
-  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test semantic_conformance
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^semantic_conformance::/)'
   ```
 - [x] Perf/security regressions: 13 tests (latency budgets, bypass attempts)
   ```bash
-  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_security_regressions
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^perf_security_regressions::/)'
   ```
 - [x] Perf migration guardrails: native-vs-legacy budgets + unavailable rationale capture
   ```bash
-  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test perf_guardrails
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^perf_guardrails::/)'
   ```
 - [x] Help snapshots match golden fixtures
   ```bash
-  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli --test help_snapshots
+  RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked -p mcp-agent-mail-cli -E 'binary_id(mcp-agent-mail-cli::it) & test(/^help_snapshots::/)'
   ```
 - [x] E2E dual-mode: 84+ assertions (7 sections)
   ```bash

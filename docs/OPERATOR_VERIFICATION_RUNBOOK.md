@@ -48,7 +48,7 @@ Requires the `git_251_racer` fixture:
 
 ```bash
 cargo test -p mcp-agent-mail-storage \
-  --test libgit2_index_race_immunity \
+  --test it libgit2_index_race_immunity:: \
   -- --nocapture
 ```
 

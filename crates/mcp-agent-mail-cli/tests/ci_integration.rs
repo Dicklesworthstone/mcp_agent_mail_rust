@@ -324,7 +324,7 @@ fn test_default_gates_skip_in_quick() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Full CI Execution Tests (Slow - marked #[ignore])
-// Run with: cargo test --test ci_integration -- --include-ignored
+// Run with: cargo test -p mcp-agent-mail-cli --test it ci_integration:: -- --include-ignored
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Helper to run `am ci` with given args and return (stdout, stderr, exit_code).

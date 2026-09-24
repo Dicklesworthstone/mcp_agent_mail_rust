@@ -4,7 +4,7 @@
 //! FTS5 tables and triggers. These tests verify the migration works correctly
 //! and that `enforce_runtime_fts_cleanup` is safe on a clean database.
 
-mod common;
+use crate::common;
 
 use asupersync::Cx;
 use mcp_agent_mail_db::DbConn;

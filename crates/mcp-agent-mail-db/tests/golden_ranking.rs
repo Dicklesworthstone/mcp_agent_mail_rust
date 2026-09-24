@@ -28,7 +28,7 @@
     clippy::manual_assert
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::config::SearchEngine;

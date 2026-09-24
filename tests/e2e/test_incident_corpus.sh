@@ -129,7 +129,7 @@ e2e_section "Phase 1: L1 corpus materialization + classification"
 
 L1_STATUS="fail"
 if run_cargo_fixture "l1_corruption_corpus.log" 3 \
-    test -p mcp-agent-mail-cli --test corruption_corpus; then
+    test -p mcp-agent-mail-cli --test it corruption_corpus::; then
     L1_STATUS="pass"
     e2e_pass "L1 corpus: coverage + documentation + deterministic materialization green"
 else
@@ -164,8 +164,8 @@ else
     e2e_fail "server-binary name-mismatch matrix failed - see ${E2E_ARTIFACT_DIR}/l2_name_mismatch_mcp_binary.log"
 fi
 if run_cargo_fixture "l2_name_mismatch_cli_matrix.log" 1 \
-    test -p mcp-agent-mail-cli --test mode_matrix_harness \
-    matrix_mcp_name_mismatch_denials_print_exact_corrections; then
+    test -p mcp-agent-mail-cli --test it \
+    mode_matrix_harness::matrix_mcp_name_mismatch_denials_print_exact_corrections; then
     e2e_pass "CLI mode-matrix harness pins the mismatch->correction table"
 else
     MATRIX_STATUS="fail"
@@ -235,8 +235,8 @@ else
     # shellcheck disable=SC2030  # subshell-local override is intentional
     if ( export TMPDIR="${MIXED_TMPDIR}" E2E_CARGO_FORCE_LOCAL=1
         run_cargo_fixture "l3_mixed_load.log" 1 \
-            test -p mcp-agent-mail-db --test load_concurrency \
-            mixed_inbox_reservation_search_send_load_reproducer -- --exact ); then
+            test -p mcp-agent-mail-db --test it \
+            load_concurrency::mixed_inbox_reservation_search_send_load_reproducer -- --exact ); then
         MIXED_STATUS="pass"
         e2e_pass "mixed inbox/reservation/search/send load reproducer green (TMPDIR=${MIXED_TMPDIR})"
     else

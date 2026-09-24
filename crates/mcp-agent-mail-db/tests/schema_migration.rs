@@ -15,7 +15,7 @@
 
 #![allow(clippy::redundant_clone, clippy::too_many_lines)]
 
-mod common;
+use crate::common;
 
 use asupersync::cx::Cx;
 use mcp_agent_mail_db::DbConn as SqliteConnection;

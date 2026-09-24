@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 //! Parity tests verifying validation error messages match the Python reference.
 //!
 //! Each test calls an MCP tool with invalid input and verifies the error type,

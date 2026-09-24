@@ -5,7 +5,7 @@
 //! Renders each screen at standard terminal sizes (80x24, 120x40) and
 //! compares against stored `.snap` baselines under `tests/snapshots/`.
 //!
-//! Run `BLESS=1 cargo test -p mcp-agent-mail-server --test golden_snapshots`
+//! Run `BLESS=1 cargo test -p mcp-agent-mail-server --test it golden_snapshots::`
 //! to create or update snapshot files.
 
 use std::sync::Arc;

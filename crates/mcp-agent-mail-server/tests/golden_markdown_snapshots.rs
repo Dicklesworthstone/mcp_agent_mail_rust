@@ -9,10 +9,10 @@
 //!
 //! ```sh
 //! # Check against existing snapshots
-//! cargo test -p mcp-agent-mail-server --test golden_markdown_snapshots
+//! cargo test -p mcp-agent-mail-server --test it golden_markdown_snapshots::
 //!
 //! # Bless (create/update) snapshots
-//! BLESS=1 cargo test -p mcp-agent-mail-server --test golden_markdown_snapshots
+//! BLESS=1 cargo test -p mcp-agent-mail-server --test it golden_markdown_snapshots::
 //! ```
 //!
 //! ## Coverage

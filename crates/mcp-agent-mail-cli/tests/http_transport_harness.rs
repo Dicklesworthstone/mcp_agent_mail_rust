@@ -1,7 +1,7 @@
 //! br-dsdzo: Native HTTP transport/parity harness for HTTP-family suites.
 //!
 //! Current phase: managed adapter.
-//! - Native runner entrypoint is Rust (`cargo test --test http_transport_harness`).
+//! - Native runner entrypoint is Rust (`cargo test -p mcp-agent-mail-cli --test it http_transport_harness::`).
 //! - Scenario execution delegates to shell suites (`http`, `http_streamable`, `mcp_api_parity`).
 //! - Harness captures deterministic metadata and copies legacy artifacts.
 

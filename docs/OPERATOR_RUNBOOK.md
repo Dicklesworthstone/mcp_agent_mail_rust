@@ -1037,7 +1037,7 @@ Before allowing a new archive perf candidate back into rollout, rerun the
 storage stress and batch benchmark guardrails on the reverted-or-fixed branch:
 
 ```bash
-rch exec -- cargo test -p mcp-agent-mail-storage --test stress_pipeline -- --nocapture
+rch exec -- cargo test -p mcp-agent-mail-storage --test it stress_pipeline:: -- --nocapture
 MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
   rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch
 ```

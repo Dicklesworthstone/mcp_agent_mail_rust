@@ -98,7 +98,7 @@ After applying remediation:
 ```bash
 # Run a synthetic stress loop that exercises the exact race.
 # Requires the git-251-racer fixture (bead H1).
-cargo test -p mcp-agent-mail-storage --test libgit2_index_race_immunity \
+cargo test -p mcp-agent-mail-storage --test it libgit2_index_race_immunity:: \
   -- --nocapture
 # Opt in via AM_C8_RUN=1; gated because it deliberately triggers
 # CLI git segfaults on 2.51.0 boxes.

@@ -1033,17 +1033,23 @@ where
     let mut cmd = Command::new(std::env::current_exe().expect("current test exe"));
     cmd.env("AM_KNOWN_BAD_GIT_HELPER", scenario.key()).args([
         "--exact",
-        scenario.test_name(),
+        &mcp_agent_mail_test_helpers::libtest_path!(scenario.test_name()),
         "--nocapture",
     ]);
     configure(&mut cmd);
     let output = cmd.output().expect("run child scenario");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "{} child failed\nstdout:\n{}\nstderr:\n{}",
+        "{} child failed\nstdout:\n{stdout}\nstderr:\n{}",
         scenario.test_name(),
-        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    // A filter that matches nothing also exits 0 (br-kp1in.28).
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "{} child ran no test:\n{stdout}",
+        scenario.test_name()
     );
 }
 
@@ -1171,8 +1177,8 @@ fn write_artifacts(
         ),
     )?;
     let replay = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\ncargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git {} -- --nocapture\n",
-        scenario.test_name()
+        "#!/usr/bin/env bash\nset -euo pipefail\ncargo test -p mcp-agent-mail-storage --test it {} -- --nocapture\n",
+        mcp_agent_mail_test_helpers::libtest_path!(scenario.test_name())
     );
     let replay_path = dir.join("replay.sh");
     fs::write(&replay_path, replay)?;

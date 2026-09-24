@@ -10,7 +10,7 @@
     clippy::missing_const_for_fn
 )]
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

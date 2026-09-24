@@ -17,7 +17,7 @@
     clippy::manual_let_else
 )]
 
-mod common;
+use crate::common;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_db::queries;
@@ -1111,7 +1111,7 @@ fn stress_pool_exhaustion_recovery() {
 // Spawns 50 projects × 20 agents = 1000 agents performing 16,000 operations:
 //   1,000 registrations + 5,000 sends + 5,000 fetches + 5,000 acks
 //
-// Run explicitly: cargo test --test stress stress_1000_agent -- --ignored
+// Run explicitly: cargo test -p mcp-agent-mail-db --test it stress::stress_1000_agent -- --ignored
 // =============================================================================
 
 fn cap(s: &str) -> String {

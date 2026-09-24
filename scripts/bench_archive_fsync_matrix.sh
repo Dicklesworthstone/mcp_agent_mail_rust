@@ -232,6 +232,6 @@ AM_FSYNC_MATRIX_ARTIFACT_DIR="${OUTPUT_DIR}" \
 AM_FSYNC_MATRIX_SINGLE_P95_BUDGET_MS="${SINGLE_BUDGET_MS}" \
 AM_FSYNC_MATRIX_BATCH_100_P95_BUDGET_MS="${BATCH_BUDGET_MS}" \
 CARGO_TARGET_DIR="${TARGET_DIR}" \
-cargo test -p mcp-agent-mail-storage --test fsync_matrix archive_fsync_matrix_probe -- --ignored --exact --nocapture
+cargo test -p mcp-agent-mail-storage --test it fsync_matrix::archive_fsync_matrix_probe -- --ignored --exact --nocapture
 
 printf 'artifact summary: %s\n' "${OUTPUT_DIR}/summary.json"
