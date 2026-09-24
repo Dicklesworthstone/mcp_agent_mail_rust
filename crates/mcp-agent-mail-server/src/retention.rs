@@ -24,6 +24,10 @@
 //! another message or changes read/ack state. Its per-pass result is not a
 //! whole-mailbox or attachment-durability certificate.
 //!
+//! Terminal reservation releases also converge without another client read.
+//! Set `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED=false` to disable this separate
+//! default-on pass. It preserves foreign-generation and conflicting artifacts.
+//!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
 
@@ -39,6 +43,7 @@ use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCurs
 use mcp_agent_mail_storage::recovery::message_reconcile::database::{
     self as message_archive_reconcile, ArchivePruneCursor, ArchivePruneReport, ReconcileCursor,
 };
+use mcp_agent_mail_storage::recovery::reservation_reconcile::{self, ReservationReconcileCursor};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -91,7 +96,10 @@ fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
 ///
 /// Must be called at most once. Subsequent calls are no-ops.
 pub fn start(config: &Config) {
-    if !maintenance_worker_enabled(config, message_archive_reconcile::enabled(config)) {
+    if !maintenance_worker_enabled(
+        config,
+        message_archive_reconcile::enabled(config) || reservation_reconcile::enabled(config),
+    ) {
         return;
     }
 
@@ -169,13 +177,16 @@ fn retention_pool_config(config: &Config) -> DbPoolConfig {
 
 fn retention_loop(config: &Config, settled_before_us: i64) {
     let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
-    let repair_enabled = message_archive_reconcile::enabled(config);
+    let message_repair_enabled = message_archive_reconcile::enabled(config);
+    let reservation_repair_enabled = reservation_reconcile::enabled(config);
+    let repair_enabled = message_repair_enabled || reservation_repair_enabled;
     let poll_interval = maintenance_poll_interval(interval, repair_enabled);
     let startup_delay = poll_interval.min(Duration::from_secs(10));
     let needs_db = message_retention_needs_db(config) || repair_enabled;
     let mut pool: Option<DbPool> = None;
     let mut cursor = ReconcileCursor::settled_before(settled_before_us);
     let mut agent_cursor = AgentReconcileCursor::default();
+    let mut reservation_cursor = ReservationReconcileCursor::default();
     let mut prune_cursor = ArchivePruneCursor::default();
     let mut last_report: Option<Instant> = None;
 
@@ -183,6 +194,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
         interval_secs = interval.as_secs(),
         poll_interval_secs = poll_interval.as_secs(),
         archive_reconcile_enabled = repair_enabled,
+        reservation_release_reconcile_enabled = reservation_repair_enabled,
         retention_enabled = config.retention_report_enabled,
         quota_enabled = config.quota_enabled,
         messages_retention_days = config.messages_retention_days,
@@ -220,7 +232,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             }
         }
 
-        if repair_enabled {
+        if message_repair_enabled {
             let mut retire_pool = false;
             if let Some(live_pool) = pool.as_ref() {
                 let cx = worker_cx();
@@ -298,6 +310,32 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                 // A verified recovery may have replaced the live generation.
                 // Reacquire through ordinary pool admission on the next tick.
                 pool = None;
+            }
+        }
+
+        if reservation_repair_enabled && let Some(live_pool) = pool.as_ref() {
+            let cx = worker_cx();
+            match reservation_reconcile::reconcile_reservation_releases(
+                &cx,
+                live_pool,
+                config,
+                &mut reservation_cursor,
+                &SHUTDOWN,
+            ) {
+                Ok(report) => {
+                    if report.scanned > 0 || report.interrupted {
+                        info!(target: "maintenance", event = "reservation_release_archive_reconcile",
+                            scanned = report.scanned, unchanged = report.unchanged,
+                            attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
+                            interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
+                            "bounded terminal reservation release reconciliation pass completed");
+                    }
+                }
+                Err(error) => {
+                    warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
+                        error = %error, "reservation release reconciliation refused; retrying next cycle");
+                    pool = None;
+                }
             }
         }
 

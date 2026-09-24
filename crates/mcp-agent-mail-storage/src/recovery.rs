@@ -27,6 +27,7 @@
 pub mod agent_reconcile;
 pub mod message_reconcile;
 pub mod ref_backup;
+pub mod reservation_reconcile;
 
 use std::path::Path;
 

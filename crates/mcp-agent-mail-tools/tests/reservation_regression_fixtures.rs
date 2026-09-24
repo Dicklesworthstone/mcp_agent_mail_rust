@@ -493,3 +493,239 @@ fn reservation_parity_checker_reports_f4_field_drift() {
         "active-state report should include exact release drift: {report:#?}"
     );
 }
+
+// The guard deliberately reads the real process identity, so exercise it in a
+// child process instead of mutating environment variables in parallel tests.
+#[test]
+fn reservation_release_guard_probe() {
+    let Ok(root) = std::env::var("AM_RELEASE_GUARD_PROBE_ROOT") else {
+        return;
+    };
+    let paths = (401..417)
+        .map(|id| format!("src/{id}.rs"))
+        .collect::<Vec<_>>();
+    let conflicts = mcp_agent_mail_guard::guard_check(
+        &Path::new(&root).join("projects/project"),
+        Path::new(&root),
+        &paths,
+        false,
+    )
+    .expect("native guard reads reservation artifacts");
+    if std::env::var("AM_RELEASE_GUARD_EXPECT_BLOCKED").as_deref() == Ok("1") {
+        let blocked = conflicts
+            .iter()
+            .map(|conflict| &conflict.path)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            blocked,
+            paths.iter().collect(),
+            "every lost release blocks its path"
+        );
+    } else {
+        assert!(
+            conflicts.is_empty(),
+            "repaired releases must unblock the guard: {conflicts:?}"
+        );
+    }
+    println!("reservation-release-guard-probe-executed");
+}
+
+fn probe_release_guard(root: &Path, blocked: bool) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "reservation_regression_fixtures::reservation_release_guard_probe",
+            "--nocapture",
+        ])
+        .env("AGENT_NAME", "GreenStone")
+        .env("AM_RELEASE_GUARD_PROBE_ROOT", root)
+        .env(
+            "AM_RELEASE_GUARD_EXPECT_BLOCKED",
+            if blocked { "1" } else { "0" },
+        )
+        .output()
+        .expect("run guard probe");
+    assert!(
+        output.status.success(),
+        "native guard probe failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("reservation-release-guard-probe-executed"),
+        "guard probe must execute its assertions, not merely exit successfully"
+    );
+}
+
+#[test]
+fn reservation_release_background_repair_survives_reopen_without_client_reads() {
+    // Isolate the actual global archive queue and mutation fence used by the
+    // failed release writer; no other test may flush this fixture's Git work.
+    if std::env::var("AM_RELEASE_REOPEN_TEST_CHILD").as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "reservation_regression_fixtures::reservation_release_background_repair_survives_reopen_without_client_reads", "--nocapture"])
+            .env("AM_RELEASE_REOPEN_TEST_CHILD", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "release repair child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("reservation-release-reopen-executed"),
+            "integration child must execute the complete failed-write/reopen/repair scenario"
+        );
+        return;
+    }
+    use asupersync::{Cx, Outcome};
+    use fastmcp_core::block_on;
+    use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
+    use mcp_agent_mail_db::{DbPoolConfig, create_pool, micros_to_iso, now_micros};
+    use mcp_agent_mail_storage::recovery::reservation_reconcile::{
+        ReservationReconcileCursor, reconcile_reservation_releases,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &temp.path().join("mail.sqlite3"),
+            ),
+            storage_root: temp.path().join("archive"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.storage_root).unwrap();
+        let settings = DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            ..Default::default()
+        };
+        let pool = create_pool(&settings).unwrap();
+        let cx = Cx::for_testing();
+        let Outcome::Ok(conn) = block_on(pool.acquire(&cx)) else {
+            panic!("fixture connection")
+        };
+        conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'project', '/project', 1)").unwrap();
+        conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
+        conn.execute_raw(
+            "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')",
+        )
+        .unwrap();
+        let created = now_micros() - 60_000_000;
+        let expires = created + 86_400_000_000;
+        let mut active = Vec::new();
+        for id in 401..417 {
+            conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'src/{id}.rs', 1, 'release-test', {created}, {expires}, NULL)")).unwrap();
+            active.push(
+                serde_json::json!({"id": id, "project": "/project", "agent": "BlueLake",
+                "path_pattern": format!("src/{id}.rs"), "exclusive": true, "reason": "release-test",
+                "created_ts": micros_to_iso(created), "expires_ts": micros_to_iso(expires),
+                "released_ts": null, "db_generation": "aabb"}),
+            );
+        }
+        drop(conn);
+        let archive = mcp_agent_mail_storage::ensure_archive(&config, "project").unwrap();
+        mcp_agent_mail_storage::write_file_reservation_records(&archive, &config, &active).unwrap();
+        mcp_agent_mail_storage::flush_async_commits();
+        let ids = (401..417).collect::<Vec<_>>();
+        let released = block_on(mcp_agent_mail_db::queries::release_reservations_by_ids(
+            &cx, &pool, &ids,
+        ));
+        assert!(
+            matches!(released, Outcome::Ok(16)),
+            "DB releases succeed: {released:?}"
+        );
+        let Outcome::Ok(conn) = block_on(pool.acquire(&cx)) else {
+            panic!("release connection")
+        };
+        let mut released_records = active;
+        for record in &mut released_records {
+            let id = record["id"].as_i64().unwrap();
+            let timestamp = scalar_i64(
+                &conn,
+                &format!(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id={id}"
+                ),
+                "released_ts",
+            );
+            record["released_ts"] = serde_json::json!(micros_to_iso(timestamp));
+        }
+        drop(conn);
+        // A directory at the stable target makes the real writer fail even
+        // under root. Restore the old ACTIVE file as a crash would leave it.
+        let stable = archive
+            .root
+            .join("file_reservations")
+            .join(reservation_artifact_filename(Some("aabb"), 401));
+        let held = stable.with_extension("held");
+        std::fs::rename(&stable, &held).unwrap();
+        std::fs::create_dir(&stable).unwrap();
+        assert!(
+            mcp_agent_mail_storage::write_file_reservation_records(
+                &archive,
+                &config,
+                &released_records
+            )
+            .is_err()
+        );
+        std::fs::rename(&stable, stable.with_extension("blocked")).unwrap();
+        std::fs::rename(&held, &stable).unwrap();
+        probe_release_guard(&config.storage_root, true);
+        let Outcome::Ok(conn) = block_on(pool.acquire(&cx)) else {
+            panic!("parity connection")
+        };
+        let before = check_reservation_parity_with_db_conn(&conn, &config.storage_root).unwrap();
+        assert_eq!(before.drift.released_ts_mismatches, 16, "{before:?}");
+        assert_eq!(before.drift.active_status_mismatches, 16, "{before:?}");
+        drop(conn);
+        drop(pool);
+
+        // Reopen only the durable DB, with a fresh maintenance cursor. No
+        // reservation read or mutation tool participates in convergence.
+        let reopened = create_pool(&settings).unwrap();
+        let mut cursor = ReservationReconcileCursor::default();
+        let mut repaired = 0;
+        for _ in 0..4 {
+            let report = reconcile_reservation_releases(
+                &cx,
+                &reopened,
+                &config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(report.repaired, 4, "{report:?}");
+            assert_eq!(report.deferred, 0, "{report:?}");
+            assert!(report.scanned <= 32);
+            repaired += report.repaired;
+        }
+        assert_eq!(repaired, 16);
+        probe_release_guard(&config.storage_root, false);
+        let Outcome::Ok(conn) = block_on(reopened.acquire(&cx)) else {
+            panic!("final parity connection")
+        };
+        let after = check_reservation_parity_with_db_conn(&conn, &config.storage_root).unwrap();
+        assert!(
+            after.ok,
+            "background repair restores actual doctor parity: {after:?}"
+        );
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) AS n FROM file_reservations", "n"),
+            16
+        );
+        assert_eq!(
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) AS n FROM file_reservation_releases",
+                "n"
+            ),
+            16
+        );
+    });
+    println!("reservation-release-reopen-executed");
+}

@@ -232,9 +232,9 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
     })
 }
 
-struct Artifact {
-    bytes: Vec<u8>,
-    value: Value,
+pub(super) struct Artifact {
+    pub(super) bytes: Vec<u8>,
+    pub(super) value: Value,
 }
 
 fn decode_artifact(bytes: Vec<u8>) -> crate::Result<Artifact> {
@@ -250,7 +250,7 @@ fn decode_artifact(bytes: Vec<u8>) -> crate::Result<Artifact> {
     Ok(Artifact { bytes, value })
 }
 
-fn read_artifact(path: &Path) -> crate::Result<Option<Artifact>> {
+pub(super) fn read_artifact(path: &Path) -> crate::Result<Option<Artifact>> {
     if crate::path_existing_prefix_has_symlink(path)? {
         return Err(invalid("agent metadata path contains a symlink"));
     }
@@ -269,7 +269,7 @@ fn read_artifact(path: &Path) -> crate::Result<Option<Artifact>> {
     decode_artifact(bytes).map(Some)
 }
 
-fn head_tree(repo: &Repository) -> crate::Result<Option<Tree<'_>>> {
+pub(super) fn head_tree(repo: &Repository) -> crate::Result<Option<Tree<'_>>> {
     match repo.head() {
         Ok(head) => Ok(Some(head.peel_to_tree()?)),
         Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
@@ -279,7 +279,7 @@ fn head_tree(repo: &Repository) -> crate::Result<Option<Tree<'_>>> {
     }
 }
 
-fn committed_artifact(
+pub(super) fn committed_artifact(
     repo: &Repository,
     tree: Option<&Tree<'_>>,
     path: &str,
