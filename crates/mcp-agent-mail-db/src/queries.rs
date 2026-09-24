@@ -29594,6 +29594,99 @@ mod tests {
         });
     }
 
+    /// br-kp1in.16: 16 and 32 concurrent autocommit writers (pinned MVCC
+    /// concurrent mode, production retry wrapper) lose no rows and leave a
+    /// database an independent C SQLite full `integrity_check` accepts.
+    #[test]
+    fn autocommit_writer_storm_loses_no_rows_and_keeps_integrity() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        for writers in [16_usize, 32] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join(format!("autocommit_storm_{writers}.db"));
+            let cfg = crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: writers,
+                run_migrations: true,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let pool = crate::create_pool(&cfg).expect("create pool");
+            let per_writer = 8_usize;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
+            // Spawn every writer before joining any: they meet at the barrier.
+            let mut handles = Vec::with_capacity(writers);
+            for writer in 0..writers {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("writer runtime");
+                    barrier.wait();
+                    let mut failures = Vec::new();
+                    for row in 0..per_writer {
+                        let slug = format!("storm-{writers}-{writer}-{row}");
+                        let outcome = rt.block_on(async {
+                            let cx = Cx::current().expect("runtime installs a context");
+                            run_with_mvcc_retry(&cx, "autocommit storm insert", || async {
+                                let conn = match acquire_conn(&cx, &pool).await {
+                                    Outcome::Ok(conn) => conn,
+                                    Outcome::Err(error) => return Outcome::Err(error),
+                                    Outcome::Cancelled(reason) => {
+                                        return Outcome::Cancelled(reason);
+                                    }
+                                    Outcome::Panicked(payload) => {
+                                        return Outcome::Panicked(payload);
+                                    }
+                                };
+                                match conn.execute_raw(&format!(
+                                    "INSERT INTO projects (slug, human_key, created_at) \
+                                         VALUES ('{slug}', '/tmp/{slug}', 0)"
+                                )) {
+                                    Ok(()) => Outcome::Ok(()),
+                                    Err(error) => Outcome::Err(map_sql_error(&error)),
+                                }
+                            })
+                            .await
+                        });
+                        if !matches!(outcome, Outcome::Ok(())) {
+                            failures.push(format!("{slug}: {outcome:?}"));
+                        }
+                    }
+                    failures
+                }));
+            }
+            let failures: Vec<String> = handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("writer thread"))
+                .collect();
+            assert!(failures.is_empty(), "{writers} writers: {failures:?}");
+            drop(pool);
+
+            let verify = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+                .expect("independent C SQLite connection");
+            let count = verify
+                .query_sync("SELECT count(*) FROM projects", &[])
+                .expect("count projects")
+                .first()
+                .and_then(|row| row.get_as::<i64>(0).ok());
+            assert_eq!(
+                count,
+                Some(i64::try_from(writers * per_writer).expect("row count fits")),
+                "{writers} autocommit writers must lose no rows"
+            );
+            let integrity: Vec<String> = verify
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("integrity_check")
+                .iter()
+                .filter_map(|row| row.get_as::<String>(0).ok())
+                .collect();
+            assert_eq!(integrity, vec!["ok".to_string()], "{writers} writers");
+        }
+    }
+
     #[test]
     fn set_contact_policy_by_name_preserves_lookup_and_cache() {
         use asupersync::runtime::RuntimeBuilder;

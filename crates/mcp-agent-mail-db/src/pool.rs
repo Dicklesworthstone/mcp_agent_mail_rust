@@ -3874,6 +3874,13 @@ impl DbPool {
                         }
                     }
 
+                    if open_mode != DbPoolOpenMode::QueryOnlyStrict
+                        && let Err(pin_err) = pin_autocommit_write_mode(&conn)
+                    {
+                        crate::close_db_conn(conn, "pool connection write-mode pin failed");
+                        return Outcome::Err(pin_err);
+                    }
+
                     Outcome::Ok(conn)
                 }
             })
@@ -7027,6 +7034,66 @@ where
         || open_file(sqlite_path),
         sleep_fn,
     )
+}
+
+/// Pins how writes outside an explicit transaction run (br-kp1in.16).
+///
+/// FrankenSQLite opens every autocommit write as an MVCC concurrent writer
+/// while `concurrent_mode_default` is true, which is its current default. That
+/// is also the mode the release smoke qualified: a 16-client storm with zero
+/// `RESOURCE_BUSY` and an independent `integrity_check` of ok. Setting it
+/// explicitly keeps an upstream default flip from silently changing the write
+/// path. Explicit transactions still follow `FSQLITE_CONCURRENT_MODE`
+/// (`BEGIN IMMEDIATE` unless it is enabled).
+pub const AUTOCOMMIT_CONCURRENT_MODE_PRAGMA: &str = "PRAGMA fsqlite.concurrent_mode = ON;";
+
+/// Autocommit write mode read back from the last pinned runtime connection:
+/// -1 = not observed (or an engine without the pragma), 0 = serialized,
+/// 1 = MVCC concurrent.
+static OBSERVED_AUTOCOMMIT_CONCURRENT_MODE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+/// Effective autocommit write mode of runtime connections, if observed:
+/// `Some(true)` = MVCC concurrent writers.
+#[must_use]
+pub fn observed_autocommit_concurrent_mode() -> Option<bool> {
+    match OBSERVED_AUTOCOMMIT_CONCURRENT_MODE.load(Ordering::Relaxed) {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn pin_autocommit_write_mode(conn: &DbConn) -> Result<(), SqlError> {
+    if let Err(error) = conn.execute_raw(AUTOCOMMIT_CONCURRENT_MODE_PRAGMA) {
+        // Only FrankenSQLite has the `fsqlite` pragma namespace.
+        if error.to_string().contains("unknown database fsqlite") {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    let effective = conn
+        .query_sync("PRAGMA fsqlite.concurrent_mode", &[])?
+        .first()
+        .and_then(|row| row.get_as::<i64>(0).ok());
+    if effective != Some(1) {
+        return Err(SqlError::Custom(format!(
+            "fsqlite.concurrent_mode reads {effective:?} after pinning autocommit writes to MVCC concurrent"
+        )));
+    }
+    if OBSERVED_AUTOCOMMIT_CONCURRENT_MODE.swap(1, Ordering::Relaxed) != 1 {
+        tracing::info!(
+            autocommit_writes = "mvcc_concurrent",
+            explicit_transactions = if mcp_agent_mail_core::Config::get().fsqlite_concurrent_mode {
+                "begin_concurrent"
+            } else {
+                "begin_immediate"
+            },
+            "sqlite write modes pinned"
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -21302,6 +21369,55 @@ mod tests {
             Some(1),
             "autocommit insert through a pooled connection must be visible to a fresh handle"
         );
+    }
+
+    /// br-kp1in.16: runtime connections run autocommit writes as MVCC
+    /// concurrent writers because the pool sets it, not because of an engine
+    /// default; a connection whose engine default is serialized is re-pinned.
+    #[test]
+    fn runtime_connections_pin_autocommit_writes_to_mvcc_concurrent() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = DbPoolConfig {
+            database_url: format!(
+                "sqlite:///{}",
+                dir.path().join("write_mode_pin.db").display()
+            ),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&cfg).expect("create pool");
+        let mode = |conn: &DbConn| {
+            conn.query_sync("PRAGMA fsqlite.concurrent_mode", &[])
+                .expect("read fsqlite.concurrent_mode")
+                .first()
+                .and_then(|row| row.get_as::<i64>(0).ok())
+        };
+
+        rt.block_on(async {
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire pooled connection");
+            assert_eq!(mode(&conn), Some(1), "pool connections are pinned");
+            assert_eq!(observed_autocommit_concurrent_mode(), Some(true));
+
+            // An engine whose default is serialized: the pin still decides.
+            conn.execute_raw("PRAGMA fsqlite.concurrent_mode = OFF")
+                .expect("simulate a serialized engine default");
+            assert_eq!(mode(&conn), Some(0));
+            pin_autocommit_write_mode(&conn).expect("re-pin the write mode");
+            assert_eq!(mode(&conn), Some(1));
+        });
     }
 
     #[test]
