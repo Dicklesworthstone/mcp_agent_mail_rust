@@ -1,0 +1,274 @@
+{
+  "schema_version": 2,
+  "started_at": "2026-09-24T15:22:33Z",
+  "host": "thinkstation1",
+  "soak_secs": 300,
+  "converge_secs": 300,
+  "fetch_inbox_p99_budget_s": 2.0,
+  "arms": [
+    {
+      "arm": "candidate",
+      "binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/dae70a4b-c929-4271-8dbc-2866a572e980/scratchpad/wedge/e7744-testfeat/am",
+      "binary_sha256": "bc2bb90f0d51c8a6d184fd79597ba854cede16cd20745a5c2daaf5f9df528d46",
+      "phases": {
+        "flow": {
+          "verdict": "PASS",
+          "checks": [
+            {
+              "name": "ensure_project",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "register two agents",
+              "ok": true,
+              "detail": "['RedCove', 'RubyDeer']"
+            },
+            {
+              "name": "invalid agent name refused",
+              "ok": true,
+              "detail": "{'error': {'type': 'INVALID_AGENT_NAME', 'message': \"Invalid agent name format: 'not a valid name!'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name.\", 'recoverable': True, 'data': {'provided': 'not a valid name!'}}}"
+            },
+            {
+              "name": "reserve src/auth/**",
+              "ok": true,
+              "detail": "{'granted': [{'id': 1, 'path_pattern': 'src/auth/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-09-24T16:22:38.100897Z'}], 'conflicts': []}"
+            },
+            {
+              "name": "symmetric glob conflict",
+              "ok": true,
+              "detail": "{'granted': [], 'conflicts': [{'path': 'src/auth/login.rs', 'holders': [{'agent': 'RedCove', 'path_pattern': 'src/auth/**', 'exclusive': True, 'expires_ts': '2026-09-24T16:22:38.100897Z'}]}]}"
+            },
+            {
+              "name": "send_message",
+              "ok": true,
+              "detail": "{'deliveries': [{'project': '/data/projects/mcp_agent_mail_rust-pinklynx-wedge/tests/artifacts/release_smoke/20260924_152233/release_smoke/candidate-20260924T112233-2479249/proj1', 'payload': {'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'body_md': 'hi', 'importance': 'normal', 'ack_required': True, 'created_ts': '2026-09-24T15:22:38.379762Z'"
+            },
+            {
+              "name": "fetch_inbox sees message",
+              "ok": true,
+              "detail": "[{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'RedCove', 'created_ts': '2026-09-24T15:22:38.379762Z', 'read_ts': '2026-09-24T15:22:38.496872Z', 'kind': 'to', 'attachments': []}, {'id': 1, 'project_id': 1, 'sender_id': 1, 'thread_id': None, 'topic': None, 'subject': 'Contact approved: RedC"
+            },
+            {
+              "name": "acknowledge_message",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "reply_message",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "delivery receipt persisted",
+              "ok": true,
+              "detail": "{'message_id': 2, 'project_id': 1, 'persisted': True, 'persisted_at': '2026-09-24T15:22:38.379762Z', 'recipients': [{'recipient': 'RubyDeer', 'kind': 'to', 'persisted': True, 'signaled': False, 'signal_receipts': [], 'acknowledged': True, 'acknowledged_at': '2026-09-24T15:22:38.551425Z'}]}"
+            },
+            {
+              "name": "search_messages finds the message",
+              "ok": true,
+              "detail": "{'result': [{'id': 1, 'subject': 'Contact approved: RedCove -> RubyDeer', 'importance': 'normal', 'ack_required': 0, 'created_ts': '2026-09-24T15:22:38.294054Z', 'thread_id': None, 'from': 'RedCove', 'to': ['RubyDeer'], 'cc': []}, {'id': 2, 'subject': 'smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-09-24T15:22:38.379762Z', 'thread_id': 'smoke-1', 'from': 'RedCove', 'to': ['"
+            },
+            {
+              "name": "summarize_thread",
+              "ok": true,
+              "detail": "{'thread_id': 'smoke-1', 'summary': {'participants': ['RedCove', 'RubyDeer'], 'key_points': [], 'action_items': [], 'total_messages': 2, 'open_actions': 0, 'done_actions': 0, 'mentions': []}, 'examples': []}"
+            },
+            {
+              "name": "resource://inbox lists the message",
+              "ok": true,
+              "detail": "{'agent': 'RubyDeer', 'count': 2, 'messages': [{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'RedCove', 'created_ts': '2026-09-24T15:22:38.379762Z', 'kind': 'to', 'attachments': [], 'commit': {'authored_ts': None, 'deletions': 0, 'diff_summary': {'excerpt': [], 'hunks': 0}, 'hexsha': None,"
+            },
+            {
+              "name": "broadcast refused",
+              "ok": true,
+              "detail": "{'code': -32000, 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'data': {'error': {'type': 'BROADCAST_DISABLED', 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'recoverable': True, 'data': {'argument': 'broadcast'}}}}"
+            },
+            {
+              "name": "idempotent replay",
+              "ok": true,
+              "detail": "{'granted': [{'id': 2, 'path_pattern': 'docs/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-09-24T15:32:39.094931Z'}], 'conflicts': [], 'idempotent_replay': True}"
+            },
+            {
+              "name": "idempotency key conflict",
+              "ok": true,
+              "detail": "{'error': {'type': 'IDEMPOTENCY_KEY_CONFLICT', 'message': \"idempotency_key 'smoke-k1' for tool 'file_reservation_paths' was already used with a different payload. The original request stands; do not retry a changed payload under the same key. Use a fresh idempotency_key for a genuinely new request.\", 'recoverable': False, 'data': {'tool': 'file_reservation_paths', 'idempotency_key': 'smoke-k1', 'o"
+            },
+            {
+              "name": "release",
+              "ok": true,
+              "detail": "{'released': 1, 'released_at': '2026-09-24T15:22:39.293939Z'}"
+            },
+            {
+              "name": "re-grant after release",
+              "ok": true,
+              "detail": "{'granted': [{'id': 3, 'path_pattern': 'src/auth/login.rs', 'exclusive': True, 'reason': '', 'expires_ts': '2026-09-24T15:32:39.303600Z'}], 'conflicts': []}"
+            },
+            {
+              "name": "inbox events cursor",
+              "ok": true,
+              "detail": "{'events': [{'cursor': 1, 'message_id': 1, 'kind': 'to', 'delivered_ts': '2026-09-24T15:22:38.294054Z', 'subject': 'Contact approved: RedCove -> RubyDeer', 'from': 'RedCove', 'importance': 'normal', 'ack_required': False}, {'cursor': 2, 'message_id': 2, 'kind': 'to', 'delivered_ts': '2026-09-24T15:22:38.379762Z', 'subject': 'smoke', 'from': 'RedCove', 'importance': 'normal', 'ack_required': True}]"
+            }
+          ]
+        },
+        "cross_project": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "register peer in the second project",
+              "ok": true,
+              "detail": "{'id': 3, 'name': 'CalmPike', 'program': 'gemini-cli', 'model': 'smoke', 'task_description': '', 'inception_ts': '2026-09-24T15:22:39.454369Z', 'last_active_ts': '2026-09-24T15:22:39.454369Z', 'project_id': 2, 'attachments_policy': 'auto', 'reaper_exempt': False, 'capabilities': ['send_message', 'fetch_inbox', 'file_reservation_paths', 'acknowledge_message'], 'registration_token': '<redacted>'}"
+            },
+            {
+              "name": "cross-project contact handshake",
+              "ok": true,
+              "detail": "{'request': {'from': 'RedCove', 'from_project': '/data/projects/mcp_agent_mail_rust-pinklynx-wedge/tests/artifacts/release_smoke/20260924_152233/release_smoke/candidate-20260924T112233-2479249/proj1', 'to': 'CalmPike', 'to_project': '/data/projects/mcp_agent_mail_rust-pinklynx-wedge/tests/artifacts/release_smoke/20260924_152233/release_smoke/candidate-20260924T112233-2479249/proj2', 'status': 'pen"
+            },
+            {
+              "name": "no same-name placeholder in the sender's project",
+              "ok": false,
+              "detail": "['CalmPike', 'RubyDeer', 'RedCove']"
+            },
+            {
+              "name": "delivered to the peer's project or refused with CROSS_PROJECT_RECIPIENT",
+              "ok": false,
+              "detail": "{'send': {'deliveries': [{'project': '/data/projects/mcp_agent_mail_rust-pinklynx-wedge/tests/artifacts/release_smoke/20260924_152233/release_smoke/candidate-20260924T112233-2479249/proj1', 'payload': {'id': 6, 'project_id': 1, 'sender_id': 1, 'thread_id': None, 'topic': None, 'subject': 'xp-smoke', 'body_md': 'cross-project', 'importance': 'normal', 'ack_required': False, 'created_ts': '2026-09-2"
+            }
+          ],
+          "outcome": "misdelivered"
+        },
+        "storm": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "all storm sends acknowledged",
+              "ok": false,
+              "detail": "239/240 errors=[\"{'error': {'type': 'RESOURCE_BUSY', 'message': 'Resource is temporarily busy. Wait a moment and try again.', 'recoverable': True, 'data': {'error_detail': 'Query error: database is busy', 'db_error_classification': {'class': 'busy_retryable', 'severity': 'P2', 'repairable': False, 'safe_to_retry': True, 'safe_to_continue_read_only': True, 'blocks_edits': True, 'recommended_command"
+            },
+            {
+              "name": "acknowledged ids distinct",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "zero RESOURCE_BUSY",
+              "ok": false,
+              "detail": "1/240"
+            }
+          ],
+          "offered": 240,
+          "p50_s": 1.2863352298736572,
+          "p99_s": 1.9285967350006104,
+          "errors": [
+            "{'error': {'type': 'RESOURCE_BUSY', 'message': 'Resource is temporarily busy. Wait a moment and try again.', 'recoverable': True, 'data': {'error_detail': 'Query error: database is busy', 'db_error_classification': {'class': 'busy_retryable', 'severity': 'P2', 'repairable': False, 'safe_to_retry': True, 'safe_to_continue_read_only': True, 'blocks_edits': True, 'recommended_command': 'am doctor loc"
+          ]
+        },
+        "crash": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "all 49 acknowledged ids survive SIGKILL",
+              "ok": true,
+              "detail": "missing=[]"
+            },
+            {
+              "name": "archive converges to DB without client reads (<= 300s)",
+              "ok": false,
+              "detail": "archive=282 db=296 last=Archive and sqlite inventory are aligned enough for health_check: archive projects=2, agents=4, messages=282, db projects=2, agents=4, messages=296"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            }
+          ],
+          "acked": 49,
+          "server_integrity_verdict_after_restart": {
+            "status": "green",
+            "detail": "full integrity_check passed at 1790263389777606; latest integrity_check also passed",
+            "critical": true
+          }
+        },
+        "soak": {
+          "verdict": "FAIL",
+          "checks": [
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no EMFILE (server log and client responses)",
+              "ok": true,
+              "detail": "[]"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=29 bad=[{'t': 1790263715, 'drained_total': 91, 'depth_at_open': 1, 'depth_at_close': 88}, {'t': 1790263725, 'drained_total': 91, 'depth_at_open': 88, 'depth_at_close': 165}, {'t': 1790263736, 'drained_total': 91, 'depth_at_open': 165, 'depth_at_close': 223}, {'t': 1790263746, 'drained_total': 91, 'depth_at_open': 223, 'depth_at_close': 306}, {'t': 1790263756, 'drained_total': 91, 'depth_at"
+            },
+            {
+              "name": "health archive_lag stall verdict agrees with the WBQ counters",
+              "ok": false,
+              "detail": "lag_samples=0 disagree=[]"
+            },
+            {
+              "name": "fetch_inbox p99 <= 2.0s under write load",
+              "ok": true,
+              "detail": "p99=0.5302650928497314 n=177"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": false,
+              "detail": "max=16"
+            },
+            {
+              "name": "zero HTTP server restarts",
+              "ok": true,
+              "detail": "{'alive': True, 'markers': []}"
+            },
+            {
+              "name": "no archive re-root",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "archive converges after load stops",
+              "ok": false,
+              "detail": "archive=373 db=2117 last=Archive and sqlite inventory are aligned enough for health_check: archive projects=2, agents=4, messages=373, db projects=2, agents=4, messages=2117"
+            }
+          ],
+          "counts": {
+            "send": 1821,
+            "read": 177,
+            "search": 224,
+            "health": 256,
+            "err": 25
+          },
+          "sqlite_fds_max": 2,
+          "fetch_inbox_p99_s": 0.5302650928497314,
+          "fetch_inbox_samples": 177,
+          "wbq_samples": 29,
+          "server_threads_end": 121
+        }
+      },
+      "binary_version": "am 0.3.36",
+      "server_exe_sha256": "bc2bb90f0d51c8a6d184fd79597ba854cede16cd20745a5c2daaf5f9df528d46",
+      "server_nofile_soft_hard": [
+        "1024",
+        "1048576"
+      ],
+      "server_threads_start": 19,
+      "clean_shutdown": false,
+      "server_log_walfec_lines": 10052,
+      "verdict": "FAIL"
+    }
+  ],
+  "finished_at": "2026-09-24T15:39:27Z",
+  "candidate_verdict": "FAIL"
+}
