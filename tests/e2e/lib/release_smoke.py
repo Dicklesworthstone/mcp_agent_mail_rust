@@ -166,10 +166,22 @@ class Arm:
             time.sleep(0.5)
         raise RuntimeError(f"{self.name}: server not ready within 120 s")
 
-    def kill(self, sig: int = signal.SIGKILL) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(sig)
+    def kill(self, sig: int = signal.SIGKILL, grace_s: float = 60) -> bool:
+        """Signal the server and wait up to `grace_s` for it to exit.
+
+        Returns whether it exited in time. A server that outlives the grace
+        period (a wedged drain can block graceful shutdown) is SIGKILLed so the
+        smoke still stops it and writes its receipt."""
+        if not (self.proc and self.proc.poll() is None):
+            return True
+        self.proc.send_signal(sig)
+        try:
+            self.proc.wait(timeout=grace_s)
+            return True
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
             self.proc.wait(timeout=60)
+            return False
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -510,7 +522,7 @@ def phase_crash(arm: Arm, state: dict, c: list) -> dict:
     server_integrity = arm.health()["verdicts"]["integrity_check"]
     ok, detail = arm.wait_converged(CONVERGE_SECS, 10)
     check(c, f"archive converges to DB without client reads (<= {CONVERGE_SECS}s)", ok, detail)
-    arm.kill(signal.SIGTERM)
+    check(c, "server exits within 60 s of SIGTERM", arm.kill(signal.SIGTERM))
     ok, detail = arm.offline_integrity_check()
     check(c, "full PRAGMA integrity_check ok (independent C SQLite, server stopped)", ok, detail)
     arm.start()
@@ -694,7 +706,9 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
     except Exception as ex:
         result["error"] = f"{type(ex).__name__}: {ex}"
     finally:
-        arm.kill(signal.SIGTERM)
+        result["clean_shutdown"] = arm.kill(signal.SIGTERM)
+        if not result["clean_shutdown"]:
+            log(f"{name}: server ignored SIGTERM for 60 s; SIGKILLed")
     try:
         result["server_log_walfec_lines"] = sum(
             1 for line in arm.server_log.read_text(errors="replace").splitlines()
@@ -703,7 +717,8 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
         pass
     verdicts = [p.get("verdict") for p in result["phases"].values()]
     result["verdict"] = ("PASS" if len(verdicts) == len(PHASES)
-                         and all(v == "PASS" for v in verdicts) else "FAIL")
+                         and all(v == "PASS" for v in verdicts)
+                         and result["clean_shutdown"] else "FAIL")
     return result
 
 
