@@ -668,6 +668,19 @@ _e2e_json_escape() {
     echo -n "$s"
 }
 
+# Same escaping into variable $1 without a command-substitution fork (bash 3.1+
+# `printf -v`). Per-file forks made bundle manifests of large artifact trees
+# take ~1 h (br-kp1in.14: ~50k files from the release smoke's mailboxes).
+_e2e_json_escape_into() {
+    local s="$2"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf -v "$1" '%s' "$s"
+}
+
 _e2e_stat_bytes() {
     local file="$1"
     stat --format='%s' "$file" 2>/dev/null || stat -f '%z' "$file" 2>/dev/null || echo "0"
@@ -1536,14 +1549,32 @@ e2e_write_bundle_manifest() {
         git_dirty="true"
     fi
 
-    local bundle_files=()
-    local bundle_list_dir bundle_list_file
+    local bundle_list_dir bundle_list_file bundle_sha_file bundle_size_file
     bundle_list_dir="$(e2e_mktemp "e2e_bundle_files")"
     bundle_list_file="${bundle_list_dir}/files.txt"
+    bundle_sha_file="${bundle_list_dir}/sha256.txt"
+    bundle_size_file="${bundle_list_dir}/bytes.txt"
     find "$artifact_dir" -type f ! -path "$manifest" ! -name ".case_artifacts.tsv" | sort >"$bundle_list_file"
-    while IFS= read -r f; do
-        bundle_files+=("$f")
-    done <"$bundle_list_file"
+
+    # Hash and size every file in a few batched processes (output order follows
+    # the input list) instead of several forks per file; a large artifact tree
+    # (the release smoke's mailboxes, ~50k files) took ~1 h the old way. Any
+    # failure or count mismatch (e.g. no GNU xargs/stat) falls back to the
+    # per-file helpers below.
+    local batched=0
+    local listed
+    listed="$(wc -l <"$bundle_list_file")"
+    # Both exist even when the batch fails early; the loop below redirects from them.
+    : >"$bundle_sha_file"
+    : >"$bundle_size_file"
+    if tr '\n' '\0' <"$bundle_list_file" | xargs -0 -r sha256sum 2>/dev/null \
+            | awk '{ sub(/^\\/, "", $1); print $1 }' >"$bundle_sha_file" \
+        && tr '\n' '\0' <"$bundle_list_file" | xargs -0 -r stat --format='%s' 2>/dev/null \
+            >"$bundle_size_file" \
+        && [ "$(wc -l <"$bundle_sha_file")" -eq "$listed" ] \
+        && [ "$(wc -l <"$bundle_size_file")" -eq "$listed" ]; then
+        batched=1
+    fi
 
     {
         echo "{"
@@ -1581,13 +1612,16 @@ e2e_write_bundle_manifest() {
         echo "  },"
         echo "  \"files\": ["
 
-        local first=1
-        for f in "${bundle_files[@]}"; do
-            local rel="${f#"$artifact_dir"/}"
-            local sha
-            sha="$(e2e_sha256 "$f")"
-            local bytes
-            bytes="$(_e2e_stat_bytes "$f")"
+        local first=1 f sha bytes rel rel_json
+        while IFS= read -r f; do
+            if [ "$batched" -eq 1 ]; then
+                IFS= read -r sha <&3
+                IFS= read -r bytes <&4
+            else
+                sha="$(e2e_sha256 "$f")"
+                bytes="$(_e2e_stat_bytes "$f")"
+            fi
+            rel="${f#"$artifact_dir"/}"
 
             local kind="opaque"
             local schema_json="null"
@@ -1669,8 +1703,10 @@ e2e_write_bundle_manifest() {
             else
                 echo "    ,"
             fi
-            echo "    {\"path\": \"$( _e2e_json_escape "$rel" )\", \"sha256\": \"$( _e2e_json_escape "$sha" )\", \"bytes\": ${bytes}, \"kind\": \"$( _e2e_json_escape "$kind" )\", \"schema\": ${schema_json}}"
-        done
+            # sha256 is hex and kind is a fixed token; only the path needs escaping.
+            _e2e_json_escape_into rel_json "$rel"
+            echo "    {\"path\": \"${rel_json}\", \"sha256\": \"${sha}\", \"bytes\": ${bytes}, \"kind\": \"${kind}\", \"schema\": ${schema_json}}"
+        done <"$bundle_list_file" 3<"$bundle_sha_file" 4<"$bundle_size_file"
 
         echo "  ]"
         echo "}"
@@ -2241,7 +2277,10 @@ e2e_tree() {
 # Stable SHA256 of a file
 e2e_sha256() {
     local file="$1"
-    sha256sum "$file" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$file" | awk '{print $1}'
+    # GNU sha256sum prefixes the line with "\" when the name needs escaping
+    # (e.g. a backslash in it); that marker is not part of the digest.
+    sha256sum "$file" 2>/dev/null | awk '{ sub(/^\\/, "", $1); print $1 }' \
+        || shasum -a 256 "$file" | awk '{print $1}'
 }
 
 # Stable SHA256 of a string
