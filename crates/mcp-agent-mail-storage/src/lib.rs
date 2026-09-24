@@ -7855,7 +7855,6 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 
 /// Create a directory (and parents) only if we haven't already created it.
 fn ensure_dir(dir: &Path) -> std::io::Result<()> {
-    let _mutation = ArchiveMutationGuard::begin_at(dir);
     {
         let cache = DIR_CACHE
             .lock()
@@ -7864,6 +7863,9 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
             return Ok(());
         }
     }
+    // A cached directory is no mutation: it must not wait for the global
+    // publication fence behind a draining batch (br-kp1in.13).
+    let _mutation = ArchiveMutationGuard::begin_at(dir);
     if path_existing_prefix_has_symlink(dir)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -10472,7 +10474,10 @@ pub fn clear_notification_signal(
     project_slug: &str,
     agent_name: &str,
 ) -> SignalClearOutcome {
-    let _mutation = ArchiveMutationGuard::begin_at(&config.notifications_signals_dir);
+    // No archive mutation guard: a signal file is a wake-up hint outside the
+    // Git archive, and fetch_inbox calls this on every read. Holding the global
+    // publication fence here queued inbox reads behind whole write-behind
+    // batches, 25-30 s under load (br-kp1in.13).
     if !config.notifications_enabled {
         return SignalClearOutcome::Disabled;
     }
@@ -13566,6 +13571,73 @@ mod tests {
         let unknown = fence_contention_report(FENCE_WAIT_REPORT_AFTER, waiter, None)
             .expect("reported even without a recorded holder");
         assert!(unknown.contains("an unrecorded holder"), "{unknown}");
+    }
+
+    /// br-kp1in.13: fetch_inbox clears a notification signal on every read, and
+    /// a cached directory is no mutation. Neither may queue behind the global
+    /// publication fence that a draining write-behind batch holds (observed:
+    /// inbox reads waiting 25-30 s); a real archive mutation still waits.
+    #[test]
+    fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
+        let tmp = TempDir::new().unwrap();
+        let cached_dir = tmp.path().join("cached");
+        ensure_dir(&cached_dir).expect("create and cache the directory");
+        let mut config = test_config(tmp.path());
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/proj/agents/BlueLake.signal");
+        fs::create_dir_all(signal.parent().unwrap()).unwrap();
+        fs::write(&signal, "{}").unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+
+        // On a helper thread with a deadline, so a regression fails instead
+        // of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            for enabled in [false, true] {
+                config.notifications_enabled = enabled;
+                outcomes.push(clear_notification_signal(&config, "proj", "BlueLake"));
+            }
+            ensure_dir(&cached_dir).expect("cached directory");
+            done_tx.send(outcomes).expect("report outcomes");
+        });
+        let outcomes = done_rx.recv_timeout(Duration::from_secs(5));
+
+        // Negative control: a real mutation window waits while the fence is held.
+        let (mutated_tx, mutated_rx) = std::sync::mpsc::channel();
+        let mutator = std::thread::spawn(move || {
+            let _guard = ArchiveMutationGuard::begin();
+            mutated_tx.send(()).expect("report the mutation");
+        });
+        let mutation_waited = mutated_rx.recv_timeout(Duration::from_millis(300)).is_err();
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        mutated_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the mutation proceeds once the fence is released");
+        mutator.join().expect("mutator thread");
+        probe.join().expect("probe thread");
+
+        assert_eq!(
+            outcomes.expect("signal clears and a cached ensure_dir must not wait for the fence"),
+            vec![SignalClearOutcome::Disabled, SignalClearOutcome::Cleared]
+        );
+        assert!(!signal.exists(), "the enabled clear removed the signal");
+        assert!(
+            mutation_waited,
+            "a real archive mutation waits for the held fence"
+        );
     }
 
     #[test]
