@@ -8455,7 +8455,31 @@ fn build_reservations(
     conflicts_only: bool,
     expiring_minutes: Option<u32>,
 ) -> Result<(ReservationsData, Vec<String>), CliError> {
-    let now_us = mcp_agent_mail_db::now_micros();
+    build_reservations_at(
+        conn,
+        mcp_agent_mail_db::now_micros(),
+        project_id,
+        project_slug,
+        agent,
+        show_all,
+        conflicts_only,
+        expiring_minutes,
+    )
+}
+
+/// [`build_reservations`] evaluated at an explicit clock (`now_us`, microseconds
+/// since the epoch), so grant ages, remaining seconds and the expiring window are
+/// exact under a fixed clock in tests (GH#330).
+fn build_reservations_at(
+    conn: &DbConn,
+    now_us: i64,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+    show_all: bool,
+    conflicts_only: bool,
+    expiring_minutes: Option<u32>,
+) -> Result<(ReservationsData, Vec<String>), CliError> {
     let expiring_threshold = now_us.saturating_add(
         i64::from(expiring_minutes.unwrap_or(10))
             .saturating_mul(60)
@@ -25558,49 +25582,177 @@ mod tests {
         );
     }
 
-    /// GH#330: JSON consumers get absolute RFC 3339 grant/expiry times and an
-    /// integer age, not only the humanized "1h ago" string.
+    /// Fixed clock for the GH#330 reservation-time tests: 2026-02-16T10:00:00Z.
+    const GH330_NOW_US: i64 = 1_771_236_000_000_000;
+
+    /// Two live reservations relative to [`GH330_NOW_US`]: Alice's `src/**`
+    /// (granted 90 min ago, 30 min left) and Bob's `docs/**` (granted 1 min ago,
+    /// 5 min left, so inside the default 10-minute expiring window).
+    fn gh330_reservations_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
+        let (temp_dir, conn) = setup_robot_thread_message_test_db();
+        for (id, agent_id, path, created_us, expires_us) in [
+            (
+                1_i64,
+                1_i64,
+                "src/**",
+                GH330_NOW_US - 5_400_000_000,
+                GH330_NOW_US + 1_800_000_000,
+            ),
+            (
+                2,
+                2,
+                "docs/**",
+                GH330_NOW_US - 60_000_000,
+                GH330_NOW_US + 300_000_000,
+            ),
+        ] {
+            conn.query_sync(
+                "INSERT INTO file_reservations
+                 (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+                 VALUES (?, 1, ?, ?, 1, 'gh330', ?, ?, NULL)",
+                &[
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(agent_id),
+                    mcp_agent_mail_db::sqlmodel_core::Value::Text(path.to_string()),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_us),
+                    mcp_agent_mail_db::sqlmodel_core::Value::BigInt(expires_us),
+                ],
+            )
+            .expect("insert reservation");
+        }
+        (temp_dir, conn)
+    }
+
+    /// GH#330: JSON consumers get absolute RFC 3339 grant/expiry times and
+    /// integer ages, exact under a fixed clock, not only "1h ago".
     #[test]
     fn build_reservations_exposes_absolute_grant_and_expiry_times() {
-        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
-        let now_us = mcp_agent_mail_db::now_micros();
-        let created_us = now_us - 5_400_000_000; // granted 90 minutes ago
-        let expires_us = now_us + 1_800_000_000;
-        conn.query_sync(
-            "INSERT INTO file_reservations
-             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
-             VALUES (1, 1, 1, 'src/**', 1, 'gh330', ?, ?, NULL)",
-            &[
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_us),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(expires_us),
-            ],
-        )
-        .expect("insert reservation");
+        let (_temp_dir, conn) = gh330_reservations_db();
+        let (data, _) =
+            build_reservations_at(&conn, GH330_NOW_US, 1, "proj", None, false, false, None)
+                .expect("build reservations");
 
-        let (data, _) = build_reservations(&conn, 1, "proj", None, false, false, None)
-            .expect("build reservations");
-        assert_eq!(data.all_active.len(), 1);
-        let json = serde_json::to_value(&data.all_active[0]).expect("serialize entry");
+        let all_active = serde_json::to_value(&data.all_active).expect("serialize entries");
+        assert_eq!(
+            all_active,
+            serde_json::json!([
+                {
+                    "agent": "Bob",
+                    "path": "docs/**",
+                    "exclusive": true,
+                    "remaining_seconds": 300,
+                    "remaining": "5m \u{26a0}",
+                    "granted_at": "1m ago",
+                    "granted_ts": "2026-02-16T09:59:00.000000Z",
+                    "expires_ts": "2026-02-16T10:05:00.000000Z",
+                    "granted_age_seconds": 60
+                },
+                {
+                    "agent": "Alice",
+                    "path": "src/**",
+                    "exclusive": true,
+                    "remaining_seconds": 1800,
+                    "remaining": "30m",
+                    "granted_at": "1h ago",
+                    "granted_ts": "2026-02-16T08:30:00.000000Z",
+                    "expires_ts": "2026-02-16T10:30:00.000000Z",
+                    "granted_age_seconds": 5400
+                }
+            ])
+        );
+        // The absolute times are RFC 3339 and agree with the integer fields.
+        for entry in all_active.as_array().expect("array") {
+            let granted = chrono::DateTime::parse_from_rfc3339(
+                entry["granted_ts"].as_str().expect("granted_ts"),
+            )
+            .expect("granted_ts is RFC 3339");
+            let expires = chrono::DateTime::parse_from_rfc3339(
+                entry["expires_ts"].as_str().expect("expires_ts"),
+            )
+            .expect("expires_ts is RFC 3339");
+            let now = chrono::DateTime::from_timestamp_micros(GH330_NOW_US).expect("now");
+            assert_eq!(
+                (now - granted.with_timezone(&chrono::Utc)).num_seconds(),
+                entry["granted_age_seconds"].as_i64().expect("age")
+            );
+            assert_eq!(
+                (expires.with_timezone(&chrono::Utc) - now).num_seconds(),
+                entry["remaining_seconds"].as_i64().expect("remaining")
+            );
+        }
+        // Only Bob's lease is inside the default 10-minute window at this clock.
+        let expiring: Vec<&str> = data.expiring_soon.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(expiring, ["docs/**"]);
+    }
 
-        let granted = json["granted_ts"].as_str().expect("granted_ts is a string");
-        assert_eq!(granted, mcp_agent_mail_db::micros_to_iso(created_us));
+    #[test]
+    fn robot_reservations_json_has_no_humanized_only_time_field() {
+        // GH#330 negative: every humanized time in the JSON payload must sit next
+        // to its machine-usable form, so no consumer has to parse "1h ago".
+        fn walk(value: &serde_json::Value, at: &str, violations: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (humanized, required) in [
+                        ("granted_at", &["granted_ts", "granted_age_seconds"][..]),
+                        ("remaining", &["remaining_seconds", "expires_ts"][..]),
+                    ] {
+                        if map.contains_key(humanized) {
+                            for key in required {
+                                if !map.get(*key).is_some_and(|v| !v.is_null()) {
+                                    violations.push(format!("{at}: {humanized} without {key}"));
+                                }
+                            }
+                        }
+                    }
+                    for (key, child) in map {
+                        walk(child, &format!("{at}.{key}"), violations);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        walk(child, &format!("{at}[{i}]"), violations);
+                    }
+                }
+                serde_json::Value::String(s)
+                    if s.ends_with(" ago") && !at.ends_with(".granted_at") =>
+                {
+                    violations.push(format!("{at}: humanized time {s:?} outside granted_at"));
+                }
+                _ => {}
+            }
+        }
+
+        let (_temp_dir, conn) = gh330_reservations_db();
+        let (data, _) =
+            build_reservations_at(&conn, GH330_NOW_US, 1, "proj", None, true, false, None)
+                .expect("build reservations");
+        let json = serde_json::to_value(&data).expect("serialize reservations");
+        let mut violations = Vec::new();
+        walk(&json, "$", &mut violations);
+        assert!(violations.is_empty(), "{violations:#?}");
         assert!(
-            chrono::DateTime::parse_from_rfc3339(granted).is_ok(),
-            "granted_ts must be RFC 3339: {granted}"
+            json.to_string().contains("\"granted_at\":\"1h ago\""),
+            "the walk must have seen a humanized field: {json}"
         );
-        let expires = json["expires_ts"].as_str().expect("expires_ts is a string");
-        assert_eq!(expires, mcp_agent_mail_db::micros_to_iso(expires_us));
-        let age = json["granted_age_seconds"]
-            .as_i64()
-            .expect("granted_age_seconds is an integer");
-        assert!(
-            (5_390..=5_460).contains(&age),
-            "age should be ~5400 s, got {age}"
+
+        // The check bites: an entry that only carries the humanized grant time
+        // is reported.
+        let mut stripped = data.all_active[0].clone();
+        stripped.granted_ts = None;
+        stripped.granted_age_seconds = None;
+        let mut violations = Vec::new();
+        walk(
+            &serde_json::to_value(&stripped).expect("serialize"),
+            "$",
+            &mut violations,
         );
-        assert!(json["remaining_seconds"].as_i64().is_some_and(|s| s > 0));
-        // The humanized field stays for human formats; it is no longer the only
-        // representation of the grant time.
-        assert!(json["granted_at"].as_str().is_some());
+        assert_eq!(
+            violations,
+            [
+                "$: granted_at without granted_ts",
+                "$: granted_at without granted_age_seconds"
+            ]
+        );
     }
 
     #[test]
