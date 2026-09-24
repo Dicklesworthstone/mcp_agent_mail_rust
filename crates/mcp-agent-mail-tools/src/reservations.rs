@@ -130,6 +130,10 @@ pub struct OwnActiveReservation {
 pub struct ReleaseResult {
     pub released: i32,
     pub released_at: String,
+    /// The reservations this call released, ascending (br-kp1in.24 / GH#329),
+    /// so a caller can tell which of its requested holds are gone. Additive to
+    /// the legacy `{released, released_at}` shape.
+    pub released_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2497,9 +2501,12 @@ pub async fn release_file_reservations(
         }
     }
 
+    let mut released_ids: Vec<i64> = released_rows.iter().filter_map(|row| row.id).collect();
+    released_ids.sort_unstable();
     let response = ReleaseResult {
         released: i32::try_from(released_rows.len()).unwrap_or(i32::MAX),
         released_at: micros_to_iso(mcp_agent_mail_db::now_micros()),
+        released_ids,
     };
 
     tracing::debug!(
@@ -5624,6 +5631,13 @@ mod tests {
                 )
                 .expect("release response JSON");
                 assert_eq!(released["released"].as_i64(), Some(2));
+                let mut granted_ids = first_ids.expect("macro granted ids");
+                granted_ids.sort_unstable();
+                assert_eq!(
+                    released["released_ids"],
+                    serde_json::json!(granted_ids),
+                    "released_ids names exactly the released leases"
+                );
                 let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
                     Outcome::Ok(rows) => rows,
                     other => panic!("post-path-release read failed: {other:?}"),
@@ -5690,6 +5704,11 @@ mod tests {
                 )
                 .expect("legacy release response JSON");
                 assert_eq!(released["released"].as_i64(), Some(13));
+                // Every sibling the one id selected, and none of the leases
+                // released earlier in this test.
+                let mut sibling_ids = legacy_ids.clone();
+                sibling_ids.sort_unstable();
+                assert_eq!(released["released_ids"], serde_json::json!(sibling_ids));
                 let active = match queries::get_active_reservations(&cx, &pool, project_id).await {
                     Outcome::Ok(rows) => rows,
                     other => panic!("post-id-release read failed: {other:?}"),
@@ -6185,11 +6204,13 @@ mod tests {
         let r = ReleaseResult {
             released: 3,
             released_at: "2026-02-06T01:00:00Z".into(),
+            released_ids: vec![4, 7, 9],
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["released"], 3);
         assert!(json["released_at"].is_string());
+        assert_eq!(json["released_ids"], serde_json::json!([4, 7, 9]));
     }
 
     #[test]
@@ -6416,10 +6437,12 @@ mod tests {
         let r = ReleaseResult {
             released: 0,
             released_at: "2026-02-06T00:00:00Z".into(),
+            released_ids: Vec::new(),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(json["released"], 0);
+        assert_eq!(json["released_ids"], serde_json::json!([]));
     }
 
     #[test]

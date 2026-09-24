@@ -19827,19 +19827,61 @@ fn emit_proxied_file_reservations_output(
                 .get("released")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            output::success(&format!(
-                "Released {released} reservation(s) for {agent} in {project}."
-            ));
+            let released_ids = payload
+                .get("released_ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_i64)
+                        .collect::<std::collections::BTreeSet<i64>>()
+                });
+            match released_ids
+                .as_ref()
+                .filter(|released_ids| !released_ids.is_empty())
+            {
+                Some(released_ids) => output::success(&format!(
+                    "Released {released} reservation(s) for {agent} in {project}: id(s) {}.",
+                    released_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                None => output::success(&format!(
+                    "Released {released} reservation(s) for {agent} in {project}."
+                )),
+            }
             // br-kp1in.24 / GH#329: an explicit id that released nothing must
             // not pass silently; the caller would believe the lease is gone.
-            let distinct_ids = ids.iter().collect::<std::collections::BTreeSet<_>>().len();
-            let requested = i64::try_from(distinct_ids).unwrap_or(i64::MAX);
-            if paths.is_empty() && released < requested {
-                output::warn(&format!(
-                    "{} of {requested} requested reservation id(s) released nothing: not found, \
-                     already released, or not held by {agent}.",
-                    requested - released
-                ));
+            let requested_ids = ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<i64>>();
+            if paths.is_empty() && !requested_ids.is_empty() {
+                if let Some(released_ids) = released_ids.as_ref() {
+                    let missed = requested_ids
+                        .difference(released_ids)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    if !missed.is_empty() {
+                        output::warn(&format!(
+                            "Reservation id(s) {} released nothing: not found, already released, \
+                             or not held by {agent}.",
+                            missed.join(", ")
+                        ));
+                    }
+                } else {
+                    // A server without `released_ids` reports only a count.
+                    let requested = i64::try_from(requested_ids.len()).unwrap_or(i64::MAX);
+                    if released < requested {
+                        output::warn(&format!(
+                            "{} of {requested} requested reservation id(s) released nothing: not \
+                             found, already released, or not held by {agent}.",
+                            requested - released
+                        ));
+                    }
+                }
             }
         }
         _ => {}
@@ -70026,17 +70068,29 @@ startup_timeout_sec = 42
             output
         };
 
-        // A duplicate of a released id is not an extra miss.
+        // A duplicate of a released id is not an extra miss. The output names
+        // the id that was released and the one that released nothing.
         let output = release(vec![1, 999_999, 1]);
         assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(output.contains(": id(s) 1."), "{output}");
         assert!(
-            output.contains("1 of 2 requested reservation id(s) released nothing"),
+            output.contains("Reservation id(s) 999999 released nothing"),
             "{output}"
         );
 
         let output = release(vec![1]);
         assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(output.contains(": id(s) 1."), "{output}");
         assert!(!output.contains("released nothing"), "{output}");
+
+        // Only an unknown id: nothing released, so no id list, and the miss is named.
+        let output = release(vec![999_999]);
+        assert!(output.contains("Released 0 reservation(s)"), "{output}");
+        assert!(!output.contains("id(s) 1"), "{output}");
+        assert!(
+            output.contains("Reservation id(s) 999999 released nothing"),
+            "{output}"
+        );
     }
 
     #[test]
