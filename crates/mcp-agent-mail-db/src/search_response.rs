@@ -1,7 +1,7 @@
 //! Lexical response assembler: ranking, pagination, snippets, and explain
 //!
 //! Converts raw Tantivy search results into [`SearchResults`] with:
-//! - Score-sorted hits with deterministic tie-breaking (by ID descending)
+//! - Score-sorted hits with deterministic tie-breaking (by ID ascending)
 //! - Offset/limit pagination with correct `total_count`
 //! - Context-aware text snippets with term highlighting
 //! - Optional deterministic multi-stage explain report
@@ -356,13 +356,72 @@ impl Ord for LexicalRank {
 type RankedDocuments = Vec<(LexicalRank, tantivy::DocAddress)>;
 
 #[cfg(feature = "tantivy-engine")]
+#[derive(Clone, Copy)]
+enum LexicalPagination<'a> {
+    Offset(usize),
+    Cursor(Option<&'a crate::search_planner::SearchCursor>),
+}
+
+/// Refresh a surviving boundary against the same filtered snapshot as its page.
+/// BM25 scores can change after unrelated messages are indexed; the boundary's
+/// identity still marks where to continue. If it was removed or no longer
+/// matches the query, retain the encoded score/ID boundary.
+#[cfg(feature = "tantivy-engine")]
+fn current_cursor_boundary(
+    searcher: &tantivy::Searcher,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    cursor: &crate::search_planner::SearchCursor,
+) -> tantivy::Result<(f64, i64)> {
+    use tantivy::query::{BooleanQuery, EnableScoring, Occur, TermQuery};
+    use tantivy::schema::IndexRecordOption;
+
+    let Ok(id) = u64::try_from(cursor.id) else {
+        return Ok((cursor.score, cursor.id));
+    };
+    let identity_query = TermQuery::new(
+        tantivy::Term::from_field_u64(handles.id, id),
+        IndexRecordOption::Basic,
+    );
+    // IDs may also occur on another document kind in the unified index. Only
+    // a boundary that matches the original query and all its filters counts.
+    let boundary_query = BooleanQuery::new(vec![
+        (Occur::Must, Box::new(identity_query)),
+        (Occur::Must, query.box_clone()),
+    ]);
+    let addresses = searcher.search(&boundary_query, &TopDocs::with_limit(1))?;
+    let Some((_, address)) = addresses.first() else {
+        return Ok((cursor.score, cursor.id));
+    };
+    // Read the original query's score, without the extra identity term used
+    // to locate this document and without assembling an explanation tree.
+    let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+    let mut scorer = weight.scorer(searcher.segment_reader(address.segment_ord), 1.0)?;
+    let score = if tantivy::DocSet::seek(scorer.as_mut(), address.doc_id) == address.doc_id {
+        f64::from(scorer.score())
+    } else {
+        cursor.score
+    };
+    Ok((score, cursor.id))
+}
+
+#[cfg(feature = "tantivy-engine")]
 fn collect_ranked_page(
     searcher: &tantivy::Searcher,
     query: &dyn Query,
     handles: &FieldHandles,
     limit: usize,
-    offset: usize,
+    pagination: LexicalPagination<'_>,
 ) -> tantivy::Result<(usize, RankedDocuments)> {
+    let (offset, boundary) = match pagination {
+        LexicalPagination::Offset(offset) => (offset, None),
+        LexicalPagination::Cursor(cursor) => (
+            0,
+            cursor
+                .map(|cursor| current_cursor_boundary(searcher, query, handles, cursor))
+                .transpose()?,
+        ),
+    };
     let num_docs = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
     if limit == 0 || offset >= num_docs {
         // Preserve the exact matching count, including for count-only queries
@@ -397,10 +456,25 @@ fn collect_ranked_page(
                 // Match build_hit's representation of the stored document ID.
                 #[allow(clippy::cast_possible_wrap)]
                 let doc_id = ids.first(doc).unwrap_or(0) as i64;
-                LexicalRank { score, doc_id }
+                if boundary.is_some_and(|(boundary_score, boundary_id)| {
+                    let order = f64::from(score).total_cmp(&boundary_score);
+                    order.is_gt() || (order.is_eq() && doc_id <= boundary_id)
+                }) {
+                    return None;
+                }
+                Some(LexicalRank { score, doc_id })
             }
         });
-    searcher.search(query, &(Count, collector))
+    let (count, ranked) = searcher.search(query, &(Count, collector))?;
+    // None sorts below every eligible rank. A short last page may retain some
+    // excluded documents in the bounded heap; never hydrate or return them.
+    Ok((
+        count,
+        ranked
+            .into_iter()
+            .filter_map(|(rank, address)| rank.map(|rank| (rank, address)))
+            .collect(),
+    ))
 }
 
 /// Execute a Tantivy search and assemble results with pagination, snippets,
@@ -427,13 +501,65 @@ pub fn execute_search(
     explain: bool,
     config: &ResponseConfig,
 ) -> SearchResults {
+    execute_search_page(
+        index,
+        query,
+        handles,
+        query_terms,
+        limit,
+        LexicalPagination::Offset(offset),
+        explain,
+        config,
+    )
+}
+
+/// Collect a planner page in score-descending, ID-ascending order. The cursor
+/// boundary is applied during collection, before top-K truncation, so page
+/// depth does not require retaining an ever-growing prefix of the corpus.
+#[cfg(feature = "tantivy-engine")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_search_with_cursor(
+    index: &Index,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    query_terms: &[String],
+    limit: usize,
+    cursor: Option<&crate::search_planner::SearchCursor>,
+    explain: bool,
+    config: &ResponseConfig,
+) -> SearchResults {
+    execute_search_page(
+        index,
+        query,
+        handles,
+        query_terms,
+        limit,
+        LexicalPagination::Cursor(cursor),
+        explain,
+        config,
+    )
+}
+
+#[cfg(feature = "tantivy-engine")]
+#[allow(clippy::too_many_arguments)]
+fn execute_search_page(
+    index: &Index,
+    query: &dyn Query,
+    handles: &FieldHandles,
+    query_terms: &[String],
+    limit: usize,
+    pagination: LexicalPagination<'_>,
+    explain: bool,
+    config: &ResponseConfig,
+) -> SearchResults {
     let start = Instant::now();
 
     let Ok(reader) = manual_index_reader(index) else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
     let searcher = reader.searcher();
-    let Ok((total_count, top_docs)) = collect_ranked_page(&searcher, query, handles, limit, offset)
+    let Ok((total_count, top_docs)) =
+        collect_ranked_page(&searcher, query, handles, limit, pagination)
     else {
         return SearchResults::empty(SearchMode::Lexical, start.elapsed());
     };
@@ -1400,6 +1526,166 @@ mod tests {
         }
 
         #[test]
+        fn cursor_pages_exhaust_tied_corpus_beyond_candidate_prefix() {
+            use crate::search_planner::SearchCursor;
+
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            // Reverse insertion order and independent segments must not affect
+            // the score/ID boundary, even after passing the old 64-hit prefix.
+            for segment in (0..3_u64).rev() {
+                for id in (segment * 32 + 1..=segment * 32 + 32).rev() {
+                    writer
+                        .add_document(doc!(
+                            handles.id => id,
+                            handles.doc_kind => "message",
+                            handles.body => "same matching text"
+                        ))
+                        .unwrap();
+                }
+                writer.commit().unwrap();
+            }
+            assert_eq!(
+                manual_index_reader(&index)
+                    .unwrap()
+                    .searcher()
+                    .segment_readers()
+                    .len(),
+                3
+            );
+
+            let config = ResponseConfig::default();
+            for limit in [1, 3, 7] {
+                let mut cursor = None;
+                let mut ids = Vec::new();
+                for _ in 0..=96 {
+                    let page = execute_search_with_cursor(
+                        &index,
+                        &AllQuery,
+                        &handles,
+                        &[],
+                        limit,
+                        cursor.as_ref(),
+                        true,
+                        &config,
+                    );
+                    assert_eq!(page.total_count, 96);
+                    assert_eq!(page.explain.as_ref().unwrap().hits.len(), page.hits.len());
+                    assert!(page.hits.len() <= limit);
+                    ids.extend(page.hits.iter().map(|hit| hit.doc_id));
+                    let Some(last) = page.hits.last() else { break };
+                    cursor = Some(SearchCursor {
+                        score: last.score,
+                        id: last.doc_id,
+                    });
+                }
+                assert_eq!(ids, (1..=96).collect::<Vec<_>>(), "page size {limit}");
+            }
+        }
+
+        #[test]
+        fn cursor_page_continues_after_deleted_boundary() {
+            use crate::search_planner::SearchCursor;
+
+            let (index, handles) = setup_index();
+            let config = ResponseConfig::default();
+            let first = execute_search_with_cursor(
+                &index,
+                &AllQuery,
+                &handles,
+                &[],
+                2,
+                None,
+                false,
+                &config,
+            );
+            assert_eq!(
+                first.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            let last = first.hits.last().unwrap();
+            let cursor = SearchCursor {
+                score: last.score,
+                id: last.doc_id,
+            };
+            let mut writer = index.writer::<TantivyDocument>(15_000_000).unwrap();
+            writer.delete_term(tantivy::Term::from_field_u64(handles.id, 2));
+            writer.commit().unwrap();
+
+            let next = execute_search_with_cursor(
+                &index,
+                &AllQuery,
+                &handles,
+                &[],
+                2,
+                Some(&cursor),
+                false,
+                &config,
+            );
+            assert_eq!(
+                next.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                vec![3]
+            );
+        }
+
+        #[test]
+        fn cursor_page_refreshes_boundary_score_after_corpus_growth() {
+            use crate::search_planner::SearchCursor;
+
+            let (schema, handles) = build_schema();
+            let index = Index::create_in_ram(schema);
+            register_tokenizer(&index);
+            let mut writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            for id in 1..=3_u64 {
+                writer
+                    .add_document(doc!(handles.id => id, handles.body => "needle shared"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            let query = QueryParser::for_index(&index, vec![handles.body])
+                .parse_query("needle")
+                .unwrap();
+            let config = ResponseConfig::default();
+            let first =
+                execute_search_with_cursor(&index, &*query, &handles, &[], 2, None, false, &config);
+            let last = first.hits.last().unwrap();
+            assert_eq!(last.doc_id, 2);
+            let cursor = SearchCursor {
+                score: last.score,
+                id: last.doc_id,
+            };
+            for id in 4..=20_u64 {
+                writer
+                    .add_document(doc!(handles.id => id, handles.body => "unrelated corpus growth"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+
+            let next = execute_search_with_cursor(
+                &index,
+                &*query,
+                &handles,
+                &[],
+                2,
+                Some(&cursor),
+                false,
+                &config,
+            );
+            assert_eq!(
+                next.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                vec![3]
+            );
+            assert_ne!(
+                next.hits[0].score.to_bits(),
+                cursor.score.to_bits(),
+                "fixture must change BM25 scores"
+            );
+        }
+
+        #[test]
         fn relevance_precedes_id_and_original_scores_are_preserved() {
             use tantivy::query::{BooleanQuery, Occur, TermQuery};
             use tantivy::schema::IndexRecordOption;
@@ -1439,6 +1725,30 @@ mod tests {
                 ids.push(hit.doc_id);
             }
             assert_eq!(ids, vec![1, 2, 3]);
+
+            let mut cursor = None;
+            let mut cursor_ids = Vec::new();
+            for _ in 0..4 {
+                let page = execute_search_with_cursor(
+                    &index,
+                    &query,
+                    &handles,
+                    &[],
+                    1,
+                    cursor.as_ref(),
+                    false,
+                    &config,
+                );
+                let Some(hit) = page.hits.first() else { break };
+                let id = u64::try_from(hit.doc_id).unwrap();
+                assert_eq!(hit.score.to_bits(), expected_scores[&id]);
+                cursor_ids.push(hit.doc_id);
+                cursor = Some(crate::search_planner::SearchCursor {
+                    score: hit.score,
+                    id: hit.doc_id,
+                });
+            }
+            assert_eq!(cursor_ids, vec![1, 2, 3]);
         }
 
         #[test]

@@ -4484,14 +4484,9 @@ pub async fn execute_search(
         && (pool.search_identity_path() != pool.sqlite_path()
             || lexical_index_is_foreign_to_pool(pool))
     {
-        let mut snapshot_query = query.clone();
-        snapshot_query.limit = Some(pagination_fetch_limit(
-            query,
-            lexical_candidate_limit(query),
-        ));
         let raw_results = match crate::search_v3::search_private_snapshot(
             &lexical_backfill_database_url(pool),
-            &snapshot_query,
+            query,
         ) {
             Ok(results) => results,
             Err(error) => return Outcome::Err(map_bridge_bootstrap_error(&error)),
@@ -4503,8 +4498,7 @@ pub async fn execute_search(
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             };
-        let raw_results = apply_cursor_window(raw_results, query);
-        let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+        let raw_results = trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
         let explain = query
             .explain
             .then(|| build_v3_query_explain(query, SearchEngine::Lexical, None));
@@ -4597,13 +4591,7 @@ pub async fn execute_search(
     // ── Tantivy-only fast path ──────────────────────────────────────
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
-        let mut lexical_query = query.clone();
-        lexical_query.limit = Some(pagination_fetch_limit(
-            query,
-            lexical_candidate_limit(query),
-        ));
-
-        let candidates = match try_tantivy_search(pool, &lexical_query) {
+        let candidates = match try_tantivy_search(pool, query) {
             Ok(results) => results,
             Err(error) => return Outcome::Err(error),
         };
@@ -4625,7 +4613,7 @@ pub async fn execute_search(
                         );
                         return Outcome::Err(err);
                     }
-                    match try_tantivy_search(pool, &lexical_query) {
+                    match try_tantivy_search(pool, query) {
                         Ok(Some(rerun_results)) => raw_results = rerun_results,
                         Ok(None) => {}
                         Err(error) => return Outcome::Err(error),
@@ -4641,8 +4629,8 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
-            let raw_results = apply_cursor_window(raw_results, query);
-            let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
+            let raw_results =
+                trim_search_results_to_limit(raw_results, lexical_candidate_limit(query));
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
             } else {
@@ -4728,6 +4716,10 @@ pub async fn execute_search(
         candidate_query.limit = Some(pagination_fetch_limit(query, legacy_candidate_limit(query)));
         let plan = derive_hybrid_execution_plan(cx, &candidate_query, engine);
         let mut lexical_query = candidate_query.clone();
+        // A hybrid cursor contains fused scores, not lexical BM25 scores.
+        // Candidate retrieval starts at the beginning; only the final fused
+        // ranking can apply that cursor.
+        lexical_query.cursor = None;
         lexical_query.limit = Some(pagination_fetch_limit(
             query,
             plan.derivation.budget.lexical_limit,

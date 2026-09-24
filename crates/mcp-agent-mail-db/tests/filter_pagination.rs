@@ -674,6 +674,68 @@ fn pagination_determinism() {
     assert_eq!(all_runs[0].len(), 8, "all 8 messages collected");
 }
 
+/// Keyset pagination must reach beyond the old fixed candidate prefix and use
+/// the same total order in collection, response construction, and continuation.
+#[test]
+fn pagination_exhausts_beyond_candidate_prefix_with_date_and_recency() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "pag-deep");
+    let aid = seed_agent(&pool, pid, "SilverOwl");
+    let mut ids = Vec::new();
+    for day in 0..80 {
+        let id = create_msg(
+            &pool,
+            pid,
+            aid,
+            "deepcursor matching text",
+            "deepcursor matching body",
+            "normal",
+            None,
+            false,
+        );
+        set_message_ts(&pool, id, BASE_TS + day * MICROS_PER_DAY);
+        ids.push(id);
+    }
+
+    for (ranking, date_filtered) in [
+        (RankingMode::Relevance, false),
+        (RankingMode::Relevance, true),
+        (RankingMode::Recency, true),
+    ] {
+        let mut query = SearchQuery::messages("deepcursor", pid);
+        query.limit = Some(3);
+        query.ranking = ranking;
+        if date_filtered {
+            query.time_range = TimeRange {
+                min_ts: Some(BASE_TS + 4 * MICROS_PER_DAY),
+                max_ts: Some(BASE_TS + 75 * MICROS_PER_DAY),
+            };
+        }
+        let mut collected = Vec::new();
+        for _ in 0..=80 {
+            let response = search(&pool, &query);
+            assert!(response.results.len() <= 3);
+            collected.extend(result_ids(&response));
+            query.cursor = response.next_cursor;
+            if query.cursor.is_none() {
+                break;
+            }
+        }
+        let mut expected = if date_filtered {
+            ids[4..=75].to_vec()
+        } else {
+            ids.clone()
+        };
+        if ranking == RankingMode::Recency {
+            expected.reverse();
+        }
+        assert_eq!(
+            collected, expected,
+            "ranking={ranking:?}, date_filtered={date_filtered}"
+        );
+    }
+}
+
 /// Test: last page has no `next_cursor`.
 #[test]
 fn pagination_last_page_no_cursor() {

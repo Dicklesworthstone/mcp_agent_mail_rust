@@ -25,7 +25,8 @@ use tantivy::{Index, IndexReader, ReloadPolicy, Term};
 use crate::DbConn;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::search_planner::{
-    Direction, DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
+    Direction, DocKind, Importance, SearchCursor, SearchQuery as PlannerQuery,
+    SearchResult as PlannerResult,
 };
 
 /// Bridge between the Tantivy search engine and the planner query/result types.
@@ -165,6 +166,7 @@ impl TantivyBridge {
 
         // Execute
         let limit = query.effective_limit();
+        let cursor = query.cursor.as_deref().and_then(SearchCursor::decode);
         let config = ResponseConfig::default();
         let mut fetch_limit = if importance_plan.needs_post_filter {
             limit.saturating_mul(4).max(limit).max(16)
@@ -174,13 +176,13 @@ impl TantivyBridge {
         let max_fetch_limit = limit.saturating_mul(16).max(fetch_limit).max(64);
 
         loop {
-            let results = lexical_response::execute_search(
+            let results = lexical_response::execute_search_with_cursor(
                 &self.index,
                 &*final_query,
                 &self.handles,
                 &terms,
                 fetch_limit,
-                0, // offset handled externally via cursor
+                cursor.as_ref(),
                 query.explain,
                 &config,
             );
@@ -2773,6 +2775,66 @@ mod tests {
                 r.score
             );
         }
+    }
+
+    #[test]
+    fn search_cursor_exhausts_scoped_date_filtered_corpus() {
+        use crate::search_planner::TimeRange;
+
+        let bridge = TantivyBridge::in_memory();
+        let handles = bridge.handles();
+        let mut writer = bridge
+            .index()
+            .writer_with_num_threads(1, 15_000_000)
+            .unwrap();
+        for id in (1..=120_u64).rev() {
+            writer
+                .add_document(doc!(
+                    handles.id => id,
+                    handles.doc_kind => "message",
+                    handles.project_id => 1_u64,
+                    handles.subject => "paginated matching text",
+                    handles.body => "paginated matching text",
+                    handles.created_ts => i64::try_from(id).unwrap()
+                ))
+                .unwrap();
+        }
+        // A duplicate numeric identity from another kind/project must neither
+        // enter the page nor replace its matching boundary during score refresh.
+        writer
+            .add_document(doc!(
+                handles.id => 7_u64,
+                handles.doc_kind => "agent",
+                handles.project_id => 2_u64,
+                handles.subject => "paginated matching text",
+                handles.body => "paginated matching text",
+                handles.created_ts => 7_i64
+            ))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let mut query = PlannerQuery::messages("paginated", 1);
+        query.time_range = TimeRange {
+            min_ts: Some(5),
+            max_ts: Some(110),
+        };
+        query.limit = Some(3);
+        let mut ids = Vec::new();
+        for _ in 0..=120 {
+            let page = bridge.search(&query);
+            assert!(page.len() <= 3);
+            assert!(page.iter().all(|hit| hit.project_id == Some(1)));
+            ids.extend(page.iter().map(|hit| hit.id));
+            let Some(last) = page.last() else { break };
+            query.cursor = Some(
+                SearchCursor {
+                    score: last.score.unwrap(),
+                    id: last.id,
+                }
+                .encode(),
+            );
+        }
+        assert_eq!(ids, (5..=110).collect::<Vec<_>>());
     }
 
     // -- Incremental indexing tests ----------------------------------------
