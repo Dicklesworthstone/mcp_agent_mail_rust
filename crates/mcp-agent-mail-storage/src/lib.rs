@@ -1141,6 +1141,12 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
                     }
                 }
             }
+            #[cfg(test)]
+            WBQ_AFTER_SALVAGE_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().take() {
+                    hook();
+                }
+            });
         }
         *slot = Some(rx);
         let prior_depth = wbq.op_depth.swap(salvaged_ops, Ordering::Relaxed);
@@ -1167,6 +1173,12 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
         );
     }
 
+    #[cfg(test)]
+    WBQ_BEFORE_DRAIN_SPAWN_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
     let receiver_slot = Arc::clone(&wbq.receiver_slot);
     let op_depth_worker = Arc::clone(&wbq.op_depth);
     let handle = std::thread::Builder::new()
@@ -1231,6 +1243,14 @@ fn wbq_reserve_enqueue(op_depth: &AtomicU64) {
 
 #[cfg(test)]
 std::thread_local! {
+    // Coordinate admission/restart at the actual accounting and salvage
+    // boundaries without sleeps or replacing the real queue/drain.
+    static WBQ_AFTER_RESERVE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static WBQ_AFTER_SALVAGE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static WBQ_BEFORE_DRAIN_SPAWN_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     // Pause only the calling producer after the real channel publication, so
     // tests can let the real drain finish before the enqueue call returns.
     static WBQ_AFTER_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -1241,11 +1261,32 @@ fn wbq_try_send_counted(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     msg: WbqMsg,
+    lifecycle: Option<&Mutex<()>>,
 ) -> std::result::Result<(), std::sync::mpsc::TrySendError<WbqMsg>> {
+    // Restart/shutdown own this mutex while replacing the receiver and its
+    // counters. Serialize only this nonblocking admission attempt: a reserve
+    // on the old sender must never be rolled back against replacement work,
+    // and no accepted op may arrive after the salvage pass has finished.
+    // Contention shares the bounded channel-full retry path; neither shutdown
+    // nor another producer can extend admission by holding us in a mutex wait.
+    let _admission = match lifecycle.map(Mutex::try_lock) {
+        Some(Ok(guard)) => Some(guard),
+        Some(Err(std::sync::TryLockError::Poisoned(error))) => Some(error.into_inner()),
+        Some(Err(std::sync::TryLockError::WouldBlock)) => {
+            return Err(std::sync::mpsc::TrySendError::Full(msg));
+        }
+        None => None,
+    };
     // Account for the op BEFORE the receiver can observe it. Incrementing
     // after try_send lets a fast drain subtract from zero; saturating counters
     // then strand a phantom queued op and eventually report a false stall.
     wbq_reserve_enqueue(op_depth);
+    #[cfg(test)]
+    WBQ_AFTER_RESERVE_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
     let result = sender.try_send(msg);
     let metrics = mcp_agent_mail_core::global_metrics();
     if result.is_ok() {
@@ -1276,10 +1317,20 @@ fn wbq_try_send_counted(
     result
 }
 
+#[cfg(any(test, fuzzing))]
 fn wbq_enqueue_with_sender(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     op: WriteOp,
+) -> WbqEnqueueResult {
+    wbq_enqueue_with_sender_admission(sender, op_depth, op, None)
+}
+
+fn wbq_enqueue_with_sender_admission(
+    sender: &std::sync::mpsc::SyncSender<WbqMsg>,
+    op_depth: &AtomicU64,
+    op: WriteOp,
+    lifecycle: Option<&Mutex<()>>,
 ) -> WbqEnqueueResult {
     let envelope = WbqOpEnvelope {
         enqueued_at: Instant::now(),
@@ -1287,7 +1338,7 @@ fn wbq_enqueue_with_sender(
     };
 
     let msg = WbqMsg::Op(envelope);
-    match wbq_try_send_counted(sender, op_depth, msg) {
+    match wbq_try_send_counted(sender, op_depth, msg, lifecycle) {
         Ok(()) => WbqEnqueueResult::Enqueued,
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
         Err(std::sync::mpsc::TrySendError::Full(msg)) => {
@@ -1305,7 +1356,7 @@ fn wbq_enqueue_with_sender(
             let mut backoff = Duration::from_millis(1);
             let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
             loop {
-                match wbq_try_send_counted(sender, op_depth, cur) {
+                match wbq_try_send_counted(sender, op_depth, cur, lifecycle) {
                     Ok(()) => break WbqEnqueueResult::Enqueued,
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         break WbqEnqueueResult::QueueUnavailable;
@@ -1329,6 +1380,7 @@ fn wbq_enqueue_with_sender(
     }
 }
 
+#[cfg(any(test, fuzzing))]
 fn wbq_enqueue_with_sender_and_pressure(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
@@ -1355,7 +1407,10 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
     let Some(sender) = wbq_sender_clone(wbq) else {
         return WbqEnqueueResult::QueueUnavailable;
     };
-    wbq_enqueue_with_sender_and_pressure(&sender, wbq.op_depth.as_ref(), op, disk_pressure)
+    if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return WbqEnqueueResult::SkippedDiskCritical;
+    }
+    wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(&wbq.lifecycle))
 }
 
 /// Execute a write op synchronously on the caller thread.
@@ -19500,6 +19555,213 @@ mod tests {
         if let Some(h) = handle {
             let _ = h.join();
         }
+    }
+
+    #[test]
+    fn wbq_restart_admission_is_atomic_with_salvage() {
+        const CHILD: &str = "AM_TEST_WBQ_RESTART_ADMISSION";
+        const COMPLETED: &str = "WBQ restart admission verified";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_restart_admission_is_atomic_with_salvage",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("STORAGE_ROOT", isolated.path())
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                .output()
+                .expect("isolated WBQ restart race");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        // A deadlock must fail this isolated test instead of hanging the suite.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(15));
+            eprintln!("WBQ restart admission watchdog expired");
+            std::process::exit(1);
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "restart-admission".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/restart-admission/agents/{agent}.signal"))
+        };
+        let finish_drain = |wbq: &WriteBehindQueue| {
+            let sender = wbq_sender_clone(wbq).expect("replacement sender");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline)
+                .expect("flush admission");
+            done_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("replacement must drain all admitted work");
+            wbq_send_control_with_deadline(&sender, WbqMsg::Shutdown, deadline)
+                .expect("shutdown admission");
+            let handle = wbq.drain_handle.lock().take().expect("drain handle");
+            handle.join().expect("bounded drain shutdown");
+            assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+            assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        };
+
+        // First race: an old-generation producer has reserved its depth but
+        // has not published the message when another caller starts salvage.
+        let wbq = Arc::new(new_write_behind_queue());
+        let (old_sender, old_receiver) = std::sync::mpsc::sync_channel(4);
+        *wbq.receiver_slot.lock().unwrap() = Some(old_receiver);
+        *wbq.sender.lock().unwrap() = Some(old_sender.clone());
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let producer_wbq = Arc::clone(&wbq);
+        let producer_sender = old_sender.clone();
+        let admitted_op = signal_op("GreenCastle");
+        let producer = std::thread::spawn(move || {
+            WBQ_AFTER_RESERVE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    reserved_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("resume reserved producer");
+                }));
+            });
+            wbq_enqueue_with_sender_admission(
+                &producer_sender,
+                producer_wbq.op_depth.as_ref(),
+                admitted_op,
+                Some(&producer_wbq.lifecycle),
+            )
+        });
+        reserved_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer must reserve before publication");
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(
+                wbq.lifecycle.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "restart must not replace accounting while an admission is unfinished"
+        );
+        let restart_wbq = Arc::clone(&wbq);
+        let (starting_tx, starting_rx) = std::sync::mpsc::sync_channel(1);
+        let restart = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            wbq_start_inner(&restart_wbq);
+        });
+        starting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        resume_tx.send(()).unwrap();
+        assert_eq!(producer.join().unwrap(), WbqEnqueueResult::Enqueued);
+        restart.join().expect("restart after completed admission");
+        finish_drain(&wbq);
+        assert!(signal_path("GreenCastle").is_file());
+
+        // Second race: salvage has copied the old channel, but has not dropped
+        // its receiver yet. A stale sender must never acknowledge new work in
+        // this gap: that work would miss salvage and be discarded on drop.
+        let wbq = Arc::new(new_write_behind_queue());
+        let (old_sender, old_receiver) = std::sync::mpsc::sync_channel(4);
+        *wbq.receiver_slot.lock().unwrap() = Some(old_receiver);
+        *wbq.sender.lock().unwrap() = Some(old_sender.clone());
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &old_sender,
+                wbq.op_depth.as_ref(),
+                signal_op("BronzeHare"),
+                Some(&wbq.lifecycle),
+            ),
+            WbqEnqueueResult::Enqueued
+        );
+        let (salvaged_tx, salvaged_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let (replaced_tx, replaced_rx) = std::sync::mpsc::sync_channel(1);
+        let (spawn_tx, spawn_rx) = std::sync::mpsc::sync_channel(1);
+        let restart_wbq = Arc::clone(&wbq);
+        let restart = std::thread::spawn(move || {
+            WBQ_AFTER_SALVAGE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    salvaged_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("resume completed salvage pass");
+                }));
+            });
+            WBQ_BEFORE_DRAIN_SPAWN_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    replaced_tx.send(()).unwrap();
+                    spawn_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("allow replacement drain to spawn");
+                }));
+            });
+            wbq_start_inner(&restart_wbq);
+        });
+        salvaged_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &old_sender,
+                wbq.op_depth.as_ref(),
+                signal_op("CobaltRobin"),
+                Some(&wbq.lifecycle),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+            "an old sender cannot publish behind the completed salvage pass"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "restart contention must respect the enqueue budget"
+        );
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 1);
+        resume_tx.send(()).unwrap();
+        replaced_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Keep the real replacement worker from dequeuing its salvaged op
+        // until the stale producer has completed its rejected admission.
+        let receiver_guard = wbq.receiver_slot.lock().unwrap();
+        spawn_tx.send(()).unwrap();
+        restart.join().expect("finish replacement generation");
+        // Even after restart, a stale sender's rejected attempt must balance
+        // its own accounting without subtracting salvaged replacement work.
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &old_sender,
+                wbq.op_depth.as_ref(),
+                signal_op("SilverFox"),
+                Some(&wbq.lifecycle),
+            ),
+            WbqEnqueueResult::QueueUnavailable
+        );
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 1);
+        drop(receiver_guard);
+        finish_drain(&wbq);
+        assert!(signal_path("BronzeHare").is_file());
+        assert!(!signal_path("CobaltRobin").exists());
+        assert!(!signal_path("SilverFox").exists());
+        assert_eq!(wbq_stats().enqueued, 2);
+        assert_eq!(wbq_stats().drained, 2);
+        let metrics = mcp_agent_mail_core::global_metrics();
+        assert_eq!(metrics.storage.wbq_respawn_salvaged_total.load(), 2);
+        assert_eq!(metrics.storage.wbq_respawn_lost_total.load(), 0);
+        println!("{COMPLETED}");
     }
 
     #[test]
