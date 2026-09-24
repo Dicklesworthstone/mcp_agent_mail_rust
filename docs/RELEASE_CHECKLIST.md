@@ -20,6 +20,13 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
 - [ ] Build both `am` and `mcp-agent-mail` for Linux x86_64 GNU, Linux aarch64
   GNU, Linux x86_64 musl, macOS aarch64, macOS x86_64, and Windows x86_64 MSVC.
   Retain native execution receipts; cross-compilation alone is not native proof.
+- [ ] Run the bounded black-box release smoke (br-kp1in.14, about 15 minutes) on
+  the exact packaged Linux x86_64 `am`, with the previous release as the
+  same-invocation control:
+  `AM_RELEASE_SMOKE_BIN=<candidate am> AM_RELEASE_SMOKE_CONTROL_BIN=<previous am> tests/e2e/test_release_smoke.sh`.
+  Attach `release_smoke_receipt.json` to the candidate record. Tag only when
+  `candidate_verdict` is `PASS` at the default (release) bounds and the
+  receipt's `server_exe_sha256` equals the candidate's SHA-256.
 - [ ] Update the changelog from verified commits and synchronize the version
   only after the candidate gates pass. Keep the gated sibling dependency revision.
 - [ ] Verify archive contents, checksums, `release-manifest.json`, signed
@@ -311,6 +318,8 @@ wc -l "${SOAK_TREND}"
    RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --locked --workspace --all-targets -- -D warnings
    RCH_REQUIRE_REMOTE=1 rch exec -- cargo nextest run --locked --workspace
    cargo fmt --check
+   AM_RELEASE_SMOKE_BIN=/path/to/candidate/am \
+     AM_RELEASE_SMOKE_CONTROL_BIN=/path/to/previous/am tests/e2e/test_release_smoke.sh
    am e2e run --project . dual_mode
    am e2e run --project . mode_matrix
    am e2e run --project . security_privacy
