@@ -418,6 +418,15 @@ pub async fn complete_system_user(
 
     // Conformance-test-only fixture mode (see block comment near EOF).
     if conformance_fixture_mode_enabled() {
+        // br-kp1in.21: tool responses do not surface the provider (byte-parity
+        // fixtures), so a stray switch must at least be loud in the logs.
+        static FIXTURE_WARNED: OnceLock<()> = OnceLock::new();
+        FIXTURE_WARNED.get_or_init(|| {
+            tracing::warn!(
+                "MCP_AGENT_MAIL_LLM_STUB is set: LLM-backed tools return canned conformance \
+                 fixture text, not model output. Unset it outside conformance/E2E tests."
+            );
+        });
         return Ok(LlmOutput {
             content: conformance_fixture_completion(system, user),
             model: resolved,
