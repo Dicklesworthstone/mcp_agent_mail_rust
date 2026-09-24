@@ -1292,7 +1292,10 @@ mod tests {
                 // These records pass the old integrity and typed-view checks.
                 // Without schema admission, their null filters authorize all
                 // of the agent's pre-cutoff leases under v1 semantics.
-                assert!(record_has_valid_intent_hash(&record, release_intent_hash_payload));
+                assert!(record_has_valid_intent_hash(
+                    &record,
+                    release_intent_hash_payload
+                ));
                 assert!(serde_json::from_value::<QueuedReleaseIntentView>(record.clone()).is_ok());
                 let path = append_jsonl(
                     &config,
@@ -1314,11 +1317,14 @@ mod tests {
     #[test]
     fn release_intent_reader_rejects_unsupported_replay_marker_schemas() {
         for version in unsupported_release_versions() {
-            for status in [REPLAY_STATUS_REPLAYED, REPLAY_STATUS_ABANDONED, REPLAY_STATUS_FAILED] {
+            for status in [
+                REPLAY_STATUS_REPLAYED,
+                REPLAY_STATUS_ABANDONED,
+                REPLAY_STATUS_FAILED,
+            ] {
                 let tmp = tempfile::tempdir().unwrap();
                 let config = test_config(tmp.path());
-                let (id, hash) =
-                    write_release_intent_fixture(&config, 1, Value::Null, json!([42]));
+                let (id, hash) = write_release_intent_fixture(&config, 1, Value::Null, json!([42]));
                 let mut marker = json!({
                     "kind": RELEASE_INTENT_REPLAY_KIND,
                     "intent_id": id,
@@ -1358,7 +1364,10 @@ mod tests {
             (Value::Null, Value::Null),
             (json!([]), Value::Null),
             (Value::Null, json!([])),
-            (json!(["literal,comma.rs", "src/{one,two}.rs"]), json!([1, 2])),
+            (
+                json!(["literal,comma.rs", "src/{one,two}.rs"]),
+                json!([1, 2]),
+            ),
         ];
         for (index, (paths, ids)) in filters.iter().enumerate() {
             write_release_intent_fixture(
@@ -1372,13 +1381,20 @@ mod tests {
         assert_eq!(queued.len(), filters.len());
         for (intent, (paths, ids)) in queued.iter().zip(&filters) {
             assert_eq!(serde_json::to_value(&intent.paths).unwrap(), *paths);
-            assert_eq!(serde_json::to_value(&intent.file_reservation_ids).unwrap(), *ids);
+            assert_eq!(
+                serde_json::to_value(&intent.file_reservation_ids).unwrap(),
+                *ids
+            );
         }
     }
 
     #[test]
     fn release_schema_admission_is_scoped_and_redacts_malformed_values() {
-        for record in [json!(null), json!({}), json!({"kind": "other", "schema_version": 99})] {
+        for record in [
+            json!(null),
+            json!({}),
+            json!({"kind": "other", "schema_version": 99}),
+        ] {
             ensure_supported_release_schema(&record).unwrap();
         }
         let error = ensure_supported_release_schema(&json!({
