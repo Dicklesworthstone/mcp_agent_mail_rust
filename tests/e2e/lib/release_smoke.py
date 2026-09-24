@@ -310,9 +310,19 @@ class Arm:
 # runner turns the checks into PASS | FAIL | NO_VERDICT.
 # ---------------------------------------------------------------------------
 
+# Tool responses echoed into check details can carry identity tokens; receipts
+# are attached to release records, so they never persist a token value.
+_TOKEN_VALUE = re.compile(r"""((?:registration|sender)_token['"]?\s*[:=]\s*['"]?)[^'",}\s]+""")
+
+
+def redact(text: str) -> str:
+    return _TOKEN_VALUE.sub(r"\1<redacted>", text)
+
+
 def check(checks: list, name: str, ok: bool, detail: object = "") -> bool:
-    checks.append({"name": name, "ok": bool(ok), "detail": str(detail)[:400]})
-    log(("PASS " if ok else "FAIL ") + name + (f" {str(detail)[:160]}" if not ok else ""))
+    detail = redact(str(detail))
+    checks.append({"name": name, "ok": bool(ok), "detail": detail[:400]})
+    log(("PASS " if ok else "FAIL ") + name + (f" {detail[:160]}" if not ok else ""))
     return ok
 
 
