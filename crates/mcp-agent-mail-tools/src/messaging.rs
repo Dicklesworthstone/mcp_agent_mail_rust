@@ -4924,6 +4924,17 @@ fn mcp_error_supports_ack_intent(error: &McpError) -> bool {
         })
 }
 
+/// The cause a queued ack intent records. The MCP error's message is generic
+/// ("A database error occurred ..."), so include the underlying error detail it
+/// carries; without it the queue cannot say why the database was unavailable.
+fn mcp_error_cause(error: &McpError) -> String {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data["error"]["data"]["error_detail"].as_str())
+        .map_or_else(|| error.to_string(), |detail| format!("{error}: {detail}"))
+}
+
 /// Build the `queued` response after persisting a durable ack intent.
 fn queued_ack_intent_response(
     config: &Config,
@@ -5146,7 +5157,7 @@ pub async fn acknowledge_message(
                 &agent_name,
                 message_id,
                 "get_db_pool",
-                &error.to_string(),
+                &mcp_error_cause(&error),
                 idempotency.as_ref(),
             );
         }
@@ -5160,7 +5171,7 @@ pub async fn acknowledge_message(
                 &agent_name,
                 message_id,
                 "resolve_project",
-                &error.to_string(),
+                &mcp_error_cause(&error),
                 idempotency.as_ref(),
             );
         }
@@ -5186,7 +5197,7 @@ pub async fn acknowledge_message(
                 &agent_name,
                 message_id,
                 "resolve_agent",
-                &error.to_string(),
+                &mcp_error_cause(&error),
                 idempotency.as_ref(),
             );
         }
@@ -5937,7 +5948,8 @@ mod tests {
                     for intent in &queued {
                         assert_eq!(intent.failure.stage, "resolve_project");
                         assert!(intent.failure.error_detail.contains(blocked_parent.to_str().unwrap()),
-                            "queued failure must be caused by the same filesystem obstruction");
+                            "queued failure must be caused by the same filesystem obstruction: {}",
+                            intent.failure.error_detail);
                         assert_eq!(
                             intent.idempotency,
                             Some(ack_retry_claim(&intent.agent_name, intent.message_id, KEY)),
