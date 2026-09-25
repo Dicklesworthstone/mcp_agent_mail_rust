@@ -94032,8 +94032,13 @@ fn seed_malformed_btree_db(db_path: &Path) {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text)
             .expect("open canonical db for malformed fixture");
         // Bulk-load enough sizable rows to force a multi-page table B-tree, so
-        // corrupting pages 2+ reliably reaches populated data pages.
+        // corrupting pages 2+ reliably reaches populated data pages. One
+        // transaction: 1,500 autocommit inserts each synced the rollback
+        // journal, ~55 s per fixture alone and past the 240 s kill under gate
+        // load (br-t31jg item 6).
         let filler = "x".repeat(600);
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .expect("begin malformed fixture bulk load");
         for i in 1..=1500i64 {
             conn.query_sync(
                 "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
@@ -94046,6 +94051,8 @@ fn seed_malformed_btree_db(db_path: &Path) {
             )
             .expect("insert filler row for malformed fixture");
         }
+        conn.execute_raw("COMMIT")
+            .expect("commit malformed fixture bulk load");
         conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("checkpoint malformed fixture db");
     }
