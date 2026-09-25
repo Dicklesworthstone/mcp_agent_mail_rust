@@ -2596,6 +2596,9 @@ effective_free_bytes={free}"
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
 
+        // br-ivw0d: a failed lookup is returned as the (retryable) database
+        // error it is. Treating it as "no recent contact, not approved" refused
+        // already-approved recipients with a misleading CONTACT_REQUIRED.
         let recent_ids = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
                 ctx.cx(),
@@ -2606,8 +2609,7 @@ effective_free_bytes={free}"
                 since_ts,
             )
             .await,
-        )
-        .unwrap_or_default();
+        )?;
         let recent_set: HashSet<i64> = recent_ids.into_iter().collect();
 
         let approved_ids = db_outcome_to_mcp_result(
@@ -2619,8 +2621,7 @@ effective_free_bytes={free}"
                 &candidate_ids,
             )
             .await,
-        )
-        .unwrap_or_default();
+        )?;
         let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
         let mut blocked: Vec<(String, String)> = Vec::new();
@@ -2729,8 +2730,7 @@ effective_free_bytes={free}"
                         &candidate_ids,
                     )
                     .await,
-                )
-                .unwrap_or_default();
+                )?;
                 let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
                 // Remove agents who are STILL blocked from the delivery lists.
@@ -3685,8 +3685,7 @@ effective_free_bytes={free}"
                 since_ts,
             )
             .await,
-        )
-        .unwrap_or_default();
+        )?;
         let recent_set: HashSet<i64> = recent_ids.into_iter().collect();
 
         let approved_ids = db_outcome_to_mcp_result(
@@ -3698,8 +3697,7 @@ effective_free_bytes={free}"
                 &candidate_ids,
             )
             .await,
-        )
-        .unwrap_or_default();
+        )?;
         let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
         let mut blocked: Vec<String> = Vec::new();
@@ -3788,8 +3786,7 @@ effective_free_bytes={free}"
                         &candidate_ids,
                     )
                     .await,
-                )
-                .unwrap_or_default();
+                )?;
                 let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
                 blocked.retain(|name| {
@@ -5753,6 +5750,144 @@ mod tests {
                             .as_array()
                             .map(Vec::len),
                         Some(2)
+                    );
+                });
+            },
+        );
+        Config::reset_cached();
+    }
+
+    /// br-ivw0d: when the approved-contact lookup fails, an already-approved
+    /// recipient must not be refused with `CONTACT_REQUIRED` ("request approval").
+    #[test]
+    fn contact_lookup_failure_is_not_reported_as_contact_required() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("contact lookup test tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs contact lookup context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_key = format!(
+                        "/data/projects/contact-lookup-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    crate::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure project");
+                    for name in ["BlueLake", "RedPeak"] {
+                        crate::register_agent(
+                            &ctx,
+                            project_key.clone(),
+                            "codex-cli".to_string(),
+                            "gpt-5".to_string(),
+                            Some(name.to_string()),
+                            Some("contact lookup".to_string()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("register agent");
+                    }
+                    crate::set_contact_policy(
+                        &ctx,
+                        project_key.clone(),
+                        "RedPeak".to_string(),
+                        "contacts_only".to_string(),
+                    )
+                    .await
+                    .expect("recipient requires approved contacts");
+                    crate::request_contact(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        "RedPeak".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("request contact");
+                    crate::respond_contact(
+                        &ctx,
+                        project_key.clone(),
+                        "RedPeak".to_string(),
+                        "BlueLake".to_string(),
+                        None,
+                        true,
+                        None,
+                    )
+                    .await
+                    .expect("approve contact");
+
+                    let send = |subject: &str| {
+                        send_message(
+                            &ctx,
+                            project_key.clone(),
+                            "BlueLake".to_string(),
+                            vec!["RedPeak".to_string()],
+                            subject.to_string(),
+                            "body".to_string(),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            None,
+                            Some(false),
+                            None,
+                            None,
+                            None,
+                            Some(false),
+                            None,
+                            None,
+                        )
+                    };
+                    // Positive control: the approved contact may send.
+                    send("approved contact").await.expect("approved send");
+
+                    // The approved-contact lookup now fails.
+                    let pool = get_db_pool().expect("get test pool");
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire test connection");
+                    conn.execute_raw("ALTER TABLE agent_links RENAME TO agent_links_hidden")
+                        .expect("hide approved contacts");
+                    drop(conn);
+                    drop(pool);
+
+                    let error = send("lookup failure")
+                        .await
+                        .expect_err("a failed contact lookup must fail the send");
+                    let rendered = format!("{error:?}");
+                    assert!(
+                        !rendered.contains("CONTACT_REQUIRED")
+                            && !rendered.contains("Contact approval required"),
+                        "lookup failure must not be reported as a policy refusal: {rendered}"
                     );
                 });
             },
