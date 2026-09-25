@@ -7018,18 +7018,26 @@ async fn get_agent_deregistered_at_in_tx(
 }
 
 /// Return the explicit deregistration timestamp for an agent, if present.
+///
+/// Every send and reply runs this for the sender and each recipient, so under
+/// concurrent writers it meets transient busy (including the WAL recovery
+/// fence, "recovery in progress"); it retries like the other idempotent reads
+/// instead of failing the whole send with `RESOURCE_BUSY` (br-fohxo).
 pub async fn get_agent_deregistered_at(
     cx: &Cx,
     pool: &DbPool,
     agent_id: i64,
 ) -> Outcome<Option<i64>, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    get_agent_deregistered_at_in_tx(cx, &tracked(&*conn), agent_id).await
+    run_read_with_mvcc_retry(cx, "get_agent_deregistered_at", || async {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        get_agent_deregistered_at_in_tx(cx, &tracked(&*conn), agent_id).await
+    })
+    .await
 }
 
 /// Return the ids of deregistered agents in one project.
@@ -20373,6 +20381,48 @@ mod tests {
 
         assert!(matches!(result, Outcome::Ok(3)));
         assert_eq!(attempts.get(), 3, "must restart the whole transaction body");
+    }
+
+    /// br-fohxo: the WAL recovery fence is transient busy for idempotent reads
+    /// (`get_agent_deregistered_at` on every send); a non-busy error is not.
+    #[test]
+    fn run_read_with_mvcc_retry_retries_the_recovery_fence_only() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let attempts = std::cell::Cell::new(0_u32);
+        let result = rt.block_on(async {
+            run_read_with_mvcc_retry(&cx, "test_recovery_fence", || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    if attempt < 3 {
+                        Outcome::Err(DbError::ResourceBusy(
+                            "Query error: database is busy (recovery in progress)".to_string(),
+                        ))
+                    } else {
+                        Outcome::Ok(attempt)
+                    }
+                }
+            })
+            .await
+        });
+        assert!(matches!(result, Outcome::Ok(3)));
+        assert_eq!(attempts.get(), 3);
+
+        let attempts = std::cell::Cell::new(0_u32);
+        let result: Outcome<u32, DbError> = rt.block_on(async {
+            run_read_with_mvcc_retry(&cx, "test_non_busy", || {
+                attempts.set(attempts.get() + 1);
+                async { Outcome::Err(DbError::Sqlite("no such table: agents".to_string())) }
+            })
+            .await
+        });
+        assert!(matches!(result, Outcome::Err(DbError::Sqlite(_))));
+        assert_eq!(attempts.get(), 1, "a non-busy error is returned at once");
     }
 
     #[test]
