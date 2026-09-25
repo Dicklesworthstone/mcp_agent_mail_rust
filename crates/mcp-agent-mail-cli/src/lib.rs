@@ -19493,10 +19493,31 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
         // another Agent Mail process already owns the mailbox" whenever a
         // server was up — the normal state — making first-class verbs
         // unusable. Local fallback still applies when no daemon is present.
-        if try_proxy_file_reservations_mutation(&action)? {
+        let payload = run_file_reservations_mutation(&action)?;
+        // GH#329: `--paths a.rs,b.rs` is first matched literally, because a
+        // comma can be part of a real file name. When that literal restriction
+        // matched nothing, retry once with the value split on top-level commas
+        // (glob braces/classes such as `src/{a,b}.rs` stay whole) so the
+        // natural comma-list form releases/renews what the caller meant
+        // instead of leaving every hold in place.
+        if file_reservations_mutation_matched_nothing(&action, &payload)
+            && let Some(split_action) = file_reservations_action_with_split_paths(&action)
+        {
+            if let FileReservationsCommand::Renew { paths, .. }
+            | FileReservationsCommand::Release { paths, .. } = &split_action
+            {
+                output::warn(&format!(
+                    "No reservation matched the literal --paths value(s); retrying with the \
+                     comma-separated parts: {}",
+                    paths.join(" ")
+                ));
+            }
+            let payload = run_file_reservations_mutation(&split_action)?;
+            emit_proxied_file_reservations_output(&split_action, &payload);
             return Ok(());
         }
-        return handle_file_reservations_mutation_locally(&action);
+        emit_proxied_file_reservations_output(&action, &payload);
+        return Ok(());
     }
 
     let config = Config::from_env();
@@ -19513,10 +19534,128 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
     result
 }
 
+/// Run one mutating reservation verb through a live daemon when one owns the
+/// mailbox, else through the local tool path, and return the tool payload.
+fn run_file_reservations_mutation(
+    action: &FileReservationsCommand,
+) -> CliResult<serde_json::Value> {
+    if let Some(payload) = try_proxy_file_reservations_mutation(action)? {
+        return Ok(payload);
+    }
+    handle_file_reservations_mutation_locally(action)
+}
+
+/// True when a path-restricted release/renew (not queued) acted on nothing.
+fn file_reservations_mutation_matched_nothing(
+    action: &FileReservationsCommand,
+    payload: &serde_json::Value,
+) -> bool {
+    match action {
+        FileReservationsCommand::Release { paths, .. } if !paths.is_empty() => {
+            let queued = payload.get("queued").and_then(serde_json::Value::as_bool) == Some(true)
+                || payload.get("status").and_then(serde_json::Value::as_str) == Some("queued");
+            !queued
+                && payload
+                    .get("released")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+                    == 0
+        }
+        FileReservationsCommand::Renew { paths, .. } if !paths.is_empty() => payload
+            .get("file_reservations")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        _ => false,
+    }
+}
+
+/// Split one `--paths` value on commas outside glob syntax: `{...}`
+/// alternations and `[...]` classes keep their commas. Segments are trimmed
+/// and empty segments dropped.
+fn split_reservation_path_on_top_level_commas(value: &str) -> Vec<String> {
+    let mut brace_depth = 0usize;
+    let mut in_class = false;
+    let mut start = 0usize;
+    let mut segments = Vec::new();
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '{' if !in_class => brace_depth += 1,
+            '}' if !in_class => brace_depth = brace_depth.saturating_sub(1),
+            ',' if !in_class && brace_depth == 0 => {
+                segments.push(&value[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&value[start..]);
+    segments
+        .into_iter()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same release/renew with every `--paths` value split on top-level
+/// commas, or `None` when splitting changes nothing (no retry is useful) or
+/// would leave no pattern at all (that must never widen into "every hold").
+fn file_reservations_action_with_split_paths(
+    action: &FileReservationsCommand,
+) -> Option<FileReservationsCommand> {
+    let split = |paths: &[String]| -> Option<Vec<String>> {
+        let mut changed = false;
+        let mut out = Vec::with_capacity(paths.len());
+        for value in paths {
+            let parts = split_reservation_path_on_top_level_commas(value);
+            // Only a top-level comma justifies a retry; whitespace alone is
+            // part of the literal value.
+            if parts.len() > 1 || (value.contains(',') && parts.first() != Some(value)) {
+                changed = true;
+            }
+            out.extend(parts);
+        }
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|path| seen.insert(path.clone()));
+        (changed && !out.is_empty() && out != paths).then_some(out)
+    };
+    match action {
+        FileReservationsCommand::Release {
+            project,
+            agent,
+            paths,
+            ids,
+        } => Some(FileReservationsCommand::Release {
+            project: project.clone(),
+            agent: agent.clone(),
+            paths: split(paths)?,
+            ids: ids.clone(),
+        }),
+        FileReservationsCommand::Renew {
+            project,
+            agent,
+            extend_seconds,
+            paths,
+            ids,
+        } => Some(FileReservationsCommand::Renew {
+            project: project.clone(),
+            agent: agent.clone(),
+            extend_seconds: *extend_seconds,
+            paths: split(paths)?,
+            ids: ids.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Use the same reservation transaction and archive path as MCP when no daemon
 /// owns the mailbox. Keep the exclusive CLI ownership guard through the entire
 /// operation; opening a second direct-SQL mutation path loses archive updates.
-fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -> CliResult<()> {
+fn handle_file_reservations_mutation_locally(
+    action: &FileReservationsCommand,
+) -> CliResult<serde_json::Value> {
     let config = Config::from_env();
     let _mailbox_mutation_locks =
         acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
@@ -19590,8 +19729,7 @@ fn handle_file_reservations_mutation_locally(action: &FileReservationsCommand) -
         };
         parse_tool_json_payload(tool, &result.map_err(mcp_error_to_cli_error)?)
     })?;
-    emit_proxied_file_reservations_output(action, &payload);
-    Ok(())
+    Ok(payload)
 }
 
 /// Make the provenance of a direct CLI reservation read explicit. A readable
@@ -19619,13 +19757,15 @@ fn emit_cli_reservation_read_attestation(attestation: &robot::ReservationReadAtt
 /// [`send_mail_envelope_via_server_or_local`] and the mutating `contacts`
 /// verbs proxy via [`try_proxy_contacts_mutation`] (#171, GH#185).
 ///
-/// Returns `Ok(true)` when the daemon handled the call (output already
-/// emitted), `Ok(false)` when no daemon owns the mailbox and the caller should
+/// Returns `Ok(Some(payload))` when the daemon handled the call (the caller
+/// renders it), `Ok(None)` when no daemon owns the mailbox and the caller should
 /// fall back to the local tool path. Returns `Err` when the daemon rejected
 /// the call in a way that disallows local fallback, or when a daemon owns the
 /// mailbox but its HTTP endpoint is unreachable (refusing a local mutation the
 /// owner would block anyway).
-fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> CliResult<bool> {
+fn try_proxy_file_reservations_mutation(
+    action: &FileReservationsCommand,
+) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
     let server_url = local_server_url(&server_config);
@@ -19633,7 +19773,7 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
 
     let Some((tool_name, command_label, arguments)) = file_reservations_proxy_request(action)
     else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let storage_root = server_config.storage_root.clone();
@@ -19650,12 +19790,7 @@ fn try_proxy_file_reservations_mutation(action: &FileReservationsCommand) -> Cli
         .await
     })?;
 
-    let Some(payload) = payload else {
-        return Ok(false);
-    };
-
-    emit_proxied_file_reservations_output(action, &payload);
-    Ok(true)
+    Ok(payload)
 }
 
 /// Translate a mutating reservation command into its MCP tool request.
@@ -19763,13 +19898,21 @@ fn emit_proxied_file_reservations_output(
                 ));
             }
         }
-        FileReservationsCommand::Renew { paths, ids, .. } => {
+        FileReservationsCommand::Renew {
+            project,
+            paths,
+            ids,
+            ..
+        } => {
             let rows = payload
                 .get("file_reservations")
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             output::success(&format!("Renewed {} reservation(s).", rows.len()));
+            if rows.is_empty() && !paths.is_empty() {
+                warn_path_restriction_matched_nothing("renewed", project, paths);
+            }
             // br-kp1in.24 / GH#329: name the requested ids that renewed nothing.
             if paths.is_empty() && !ids.is_empty() {
                 let renewed: std::collections::BTreeSet<i64> = rows
@@ -19854,6 +19997,9 @@ fn emit_proxied_file_reservations_output(
                     "Released {released} reservation(s) for {agent} in {project}."
                 )),
             }
+            if released == 0 && !paths.is_empty() {
+                warn_path_restriction_matched_nothing("released", project, paths);
+            }
             // br-kp1in.24 / GH#329: an explicit id that released nothing must
             // not pass silently; the caller would believe the lease is gone.
             let requested_ids = ids
@@ -19888,6 +20034,19 @@ fn emit_proxied_file_reservations_output(
         }
         _ => {}
     }
+}
+
+/// GH#329: a path-restricted release/renew that acted on nothing must not look
+/// like success. The exit status stays 0 (a repeated release is an idempotent
+/// no-op), but stderr names the patterns so a caller that mistyped one, and
+/// still holds the lease, can tell.
+fn warn_path_restriction_matched_nothing(verb: &str, project: &str, paths: &[String]) {
+    output::warn(&format!(
+        "Nothing was {verb}: no active reservation held by this agent matched --paths {}. \
+         If these were already released this is expected; otherwise check the patterns \
+         with `am file_reservations list {project}`.",
+        paths.join(" ")
+    ));
 }
 
 fn active_reservation_predicate_sql(table_ref: &str) -> String {
@@ -70131,6 +70290,233 @@ startup_timeout_sec = 42
         let output = renew(vec![1]);
         assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
         assert!(!output.contains("renewed nothing"), "{output}");
+    }
+
+    #[test]
+    fn split_reservation_path_on_top_level_commas_keeps_glob_syntax_whole() {
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/a.rs,src/b.rs"),
+            ["src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas(" src/a.rs , ,src/b.rs,"),
+            ["src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/{a,b}.rs,lib/{x,{y,z}}/*.rs"),
+            ["src/{a,b}.rs", "lib/{x,{y,z}}/*.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/[a,b].rs,c.rs"),
+            ["src/[a,b].rs", "c.rs"]
+        );
+        assert_eq!(
+            split_reservation_path_on_top_level_commas("src/{a,b}.rs"),
+            ["src/{a,b}.rs"]
+        );
+    }
+
+    #[test]
+    fn file_reservations_split_paths_retry_only_when_it_changes_the_restriction() {
+        let release = |paths: &[&str]| FileReservationsCommand::Release {
+            project: "p".to_string(),
+            agent: "BlueLake".to_string(),
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            ids: vec![],
+        };
+        // No top-level comma: nothing to retry.
+        assert!(file_reservations_action_with_split_paths(&release(&["src/{a,b}.rs"])).is_none());
+        assert!(file_reservations_action_with_split_paths(&release(&[])).is_none());
+        // Whitespace alone is literal data, not a list.
+        assert!(file_reservations_action_with_split_paths(&release(&[" spaced.rs "])).is_none());
+        // Only separators: splitting must never widen into an unrestricted release.
+        assert!(file_reservations_action_with_split_paths(&release(&[",", " , "])).is_none());
+        match file_reservations_action_with_split_paths(&release(&["a.rs,b.rs", "b.rs"])) {
+            Some(FileReservationsCommand::Release { paths, .. }) => {
+                assert_eq!(paths, ["a.rs", "b.rs"]);
+            }
+            other => panic!("expected split release, got {other:?}"),
+        }
+        let renew = FileReservationsCommand::Renew {
+            project: "p".to_string(),
+            agent: "BlueLake".to_string(),
+            extend_seconds: 600,
+            paths: vec!["a.rs,b.rs".to_string()],
+            ids: vec![7],
+        };
+        match file_reservations_action_with_split_paths(&renew) {
+            Some(FileReservationsCommand::Renew {
+                paths,
+                ids,
+                extend_seconds,
+                ..
+            }) => {
+                assert_eq!(paths, ["a.rs", "b.rs"]);
+                assert_eq!(ids, [7]);
+                assert_eq!(extend_seconds, 600);
+            }
+            other => panic!("expected split renew, got {other:?}"),
+        }
+    }
+
+    fn fixture_blue_lake_active_reservations(db_path: &Path) -> i64 {
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.query_sync(
+            "SELECT COUNT(*) AS n FROM file_reservations \
+             WHERE project_id = 1 AND agent_id = 1 AND released_ts IS NULL",
+            &[],
+        )
+        .unwrap()
+        .first()
+        .and_then(|row| row.get_named("n").ok())
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn integration_file_reservations_comma_list_paths_release_and_renew_what_was_meant() {
+        // GH#329: `--paths "a,b"` was matched as ONE literal pattern, printed
+        // "Released 0", and left every hold in place.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Renew: the literal value matches nothing, the split parts renew id 1.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        drop(seed_acks_and_reservations_db(&db_path));
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 600,
+                paths: vec!["docs/not-held.md, src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        assert!(result.is_ok(), "comma-list renew failed: {result:?}");
+        assert!(output.contains("Renewed 1 reservation(s)"), "{output}");
+        assert!(
+            output.contains("retrying with the comma-separated parts"),
+            "{output}"
+        );
+
+        // Release: same shape, and the hold is really gone afterwards.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["docs/not-held.md,src/api/*.rs".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "comma-list release failed: {result:?}");
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(!output.contains("Nothing was released"), "{output}");
+        assert_eq!(fixture_blue_lake_active_reservations(&db_path), 0);
+    }
+
+    #[test]
+    fn integration_file_reservations_literal_comma_path_is_matched_first() {
+        // A comma can be part of a real file name; the literal value wins and
+        // no split retry happens when it matches.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "UPDATE file_reservations SET path_pattern = ? WHERE id = 1",
+            &[sqlmodel_core::Value::Text("docs/a,b.md".to_string())],
+        )
+        .unwrap();
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["docs/a,b.md".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "literal comma release failed: {result:?}");
+        assert!(output.contains("Released 1 reservation(s)"), "{output}");
+        assert!(!output.contains("retrying"), "{output}");
+        assert_eq!(fixture_blue_lake_active_reservations(&db_path), 0);
+    }
+
+    #[test]
+    fn integration_file_reservations_path_restriction_matching_nothing_warns_and_exits_ok() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        drop(seed_acks_and_reservations_db(&db_path));
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let release = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Release {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                paths: vec!["docs/not-held.md".to_string()],
+                ids: vec![],
+            },
+        );
+        let renew = run_file_reservations_mutation_in_fixture(
+            &db_path,
+            FileReservationsCommand::Renew {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                extend_seconds: 600,
+                paths: vec!["docs/not-held.md".to_string()],
+                ids: vec![],
+            },
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        // Idempotent no-op contract: success exit, "Released 0" kept ...
+        assert!(release.is_ok() && renew.is_ok(), "{release:?} {renew:?}");
+        assert!(output.contains("Released 0 reservation(s)"), "{output}");
+        // ... but the restriction that matched nothing is named.
+        assert!(
+            output.contains("Nothing was released")
+                && output.contains("Nothing was renewed")
+                && output.contains("--paths docs/not-held.md"),
+            "{output}"
+        );
+        assert!(!output.contains("retrying"), "{output}");
+        assert_eq!(fixture_blue_lake_active_reservations(&db_path), 1);
+
+        // An unrestricted release that finds nothing stays quiet.
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        for _ in 0..2 {
+            let result = run_file_reservations_mutation_in_fixture(
+                &db_path,
+                FileReservationsCommand::Release {
+                    project: "test-proj".to_string(),
+                    agent: "BlueLake".to_string(),
+                    paths: vec![],
+                    ids: vec![],
+                },
+            );
+            assert!(result.is_ok(), "{result:?}");
+        }
+        let output = capture.drain_to_string();
+        assert!(output.contains("Released 0 reservation(s)"), "{output}");
+        assert!(!output.contains("Nothing was released"), "{output}");
     }
 
     #[test]

@@ -1,16 +1,12 @@
 name: Reservation restriction regressions
 
+# Disabled: this project does not build or gate through GitHub Actions (builds
+# and release gates run locally via rch/dsr), and PR #331 is not merged. The
+# push trigger is removed so no push to main runs this job; the same
+# regressions run locally with:
+#   cargo test -p mcp-agent-mail-cli --lib file_reservations
+#   cargo test -p mcp-agent-mail-cli --test it file_reservations_argument_compat::
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/reservation-restrictions.yml'
-      - 'crates/mcp-agent-mail-cli/src/lib.rs'
-      - 'crates/mcp-agent-mail-cli/tests/file_reservations_argument_compat.rs'
-      - 'crates/mcp-agent-mail-tools/src/reservations.rs'
-      - 'crates/mcp-agent-mail-tools/src/degraded_intents.rs'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
   workflow_dispatch:
 
 permissions:
