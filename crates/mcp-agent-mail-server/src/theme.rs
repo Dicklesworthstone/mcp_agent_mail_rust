@@ -30,29 +30,11 @@ pub fn parse_console_theme(value: &str) -> ThemeId {
     }
 }
 
-/// Initialize the console theme from the `CONSOLE_THEME` environment variable.
+/// Initialize the console theme from the already-parsed config value
+/// (`CONSOLE_THEME`, which `Config` may load from the persisted user envfile).
 ///
-/// Call this early in server startup (before any banner/HUD rendering) when
-/// rich console output is active (`LOG_RICH_ENABLED=true` + TTY).
-///
-/// Returns the resolved [`ThemeId`].
-#[must_use]
-pub fn init_console_theme() -> ThemeId {
-    let value = std::env::var("CONSOLE_THEME").unwrap_or_default();
-    let id = if value.is_empty() {
-        ThemeId::CyberpunkAurora
-    } else {
-        parse_console_theme(&value)
-    };
-    theme::set_theme(id);
-    id
-}
-
-/// Initialize the console theme from the already-parsed config value.
-///
-/// This is the preferred server integration path because `Config` may load
-/// console settings from the persisted user envfile (and those values are not
-/// guaranteed to exist in the process environment).
+/// Call this early (before any banner/HUD rendering) when rich console output
+/// is active. Returns the resolved [`ThemeId`].
 #[must_use]
 pub fn init_console_theme_from_config(theme_id: ConsoleThemeId) -> ThemeId {
     let id = match theme_id {
@@ -363,8 +345,6 @@ mod tests {
     fn init_console_theme_sets_default() {
         // With no env var set, should default to CyberpunkAurora
         let _guard = ScopedThemeLock::new(ThemeId::HighContrast); // start at different theme
-        // init_console_theme reads env, but CONSOLE_THEME is likely unset in test env
-        // Just verify parse logic works
         let id = parse_console_theme("");
         assert_eq!(id, ThemeId::CyberpunkAurora);
     }

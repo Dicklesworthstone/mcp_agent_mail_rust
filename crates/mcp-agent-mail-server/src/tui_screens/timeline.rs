@@ -27,9 +27,8 @@ use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{EventSeverity, EventSource, MailEvent, MailEventKind, VerbosityTier};
 use crate::tui_layout::{DockLayout, DockPosition, DockPreset};
 use crate::tui_persist::{
-    PreferencePersister, ScreenFilterPresetStore, TuiPreferences,
-    console_persist_path_from_env_or_default, load_screen_filter_presets_or_default,
-    save_screen_filter_presets, screen_filter_presets_path,
+    PreferencePersister, ScreenFilterPresetStore, TuiPreferences, configured_console_persist_path,
+    load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
 use crate::tui_screens::{
     DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg, SelectionState,
@@ -737,7 +736,7 @@ impl TimelineScreen {
         filter_presets_path_override: Option<PathBuf>,
     ) -> Self {
         let filter_presets_path = filter_presets_path_override.unwrap_or_else(|| {
-            let console_path = console_persist_path_from_env_or_default();
+            let console_path = configured_console_persist_path();
             screen_filter_presets_path(&console_path)
         });
         let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);

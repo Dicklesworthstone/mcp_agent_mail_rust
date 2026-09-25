@@ -638,10 +638,6 @@ impl ToastSeverityThreshold {
         }
     }
 
-    fn from_env() -> Self {
-        Self::parse(&std::env::var("AM_TUI_TOAST_SEVERITY").unwrap_or_default())
-    }
-
     fn from_config(config: &mcp_agent_mail_core::Config) -> Self {
         if config.tui_toast_enabled {
             Self::parse(config.tui_toast_severity.as_str())
@@ -722,30 +718,6 @@ fn sanitize_filename_component(value: &str) -> String {
     }
 
     out.trim_matches('_').to_string()
-}
-
-fn resolve_export_dir_from_sources(
-    env_export_dir: Option<&str>,
-    home_dir: Option<&Path>,
-) -> PathBuf {
-    if let Some(path) = env_export_dir.map(str::trim).filter(|v| !v.is_empty()) {
-        return PathBuf::from(path);
-    }
-    // Backward compat: use legacy path if it already exists on disk.
-    if let Some(home) = home_dir {
-        let legacy = home.join(".mcp_agent_mail");
-        if legacy.exists() {
-            return legacy.join("exports");
-        }
-    }
-    // XDG data dir for new installations.
-    if let Some(data) = dirs::data_dir() {
-        return data.join("mcp-agent-mail").join("exports");
-    }
-    if let Some(home) = home_dir {
-        return home.join(".mcp_agent_mail").join("exports");
-    }
-    PathBuf::from(".mcp_agent_mail").join("exports")
 }
 
 fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
@@ -1697,7 +1669,8 @@ impl MailAppModel {
             macro_engine: MacroEngine::new(),
             reservation_tracker: HashMap::new(),
             warned_reservations: HashSet::new(),
-            toast_severity: ToastSeverityThreshold::from_env(),
+            // `with_config` applies AM_TUI_TOAST_SEVERITY via Config.
+            toast_severity: ToastSeverityThreshold::Info,
             toast_muted: false,
             git_segfault_toast_enabled: true,
             git_segfault_retry_toasts: GitSegfaultRetryToastState::default(),
@@ -2402,12 +2375,6 @@ impl MailAppModel {
         }
     }
 
-    fn resolve_export_dir() -> PathBuf {
-        let env_export = std::env::var("AM_EXPORT_DIR").ok();
-        let home = dirs::home_dir();
-        resolve_export_dir_from_sources(env_export.as_deref(), home.as_deref())
-    }
-
     fn export_snapshot_to_dir(
         &self,
         format: ExportFormat,
@@ -2439,7 +2406,7 @@ impl MailAppModel {
     }
 
     fn export_current_snapshot(&mut self, format: ExportFormat) {
-        let export_dir = Self::resolve_export_dir();
+        let export_dir = self.state.export_dir().to_path_buf();
         match self.export_snapshot_to_dir(format, &export_dir) {
             Ok(path) => {
                 self.notifications.notify(
@@ -8803,20 +8770,52 @@ mod tests {
     }
 
     #[test]
-    fn resolve_export_dir_prefers_env_and_falls_back_to_xdg() {
-        let home = PathBuf::from("/tmp/fake-home");
-        let from_env =
-            resolve_export_dir_from_sources(Some("/tmp/custom-export"), Some(home.as_path()));
-        assert_eq!(from_env, PathBuf::from("/tmp/custom-export"));
+    fn export_current_snapshot_writes_into_the_configured_export_dir() {
+        // AM_EXPORT_DIR is parsed once by Config (env, .env, console persist
+        // file); the export action must use that value, per model, rather than
+        // a process-global source that two differently configured models share.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_for = |dir: &Path| {
+            let config = Config {
+                export_dir: dir.to_path_buf(),
+                ..Config::default()
+            };
+            let model = MailAppModel::new(TuiSharedState::new(&config));
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(80, 24, &mut pool);
+            model.view(&mut frame);
+            model
+        };
+        let dir_a = tmp.path().join("exports-a");
+        let dir_b = tmp.path().join("exports-b");
+        let mut model_a = model_for(&dir_a);
+        let mut model_b = model_for(&dir_b);
 
-        // With a non-existent home, it should fall back to the XDG data dir
-        // (if available) or ultimately fall back to the legacy path.
-        let from_home = resolve_export_dir_from_sources(None, Some(home.as_path()));
-        if let Some(data) = dirs::data_dir() {
-            assert_eq!(from_home, data.join("mcp-agent-mail").join("exports"));
-        } else {
-            assert_eq!(from_home, home.join(".mcp_agent_mail").join("exports"));
-        }
+        model_a.export_current_snapshot(ExportFormat::Text);
+        model_b.export_current_snapshot(ExportFormat::Html);
+
+        let names = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let in_a = names(&dir_a);
+        let in_b = names(&dir_b);
+        assert_eq!(in_a.len(), 1, "model A exports into its own dir: {in_a:?}");
+        assert_eq!(in_b.len(), 1, "model B exports into its own dir: {in_b:?}");
+        let extension = |name: &str| {
+            Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_owned)
+        };
+        assert_eq!(extension(&in_a[0]).as_deref(), Some("txt"), "{in_a:?}");
+        assert_eq!(extension(&in_b[0]).as_deref(), Some("html"), "{in_b:?}");
     }
 
     #[test]

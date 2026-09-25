@@ -44,10 +44,6 @@ const MAINTENANCE_EVIDENCE_DIR_NAME: &str = "agent-mail-maintenance";
 const MAINTENANCE_EVIDENCE_ARCHIVE_DIR_NAME: &str = "archive";
 const COMPLETED_EVIDENCE_KEEP_COUNT: usize = 20;
 const COMPLETED_EVIDENCE_KEEP_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-/// Mirrors the `Config` default for `archive_maintenance_interval_secs`; the
-/// unowned-lock reap threshold must be derivable without a `Config` because
-/// `run_maintenance` is also invoked from the CLI with only a git dir.
-const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 1800;
 const UNOWNED_LOCK_REAP_ENV: &str = "AM_ARCHIVE_MAINTENANCE_REAP_UNOWNED_LOCK";
 const PLAN_TOP_LIMIT: usize = 8;
 const LOOSE_OBJECTS_WATCH_AT: u64 = 1_000;
@@ -923,15 +919,13 @@ fn unowned_lock_reap_enabled() -> bool {
 /// Age beyond which a lock with no PID evidence is considered abandoned: one
 /// full maintenance interval plus the command timeout. Any legitimately held
 /// lock from a live run must have been refreshed or released within that
-/// window. Reads `AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS` directly because this
-/// path (via the CLI) may run without a `Config`.
+/// window. `run_maintenance` is also invoked from the CLI with only a git dir,
+/// so the interval comes from the process `Config` (one parse, one clamp:
+/// `AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS` is bounded to 60..=86400 there).
 fn unowned_lock_reap_threshold_secs() -> u64 {
-    let interval = std::env::var("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_SECS)
-        .max(MIN_INTERVAL_SECS);
-    interval.saturating_add(MAINTENANCE_COMMAND_TIMEOUT_SECS)
+    mcp_agent_mail_core::Config::get()
+        .archive_maintenance_interval_secs
+        .saturating_add(MAINTENANCE_COMMAND_TIMEOUT_SECS)
 }
 
 #[derive(Debug)]

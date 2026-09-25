@@ -151,10 +151,10 @@ fn theme_default_tree_guides() -> TreeGuides {
     }
 }
 
-fn thread_tree_guides() -> TreeGuides {
-    std::env::var("AM_TUI_THREAD_GUIDES")
-        .ok()
-        .as_deref()
+/// Resolve the configured guide style (`Config::tui_thread_guides`, parsed
+/// once from `AM_TUI_THREAD_GUIDES`) or fall back to the theme default.
+fn thread_tree_guides(configured: Option<&str>) -> TreeGuides {
+    configured
         .and_then(parse_tree_guides)
         .unwrap_or_else(theme_default_tree_guides)
 }
@@ -1848,6 +1848,7 @@ impl MailScreen for ThreadExplorerScreen {
         if area.height < 4 || area.width < 20 {
             return;
         }
+        let guides = thread_tree_guides(state.thread_tree_guides());
 
         // Avoid unconditional full-screen wipes here: filter/list/detail panes
         // repaint their own bounds, which keeps steady-state redraw cost lower
@@ -1984,6 +1985,7 @@ impl MailScreen for ThreadExplorerScreen {
                     self.total_thread_messages,
                     matches!(self.focus, Focus::DetailPanel),
                     self.detail_tree_focus,
+                    guides,
                     &self.last_detail_max_scroll,
                 );
             }
@@ -2072,6 +2074,7 @@ impl MailScreen for ThreadExplorerScreen {
                     self.total_thread_messages,
                     matches!(self.focus, Focus::DetailPanel),
                     self.detail_tree_focus,
+                    guides,
                     &self.last_detail_max_scroll,
                 );
             }
@@ -2140,6 +2143,7 @@ impl MailScreen for ThreadExplorerScreen {
                             self.total_thread_messages,
                             true,
                             self.detail_tree_focus,
+                            guides,
                             &self.last_detail_max_scroll,
                         );
                     }
@@ -3374,6 +3378,7 @@ fn render_thread_detail(
     total_thread_messages: usize,
     focused: bool,
     tree_focus: bool,
+    guides: TreeGuides,
     max_scroll_cell: &std::cell::Cell<usize>,
 ) {
     let title = thread.map_or_else(
@@ -3698,7 +3703,6 @@ fn render_thread_detail(
             tree_area.height.saturating_sub(tree_header_h),
         );
         if tree_inner.width > 0 && tree_inner.height > 0 {
-            let guides = thread_tree_guides();
             let indent_token = tree_indent_token(guides);
             let marker_len = crate::tui_theme::SELECTION_PREFIX.chars().count();
             let max_depth = usize::from(tree_inner.width / 3).saturating_sub(1).max(1);
@@ -5432,6 +5436,7 @@ mod tests {
             12,
             false,
             true,
+            thread_tree_guides(None),
             &last_detail_max_scroll,
         );
 
@@ -5479,6 +5484,7 @@ mod tests {
             2,
             true,
             true,
+            thread_tree_guides(None),
             &last_detail_max_scroll,
         );
 
@@ -6079,6 +6085,49 @@ mod tests {
         assert_eq!(parse_tree_guides("nope"), None);
     }
 
+    #[test]
+    fn configured_thread_guides_drive_the_rendered_tree_indent() {
+        // Pin a non-high-contrast theme so the unset case falls back to Rounded.
+        let _theme =
+            ftui_extras::theme::ScopedThemeLock::new(ftui_extras::theme::ThemeId::LumenLight);
+        let render = |guides: Option<&str>| {
+            let mut screen = ThreadExplorerScreen::new();
+            screen.threads.push(make_thread("guides-thread", 3, 1));
+            let root = make_message(1);
+            let mut child = make_message(2);
+            child.reply_to_id = Some(1);
+            let mut grandchild = make_message(3);
+            grandchild.reply_to_id = Some(2);
+            screen.detail_messages = vec![root, child, grandchild];
+            screen.loaded_thread_id = "guides-thread".to_string();
+            let config = mcp_agent_mail_core::Config {
+                tui_thread_guides: guides.map(str::to_string),
+                ..mcp_agent_mail_core::Config::default()
+            };
+            let state = TuiSharedState::new(&config);
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(160, 40, &mut pool);
+            screen.view(&mut frame, Rect::new(0, 0, 160, 40), &state);
+            buffer_to_text(&frame.buffer)
+        };
+
+        let bold = render(Some("bold"));
+        assert!(
+            bold.contains("▪ "),
+            "AM_TUI_THREAD_GUIDES=bold must render bold indent guides:\n{bold}"
+        );
+        let unset = render(None);
+        assert!(
+            !unset.contains('▪'),
+            "unset guides must fall back to the theme default, not bold:\n{unset}"
+        );
+        let double = render(Some("double"));
+        assert!(
+            double.contains("• ") && !double.contains('▪'),
+            "AM_TUI_THREAD_GUIDES=double must render double indent guides:\n{double}"
+        );
+    }
+
     fn make_message(id: i64) -> ThreadMessage {
         ThreadMessage {
             id,
@@ -6568,6 +6617,7 @@ mod tests {
             1,
             true,
             false,
+            thread_tree_guides(None),
             &last_detail_max_scroll,
         );
 

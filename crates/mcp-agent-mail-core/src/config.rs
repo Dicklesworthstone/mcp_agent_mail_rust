@@ -326,7 +326,6 @@ pub struct Config {
 
     // Database
     pub database_url: String,
-    pub database_echo: bool,
     pub database_pool_size: Option<usize>,
     pub database_max_overflow: Option<usize>,
     pub database_pool_timeout: Option<u64>,
@@ -388,7 +387,6 @@ pub struct Config {
     // Ephemeral isolation
     pub ephemeral_mode: crate::ephemeral::EphemeralMode,
     pub ephemeral_root: Option<std::path::PathBuf>,
-    pub ephemeral_ttl_hours: u64,
 
     // Disk space monitoring
     pub disk_space_monitor_enabled: bool,
@@ -451,9 +449,6 @@ pub struct Config {
     pub http_bearer_token: Option<String>,
     pub http_allow_localhost_unauthenticated: bool,
     pub http_request_log_enabled: bool,
-    pub http_otel_enabled: bool,
-    pub http_otel_service_name: String,
-    pub http_otel_exporter_otlp_endpoint: String,
 
     // HTTP Supervisor tuning (server-side)
     /// Max simultaneous connections the listener accepts (default 4096).
@@ -572,7 +567,6 @@ pub struct Config {
     pub llm_default_model: String,
     pub llm_temperature: f64,
     pub llm_max_tokens: u32,
-    pub llm_cost_logging_enabled: bool,
 
     // Notifications
     pub notifications_enabled: bool,
@@ -629,7 +623,6 @@ pub struct Config {
     pub log_rich_enabled: bool,
     pub log_tool_calls_enabled: bool,
     pub log_tool_calls_result_max_chars: usize,
-    pub log_include_trace: bool,
     pub log_json_enabled: bool,
 
     // Console / TUI layout + persistence
@@ -660,7 +653,9 @@ pub struct Config {
     pub tui_ambient: String,
     pub tui_debug: bool,
     pub export_dir: PathBuf,
-    pub tui_tree_style: String,
+    /// Thread tree guide style (`AM_TUI_THREAD_GUIDES`: ascii, unicode, bold,
+    /// double, rounded). `None` lets the active theme choose.
+    pub tui_thread_guides: Option<String>,
     pub tui_theme: String,
     pub tui_toast_enabled: bool,
     pub tui_toast_severity: String,
@@ -1575,7 +1570,6 @@ impl Default for Config {
             // This sentinel value is replaced in `from_env()` with a path
             // derived from `storage_root` when no explicit DATABASE_URL is set.
             database_url: DEFAULT_LEGACY_DATABASE_URL.to_string(),
-            database_echo: false,
             database_pool_size: None,
             database_max_overflow: None,
             database_pool_timeout: None,
@@ -1602,7 +1596,6 @@ impl Default for Config {
             // Ephemeral isolation
             ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
             ephemeral_root: None,
-            ephemeral_ttl_hours: 24,
 
             // Disk space monitoring
             disk_space_monitor_enabled: true,
@@ -1651,9 +1644,6 @@ impl Default for Config {
             http_bearer_token: None,
             http_allow_localhost_unauthenticated: false,
             http_request_log_enabled: false,
-            http_otel_enabled: false,
-            http_otel_service_name: "mcp-agent-mail".to_string(),
-            http_otel_exporter_otlp_endpoint: String::new(),
 
             // HTTP Supervisor tuning
             http_max_connections: 4096,
@@ -1765,7 +1755,6 @@ impl Default for Config {
             llm_default_model: "gpt-5.4".to_string(),
             llm_temperature: 0.2,
             llm_max_tokens: 512,
-            llm_cost_logging_enabled: true,
 
             // Notifications
             notifications_enabled: false,
@@ -1823,7 +1812,6 @@ impl Default for Config {
             log_rich_enabled: true,
             log_tool_calls_enabled: true,
             log_tool_calls_result_max_chars: 2000,
-            log_include_trace: false,
             log_json_enabled: false,
 
             // Console / TUI layout + persistence
@@ -1864,7 +1852,7 @@ impl Default for Config {
                     .join(".mcp_agent_mail"),
                 "exports",
             ),
-            tui_tree_style: "rounded".to_string(),
+            tui_thread_guides: None,
             tui_theme: "default".to_string(),
             tui_toast_enabled: true,
             tui_toast_severity: "info".to_string(),
@@ -2112,7 +2100,6 @@ impl Config {
         if let Some(v) = infra_env_value("DATABASE_URL") {
             config.database_url = v;
         }
-        config.database_echo = env_bool("DATABASE_ECHO", config.database_echo);
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
         config.database_max_overflow = env_usize_opt("DATABASE_MAX_OVERFLOW");
         config.database_pool_timeout = env_u64_opt("DATABASE_POOL_TIMEOUT");
@@ -2236,7 +2223,6 @@ impl Config {
                 shellexpand::tilde(&v).into_owned(),
             ));
         }
-        config.ephemeral_ttl_hours = env_u64("AM_EPHEMERAL_TTL_HOURS", config.ephemeral_ttl_hours);
 
         // Disk space monitoring
         config.disk_space_monitor_enabled = env_bool(
@@ -2347,13 +2333,6 @@ impl Config {
         );
         config.http_request_log_enabled =
             env_bool("HTTP_REQUEST_LOG_ENABLED", config.http_request_log_enabled);
-        config.http_otel_enabled = env_bool("HTTP_OTEL_ENABLED", config.http_otel_enabled);
-        if let Some(v) = env_value("OTEL_SERVICE_NAME") {
-            config.http_otel_service_name = v;
-        }
-        if let Some(v) = env_value("OTEL_EXPORTER_OTLP_ENDPOINT") {
-            config.http_otel_exporter_otlp_endpoint = v;
-        }
 
         // HTTP Supervisor tuning
         config.http_max_connections =
@@ -2611,8 +2590,6 @@ impl Config {
         }
         config.llm_temperature = env_f64("LLM_TEMPERATURE", config.llm_temperature);
         config.llm_max_tokens = env_u32("LLM_MAX_TOKENS", config.llm_max_tokens);
-        config.llm_cost_logging_enabled =
-            env_bool("LLM_COST_LOGGING_ENABLED", config.llm_cost_logging_enabled);
 
         // Notifications
         config.notifications_enabled =
@@ -2750,7 +2727,6 @@ impl Config {
             "LOG_TOOL_CALLS_RESULT_MAX_CHARS",
             config.log_tool_calls_result_max_chars,
         );
-        config.log_include_trace = env_bool("LOG_INCLUDE_TRACE", config.log_include_trace);
         config.log_json_enabled = env_bool("LOG_JSON_ENABLED", config.log_json_enabled);
 
         // Console / TUI layout + persistence
@@ -2875,13 +2851,13 @@ impl Config {
                 config.export_dir = PathBuf::from(trimmed);
             }
         }
-        if let Some(v) = console_value("AM_TUI_TREE_STYLE") {
+        if let Some(v) = console_value("AM_TUI_THREAD_GUIDES") {
             let lower = v.trim().to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "rounded" | "plain" | "bold" | "double" | "ascii"
+                "ascii" | "unicode" | "bold" | "double" | "rounded"
             ) {
-                config.tui_tree_style = lower;
+                config.tui_thread_guides = Some(lower);
             }
         }
         if let Some(v) = console_value("AM_TUI_THEME").or_else(|| console_value("TUI_THEME")) {
@@ -5720,7 +5696,7 @@ mod tests {
             "exports",
         );
         assert_eq!(config.export_dir, expected_export_dir);
-        assert_eq!(config.tui_tree_style, "rounded");
+        assert_eq!(config.tui_thread_guides, None);
         assert_eq!(config.tui_theme, "default");
     }
 
@@ -5731,7 +5707,7 @@ mod tests {
             ("AM_TUI_AMBIENT", "full"),
             ("AM_TUI_DEBUG", "true"),
             ("AM_EXPORT_DIR", "/tmp/am-exports"),
-            ("AM_TUI_TREE_STYLE", "double"),
+            ("AM_TUI_THREAD_GUIDES", "DOUBLE"),
             ("AM_TUI_THEME", "gruvbox"),
         ]);
         let config = Config::from_env();
@@ -5739,7 +5715,7 @@ mod tests {
         assert_eq!(config.tui_ambient, "full");
         assert!(config.tui_debug);
         assert_eq!(config.export_dir, PathBuf::from("/tmp/am-exports"));
-        assert_eq!(config.tui_tree_style, "double");
+        assert_eq!(config.tui_thread_guides.as_deref(), Some("double"));
         assert_eq!(config.tui_theme, "gruvbox");
     }
 
@@ -5755,7 +5731,9 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[
             ("AM_TUI_AMBIENT", "neon"),
             ("AM_EXPORT_DIR", ""),
-            ("AM_TUI_TREE_STYLE", "zigzag"),
+            // "plain" was accepted by the retired AM_TUI_TREE_STYLE parser but
+            // has no guide style in the Threads screen.
+            ("AM_TUI_THREAD_GUIDES", "plain"),
             ("AM_TUI_THEME", "matrix"),
         ]);
         let config = Config::from_env();
@@ -5767,8 +5745,397 @@ mod tests {
             "exports",
         );
         assert_eq!(config.export_dir, expected_export_dir);
-        assert_eq!(config.tui_tree_style, "rounded");
+        assert_eq!(config.tui_thread_guides, None);
         assert_eq!(config.tui_theme, "default");
+    }
+
+    // -----------------------------------------------------------------------
+    // Config surface honesty (br-kp1in.20): no dead fields, no re-parsed knobs
+    // -----------------------------------------------------------------------
+
+    /// Index just past the `}` matching the `{` at `open`. Braces inside
+    /// string/char literals are not special-cased; the scanned blocks keep
+    /// them balanced.
+    fn matching_brace_end(source: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(open + offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `source` without the item that starts at `header` (through the `}`
+    /// matching the first `{` after it).
+    fn strip_block_after(source: &str, header: &str) -> String {
+        let Some(start) = source.find(header) else {
+            return source.to_string();
+        };
+        let end = source[start..]
+            .find('{')
+            .and_then(|brace| matching_brace_end(source, start + brace));
+        end.map_or_else(
+            || source.to_string(),
+            |end| format!("{}{}", &source[..start], &source[end..]),
+        )
+    }
+
+    /// Drop every inline `#[cfg(test)] mod name { ... }` block so that only
+    /// production code counts as a reader.
+    fn strip_inline_test_modules(source: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(source.len());
+        let mut rest = source;
+        while let Some(at) = rest.find(MARKER) {
+            let decl_start = at + MARKER.len();
+            let decl = rest[decl_start..].trim_start();
+            let decl = decl.strip_prefix("pub(crate) ").unwrap_or(decl);
+            // `decl` is a suffix of `rest`, so its offset is the length delta.
+            let module_open = decl.strip_prefix("mod ").and_then(|module| {
+                let brace = module.find('{')?;
+                module
+                    .find(';')
+                    .is_none_or(|semi| brace < semi)
+                    .then_some(rest.len() - module.len() + brace)
+            });
+            if let Some(end) = module_open.and_then(|open| matching_brace_end(rest, open)) {
+                out.push_str(&rest[..at]);
+                rest = &rest[end..];
+            } else {
+                out.push_str(&rest[..decl_start]);
+                rest = &rest[decl_start..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn production_sources() -> Vec<(std::path::PathBuf, String)> {
+        let root = crate::flags::workspace_root();
+        let mut files = Vec::new();
+        crate::flags::collect_rust_sources(&root.join("crates"), &mut files);
+        files
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .strip_prefix(&root)
+                    .unwrap_or(path)
+                    .components()
+                    .any(|c| {
+                        matches!(
+                            c.as_os_str().to_str(),
+                            Some("tests" | "benches" | "examples")
+                        )
+                    })
+            })
+            .filter_map(|path| {
+                let source = std::fs::read_to_string(&path).ok()?;
+                Some((path, strip_inline_test_modules(&source)))
+            })
+            .collect()
+    }
+
+    fn is_ident_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    }
+
+    /// `.field` followed by a non-identifier character.
+    fn reads_field(source: &str, field: &str) -> bool {
+        let needle = format!(".{field}");
+        source.match_indices(&needle).any(|(at, _)| {
+            source[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_ident_char(ch))
+        })
+    }
+
+    fn fields_without_readers(fields: &[String], sources: &[(String, String)]) -> Vec<String> {
+        fields
+            .iter()
+            .filter(|field| !sources.iter().any(|(_, source)| reads_field(source, field)))
+            .cloned()
+            .collect()
+    }
+
+    fn config_rs_source() -> String {
+        std::fs::read_to_string(
+            crate::flags::workspace_root().join("crates/mcp-agent-mail-core/src/config.rs"),
+        )
+        .expect("read config.rs")
+    }
+
+    fn config_struct_fields(config_rs: &str) -> Vec<String> {
+        let start = config_rs
+            .find("\npub struct Config {\n")
+            .expect("pub struct Config");
+        let body = &config_rs[start..];
+        let end = body.find("\n}\n").expect("end of struct Config");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let name = line.strip_prefix("    pub ")?.split_once(':')?.0;
+                name.chars().all(is_ident_char).then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// Config fields whose only job is to feed another field during
+    /// `from_env`; the knob works, the stored copy is informational.
+    const PARSE_TIME_ONLY_FIELDS: &[(&str, &str)] = &[
+        (
+            "cache_profile",
+            "AM_CACHE_PROFILE selects database_cache_budget_kb and the read-cache sizes in from_env",
+        ),
+        (
+            "allow_ephemeral_projects_in_default_storage",
+            "legacy alias folded into ephemeral_mode = Deny in from_env",
+        ),
+    ];
+
+    #[test]
+    fn dead_field_detector_flags_a_field_nothing_reads() {
+        let fields = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let sources = vec![(
+            "x.rs".to_string(),
+            // `.alphabet` and `beta_extra` must not count as reads of alpha/beta.
+            "fn f(c: &C) { let _ = c.gamma; c.alphabet(); c.beta_extra; }".to_string(),
+        )];
+        assert_eq!(
+            fields_without_readers(&fields, &sources),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn every_config_field_has_a_production_reader() {
+        let config_rs = config_rs_source();
+        let fields = config_struct_fields(&config_rs);
+        assert!(
+            fields.len() > 150,
+            "expected the full Config field list, parsed {}",
+            fields.len()
+        );
+        // Inside config.rs, the struct, Default, Debug, and the env parser are
+        // writers (or echo every field); only the rest of the file counts.
+        let mut config_readers = strip_inline_test_modules(&config_rs);
+        for header in [
+            "\npub struct Config {",
+            "\nimpl Default for Config {",
+            "\nimpl std::fmt::Debug for Config {",
+            "    fn from_env_with_generation_hook(",
+        ] {
+            config_readers = strip_block_after(&config_readers, header);
+        }
+        let config_path =
+            crate::flags::workspace_root().join("crates/mcp-agent-mail-core/src/config.rs");
+        let mut sources: Vec<(String, String)> = production_sources()
+            .into_iter()
+            .filter(|(path, _)| *path != config_path)
+            .map(|(path, source)| (path.display().to_string(), source))
+            .collect();
+        assert!(sources.len() > 50, "scanned only {} files", sources.len());
+        sources.push(("config.rs (non-parser code)".to_string(), config_readers));
+
+        let dead: Vec<String> = fields_without_readers(&fields, &sources)
+            .into_iter()
+            .filter(|field| !PARSE_TIME_ONLY_FIELDS.iter().any(|(f, _)| f == field))
+            .collect();
+        assert!(
+            dead.is_empty(),
+            "Config fields with no production reader (wire them to their consumer or \
+             delete them; no dead knobs): {dead:?}"
+        );
+        for (field, _why) in PARSE_TIME_ONLY_FIELDS {
+            assert!(
+                fields.iter().any(|f| f == field),
+                "stale PARSE_TIME_ONLY_FIELDS entry: {field} is no longer a Config field"
+            );
+        }
+    }
+
+    const RAW_ENV_READERS: &[&str] = &[
+        "var(",
+        "var_os(",
+        "env_value(",
+        "infra_env_value(",
+        "real_env_value(",
+        "full_env_value(",
+        "env_bool(",
+        "env_truthy(",
+        "env_u64(",
+        "env_usize(",
+    ];
+
+    /// Env names the `from_env` body passes as a string literal to any call.
+    fn env_names_parsed_by_config(config_rs: &str) -> std::collections::BTreeSet<String> {
+        let start = config_rs
+            .find("    fn from_env_with_generation_hook(")
+            .expect("from_env parser");
+        let open = start + config_rs[start..].find('{').expect("parser body");
+        let end = matching_brace_end(config_rs, open).expect("parser end");
+        let parser = &config_rs[start..end];
+        let mut names = std::collections::BTreeSet::new();
+        for (at, _) in parser.match_indices('(') {
+            // Calls rustfmt splits across lines put the literal on the next line.
+            let Some(rest) = parser[at + 1..].trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else { continue };
+            let name = &rest[..end];
+            if name.len() >= 3
+                && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                names.insert(name.to_string());
+            }
+        }
+        names
+    }
+
+    /// `(name, file)` pairs where production code outside Config reads a knob
+    /// that Config already parses.
+    fn raw_rereads(
+        names: &std::collections::BTreeSet<String>,
+        sources: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let mut hits = Vec::new();
+        for (file, source) in sources {
+            for name in names {
+                let quoted = format!("\"{name}\"");
+                let reread = source.match_indices(&quoted).any(|(at, _)| {
+                    let before = source[..at].trim_end();
+                    RAW_ENV_READERS
+                        .iter()
+                        .any(|reader| before.ends_with(reader))
+                });
+                if reread {
+                    hits.push((name.clone(), file.clone()));
+                }
+            }
+        }
+        hits
+    }
+
+    /// Justified raw reads of Config-owned knobs: `(name, file suffix, why)`.
+    const RAW_REREAD_ALLOW: &[(&str, &str, &str)] = &[
+        (
+            "HTTP_PATH",
+            "mcp-agent-mail/src/main.rs",
+            "serve ranks HTTP_PATH against --path/--transport, which needs explicit-vs-default provenance",
+        ),
+        (
+            "DATABASE_URL",
+            "mcp-agent-mail-core/src/legacy.rs",
+            "legacy detector reports which source (process env, project .env, user envfile) set it",
+        ),
+        (
+            "STORAGE_ROOT",
+            "mcp-agent-mail-core/src/legacy.rs",
+            "legacy detector reports which source (process env, project .env, user envfile) set it",
+        ),
+        (
+            "DATABASE_URL",
+            "mcp-agent-mail-cli/src/lib.rs",
+            "presence check: only the process env makes a doctor/activity mailbox scope explicit (GH#193)",
+        ),
+        (
+            "STORAGE_ROOT",
+            "mcp-agent-mail-cli/src/lib.rs",
+            "presence check: only the process env makes a doctor/activity mailbox scope explicit (GH#193)",
+        ),
+        (
+            "DATABASE_URL",
+            "mcp-agent-mail-db/src/migrate.rs",
+            "Python-DB discovery needs the raw URL; Config substitutes the Rust default when unset",
+        ),
+        (
+            "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+            "mcp-agent-mail-guard/src/lib.rs",
+            "git hook contract: the guard gates on the committing process env, like the hook script",
+        ),
+        (
+            "WORKTREES_ENABLED",
+            "mcp-agent-mail-guard/src/lib.rs",
+            "git hook contract: the guard gates on the committing process env, like the hook script",
+        ),
+        (
+            "GIT_IDENTITY_ENABLED",
+            "mcp-agent-mail-guard/src/lib.rs",
+            "git hook contract: the guard gates on the committing process env, like the hook script",
+        ),
+    ];
+
+    #[test]
+    fn reread_detector_flags_a_raw_env_read_of_a_config_knob() {
+        let names: std::collections::BTreeSet<String> =
+            ["FOO_KNOB".to_string(), "BAR_KNOB".to_string()].into();
+        let sources = vec![
+            (
+                "a.rs".to_string(),
+                "let v = std::env::var(\"FOO_KNOB\").ok();".to_string(),
+            ),
+            (
+                "b.rs".to_string(),
+                // A mention that is not an env read must not count.
+                "tracing::warn!(\"BAR_KNOB is deprecated\"); let k = \"BAR_KNOB\";".to_string(),
+            ),
+        ];
+        assert_eq!(
+            raw_rereads(&names, &sources),
+            vec![("FOO_KNOB".to_string(), "a.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn config_owned_knobs_are_not_reparsed_outside_config() {
+        let config_rs = config_rs_source();
+        let names = env_names_parsed_by_config(&config_rs);
+        assert!(
+            names.len() > 150 && names.contains("DATABASE_POOL_SIZE"),
+            "expected the full from_env knob list, parsed {}",
+            names.len()
+        );
+        let config_path =
+            crate::flags::workspace_root().join("crates/mcp-agent-mail-core/src/config.rs");
+        let sources: Vec<(String, String)> = production_sources()
+            .into_iter()
+            .filter(|(path, _)| *path != config_path)
+            .map(|(path, source)| (path.display().to_string(), source))
+            .collect();
+        let hits = raw_rereads(&names, &sources);
+        let allowed = |name: &str, file: &str| {
+            RAW_REREAD_ALLOW
+                .iter()
+                .any(|(n, suffix, _)| *n == name && file.ends_with(suffix))
+        };
+        let unjustified: Vec<&(String, String)> = hits
+            .iter()
+            .filter(|(name, file)| !allowed(name, file))
+            .collect();
+        assert!(
+            unjustified.is_empty(),
+            "knobs Config already parses are re-read raw (divergent default/clamp/.env \
+             handling); read the Config field instead or justify in RAW_REREAD_ALLOW: \
+             {unjustified:#?}"
+        );
+        for (name, suffix, _why) in RAW_REREAD_ALLOW {
+            assert!(
+                hits.iter()
+                    .any(|(n, file)| n == name && file.ends_with(suffix)),
+                "stale RAW_REREAD_ALLOW entry: {name} is no longer read raw in {suffix}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

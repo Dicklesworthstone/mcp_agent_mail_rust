@@ -27,7 +27,7 @@ use crate::tui_action_menu::{ActionEntry, reservations_actions, reservations_bat
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{DbStatSnapshot, MailEvent, ReservationSnapshot};
 use crate::tui_persist::{
-    ScreenFilterPresetStore, console_persist_path_from_env_or_default,
+    ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
@@ -366,7 +366,7 @@ pub struct ReservationsScreen {
 impl ReservationsScreen {
     fn build(filter_presets_path_override: Option<PathBuf>) -> Self {
         let filter_presets_path = filter_presets_path_override.unwrap_or_else(|| {
-            let console_path = console_persist_path_from_env_or_default();
+            let console_path = configured_console_persist_path();
             screen_filter_presets_path(&console_path)
         });
         let filter_presets = load_screen_filter_presets_or_default(&filter_presets_path);

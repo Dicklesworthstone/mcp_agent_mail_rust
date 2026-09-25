@@ -10,7 +10,7 @@ use crate::schema;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::{
     ConsistencyMessageRef, LockLevel, OrderedRwLock,
-    config::{env_value, infra_env_value},
+    config::env_value,
     disk::{
         SqliteRecoveryCandidateKind, SqliteRecoveryCandidateName,
         classify_sqlite_recovery_candidate_name, is_sqlite_memory_database_url,
@@ -2695,24 +2695,18 @@ impl DbPoolConfig {
     pub fn from_env() -> Self {
         let core_config = mcp_agent_mail_core::Config::from_env();
 
-        // Use infra_env_value so a project-local .env cannot hijack the
-        // database path.  When no explicit DATABASE_URL is set, derive it
-        // from the resolved storage_root via Config (which handles the
-        // storage-root-relative default).
-        let database_url =
-            infra_env_value("DATABASE_URL").unwrap_or_else(|| core_config.database_url.clone());
+        // Config reads DATABASE_URL via infra_env_value (a project-local .env
+        // cannot hijack the database path) and, when it is unset, derives the
+        // storage-root-relative default.
+        let database_url = core_config.database_url.clone();
 
-        let pool_timeout = env_value("DATABASE_POOL_TIMEOUT")
-            .and_then(|s| s.parse::<u64>().ok())
+        let pool_timeout = core_config
+            .database_pool_timeout
             .map_or(DEFAULT_POOL_TIMEOUT_MS, pool_timeout_ms_from_setting);
 
         // Determine pool sizing: explicit, auto, or default constants.
-        let pool_size_raw = env_value("DATABASE_POOL_SIZE");
-        let explicit_size = pool_size_raw
-            .as_deref()
-            .and_then(|s| s.parse::<usize>().ok());
-        let explicit_overflow =
-            env_value("DATABASE_MAX_OVERFLOW").and_then(|s| s.parse::<usize>().ok());
+        let explicit_size = core_config.database_pool_size;
+        let explicit_overflow = core_config.database_max_overflow;
 
         let (min_conn, max_conn) = match (explicit_size, explicit_overflow) {
             // Both explicitly set → honour literally.

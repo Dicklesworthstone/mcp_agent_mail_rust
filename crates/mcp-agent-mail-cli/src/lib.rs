@@ -17170,7 +17170,9 @@ fn render_setup_actions_table(results: &[mcp_agent_mail_core::setup::SetupResult
         return;
     }
 
-    let _ = mcp_agent_mail_server::theme::init_console_theme();
+    let _ = mcp_agent_mail_server::theme::init_console_theme_from_config(
+        mcp_agent_mail_core::Config::get().console_theme,
+    );
     let reset = mcp_agent_mail_server::theme::RESET;
     let dim = mcp_agent_mail_server::theme::DIM;
     let border = mcp_agent_mail_server::theme::secondary_bold();

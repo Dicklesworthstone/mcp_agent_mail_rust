@@ -1681,7 +1681,8 @@ fn tracked<T: TrackedConnectionSource + ?Sized>(conn: &T) -> TrackedConnection<'
 
 /// Whether `BEGIN CONCURRENT` is enabled (MVCC page-level writes).
 ///
-/// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `false`.
+/// Read once from `Config::fsqlite_concurrent_mode` (`FSQLITE_CONCURRENT_MODE`,
+/// honoring `.env` like the pool's autocommit pragma does); defaults to `false`.
 /// When `false`, all transactions use `BEGIN IMMEDIATE` (single-writer).
 /// Set `FSQLITE_CONCURRENT_MODE=true` to opt in to `BEGIN CONCURRENT`.
 ///
@@ -1693,8 +1694,7 @@ fn tracked<T: TrackedConnectionSource + ?Sized>(conn: &T) -> TrackedConnection<'
 /// been fixed.  Single-writer mode (`BEGIN IMMEDIATE`) is recommended
 /// for all deployments.
 static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let enabled = mcp_agent_mail_core::Config::get().fsqlite_concurrent_mode;
     if enabled {
         tracing::warn!(
             "FSQLITE_CONCURRENT_MODE=true: BEGIN CONCURRENT is enabled. \

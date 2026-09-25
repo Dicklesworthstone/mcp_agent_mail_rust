@@ -354,7 +354,6 @@ fixed stack; that has to be fixed in the recursion itself.
 | `TUI_KEYMAP_PROFILE`   | `default` | Keymap profile (`default`/`vim`/`emacs`/`minimal`/`custom`) |
 | `TUI_ACTIVE_PRESET`    | `default` | Active keymap preset name            |
 | `AM_TUI_THEME`         | `default` | Theme override (`default`, `solarized`, `dracula`, `nord`, `gruvbox`, `frankenstein`) |
-| `AM_TUI_TREE_STYLE`    | `rounded` | Tree style (`rounded`, `plain`, `bold`, `double`, `ascii`) |
 | `AM_TUI_DEBUG`         | `false`   | Enable TUI debug behaviors           |
 | `AM_TUI_EFFECTS`       | `true`    | Enable TUI visual effects            |
 | `AM_TUI_AMBIENT`       | `subtle`  | Ambient rendering mode (`off`/`subtle`/`full`) |

@@ -8,6 +8,7 @@ use asupersync::channel::mpsc::{SendError, Sender};
 use asupersync::time::{sleep, wall_now};
 use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -748,6 +749,10 @@ pub struct TuiSharedState {
     startup_signals: (Mutex<StartupSignalState>, Condvar),
     /// Latest rendered TUI frame for the web dashboard mirror.
     web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore,
+    /// Snapshot export directory (`Config::export_dir`, `AM_EXPORT_DIR`).
+    export_dir: PathBuf,
+    /// Thread tree guide style (`Config::tui_thread_guides`); `None` = theme default.
+    thread_tree_guides: Option<String>,
 }
 
 impl TuiSharedState {
@@ -797,6 +802,8 @@ impl TuiSharedState {
             screen_refreshes: ScreenRefreshSlots::new(),
             startup_signals: (Mutex::new(StartupSignalState::default()), Condvar::new()),
             web_dashboard_frame: crate::tui_web_dashboard::WebDashboardFrameStore::new(),
+            export_dir: config.export_dir.clone(),
+            thread_tree_guides: config.tui_thread_guides.clone(),
         })
     }
 
@@ -1226,6 +1233,16 @@ impl TuiSharedState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[must_use]
+    pub fn export_dir(&self) -> &Path {
+        &self.export_dir
+    }
+
+    #[must_use]
+    pub fn thread_tree_guides(&self) -> Option<&str> {
+        self.thread_tree_guides.as_deref()
     }
 
     #[must_use]

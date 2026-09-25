@@ -28090,9 +28090,6 @@ first body
             http_request_log_enabled: true,
             log_json_enabled: true,
             log_rich_enabled: false,
-            http_otel_enabled: true,
-            http_otel_service_name: "mcp-agent-mail-test".to_string(),
-            http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
             ..Default::default()
         };
         let state = build_state(config);
@@ -29933,57 +29930,6 @@ first body
             "request logging disabled by default"
         );
         assert!(!config.log_json_enabled, "JSON logging disabled by default");
-        assert!(!config.http_otel_enabled, "OTEL disabled by default");
-        assert_eq!(config.http_otel_service_name, "mcp-agent-mail");
-        assert_eq!(config.http_otel_exporter_otlp_endpoint, "");
-    }
-
-    // -- OTEL config no-op parity (server-level) --
-
-    #[test]
-    fn otel_config_enabled_does_not_affect_logging_behavior() {
-        // Legacy parity: OTEL fields exist in config but the Rust port does not
-        // add spans/traces. We verify that enabling OTEL does not change the
-        // request logging output format or introduce crashes.
-        let _guard = STDIO_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config {
-            http_request_log_enabled: true,
-            log_json_enabled: true,
-            log_rich_enabled: false,
-            http_otel_enabled: true,
-            http_otel_service_name: "test-service".to_string(),
-            http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let capture = StdioCapture::install().expect("stdio capture install");
-        let req = make_request_with_peer_addr(
-            Http1Method::Get,
-            "/health/liveness",
-            &[],
-            Some("10.0.0.1:5555".parse().unwrap()),
-        );
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let out = capture.drain_to_string();
-
-        // JSON log line should exist and not contain OTEL-specific span/trace fields.
-        let json_line = out
-            .lines()
-            .find(|line| line.trim_start().starts_with('{') && line.trim_end().ends_with('}'))
-            .expect("expected JSON log line with OTEL enabled");
-        let v: serde_json::Value = serde_json::from_str(json_line).unwrap();
-        assert_eq!(v["event"], "request");
-        assert!(
-            v.get("trace_id").is_none(),
-            "no trace_id in output (OTEL is no-op)"
-        );
-        assert!(
-            v.get("span_id").is_none(),
-            "no span_id in output (OTEL is no-op)"
-        );
     }
 
     // -- Field derivation tests --

@@ -3645,9 +3645,11 @@ pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
     if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
         v.push(PathBuf::from(xdg_data).join("mcp-agent-mail"));
     }
-    if let Ok(storage) = std::env::var("STORAGE_ROOT") {
-        v.push(PathBuf::from(storage));
-    }
+    // The storage root doctor repairs, as Config resolves it: STORAGE_ROOT from
+    // the process env or the authority-checked user envfile (never a project
+    // `.env`), else the default. A raw process-env read left an envfile-set
+    // root outside the write scope.
+    v.push(mcp_agent_mail_core::Config::from_env().storage_root);
     if let Some(home) = dirs::home_dir() {
         v.push(home.join(".local").join("share").join("mcp-agent-mail"));
         v.push(home.join(".mcp_agent_mail_git_mailbox_repo"));
@@ -4142,8 +4144,23 @@ mod tests {
             .collect::<Vec<_>>()
             .join("|");
         assert!(s.contains(".doctor"));
-        // Storage root is conditional; XDG paths are conditional. Just assert
-        // the per-repo scopes are always present.
+        // XDG paths are conditional; the per-repo scopes are always present.
+
+        // The storage root comes from Config (one resolution of STORAGE_ROOT).
+        // (Config canonicalizes the root, e.g. /tmp -> /private/tmp on macOS.)
+        let is_probe = |p: &PathBuf| p.ends_with("am-doctor-scope-probe-root");
+        assert!(
+            !scopes.iter().any(is_probe),
+            "negative control: probe not set"
+        );
+        let with_root = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", "/tmp/am-doctor-scope-probe-root")],
+            default_write_scopes,
+        );
+        assert!(
+            with_root.iter().any(is_probe),
+            "Config-resolved STORAGE_ROOT must be a write scope: {with_root:?}"
+        );
     }
 
     #[test]

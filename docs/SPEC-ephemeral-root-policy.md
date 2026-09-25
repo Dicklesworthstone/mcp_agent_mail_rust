@@ -172,7 +172,6 @@ Requirements:
 |----------|---------|-------------|
 | `AM_EPHEMERAL_MODE` | `auto` | `auto` (detect), `force` (always isolate), `deny` (never isolate) |
 | `AM_EPHEMERAL_ROOT` | `$TMPDIR` | Base directory for isolated ephemeral roots |
-| `AM_EPHEMERAL_TTL_HOURS` | `24` | Auto-cleanup threshold for stale ephemeral roots |
 | `ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE` | `false` | Legacy flag; equivalent to `AM_EPHEMERAL_MODE=deny` |
 
 ---

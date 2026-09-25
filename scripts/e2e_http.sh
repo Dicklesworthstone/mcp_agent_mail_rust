@@ -693,10 +693,10 @@ stop_server "${PID1}"
 trap - EXIT
 
 # ---------------------------------------------------------------------------
-# Run 2: request logging + OTEL no-op (misconfig must not crash)
+# Run 2: request logging (kv renderer)
 # ---------------------------------------------------------------------------
 
-e2e_banner "Run 2: request logging + OTEL no-op (misconfig)"
+e2e_banner "Run 2: request logging (kv)"
 
 WORK2="$(e2e_mktemp "e2e_http_run2")"
 DB2="${WORK2}/db.sqlite3"
@@ -707,9 +707,6 @@ URL2="http://127.0.0.1:${PORT2}"
 PID2="$(start_server "run2" "${PORT2}" "${DB2}" "${STORAGE2}" "${BIN}" \
     "HTTP_REQUEST_LOG_ENABLED=1" \
     "LOG_JSON_ENABLED=0" \
-    "HTTP_OTEL_ENABLED=1" \
-    "OTEL_SERVICE_NAME=e2e" \
-    "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:1" \
 )"
 trap 'stop_server "${PID2}" || true' EXIT
 

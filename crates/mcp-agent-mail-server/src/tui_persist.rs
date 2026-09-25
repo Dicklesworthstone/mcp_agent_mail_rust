@@ -293,26 +293,12 @@ pub fn default_console_persist_path() -> PathBuf {
         .join("config.env")
 }
 
-/// Resolve the console envfile path from `CONSOLE_PERSIST_PATH`, falling back
-/// to the default location.
+/// The console envfile path as resolved by `Config` (`CONSOLE_PERSIST_PATH`,
+/// tilde-expanded, else the default location), for screens constructed
+/// without a `Config` handle.
 #[must_use]
-pub fn console_persist_path_from_env_or_default() -> PathBuf {
-    let candidate = std::env::var("CONSOLE_PERSIST_PATH")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    if let Some(value) = candidate {
-        if value == "~" {
-            return std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from);
-        }
-        if let Some(rest) = value.strip_prefix("~/") {
-            return std::env::var("HOME")
-                .map_or_else(|_| PathBuf::from("."), PathBuf::from)
-                .join(rest);
-        }
-        return PathBuf::from(value);
-    }
-    default_console_persist_path()
+pub fn configured_console_persist_path() -> PathBuf {
+    mcp_agent_mail_core::Config::get().console_persist_path
 }
 
 /// Compute the path used for persisted screen filter presets.

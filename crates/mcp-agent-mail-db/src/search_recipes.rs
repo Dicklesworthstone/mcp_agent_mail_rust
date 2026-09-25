@@ -315,14 +315,13 @@ use crate::sqlmodel::Value;
 
 /// Whether sync write helpers should use `BEGIN CONCURRENT`.
 ///
-/// Controlled by `FSQLITE_CONCURRENT_MODE` (default: disabled).
-/// Set `FSQLITE_CONCURRENT_MODE=true` to opt in.
+/// Controlled by `Config::fsqlite_concurrent_mode` (`FSQLITE_CONCURRENT_MODE`,
+/// default: disabled), the same source as queries.rs and the pool pragma.
 ///
 /// See queries.rs `CONCURRENT_MODE_ENABLED` for the known snapshot-drift
 /// limitation (GH#65).
 static SYNC_CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    let enabled = mcp_agent_mail_core::Config::get().fsqlite_concurrent_mode;
     if enabled {
         tracing::warn!(
             "FSQLITE_CONCURRENT_MODE=true (search_recipes): BEGIN CONCURRENT enabled \
