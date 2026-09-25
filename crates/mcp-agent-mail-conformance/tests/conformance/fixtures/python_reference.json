@@ -2214,7 +2214,7 @@
                 "from_project": "/abs/path/backend",
                 "to": "GreenCastle",
                 "to_project": "/abs/path/backend",
-                "status": "pending",
+                "status": "approved",
                 "expires_ts": null
               },
               "response": {

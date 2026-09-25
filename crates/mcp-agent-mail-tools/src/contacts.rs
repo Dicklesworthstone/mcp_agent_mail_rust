@@ -420,10 +420,12 @@ pub(crate) async fn request_contact_with_intro(
     let link_row = db_outcome_to_mcp_result(link_out)?;
 
     // Only send intro mail if the target's policy allows it and the link
-    // is not blocked (a re-request against a blocked link should be silent).
+    // awaits a decision: a re-request against a blocked link is silent, and
+    // one against an approval still in force leaves it approved (br-xhfoz),
+    // so there is nothing for the target to act on.
     let should_send_intro = intro == ContactIntro::PendingRequest
         && to_row.contact_policy != "block_all"
-        && link_row.status != "blocked";
+        && link_row.status == "pending";
 
     if should_send_intro {
         let subject = format!("Contact request from {from_agent_name}");

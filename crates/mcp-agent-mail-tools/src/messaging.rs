@@ -517,6 +517,30 @@ fn contact_policy_decision(
     ContactPolicyDecision::RequireApproval
 }
 
+/// Contact-enforcement lookups fail open (br-1i11.2.6): on an error every
+/// candidate is taken to have what the lookup would have proven, with a
+/// warning and a `contact_enforcement_bypass_total` increment. Treating the
+/// error as "no contact" refused already-approved recipients with a false
+/// `CONTACT_REQUIRED` (br-ivw0d). `block_all` comes from the agent row, not
+/// from these lookups, so it still holds.
+fn contact_ids_or_fail_open(
+    lookup: McpResult<Vec<i64>>,
+    candidate_ids: &[i64],
+    what: &str,
+) -> HashSet<i64> {
+    lookup.map_or_else(
+        |e| {
+            tracing::warn!("contact enforcement: {what} failed (fail-open): {e}");
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .contact_enforcement_bypass_total
+                .inc();
+            candidate_ids.iter().copied().collect()
+        },
+        |ids| ids.into_iter().collect(),
+    )
+}
+
 fn reservations_prove_shared_scope_for_contact(
     sender_patterns: &[CompiledPattern],
     recipient_patterns: &[CompiledPattern],
@@ -2596,33 +2620,36 @@ effective_free_bytes={free}"
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
 
-        // br-ivw0d: a failed lookup is returned as the (retryable) database
-        // error it is. Treating it as "no recent contact, not approved" refused
-        // already-approved recipients with a misleading CONTACT_REQUIRED.
-        let recent_ids = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
-                ctx.cx(),
-                &pool,
-                project_id,
-                sender_id,
-                &candidate_ids,
-                since_ts,
-            )
-            .await,
-        )?;
-        let recent_set: HashSet<i64> = recent_ids.into_iter().collect();
+        let recent_set = contact_ids_or_fail_open(
+            db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &candidate_ids,
+                    since_ts,
+                )
+                .await,
+            ),
+            &candidate_ids,
+            "list_recent_contact_agent_ids",
+        );
 
-        let approved_ids = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_approved_contact_ids(
-                ctx.cx(),
-                &pool,
-                project_id,
-                sender_id,
-                &candidate_ids,
-            )
-            .await,
-        )?;
-        let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+        let approved_set = contact_ids_or_fail_open(
+            db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_approved_contact_ids(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &candidate_ids,
+                )
+                .await,
+            ),
+            &candidate_ids,
+            "list_approved_contact_ids",
+        );
 
         let mut blocked: Vec<(String, String)> = Vec::new();
 
@@ -2721,17 +2748,20 @@ effective_free_bytes={free}"
                     }
                 }
 
-                let approved_ids = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_approved_contact_ids(
-                        ctx.cx(),
-                        &pool,
-                        project_id,
-                        sender_id,
-                        &candidate_ids,
-                    )
-                    .await,
-                )?;
-                let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+                let approved_set = contact_ids_or_fail_open(
+                    db_outcome_to_mcp_result(
+                        mcp_agent_mail_db::queries::list_approved_contact_ids(
+                            ctx.cx(),
+                            &pool,
+                            project_id,
+                            sender_id,
+                            &candidate_ids,
+                        )
+                        .await,
+                    ),
+                    &candidate_ids,
+                    "list_approved_contact_ids",
+                );
 
                 // Remove agents who are STILL blocked from the delivery lists.
                 // Agents who are now approved remain in the lists (they were added by push_recipient).
@@ -3675,30 +3705,36 @@ effective_free_bytes={free}"
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
 
-        let recent_ids = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
-                ctx.cx(),
-                &pool,
-                project_id,
-                sender_id,
-                &candidate_ids,
-                since_ts,
-            )
-            .await,
-        )?;
-        let recent_set: HashSet<i64> = recent_ids.into_iter().collect();
+        let recent_set = contact_ids_or_fail_open(
+            db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &candidate_ids,
+                    since_ts,
+                )
+                .await,
+            ),
+            &candidate_ids,
+            "list_recent_contact_agent_ids",
+        );
 
-        let approved_ids = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_approved_contact_ids(
-                ctx.cx(),
-                &pool,
-                project_id,
-                sender_id,
-                &candidate_ids,
-            )
-            .await,
-        )?;
-        let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+        let approved_set = contact_ids_or_fail_open(
+            db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_approved_contact_ids(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    sender_id,
+                    &candidate_ids,
+                )
+                .await,
+            ),
+            &candidate_ids,
+            "list_approved_contact_ids",
+        );
 
         let mut blocked: Vec<String> = Vec::new();
         for name in resolved_to
@@ -3777,17 +3813,20 @@ effective_free_bytes={free}"
 
             // Re-check contact approval after handshake attempts (mirrors send_message)
             if !attempted.is_empty() {
-                let approved_ids = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_approved_contact_ids(
-                        ctx.cx(),
-                        &pool,
-                        project_id,
-                        sender_id,
-                        &candidate_ids,
-                    )
-                    .await,
-                )?;
-                let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
+                let approved_set = contact_ids_or_fail_open(
+                    db_outcome_to_mcp_result(
+                        mcp_agent_mail_db::queries::list_approved_contact_ids(
+                            ctx.cx(),
+                            &pool,
+                            project_id,
+                            sender_id,
+                            &candidate_ids,
+                        )
+                        .await,
+                    ),
+                    &candidate_ids,
+                    "list_approved_contact_ids",
+                );
 
                 blocked.retain(|name| {
                     if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
@@ -5758,7 +5797,8 @@ mod tests {
     }
 
     /// br-ivw0d: when the approved-contact lookup fails, an already-approved
-    /// recipient must not be refused with `CONTACT_REQUIRED` ("request approval").
+    /// recipient must not be refused with `CONTACT_REQUIRED` ("request approval");
+    /// the lookup fails open and counts the bypass (br-1i11.2.6).
     #[test]
     fn contact_lookup_failure_is_not_reported_as_contact_required() {
         let _lock = MESSAGING_THREAD_ID_TEST_LOCK
@@ -5893,14 +5933,165 @@ mod tests {
                     drop(conn);
                     drop(pool);
 
-                    let error = send("RedPeak", "lookup failure")
+                    let bypasses = || {
+                        mcp_agent_mail_core::global_metrics()
+                            .tools
+                            .snapshot()
+                            .contact_enforcement_bypass_total
+                    };
+                    let before = bypasses();
+                    send("RedPeak", "lookup failure")
                         .await
-                        .expect_err("a failed contact lookup must fail the send");
-                    let rendered = format!("{error:?}");
+                        .expect("a failed contact lookup fails open, not CONTACT_REQUIRED");
                     assert!(
-                        !rendered.contains("CONTACT_REQUIRED")
-                            && !rendered.contains("Contact approval required"),
-                        "lookup failure must not be reported as a policy refusal: {rendered}"
+                        bypasses() > before,
+                        "the fail-open lookup must count the enforcement bypass"
+                    );
+                });
+            },
+        );
+        Config::reset_cached();
+    }
+
+    /// br-xhfoz: requesting contact again with an already-approved peer (what a
+    /// concurrent first-contact auto-handshake does) must not revoke the
+    /// approval or send the peer another actionable intro.
+    #[test]
+    fn repeated_contact_request_keeps_an_approved_pair_sending() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("repeated request test tempdir");
+        let storage_root = temp.path().join("storage");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite:///{}", database_path.display());
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs repeated request context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let project_key = format!(
+                        "/data/projects/repeated-contact-{}",
+                        mcp_agent_mail_db::now_micros()
+                    );
+                    crate::ensure_project(&ctx, project_key.clone(), None)
+                        .await
+                        .expect("ensure project");
+                    for name in ["BlueLake", "RedPeak"] {
+                        crate::register_agent(
+                            &ctx,
+                            project_key.clone(),
+                            "codex-cli".to_string(),
+                            "gpt-5".to_string(),
+                            Some(name.to_string()),
+                            Some("repeated request".to_string()),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("register agent");
+                    }
+                    crate::set_contact_policy(
+                        &ctx,
+                        project_key.clone(),
+                        "RedPeak".to_string(),
+                        "contacts_only".to_string(),
+                    )
+                    .await
+                    .expect("recipient requires approved contacts");
+                    let request = || {
+                        crate::request_contact(
+                            &ctx,
+                            project_key.clone(),
+                            "BlueLake".to_string(),
+                            "RedPeak".to_string(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    };
+                    let first: Value =
+                        serde_json::from_str(&request().await.expect("first request"))
+                            .expect("request json");
+                    assert_eq!(first["status"], "pending");
+                    crate::respond_contact(
+                        &ctx,
+                        project_key.clone(),
+                        "RedPeak".to_string(),
+                        "BlueLake".to_string(),
+                        None,
+                        true,
+                        None,
+                    )
+                    .await
+                    .expect("approve contact");
+
+                    let again: Value =
+                        serde_json::from_str(&request().await.expect("repeated request"))
+                            .expect("request json");
+                    assert_eq!(again["status"], "approved", "the approval is kept: {again}");
+
+                    send_message(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        vec!["RedPeak".to_string()],
+                        "still approved".to_string(),
+                        "body".to_string(),
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        None,
+                        Some(false),
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("an approved pair still sends after a repeated request");
+
+                    let pool = get_db_pool().expect("get test pool");
+                    let conn = pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("acquire test connection");
+                    let rows = conn
+                        .query_sync(
+                            "SELECT COUNT(*) AS n FROM messages \
+                             WHERE subject = 'Contact request from BlueLake'",
+                            &[],
+                        )
+                        .expect("count intros");
+                    let intros = rows
+                        .first()
+                        .and_then(|row| row.get_named::<i64>("n").ok())
+                        .expect("intro count");
+                    assert_eq!(
+                        intros, 1,
+                        "only the first request sends an actionable intro"
                     );
                 });
             },

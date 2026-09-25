@@ -15329,10 +15329,15 @@ pub async fn request_contact(
             Outcome::Ok(_) => {}
             Outcome::Err(e) => {
                 if is_contact_pair_unique_violation(&e) {
+                    // br-xhfoz: an approval still in force (the predicate
+                    // `list_approved_contact_ids` uses) is the target's consent;
+                    // a repeated or concurrent request must not reset it to
+                    // pending. Expired approvals and pending links refresh.
                     let refresh_sql = "UPDATE agent_links \
                         SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
                         WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? AND b_agent_id = ? \
-                          AND status != 'blocked'";
+                          AND status != 'blocked' \
+                          AND (status != 'approved' OR (expires_ts IS NOT NULL AND expires_ts <= ?))";
                     let refresh_params = vec![
                         Value::Text(reason.to_string()),
                         Value::BigInt(now),
@@ -15341,6 +15346,7 @@ pub async fn request_contact(
                         Value::BigInt(from_agent_id),
                         Value::BigInt(to_project_id),
                         Value::BigInt(to_agent_id),
+                        Value::BigInt(now),
                     ];
                     let _updated_rows = try_in_tx!(
                         cx,
@@ -30190,6 +30196,126 @@ mod tests {
             );
             assert_eq!(to_incoming[0].id, Some(first_id));
             assert_eq!(to_incoming[0].reason, "refreshed");
+        });
+    }
+
+    /// br-xhfoz: a repeated (or concurrent) request must not reset an approval
+    /// that is still in force to pending; an expired approval renews to
+    /// pending and a blocked link stays blocked.
+    #[test]
+    fn request_contact_keeps_an_approval_in_force() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("request_contact_keeps_approval.db");
+
+        rt.block_on(async {
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-contact-keep-{}", now_micros()),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenStone", "RedPeak"] {
+                let agent = register_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "codex-cli",
+                    "gpt-5",
+                    Some("contact"),
+                    Some("contacts_only"),
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("register agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            let (from_id, to_id, blocked_id) = (ids[0], ids[1], ids[2]);
+            let request = |to: i64, reason: &'static str| {
+                request_contact(&cx, &pool, project_id, from_id, project_id, to, reason, 600)
+            };
+            let approved_ids = || async {
+                list_approved_contact_ids(&cx, &pool, project_id, from_id, &[to_id])
+                    .await
+                    .into_result()
+                    .expect("list approved contacts")
+            };
+
+            request(to_id, "initial")
+                .await
+                .into_result()
+                .expect("initial request");
+            let (_, approval) = respond_contact(
+                &cx, &pool, project_id, from_id, project_id, to_id, true, 3_600,
+            )
+            .await
+            .into_result()
+            .expect("approve");
+            assert_eq!(approved_ids().await, vec![to_id]);
+
+            let again = request(to_id, "again")
+                .await
+                .into_result()
+                .expect("repeated request");
+            assert_eq!(again.status, "approved", "an approval in force is kept");
+            assert_eq!(again.expires_ts, approval.expires_ts, "expiry is not reset");
+            assert_eq!(approved_ids().await, vec![to_id]);
+
+            // Negative: once the approval has expired, a request renews it to
+            // pending with a fresh expiry.
+            let expired_at = now_micros() - 1;
+            let conn = match pool.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+            };
+            conn.execute_sync(
+                "UPDATE agent_links SET expires_ts = ? WHERE id = ?",
+                &[
+                    Value::BigInt(expired_at),
+                    Value::BigInt(again.id.expect("link id")),
+                ],
+            )
+            .expect("expire the approval");
+            drop(conn);
+            assert!(
+                approved_ids().await.is_empty(),
+                "an expired approval is not in force"
+            );
+            let renewed = request(to_id, "renewed")
+                .await
+                .into_result()
+                .expect("renewal request");
+            assert_eq!(renewed.status, "pending");
+            assert_eq!(renewed.reason, "renewed");
+            assert!(renewed.expires_ts.is_some_and(|ts| ts > expired_at));
+
+            // A blocked link stays blocked.
+            request(blocked_id, "first")
+                .await
+                .into_result()
+                .expect("request to be blocked");
+            respond_contact(
+                &cx, &pool, project_id, from_id, project_id, blocked_id, false, 0,
+            )
+            .await
+            .into_result()
+            .expect("block");
+            let still_blocked = request(blocked_id, "retry")
+                .await
+                .into_result()
+                .expect("request against a blocked link");
+            assert_eq!(still_blocked.status, "blocked");
         });
     }
 
