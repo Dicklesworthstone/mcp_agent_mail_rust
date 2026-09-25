@@ -43,6 +43,24 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
 static MESSAGE_WRITE_SERIALIZER: LazyLock<Arc<asupersync::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(asupersync::sync::Mutex::new(())));
 
+/// Serialize in-process message inserts (br-5e8ew): id election and the insert
+/// transaction. Owned guard because the section spans async database and
+/// archive I/O; the borrowed guard is thread-affine, which would make the
+/// public future non-Send.
+async fn lock_message_write_serializer(
+    cx: &Cx,
+) -> std::result::Result<asupersync::sync::OwnedMutexGuard<()>, asupersync::sync::LockError> {
+    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx).await
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the message write serializer was held when each post-commit
+    /// visibility probe on this thread started (br-kp1in.32 regression test).
+    static SERIALIZER_LOCKED_AT_PROBE: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 // =============================================================================
 // ATC Leader Lease types
 // =============================================================================
@@ -2272,6 +2290,10 @@ async fn verify_message_recipients_visible_after_commit(
     message_id: i64,
     expected_recipients: &[(i64, &str)],
 ) -> Outcome<(), DbError> {
+    #[cfg(test)]
+    SERIALIZER_LOCKED_AT_PROBE.with(|seen| {
+        seen.borrow_mut().push(MESSAGE_WRITE_SERIALIZER.is_locked());
+    });
     let fresh_result = verify_message_recipients_visible_with_probe_mode(
         cx,
         pool,
@@ -8045,25 +8067,22 @@ async fn create_message_with_recipients_impl(
                 .to_string(),
         });
     }
-    // Use the owned guard because this critical section intentionally spans
-    // async database and archive I/O. The borrowed guard is deliberately
-    // thread-affine, which would make this public future non-Send.
-    let _serializer_guard =
-        match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&MESSAGE_WRITE_SERIALIZER), cx)
-            .await
-        {
-            Ok(guard) => guard,
-            Err(asupersync::sync::LockError::Cancelled) => {
-                return Outcome::Cancelled(CancelReason::user(
-                    "create_message_with_recipients serializer lock cancelled",
-                ));
-            }
-            Err(error) => {
-                return Outcome::Err(DbError::Internal(format!(
-                    "create_message_with_recipients serializer lock failed: {error}"
-                )));
-            }
-        };
+    // Held from id election through the insert transaction and the writer's own
+    // post-commit sample, then released before the fresh-handle visibility
+    // probe (br-kp1in.32).
+    let serializer_guard = match lock_message_write_serializer(cx).await {
+        Ok(guard) => guard,
+        Err(asupersync::sync::LockError::Cancelled) => {
+            return Outcome::Cancelled(CancelReason::user(
+                "create_message_with_recipients serializer lock cancelled",
+            ));
+        }
+        Err(error) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "create_message_with_recipients serializer lock failed: {error}"
+            )));
+        }
+    };
     // De-duplicate resolved recipient ids before any insert. The
     // `message_recipients` primary key is `(message_id, agent_id)` — `kind` is
     // NOT part of it — so the same agent appearing twice in `recipients` (e.g.
@@ -8253,6 +8272,12 @@ async fn create_message_with_recipients_impl(
         drop(conn);
         (row, writer_post_commit_counts)
     };
+    // The insert is committed and the writer sampled its own rows; the
+    // fresh-handle probe below opens its own connections per query and must not
+    // hold every other in-process send behind it. A probe miss still cannot
+    // delete a message the writer's sample confirmed (GH#179), and the rare
+    // compensating delete re-takes the serializer.
+    drop(serializer_guard);
 
     let Some(message_id) = row.id else {
         return Outcome::Err(DbError::Internal(
@@ -8310,6 +8335,9 @@ async fn create_message_with_recipients_impl(
                 error,
                 writer_post_commit_counts,
             );
+            // The compensating delete is serialized like the insert it undoes;
+            // if the lock wait is cancelled the ghost is still cleaned up.
+            let _cleanup_guard = lock_message_write_serializer(cx).await.ok();
             return Outcome::Err(
                 cleanup_message_after_post_commit_probe_failure(
                     cx,
@@ -29427,6 +29455,88 @@ mod tests {
             capture.drop_close_count(),
             0,
             "pooled connection teardown should close cleanly without drop_close warnings"
+        );
+    }
+
+    /// br-kp1in.32: the process-wide message serializer covers id election and
+    /// the insert transaction, not the fresh-handle visibility probe (two new
+    /// connections per send). Held through the probe, it kept release send
+    /// throughput flat at ~9-13 sends/s from 1 to 16 clients.
+    #[test]
+    fn message_serializer_is_released_before_the_post_commit_probe() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("serializer_scope.db");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 4,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow_mut().clear());
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let project = ensure_project(&cx, &pool, "/tmp/am-serializer-scope")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenCastle"] {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "codex-cli",
+                    "gpt-5",
+                    Some("serializer scope"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            for index in 0..3 {
+                let row = create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_id,
+                    ids[0],
+                    &format!("scope {index}"),
+                    "body",
+                    Some("SERIALIZER-SCOPE"),
+                    "normal",
+                    false,
+                    "[]",
+                    &[(ids[1], "to")],
+                )
+                .await
+                .into_result()
+                .expect("create message");
+                assert!(row.id.is_some(), "created message must include id");
+            }
+        });
+        let seen = SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow().clone());
+        assert_eq!(
+            seen.len(),
+            3,
+            "one post-commit probe per fresh send: {seen:?}"
+        );
+        // Another test in this process may hold the serializer at a probe
+        // instant; this call never does, so at least one probe sees it free.
+        // Holding the guard through the probe makes every entry `true`.
+        assert!(
+            seen.iter().any(|locked| !locked),
+            "every post-commit probe ran with the message serializer still held: {seen:?}"
         );
     }
 
