@@ -19,8 +19,10 @@
 //! br-8j6cb adds non-destructive message archive healing on this same worker.
 //! File-backed mailboxes enable it by default; set
 //! `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED=false` to disable it. Bounded recent
-//! catch-up and rotating history passes run at most once per minute, without
-//! accelerating the configured reporting/pruning cadence. Repair never sends
+//! catch-up and rotating history passes run once per minute in steady state;
+//! while a pass exhausts its repair budget the next pass follows after one
+//! second until the backlog clears. Neither accelerates the configured
+//! reporting/pruning cadence. Repair never sends
 //! another message or changes read/ack state. Its per-pass result is not a
 //! whole-mailbox or attachment-durability certificate.
 //!
@@ -90,6 +92,26 @@ fn maintenance_poll_interval(report_interval: Duration, repair_enabled: bool) ->
 
 fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
     elapsed.is_none_or(|elapsed| elapsed >= interval)
+}
+
+/// Pause before the next message-repair pass while a pass keeps exhausting its
+/// repair budget (a real DB-ahead backlog, e.g. archive writes that were still
+/// queued when the process was killed).
+const REPAIR_CATCH_UP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Sleep before the next worker pass. A pass that exhausted its repair budget
+/// left known work behind, so the next one follows after
+/// [`REPAIR_CATCH_UP_POLL_INTERVAL`] instead of the steady-state poll: at 4
+/// repairs per pass, a once-per-minute cadence healed ~20 messages in five
+/// minutes, so a crash that lost a busy queue's archive writes stayed
+/// DB-ahead for tens of minutes. Reporting and pruning keep their own
+/// `report_is_due` schedule.
+fn next_poll_interval(poll_interval: Duration, repair_backlog: bool) -> Duration {
+    if repair_backlog {
+        REPAIR_CATCH_UP_POLL_INTERVAL.min(poll_interval)
+    } else {
+        poll_interval
+    }
 }
 
 /// Start the retention/quota/message-reconciliation worker when needed.
@@ -232,6 +254,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             }
         }
 
+        let mut message_repair_backlog = false;
         if message_repair_enabled {
             let mut retire_pool = false;
             if let Some(live_pool) = pool.as_ref() {
@@ -244,6 +267,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                     &SHUTDOWN,
                 ) {
                     Ok(report) => {
+                        message_repair_backlog = report.budget_exhausted;
                         if report.scanned > 0 || report.interrupted {
                             info!(
                                 target: "maintenance",
@@ -373,7 +397,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             last_report = Some(Instant::now());
         }
 
-        if sleep_with_shutdown(poll_interval) {
+        if sleep_with_shutdown(next_poll_interval(poll_interval, message_repair_backlog)) {
             return;
         }
     }
@@ -1327,6 +1351,23 @@ mod tests {
         );
         assert_eq!(selected.max_connections, 1);
         assert!(!selected.run_migrations);
+    }
+
+    #[test]
+    fn repair_backlog_shortens_only_the_next_pass_pause() {
+        let poll = maintenance_poll_interval(Duration::from_secs(3600), true);
+        // Steady state keeps the once-per-minute cadence.
+        assert_eq!(next_poll_interval(poll, false), Duration::from_secs(60));
+        // A pass that exhausted its repair budget is followed within a second.
+        assert_eq!(next_poll_interval(poll, true), Duration::from_secs(1));
+        // Never longer than the configured poll.
+        let fast_poll = Duration::from_millis(250);
+        assert_eq!(next_poll_interval(fast_poll, true), fast_poll);
+        // Reporting stays on its own interval regardless of catch-up passes.
+        assert!(!report_is_due(
+            Some(REPAIR_CATCH_UP_POLL_INTERVAL),
+            Duration::from_secs(3600)
+        ));
     }
 
     #[test]
