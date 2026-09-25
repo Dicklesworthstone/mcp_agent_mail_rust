@@ -165,6 +165,19 @@ pub fn invalidate_search_cache(trigger: InvalidationTrigger) {
     }
 }
 
+/// A message (or a message edit) was committed to the source database.
+///
+/// Delivery never writes the lexical index: `search_v3::search_database`
+/// catches the index up from the committed rows (change clock + marker)
+/// before every query, so an index commit per delivery only added a fresh
+/// connection and a Tantivy commit (several fdatasyncs) to the reply path —
+/// more than half of a steady-state single send (br-kp1in.32). Cached result
+/// sets must still be dropped now, or they keep serving pre-delivery
+/// false-negatives until their TTL expires (GH#227).
+pub fn note_message_ingested() {
+    invalidate_search_cache(InvalidationTrigger::SourceIngest);
+}
+
 /// Test-only: current epoch of the (force-initialized) global search cache,
 /// so sibling modules can assert that a delivery path bumped it (GH#227).
 #[cfg(test)]
@@ -5214,11 +5227,10 @@ mod tests {
     /// different database — otherwise cached pre-delivery result sets keep
     /// serving confident false-negatives until the TTL expires.
     #[test]
-    fn gh227_index_message_invalidates_search_cache_without_bridge() {
+    fn gh227_message_ingestion_invalidates_search_cache_without_bridge() {
         let cache = global_search_cache();
         let epoch_before = cache.current_epoch();
-        let result = crate::search_v3::index_message(":memory:", 733);
-        assert!(result.is_ok(), "index_message must not fail the send path");
+        note_message_ingested();
         assert!(
             cache.current_epoch() > epoch_before,
             "ingestion must bump the search cache epoch regardless of bridge state"

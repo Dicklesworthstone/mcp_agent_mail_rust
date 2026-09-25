@@ -618,6 +618,9 @@ impl WarmWorker {
 pub enum InvalidationTrigger {
     /// Index was updated with new documents.
     IndexUpdate,
+    /// A message was committed to the source database; the lexical index
+    /// catches up on the next query.
+    SourceIngest,
     /// Index was rebuilt from scratch.
     IndexRebuild,
     /// Embedding model changed.

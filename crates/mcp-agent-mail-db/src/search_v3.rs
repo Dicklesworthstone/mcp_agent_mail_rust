@@ -1389,13 +1389,6 @@ fn acquire_writer_with_retry(
     }
 }
 
-fn with_tantivy_writer<T>(
-    bridge: &TantivyBridge,
-    operation: impl FnOnce(&mut tantivy::IndexWriter) -> Result<T, String>,
-) -> Result<T, String> {
-    with_tantivy_writer_policy(bridge, WriterBusyPolicy::Retry, operation)
-}
-
 fn with_tantivy_writer_policy<T>(
     bridge: &TantivyBridge,
     busy: WriterBusyPolicy,
@@ -1427,105 +1420,9 @@ fn with_tantivy_writer_policy<T>(
     result
 }
 
-/// Index a committed message from its explicit source mailbox.
-///
-/// Returns `Ok(true)` if indexed, `Ok(false)` when the bridge is absent, busy,
-/// or bound to another source, and `Err` on write failure.
-///
-/// This is intentionally fire-and-forget safe: callers should not fail the
-/// message send operation if indexing fails.
-pub fn index_message(db_url: &str, message_id: i64) -> Result<bool, String> {
-    index_messages_batch(db_url, &[message_id]).map(|count| count != 0)
-}
-
-/// Index committed messages only into the bridge bound to their source file.
-///
-/// More efficient than calling [`index_message`] repeatedly — uses a single
-/// source transaction, writer and commit for the entire batch. Read the current
-/// projections from that transaction: delayed notifications must not overwrite
-/// a newer document with an old caller-owned copy that has the same numeric ID.
-pub fn index_messages_batch(db_url: &str, message_ids: &[i64]) -> Result<usize, String> {
-    if message_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let result = (|| {
-        let Some(bridge) = get_bridge() else {
-            return Ok(0);
-        };
-        // Delivery has already committed its row and change-clock increment.
-        // Never make that successful delivery wait for a corpus rebuild; the
-        // next search observes the clock and catches up this skipped update.
-        let _source_guard = match bridge.source_operation.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(0),
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        };
-        let Some(state) = read_backfill_state(&bridge) else {
-            return Ok(0);
-        };
-        let Some(db_path) = resolve_search_sqlite_path_from_database_url(db_url) else {
-            return Ok(0);
-        };
-        if state.db_path != db_path
-            || sqlite_file_backfill_fingerprint(&db_path)
-                .is_none_or(|current| !same_backfill_source_file(state.db_fingerprint, current))
-        {
-            return Ok(0);
-        }
-        let conn = open_backfill_conn(&db_path)?;
-        conn.execute_sync("BEGIN DEFERRED", &[])
-            .map_err(|error| format!("ingestion source transaction: {error}"))?;
-        if crate::queries::db_generation_id_conn(&conn) != state.db_generation {
-            return Ok(0);
-        }
-        let count = with_tantivy_writer(&bridge, |writer| {
-            let mut count = 0;
-            for &message_id in message_ids {
-                let rows = conn
-                    .query_sync(
-                        "SELECT m.id, m.project_id, p.slug, a.name, m.subject, m.body_md, \
-                         m.thread_id, m.importance, m.created_ts FROM messages m \
-                         JOIN projects p ON p.id = m.project_id \
-                         JOIN agents a ON a.id = m.sender_id WHERE m.id = ?",
-                        &[Value::BigInt(message_id)],
-                    )
-                    .map_err(|error| format!("ingestion source row: {error}"))?;
-                let Some(row) = rows.first() else {
-                    continue;
-                };
-                let message = (|| -> Result<IndexableMessage, sqlmodel_core::error::Error> {
-                    Ok(IndexableMessage {
-                        id: row.get_as(0)?,
-                        project_id: row.get_as(1)?,
-                        project_slug: row.get_as(2)?,
-                        sender_name: row.get_as(3)?,
-                        subject: row.get_as(4)?,
-                        body_md: row.get_as(5)?,
-                        thread_id: row.get_as(6)?,
-                        importance: row.get_as(7)?,
-                        created_ts: row.get_as(8)?,
-                    })
-                })()
-                .map_err(|error| format!("ingestion source projection: {error}"))?;
-                upsert_indexable_message(writer, bridge.handles(), &message)?;
-                count += 1;
-            }
-            writer
-                .commit()
-                .map_err(|error| format!("Tantivy commit error: {error}"))?;
-            Ok(count)
-        })?;
-        refresh_index_health_metrics(&bridge);
-        Ok(count)
-    })();
-    // GH#227: even a foreign source, absent bridge, or failed write invalidates
-    // cached results. The next query can backfill from the committed source.
-    crate::search_service::invalidate_search_cache(
-        crate::search_cache::InvalidationTrigger::IndexUpdate,
-    );
-    result
-}
+// Delivery does not write this index (br-kp1in.32): `search_database` catches
+// it up from the committed source before every query, and
+// `search_service::note_message_ingested` drops cached result sets (GH#227).
 
 // ── Startup backfill ─────────────────────────────────────────────────────
 
@@ -1826,12 +1723,14 @@ fn backfill_into_bridge_locked_with_opener(
         // legitimately yield Skip here.
         match choose_backfill_plan(&conn, db_stats, index_stats)? {
             BackfillPlan::FullRebuild => {
-                // br-kp1in.18: live indexing skips a delivery while another
-                // operation holds the source lock, leaving holes above the
-                // marker that the tail count reads as damage. Rows up to the
-                // marker are unchanged (append-only clock) and were fully
-                // indexed when it was written, so re-ingesting everything after
-                // it repairs the holes; upserts make overlap harmless.
+                // br-kp1in.18: indexes written by versions that indexed some
+                // deliveries live and skipped others (source lock busy) have
+                // holes above the marker that the tail count reads as damage.
+                // (Delivery no longer writes the index, br-kp1in.32, so new
+                // holes do not arise.) Rows up to the marker are unchanged
+                // (append-only clock) and were fully indexed when it was
+                // written, so re-ingesting everything after it repairs the
+                // holes; upserts make overlap harmless.
                 marker_resume_plan(&conn, db_stats, previous_state.as_ref())?
                     .unwrap_or(BackfillPlan::FullRebuild)
             }
@@ -2854,24 +2753,6 @@ mod tests {
     }
 
     #[test]
-    fn index_message_without_bridge_returns_false() {
-        // When the global bridge is not initialized, index_message should
-        // gracefully return Ok(false) rather than error.
-        // If another test already initialized the process-global bridge,
-        // index_message may legitimately return Ok(true) instead.
-        let msg = make_indexable(1, "Test", "Body");
-        let result = index_message(":memory:", msg.id);
-        // Either Ok(false) (bridge not set) or Ok(true) (bridge set by another test).
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn index_messages_batch_empty_returns_zero() {
-        let result = index_messages_batch(":memory:", &[]);
-        assert_eq!(result, Ok(0));
-    }
-
-    #[test]
     fn busy_writer_fails_fast_only_under_the_fail_fast_policy() {
         // br-kp1in.18: the CLI's live refresh used to sleep through five
         // backoffs (1.55 s) for a writer the running server never releases.
@@ -2920,7 +2801,7 @@ mod tests {
         let handles = bridge.handles();
         for id in [301_i64, 302_i64] {
             let msg = make_indexable(id, "Retained writer", "Body");
-            with_tantivy_writer(&bridge, |writer| {
+            with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
                 upsert_indexable_message(writer, handles, &msg)?;
                 writer
                     .commit()
@@ -2952,7 +2833,7 @@ mod tests {
         let handles = bridge.handles();
 
         let stale = make_indexable(401, "Uncommitted casualty", "Body");
-        let err = with_tantivy_writer(&bridge, |writer| {
+        let err = with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
             upsert_indexable_message(writer, handles, &stale)?;
             Err::<(), String>("simulated failure after staging a doc".to_string())
         });
@@ -2963,7 +2844,7 @@ mod tests {
         );
 
         let msg = make_indexable(402, "Fresh start", "Body");
-        with_tantivy_writer(&bridge, |writer| {
+        with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
             upsert_indexable_message(writer, handles, &msg)?;
             writer
                 .commit()
@@ -3630,21 +3511,23 @@ mod tests {
         }
         init_bridge(index_a.path()).unwrap();
         backfill_from_db(&path_a).unwrap();
-        let bridge_a = get_bridge().unwrap();
-        let marker = std::fs::read(backfill_state_path(&bridge_a)).unwrap();
-        let meta = std::fs::read(index_a.path().join("meta.json")).unwrap();
-        assert!(!index_message(&path_b, 1).unwrap());
-        assert_eq!(
-            std::fs::read(backfill_state_path(&bridge_a)).unwrap(),
-            marker
-        );
-        assert_eq!(
-            std::fs::read(index_a.path().join("meta.json")).unwrap(),
-            meta
-        );
+        let search_a = |text: &str| {
+            search_database(
+                &path_a,
+                index_a.path(),
+                &PlannerQuery {
+                    text: text.to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
 
-        // Nullable threads and empty subjects are read from the committed row,
-        // not supplied by the notification that requests indexing.
+        // Delivery writes no index (br-kp1in.32). The query path catches up
+        // from the committed row, including its nullable thread and empty
+        // subject.
         conn_a
             .execute_sync(
                 "INSERT INTO messages (id, project_id, sender_id, subject, body_md, \
@@ -3652,35 +3535,19 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert!(index_message(&path_a, 2).unwrap());
-        assert_eq!(backfill_from_db(&path_a).unwrap(), (0, 2));
-        let fresh = bridge_a.search(&PlannerQuery {
-            text: "freshbody".to_string(),
-            doc_kind: DocKind::Message,
-            ..Default::default()
-        });
+        let fresh = search_a("freshbody");
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].id, 2);
         assert_eq!(fresh[0].thread_id, None);
+        // An edit of a committed row is caught up the same way.
         conn_a
             .execute_sync(
                 "UPDATE messages SET body_md = 'latestbody' WHERE id = 2",
                 &[],
             )
             .unwrap();
-        assert!(index_message(&path_a, 2).unwrap());
-        assert!(!index_message(&path_a, 999).unwrap());
         for (text, expected) in [("latestbody", 1), ("freshbody", 0)] {
-            assert_eq!(
-                bridge_a
-                    .search(&PlannerQuery {
-                        text: text.to_string(),
-                        doc_kind: DocKind::Message,
-                        ..Default::default()
-                    })
-                    .len(),
-                expected
-            );
+            assert_eq!(search_a(text).len(), expected, "query {text}");
         }
         backfill_from_db(&path_a).unwrap();
 
@@ -3724,7 +3591,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_ingestion_skips_busy_rebuild_and_search_catches_up() {
+    fn delivery_writes_no_index_and_search_catches_up() {
         let _guard = BRIDGE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3757,18 +3624,15 @@ mod tests {
         std::thread::scope(|scope| {
             let rebuild_guard = bridge.source_operation.lock().unwrap();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            let source_path = &path;
             let worker = scope.spawn(move || {
-                sender.send(index_message(source_path, 2)).unwrap();
+                crate::search_service::note_message_ingested();
+                sender.send(()).unwrap();
             });
             let completed = receiver.recv_timeout(std::time::Duration::from_secs(5));
             // Release even on timeout so a regression cannot orphan the worker.
             drop(rebuild_guard);
             worker.join().unwrap();
-            assert_eq!(
-                completed.expect("delivery must complete while rebuild owns the guard"),
-                Ok(false)
-            );
+            completed.expect("delivery must complete while rebuild owns the guard");
         });
         assert!(crate::search_service::global_search_cache_epoch_for_tests() > epoch);
         assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
@@ -3865,16 +3729,20 @@ mod tests {
         }
     }
 
-    /// br-kp1in.18: deliveries skipped by live indexing (source lock busy)
-    /// leave holes above the marker; the next backfill re-ingests only the rows
-    /// after the marker instead of rebuilding the whole index, unless the
-    /// marker itself recorded an incomplete index.
+    /// br-kp1in.18 / br-kp1in.32: deliveries write no index, so rows appended
+    /// after the marker leave the index a clean prefix and the next backfill
+    /// appends only them. An index written by an older version (which indexed
+    /// some deliveries live and skipped others) has holes above the marker:
+    /// it resumes after a complete marker instead of rebuilding, and never
+    /// trusts an incomplete one.
     #[test]
-    fn skipped_live_deliveries_resume_from_marker_instead_of_full_rebuild() {
+    fn unindexed_deliveries_resume_from_marker_instead_of_full_rebuild() {
         let _guard = BRIDGE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for marker_complete in [true, false] {
+        for (marker_complete, legacy_hole) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
             reset_bridge_for_tests();
             let source = tempfile::tempdir().unwrap();
             let index = tempfile::tempdir().unwrap();
@@ -3914,14 +3782,31 @@ mod tests {
                 )
                 .unwrap();
             }
-            // Deliveries 4 and 5 were skipped while the source lock was busy;
-            // 6 was indexed live.
-            assert_eq!(index_message(&path, 6), Ok(true));
-            let expected = if marker_complete { (3, 0) } else { (6, 0) };
+            // Deliveries 4..=6 wrote no index (br-kp1in.32). The legacy shape
+            // is what an older version left behind: 6 indexed live, 4 and 5
+            // skipped.
+            if legacy_hole {
+                let handles = bridge.handles();
+                let live = make_indexable(6, "appended6", "appended body 6");
+                with_tantivy_writer_policy(&bridge, WriterBusyPolicy::Retry, |writer| {
+                    upsert_indexable_message(writer, handles, &live)?;
+                    writer
+                        .commit()
+                        .map_err(|e| format!("Tantivy commit error: {e}"))?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let expected = if legacy_hole && !marker_complete {
+                (6, 0)
+            } else {
+                (3, 0)
+            };
             assert_eq!(
                 backfill_from_db(&path).unwrap(),
                 expected,
-                "marker_complete={marker_complete}: resume after the marker, never trust an incomplete one"
+                "marker_complete={marker_complete} legacy_hole={legacy_hole}: append a clean \
+                 prefix; resume a holed index after a complete marker, never trust an incomplete one"
             );
             let hits = search_database(
                 &path,

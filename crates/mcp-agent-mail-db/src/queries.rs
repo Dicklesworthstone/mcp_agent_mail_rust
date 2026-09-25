@@ -7715,24 +7715,8 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(pool, &row) {
-        tracing::warn!(
-            message_id = row.id.unwrap_or_default(),
-            error = %error,
-            "message committed but incremental search indexing failed"
-        );
-    }
+    crate::search_service::note_message_ingested();
     Outcome::Ok(row)
-}
-
-fn index_created_message_best_effort(
-    pool: &DbPool,
-    row: &MessageRow,
-) -> std::result::Result<bool, String> {
-    let Some(message_id) = row.id else {
-        return Ok(false);
-    };
-    crate::search_v3::index_message(pool.sqlite_path(), message_id)
 }
 
 /// Elect the next canonical message id durably inside the caller's write

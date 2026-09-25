@@ -3043,7 +3043,7 @@ pub async fn force_release_file_reservation(
                     &message.subject,
                     &message.body_md,
                 );
-                crate::messaging::enqueue_message_lexical_index(pool.sqlite_path(), message_id);
+                mcp_agent_mail_db::search_service::note_message_ingested();
                 let all_recipient_names = vec![holder_agent_name.clone()];
                 let msg_json = serde_json::json!({
                     "id": message_id,

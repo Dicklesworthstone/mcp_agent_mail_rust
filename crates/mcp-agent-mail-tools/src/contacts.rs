@@ -507,7 +507,7 @@ async fn send_contact_notice(
         &message.subject,
         &message.body_md,
     );
-    crate::messaging::enqueue_message_lexical_index(pool.sqlite_path(), message.id.unwrap_or(0));
+    mcp_agent_mail_db::search_service::note_message_ingested();
 
     // Write message to archive
     let config = mcp_agent_mail_core::Config::get();

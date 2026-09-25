@@ -127,25 +127,6 @@ pub(crate) fn enqueue_message_semantic_index(
     );
 }
 
-/// Index a message into the Tantivy lexical search index (fire-and-forget).
-///
-/// Runs synchronously but is best-effort: failures are logged, never propagated.
-pub(crate) fn enqueue_message_lexical_index(db_path: &str, message_id: i64) {
-    match mcp_agent_mail_db::search_v3::index_message(db_path, message_id) {
-        Ok(true) => {
-            tracing::debug!(message_id, "indexed message in Tantivy");
-        }
-        Ok(false) => {} // bridge not initialized, silent skip
-        Err(e) => {
-            tracing::warn!(
-                message_id,
-                error = %e,
-                "failed to index message in Tantivy (non-fatal)"
-            );
-        }
-    }
-}
-
 pub(crate) fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) {
     let _ = mcp_agent_mail_db::search_service::enqueue_semantic_document(
         mcp_agent_mail_db::search_planner::DocKind::Agent,
@@ -2911,7 +2892,8 @@ effective_free_bytes={free}"
     // them exactly once. This is the at-most-once archive-dispatch guarantee.
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, message_id, &message.subject, &message.body_md);
-        enqueue_message_lexical_index(pool.sqlite_path(), message_id);
+        // No lexical index write on the reply path: search catches up on read.
+        mcp_agent_mail_db::search_service::note_message_ingested();
 
         // Emit notification signals for to/cc recipients only (never bcc).
         //
@@ -3925,7 +3907,7 @@ effective_free_bytes={free}"
     // exactly once (at-most-once archive dispatch).
     if !idempotent_replay {
         enqueue_message_semantic_index(project_id, reply_id, &reply.subject, &reply.body_md);
-        enqueue_message_lexical_index(pool.sqlite_path(), reply_id);
+        mcp_agent_mail_db::search_service::note_message_ingested();
 
         // Emit notification signals for to/cc recipients only (never bcc).
         // Mirrors the send_message notification logic for parity with Python.
@@ -9002,25 +8984,5 @@ mod tests {
         args.insert("cc".to_string(), json!({"name": "Agent"}));
         let result = normalize_send_message_cc_bcc_argument(&mut args, "cc");
         assert!(result.is_err());
-    }
-
-    // ── enqueue_message_lexical_index non-fatal behavior ────────────
-
-    #[test]
-    fn enqueue_lexical_index_does_not_panic() {
-        // When the global Tantivy bridge is not initialized,
-        // enqueue_message_lexical_index should silently no-op.
-        enqueue_message_lexical_index(":memory:", 1);
-        // If we reach here, the function didn't panic.
-    }
-
-    #[test]
-    fn enqueue_lexical_index_missing_source_does_not_panic() {
-        enqueue_message_lexical_index("", 2);
-    }
-
-    #[test]
-    fn enqueue_lexical_index_zero_id_does_not_panic() {
-        enqueue_message_lexical_index(":memory:", 0);
     }
 }
