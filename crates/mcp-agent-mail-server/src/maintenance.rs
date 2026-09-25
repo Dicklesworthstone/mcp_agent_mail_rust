@@ -2182,8 +2182,13 @@ mod tests {
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
+        // Fixture commits must not spawn git's own detached auto-maintenance
+        // (git 2.55 runs `git maintenance run --auto --quiet --detach` after a
+        // commit): it holds objects/maintenance.lock, and a test that runs
+        // `run_maintenance` right after races that lock under load.
         let output = Command::new("git")
             .current_dir(dir)
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .output()
             .expect("spawn git");
