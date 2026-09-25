@@ -5791,7 +5791,7 @@ mod tests {
                     crate::ensure_project(&ctx, project_key.clone(), None)
                         .await
                         .expect("ensure project");
-                    for name in ["BlueLake", "RedPeak"] {
+                    for name in ["BlueLake", "RedPeak", "GreenCastle"] {
                         crate::register_agent(
                             &ctx,
                             project_key.clone(),
@@ -5808,14 +5808,16 @@ mod tests {
                         .await
                         .expect("register agent");
                     }
-                    crate::set_contact_policy(
-                        &ctx,
-                        project_key.clone(),
-                        "RedPeak".to_string(),
-                        "contacts_only".to_string(),
-                    )
-                    .await
-                    .expect("recipient requires approved contacts");
+                    for recipient in ["RedPeak", "GreenCastle"] {
+                        crate::set_contact_policy(
+                            &ctx,
+                            project_key.clone(),
+                            recipient.to_string(),
+                            "contacts_only".to_string(),
+                        )
+                        .await
+                        .expect("recipient requires approved contacts");
+                    }
                     crate::request_contact(
                         &ctx,
                         project_key.clone(),
@@ -5843,12 +5845,12 @@ mod tests {
                     .await
                     .expect("approve contact");
 
-                    let send = |subject: &str| {
+                    let send = |recipient: &str, subject: &str| {
                         send_message(
                             &ctx,
                             project_key.clone(),
                             "BlueLake".to_string(),
-                            vec!["RedPeak".to_string()],
+                            vec![recipient.to_string()],
                             subject.to_string(),
                             "body".to_string(),
                             None,
@@ -5866,7 +5868,18 @@ mod tests {
                         )
                     };
                     // Positive control: the approved contact may send.
-                    send("approved contact").await.expect("approved send");
+                    send("RedPeak", "approved contact")
+                        .await
+                        .expect("approved send");
+                    // Negative control: a recipient with no approved link is
+                    // still refused by policy.
+                    let refused = send("GreenCastle", "no contact")
+                        .await
+                        .expect_err("an unapproved recipient is refused");
+                    assert!(
+                        format!("{refused:?}").contains("CONTACT_REQUIRED"),
+                        "an unapproved recipient must be a policy refusal: {refused:?}"
+                    );
 
                     // The approved-contact lookup now fails.
                     let pool = get_db_pool().expect("get test pool");
@@ -5880,7 +5893,7 @@ mod tests {
                     drop(conn);
                     drop(pool);
 
-                    let error = send("lookup failure")
+                    let error = send("RedPeak", "lookup failure")
                         .await
                         .expect_err("a failed contact lookup must fail the send");
                     let rendered = format!("{error:?}");
