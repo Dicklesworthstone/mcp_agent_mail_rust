@@ -7426,16 +7426,20 @@ fn promote_executed_experience_to_open_for_resolution(
         return true;
     }
 
-    let cx = runtime_request_cx(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
-        &cx,
-        pool,
-        experience_id,
-        ExperienceState::Open,
-        now_micros,
-        None,
-        None,
-    )) {
+    // Reached from tool-handler post-processing (message outcomes) as well as
+    // the operator sweep, so it must not nest a bridge (br-3es3d).
+    match atc_ledger_block_on(|cx| async move {
+        mcp_agent_mail_db::queries::transition_atc_experience(
+            &cx,
+            pool,
+            experience_id,
+            ExperienceState::Open,
+            now_micros,
+            None,
+            None,
+        )
+        .await
+    }) {
         asupersync::Outcome::Ok(()) => true,
         asupersync::Outcome::Err(error) => {
             tracing::debug!(
@@ -13733,6 +13737,34 @@ fn reset_atc_build_slot_observation_cache_for_test() {
     guard.1.clear();
 }
 
+/// Drive an ATC ledger operation from the synchronous observation recorders.
+///
+/// The recorders run in tool-handler post-processing, which a
+/// `fastmcp_core::block_on` bridge is already polling on this thread, and a
+/// nested `block_on` panics ("nested fastmcp_core::runtime::block_on is not
+/// supported"): with ATC live writes enabled every `send_message` failed with an
+/// internal error (br-3es3d). Build and drive the future on a scoped worker
+/// thread instead, as `dispatch` does for the same constraint. The context is
+/// minted on that worker so its timers and I/O belong to the runtime the
+/// worker drives, not to the caller's runtime, which is parked in `join`.
+fn atc_ledger_block_on<T, F>(make_future: impl FnOnce(Cx) -> F + Send) -> T
+where
+    F: std::future::Future<Output = T>,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("atc-ledger".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn_scoped(scope, || {
+                block_on(make_future(runtime_request_cx(Budget::INFINITE)))
+            })
+            .expect("spawn ATC ledger thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
+
 fn append_atc_hot_path_observation_row(
     pool: &mcp_agent_mail_db::DbPool,
     row: &ExperienceRow,
@@ -13744,10 +13776,9 @@ fn append_atc_hot_path_observation_row(
     let started_at = Instant::now();
     let stratum_key = atc_experience_stratum_key(row);
     let feature_vector_size = atc_feature_vector_size(row);
-    let cx = runtime_request_cx(Budget::INFINITE);
-    match block_on(mcp_agent_mail_db::queries::append_atc_experience(
-        &cx, pool, row,
-    )) {
+    match atc_ledger_block_on(|cx| async move {
+        mcp_agent_mail_db::queries::append_atc_experience(&cx, pool, row).await
+    }) {
         asupersync::Outcome::Ok(stored) => {
             let latency_micros = atc_elapsed_micros(started_at);
             mcp_agent_mail_core::global_metrics()
@@ -14714,12 +14745,12 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     }
 
     let started_at = Instant::now();
-    let cx = runtime_request_cx(Budget::INFINITE);
     let mut experience = None;
     for attempt in 1..=2_u8 {
-        match block_on(
-            mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, pool, message_id),
-        ) {
+        match atc_ledger_block_on(|cx| async move {
+            mcp_agent_mail_db::queries::fetch_message_sent_atc_experience(&cx, pool, message_id)
+                .await
+        }) {
             asupersync::Outcome::Ok(Some(row)) => {
                 experience = Some(row);
                 break;
@@ -14787,9 +14818,9 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
     }
 
     let Some(experience) = experience else {
-        match block_on(mcp_agent_mail_db::queries::get_message(
-            &cx, pool, message_id,
-        )) {
+        match atc_ledger_block_on(|cx| async move {
+            mcp_agent_mail_db::queries::get_message(&cx, pool, message_id).await
+        }) {
             asupersync::Outcome::Ok(_) => {
                 tracing::debug!(
                     event = "atc.hot_path.note_ack",
@@ -14886,12 +14917,19 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                 return;
             }
             let outcome = apply_outcome("resolved_after_execute_promote");
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                &cx,
-                pool,
-                experience.experience_id,
-                &outcome,
-            )) {
+            let experience_id = experience.experience_id;
+            match atc_ledger_block_on(|cx| {
+                let outcome = &outcome;
+                async move {
+                    mcp_agent_mail_db::queries::resolve_atc_experience(
+                        &cx,
+                        pool,
+                        experience_id,
+                        outcome,
+                    )
+                    .await
+                }
+            }) {
                 asupersync::Outcome::Ok(()) => {
                     mcp_agent_mail_core::global_metrics()
                         .atc
@@ -14957,12 +14995,19 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         }
         ExperienceState::Open => {
             let outcome = apply_outcome("resolved_from_open");
-            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                &cx,
-                pool,
-                experience.experience_id,
-                &outcome,
-            )) {
+            let experience_id = experience.experience_id;
+            match atc_ledger_block_on(|cx| {
+                let outcome = &outcome;
+                async move {
+                    mcp_agent_mail_db::queries::resolve_atc_experience(
+                        &cx,
+                        pool,
+                        experience_id,
+                        outcome,
+                    )
+                    .await
+                }
+            }) {
                 asupersync::Outcome::Ok(()) => {
                     mcp_agent_mail_core::global_metrics()
                         .atc
@@ -15043,14 +15088,19 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
                     )
                 };
                 let outcome = apply_outcome(note);
-                match block_on(
-                    mcp_agent_mail_db::queries::overwrite_resolved_atc_experience_outcome(
-                        &cx,
-                        pool,
-                        experience.experience_id,
-                        &outcome,
-                    ),
-                ) {
+                let experience_id = experience.experience_id;
+                match atc_ledger_block_on(|cx| {
+                    let outcome = &outcome;
+                    async move {
+                        mcp_agent_mail_db::queries::overwrite_resolved_atc_experience_outcome(
+                            &cx,
+                            pool,
+                            experience_id,
+                            outcome,
+                        )
+                        .await
+                    }
+                }) {
                     asupersync::Outcome::Ok(()) => {
                         mcp_agent_mail_core::global_metrics()
                             .atc
