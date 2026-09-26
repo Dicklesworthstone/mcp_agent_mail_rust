@@ -7258,6 +7258,107 @@ fn head_update_refname(repo: &Repository) -> Result<String> {
         .map_or_else(|| "HEAD".to_string(), str::to_string))
 }
 
+/// A ref lockfile nobody holds open must be at least this old before it counts
+/// as the leftover of a dead writer (br-1l9mc). libgit2 and git keep the
+/// lockfile open for the whole reference transaction, so the only window in
+/// which a live lock is closed is git's close-then-rename, microseconds long.
+const STALE_REF_LOCK_MIN_AGE: Duration = Duration::from_secs(5);
+/// Without holder evidence (no `/proc`), only a lock this old is taken as dead.
+const STALE_REF_LOCK_MIN_AGE_UNPROBED: Duration = Duration::from_secs(600);
+
+/// PIDs holding `path` open, or `None` when no holder evidence is available.
+///
+/// Compares `/proc/*/fd` link targets without touching their filesystems (a
+/// stat into a dead FUSE mount can block forever, br-piwvy). Other users'
+/// descriptors are unreadable, and the archive is private to its owner.
+#[cfg(target_os = "linux")]
+fn lock_file_holders(path: &Path) -> Option<Vec<u32>> {
+    let target = fs::canonicalize(path).ok()?;
+    let mut holders = Vec::new();
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .any(|fd| fs::read_link(fd.path()).is_ok_and(|link| link == target))
+        {
+            holders.push(pid);
+        }
+    }
+    Some(holders)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_file_holders(_path: &Path) -> Option<Vec<u32>> {
+    None
+}
+
+/// Move aside the lockfile of `refname` when it is the leftover of a writer
+/// that died inside a reference transaction (br-1l9mc): a regular file under
+/// the repository's git dir that no process holds open and that is older than
+/// [`STALE_REF_LOCK_MIN_AGE`]. Anything else fails closed. The lock is renamed
+/// into the git dir itself, never beside the ref, where Git would read it as a
+/// branch; it is never deleted.
+fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
+    let lock_path = repo.path().join(format!("{refname}.lock"));
+    if !path_is_nonsymlink_file(&lock_path)
+        || path_existing_prefix_has_symlink(&lock_path).unwrap_or(true)
+    {
+        return false;
+    }
+    let Some(identity) = git_lock_identity(&lock_path) else {
+        return false;
+    };
+    let min_age = match lock_file_holders(&lock_path) {
+        Some(holders) if holders.is_empty() => STALE_REF_LOCK_MIN_AGE,
+        Some(_) => return false,
+        None => STALE_REF_LOCK_MIN_AGE_UNPROBED,
+    };
+    let age = fs::symlink_metadata(&lock_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    if age.is_none_or(|age| age < min_age) {
+        return false;
+    }
+    let quarantine = next_startup_quarantine_path(
+        &repo
+            .path()
+            .join(format!("{}.lock", refname.replace('/', "-"))),
+        "stale-ref-lock",
+    );
+    // The decision was made on this exact file; a replaced lock is left alone.
+    if git_lock_identity(&lock_path).as_ref() != Some(&identity) {
+        return false;
+    }
+    match fs::rename(&lock_path, &quarantine) {
+        Ok(()) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                quarantine = %quarantine.display(),
+                age_secs = age.map_or(0, |age| age.as_secs()),
+                "[git-lock] quarantined a stale reference lock left by a dead writer"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                lock = %lock_path.display(),
+                "[git-lock] could not quarantine stale reference lock: {error}"
+            );
+            false
+        }
+    }
+}
+
 /// Create a commit object from a caller-built tree and atomically advance
 /// HEAD onto it.
 ///
@@ -7292,7 +7393,15 @@ where
     let mut tx = repo.transaction()?;
     // Hold the reference lock across tree-build + parent-read + ref-write:
     // this is the critical section another mcp-agent-mail process blocks on.
-    tx.lock_ref(&refname)?;
+    if let Err(error) = tx.lock_ref(&refname) {
+        // br-1l9mc: a writer killed inside this critical section leaves the
+        // ref lockfile behind, and every later commit would fail on it.
+        if error.code() != ErrorCode::Locked || !quarantine_stale_ref_lock(repo, &refname) {
+            return Err(error.into());
+        }
+        tx = repo.transaction()?;
+        tx.lock_ref(&refname)?;
+    }
     let Some(tree_oid) = build_tree(repo)? else {
         // Caller produced no changes (e.g. every path was already absent);
         // releasing the transaction without set_target leaves HEAD intact.
@@ -22313,6 +22422,80 @@ mod tests {
         assert!(
             repo.head().unwrap().peel_to_commit().is_ok(),
             "HEAD must be peelable after indexed-path recovery"
+        );
+    }
+
+    /// br-1l9mc: a writer killed inside the reference transaction leaves
+    /// `<ref>.lock`. The next commit moves an old, unheld lock aside instead of
+    /// failing on it forever, and leaves a fresh or held lock alone.
+    #[test]
+    fn commit_quarantines_only_a_stale_unheld_ref_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "stale-ref-lock").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let file_path = archive.root.join("agents/TestAgent/profile.json");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let rel = rel_path_cached(&archive.canonical_repo_root, &file_path).unwrap();
+        let commit = |version: u32| {
+            fs::write(
+                &file_path,
+                format!(r#"{{"name":"TestAgent","v":{version}}}"#),
+            )
+            .unwrap();
+            commit_paths_lockfree(&repo, &config, "ref lock", &[rel.as_str()])
+        };
+        commit(1).expect("initial commit");
+        let refname = repo
+            .head()
+            .unwrap()
+            .name()
+            .expect("head refname")
+            .to_string();
+        let lock_path = repo.path().join(format!("{refname}.lock"));
+        let quarantine_prefix = format!("{}.lock", refname.replace('/', "-"));
+        let quarantined = || {
+            fs::read_dir(repo.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&quarantine_prefix)
+                })
+                .count()
+        };
+        // Older than both thresholds, so the unprobed path agrees on it too.
+        let long_ago = SystemTime::now() - Duration::from_secs(700);
+
+        // A fresh lock is a live transaction as far as anyone can tell.
+        drop(fs::File::create(&lock_path).unwrap());
+        let error = commit(2).expect_err("a fresh ref lock blocks the commit");
+        assert!(error.to_string().contains("lock"), "{error}");
+        assert!(lock_path.exists());
+
+        // An old lock that a live process holds open is still live.
+        let held = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        held.set_modified(long_ago).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            commit(3).expect_err("a held ref lock blocks the commit");
+            assert!(lock_path.exists());
+        }
+        drop(held);
+
+        // Old and unheld: the leftover of a dead writer.
+        assert_eq!(quarantined(), 0);
+        let head_before = repo.head().unwrap().target();
+        commit(4).expect("the stale ref lock is moved aside and the commit lands");
+        assert!(!lock_path.exists());
+        assert_eq!(quarantined(), 1, "the lock is moved aside, not deleted");
+        assert_ne!(repo.head().unwrap().target(), head_before);
+        assert_eq!(
+            repo.branches(None).unwrap().count(),
+            1,
+            "Git does not read the quarantined lock as a branch"
         );
     }
 
