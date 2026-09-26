@@ -1629,6 +1629,16 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
+fn observe_live_lexical_source(pool: &DbPool) -> Result<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Ok(());
+    }
+    #[cfg(feature = "tantivy-engine")]
+    crate::search_v3::observe_live_source_revision(&lexical_backfill_database_url(pool))
+        .map_err(|err| map_bridge_bootstrap_error(&err))?;
+    Ok(())
+}
+
 fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
     let index_dir = direct_surface_index_dir(pool)?;
@@ -1655,9 +1665,13 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         && bridge_ready
         && has_run_lexical_backfill(&sqlite_key)?
     {
-        // Startup completion does not establish continuing freshness. This
-        // checks the durable source clock and only scans rows when it moved.
-        run_lexical_backfill_for_pool(pool)?;
+        // Startup completion does not establish continuing freshness, but every
+        // lexical query catches the index up itself (search_v3::search_database).
+        // Here only the source revision is observed, so a moved clock empties
+        // cached result sets before the cache is consulted. br-ekdk1: a full
+        // catch-up here ran twice per query and serialized every search under
+        // the init guard (search p50 ~2.8 s under sustained sends).
+        observe_live_lexical_source(pool)?;
         return Ok(());
     }
 
@@ -5776,6 +5790,95 @@ mod tests {
                 assert_eq!(std::fs::read(&meta).unwrap(), meta_before);
             });
         }
+        crate::search_v3::reset_bridge_for_tests();
+        reset_lexical_bootstrap_tracking();
+    }
+
+    /// br-ekdk1: the step before the result cache only observes the source
+    /// revision (a moved clock empties cached result sets) and indexes
+    /// nothing; the query's own catch-up in `search_database` finds the row.
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    fn bridge_readiness_observes_the_source_without_catching_up() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        reset_lexical_bootstrap_tracking();
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "observe.sqlite3");
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/search-observe")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let conn = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let insert = |id: i64, word: &str| {
+                conn.execute_sync(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES (?, ?, ?, ?, 'body', 1000000)",
+                    &[
+                        Value::BigInt(id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(sender.id.unwrap()),
+                        Value::Text(word.to_string()),
+                    ],
+                )
+                .unwrap();
+            };
+            let options = SearchOptions {
+                search_engine: Some(SearchEngine::Lexical),
+                ..Default::default()
+            };
+            insert(1, "kestrelone");
+            let first = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("kestrelone", project_id),
+                &options,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(first.results.len(), 1);
+
+            insert(2, "kestreltwo");
+            let bridge = crate::search_v3::get_bridge().unwrap();
+            let indexed = || {
+                bridge
+                    .search(&SearchQuery::messages("kestreltwo", project_id))
+                    .len()
+            };
+            let epoch_before = global_search_cache().current_epoch();
+            ensure_lexical_bridge_initialized(&pool).unwrap();
+            assert_eq!(indexed(), 0, "readiness indexes nothing");
+            assert!(
+                global_search_cache().current_epoch() > epoch_before,
+                "a moved source clock empties cached result sets"
+            );
+            let second = execute_search(
+                &cx,
+                &pool,
+                &SearchQuery::messages("kestreltwo", project_id),
+                &options,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(second.results.len(), 1, "the query's catch-up finds it");
+            assert_eq!(indexed(), 1);
+        });
         crate::search_v3::reset_bridge_for_tests();
         reset_lexical_bootstrap_tracking();
     }

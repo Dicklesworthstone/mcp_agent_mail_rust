@@ -1584,6 +1584,34 @@ pub(crate) fn search_private_snapshot(
     Ok(bridge.search(query))
 }
 
+/// Record the live source revision without indexing anything (br-ekdk1). A
+/// moved clock invalidates cached result sets, so the result cache may be
+/// consulted before [`search_database`] runs the query's own catch-up; the
+/// source is identified exactly as that catch-up identifies it.
+pub(crate) fn observe_live_source_revision(db_url: &str) -> Result<(), String> {
+    let Some(bridge) = get_bridge() else {
+        return Ok(());
+    };
+    let Some(db_path) = resolve_search_sqlite_path_from_database_url(db_url) else {
+        return Ok(());
+    };
+    if !bridge.publish_source_state {
+        return Ok(());
+    }
+    let conn = open_backfill_conn(&db_path)?;
+    let generation = crate::queries::db_generation_id_conn(&conn);
+    let clock = lexical_change_clock(&conn)?;
+    observe_lexical_source(
+        &bridge,
+        ObservedLexicalSource {
+            path: db_path,
+            generation,
+            clock,
+        },
+    );
+    Ok(())
+}
+
 /// Refresh and collect candidates while holding the same source operation
 /// lock. If another mailbox switched the global bridge after service bootstrap,
 /// use a private index rather than publishing this source into its directory.
