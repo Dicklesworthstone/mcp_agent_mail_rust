@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::query_assistance::{LexicalParser, ParseOutcome, extract_terms};
@@ -46,6 +47,14 @@ pub struct TantivyBridge {
     /// a Tantivy commit. The writer mutex alone ends too early to protect that
     /// publication or candidate retrieval from another local source.
     source_operation: Mutex<()>,
+    /// Single-flight search catch-up (br-ekdk1): catch-ups begun under
+    /// `source_operation`, and the start number of the latest one that
+    /// finished. A search that arrived when `catch_ups_started` was A may skip
+    /// its own catch-up once `catch_up_completed > A`: that catch-up opened
+    /// its snapshot after the search began, so it indexed every write that
+    /// completed before the search.
+    catch_ups_started: AtomicU64,
+    catch_up_completed: AtomicU64,
     /// Last source revision seen by this process. A marker refreshed by a
     /// different process cannot invalidate this process's result cache.
     observed_source: Mutex<Option<ObservedLexicalSource>>,
@@ -92,6 +101,8 @@ impl TantivyBridge {
             index,
             writer: Mutex::new(None),
             source_operation: Mutex::new(()),
+            catch_ups_started: AtomicU64::new(0),
+            catch_up_completed: AtomicU64::new(0),
             observed_source: Mutex::new(None),
             publish_source_state,
             handles,
@@ -110,6 +121,8 @@ impl TantivyBridge {
             index,
             writer: Mutex::new(None),
             source_operation: Mutex::new(()),
+            catch_ups_started: AtomicU64::new(0),
+            catch_up_completed: AtomicU64::new(0),
             observed_source: Mutex::new(None),
             publish_source_state: false,
             handles,
@@ -1623,6 +1636,7 @@ pub(crate) fn search_database(
     let Some(bridge) = get_bridge() else {
         return Ok(None);
     };
+    let arrival = bridge.catch_ups_started.load(Ordering::Acquire);
     let source_guard = bridge
         .source_operation
         .lock()
@@ -1634,8 +1648,14 @@ pub(crate) fn search_database(
         drop(source_guard);
         return search_private_snapshot(db_url, query).map(Some);
     }
-    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url) {
+    // Searches queued behind one catch-up share it (br-ekdk1) instead of each
+    // committing the index again in turn.
+    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(db_url)
+        && bridge.catch_up_completed.load(Ordering::Acquire) <= arrival
+    {
+        let started = bridge.catch_ups_started.fetch_add(1, Ordering::AcqRel) + 1;
         with_backfill_source_retry(|| backfill_into_bridge_locked(&bridge, db_url, None))?;
+        bridge.catch_up_completed.store(started, Ordering::Release);
     }
     Ok(Some(bridge.search(query)))
 }
@@ -3999,6 +4019,100 @@ mod tests {
         conn.execute_sync("UPDATE messages SET subject = 'edited' WHERE id = 3", &[])
             .unwrap();
         assert_eq!(backfill_from_db(&path).unwrap(), (12, 0));
+        reset_bridge_for_tests();
+    }
+
+    /// br-ekdk1: searches queued behind one catch-up share it and still see
+    /// every write that completed before they started; a search that arrives
+    /// after a catch-up finished runs its own.
+    #[test]
+    fn queued_searches_share_one_catch_up_and_later_searches_still_catch_up() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            source.path(),
+            &[(1, "seeded", "seeded body", "normal", "thread-one")],
+        );
+        let conn = DbConn::open_file(&path).unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[]).unwrap();
+        }
+        let insert = |id: i64, word: &str| {
+            conn.execute_sync(
+                &format!(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES ({id}, 1, 1, '{word}', '{word} body', {id}000000)"
+                ),
+                &[],
+            )
+            .unwrap();
+        };
+        let search = |path: &str, index_dir: &Path, word: &str| -> Vec<i64> {
+            search_database(
+                path,
+                index_dir,
+                &PlannerQuery {
+                    text: word.to_string(),
+                    doc_kind: DocKind::Message,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|hit| hit.id)
+            .collect()
+        };
+        init_bridge(index.path()).unwrap();
+        assert_eq!(search(&path, index.path(), "seeded"), vec![1]);
+        let bridge = get_bridge().unwrap();
+        let catch_ups = || bridge.catch_ups_started.load(Ordering::Acquire);
+        let before = catch_ups();
+
+        insert(2, "queued");
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let hold = bridge
+            .source_operation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let searchers: Vec<_> = (0..3)
+            .map(|_| {
+                let (path, index_dir, start) =
+                    (path.clone(), index.path().to_path_buf(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    search(&path, &index_dir, "queued")
+                })
+            })
+            .collect();
+        start.wait();
+        // Let all three record their arrival and block on the source lock.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(hold);
+        for searcher in searchers {
+            assert_eq!(
+                searcher.join().unwrap(),
+                vec![2],
+                "a write before the search is found"
+            );
+        }
+        assert_eq!(
+            catch_ups() - before,
+            1,
+            "one catch-up serves the queued searches"
+        );
+
+        // Negative: a search after that catch-up finished runs its own.
+        insert(3, "later");
+        assert_eq!(search(&path, index.path(), "later"), vec![3]);
+        assert_eq!(catch_ups() - before, 2);
         reset_bridge_for_tests();
     }
 
