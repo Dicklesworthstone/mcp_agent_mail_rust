@@ -1,0 +1,30 @@
+{
+ "cand": {
+  "binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/dae70a4b-c929-4271-8dbc-2866a572e980/scratchpad/rel-reflock/am",
+  "commits_before_kill": 10,
+  "commits_after_restart": 20,
+  "lock_still_present": false,
+  "quarantined": [
+   "refs-heads-master.lock.startup-quarantine-20260926_004611_000-2188848-000000"
+  ],
+  "lock_failures_in_log": 0,
+  "quarantine_log_lines": 1,
+  "send_errors_before": 0,
+  "send_errors_after": 0,
+  "sigterm_exit_in_grace": true,
+  "sigterm_secs": 2.7
+ },
+ "ctl": {
+  "binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/dae70a4b-c929-4271-8dbc-2866a572e980/scratchpad/rel-fohxo/am",
+  "commits_before_kill": 10,
+  "commits_after_restart": 10,
+  "lock_still_present": true,
+  "quarantined": [],
+  "lock_failures_in_log": 100,
+  "quarantine_log_lines": 0,
+  "send_errors_before": 0,
+  "send_errors_after": 0,
+  "sigterm_exit_in_grace": false,
+  "sigterm_secs": 60.0
+ }
+}
