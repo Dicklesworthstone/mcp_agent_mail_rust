@@ -1245,6 +1245,84 @@ fn marker_resume_plan(
     )
 }
 
+/// Id windows below the index maximum searched for missing messages, nearest
+/// first (see [`recent_hole_repair_plan`]).
+const RECENT_HOLE_WINDOWS: [i64; 2] = [64, 4096];
+
+/// An incremental plan that re-ingests from just below the lowest message the
+/// index lacks, when every missing message sits a little below the index
+/// maximum. Deliveries allocate ids before they commit, so a catch-up can index
+/// id N while N-1 is still in flight; N-1 then commits below the index maximum
+/// and reads as a hole, which used to cost a full rebuild under the source
+/// lock on every such race. Callers must already have proven the source
+/// append-only since the marker; upserts make re-ingested overlap harmless.
+fn recent_hole_repair_plan(
+    conn: &DbConn,
+    bridge: &TantivyBridge,
+    db: MessageStats,
+    index: MessageStats,
+) -> Result<Option<BackfillPlan>, String> {
+    // Only the append shape: an index holding an id the source lacks needs
+    // the rebuild's delete_all_documents.
+    let Ok(index_max_id) = i64::try_from(index.max_id) else {
+        return Ok(None);
+    };
+    if db.max_id < index.max_id {
+        return Ok(None);
+    }
+    let tail = fetch_db_tail_count(conn, index_max_id)?;
+    let Some(holes) = db
+        .count
+        .checked_sub(index.count.saturating_add(tail))
+        .filter(|holes| *holes > 0)
+    else {
+        return Ok(None);
+    };
+    let reader = manual_index_reader(bridge.index())
+        .map_err(|e| format!("backfill index reader error: {e}"))?;
+    let searcher = reader.searcher();
+    let id_field = bridge.handles().id;
+    for window in RECENT_HOLE_WINDOWS {
+        let rows = query_sync_with_lock_retry(
+            conn,
+            "backfill hole scan",
+            "SELECT id FROM messages WHERE id > ? AND id <= ? ORDER BY id",
+            &[
+                Value::BigInt(index_max_id.saturating_sub(window)),
+                Value::BigInt(index_max_id),
+            ],
+        )
+        .map_err(|e| format!("backfill hole scan failed: {e}"))?;
+        let mut missing = Vec::new();
+        for id in rows
+            .iter()
+            .filter_map(|row| row.get_named::<i64>("id").ok())
+        {
+            let Ok(id_u64) = u64::try_from(id) else {
+                return Ok(None);
+            };
+            let indexed = searcher
+                .search(
+                    &TermQuery::new(
+                        Term::from_field_u64(id_field, id_u64),
+                        IndexRecordOption::Basic,
+                    ),
+                    &Count,
+                )
+                .map_err(|e| format!("backfill hole lookup failed: {e}"))?;
+            if indexed == 0 {
+                missing.push(id);
+            }
+        }
+        if u64::try_from(missing.len()).is_ok_and(|found| found == holes) {
+            return Ok(missing.first().map(|lowest| BackfillPlan::Incremental {
+                start_after_id: lowest.saturating_sub(1),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn fetch_index_message_stats(bridge: &TantivyBridge) -> Result<MessageStats, String> {
     let reader = manual_index_reader(bridge.index())
         .map_err(|e| format!("backfill index reader error: {e}"))?;
@@ -1622,10 +1700,12 @@ fn backfill_into_bridge_locked_with_opener(
     }
 
     let db_generation = crate::queries::db_generation_id_conn(&conn);
+    // One read snapshot for the change clock, the watermark, the message
+    // stats and the scan, as the legacy digest path always had.
+    conn.execute_sync("BEGIN DEFERRED", &[])
+        .map_err(|error| format!("backfill read transaction: {error}"))?;
     let change_clock = lexical_change_clock(&conn)?;
     let legacy_digest = if change_clock.is_none() {
-        conn.execute_sync("BEGIN DEFERRED", &[])
-            .map_err(|error| format!("legacy backfill read transaction: {error}"))?;
         Some(legacy_backfill_content_digest(&conn)?)
     } else {
         None
@@ -1726,13 +1806,17 @@ fn backfill_into_bridge_locked_with_opener(
                 // br-kp1in.18: indexes written by versions that indexed some
                 // deliveries live and skipped others (source lock busy) have
                 // holes above the marker that the tail count reads as damage.
-                // (Delivery no longer writes the index, br-kp1in.32, so new
-                // holes do not arise.) Rows up to the marker are unchanged
-                // (append-only clock) and were fully indexed when it was
-                // written, so re-ingesting everything after it repairs the
-                // holes; upserts make overlap harmless.
-                marker_resume_plan(&conn, db_stats, previous_state.as_ref())?
-                    .unwrap_or(BackfillPlan::FullRebuild)
+                // Rows up to the marker are unchanged (append-only clock) and
+                // were fully indexed when it was written, so re-ingesting
+                // everything after it repairs the holes; upserts make overlap
+                // harmless. A delivery that commits after a higher id was
+                // already indexed leaves a hole below the marker instead,
+                // which the recent-hole plan repairs.
+                match marker_resume_plan(&conn, db_stats, previous_state.as_ref())? {
+                    Some(plan) => plan,
+                    None => recent_hole_repair_plan(&conn, bridge, db_stats, index_stats)?
+                        .unwrap_or(BackfillPlan::FullRebuild),
+                }
             }
             plan => plan,
         }
@@ -3733,8 +3817,9 @@ mod tests {
     /// after the marker leave the index a clean prefix and the next backfill
     /// appends only them. An index written by an older version (which indexed
     /// some deliveries live and skipped others) has holes above the marker:
-    /// it resumes after a complete marker instead of rebuilding, and never
-    /// trusts an incomplete one.
+    /// it resumes after a complete marker instead of rebuilding. It never
+    /// trusts an incomplete one; the holes are then located by id in the index
+    /// and re-ingested, which also avoids the rebuild.
     #[test]
     fn unindexed_deliveries_resume_from_marker_instead_of_full_rebuild() {
         let _guard = BRIDGE_TEST_LOCK
@@ -3797,16 +3882,11 @@ mod tests {
                 })
                 .unwrap();
             }
-            let expected = if legacy_hole && !marker_complete {
-                (6, 0)
-            } else {
-                (3, 0)
-            };
             assert_eq!(
                 backfill_from_db(&path).unwrap(),
-                expected,
+                (3, 0),
                 "marker_complete={marker_complete} legacy_hole={legacy_hole}: append a clean \
-                 prefix; resume a holed index after a complete marker, never trust an incomplete one"
+                 prefix; resume a holed index after a complete marker, or find its holes by id"
             );
             let hits = search_database(
                 &path,
@@ -3822,6 +3902,76 @@ mod tests {
             assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![4]);
             reset_bridge_for_tests();
         }
+    }
+
+    /// A delivery that commits after a higher id was indexed (ids are allocated
+    /// before commit) is re-ingested from just below it, not by rebuilding the
+    /// whole index; a rewrite of an existing message still rebuilds.
+    #[test]
+    fn late_commit_below_the_index_maximum_is_repaired_without_a_full_rebuild() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let source = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let rows: Vec<(i64, String, String)> = (1..=10)
+            .map(|id| (id, format!("early{id}"), format!("early body {id}")))
+            .collect();
+        let seeded: Vec<(i64, &str, &str, &str, &str)> = rows
+            .iter()
+            .map(|(id, subject, body)| {
+                (*id, subject.as_str(), body.as_str(), "normal", "thread-one")
+            })
+            .collect();
+        let path = create_test_db(source.path(), &seeded);
+        let conn = DbConn::open_file(&path).unwrap();
+        for migration in crate::schema::schema_migrations()
+            .into_iter()
+            .filter(|migration| migration.id.starts_with("v29_"))
+        {
+            conn.execute_sync(&migration.up, &[]).unwrap();
+        }
+        let insert = |id: i64| {
+            conn.execute_sync(
+                &format!(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES ({id}, 1, 1, 'late{id}', 'late body {id}', {id}000000)"
+                ),
+                &[],
+            )
+            .unwrap();
+        };
+        init_bridge(index.path()).unwrap();
+        assert_eq!(backfill_from_db(&path).unwrap(), (10, 0));
+        // Id 12 commits and is indexed while id 11 is still in flight.
+        insert(12);
+        assert_eq!(backfill_from_db(&path).unwrap(), (1, 0));
+        insert(11);
+        assert_eq!(
+            backfill_from_db(&path).unwrap(),
+            (2, 0),
+            "re-ingest 11 and 12 only, not all 12 messages"
+        );
+        let hits = search_database(
+            &path,
+            index.path(),
+            &PlannerQuery {
+                text: "late11".to_string(),
+                doc_kind: DocKind::Message,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![11]);
+        assert_eq!(backfill_from_db(&path).unwrap().0, 0, "nothing left to do");
+
+        // Negative: a rewrite is not an append; the whole index is rebuilt.
+        conn.execute_sync("UPDATE messages SET subject = 'edited' WHERE id = 3", &[])
+            .unwrap();
+        assert_eq!(backfill_from_db(&path).unwrap(), (12, 0));
+        reset_bridge_for_tests();
     }
 
     #[test]
