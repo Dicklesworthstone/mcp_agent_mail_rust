@@ -1125,7 +1125,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
 | `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
 | `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
-| `DB_JOURNAL_SIZE_LIMIT_BYTES` | `268435456` | `journal_size_limit` WAL truncation cap (256 MiB) |
+| `DB_JOURNAL_SIZE_LIMIT_BYTES` | `16777216` | `journal_size_limit` WAL truncation cap (16 MiB); an automatic checkpoint over the cap truncates the WAL |
 | `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
 | `AGENT_MAIL_GUARD_PUSH_MAX_COMMITS` | `2000` | Most commits the pre-push guard inspects per pushed ref (newest first); past it the scan is truncated and fails closed. `0` removes the bound |

@@ -1613,7 +1613,10 @@ impl Default for Config {
             db_checkpoint_interval_secs: 300, // passive WAL checkpoint every 5 min
             db_analyze_interval_secs: 21_600, // refresh planner stats every 6 h
             db_vacuum_interval_secs: 86_400,  // reclaim/defragment daily (0 disables)
-            db_journal_size_limit_bytes: 268_435_456, // 256 MiB WAL truncation cap
+            // 16 MiB WAL truncation cap: an automatic checkpoint over the cap is
+            // promoted to TRUNCATE. Every fresh engine connection rescans the whole
+            // WAL, so a smaller WAL is cheaper per send (br-v0ucm, br-yzk37).
+            db_journal_size_limit_bytes: 16_777_216,
 
             // Doctor recovery-debris retention (br-mudrv)
             doctor_retention_enabled: true,
