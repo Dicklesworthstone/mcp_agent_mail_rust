@@ -286,19 +286,28 @@ where
     }
 }
 
-/// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
-///
-/// I3 (br-bvq1x.9.3): a `SQLite` connection dropped without explicit `close()`.
-/// Thin delegator; the detection logic lives in `mcp_agent_mail_server`.
-struct DropCloseCounterLayer;
-
-impl<S> Layer<S> for DropCloseCounterLayer
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        mcp_agent_mail_server::note_possible_drop_close_event(event);
-    }
+/// The fmt layer under `filter`, plus the counting layers, each filtered to the
+/// targets it reads. An unfiltered layer would make `tracing::enabled!` true for
+/// every callsite and switch off the storage engine's fused DML lane (br-49zjq).
+fn mcp_log_subscriber(filter: EnvFilter) -> impl Subscriber + Send + Sync + 'static {
+    let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_filter(tracing_subscriber::filter::FilterExt::and(
+            filter,
+            mcp_agent_mail_cli::DependencyWarnRateLimit::default(),
+        ));
+    let git_segfault_layer =
+        GitSegfaultRetryTuiLayer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            matches!(
+                metadata.target(),
+                GIT_LOCKED_TRACE_TARGET | GUARD_SEGFAULT_TRACE_TARGET
+            )
+        }));
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(git_segfault_layer)
+        .with(mcp_agent_mail_cli::drop_close_counter_layer())
 }
 
 fn git_segfault_retry_trace_event_from_fields(
@@ -736,18 +745,7 @@ fn main() {
         && config.tui_enabled
         && std::io::stdout().is_terminal();
     let filter = build_mcp_log_filter(suppress_runtime_logs_for_tui, &config.log_level);
-    let fmt_layer = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_filter(tracing_subscriber::filter::FilterExt::and(
-            filter,
-            mcp_agent_mail_cli::DependencyWarnRateLimit::default(),
-        ));
-    tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(GitSegfaultRetryTuiLayer)
-        .with(DropCloseCounterLayer)
-        .init();
+    mcp_log_subscriber(filter).init();
 
     if cli.verbose {
         tracing::info!("Configuration loaded: {:?}", config);
@@ -1052,6 +1050,41 @@ mod tests {
         assert!(directives.contains(&"execute_statement_dispatch=error"));
         assert!(directives.contains(&"mvcc=warn"));
         assert!(directives.contains(&"checkpoint=warn"));
+    }
+
+    /// br-49zjq: the counting layers must not enable the storage engine's
+    /// per-statement tracing (which switches off its fused DML lane), yet must
+    /// still receive their own targets when the TUI turns fmt output off.
+    #[test]
+    fn mcp_subscriber_enables_only_the_counted_targets_beyond_its_filter() {
+        for directives in [
+            "off".to_string(),
+            default_mcp_log_filter("info"),
+            default_mcp_log_filter("debug"),
+        ] {
+            tracing::subscriber::with_default(
+                mcp_log_subscriber(EnvFilter::new(&directives)),
+                || {
+                    assert!(
+                        !tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG),
+                        "filter {directives:?}"
+                    );
+                    assert!(
+                        !tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO),
+                        "filter {directives:?}"
+                    );
+                    assert!(
+                        !tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG),
+                        "filter {directives:?}"
+                    );
+                    assert!(tracing::enabled!(target: "fsqlite::runtime", tracing::Level::WARN));
+                    assert!(tracing::enabled!(
+                        target: "mcp_agent_mail::git_locked",
+                        tracing::Level::WARN
+                    ));
+                },
+            );
+        }
     }
 
     #[test]

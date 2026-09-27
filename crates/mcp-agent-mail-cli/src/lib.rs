@@ -4358,10 +4358,28 @@ fn is_project_not_found_error(err: &CliError) -> bool {
 /// Counts frankensqlite `drop_close` warnings into `db.drop_close_total`.
 ///
 /// I3 (br-bvq1x.9.3): thin delegator; the detection logic lives in
-/// `mcp_agent_mail_server`. Registered UNFILTERED so it still observes
-/// connection-lifecycle warnings even when the TUI suppresses fmt logs (the
-/// exact freeze scenario where `drop_close` matters most).
+/// `mcp_agent_mail_server`. Register it through [`drop_close_counter_layer`].
 struct DropCloseCounterLayer;
+
+/// The `drop_close` counter, filtered to the one target it counts.
+///
+/// Its filter is independent of the fmt filter, so it still observes
+/// connection-lifecycle warnings when the TUI suppresses fmt logs (the exact
+/// freeze scenario where `drop_close` matters most). It must not be unfiltered:
+/// a layer without a filter is interested in every callsite, which makes
+/// `tracing::enabled!` true everywhere. FrankenSQLite then turns off its fused
+/// prepared-DML fast lane and opens a DEBUG span per statement on every
+/// connection (br-49zjq).
+pub fn drop_close_counter_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
+    use tracing_subscriber::Layer as _;
+
+    DropCloseCounterLayer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+        metadata.target() == mcp_agent_mail_server::FSQLITE_RUNTIME_TRACE_TARGET
+    }))
+}
 
 impl<S> tracing_subscriber::Layer<S> for DropCloseCounterLayer
 where
@@ -4441,34 +4459,39 @@ impl<S> tracing_subscriber::layer::Filter<S> for DependencyWarnRateLimit {
 }
 
 fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool, log_level: &str) {
-    use tracing_subscriber::Layer as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
     TRACING_INIT.call_once(|| {
         let filter = build_release_log_filter(suppress_runtime_logs_for_tui, log_level);
-
-        // The env filter is scoped to the fmt layer ONLY so the drop_close
-        // counter keeps observing fsqlite warnings even when the filter is
-        // "off" (TUI active). Preserves the prior fmt behaviour exactly.
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .with_ansi(crate::output::is_tty())
-            .compact()
-            .with_filter(tracing_subscriber::filter::FilterExt::and(
-                filter,
-                DependencyWarnRateLimit::default(),
-            ));
-
         // Ignore double-init errors when tests or host processes already set a subscriber.
-        let _ = tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(DropCloseCounterLayer)
-            .try_init();
+        let _ = release_log_subscriber(filter).try_init();
     });
+}
+
+fn release_log_subscriber(
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // The env filter is scoped to the fmt layer ONLY so the drop_close
+    // counter keeps observing fsqlite warnings even when the filter is
+    // "off" (TUI active).
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_ansi(crate::output::is_tty())
+        .compact()
+        .with_filter(tracing_subscriber::filter::FilterExt::and(
+            filter,
+            DependencyWarnRateLimit::default(),
+        ));
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(drop_close_counter_layer())
 }
 
 /// `log_level` is the canonical `LOG_LEVEL` from `Config` (br-kp1in.20).
@@ -45727,6 +45750,54 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
                 .unwrap()
                 .push((meta.target().to_string(), *meta.level(), meta));
         }
+    }
+
+    /// br-49zjq: FrankenSQLite keeps its fused prepared-DML lane only while
+    /// `tracing::enabled!` is false for its per-statement targets. The release
+    /// subscriber must keep them off, including with the TUI's "off" filter,
+    /// while the `drop_close` counter still sees `fsqlite::runtime` warnings.
+    #[test]
+    fn release_subscriber_leaves_statement_tracing_off_and_counts_drop_close() {
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        fn statement_tracing_enabled() -> bool {
+            tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG)
+                || tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO)
+                || tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
+        }
+
+        // Control: the pre-fix composition (counter layer without a filter)
+        // enables every callsite, so the assertions below can fail.
+        let unfiltered = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new("off")))
+            .with(DropCloseCounterLayer);
+        tracing::subscriber::with_default(unfiltered, || assert!(statement_tracing_enabled()));
+
+        for directives in [
+            "off".to_string(),
+            default_release_log_filter("info"),
+            default_release_log_filter("debug"),
+        ] {
+            let subscriber = release_log_subscriber(EnvFilter::new(&directives));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(!statement_tracing_enabled(), "filter {directives:?}");
+            });
+        }
+
+        assert_eq!(
+            mcp_agent_mail_server::FSQLITE_RUNTIME_TRACE_TARGET,
+            "fsqlite::runtime"
+        );
+        let counter = &mcp_agent_mail_core::global_metrics().db.drop_close_total;
+        let before = counter.load();
+        let subscriber = release_log_subscriber(EnvFilter::new("off"));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "fsqlite::runtime", event = "drop_close", "dropped");
+        });
+        // `>`: a globally installed subscriber in a sibling test may count too.
+        assert!(counter.load() > before);
     }
 
     /// br-kp1in.26: a WARN emitted on every connection open must not flood the
