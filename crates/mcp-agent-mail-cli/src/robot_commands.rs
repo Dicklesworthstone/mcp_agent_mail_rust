@@ -15721,22 +15721,39 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 .collect();
             let descriptors = (!owner_pids.is_empty())
                 .then(|| crate::doctor_server_descriptor_check(&owner_pids));
+            // The server's own leak detector sees growth over time, which a
+            // point-in-time /proc sample cannot: relay its verdict too.
+            let server_descriptor_relay = descriptors.as_ref().and_then(|_| {
+                let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
+                    &config.http_host,
+                    config.http_port,
+                );
+                crate::probe_local_jsonrpc_health(&config, &port_status)
+                    .payload
+                    .as_ref()
+                    .and_then(crate::server_descriptor_warning)
+            });
             let descriptors_status = descriptors.as_ref().map(|check| check.status);
             let descriptors_unhealthy = descriptors_status == Some("fail");
-            let descriptors_degraded = descriptors_status == Some("warn");
+            let descriptors_degraded =
+                descriptors_status == Some("warn") || server_descriptor_relay.is_some();
             probes.push(HealthProbe {
                 name: "server_descriptors".into(),
                 status: match descriptors_status {
                     None => "skip",
                     Some("fail") => "fail",
                     Some("warn") => "degraded",
+                    Some(_) if server_descriptor_relay.is_some() => "degraded",
                     Some(_) => "ok",
                 }
                 .into(),
                 latency_ms: 0.0,
                 detail: descriptors.map_or_else(
                     || "no live mailbox owner process to sample".to_string(),
-                    |check| check.detail,
+                    |check| match &server_descriptor_relay {
+                        Some(relay) => format!("{}; {relay}", check.detail),
+                        None => check.detail,
+                    },
                 ),
             });
 
