@@ -8768,21 +8768,120 @@ fn collect_canonical_message_paths_with_id(
     }
 }
 
+/// Stat identity of a canonical message file; see [`CanonicalIdCache`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct MessageFileStamp {
+    len: u64,
+    device: u64,
+    inode: u64,
+    modified_ns: i128,
+    changed_ns: i128,
+}
+
+#[cfg(unix)]
+fn message_file_stamp(metadata: &fs::Metadata) -> Option<MessageFileStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Some(MessageFileStamp {
+        len: metadata.len(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+            + i128::from(metadata.mtime_nsec()),
+        changed_ns: i128::from(metadata.ctime()) * 1_000_000_000
+            + i128::from(metadata.ctime_nsec()),
+    })
+}
+
+/// Without a change time a rewritten file cannot be told apart: never cache.
+#[cfg(not(unix))]
+const fn message_file_stamp(_metadata: &fs::Metadata) -> Option<MessageFileStamp> {
+    None
+}
+
+/// Front-matter ids of one project's canonical message files, parsed once and
+/// reused while a file's stamp is unchanged.
+///
+/// Every canonical write checks that no other file claims its message id, and
+/// parsing every file for that made each write O(messages in the project):
+/// thousands of opens per message in large live projects (br-dgut7). The walk
+/// still lists and stats every file, but only new or changed files are parsed.
+/// An entry is trusted only when the file last changed [`RACY_STAMP_WINDOW`]
+/// before it was parsed; otherwise a rewrite inside one filesystem timestamp
+/// tick could keep the stamp while changing the id (git's racily-clean rule).
+#[derive(Debug, Default)]
+struct CanonicalIdCache {
+    files: HashMap<PathBuf, CanonicalIdCacheEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CanonicalIdCacheEntry {
+    stamp: MessageFileStamp,
+    parsed_at_ns: i128,
+    id: Option<i64>,
+}
+
+impl CanonicalIdCacheEntry {
+    fn trusted_for(&self, stamp: MessageFileStamp, racy_window_ns: i128) -> bool {
+        self.stamp == stamp && stamp.changed_ns.saturating_add(racy_window_ns) < self.parsed_at_ns
+    }
+}
+
+/// Coarser than the timestamp granularity of the filesystems the archive may
+/// live on (ext4 ticks, 1-2 s on NFS/FAT).
+const RACY_STAMP_WINDOW: Duration = Duration::from_secs(2);
+
+static CANONICAL_ID_CACHES: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<CanonicalIdCache>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn unix_time_ns(time: SystemTime) -> i128 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| {
+        i128::try_from(elapsed.as_nanos()).unwrap_or(i128::MAX)
+    })
+}
+
 fn collect_canonical_message_id_index(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
 ) -> HashMap<i64, Vec<PathBuf>> {
+    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW).0
+}
+
+/// The id index for `wanted_ids`, and how many files had to be parsed.
+fn collect_canonical_message_id_index_with_window(
+    messages_root: &Path,
+    wanted_ids: &HashSet<i64>,
+    racy_window: Duration,
+) -> (HashMap<i64, Vec<PathBuf>>, usize) {
     let mut index = HashMap::new();
+    let mut parsed = 0_usize;
     if wanted_ids.is_empty() {
-        return index;
+        return (index, parsed);
     }
     if !path_is_nonsymlink_dir(messages_root) {
-        return index;
+        return (index, parsed);
+    }
+    // `read_message_file` refuses every file under a symlinked prefix, so no
+    // file can match; cached ids must not be served through one either.
+    if path_existing_prefix_has_symlink(messages_root).unwrap_or(true) {
+        return (index, parsed);
     }
 
     let Ok(year_entries) = fs::read_dir(messages_root) else {
-        return index;
+        return (index, parsed);
     };
+    let cache = {
+        let mut caches = CANONICAL_ID_CACHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(caches.entry(messages_root.to_path_buf()).or_default())
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
+    let mut seen = HashSet::with_capacity(cache.files.len());
     for year_entry in year_entries.flatten() {
         let year_path = year_entry.path();
         let Ok(year_type) = year_entry.file_type() else {
@@ -8831,11 +8930,43 @@ fn collect_canonical_message_id_index(
                     continue;
                 }
 
-                let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
-                    continue;
+                let stamp = file_entry
+                    .metadata()
+                    .ok()
+                    .as_ref()
+                    .and_then(message_file_stamp);
+                seen.insert(file_path.clone());
+                let cached = stamp.and_then(|stamp| {
+                    cache
+                        .files
+                        .get(&file_path)
+                        .filter(|entry| entry.trusted_for(stamp, racy_window_ns))
+                        .map(|entry| entry.id)
+                });
+                let existing_id = if let Some(id) = cached {
+                    id
+                } else {
+                    parsed += 1;
+                    let parsed_at_ns = unix_time_ns(SystemTime::now());
+                    let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
+                        // Never cache a failed read: it may be transient.
+                        cache.files.remove(&file_path);
+                        continue;
+                    };
+                    let id = frontmatter.get("id").and_then(serde_json::Value::as_i64);
+                    if let Some(stamp) = stamp {
+                        cache.files.insert(
+                            file_path.clone(),
+                            CanonicalIdCacheEntry {
+                                stamp,
+                                parsed_at_ns,
+                                id,
+                            },
+                        );
+                    }
+                    id
                 };
-                let Some(existing_id) = frontmatter.get("id").and_then(serde_json::Value::as_i64)
-                else {
+                let Some(existing_id) = existing_id else {
                     continue;
                 };
                 if wanted_ids.contains(&existing_id) {
@@ -8847,7 +8978,8 @@ fn collect_canonical_message_id_index(
             }
         }
     }
-    index
+    cache.files.retain(|path, _| seen.contains(path));
+    (index, parsed)
 }
 
 fn reject_canonical_message_id_collision_against_matches(
@@ -14552,6 +14684,66 @@ mod tests {
             1,
             "duplicate-id rejection must not create a second canonical file"
         );
+    }
+
+    /// br-dgut7: the canonical-id index parses a message file once, re-parses
+    /// only files whose stamp changed, forgets deleted files, and trusts
+    /// nothing that changed within the racy window of its parse.
+    #[test]
+    fn canonical_id_index_reparses_only_new_or_changed_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("messages");
+        let month = root.join("2026").join("09");
+        fs::create_dir_all(&month).unwrap();
+        let write = |name: &str, id: i64, body: &str| {
+            let message = serde_json::json!({ "id": id, "subject": name });
+            let content = render_message_bundle_content(&message, body).unwrap();
+            fs::write(month.join(name), content).unwrap();
+        };
+        let names = |index: &HashMap<i64, Vec<PathBuf>>, id: i64| -> Vec<String> {
+            index.get(&id).map_or_else(Vec::new, |paths| {
+                paths
+                    .iter()
+                    .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect()
+            })
+        };
+        write("a__1.md", 1, "a");
+        write("b__2.md", 2, "b");
+        write("c__3.md", 3, "c");
+        let wanted = HashSet::from([1, 2, 3, 9]);
+
+        let (first, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 3);
+        assert_eq!(names(&first, 2), ["b__2.md"]);
+        let (second, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 0, "unchanged files must be served from the cache");
+        assert_eq!(second, first);
+
+        // In-place rewrite to another id: a cache keyed by path alone would
+        // keep reporting id 2 and miss a collision on id 9.
+        write("b__2.md", 9, "b, rewritten under another id");
+        let (rewritten, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 1);
+        assert!(names(&rewritten, 2).is_empty());
+        assert_eq!(names(&rewritten, 9), ["b__2.md"]);
+
+        fs::remove_file(month.join("c__3.md")).unwrap();
+        let (deleted, parsed) =
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+        assert_eq!(parsed, 0);
+        assert!(names(&deleted, 3).is_empty());
+
+        // Every file changed within an hour of its parse: nothing is trusted.
+        let (_, parsed) = collect_canonical_message_id_index_with_window(
+            &root,
+            &wanted,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(parsed, 2);
     }
 
     #[test]
