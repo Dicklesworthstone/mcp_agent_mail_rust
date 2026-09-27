@@ -1,0 +1,740 @@
+{
+ "bead": "br-49zjq",
+ "what": "same-invocation alternating A/B, fresh mailbox per run: 5x(16x6) send storms, 40 fetch_inbox, count of the engine fused-lane-suppression WARN; abfl2 adds server CPU per op from /proc/pid/stat",
+ "host": "thinkstation1 (64 cores; load 11-90 from other agents during the runs)",
+ "control": {
+  "code": "a7eec586",
+  "binary_sha256_prefix": "6f45851deaa671ee"
+ },
+ "candidate": {
+  "code": "c6fd0541",
+  "binary_sha256_prefix": "35ad57283bd660d2"
+ },
+ "harness": "scratchpad it/ab_fastlane.py (not committed)",
+ "runs": {
+  "abfl1": [
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 31.2,
+      "p50_s": 0.345,
+      "p99_s": 1.411
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 30.5,
+      "p50_s": 0.465,
+      "p99_s": 0.841
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 27.4,
+      "p50_s": 0.551,
+      "p99_s": 0.694
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 23.3,
+      "p50_s": 0.68,
+      "p99_s": 0.793
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 36.7,
+      "p50_s": 0.392,
+      "p99_s": 0.816
+     }
+    ],
+    "total_acked_per_s": 29.8,
+    "fetch_p50_ms": 28.5,
+    "fused_lane_warn_lines": 1,
+    "round": 0
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 38.5,
+      "p50_s": 0.311,
+      "p99_s": 1.132
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 34.7,
+      "p50_s": 0.425,
+      "p99_s": 0.579
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.8,
+      "p50_s": 0.673,
+      "p99_s": 0.791
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 18.6,
+      "p50_s": 0.852,
+      "p99_s": 1.003
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 17.5,
+      "p50_s": 0.885,
+      "p99_s": 1.062
+     }
+    ],
+    "total_acked_per_s": 26.4,
+    "fetch_p50_ms": 59.0,
+    "fused_lane_warn_lines": 0,
+    "round": 0
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 31.0,
+      "p50_s": 0.384,
+      "p99_s": 1.46
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 34.1,
+      "p50_s": 0.422,
+      "p99_s": 0.68
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 28.7,
+      "p50_s": 0.537,
+      "p99_s": 0.743
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.0,
+      "p50_s": 0.689,
+      "p99_s": 0.916
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 37.3,
+      "p50_s": 0.397,
+      "p99_s": 0.679
+     }
+    ],
+    "total_acked_per_s": 30.6,
+    "fetch_p50_ms": 29.1,
+    "fused_lane_warn_lines": 0,
+    "round": 1
+   },
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 30.3,
+      "p50_s": 0.422,
+      "p99_s": 1.185
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 31.5,
+      "p50_s": 0.473,
+      "p99_s": 0.724
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 26.2,
+      "p50_s": 0.582,
+      "p99_s": 0.713
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.6,
+      "p50_s": 0.653,
+      "p99_s": 0.956
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 19.9,
+      "p50_s": 0.767,
+      "p99_s": 0.948
+     }
+    ],
+    "total_acked_per_s": 26.1,
+    "fetch_p50_ms": 60.1,
+    "fused_lane_warn_lines": 1,
+    "round": 1
+   },
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 32.6,
+      "p50_s": 0.353,
+      "p99_s": 1.28
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 32.1,
+      "p50_s": 0.44,
+      "p99_s": 0.688
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 21.5,
+      "p50_s": 0.722,
+      "p99_s": 0.828
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 19.9,
+      "p50_s": 0.761,
+      "p99_s": 1.008
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 37.0,
+      "p50_s": 0.403,
+      "p99_s": 0.671
+     }
+    ],
+    "total_acked_per_s": 28.6,
+    "fetch_p50_ms": 29.4,
+    "fused_lane_warn_lines": 1,
+    "round": 2
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 36.0,
+      "p50_s": 0.36,
+      "p99_s": 1.124
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 31.7,
+      "p50_s": 0.42,
+      "p99_s": 0.637
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 28.5,
+      "p50_s": 0.539,
+      "p99_s": 0.655
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 23.6,
+      "p50_s": 0.663,
+      "p99_s": 0.843
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 39.6,
+      "p50_s": 0.373,
+      "p99_s": 0.519
+     }
+    ],
+    "total_acked_per_s": 31.9,
+    "fetch_p50_ms": 28.1,
+    "fused_lane_warn_lines": 0,
+    "round": 2
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 24.3,
+      "p50_s": 0.583,
+      "p99_s": 1.796
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 24.4,
+      "p50_s": 0.599,
+      "p99_s": 1.001
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 20.1,
+      "p50_s": 0.732,
+      "p99_s": 1.001
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 20.5,
+      "p50_s": 0.704,
+      "p99_s": 0.973
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 20.4,
+      "p50_s": 0.789,
+      "p99_s": 0.912
+     }
+    ],
+    "total_acked_per_s": 21.9,
+    "fetch_p50_ms": 18.0,
+    "fused_lane_warn_lines": 0,
+    "round": 3
+   },
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 34.4,
+      "p50_s": 0.387,
+      "p99_s": 1.058
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 30.2,
+      "p50_s": 0.464,
+      "p99_s": 0.692
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 24.2,
+      "p50_s": 0.595,
+      "p99_s": 0.925
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.2,
+      "p50_s": 0.693,
+      "p99_s": 0.865
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 17.8,
+      "p50_s": 0.906,
+      "p99_s": 1.05
+     }
+    ],
+    "total_acked_per_s": 25.8,
+    "fetch_p50_ms": 63.6,
+    "fused_lane_warn_lines": 1,
+    "round": 3
+   }
+  ],
+  "abfl2": [
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 33.0,
+      "p50_s": 0.389,
+      "p99_s": 1.244
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 30.6,
+      "p50_s": 0.466,
+      "p99_s": 0.655
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 21.3,
+      "p50_s": 0.672,
+      "p99_s": 1.35
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.4,
+      "p50_s": 0.654,
+      "p99_s": 0.905
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 19.1,
+      "p50_s": 0.791,
+      "p99_s": 1.018
+     }
+    ],
+    "total_acked_per_s": 25.3,
+    "fetch_p50_ms": 61.7,
+    "cpu_ms_per_send": 187.6,
+    "cpu_ms_per_fetch": 65.0,
+    "fused_lane_warn_lines": 1,
+    "round": 0
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 34.3,
+      "p50_s": 0.372,
+      "p99_s": 1.108
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 30.8,
+      "p50_s": 0.436,
+      "p99_s": 0.824
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 29.5,
+      "p50_s": 0.528,
+      "p99_s": 0.676
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 26.3,
+      "p50_s": 0.562,
+      "p99_s": 0.894
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 38.4,
+      "p50_s": 0.39,
+      "p99_s": 0.562
+     }
+    ],
+    "total_acked_per_s": 31.9,
+    "fetch_p50_ms": 28.3,
+    "cpu_ms_per_send": 143.31,
+    "cpu_ms_per_fetch": 30.0,
+    "fused_lane_warn_lines": 0,
+    "round": 0
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 34.3,
+      "p50_s": 0.338,
+      "p99_s": 1.224
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 33.3,
+      "p50_s": 0.419,
+      "p99_s": 0.742
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 28.6,
+      "p50_s": 0.533,
+      "p99_s": 0.721
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 24.0,
+      "p50_s": 0.627,
+      "p99_s": 0.868
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 19.7,
+      "p50_s": 0.803,
+      "p99_s": 0.923
+     }
+    ],
+    "total_acked_per_s": 28.0,
+    "fetch_p50_ms": 56.3,
+    "cpu_ms_per_send": 179.15,
+    "cpu_ms_per_fetch": 63.0,
+    "fused_lane_warn_lines": 0,
+    "round": 1
+   },
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 31.6,
+      "p50_s": 0.387,
+      "p99_s": 1.142
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 27.9,
+      "p50_s": 0.517,
+      "p99_s": 0.807
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 25.7,
+      "p50_s": 0.591,
+      "p99_s": 0.733
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.5,
+      "p50_s": 0.679,
+      "p99_s": 0.883
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 34.7,
+      "p50_s": 0.436,
+      "p99_s": 0.633
+     }
+    ],
+    "total_acked_per_s": 28.5,
+    "fetch_p50_ms": 29.6,
+    "cpu_ms_per_send": 155.54,
+    "cpu_ms_per_fetch": 40.25,
+    "fused_lane_warn_lines": 1,
+    "round": 1
+   },
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 28.4,
+      "p50_s": 0.418,
+      "p99_s": 1.149
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 27.9,
+      "p50_s": 0.541,
+      "p99_s": 0.807
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 26.1,
+      "p50_s": 0.595,
+      "p99_s": 0.696
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 21.4,
+      "p50_s": 0.723,
+      "p99_s": 0.888
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 17.3,
+      "p50_s": 0.894,
+      "p99_s": 1.083
+     }
+    ],
+    "total_acked_per_s": 24.2,
+    "fetch_p50_ms": 62.7,
+    "cpu_ms_per_send": 196.77,
+    "cpu_ms_per_fetch": 67.75,
+    "fused_lane_warn_lines": 1,
+    "round": 2
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 40.0,
+      "p50_s": 0.29,
+      "p99_s": 0.901
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 30.0,
+      "p50_s": 0.466,
+      "p99_s": 0.777
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 29.9,
+      "p50_s": 0.498,
+      "p99_s": 0.723
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 24.5,
+      "p50_s": 0.614,
+      "p99_s": 1.029
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 21.6,
+      "p50_s": 0.695,
+      "p99_s": 0.883
+     }
+    ],
+    "total_acked_per_s": 29.2,
+    "fetch_p50_ms": 58.9,
+    "cpu_ms_per_send": 179.31,
+    "cpu_ms_per_fetch": 66.0,
+    "fused_lane_warn_lines": 0,
+    "round": 2
+   },
+   {
+    "arm": "candidate",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 36.6,
+      "p50_s": 0.336,
+      "p99_s": 1.137
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 33.8,
+      "p50_s": 0.434,
+      "p99_s": 0.701
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 27.4,
+      "p50_s": 0.549,
+      "p99_s": 0.792
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 21.6,
+      "p50_s": 0.687,
+      "p99_s": 0.86
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 41.9,
+      "p50_s": 0.37,
+      "p99_s": 0.515
+     }
+    ],
+    "total_acked_per_s": 32.3,
+    "fetch_p50_ms": 27.9,
+    "cpu_ms_per_send": 144.12,
+    "cpu_ms_per_fetch": 31.25,
+    "fused_lane_warn_lines": 0,
+    "round": 3
+   },
+   {
+    "arm": "control",
+    "storms": [
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 42.5,
+      "p50_s": 0.331,
+      "p99_s": 0.73
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 31.3,
+      "p50_s": 0.459,
+      "p99_s": 0.714
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 25.9,
+      "p50_s": 0.552,
+      "p99_s": 0.986
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 22.3,
+      "p50_s": 0.662,
+      "p99_s": 0.866
+     },
+     {
+      "acked": 96,
+      "errors": 0,
+      "acked_per_s": 17.8,
+      "p50_s": 0.787,
+      "p99_s": 1.189
+     }
+    ],
+    "total_acked_per_s": 28.0,
+    "fetch_p50_ms": 61.1,
+    "cpu_ms_per_send": 189.35,
+    "cpu_ms_per_fetch": 66.25,
+    "fused_lane_warn_lines": 1,
+    "round": 3
+   }
+  ]
+ }
+}
