@@ -1,0 +1,202 @@
+{
+ "bead": "br-dgut7",
+ "control": {
+  "code": "c6fd0541",
+  "binary_sha256_prefix": "35ad57283bd660d2"
+ },
+ "candidate": {
+  "code": "e814927f (binary built before the non-unix dead_code allow; identical on Linux)",
+  "binary_sha256_prefix": "a2bd91579e4ea557"
+ },
+ "host": "thinkstation1 (64 cores, shared with other agents)",
+ "seed": "one project, 3,209 messages, archive converged, copied fresh for every run",
+ "harness": "scratchpad it/dgut7_trickle.py and it/dgut7_ab.py (not committed)",
+ "trickle_60_sequential_sends": [
+  {
+   "arm": "control",
+   "sends": 60,
+   "cpu_ms_per_send": 407.2,
+   "archive_lat_p50_ms": 211.1,
+   "archive_lat_p95_ms": 286.5,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 0
+  },
+  {
+   "arm": "candidate",
+   "sends": 60,
+   "cpu_ms_per_send": 246.0,
+   "archive_lat_p50_ms": 49.0,
+   "archive_lat_p95_ms": 49.8,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 0
+  },
+  {
+   "arm": "candidate",
+   "sends": 60,
+   "cpu_ms_per_send": 250.8,
+   "archive_lat_p50_ms": 49.0,
+   "archive_lat_p95_ms": 50.4,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 1
+  },
+  {
+   "arm": "control",
+   "sends": 60,
+   "cpu_ms_per_send": 403.2,
+   "archive_lat_p50_ms": 209.3,
+   "archive_lat_p95_ms": 270.0,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 1
+  },
+  {
+   "arm": "control",
+   "sends": 60,
+   "cpu_ms_per_send": 441.7,
+   "archive_lat_p50_ms": 227.7,
+   "archive_lat_p95_ms": 459.4,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 2
+  },
+  {
+   "arm": "candidate",
+   "sends": 60,
+   "cpu_ms_per_send": 247.0,
+   "archive_lat_p50_ms": 49.1,
+   "archive_lat_p95_ms": 94.5,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 2
+  },
+  {
+   "arm": "candidate",
+   "sends": 60,
+   "cpu_ms_per_send": 253.3,
+   "archive_lat_p50_ms": 48.7,
+   "archive_lat_p95_ms": 50.5,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 3
+  },
+  {
+   "arm": "control",
+   "sends": 60,
+   "cpu_ms_per_send": 398.7,
+   "archive_lat_p50_ms": 210.2,
+   "archive_lat_p95_ms": 277.5,
+   "converged": true,
+   "detail": "archive=3269 db=3269",
+   "round": 3
+  }
+ ],
+ "storm_16x30": [
+  {
+   "arm": "control",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 18.5,
+   "p50_s": 0.761,
+   "converge_s": 31.8,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 295.9,
+   "cpu_s_storm_to_converged": 143.1,
+   "round": 0
+  },
+  {
+   "arm": "candidate",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 19.2,
+   "p50_s": 0.837,
+   "converge_s": 26.3,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 311.9,
+   "cpu_s_storm_to_converged": 151.3,
+   "round": 0
+  },
+  {
+   "arm": "candidate",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 18.9,
+   "p50_s": 0.84,
+   "converge_s": 26.7,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 307.5,
+   "cpu_s_storm_to_converged": 148.9,
+   "round": 1
+  },
+  {
+   "arm": "control",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 19.7,
+   "p50_s": 0.775,
+   "converge_s": 25.7,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 300.1,
+   "cpu_s_storm_to_converged": 145.1,
+   "round": 1
+  },
+  {
+   "arm": "control",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 19.2,
+   "p50_s": 0.782,
+   "converge_s": 26.4,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 306.9,
+   "cpu_s_storm_to_converged": 148.5,
+   "round": 2
+  },
+  {
+   "arm": "candidate",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 9.0,
+   "p50_s": 0.789,
+   "converge_s": 53.4,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 335.2,
+   "cpu_s_storm_to_converged": 161.3,
+   "round": 2
+  },
+  {
+   "arm": "candidate",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 20.4,
+   "p50_s": 0.742,
+   "converge_s": 24.9,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 301.3,
+   "cpu_s_storm_to_converged": 146.2,
+   "round": 3
+  },
+  {
+   "arm": "control",
+   "acked": 480,
+   "errors": 0,
+   "sends_per_s": 20.5,
+   "p50_s": 0.77,
+   "converge_s": 24.8,
+   "converged": true,
+   "detail": "archive=3689 db=3689",
+   "cpu_ms_per_send_during_storm": 300.2,
+   "cpu_s_storm_to_converged": 145.4,
+   "round": 3
+  }
+ ]
+}
