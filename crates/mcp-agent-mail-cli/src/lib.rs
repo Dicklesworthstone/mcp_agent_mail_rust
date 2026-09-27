@@ -30612,6 +30612,27 @@ fn probe_local_http_health(
     }
 }
 
+/// The live server's `descriptors` health contributor when it is not green
+/// (br-kp1in.17): a rising descriptor floor or thin headroom raises the
+/// server's `health_level` only to yellow, which alone does not warn here.
+/// Servers that predate the contributor report nothing.
+fn server_descriptor_warning(health: &serde_json::Value) -> Option<String> {
+    let row = health
+        .get("health_level_contributors")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("name").and_then(serde_json::Value::as_str) == Some("descriptors"))?;
+    let level = row.get("level").and_then(serde_json::Value::as_str)?;
+    if level.eq_ignore_ascii_case("green") {
+        return None;
+    }
+    let detail = row
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Some(format!("server descriptors {level}: {detail}"))
+}
+
 fn probe_local_jsonrpc_health(
     config: &Config,
     port_status: &mcp_agent_mail_server::startup_checks::PortStatus,
@@ -30691,9 +30712,14 @@ fn probe_local_jsonrpc_health(
                                     && !health_level.eq_ignore_ascii_case("critical")
                                     && !health_level.eq_ignore_ascii_case("red")
                                 {
-                                    DoctorProbeResult::ok(format!(
-                                        "JSON-RPC health_check succeeded via {url}"
-                                    ))
+                                    match server_descriptor_warning(&parsed) {
+                                        Some(warning) => {
+                                            DoctorProbeResult::warn(format!("{warning} via {url}"))
+                                        }
+                                        None => DoctorProbeResult::ok(format!(
+                                            "JSON-RPC health_check succeeded via {url}"
+                                        )),
+                                    }
                                 } else if status.eq_ignore_ascii_case("ok") {
                                     DoctorProbeResult::warn(detail)
                                 } else {
@@ -58198,6 +58224,41 @@ startup_timeout_sec = 42
         );
         assert_eq!(
             parse_proc_limits_nofile_soft("Max processes  10  10  processes\n"),
+            None
+        );
+    }
+
+    /// br-kp1in.17: `am doctor` relays the server's descriptor-leak verdict.
+    #[test]
+    fn server_descriptor_warning_relays_a_non_green_descriptors_contributor() {
+        let health = |level: &str| {
+            serde_json::json!({
+                "status": "ok",
+                "health_level": "yellow",
+                "health_level_contributors": [
+                    {"name": "pressure", "level": "yellow", "detail": "pool 85%"},
+                    {"name": "descriptors", "level": level,
+                     "detail": "1900 open of soft limit 65536 (2%); floor rose in every window"},
+                ],
+            })
+        };
+        let warning =
+            server_descriptor_warning(&health("yellow")).expect("yellow descriptors warn");
+        assert!(
+            warning.starts_with("server descriptors yellow: 1900 open"),
+            "{warning}"
+        );
+        assert_eq!(server_descriptor_warning(&health("green")), None);
+        // Another yellow contributor alone does not make this probe warn.
+        assert_eq!(
+            server_descriptor_warning(&serde_json::json!({
+                "health_level_contributors": [{"name": "pressure", "level": "yellow", "detail": ""}],
+            })),
+            None
+        );
+        // A server that predates the contributor.
+        assert_eq!(
+            server_descriptor_warning(&serde_json::json!({"status": "ok"})),
             None
         );
     }
