@@ -182,10 +182,11 @@ pub use mcp_config::{
 pub use memory::{MemoryPressure, MemorySample};
 pub use metrics::{
     CanaryMetrics, CanaryMetricsSnapshot, CorruptionDetectionSource, CorruptionMetrics,
-    CorruptionMetricsSnapshot, Counter, DbMetricsSnapshot, FdMetricsSnapshot, GaugeI64, GaugeU64,
-    GlobalMetricsSnapshot, HistogramSnapshot, HttpMetricsSnapshot, Log2Histogram,
-    StorageMetricsSnapshot, ToolsMetricsSnapshot, count_open_fds, fd_metrics_snapshot,
-    global_metrics, read_fd_limits,
+    CorruptionMetricsSnapshot, Counter, DbMetricsSnapshot, DescriptorFloorGrowth,
+    DescriptorFloorTracker, FdMetricsSnapshot, GaugeI64, GaugeU64, GlobalMetricsSnapshot,
+    HistogramSnapshot, HttpMetricsSnapshot, Log2Histogram, StorageMetricsSnapshot,
+    ToolsMetricsSnapshot, count_open_fds, descriptor_floor_growth, fd_metrics_snapshot,
+    global_metrics, read_fd_limits, record_descriptor_sample,
 };
 pub use models::{
     Agent, AgentLink, ConsistencyMessageRef, ConsistencyReport, FileReservation,

@@ -1427,6 +1427,47 @@ pub struct HealthLevelContributor {
     pub detail: String,
 }
 
+/// Descriptor pressure as a health level (br-kp1in.17): red at 90 % of the
+/// soft `RLIMIT_NOFILE`, yellow at 70 % or while the open-descriptor floor
+/// rises in every recent window (the leak signature).
+const fn descriptor_health_level(
+    utilization_pct: Option<u64>,
+    floor_rising: bool,
+) -> mcp_agent_mail_core::HealthLevel {
+    use mcp_agent_mail_core::HealthLevel;
+    match utilization_pct {
+        Some(pct) if pct >= 90 => HealthLevel::Red,
+        Some(pct) if pct >= 70 => HealthLevel::Yellow,
+        _ if floor_rising => HealthLevel::Yellow,
+        _ => HealthLevel::Green,
+    }
+}
+
+fn descriptor_health_detail(
+    descriptors: &mcp_agent_mail_core::FdMetricsSnapshot,
+    growth: Option<&mcp_agent_mail_core::DescriptorFloorGrowth>,
+) -> String {
+    let open = descriptors
+        .open_fds
+        .map_or_else(|| "unknown".to_string(), |n| n.to_string());
+    let soft = descriptors
+        .soft_limit
+        .map_or_else(|| "unlimited/unknown".to_string(), |n| n.to_string());
+    let pct = descriptors
+        .utilization_pct
+        .map_or_else(String::new, |p| format!(" ({p}%)"));
+    let floor = growth.map_or_else(
+        || "floor not rising".to_string(),
+        |growth| {
+            format!(
+                "floor rose in every window {:?} (+{}/h): possible descriptor leak",
+                growth.floors, growth.per_hour
+            )
+        },
+    );
+    format!("{open} open of soft limit {soft}{pct}; {floor}")
+}
+
 /// Active recovery state surfaced in `health_check` when the mailbox is degraded or recovering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryStatusResponse {
@@ -2046,6 +2087,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // consuming most of the fixed ecosystem client deadline. Treat that as
     // functional degradation so an all-zero pool snapshot cannot hide it.
     effective_level = effective_level.max(coalescer_latency_level);
+    // br-kp1in.17: descriptor exhaustion is what took v0.3.36 daemons down;
+    // name the headroom and a rising descriptor floor before it bites.
+    let descriptors = mcp_agent_mail_core::fd_metrics_snapshot();
+    let descriptor_growth = mcp_agent_mail_core::descriptor_floor_growth();
+    let descriptor_level =
+        descriptor_health_level(descriptors.utilization_pct, descriptor_growth.is_some());
+    effective_level = effective_level.max(descriptor_level);
     let failing_verdicts = verdicts.failing_names();
     // GH#300: name every input behind the effective level so a red or yellow
     // top level that no decomposed verdict explains (live pressure, archive
@@ -2101,6 +2149,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 metrics.storage.commit_queue_latency_us.p99 / 1_000,
                 config.health_commit_coalescer_p99_degraded_ms
             ),
+        },
+        HealthLevelContributor {
+            name: "descriptors".to_string(),
+            level: descriptor_level.to_string(),
+            detail: descriptor_health_detail(&descriptors, descriptor_growth.as_ref()),
         },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
@@ -4812,6 +4865,41 @@ mod tests {
         }
     }
 
+    /// br-kp1in.17: descriptor headroom and a rising floor raise `health_level`.
+    #[test]
+    fn descriptor_health_level_grades_headroom_and_a_rising_floor() {
+        use mcp_agent_mail_core::HealthLevel;
+        assert_eq!(descriptor_health_level(Some(95), false), HealthLevel::Red);
+        assert_eq!(descriptor_health_level(Some(90), true), HealthLevel::Red);
+        assert_eq!(
+            descriptor_health_level(Some(70), false),
+            HealthLevel::Yellow
+        );
+        assert_eq!(descriptor_health_level(Some(69), false), HealthLevel::Green);
+        assert_eq!(descriptor_health_level(Some(5), true), HealthLevel::Yellow);
+        assert_eq!(descriptor_health_level(None, false), HealthLevel::Green);
+        assert_eq!(descriptor_health_level(None, true), HealthLevel::Yellow);
+
+        let snapshot = mcp_agent_mail_core::FdMetricsSnapshot {
+            soft_limit: Some(2048),
+            hard_limit: Some(1_048_576),
+            open_fds: Some(1900),
+            utilization_pct: Some(92),
+        };
+        let growth = mcp_agent_mail_core::DescriptorFloorGrowth {
+            floors: vec![1500, 1600, 1700],
+            per_hour: 200,
+        };
+        let detail = descriptor_health_detail(&snapshot, Some(&growth));
+        assert!(
+            detail.starts_with("1900 open of soft limit 2048 (92%);"),
+            "{detail}"
+        );
+        assert!(detail.contains("possible descriptor leak"), "{detail}");
+        let steady = descriptor_health_detail(&snapshot, None);
+        assert!(steady.ends_with("floor not rising"), "{steady}");
+    }
+
     #[test]
     fn health_check_retention_block_serializes_null_free() {
         // GH#210: the retention block is compact and null-free — zero
@@ -5189,6 +5277,46 @@ body
                         }),
                     "health_check should surface missing archive project identity: {value}"
                 );
+            },
+        );
+    }
+
+    /// br-kp1in.17: every `health_check` names this process's descriptor
+    /// headroom among the inputs to `health_level`.
+    #[test]
+    fn health_check_reports_descriptor_headroom_as_a_level_contributor() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("descriptor-health.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                let contributors = value["health_level_contributors"]
+                    .as_array()
+                    .expect("contributors array");
+                let descriptors = contributors
+                    .iter()
+                    .find(|row| row["name"] == "descriptors")
+                    .unwrap_or_else(|| panic!("descriptors contributor missing: {value}"));
+                assert_eq!(descriptors["level"], "green", "{descriptors}");
+                let detail = descriptors["detail"].as_str().expect("detail");
+                assert!(detail.contains(" open of soft limit "), "{detail}");
+                assert!(detail.ends_with("floor not rising"), "{detail}");
             },
         );
     }

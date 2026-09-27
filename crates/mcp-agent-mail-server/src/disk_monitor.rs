@@ -68,6 +68,28 @@ fn should_emit_pressure_change_alert(previous: DiskPressure, current: DiskPressu
     previous != current
 }
 
+/// Feed the descriptor leak detector (br-kp1in.17) and warn once each time
+/// it starts reporting a rising floor. Returns whether growth is reported.
+fn sample_descriptors(elapsed: Duration, reported: bool) -> bool {
+    let Some(open_fds) = mcp_agent_mail_core::count_open_fds() else {
+        return reported;
+    };
+    mcp_agent_mail_core::record_descriptor_sample(
+        u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        open_fds,
+    );
+    let growth = mcp_agent_mail_core::descriptor_floor_growth();
+    if let Some(growth) = growth.as_ref().filter(|_| !reported) {
+        tracing::warn!(
+            open_fds,
+            floors = ?growth.floors,
+            per_hour = growth.per_hour,
+            "open descriptor floor rose in every recent window: possible descriptor leak"
+        );
+    }
+    growth.is_some()
+}
+
 pub fn start(config: &Config) {
     let mut worker = WORKER
         .lock()
@@ -139,6 +161,7 @@ fn monitor_loop(
 ) {
     let mut schedule = MonitorSchedule::new(config);
     let started = Instant::now();
+    let mut descriptor_growth_reported = false;
     tracing::info!(
         disk_enabled = schedule.disk_enabled,
         disk_interval_secs = schedule.disk_interval.as_secs(),
@@ -173,6 +196,8 @@ fn monitor_loop(
                 );
             }
             last_memory_pressure = sample.pressure;
+            descriptor_growth_reported =
+                sample_descriptors(started.elapsed(), descriptor_growth_reported);
         }
 
         if disk_due && !SHUTDOWN.load(Ordering::Acquire) {
