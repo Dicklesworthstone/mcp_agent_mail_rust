@@ -59,6 +59,8 @@ thread_local! {
     /// visibility probe on this thread started (br-kp1in.32 regression test).
     static SERIALIZER_LOCKED_AT_PROBE: std::cell::RefCell<Vec<bool>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Fresh durability-probe connections opened on this thread (br-v0ucm).
+    static DURABILITY_PROBE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // =============================================================================
@@ -1939,20 +1941,34 @@ macro_rules! try_in_tx {
 const DURABILITY_PROBE_MAX_RETRIES: u32 = 3;
 
 /// Execute a durability probe query from a fresh connection when file-backed.
-///
-/// This avoids false positives where the writer connection can still observe
-/// transient state that is not yet durable/visible from independent handles.
-///
-/// Transient `SQLITE_BUSY` / `database is locked` errors are retried up to
-/// [`DURABILITY_PROBE_MAX_RETRIES`] times with exponential backoff so that a
-/// concurrent WAL checkpoint does not cause the caller to see a spurious
-/// `DATABASE_ERROR busy` for a mutation that already committed successfully.
 async fn durability_probe_query(
     cx: &Cx,
     pool: &DbPool,
     sql: &str,
     params: &[Value],
 ) -> Outcome<Vec<SqlRow>, DbError> {
+    durability_probe_queries(cx, pool, &[(sql, params)])
+        .await
+        .map(|mut rows| rows.pop().unwrap_or_default())
+}
+
+/// Execute durability probe queries, in order, on one fresh connection when
+/// file-backed.
+///
+/// This avoids false positives where the writer connection can still observe
+/// transient state that is not yet durable/visible from independent handles.
+/// One handle serves every statement: each fresh open rescans the whole WAL
+/// (br-v0ucm), so a probe must not open more than it needs.
+///
+/// Transient `SQLITE_BUSY` / `database is locked` errors are retried up to
+/// [`DURABILITY_PROBE_MAX_RETRIES`] times with exponential backoff so that a
+/// concurrent WAL checkpoint does not cause the caller to see a spurious
+/// `DATABASE_ERROR busy` for a mutation that already committed successfully.
+async fn durability_probe_queries(
+    cx: &Cx,
+    pool: &DbPool,
+    statements: &[(&str, &[Value])],
+) -> Outcome<Vec<Vec<SqlRow>>, DbError> {
     if pool.sqlite_path() == ":memory:" {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -1961,7 +1977,7 @@ async fn durability_probe_query(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         let tracked = tracked(&*conn);
-        return map_sql_outcome(traw_query(cx, &tracked, sql, params).await);
+        return run_probe_statements(cx, &tracked, statements).await;
     }
 
     for attempt in 0..=DURABILITY_PROBE_MAX_RETRIES {
@@ -1975,13 +1991,16 @@ async fn durability_probe_query(
             Ok(conn) => conn,
             Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
         };
+        #[cfg(test)]
+        DURABILITY_PROBE_OPENS.with(|opens| opens.set(opens.get() + 1));
         if let Err(e) = probe_conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL) {
+            crate::close_db_conn(probe_conn, "durability probe connection init failed");
             return Outcome::Err(DbError::Sqlite(format!(
                 "durability probe connection init failed: {e}"
             )));
         }
         let probe_tracked = tracked(&probe_conn);
-        let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
+        let out = run_probe_statements(cx, &probe_tracked, statements).await;
         crate::close_db_conn(probe_conn, "durability_probe_query connection");
 
         match &out {
@@ -2004,6 +2023,23 @@ async fn durability_probe_query(
     Outcome::Err(DbError::Internal(
         "durability probe retry loop fell through".to_string(),
     ))
+}
+
+async fn run_probe_statements(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    statements: &[(&str, &[Value])],
+) -> Outcome<Vec<Vec<SqlRow>>, DbError> {
+    let mut results = Vec::with_capacity(statements.len());
+    for (sql, params) in statements {
+        match map_sql_outcome(traw_query(cx, tracked, sql, params).await) {
+            Outcome::Ok(rows) => results.push(rows),
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+    }
+    Outcome::Ok(results)
 }
 
 /// Check if a durability-probe error is a transient busy/locked condition
@@ -2100,16 +2136,15 @@ struct WriterPostCommitCounts {
     recipient_count: Option<i64>,
 }
 
-async fn message_visibility_probe_query(
+async fn message_visibility_probe_queries(
     cx: &Cx,
     pool: &DbPool,
-    sql: &str,
-    params: &[Value],
+    statements: &[(&str, &[Value])],
     mode: MessageVisibilityProbeMode,
-) -> Outcome<Vec<SqlRow>, DbError> {
+) -> Outcome<Vec<Vec<SqlRow>>, DbError> {
     match mode {
         MessageVisibilityProbeMode::FreshHandle => {
-            durability_probe_query(cx, pool, sql, params).await
+            durability_probe_queries(cx, pool, statements).await
         }
         #[cfg(test)]
         MessageVisibilityProbeMode::PooledHandle => {
@@ -2120,7 +2155,7 @@ async fn message_visibility_probe_query(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             };
             let tracked = tracked(&*conn);
-            map_sql_outcome(traw_query(cx, &tracked, sql, params).await)
+            run_probe_statements(cx, &tracked, statements).await
         }
     }
 }
@@ -2222,20 +2257,27 @@ async fn verify_message_recipients_visible_with_probe_mode(
 ) -> Outcome<(), DbError> {
     let message_count_sql = "SELECT COUNT(*) FROM messages WHERE id = ? AND project_id = ?";
     let message_count_params = [Value::BigInt(message_id), Value::BigInt(project_id)];
-    let message_count_rows = match message_visibility_probe_query(
+    let recipient_sql = "SELECT agent_id, kind FROM message_recipients WHERE message_id = ? ORDER BY agent_id, kind";
+    let recipient_params = [Value::BigInt(message_id)];
+    let mut rows = match message_visibility_probe_queries(
         cx,
         pool,
-        message_count_sql,
-        &message_count_params,
+        &[
+            (message_count_sql, &message_count_params[..]),
+            (recipient_sql, &recipient_params[..]),
+        ],
         probe_mode,
     )
     .await
     {
-        Outcome::Ok(rows) => rows,
+        Outcome::Ok(rows) => rows.into_iter(),
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let message_count_rows = rows.next().unwrap_or_default();
+    let recipient_rows = rows.next().unwrap_or_default();
+
     let message_count = message_count_rows
         .first()
         .and_then(row_first_i64)
@@ -2245,23 +2287,6 @@ async fn verify_message_recipients_visible_with_probe_mode(
             "message row not visible after commit for message_id={message_id} project_id={project_id}"
         )));
     }
-
-    let recipient_sql = "SELECT agent_id, kind FROM message_recipients WHERE message_id = ? ORDER BY agent_id, kind";
-    let recipient_params = [Value::BigInt(message_id)];
-    let recipient_rows = match message_visibility_probe_query(
-        cx,
-        pool,
-        recipient_sql,
-        &recipient_params,
-        probe_mode,
-    )
-    .await
-    {
-        Outcome::Ok(rows) => rows,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
 
     let actual = match decode_message_recipient_pairs(message_id, &recipient_rows) {
         Ok(actual) => actual,
@@ -29369,6 +29394,80 @@ mod tests {
             .await
             .into_result()
             .expect("pooled handle should confirm committed message visibility");
+        });
+    }
+
+    /// br-v0ucm: every fresh FrankenSQLite open rescans the whole WAL, so the
+    /// post-commit visibility check must answer both of its questions (message
+    /// row, recipient rows) from ONE fresh handle, and still refuse a message
+    /// whose recipient rows are missing.
+    #[test]
+    fn message_visibility_probe_opens_one_fresh_handle_per_verification() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("message_visibility_probe_fresh.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        init_conn
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'probe-project', '/tmp/am-message-fresh-visibility', 0); \
+                 INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'), \
+                        (2, 1, 'GreenStone', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto'); \
+                 INSERT INTO messages \
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                 VALUES (1, 1, 1, 'T', 'delivered', 'body', 'normal', 0, 0, '[]'), \
+                        (2, 1, 1, 'T', 'no recipient rows', 'body', 'normal', 0, 0, '[]'); \
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                 VALUES (1, 2, 'to', NULL, NULL);",
+            )
+            .expect("seed messages");
+        drop(init_conn);
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let opens = || DURABILITY_PROBE_OPENS.with(std::cell::Cell::get);
+        rt.block_on(async {
+            let before = opens();
+            verify_message_recipients_visible_after_commit(&cx, &pool, 1, 1, &[(2, "to")])
+                .await
+                .into_result()
+                .expect("delivered message is visible from a fresh handle");
+            assert_eq!(opens() - before, 1, "one fresh handle per verification");
+
+            let before = opens();
+            let err =
+                verify_message_recipients_visible_after_commit(&cx, &pool, 1, 2, &[(2, "to")])
+                    .await
+                    .into_result()
+                    .expect_err("missing recipient rows must be refused");
+            assert!(
+                err.to_string()
+                    .contains("message recipient rows not visible after commit"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(opens() - before, 1);
         });
     }
 
