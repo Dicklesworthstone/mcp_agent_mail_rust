@@ -5775,6 +5775,10 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
+    #[cfg(test)]
+    if let Some(fault) = SQLITE_INIT_FAULTS.with(|faults| faults.borrow_mut().pop_front()) {
+        return Outcome::Err(fault);
+    }
     if sqlite_path != ":memory:" {
         let version_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
             Ok(conn) => conn,
@@ -6137,6 +6141,58 @@ fn startup_data_repairs(conn: &DbConn) -> Result<(), SqlError> {
 fn should_retry_sqlite_init_error(error: &SqlError) -> bool {
     let msg = error.to_string();
     is_sqlite_recovery_error_message(&msg) || is_lock_error(&msg)
+}
+
+/// How long initialization keeps retrying a lock/busy failure while another
+/// process initializes or migrates the same file (br-wp4am).
+const SQLITE_INIT_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const SQLITE_INIT_BUSY_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
+
+#[cfg(test)]
+thread_local! {
+    /// Busy retries taken by `retry_sqlite_init_while_busy` on this thread.
+    static SQLITE_INIT_BUSY_RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Errors the next `run_sqlite_init_once` calls on this thread return
+    /// before touching the file, oldest first.
+    static SQLITE_INIT_FAULTS: std::cell::RefCell<std::collections::VecDeque<SqlError>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Retry initialization with backoff while it keeps failing with lock/busy
+/// errors, within [`SQLITE_INIT_BUSY_RETRY_BUDGET`]. Migrations are
+/// idempotent, so once the other initializer finishes the retry is a no-op.
+/// Any other error, cancellation, or panic is returned as-is.
+async fn retry_sqlite_init_while_busy(
+    cx: &Cx,
+    sqlite_path: &str,
+    run_migrations: bool,
+    first_err: SqlError,
+) -> Outcome<(), SqlError> {
+    let deadline = Instant::now() + SQLITE_INIT_BUSY_RETRY_BUDGET;
+    let mut delay = Duration::from_millis(25);
+    let mut err = first_err;
+    let mut attempt = 0_u32;
+    loop {
+        if Instant::now() + delay > deadline {
+            return Outcome::Err(err);
+        }
+        attempt += 1;
+        tracing::warn!(
+            path = %sqlite_path,
+            error = %err,
+            attempt,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "sqlite init hit a lock/busy error (another process may be initializing this file); retrying"
+        );
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(SQLITE_INIT_BUSY_RETRY_MAX_DELAY);
+        #[cfg(test)]
+        SQLITE_INIT_BUSY_RETRIES.with(|retries| retries.set(retries.get() + 1));
+        match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
+            Outcome::Err(next) if is_lock_error(&next.to_string()) => err = next,
+            other => return other,
+        }
+    }
 }
 
 const SQLITE_LOCK_MAX_RETRIES: usize = 3;
@@ -7405,13 +7461,12 @@ async fn initialize_sqlite_file_once(
                     }
                 }
             } else {
-                // Lock/busy class errors are often transient under concurrent startup.
-                // Skip corruption probes and retry initialization once.
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %first_err,
-                    "sqlite init failed with retryable lock/busy error; retrying initialization once"
-                );
+                // Lock/busy class errors are transient under concurrent
+                // startup: another process may be migrating the same fresh
+                // file, and one immediate retry lands inside its migration
+                // (br-wp4am). Skip corruption probes; back off until it ends.
+                return retry_sqlite_init_while_busy(cx, sqlite_path, run_migrations, first_err)
+                    .await;
             }
 
             run_sqlite_init_once(cx, sqlite_path, run_migrations).await
@@ -32796,6 +32851,77 @@ mod tests {
             err.to_string().contains("symlinked path"),
             "unexpected error: {err}"
         );
+    }
+
+    /// br-wp4am: a second process migrating the same fresh file makes init
+    /// fail with 'database is busy' for as long as that migration runs. Three
+    /// consecutive busy failures (one more than the old single immediate
+    /// retry survived) must be waited out; a non-busy failure must not be.
+    #[test]
+    fn sqlite_init_retries_busy_failures_but_not_other_errors() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let tmp = tempfile::TempDir::new_in("/tmp").expect("tempdir");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let busy = || {
+            SqlError::Custom(
+                "sqlite init stage=migrate_to_latest_base failed: Query error: database is busy"
+                    .to_string(),
+            )
+        };
+        let init = |name: &str, faults: Vec<SqlError>| {
+            let db_path = tmp.path().join(name);
+            SQLITE_INIT_FAULTS.with(|queue| *queue.borrow_mut() = faults.into());
+            SQLITE_INIT_BUSY_RETRIES.with(|retries| retries.set(0));
+            let out = rt.block_on(initialize_sqlite_file_once(
+                &cx,
+                db_path.to_str().expect("utf8 db path"),
+                true,
+                &storage_root,
+            ));
+            let retries = SQLITE_INIT_BUSY_RETRIES.with(std::cell::Cell::get);
+            SQLITE_INIT_FAULTS.with(|queue| queue.borrow_mut().clear());
+            (out, retries, db_path)
+        };
+
+        let (out, retries, db_path) = init("busy_then_ok.sqlite3", vec![busy(), busy(), busy()]);
+        match out {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => panic!("init must wait out busy failures: {err}"),
+            Outcome::Cancelled(reason) => panic!("init cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => std::panic::panic_any(payload),
+        }
+        assert_eq!(retries, 3, "each busy failure after the first is one retry");
+        assert!(sqlite_file_is_healthy(&db_path).expect("health after retried init"));
+
+        let fatal =
+            SqlError::Custom("sqlite init stage=open_file failed: permission denied".into());
+        let (out, retries, _) = init("fatal.sqlite3", vec![fatal]);
+        assert!(
+            matches!(out, Outcome::Err(ref err) if err.to_string().contains("permission denied")),
+            "a non-busy failure is returned as-is: {out:?}"
+        );
+        assert_eq!(retries, 0);
+
+        let (out, retries, _) = init(
+            "busy_then_fatal.sqlite3",
+            vec![
+                busy(),
+                SqlError::Custom(
+                    "sqlite init stage=migrate_to_latest failed: no such table".into(),
+                ),
+            ],
+        );
+        assert!(
+            matches!(out, Outcome::Err(ref err) if err.to_string().contains("no such table")),
+            "a non-busy failure during the retries ends them: {out:?}"
+        );
+        assert_eq!(retries, 1);
     }
 
     #[test]
