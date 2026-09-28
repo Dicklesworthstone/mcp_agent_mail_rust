@@ -37,6 +37,14 @@ where
     F: FnOnce(Cx, String) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    run_with_storage_and_env(&[], f)
+}
+
+fn run_with_storage_and_env<F, Fut, T>(extra_env: &[(&str, &str)], f: F) -> T
+where
+    F: FnOnce(Cx, String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -44,12 +52,13 @@ where
     let db_path = format!("/tmp/auto-register-profile-{suffix}.sqlite3");
     let database_url = format!("sqlite://{db_path}");
     let storage_root = format!("/tmp/auto-register-profile-storage-{suffix}");
-    let env = [
+    let mut env = vec![
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
         ("MESSAGING_AUTO_REGISTER_RECIPIENTS", "true"),
         ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
     ];
+    env.extend_from_slice(extra_env);
     with_process_env_overrides_for_test(&env, || {
         Config::reset_cached();
         let rt = RuntimeBuilder::current_thread()
@@ -269,6 +278,99 @@ fn send_to_cross_project_contact_is_refused_instead_of_misdelivered() {
             "no BronzeHare placeholder may be created in the sender's project"
         );
     });
+}
+
+/// GH#335: without any contact link, a recipient name registered only in
+/// another project of the same product used to be auto-registered as a local
+/// placeholder, so the send "succeeded" and the real agent never saw it. It is
+/// refused now; a name unknown to every linked project still auto-registers.
+#[test]
+fn send_to_product_peer_name_is_refused_instead_of_misdelivered() {
+    run_with_storage_and_env(
+        &[("WORKTREES_ENABLED", "true")],
+        |cx, _storage_root| async move {
+            let ctx = McpContext::new(cx.clone(), 1);
+            let project_a = format!("/tmp/xprod-a-{}", unique_suffix());
+            let project_b = format!("/tmp/xprod-b-{}", unique_suffix());
+            register_open_agent(&ctx, &project_a, "GreenCastle").await;
+            register_open_agent(&ctx, &project_b, "RedStone").await;
+            let product = format!("xprod-{}", unique_suffix());
+            mcp_agent_mail_tools::ensure_product(&ctx, Some(product.clone()), None)
+                .await
+                .expect("ensure_product");
+            for project in [&project_a, &project_b] {
+                mcp_agent_mail_tools::products_link(&ctx, product.clone(), project.clone())
+                    .await
+                    .expect("products_link");
+            }
+
+            let send = |to: &str| {
+                send_message(
+                    &ctx,
+                    project_a.clone(),
+                    "GreenCastle".to_string(),
+                    vec![to.to_string()],
+                    "api change".to_string(),
+                    "please bump /v2".to_string(),
+                    None, // cc
+                    None, // bcc
+                    None, // attachment_paths
+                    None, // convert_images
+                    None, // importance
+                    None, // ack_required
+                    None, // thread_id
+                    None, // topic
+                    None, // broadcast
+                    None, // auto_contact_if_blocked
+                    None, // sender_token
+                    None, // idempotency_key
+                )
+            };
+            let before = delivery_counts(&cx).await;
+            // Case-insensitive, like every other agent-name lookup.
+            let err = send("redstone")
+                .await
+                .expect_err("a product peer's name must not be auto-registered locally");
+            assert_eq!(
+                mcp_agent_mail_tools::tool_util::tool_error_code(&err),
+                Some("CROSS_PROJECT_RECIPIENT"),
+                "{err:?}"
+            );
+            let data = &err.data.as_ref().expect("error data")["error"]["data"];
+            assert_eq!(data["recipient"], "RedStone", "{err:?}");
+            let b_dir = project_b.rsplit('/').next().expect("project b dir");
+            assert!(
+                data["recipient_project"]
+                    .as_str()
+                    .is_some_and(|project| project.ends_with(b_dir)),
+                "{err:?}"
+            );
+            assert_eq!(delivery_counts(&cx).await, before, "nothing may be written");
+            assert!(
+                peek_inbox(&ctx, &project_b, "RedStone").await.is_empty(),
+                "the real agent received nothing either"
+            );
+
+            // A name that no linked project knows keeps the auto-register behavior.
+            send("CobaltRobin")
+                .await
+                .expect("an unknown name still auto-registers");
+            let agents_a: Value = serde_json::from_str(
+                &list_agents(&ctx, project_a.clone(), None, None)
+                    .await
+                    .expect("list agents in A"),
+            )
+            .expect("agents JSON");
+            let mut names: Vec<&str> = agents_a
+                .as_array()
+                .expect("agents array")
+                .iter()
+                .filter_map(|agent| agent["name"].as_str())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, vec!["CobaltRobin", "GreenCastle"]);
+        },
+    );
 }
 
 async fn register_open_agent(ctx: &McpContext, project: &str, name: &str) -> i64 {

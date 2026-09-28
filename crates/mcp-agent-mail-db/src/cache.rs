@@ -1,5 +1,5 @@
 //! In-memory read cache for hot-path project and agent lookups,
-//! plus a deferred touch queue to batch `last_active_ts` updates.
+//! plus a deferred touch queue for batched `last_active_ts` updates.
 //!
 //! Dramatically reduces DB round-trips for repeated `resolve_project` and
 //! `resolve_agent` calls that happen on every tool invocation.
@@ -11,7 +11,8 @@
 //! - Capacity is profile-driven via `AM_CACHE_PROFILE` and can be overridden
 //!   with `AM_READ_CACHE_ENTRIES_PER_CATEGORY`
 //! - Write-through: callers should call `invalidate_*` or `put_*` after mutations
-//! - Deferred touch: `touch_agent` timestamps are buffered and flushed in batches
+//! - Deferred touch queue: drained by `queries::flush_deferred_touches`;
+//!   `queries::touch_agent` itself writes through, throttled per agent (GH#334)
 //!
 //! ## Eviction
 //!

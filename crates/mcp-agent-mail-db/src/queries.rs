@@ -6710,26 +6710,154 @@ pub async fn get_agents_by_ids(
     Outcome::Ok(out)
 }
 
-/// Touch agent (deferred).
+/// Minimum spacing between two `last_active_ts` writes for one agent (GH#334).
 ///
-/// Enqueues a `last_active_ts` update into the in-memory batch queue.
-/// The actual DB write happens when the flush interval elapses or when
-/// `flush_deferred_touches` is called explicitly. This eliminates a DB
-/// round-trip on every single tool invocation.
-pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), DbError> {
-    let now = now_micros();
-    let cache_scope = cache_scope_for_pool(pool);
-    let should_flush = crate::cache::read_cache().enqueue_touch_scoped(&cache_scope, agent_id, now);
+/// `last_active_ts` feeds `list_agents` ordering and its day-granular
+/// `active_within_days` filter, so minute resolution is plenty. The throttle
+/// bounds activity writes to one single-row UPDATE per agent per minute per
+/// process, however many tool calls that agent makes.
+pub const AGENT_TOUCH_MIN_INTERVAL_MICROS: i64 = 60 * 1_000_000;
 
-    if should_flush {
-        flush_deferred_touches(cx, pool).await
+/// Retry budget for one activity write. A touch is best-effort metadata: under
+/// write contention it yields (the next call after the conflict retries) rather
+/// than spending the full MVCC backoff budget inside a tool call.
+const AGENT_TOUCH_MVCC_RETRIES: u32 = 1;
+
+/// Bound on remembered (database, agent) touch claims before stale ones are pruned.
+const AGENT_TOUCH_THROTTLE_PRUNE_AT: usize = 4096;
+
+/// Last activity write per (database, agent), in microseconds.
+static AGENT_TOUCH_THROTTLE: LazyLock<std::sync::Mutex<HashMap<(String, i64), i64>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Throttle key for a pool's database.
+///
+/// A file database is keyed by its path, not by the pool generation, so the
+/// query-only read pool and the write pool of one mailbox share one throttle
+/// and a pool rebuilt between calls does not reset it. The throttle can only
+/// suppress a write, never redirect one, so a recovery that renumbers agent
+/// ids at worst delays one agent's next touch by one interval. Every
+/// in-memory pool is a separate database, so it keeps its unique identity key.
+fn agent_touch_throttle_key(pool: &DbPool) -> String {
+    let path = pool.sqlite_path();
+    if path == ":memory:" {
+        pool.sqlite_identity_key()
     } else {
-        Outcome::Ok(())
+        path.to_string()
     }
 }
 
-/// Immediately flush all pending deferred touch updates to the DB.
-/// Call this on server shutdown or when precise `last_active_ts` is needed.
+fn agent_touch_throttle() -> std::sync::MutexGuard<'static, HashMap<(String, i64), i64>> {
+    AGENT_TOUCH_THROTTLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn agent_touch_elapsed(last: i64, now: i64) -> bool {
+    // A wall clock that stepped backwards must not suppress touches until it
+    // catches up again.
+    now < last || now - last >= AGENT_TOUCH_MIN_INTERVAL_MICROS
+}
+
+/// Whether [`touch_agent`] would write for this agent now.
+///
+/// Lets a read-only surface skip opening the write pool while the agent's
+/// last touch is still fresh. Advisory only: [`touch_agent`] claims atomically.
+#[must_use]
+pub fn agent_touch_due(pool: &DbPool, agent_id: i64) -> bool {
+    let key = (agent_touch_throttle_key(pool), agent_id);
+    agent_touch_throttle()
+        .get(&key)
+        .is_none_or(|&last| agent_touch_elapsed(last, now_micros()))
+}
+
+/// Record agent activity (`last_active_ts`), throttled write-through (GH#334).
+///
+/// Writes at most once per [`AGENT_TOUCH_MIN_INTERVAL_MICROS`] per agent and
+/// database; calls inside the interval return `Ok(false)` without touching
+/// the database. The write itself is one single-row
+/// `UPDATE agents SET last_active_ts = MAX(last_active_ts, ?)` on the given
+/// (write) pool, so nothing is left queued in memory: an agent that goes idle
+/// right after a call still has that call recorded, and a pool rebuilt between
+/// calls cannot strand a pending update under a retired pool generation.
+///
+/// Returns `Ok(true)` when the write committed. A failed write still counts
+/// against the interval, so it is retried by the first call after the interval
+/// rather than by every call against a contended database.
+pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<bool, DbError> {
+    let now = now_micros();
+    let key = (agent_touch_throttle_key(pool), agent_id);
+    {
+        let mut throttle = agent_touch_throttle();
+        if throttle
+            .get(&key)
+            .is_some_and(|&last| !agent_touch_elapsed(last, now))
+        {
+            return Outcome::Ok(false);
+        }
+        if throttle.len() >= AGENT_TOUCH_THROTTLE_PRUNE_AT {
+            throttle.retain(|_, last| !agent_touch_elapsed(*last, now));
+        }
+        throttle.insert(key, now);
+    }
+
+    let outcome =
+        run_with_mvcc_retry_with_budget(cx, "touch_agent", AGENT_TOUCH_MVCC_RETRIES, || async {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let tracked = tracked(&*conn);
+            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(
+                    traw_execute(
+                        cx,
+                        &tracked,
+                        "UPDATE agents SET last_active_ts = MAX(last_active_ts, ?) WHERE id = ?",
+                        &[Value::BigInt(now), Value::BigInt(agent_id)],
+                    )
+                    .await,
+                )
+            );
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            Outcome::Ok(())
+        })
+        .await;
+
+    // A failed write keeps its claim: the touch is retried after the interval,
+    // not by every call, so a contended database is not hit harder.
+    match outcome {
+        Outcome::Ok(()) => {
+            // Evict a cached row rather than patching it: a patched copy could
+            // overwrite a concurrent writer's fresher row (e.g. a contact
+            // policy change). This costs one re-read per agent per interval.
+            let cache = crate::cache::read_cache();
+            let scope = cache_scope_for_pool(pool);
+            if let Some(agent) = cache.get_agent_by_id_scoped(&scope, agent_id) {
+                cache.invalidate_agent_scoped(
+                    &scope,
+                    agent.project_id,
+                    &agent.name,
+                    Some(agent_id),
+                );
+            }
+            Outcome::Ok(true)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Flush touches queued in the read cache's deferred-touch queue.
+///
+/// [`touch_agent`] writes through (throttled) and no longer enqueues here;
+/// this drains only entries a caller placed on the queue directly.
 pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
     let read_cache = crate::cache::read_cache();
     let cache_scope = cache_scope_for_pool(pool);
@@ -16209,6 +16337,54 @@ pub async fn list_product_projects(
             }
             Outcome::Ok(out)
         }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// GH#335: find an agent named `name` (case-insensitive) registered in another
+/// project that shares a product with `project_id`.
+///
+/// Returns the peer's `(project human_key, canonical agent name)`, or `None`
+/// when `project_id` is in no product or no linked project has that name.
+pub async fn find_agent_in_product_peer_projects(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+) -> Outcome<Option<(String, String)>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    let sql = "SELECT a.name AS name, \
+                      COALESCE(NULLIF(TRIM(p.human_key), ''), '[unknown-project-' || a.project_id || ']') AS human_key \
+               FROM agents a \
+               LEFT JOIN projects p ON p.id = a.project_id \
+               WHERE a.project_id IN ( \
+                         SELECT peer.project_id FROM product_project_links peer \
+                         WHERE peer.product_id IN ( \
+                             SELECT mine.product_id FROM product_project_links mine \
+                             WHERE mine.project_id = ?)) \
+                 AND a.project_id <> ? \
+                 AND a.name = ? COLLATE NOCASE \
+               ORDER BY a.project_id ASC, a.id ASC LIMIT 1";
+    let params = [
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::Text(name.to_string()),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => Outcome::Ok(rows.first().and_then(|row| {
+            let name = row.get_named::<String>("name").ok()?;
+            let human_key = row.get_named::<String>("human_key").ok()?;
+            Some((human_key, name))
+        })),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -34361,10 +34537,11 @@ mod tests {
             set_agent_last_active_for_test(&cx, &pool_a, first_agent_id, 0).await;
             set_agent_last_active_for_test(&cx, &pool_b, second_agent_id, 0).await;
 
-            touch_agent(&cx, &pool_a, first_agent_id)
-                .await
-                .into_result()
-                .expect("queue deferred touch in pool a");
+            crate::cache::read_cache().enqueue_touch_scoped(
+                &cache_scope_for_pool(&pool_a),
+                first_agent_id,
+                now_micros(),
+            );
 
             flush_deferred_touches(&cx, &pool_b)
                 .await
@@ -34383,6 +34560,115 @@ mod tests {
             assert!(
                 read_agent_last_active_for_test(&cx, &pool_a, first_agent_id).await > 0,
                 "pool a flush should still apply its own deferred touch"
+            );
+        });
+    }
+
+    /// GH#334: `touch_agent` writes `last_active_ts` through immediately, at
+    /// most once per interval per agent and database file, with the throttle
+    /// shared by every pool (write or query-only) of that file.
+    #[test]
+    fn touch_agent_writes_through_and_throttles_per_database_file() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("touch_agent_throttle.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/touch-agent-throttle")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project.id.expect("project id"),
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+            // Prime the agent cache so the eviction on write is exercised.
+            let _ = get_agent_by_id(&cx, &pool, agent_id).await;
+            set_agent_last_active_for_test(&cx, &pool, agent_id, 1).await;
+
+            assert!(agent_touch_due(&pool, agent_id));
+            let wrote = touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("first touch");
+            assert!(wrote, "the first touch must write");
+            let touched = read_agent_last_active_for_test(&cx, &pool, agent_id).await;
+            assert!(
+                touched > 1,
+                "the touch must be durable at once, got {touched}"
+            );
+            assert!(
+                crate::cache::read_cache()
+                    .get_agent_by_id_scoped(&cache_scope_for_pool(&pool), agent_id)
+                    .is_none(),
+                "the cached row with the old timestamp must be evicted"
+            );
+
+            // Within the interval: no write, even from another pool of the file.
+            set_agent_last_active_for_test(&cx, &pool, agent_id, 1).await;
+            assert!(!agent_touch_due(&pool, agent_id));
+            let wrote = touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("throttled touch");
+            assert!(!wrote, "a touch inside the interval must be skipped");
+            let read_cfg = crate::pool::DbPoolConfig {
+                database_url: format!(
+                    "sqlite:///{}",
+                    dir.path().join("touch_agent_throttle.db").display()
+                ),
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let read_pool = crate::create_query_only_pool(&read_cfg).expect("query-only pool");
+            assert!(
+                !agent_touch_due(&read_pool, agent_id),
+                "a read pool of the same file must share the throttle"
+            );
+            assert_eq!(
+                read_agent_last_active_for_test(&cx, &pool, agent_id).await,
+                1
+            );
+
+            // Once the interval has elapsed, the next touch writes again.
+            agent_touch_throttle().insert(
+                (agent_touch_throttle_key(&pool), agent_id),
+                now_micros() - AGENT_TOUCH_MIN_INTERVAL_MICROS - 1,
+            );
+            assert!(agent_touch_due(&pool, agent_id));
+            let wrote = touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("touch after interval");
+            assert!(wrote, "a touch after the interval must write");
+            assert!(read_agent_last_active_for_test(&cx, &pool, agent_id).await > 1);
+
+            // last_active_ts never moves backwards.
+            let latest = read_agent_last_active_for_test(&cx, &pool, agent_id).await;
+            set_agent_last_active_for_test(&cx, &pool, agent_id, latest + 10_000_000_000).await;
+            agent_touch_throttle().remove(&(agent_touch_throttle_key(&pool), agent_id));
+            touch_agent(&cx, &pool, agent_id)
+                .await
+                .into_result()
+                .expect("touch behind a newer value");
+            assert_eq!(
+                read_agent_last_active_for_test(&cx, &pool, agent_id).await,
+                latest + 10_000_000_000
             );
         });
     }

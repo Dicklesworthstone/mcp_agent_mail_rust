@@ -887,6 +887,48 @@ pub mod tool_util {
         })
     }
 
+    /// GH#334: record that the acting agent (the caller, never a recipient)
+    /// was active, on the write `pool` the tool already holds.
+    ///
+    /// Best-effort: `queries::touch_agent` writes at most once a minute per
+    /// agent, and a failed touch is logged, never surfaced to the caller.
+    pub async fn touch_acting_agent(ctx: &McpContext, pool: &DbPool, agent_id: Option<i64>) {
+        let Some(agent_id) = agent_id.filter(|id| *id > 0) else {
+            return;
+        };
+        match mcp_agent_mail_db::queries::touch_agent(ctx.cx(), pool, agent_id).await {
+            asupersync::Outcome::Ok(_) => {}
+            asupersync::Outcome::Err(error) => {
+                tracing::debug!(agent_id, error = %error, "agent activity touch failed");
+            }
+            asupersync::Outcome::Cancelled(_) | asupersync::Outcome::Panicked(_) => {
+                tracing::debug!(agent_id, "agent activity touch did not complete");
+            }
+        }
+    }
+
+    /// [`touch_acting_agent`] for a tool that reads through a live query-only
+    /// pool. The write pool is opened only when the agent's touch is due, so a
+    /// polling agent adds no write-lane traffic between touches.
+    pub(crate) async fn touch_acting_agent_after_live_read(
+        ctx: &McpContext,
+        read_pool: &DbPool,
+        agent_id: Option<i64>,
+    ) {
+        let Some(agent_id) = agent_id.filter(|id| *id > 0) else {
+            return;
+        };
+        if !mcp_agent_mail_db::queries::agent_touch_due(read_pool, agent_id) {
+            return;
+        }
+        match get_db_pool() {
+            Ok(pool) => touch_acting_agent(ctx, &pool, Some(agent_id)).await,
+            Err(error) => {
+                tracing::debug!(agent_id, error = %error, "agent activity touch skipped");
+            }
+        }
+    }
+
     /// Open the live mailbox for a read surface without migrations, recovery,
     /// reconciliation, directory creation, or writer-generation changes.
     pub(crate) fn get_live_read_db_pool() -> McpResult<DbPool> {

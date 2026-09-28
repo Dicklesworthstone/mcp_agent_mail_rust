@@ -8,6 +8,7 @@
 //! `every_test_file_is_linked` fails for any `tests/*.rs` left out.
 #![recursion_limit = "256"]
 
+mod agent_activity;
 mod agent_name_parity;
 mod auto_name_collision;
 mod auto_register_profile;

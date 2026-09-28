@@ -965,7 +965,7 @@ sequenceDiagram
 ### Across Different Repos
 
 - **Option A (single project bus):** Register both repos under the same `project_key`. Keep reservation patterns specific (`frontend/**` vs `backend/**`).
-- **Option B (separate projects):** Each repo has its own `project_key`. Contact links (`request_contact`/`respond_contact` or `macro_contact_handshake`) record the cross-project relationship, and the product bus gives cross-project search and inbox views. `send_message` itself delivers only within one project: naming a contact from another project is refused with `CROSS_PROJECT_RECIPIENT` rather than delivered. For direct messages between repos, use Option A.
+- **Option B (separate projects):** Each repo has its own `project_key`. Contact links (`request_contact`/`respond_contact` or `macro_contact_handshake`) record the cross-project relationship, and the product bus gives cross-project search and inbox views. `send_message` itself delivers only within one project: naming a contact from another project, or an agent registered in another project linked to the same product, is refused with `CROSS_PROJECT_RECIPIENT` rather than delivered (no same-name placeholder is created). For direct messages between repos, use Option A.
 
 ### External Git Coordination (opt-in)
 

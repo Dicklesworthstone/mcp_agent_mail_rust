@@ -1762,6 +1762,7 @@ pub async fn file_reservation_paths(
     )
     .await?;
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     // Fingerprint the actual normalized path set, not its input spelling or
     // duplicate/order artifacts. JSON preserves list boundaries even when a
@@ -2349,6 +2350,7 @@ pub async fn release_file_reservations(
         Err(error) => return Err(error),
     };
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     let ids_to_release = if normalized_paths.is_some() || file_reservation_ids.is_some() {
         let existing_rows = match mcp_agent_mail_db::queries::list_unreleased_file_reservations(
@@ -2575,6 +2577,7 @@ pub async fn renew_file_reservations(
     )
     .await?;
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     let existing_rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true).await,

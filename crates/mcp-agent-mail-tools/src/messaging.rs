@@ -604,6 +604,27 @@ async fn cross_project_contact_named(
     Ok(None)
 }
 
+/// `CROSS_PROJECT_RECIPIENT`: the recipient name belongs to an agent in
+/// another project, so auto-registering it here would misdeliver.
+fn cross_project_recipient_error(peer_name: &str, peer_project: &str, relation: &str) -> McpError {
+    legacy_tool_error(
+        "CROSS_PROJECT_RECIPIENT",
+        format!(
+            "Recipient '{peer_name}' is not registered in this project; {relation} \
+             '{peer_project}'. send_message only delivers within one project, so nothing was \
+             sent (auto-registering a same-name placeholder here would strand the message \
+             where the real agent never sees it). Register that agent in this project, or \
+             coordinate from a project you both belong to."
+        ),
+        false,
+        json!({
+            "recipient": peer_name,
+            "recipient_project": peer_project,
+            "cross_project_messaging_supported": false,
+        }),
+    )
+}
+
 async fn resolve_or_register_agent(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -647,21 +668,29 @@ async fn resolve_or_register_agent(
                     Outcome::Ok(project) => project.human_key,
                     _ => format!("project #{peer_project_id}"),
                 };
-                return Err(legacy_tool_error(
-                    "CROSS_PROJECT_RECIPIENT",
-                    format!(
-                        "Recipient '{peer_name}' is not registered in this project; it is your \
-                         contact in project '{peer_project}'. send_message only delivers within \
-                         one project, so nothing was sent (previously this created a same-name \
-                         placeholder here and the peer never received it). Register that agent \
-                         in this project, or coordinate from a project you both belong to."
-                    ),
-                    false,
-                    json!({
-                        "recipient": peer_name,
-                        "recipient_project": peer_project,
-                        "cross_project_messaging_supported": false,
-                    }),
+                return Err(cross_project_recipient_error(
+                    &peer_name,
+                    &peer_project,
+                    "it is your contact in project",
+                ));
+            }
+            // GH#335: likewise for a name registered in another project of the
+            // same product. The product bus aggregates reads across linked
+            // projects but does not route mail, so a local placeholder would
+            // strand the message while the real agent never sees it.
+            if let Some((peer_project, peer_name)) = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::find_agent_in_product_peer_projects(
+                    ctx.cx(),
+                    pool,
+                    project_id,
+                    &agent_name_norm,
+                )
+                .await,
+            )? {
+                return Err(cross_project_recipient_error(
+                    &peer_name,
+                    &peer_project,
+                    "an agent with that name is registered in the same product's project",
                 ));
             }
             // Proof gate (fail-closed): auto-registering an unknown recipient
@@ -2352,6 +2381,7 @@ effective_free_bytes={free}"
         sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
     {
@@ -3368,6 +3398,7 @@ effective_free_bytes={free}"
         sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
     // Resolve original sender name for default recipient
     let original_sender = db_outcome_to_mcp_result(
@@ -4385,6 +4416,10 @@ pub async fn fetch_inbox(
             );
         }
     }
+    // An archive snapshot never writes back (see above), activity included.
+    if read_pool.live_sqlite_path().is_some() {
+        crate::tool_util::touch_acting_agent_after_live_read(ctx, &read_pool, agent.id).await;
+    }
     phase.mark("downstream_cache_update");
 
     // Clear notification signal (best-effort).
@@ -4561,6 +4596,7 @@ pub async fn fetch_inbox_events(
     )
     .await?;
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     let page = match mcp_agent_mail_db::queries::fetch_inbox_delivery_events(
         ctx.cx(),
@@ -4760,6 +4796,7 @@ pub async fn mark_message_read(
     )
     .await?;
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     // Authorization note: agent_id is globally unique (auto-increment across
     // all projects), so the DB query `WHERE agent_id = ? AND message_id = ?`
@@ -4865,6 +4902,7 @@ pub async fn mark_all_read(
     )
     .await?;
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     let outcome = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::mark_messages_read_bulk(
@@ -5222,6 +5260,7 @@ pub async fn acknowledge_message(
         Err(error) => return Err(error),
     };
     let agent_id = agent.id.unwrap_or(0);
+    crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
     // Authorization note: agent_id is globally unique (auto-increment), so
     // the DB query implicitly scopes to the correct project. See mark_message_read.
