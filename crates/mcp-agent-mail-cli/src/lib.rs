@@ -30633,6 +30633,36 @@ fn server_descriptor_warning(health: &serde_json::Value) -> Option<String> {
     Some(format!("server descriptors {level}: {detail}"))
 }
 
+/// `(status, detail)` for robot health's `sqlite_write_mode` probe: the
+/// autocommit write mode the live server's engine runs (br-kp1in.16). The
+/// runtime pins MVCC concurrent on every write connection, so any other
+/// observed mode is degraded.
+fn server_write_mode_probe(health: Option<&serde_json::Value>) -> (&'static str, String) {
+    let Some(mode) = health
+        .and_then(|health| health.get("sqlite_autocommit_write_mode"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return (
+            "skip",
+            "live server health reported no write mode".to_string(),
+        );
+    };
+    match mode {
+        "mvcc_concurrent" => (
+            "ok",
+            "autocommit writes pinned to MVCC concurrent".to_string(),
+        ),
+        "" | "not_observed" => (
+            "skip",
+            "server has not opened a write connection yet".to_string(),
+        ),
+        other => (
+            "degraded",
+            format!("autocommit write mode is {other}; the runtime pins mvcc_concurrent"),
+        ),
+    }
+}
+
 fn probe_local_jsonrpc_health(
     config: &Config,
     port_status: &mcp_agent_mail_server::startup_checks::PortStatus,
@@ -58261,6 +58291,29 @@ startup_timeout_sec = 42
             server_descriptor_warning(&serde_json::json!({"status": "ok"})),
             None
         );
+    }
+
+    #[test]
+    fn server_write_mode_probe_flags_any_mode_but_the_pinned_one() {
+        // br-kp1in.16.
+        let health = |mode: &str| serde_json::json!({"sqlite_autocommit_write_mode": mode});
+        assert_eq!(
+            server_write_mode_probe(Some(&health("mvcc_concurrent"))).0,
+            "ok"
+        );
+        let (status, detail) = server_write_mode_probe(Some(&health("serialized")));
+        assert_eq!(status, "degraded");
+        assert!(detail.contains("serialized"), "{detail}");
+        assert_eq!(
+            server_write_mode_probe(Some(&health("not_observed"))).0,
+            "skip"
+        );
+        // A server that predates the field, and no reachable server.
+        assert_eq!(
+            server_write_mode_probe(Some(&serde_json::json!({"status": "ok"}))).0,
+            "skip"
+        );
+        assert_eq!(server_write_mode_probe(None).0, "skip");
     }
 
     #[test]

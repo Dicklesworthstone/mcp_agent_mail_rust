@@ -15721,18 +15721,25 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 .collect();
             let descriptors = (!owner_pids.is_empty())
                 .then(|| crate::doctor_server_descriptor_check(&owner_pids));
-            // The server's own leak detector sees growth over time, which a
-            // point-in-time /proc sample cannot: relay its verdict too.
-            let server_descriptor_relay = descriptors.as_ref().and_then(|_| {
+            let server_health = descriptors.as_ref().and_then(|_| {
                 let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
                     &config.http_host,
                     config.http_port,
                 );
-                crate::probe_local_jsonrpc_health(&config, &port_status)
-                    .payload
-                    .as_ref()
-                    .and_then(crate::server_descriptor_warning)
+                crate::probe_local_jsonrpc_health(&config, &port_status).payload
             });
+            // The server's own leak detector sees growth over time, which a
+            // point-in-time /proc sample cannot: relay its verdict too.
+            let server_descriptor_relay = server_health
+                .as_ref()
+                .and_then(crate::server_descriptor_warning);
+            // br-kp1in.16: the autocommit write mode the server's engine runs.
+            let (write_mode_status, write_mode_detail) = if descriptors.is_some() {
+                crate::server_write_mode_probe(server_health.as_ref())
+            } else {
+                ("skip", "no live mailbox owner process to ask".to_string())
+            };
+            let write_mode_degraded = write_mode_status == "degraded";
             let descriptors_status = descriptors.as_ref().map(|check| check.status);
             let descriptors_unhealthy = descriptors_status == Some("fail");
             let descriptors_degraded =
@@ -15756,6 +15763,12 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     },
                 ),
             });
+            probes.push(HealthProbe {
+                name: "sqlite_write_mode".into(),
+                status: write_mode_status.into(),
+                latency_ms: 0.0,
+                detail: write_mode_detail,
+            });
 
             // Overall health
             let overall = if !db_ok
@@ -15778,6 +15791,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || tui_liveness_stalled
                 || process_owner_degraded
                 || descriptors_degraded
+                || write_mode_degraded
             {
                 "degraded"
             } else {
