@@ -131,6 +131,18 @@ mod descriptor_scan {
             && left.st_ctime_nsec == right.st_ctime_nsec
     }
 
+    /// What a classified entry must still match once it is opened.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OpenCheck {
+        /// The storage root and everything inside it: any change, contents
+        /// included, refuses the scan.
+        Generation,
+        /// A directory above the storage root: only a swap matters, because
+        /// unrelated activity in, say, /tmp or $HOME must not fail an
+        /// otherwise stable scan (br-7kk8y).
+        Identity,
+    }
+
     fn stat_opened(file: &File, path: &Path) -> DbResult<Stat> {
         rustix::fs::fstat(file)
             .map_err(|error| archive_scan_error(path, "inspect retained archive authority", error))
@@ -166,6 +178,7 @@ mod descriptor_scan {
         kind: FileType,
         optional: bool,
         skip_non_directory: bool,
+        check: OpenCheck,
         hook: &mut impl FnMut(&Path, Phase),
     ) -> DbResult<Option<Opened>> {
         let path = parent.path.join(name);
@@ -223,7 +236,11 @@ mod descriptor_scan {
             })?,
         );
         let stat = stat_opened(&file, &path)?;
-        if !same_generation(&before, &stat) {
+        let unchanged = match check {
+            OpenCheck::Generation => same_generation(&before, &stat),
+            OpenCheck::Identity => same_object(&before, &stat),
+        };
+        if !unchanged {
             return Err(archive_scan_error(
                 &path,
                 "acquire archive authority",
@@ -251,6 +268,7 @@ mod descriptor_scan {
             },
             matches!(level, Level::Root | Level::Project),
             level == Level::Projects,
+            OpenCheck::Generation,
             hook,
         )?
         else {
@@ -378,15 +396,23 @@ mod descriptor_scan {
             stat,
         }];
         let mut missing = false;
-        for component in absolute.components() {
+        let mut components = absolute.components().peekable();
+        while let Some(component) = components.next() {
             let name = match component {
                 Component::RootDir | Component::CurDir => continue,
                 Component::Normal(name) => name,
                 Component::ParentDir => OsStr::new(".."),
                 Component::Prefix(_) => unreachable!("Unix paths have no prefix components"),
             };
+            // Only the last component, the storage root itself, is archive.
+            let check = if components.peek().is_some() {
+                OpenCheck::Identity
+            } else {
+                OpenCheck::Generation
+            };
             let parent = &ancestors[ancestors.len() - 1];
-            let Some(child) = open_child(parent, name, FileType::Directory, true, false, hook)?
+            let Some(child) =
+                open_child(parent, name, FileType::Directory, true, false, check, hook)?
             else {
                 validate_generation(parent)?;
                 missing = true;
@@ -1454,6 +1480,52 @@ mod tests {
         });
         assert!(injected);
         assert_eq!(result.unwrap(), Some(97));
+    }
+
+    /// Activity in a directory above the storage root between its
+    /// classification and open is not an archive change (br-7kk8y).
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_allows_ancestor_activity_between_classification_and_open() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let ancestor = base.join("ancestor");
+        let root = ancestor.join("storage");
+        write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+        let mut injected = false;
+        let result = descriptor_scan::scan(&root, &mut |path, phase| {
+            if path == ancestor && phase == descriptor_scan::Phase::Classified && !injected {
+                injected = true;
+                fs::write(ancestor.join("unrelated-sibling"), b"unrelated").unwrap();
+            }
+        });
+        assert!(injected);
+        assert_eq!(result.unwrap(), Some(97));
+    }
+
+    /// The storage root is archive: the same activity at the same seam there
+    /// still refuses the scan.
+    #[cfg(unix)]
+    #[test]
+    fn archive_scan_refuses_storage_root_activity_between_classification_and_open() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("storage");
+        write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+        let mut injected = false;
+        let result = descriptor_scan::scan(&root, &mut |path, phase| {
+            if path == root && phase == descriptor_scan::Phase::Classified && !injected {
+                injected = true;
+                fs::write(root.join("unrelated-sibling"), b"unrelated").unwrap();
+            }
+        });
+        assert!(injected);
+        let error = result.expect_err("a storage root changed before open must not publish");
+        assert!(
+            error
+                .to_string()
+                .contains("changed between classification and open"),
+            "{error}"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
