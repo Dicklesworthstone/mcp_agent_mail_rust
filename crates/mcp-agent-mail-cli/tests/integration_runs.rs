@@ -2083,7 +2083,11 @@ fn agent_start_json_missing_agent_uses_shell_safe_placeholder() {
     let env = TestEnv::new();
     let project = env.tmp.path().display().to_string();
     let mut env_vars = env.base_env();
+    // Empty, not absent: `run_am` inherits the caller's environment, and an
+    // agent's shell exports AGENT_NAME (br-3w116).
     env_vars.retain(|(key, _)| !matches!(key.as_str(), "AGENT_NAME" | "AGENT_MAIL_AGENT"));
+    env_vars.push(("AGENT_NAME".to_string(), String::new()));
+    env_vars.push(("AGENT_MAIL_AGENT".to_string(), String::new()));
 
     let out = run_am(
         &env_vars,
@@ -2208,7 +2212,10 @@ fn agent_start_fix_idempotently_registers_identity() {
 fn agent_start_fix_blocks_without_safe_prerequisites() {
     let env = TestEnv::new();
     let mut env_vars = env.base_env();
+    // Empty, not absent: see agent_start_json_missing_agent_uses_shell_safe_placeholder.
     env_vars.retain(|(key, _)| !matches!(key.as_str(), "AGENT_NAME" | "AGENT_MAIL_AGENT"));
+    env_vars.push(("AGENT_NAME".to_string(), String::new()));
+    env_vars.push(("AGENT_MAIL_AGENT".to_string(), String::new()));
 
     let out = run_am(
         &env_vars,

@@ -90812,10 +90812,11 @@ fn non_empty_arg(value: Option<String>) -> Option<String> {
     value.filter(|raw| !raw.trim().is_empty())
 }
 
+/// Process environment only (a project `.env` must not name the agent: every
+/// agent in that directory would get the same identity), read through the
+/// config layer so explicit overrides, including an empty one, win (br-3w116).
 fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|raw| !raw.trim().is_empty())
+    mcp_agent_mail_core::config::process_env_value(name).filter(|raw| !raw.trim().is_empty())
 }
 
 fn scoped_agent_command(
