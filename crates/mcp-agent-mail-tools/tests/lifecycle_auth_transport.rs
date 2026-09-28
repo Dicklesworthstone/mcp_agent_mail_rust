@@ -59,7 +59,16 @@ where
         let rt = RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        rt.block_on(f(cx, project_key.clone()))
+        let out = rt.block_on(f(cx, project_key.clone()));
+        // Drain this test's archive writes (agent profiles from register /
+        // retire / unretire / deregister) while its STORAGE_ROOT still exists.
+        // Otherwise the process-global write-back queue executes them after
+        // the tempdir is removed, they fail with ENOENT, and the sticky
+        // durability flag makes every later send in this binary refuse with
+        // DURABILITY_DEGRADED.
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
+        out
     })
 }
 
