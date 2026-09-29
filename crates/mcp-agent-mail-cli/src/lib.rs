@@ -30992,10 +30992,37 @@ fn doctor_is_archive_month_component(value: &str) -> bool {
     value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Per-file findings the full archive audit collects during the inventory
+/// walk, so each canonical message file is read once.
+#[derive(Default)]
+struct DoctorMessageAuditSink {
+    duplicate_candidates: std::collections::BTreeMap<i64, Vec<PathBuf>>,
+    malformed_messages: Vec<DoctorArchiveMalformedMessageFinding>,
+}
+
+impl DoctorMessageAuditSink {
+    fn malformed(sink: Option<&mut Self>, path: &Path, problem: String) {
+        if let Some(sink) = sink {
+            sink.malformed_messages
+                .push(DoctorArchiveMalformedMessageFinding {
+                    path: path.display().to_string(),
+                    problem,
+                });
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Canonical message files read by [`scan_doctor_project_messages`].
+    static DOCTOR_MESSAGE_FILE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn scan_doctor_project_messages(
     messages_dir: &Path,
     global_message_ids: &mut std::collections::HashSet<i64>,
     duplicate_message_ids: &mut std::collections::HashSet<i64>,
+    mut audit: Option<&mut DoctorMessageAuditSink>,
 ) -> DoctorArchiveInventory {
     let mut inventory = DoctorArchiveInventory::default();
     for entry in walkdir::WalkDir::new(messages_dir)
@@ -31028,17 +31055,40 @@ fn scan_doctor_project_messages(
 
         inventory.canonical_message_files += 1;
 
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
-            inventory.unparseable_canonical_message_files += 1;
-            continue;
+        #[cfg(test)]
+        DOCTOR_MESSAGE_FILE_READS.with(|reads| reads.set(reads.get() + 1));
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(content) => content,
+            Err(err) => {
+                inventory.unparseable_canonical_message_files += 1;
+                DoctorMessageAuditSink::malformed(
+                    audit.as_deref_mut(),
+                    entry.path(),
+                    format!("cannot read canonical message file: {err}"),
+                );
+                continue;
+            }
         };
         let Some(frontmatter) = doctor_extract_json_frontmatter(&content) else {
             inventory.unparseable_canonical_message_files += 1;
+            DoctorMessageAuditSink::malformed(
+                audit.as_deref_mut(),
+                entry.path(),
+                "no JSON frontmatter".to_string(),
+            );
             continue;
         };
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(frontmatter) else {
-            inventory.unparseable_canonical_message_files += 1;
-            continue;
+        let message = match serde_json::from_str::<serde_json::Value>(frontmatter) {
+            Ok(message) => message,
+            Err(err) => {
+                inventory.unparseable_canonical_message_files += 1;
+                DoctorMessageAuditSink::malformed(
+                    audit.as_deref_mut(),
+                    entry.path(),
+                    format!("invalid JSON frontmatter: {err}"),
+                );
+                continue;
+            }
         };
 
         if let Some(message_id) = message
@@ -31046,6 +31096,12 @@ fn scan_doctor_project_messages(
             .and_then(serde_json::Value::as_i64)
             .filter(|&id| id > 0)
         {
+            if let Some(sink) = audit.as_deref_mut() {
+                sink.duplicate_candidates
+                    .entry(message_id)
+                    .or_default()
+                    .push(entry.path().to_path_buf());
+            }
             inventory.latest_message_id = Some(
                 inventory
                     .latest_message_id
@@ -31067,6 +31123,15 @@ fn scan_doctor_project_messages(
 }
 
 fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInventory {
+    collect_doctor_archive_inventory_with_audit(storage_root, None)
+}
+
+/// The inventory walk; with `audit`, the same single read of each canonical
+/// message file also records the full audit's per-file findings.
+fn collect_doctor_archive_inventory_with_audit(
+    storage_root: &Path,
+    mut audit: Option<&mut DoctorMessageAuditSink>,
+) -> DoctorArchiveInventory {
     let projects_root = storage_root.join("projects");
     if !path_is_real_directory(&projects_root) {
         return DoctorArchiveInventory::default();
@@ -31115,6 +31180,7 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInvento
                 &messages_dir,
                 &mut global_message_ids,
                 &mut duplicate_message_ids,
+                audit.as_deref_mut(),
             );
             inventory.messages += message_inventory.messages;
             inventory.latest_message_id = match (
@@ -31535,84 +31601,16 @@ fn doctor_audit_project_metadata(
     (resolved_slug, resolved_human_key)
 }
 
-fn doctor_audit_project_messages(
-    messages_dir: &Path,
-    duplicate_candidates: &mut std::collections::BTreeMap<i64, Vec<PathBuf>>,
-    malformed_messages: &mut Vec<DoctorArchiveMalformedMessageFinding>,
-) {
-    for entry in walkdir::WalkDir::new(messages_dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let file_type = entry.file_type();
-        if !file_type.is_file() || file_type.is_symlink() {
-            continue;
-        }
-        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("md") {
-            continue;
-        }
-
-        let Ok(relative) = entry.path().strip_prefix(messages_dir) else {
-            continue;
-        };
-        let components = doctor_archive_path_components(relative);
-        if components.first().copied() == Some("threads") {
-            continue;
-        }
-        if components.len() != 3
-            || !doctor_is_archive_year_component(components[0])
-            || !doctor_is_archive_month_component(components[1])
-        {
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(entry.path()) {
-            Ok(content) => content,
-            Err(err) => {
-                malformed_messages.push(DoctorArchiveMalformedMessageFinding {
-                    path: entry.path().display().to_string(),
-                    problem: format!("cannot read canonical message file: {err}"),
-                });
-                continue;
-            }
-        };
-        let Some(frontmatter) = doctor_extract_json_frontmatter(&content) else {
-            malformed_messages.push(DoctorArchiveMalformedMessageFinding {
-                path: entry.path().display().to_string(),
-                problem: "no JSON frontmatter".to_string(),
-            });
-            continue;
-        };
-        let message = match serde_json::from_str::<serde_json::Value>(frontmatter) {
-            Ok(message) => message,
-            Err(err) => {
-                malformed_messages.push(DoctorArchiveMalformedMessageFinding {
-                    path: entry.path().display().to_string(),
-                    problem: format!("invalid JSON frontmatter: {err}"),
-                });
-                continue;
-            }
-        };
-
-        if let Some(message_id) = message
-            .get("id")
-            .and_then(serde_json::Value::as_i64)
-            .filter(|&id| id > 0)
-        {
-            duplicate_candidates
-                .entry(message_id)
-                .or_default()
-                .push(entry.path().to_path_buf());
-        }
-    }
-}
-
 fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
+    // One read per canonical message file: the inventory walk also collects
+    // the per-file findings (it was two full passes, ~42k files each on a
+    // live archive, per `am robot health`).
+    let mut messages = DoctorMessageAuditSink::default();
     let mut report = DoctorArchiveAuditReport {
-        inventory: collect_doctor_archive_inventory(storage_root),
+        inventory: collect_doctor_archive_inventory_with_audit(storage_root, Some(&mut messages)),
         ..DoctorArchiveAuditReport::default()
     };
+    report.malformed_message_files = messages.malformed_messages;
     let projects_root = storage_root.join("projects");
     if !path_is_real_directory(&projects_root) {
         return report;
@@ -31622,8 +31620,6 @@ fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
         return report;
     };
 
-    let mut duplicate_candidates: std::collections::BTreeMap<i64, Vec<PathBuf>> =
-        std::collections::BTreeMap::new();
     let db_project_identities = doctor_collect_normalization_db_project_identities();
 
     for entry in entries.flatten() {
@@ -31636,18 +31632,9 @@ fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
         }
 
         let _ = doctor_audit_project_metadata(&project_path, &mut report, &db_project_identities);
-
-        let messages_dir = project_path.join("messages");
-        if path_is_real_directory(&messages_dir) {
-            doctor_audit_project_messages(
-                &messages_dir,
-                &mut duplicate_candidates,
-                &mut report.malformed_message_files,
-            );
-        }
     }
 
-    for (message_id, mut files) in duplicate_candidates {
+    for (message_id, mut files) in messages.duplicate_candidates {
         if files.len() < 2 {
             continue;
         }
@@ -37437,6 +37424,7 @@ fn archive_mail_status_counts(storage_root: &Path, slug: &str) -> Option<(i64, i
         &project_path.join("messages"),
         &mut message_ids,
         &mut duplicate_message_ids,
+        None,
     )
     .messages as i64;
 
@@ -62886,6 +62874,68 @@ startup_timeout_sec = 42
             report.suspicious_projects[0]
                 .reason
                 .contains("looks ephemeral")
+        );
+    }
+
+    #[test]
+    fn audit_doctor_archive_reads_each_canonical_message_file_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let canonical_dir = storage_root
+            .join("projects")
+            .join("demo")
+            .join("messages")
+            .join("2026")
+            .join("03");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        for (name, body) in [
+            (
+                "2026-03-12T00-00-00Z__first__7.md",
+                "{\"id\":7,\"subject\":\"First\"}",
+            ),
+            (
+                "2026-03-12T00-01-00Z__again__7.md",
+                "{\"id\":7,\"subject\":\"Again\"}",
+            ),
+            (
+                "2026-03-12T00-02-00Z__other__9.md",
+                "{\"id\":9,\"subject\":\"Other\"}",
+            ),
+        ] {
+            std::fs::write(
+                canonical_dir.join(name),
+                format!("---json\n{body}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-03-00Z__broken__8.md"),
+            "not-json-frontmatter\n",
+        )
+        .unwrap();
+
+        DOCTOR_MESSAGE_FILE_READS.with(|reads| reads.set(0));
+        let report = audit_doctor_archive(&storage_root);
+        // The inventory and the per-file findings share one read per file.
+        assert_eq!(DOCTOR_MESSAGE_FILE_READS.with(std::cell::Cell::get), 4);
+        assert_eq!(report.inventory.canonical_message_files, 4);
+        assert_eq!(report.inventory.messages, 2);
+        assert_eq!(report.inventory.unparseable_canonical_message_files, 1);
+        assert_eq!(report.inventory.duplicate_canonical_message_files, 1);
+        assert_eq!(report.inventory.latest_message_id, Some(9));
+        assert_eq!(report.malformed_message_files.len(), 1);
+        assert_eq!(
+            report.malformed_message_files[0].problem,
+            "no JSON frontmatter"
+        );
+        assert_eq!(report.duplicate_canonical_groups.len(), 1);
+        assert_eq!(report.duplicate_canonical_groups[0].message_id, 7);
+        assert!(
+            report.duplicate_canonical_groups[0]
+                .keep
+                .ends_with("__first__7.md"),
+            "{:?}",
+            report.duplicate_canonical_groups[0]
         );
     }
 
