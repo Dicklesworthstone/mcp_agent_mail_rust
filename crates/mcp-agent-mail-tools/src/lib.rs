@@ -560,11 +560,15 @@ pub mod tool_util {
                     ),
                 )
             }
+            // GH#333: keyed on the classification, not the text, so an open
+            // that failed at the descriptor ceiling as "busy" is reported as
+            // the descriptor exhaustion it is.
             DbError::Sqlite(ref message)
             | DbError::Schema(ref message)
             | DbError::Pool(ref message)
             | DbError::Internal(ref message)
-                if mcp_agent_mail_db::is_fd_exhaustion_error(message) =>
+            | DbError::ResourceBusy(ref message)
+                if classification.class == mcp_agent_mail_db::DbErrorClass::FdExhaustion =>
             {
                 let message = message.clone();
                 // D3 (br-bvq1x.4.3): when the failing path reported that

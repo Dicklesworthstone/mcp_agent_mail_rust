@@ -110,8 +110,11 @@ impl CorruptionCircuitBreaker {
     /// Returns true if the error qualified (regardless of whether it newly
     /// tripped the breaker).
     pub fn observe_error(&self, error: &DbError) -> bool {
+        if !error.is_corruption() {
+            return false;
+        }
         let classification = error.classification();
-        if error.is_corruption() && classification.blocks_edits {
+        if classification.blocks_edits {
             self.trip(classification.class, error.to_string());
             true
         } else {

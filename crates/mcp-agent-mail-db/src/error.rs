@@ -607,8 +607,24 @@ impl DbError {
     }
 
     /// Typed classification and policy metadata for this database error.
+    ///
+    /// GH#333: a process at its descriptor ceiling fails opens with whatever
+    /// the engine reports (a busy namespace sidecar, "unable to open database
+    /// file", a pool timeout). Classified by that text alone, the failure sent
+    /// operators to lock diagnosis and retries that cannot succeed, so those
+    /// classes are reported as descriptor exhaustion while the process is at
+    /// its ceiling.
     #[must_use]
     pub fn classification(&self) -> DbErrorClassification {
+        let classification = self.classification_from_error();
+        if can_mask_fd_exhaustion(classification.class) && process_at_fd_ceiling() {
+            return DbErrorClassification::for_class(DbErrorClass::FdExhaustion);
+        }
+        classification
+    }
+
+    /// Classification from the error alone, without process state.
+    fn classification_from_error(&self) -> DbErrorClassification {
         match self {
             Self::PoolExhausted { .. } => {
                 DbErrorClassification::for_class(DbErrorClass::PoolExhaustion)
@@ -652,7 +668,7 @@ impl DbError {
             }
             Self::Sqlite(message) | Self::Schema(message) => classify_db_error_message(message),
             Self::Internal(message) => classify_db_error_message(message),
-            Self::RetryBudgetExhausted { inner, .. } => inner.classification(),
+            Self::RetryBudgetExhausted { inner, .. } => inner.classification_from_error(),
             // GH#313: a semantic miss carried the connection/config policy
             // (reads unsafe, edits blocked, "run am doctor health"), so a
             // wrong-tuple `respond_contact` on a healthy mailbox read like a
@@ -940,6 +956,67 @@ fn fd_pressure_for(class: DbErrorClass, detail: &str) -> Option<DbFailureFdPress
         immediate_retry_useful: eviction_freed != Some(0),
         next_action: fd_next_action(eviction_freed),
     })
+}
+
+/// Descriptors of headroom below the soft `RLIMIT_NOFILE` at or under which the
+/// process counts as at its ceiling (GH#333): one open needs the main file
+/// plus its sidecars.
+const FD_CEILING_HEADROOM: u64 = 16;
+
+/// Classes an exhausted descriptor table surfaces as (GH#333). Corruption,
+/// semantic, host-pressure and owner-contention failures carry their own
+/// evidence and are never re-attributed.
+const fn can_mask_fd_exhaustion(class: DbErrorClass) -> bool {
+    matches!(
+        class,
+        DbErrorClass::BusyRetryable
+            | DbErrorClass::ConnectionOrConfigError
+            | DbErrorClass::EngineProbeLimitation
+            | DbErrorClass::PoolExhaustion
+    )
+}
+
+const fn fd_count_at_ceiling(open: u64, soft_limit: u64) -> bool {
+    soft_limit.saturating_sub(open) <= FD_CEILING_HEADROOM
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the live `/proc` probe in [`process_at_fd_ceiling`].
+    static FD_CEILING_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether this process is within [`FD_CEILING_HEADROOM`] descriptors of its
+/// soft `RLIMIT_NOFILE`. The probe reads `/proc`, which itself needs a
+/// descriptor: failing for lack of one is the answer.
+#[cfg(target_os = "linux")]
+fn process_at_fd_ceiling() -> bool {
+    #[cfg(test)]
+    if let Some(at_ceiling) = FD_CEILING_FOR_TEST.with(std::cell::Cell::get) {
+        return at_ceiling;
+    }
+    let open = match std::fs::read_dir("/proc/self/fd") {
+        Ok(entries) => u64::try_from(entries.count()).unwrap_or(u64::MAX),
+        Err(error) => {
+            return matches!(
+                rustix::io::Errno::from_io_error(&error),
+                Some(rustix::io::Errno::MFILE | rustix::io::Errno::NFILE)
+            );
+        }
+    };
+    let (Some(soft_limit), _) = mcp_agent_mail_core::read_fd_limits() else {
+        return false;
+    };
+    fd_count_at_ceiling(open, soft_limit)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_at_fd_ceiling() -> bool {
+    #[cfg(test)]
+    if let Some(at_ceiling) = FD_CEILING_FOR_TEST.with(std::cell::Cell::get) {
+        return at_ceiling;
+    }
+    false
 }
 
 fn fd_next_action(eviction_freed: Option<u64>) -> String {
@@ -2250,6 +2327,68 @@ mod tests {
         );
         let fd = envelope.fd_pressure.expect("fd section present");
         assert_eq!(fd.eviction_freed, Some(0));
+    }
+
+    /// Pins the descriptor-ceiling probe for one test; restores it on drop.
+    struct FdCeilingForTest;
+
+    impl FdCeilingForTest {
+        fn pin(at_ceiling: bool) -> Self {
+            FD_CEILING_FOR_TEST.with(|cell| cell.set(Some(at_ceiling)));
+            Self
+        }
+    }
+
+    impl Drop for FdCeilingForTest {
+        fn drop(&mut self) {
+            FD_CEILING_FOR_TEST.with(|cell| cell.set(None));
+        }
+    }
+
+    #[test]
+    fn busy_open_failure_at_the_descriptor_ceiling_is_descriptor_exhaustion() {
+        // GH#333: what a server at its ceiling actually returned.
+        let busy = || {
+            DbError::ResourceBusy(
+                "Connection error: unable to open database file: \
+                 '/m/storage.sqlite3-fsqlite-ns-use'"
+                    .into(),
+            )
+        };
+        {
+            let _ceiling = FdCeilingForTest::pin(true);
+            let envelope = busy().failure_envelope();
+            assert_eq!(envelope.class, "fd_exhaustion");
+            assert_eq!(envelope.policy.recommended_command, "am doctor health");
+            assert!(envelope.fd_pressure.is_some(), "{envelope:?}");
+            assert!(envelope.lock_owner.is_none(), "{envelope:?}");
+            assert_eq!(
+                wrap_exhausted(busy()).classification().class,
+                DbErrorClass::FdExhaustion
+            );
+            // Failures with their own evidence are never re-attributed.
+            let corrupt = DbError::Sqlite("database disk image is malformed".into());
+            assert_ne!(corrupt.classification().class, DbErrorClass::FdExhaustion);
+            assert_eq!(
+                DbError::not_found("Agent", "X").classification().class,
+                DbErrorClass::RequestSemanticError
+            );
+        }
+        let _headroom = FdCeilingForTest::pin(false);
+        let envelope = busy().failure_envelope();
+        assert_eq!(envelope.class, "busy_retryable");
+        assert!(envelope.fd_pressure.is_none(), "{envelope:?}");
+    }
+
+    #[test]
+    fn descriptor_ceiling_is_the_last_headroom_below_the_soft_limit() {
+        assert!(!fd_count_at_ceiling(1_000, 1_024));
+        assert!(fd_count_at_ceiling(1_008, 1_024));
+        assert!(fd_count_at_ceiling(1_024, 1_024));
+        assert!(fd_count_at_ceiling(2_000, 1_024));
+        // A test process is far from its ceiling: the live probe must not
+        // report one.
+        assert!(!process_at_fd_ceiling());
     }
 
     // ── Display ─────────────────────────────────────────────────────
