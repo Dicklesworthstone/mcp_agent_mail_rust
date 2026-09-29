@@ -16873,6 +16873,9 @@ fn readiness_check_with_integrity(
             // Note: If we just recovered above, this is redundant but extremely fast and safe.
             pool.run_startup_integrity_check()
                 .map_err(|e| format!("startup integrity check failed: {e}"))?;
+            // The guard's first cycle would repeat this quick-check at once; on
+            // a large mailbox one costs seconds and a burst of engine threads.
+            integrity_guard::note_startup_integrity_probe_completed();
             if let Some((sqlite_path, fingerprint)) = startup_integrity_fingerprint {
                 write_startup_integrity_cache(config, &sqlite_path, fingerprint);
             }
@@ -19687,6 +19690,30 @@ mod tests {
             db_path.exists(),
             "readiness check should leave behind an initialized sqlite file"
         );
+    }
+
+    #[test]
+    fn readiness_check_tells_the_integrity_guard_when_its_startup_probe_ran() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let config = mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", temp.path().join("guard.sqlite3").display()),
+            storage_root,
+            integrity_check_on_startup: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let _ = integrity_guard::take_startup_probe_note_for_test();
+
+        readiness_check(&config).expect("first readiness");
+        assert!(
+            integrity_guard::take_startup_probe_note_for_test(),
+            "a startup quick-check that ran must spare the guard's first cycle"
+        );
+        // Unchanged mailbox: the fingerprint cache skips the startup check, so
+        // the guard must run its own first cycle.
+        readiness_check(&config).expect("second readiness");
+        assert!(!integrity_guard::take_startup_probe_note_for_test());
     }
 
     #[test]

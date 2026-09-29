@@ -186,9 +186,14 @@ fn full_check_due(
 ///
 /// Used by HTTP/TUI startup to avoid immediately repeating the same quick-check
 /// in the background worker before the first interval elapses.
-#[allow(dead_code)]
 pub fn note_startup_integrity_probe_completed() {
     SKIP_NEXT_QUICK_CYCLE.store(true, Ordering::Release);
+}
+
+/// Whether a startup probe was noted since the last call; clears the note.
+#[cfg(test)]
+pub fn take_startup_probe_note_for_test() -> bool {
+    SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel)
 }
 
 /// Skip the next automatic backup refresh, including a due verified snapshot,
