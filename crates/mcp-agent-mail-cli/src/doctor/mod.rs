@@ -3299,6 +3299,28 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
+    // GH#333: `fd_exhaustion` tool errors send operators here, so show the live
+    // owner's descriptor headroom. Sampled from /proc, which still works when
+    // the server can no longer answer. Quiet when no owner runs; imminent
+    // exhaustion is a finding.
+    let self_pid = std::process::id();
+    let owner_pids: Vec<u32> = crate::gather_process_owner_model(&config)
+        .actual_owner_pids()
+        .into_iter()
+        .filter(|pid| *pid != self_pid)
+        .collect();
+    if !owner_pids.is_empty() {
+        let descriptors = crate::doctor_server_descriptor_check(&owner_pids);
+        ftui_runtime::ftui_println!(
+            "server_descriptors: {} ({})",
+            descriptors.status,
+            descriptors.detail
+        );
+        if descriptors.status == "fail" {
+            return Err(CliError::ExitCode(1));
+        }
+    }
+
     match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
         .and_then(|opened| {
             check_reservation_parity_with_canonical_conn(&opened.conn, &probe_target.storage_root)
