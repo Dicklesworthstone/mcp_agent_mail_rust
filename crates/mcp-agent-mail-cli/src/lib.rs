@@ -30807,6 +30807,59 @@ fn probe_local_jsonrpc_health(
     }
 }
 
+/// Call `tool` on the Agent Mail server listening on the configured endpoint
+/// and return its JSON result (br-kp1in.18). A running server answers reads
+/// from its live pool and index, while a CLI read builds a private snapshot
+/// of the whole mailbox per call. `None` when no Agent Mail server listens
+/// there or the call fails in any way (including a tool error), so the
+/// caller falls back to its direct path.
+pub(crate) fn local_server_tool_call(
+    config: &Config,
+    tool: &str,
+    arguments: serde_json::Value,
+    timeout_secs: u64,
+) -> Option<serde_json::Value> {
+    let port_status = mcp_agent_mail_server::startup_checks::check_port_status(
+        &config.http_host,
+        config.http_port,
+    );
+    if !matches!(
+        port_status,
+        mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer
+    ) {
+        return None;
+    }
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": format!("cli-{tool}"),
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    });
+    let urls = check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
+    let bearer = config.http_bearer_token.as_deref();
+    context::run_async(async {
+        for url in &urls {
+            let Ok(payload) = post_jsonrpc_request(url, bearer, &request, timeout_secs).await
+            else {
+                continue;
+            };
+            if parse_jsonrpc_error(&payload).is_some() {
+                continue;
+            }
+            let Some(result) = payload.get("result") else {
+                continue;
+            };
+            if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Ok(None);
+            }
+            return Ok(coerce_tool_result_json(result.clone()));
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
+}
+
 fn sample_agent_mail_process_cpu(pids: &[u32]) -> (Vec<DoctorProcessSample>, Option<String>) {
     #[cfg(unix)]
     {

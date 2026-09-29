@@ -346,6 +346,7 @@ fn search_data(
             value: "normal".to_string(),
             count: total_results,
         }],
+        served_by: None,
     }
 }
 

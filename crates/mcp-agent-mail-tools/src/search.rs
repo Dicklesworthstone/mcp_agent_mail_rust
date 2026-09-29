@@ -119,7 +119,8 @@ pub struct SearchResult {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Omitted when empty, so it must default when read back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bcc: Vec<String>,
     /// Message body (Markdown). Populated only when the caller passes
     /// `include_body_md=true`; otherwise omitted from the JSON envelope so
@@ -132,6 +133,9 @@ pub struct SearchResult {
     /// Top score factors with contributions (present when explain=true).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub score_factors: Vec<mcp_agent_mail_db::search_planner::ScoreFactorSummary>,
+    /// Relevance score of this hit (present when explain=true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 /// Search response wrapper
@@ -992,6 +996,11 @@ pub async fn search_messages(
                 body_md: if include_body_md { Some(r.body) } else { None },
                 reason_codes: r.reason_codes,
                 score_factors: r.score_factors,
+                score: if explain.unwrap_or(false) {
+                    r.score
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -2065,6 +2074,7 @@ mod tests {
             body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
+            score: None,
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"id\":42"));
@@ -2094,9 +2104,12 @@ mod tests {
             body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
+            score: None,
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"created_ts\":null"));
+        // The explain-only score stays out of default responses.
+        assert!(!json.contains("\"score\""));
         assert!(json.contains("\"thread_id\":null"));
         // Empty vecs should be omitted via skip_serializing_if
         assert!(!json.contains("reason_codes"));
@@ -2127,9 +2140,11 @@ mod tests {
                 contribution: 0.72,
                 summary: "Strong BM25 match on query terms".to_string(),
             }],
+            score: Some(0.72),
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"reason_codes\":[\"LexicalBm25\""));
+        assert!(json.contains("\"score\":0.72"));
         assert!(json.contains("\"score_factors\":[{"));
         assert!(json.contains("\"key\":\"bm25\""));
         assert!(json.contains("\"contribution\":0.72"));
@@ -2152,6 +2167,7 @@ mod tests {
             body_md: Some("# Hello\n\nthis is the body".to_string()),
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
+            score: None,
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert!(json.contains("\"body_md\":\"# Hello"));

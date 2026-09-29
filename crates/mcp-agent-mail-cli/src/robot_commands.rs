@@ -7412,6 +7412,10 @@ pub struct SearchData {
     pub by_agent: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub by_importance: Vec<FacetEntry>,
+    /// `"server"` when the running Agent Mail server answered (br-kp1in.18);
+    /// omitted when this process searched a private snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -7449,6 +7453,149 @@ fn recipient_kind_guidance(kind: &str) -> mcp_agent_mail_db::search_planner::Zer
     }
 }
 
+/// Facet counts over one page of search hits.
+#[derive(Default)]
+struct SearchFacetCounts {
+    threads: std::collections::HashMap<String, usize>,
+    agents: std::collections::HashMap<String, usize>,
+    importance: std::collections::HashMap<String, usize>,
+}
+
+impl SearchFacetCounts {
+    fn add(&mut self, thread_ref: &str, sender: &str, importance: &str) {
+        if !thread_ref.is_empty() {
+            *self.threads.entry(thread_ref.to_string()).or_insert(0) += 1;
+        }
+        *self.agents.entry(sender.to_string()).or_insert(0) += 1;
+        *self.importance.entry(importance.to_string()).or_insert(0) += 1;
+    }
+
+    /// `(by_thread, by_agent, by_importance)`, each by count descending.
+    fn into_entries(self) -> (Vec<FacetEntry>, Vec<FacetEntry>, Vec<FacetEntry>) {
+        let sorted = |counts: std::collections::HashMap<String, usize>| {
+            let mut entries: Vec<FacetEntry> = counts
+                .into_iter()
+                .map(|(value, count)| FacetEntry { value, count })
+                .collect();
+            entries.sort_by_key(|entry| std::cmp::Reverse(entry.count));
+            entries
+        };
+        (
+            sorted(self.threads),
+            sorted(self.agents),
+            sorted(self.importance),
+        )
+    }
+}
+
+fn search_hit_snippet(subject: &str, body: &str) -> String {
+    truncate_str(if body.is_empty() { subject } else { body }, 220)
+}
+
+fn search_hit_age(now_us: i64, created_ts: i64) -> String {
+    format_age(if created_ts > 0 {
+        age_seconds_from_micros(now_us, created_ts)
+    } else {
+        0
+    })
+}
+
+/// Robot search through the running server (br-kp1in.18); `Ok(None)` sends
+/// the caller to the private-snapshot path.
+fn search_via_server(
+    config: &mcp_agent_mail_core::Config,
+    project_key: &str,
+    query: &str,
+    importance: Option<&str>,
+    since: Option<&str>,
+) -> Result<Option<SearchData>, CliError> {
+    let mut arguments = serde_json::json!({
+        "project_key": project_key,
+        "query": query,
+        "limit": 20,
+        "explain": true,
+        "include_body_md": true,
+    });
+    if let Some(importance) = importance.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments["importance"] = importance.into();
+    }
+    if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+        // The relative forms the direct path accepts, sent as an instant.
+        arguments["since"] =
+            mcp_agent_mail_core::timestamps::micros_to_iso(parse_since_micros(since)?).into();
+    }
+    let Some(result) = crate::local_server_tool_call(config, "search_messages", arguments, 10)
+    else {
+        return Ok(None);
+    };
+    let Ok(response) = serde_json::from_value(result) else {
+        return Ok(None);
+    };
+    Ok(search_data_from_server_response(
+        query,
+        response,
+        mcp_agent_mail_db::now_micros(),
+    ))
+}
+
+/// Robot search data from the running server's `search_messages` response,
+/// requested with `explain` and bodies (br-kp1in.18). `None` when a hit
+/// carries no relevance score (a server that predates explain scores): the
+/// caller then takes the private-snapshot path rather than report invented
+/// relevance.
+fn search_data_from_server_response(
+    query: &str,
+    response: mcp_agent_mail_tools::search::SearchResponse,
+    now_us: i64,
+) -> Option<SearchData> {
+    let mut results = Vec::with_capacity(response.result.len());
+    let mut facets = SearchFacetCounts::default();
+    for hit in response.result {
+        let relevance = hit.score?;
+        let thread_ref = canonical_thread_ref_for_row(hit.id, hit.thread_id.as_deref());
+        let importance = if hit.importance.is_empty() {
+            "normal".to_string()
+        } else {
+            hit.importance
+        };
+        facets.add(&thread_ref, &hit.from, &importance);
+        let created_ts = hit
+            .created_ts
+            .as_deref()
+            .and_then(mcp_agent_mail_core::timestamps::iso_to_micros)
+            .unwrap_or(0);
+        results.push(SearchResult {
+            id: hit.id,
+            relevance,
+            snippet: search_hit_snippet(&hit.subject, hit.body_md.as_deref().unwrap_or_default()),
+            age: search_hit_age(now_us, created_ts),
+            from: hit.from,
+            subject: hit.subject,
+            topic: hit.topic,
+            thread: thread_ref,
+        });
+    }
+    let (by_thread, by_agent, by_importance) = facets.into_entries();
+    Some(SearchData {
+        query: query.to_string(),
+        total_results: results.len(),
+        results,
+        route: response
+            .explain
+            .as_ref()
+            .map(SearchRouteDiagnostic::from_explain),
+        assistance: response.assistance,
+        guidance: response.guidance,
+        next_cursor: response.next_cursor,
+        plan_diagnostic: None,
+        search_index: None,
+        by_thread,
+        by_agent,
+        by_importance,
+        served_by: Some("server"),
+    })
+}
+
 fn build_search(
     conn: &DbConn,
     pool: &mcp_agent_mail_db::DbPool,
@@ -7482,6 +7629,7 @@ fn build_search(
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
+            served_by: None,
         });
     }
 
@@ -7524,71 +7672,25 @@ fn build_search(
     let mut guidance = collected.guidance;
     let next_cursor = collected.next_cursor;
 
-    // Build results and facets
     let mut results = Vec::new();
-    let mut thread_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut agent_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut importance_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-
+    let mut facets = SearchFacetCounts::default();
     for row in collected.rows {
-        let subject = row.title;
-        let topic = row.topic;
         let thread_ref = canonical_thread_ref_for_row(row.id, row.thread_id.as_deref());
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
-        let created_ts = row.created_ts.unwrap_or(0);
         let sender = row.from_agent.unwrap_or_default();
-        let snippet_source = if row.body.is_empty() {
-            subject.clone()
-        } else {
-            row.body
-        };
-        let snippet = truncate_str(&snippet_source, 220);
-
-        if !thread_ref.is_empty() {
-            *thread_counts.entry(thread_ref.clone()).or_insert(0) += 1;
-        }
-        *agent_counts.entry(sender.clone()).or_insert(0) += 1;
-        *importance_counts.entry(importance.clone()).or_insert(0) += 1;
-
-        let age_seconds = if created_ts > 0 {
-            age_seconds_from_micros(now_us, created_ts)
-        } else {
-            0
-        };
-
+        facets.add(&thread_ref, &sender, &importance);
         results.push(SearchResult {
             id: row.id,
             relevance: row.score.unwrap_or(0.0),
+            snippet: search_hit_snippet(&row.title, &row.body),
+            age: search_hit_age(now_us, row.created_ts.unwrap_or(0)),
             from: sender,
-            subject,
-            topic,
+            subject: row.title,
+            topic: row.topic,
             thread: thread_ref,
-            snippet,
-            age: format_age(age_seconds),
         });
     }
-
-    // Sort facets by count descending
-    let mut by_thread: Vec<FacetEntry> = thread_counts
-        .into_iter()
-        .map(|(v, c)| FacetEntry { value: v, count: c })
-        .collect();
-    by_thread.sort_by_key(|x| std::cmp::Reverse(x.count));
-
-    let mut by_agent: Vec<FacetEntry> = agent_counts
-        .into_iter()
-        .map(|(v, c)| FacetEntry { value: v, count: c })
-        .collect();
-    by_agent.sort_by_key(|x| std::cmp::Reverse(x.count));
-
-    let mut by_importance: Vec<FacetEntry> = importance_counts
-        .into_iter()
-        .map(|(v, c)| FacetEntry { value: v, count: c })
-        .collect();
-    by_importance.sort_by_key(|x| std::cmp::Reverse(x.count));
+    let (by_thread, by_agent, by_importance) = facets.into_entries();
 
     let total = results.len();
     if total == 0
@@ -7612,6 +7714,7 @@ fn build_search(
         by_thread,
         by_agent,
         by_importance,
+        served_by: None,
     })
 }
 
@@ -15178,8 +15281,28 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             kind,
             importance,
             since,
-        } => {
+        } => 'search: {
             let config = mcp_agent_mail_core::Config::from_env();
+            // br-kp1in.18: a running server answers from its live pool and
+            // index in milliseconds; the private snapshot below costs seconds
+            // per call on a large mailbox. The server's search has no
+            // recipient-kind filter, and only an explicit project is routed.
+            if kind.is_none()
+                && !query.trim().is_empty()
+                && let Some(project_key) = resolved_project_flag_or_env(args.project.as_deref())
+                && let Some(data) = search_via_server(
+                    &config,
+                    &project_key,
+                    &query,
+                    importance.as_deref(),
+                    since.as_deref(),
+                )?
+            {
+                let mut env = RobotEnvelope::new(cmd_name, format, data);
+                env._meta.project =
+                    Some(mcp_agent_mail_core::resolve_project_identity(&project_key).slug);
+                break 'search format_output(&env, format)?;
+            }
             let read_db = crate::open_db_sync_async_canonical_read_best_effort_with_database_url(
                 &config.database_url,
                 Some(config.storage_root.as_path()),
@@ -18981,6 +19104,7 @@ mod tests {
                 value: "high".into(),
                 count: 2,
             }],
+            served_by: None,
         };
 
         let json = serde_json::to_value(&data).unwrap();
@@ -21243,6 +21367,7 @@ mod tests {
                 value: "high".into(),
                 count: 3,
             }],
+            served_by: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"query\":\"authentication\""));
@@ -21265,12 +21390,66 @@ mod tests {
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
+            served_by: None,
         };
         let env = RobotEnvelope::new("robot search", OutputFormat::Json, data);
         let out = format_output(&env, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_results"], 0);
         assert!(v["results"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn robot_search_maps_a_server_response_and_refuses_unscored_hits() {
+        // br-kp1in.18.
+        let now_us = mcp_agent_mail_core::timestamps::iso_to_micros("2026-02-16T10:00:00Z")
+            .expect("fixed clock");
+        let response = |second_score: serde_json::Value| {
+            serde_json::from_value::<mcp_agent_mail_tools::search::SearchResponse>(
+                serde_json::json!({
+                    "result": [
+                        {"id": 7, "subject": "Deploy plan", "importance": "high",
+                         "ack_required": 0, "created_ts": "2026-02-16T09:00:00Z",
+                         "thread_id": "br-7", "from": "BlueLake", "to": [], "cc": [],
+                         "body_md": "Roll out the new plan", "score": 1.5},
+                        {"id": 9, "subject": "Deploy follow-up", "importance": "",
+                         "ack_required": 0, "created_ts": null, "thread_id": null,
+                         "from": "BlueLake", "to": [], "cc": [], "score": second_score},
+                    ],
+                    "next_cursor": "c2",
+                }),
+            )
+            .expect("server response")
+        };
+
+        let data = search_data_from_server_response("deploy", response(0.5.into()), now_us)
+            .expect("scored hits map");
+        assert_eq!(data.served_by, Some("server"));
+        assert_eq!(data.total_results, 2);
+        assert_eq!(data.next_cursor.as_deref(), Some("c2"));
+        let (first, second) = (&data.results[0], &data.results[1]);
+        assert_eq!((first.id, first.relevance), (7, 1.5));
+        assert_eq!(first.snippet, "Roll out the new plan");
+        assert_eq!(first.age, format_age(3_600));
+        assert_eq!(first.thread, canonical_thread_ref_for_row(7, Some("br-7")));
+        // No body: the snippet is the subject; no thread: the message's own ref.
+        assert_eq!(second.snippet, "Deploy follow-up");
+        assert_eq!(second.thread, canonical_thread_ref_for_row(9, None));
+        assert_eq!(data.by_agent[0].value, "BlueLake");
+        assert_eq!(data.by_agent[0].count, 2);
+        let importance: Vec<_> = data
+            .by_importance
+            .iter()
+            .map(|entry| (entry.value.as_str(), entry.count))
+            .collect();
+        assert!(importance.contains(&("high", 1)) && importance.contains(&("normal", 1)));
+
+        // A server that predates explain scores: take the snapshot path
+        // rather than report relevance nobody computed.
+        assert!(
+            search_data_from_server_response("deploy", response(serde_json::Value::Null), now_us)
+                .is_none()
+        );
     }
 
     #[test]
@@ -21301,6 +21480,7 @@ mod tests {
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
+            served_by: None,
         };
 
         let env = enrich_envelope_with_search_index_alert(
@@ -21372,6 +21552,7 @@ mod tests {
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
+            served_by: None,
         };
 
         let json = serde_json::to_value(&data).unwrap();
