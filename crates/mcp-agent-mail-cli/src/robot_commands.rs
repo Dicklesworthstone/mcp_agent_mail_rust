@@ -7524,18 +7524,40 @@ fn search_via_server(
         arguments["since"] =
             mcp_agent_mail_core::timestamps::micros_to_iso(parse_since_micros(since)?).into();
     }
-    let Some(result) = crate::local_server_tool_call(config, "search_messages", arguments, 10)
-    else {
-        return Ok(None);
-    };
-    let Ok(response) = serde_json::from_value(result) else {
-        return Ok(None);
-    };
-    Ok(search_data_from_server_response(
-        query,
-        response,
-        mcp_agent_mail_db::now_micros(),
-    ))
+    // Same endpoints and credentials as robot inbox's server route.
+    let bearer = crate::local_server_bearer_token(config);
+    for server_url in robot_inbox_server_urls(config) {
+        let call = crate::context::run_async(async {
+            Ok(crate::try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "search_messages",
+                arguments.clone(),
+            )
+            .await)
+        })?;
+        match call {
+            crate::ServerToolCall::Success(result) => {
+                let Ok(payload) =
+                    crate::coerce_tool_result_json_or_error("search_messages", result)
+                else {
+                    return Ok(None);
+                };
+                let Ok(response) = serde_json::from_value(payload) else {
+                    return Ok(None);
+                };
+                return Ok(search_data_from_server_response(
+                    query,
+                    response,
+                    mcp_agent_mail_db::now_micros(),
+                ));
+            }
+            crate::ServerToolCall::Unavailable(_) => {}
+            // An unknown project or a bad filter: the direct path reports it.
+            crate::ServerToolCall::Rejected(_) => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// Robot search data from the running server's `search_messages` response,
