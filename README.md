@@ -395,9 +395,9 @@ macro_prepare_thread(project_key="/abs/path/to/repo", thread_id="FEAT-123",
 macro_file_reservation_cycle(project_key="/abs/path/to/repo", agent_name="GreenCastle",
                              paths=["src/auth/**"], ttl_seconds=3600, auto_release=true)
 
-# Contact handshake between agents in different projects (records the link;
-# a welcome message is only delivered within one project — across projects the
-# response carries welcome_skipped_reason instead)
+# Contact handshake between agents in different projects: approves the link and
+# delivers the welcome into the target's project (without auto_accept the link
+# stays pending, no welcome is sent, and the response says why)
 macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle",
                         target="BlueLake", to_project="/abs/path/to/other/repo",
                         auto_accept=true, welcome_subject="Coordination channel",
@@ -965,7 +965,24 @@ sequenceDiagram
 ### Across Different Repos
 
 - **Option A (single project bus):** Register both repos under the same `project_key`. Keep reservation patterns specific (`frontend/**` vs `backend/**`).
-- **Option B (separate projects):** Each repo has its own `project_key`. Contact links (`request_contact`/`respond_contact` or `macro_contact_handshake`) record the cross-project relationship, and the product bus gives cross-project search and inbox views. `send_message` itself delivers only within one project: naming a contact from another project, or an agent registered in another project linked to the same product, is refused with `CROSS_PROJECT_RECIPIENT` rather than delivered (no same-name placeholder is created). For direct messages between repos, use Option A.
+- **Option B (separate projects):** Each repo has its own `project_key`. Link two agents with a contact handshake, then address the other agent with a project-qualified name:
+
+  ```
+  macro_contact_handshake(project_key="/abs/path/frontend", requester="BlueLake",
+                          target="GreenCastle", to_project="/abs/path/backend",
+                          auto_accept=true)
+  send_message(project_key="/abs/path/frontend", sender_name="BlueLake",
+               to=["GreenCastle@/abs/path/backend"], subject="API change",
+               body_md="Please bump /v2.", thread_id="br-124", ack_required=true)
+  ```
+
+  - `Name@project` takes the project's human key or its slug (as returned by `ensure_project` and listed by `resource://projects`), and so does the older `project:<project>#Name` form. The qualified name is resolved in that project only and is never auto-registered.
+  - The message is delivered only while an approved, unexpired contact link exists between the two agents (in either direction). Without one the send fails with `CONTACT_REQUIRED` and a ready `macro_contact_handshake` call; a blocked link or a `block_all` recipient fails with `CONTACT_BLOCKED`. This holds even when the recipient's own contact policy is `open`.
+  - The message is stored in the recipient's project, so the recipient reads it with its ordinary `fetch_inbox`, acknowledges it with `acknowledge_message`, and answers with `reply_message` in its own project. A default reply to a message from another project goes back to the original sender in that sender's project over the same link.
+  - One message lives in one project: a send may address agents of one other project, or local agents, but not both (`INVALID_ARGUMENT`; send twice instead).
+  - A plain name still addresses only the sender's project. Naming a contact from another project, or an agent registered in another project of the same product, is refused with `CROSS_PROJECT_RECIPIENT` (the error carries the qualified address to use); no same-name placeholder is created.
+
+  The product bus (`fetch_inbox_product`, `search_messages_product`, `summarize_thread_product`) aggregates an agent's inboxes and threads across the linked projects.
 
 ### External Git Coordination (opt-in)
 
@@ -1819,7 +1836,7 @@ A: No. One server handles multiple projects. Each project is identified by its a
 A: Agent Mail generates memorable adjective+noun names (e.g., `GreenCastle`, `BlueLake`, `RedHarbor`) when agents register. Agents can also specify a name explicitly.
 
 **Q: Can agents in different repos talk to each other?**
-A: Yes, by sharing one `project_key` for both repos (Option A under "Across Different Repos"); direct `send_message` delivery is scoped to one project. With separate projects, contact links record the relationship and the product bus provides cross-project search and inbox queries, but a `send_message` naming an agent from another project is refused (`CROSS_PROJECT_RECIPIENT`) instead of being delivered.
+A: Yes. Either share one `project_key` for both repos (Option A under "Across Different Repos"), or keep separate projects, approve a contact link with `macro_contact_handshake(..., to_project=...)`, and address the other agent as `Name@project` (Option B). The message is stored in the recipient's project, where it reads, acknowledges and replies as usual. A plain name only addresses the sender's own project.
 
 **Q: Does this work with Claude Code's Max subscription?**
 A: Yes. You can use a Max account with Agent Mail. Each agent session connects to the same MCP server regardless of subscription tier.

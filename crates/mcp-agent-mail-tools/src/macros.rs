@@ -77,9 +77,12 @@ pub struct HandshakeResponse {
     pub welcome_skipped_reason: Option<String>,
 }
 
-/// Reason reported when a cross-project handshake cannot deliver its welcome.
-pub const WELCOME_SKIPPED_CROSS_PROJECT: &str = "cross_project_messaging_unsupported: the contact link was \
-     created, but send_message only delivers within one project, so the welcome was not sent";
+/// Reason reported when a cross-project welcome cannot be sent yet: welcome
+/// messages to another project travel over the approved contact link
+/// (GH#335), and this handshake left the link pending.
+pub const WELCOME_SKIPPED_CONTACT_PENDING: &str = "contact_not_approved: the welcome goes to \
+     another project, which needs an approved contact link; it was not sent because the \
+     request is still pending (approve it, or rerun with auto_accept=true)";
 
 fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
     serde_json::from_str(&payload)
@@ -635,7 +638,7 @@ pub async fn macro_file_reservation_cycle(
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Request contact permissions and optionally auto-approve plus send a welcome message.\n\nA cross-project handshake (`to_project`) links the contact but sends no welcome, because `send_message` delivers within one project; the response then carries `welcome_skipped_reason`."
+    description = "Request contact permissions and optionally auto-approve plus send a welcome message.\n\nA cross-project handshake (`to_project`) delivers the welcome into the target's project once the link is approved (as `send_message` to `Target@project` does); if the link is still pending, no welcome is sent and the response carries `welcome_skipped_reason`."
 )]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn macro_contact_handshake(
@@ -759,48 +762,60 @@ pub async fn macro_contact_handshake(
         None
     };
 
-    let has_welcome = welcome_subject.is_some() && welcome_body.is_some();
     let thread_id_for_log = thread_id.clone();
-    let welcome_skipped_reason =
-        (has_welcome && is_cross_project).then(|| WELCOME_SKIPPED_CROSS_PROJECT.to_string());
+    let mut welcome_skipped_reason = None;
 
     let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {
-        if is_cross_project {
-            // br-kp1in.15: surfaced in the response (welcome_skipped_reason), not
-            // only a debug log, so the caller does not assume the peer was told.
-            tracing::debug!(
-                from = %from_agent,
-                to = %target_agent_name,
-                "welcome message skipped for cross-project handshake (messaging across projects not yet supported)"
-            );
-            None
+        // GH#335: a cross-project welcome is a qualified send into the
+        // target's project, delivered only over an approved link. The slug
+        // names exactly the target's project row.
+        let welcome_recipient = if is_cross_project {
+            format!("{target_agent_name}@{}", target_project.slug)
         } else {
-            let welcome_json = crate::messaging::send_message(
-                ctx,
-                source_project_key.clone(),
-                from_agent.clone(),
-                vec![target_agent_name.clone()],
-                subject,
-                body,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None, // ack_required
-                thread_id,
-                None,
-                None,
-                None, // auto_contact_if_blocked
-                // GH#237: forward the caller's sender_token so the handshake
-                // welcome message can satisfy the fail-closed send profile
-                // (a hardcoded None made the welcome unconditionally fail
-                // closed under MESSAGING_FAIL_CLOSED_SEND_PROFILE).
-                sender_token,
-                None, // idempotency_key
-            )
-            .await?;
-            Some(parse_json(welcome_json, "welcome_message")?)
+            target_agent_name.clone()
+        };
+        let sent = crate::messaging::send_message(
+            ctx,
+            source_project_key.clone(),
+            from_agent.clone(),
+            vec![welcome_recipient],
+            subject,
+            body,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // ack_required
+            thread_id,
+            None,
+            None,
+            None, // auto_contact_if_blocked
+            // GH#237: forward the caller's sender_token so the handshake
+            // welcome message can satisfy the fail-closed send profile
+            // (a hardcoded None made the welcome unconditionally fail
+            // closed under MESSAGING_FAIL_CLOSED_SEND_PROFILE).
+            sender_token,
+            None, // idempotency_key
+        )
+        .await;
+        match sent {
+            Ok(welcome_json) => Some(parse_json(welcome_json, "welcome_message")?),
+            // The request this handshake created is still pending. Report the
+            // skipped welcome (br-kp1in.15) instead of failing the handshake.
+            Err(error)
+                if is_cross_project
+                    && crate::tool_util::tool_error_code(&error) == Some("CONTACT_REQUIRED") =>
+            {
+                tracing::debug!(
+                    from = %from_agent,
+                    to = %target_agent_name,
+                    "cross-project welcome skipped: contact link not approved yet"
+                );
+                welcome_skipped_reason = Some(WELCOME_SKIPPED_CONTACT_PENDING.to_string());
+                None
+            }
+            Err(error) => return Err(error),
         }
     } else {
         None
@@ -1558,14 +1573,14 @@ mod tests {
         assert!(json.get("welcome_skipped_reason").is_none());
 
         let skipped = HandshakeResponse {
-            welcome_skipped_reason: Some(WELCOME_SKIPPED_CROSS_PROJECT.to_string()),
+            welcome_skipped_reason: Some(WELCOME_SKIPPED_CONTACT_PENDING.to_string()),
             ..delivered
         };
         let json = serde_json::to_value(&skipped).unwrap();
         assert!(
             json["welcome_skipped_reason"]
                 .as_str()
-                .is_some_and(|reason| reason.starts_with("cross_project_messaging_unsupported"))
+                .is_some_and(|reason| reason.starts_with("contact_not_approved"))
         );
         assert!(json["welcome_message"].is_null());
     }
