@@ -302,6 +302,15 @@ pub(super) fn reset_with(reset_engine: impl FnOnce()) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     reset_engine();
     *state = HydrationState::default();
+    // A completed reset replaced the whole state, so a poison flag left by an
+    // earlier interrupted reset or refresh no longer describes this data.
+    // Leaving it set would make every later strict `lock()` fail forever.
+    hydration().clear_poison();
+}
+
+#[cfg(test)]
+pub(super) fn hydration_is_poisoned_for_test() -> bool {
+    hydration().is_poisoned()
 }
 
 #[must_use]

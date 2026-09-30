@@ -56,7 +56,7 @@ for arg in "$@"; do
             echo "  cargo test -p mcp-agent-mail-server --lib"
             echo ""
             echo "Phase 3 — Rust Snapshot/Integration Tests"
-            echo "  cargo test -p mcp-agent-mail-server --test it golden_snapshots::"
+            echo "  cargo test -p mcp-agent-mail-server --test golden_snapshots"
             echo "  cargo test -p mcp-agent-mail-server --test it golden_markdown_snapshots::"
             echo "  cargo test -p mcp-agent-mail-server --test it pty_e2e_search::"
             echo ""
@@ -261,7 +261,13 @@ fi
 if [ "$E2E_ONLY" = "0" ] && [ "$PERF_ONLY" = "0" ] && [ "$ABORT" = "0" ]; then
     phase_banner 3 "Snapshot and Integration Tests"
 
-    for test_name in golden_snapshots golden_markdown_snapshots pty_e2e_search; do
+    if [ "$ABORT" = "0" ] || [ "$FAIL_FAST" = "0" ]; then
+        set +e
+        # Own test binary: its screens read process-global metrics.
+        run_cargo_cmd "snapshot/golden_snapshots" test -p mcp-agent-mail-server --test golden_snapshots
+        set -e
+    fi
+    for test_name in golden_markdown_snapshots pty_e2e_search; do
         if [ "$ABORT" = "1" ] && [ "$FAIL_FAST" = "1" ]; then break; fi
         set +e
         run_cargo_cmd "snapshot/${test_name}" test -p mcp-agent-mail-server --test it "${test_name}::"

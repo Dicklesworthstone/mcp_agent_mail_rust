@@ -5100,55 +5100,12 @@ mod resource_shape_tests {
     where
         F: FnOnce() -> T,
     {
-        let _lock = RESOURCE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Other test modules can leave global WBQ state behind after their
-        // tempdirs have been dropped. Resource tests are serialized, so make the
-        // boundary explicit and then attribute any new degradation to this test.
-        mcp_agent_mail_storage::wbq_start();
-        mcp_agent_mail_storage::wbq_flush();
-        mcp_agent_mail_storage::flush_async_commits();
-        mcp_agent_mail_storage::clear_durability_degraded();
-
-        let temp = tempfile::tempdir().expect("resource test tempdir");
-        let storage_root = temp.path().join("storage-root");
-        std::fs::create_dir_all(&storage_root).expect("resource test storage root");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = format!("sqlite://{}", database_path.display());
-        let storage_root_str = storage_root
-            .to_str()
-            .expect("resource test storage root utf-8")
-            .to_string();
-
-        let mut overrides = vec![
-            ("DATABASE_URL", database_url.as_str()),
-            ("STORAGE_ROOT", storage_root_str.as_str()),
-        ];
-        overrides.extend_from_slice(extra_overrides);
-
-        let (result, stats, degraded) =
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-                mcp_agent_mail_storage::wbq_flush();
-                mcp_agent_mail_storage::flush_async_commits();
-                let stats = mcp_agent_mail_storage::wbq_stats();
-                let degraded = mcp_agent_mail_storage::durability_degraded();
-                mcp_agent_mail_storage::clear_durability_degraded();
-                (result, stats, degraded)
-            });
-
-        match result {
-            Ok(value) => {
-                assert!(
-                    !degraded,
-                    "resource test caused WBQ durability degradation after cleanup flush: {stats:?}"
-                );
-                value
-            }
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        crate::test_support::with_isolated_mailbox(
+            &RESOURCE_TEST_LOCK,
+            "resource",
+            extra_overrides,
+            |_| f(),
+        )
     }
 
     fn run_async<F, Fut, T>(f: F) -> T

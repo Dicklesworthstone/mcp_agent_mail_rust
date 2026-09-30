@@ -18,6 +18,15 @@ autotests = false
 name = "it"
 path = "tests/it.rs"
 
+# The only integration file kept out of `it`: its goldens render the Tool
+# Metrics and System Health screens, which read process-global metrics
+# (per-tool call counters, pool and coalescer histograms). Inside `it`, other
+# tests running in parallel threads under plain `cargo test` move those counters
+# and the "empty" goldens stop matching. See SEPARATE_TEST_BINARIES in it.rs.
+[[test]]
+name = "golden_snapshots"
+path = "tests/golden_snapshots.rs"
+
 [dependencies]
 asupersync.workspace = true
 serde.workspace = true

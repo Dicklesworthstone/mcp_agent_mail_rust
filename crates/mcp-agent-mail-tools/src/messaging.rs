@@ -5368,6 +5368,22 @@ mod tests {
 
     static MESSAGING_THREAD_ID_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Run a tool-driving test against a private mailbox. The harness drains
+    /// this test's archive writes before its tempdir is removed, so a late
+    /// write-back failure cannot set the process-global durability flag and
+    /// make later sends in this binary refuse with `DURABILITY_DEGRADED`.
+    fn with_messaging_mailbox<T>(
+        extra_overrides: &[(&str, &str)],
+        f: impl FnOnce(&crate::test_support::IsolatedMailbox) -> T,
+    ) -> T {
+        crate::test_support::with_isolated_mailbox(
+            &MESSAGING_THREAD_ID_TEST_LOCK,
+            "messaging",
+            extra_overrides,
+            f,
+        )
+    }
+
     fn run_thread_validation_test<F, Fut>(db_name: &str, f: F)
     where
         F: FnOnce(Cx, DbPool) -> Fut,
@@ -5420,100 +5436,91 @@ mod tests {
 
     #[test]
     fn fetch_inbox_live_read_receipts_preserve_peek_and_ack_state() {
-        let temp = tempfile::tempdir().expect("inbox receipt tempdir");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database_path);
-        let storage_root = temp.path().join("archive");
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root.to_str().expect("storage path")),
-            ],
-            || {
-                Config::reset_cached();
-                let rt = RuntimeBuilder::current_thread().build().expect("runtime");
-                rt.block_on(async {
-                    let cx = Cx::current().expect("runtime installs inbox receipt test context");
-                    let ctx = McpContext::new(cx.clone(), 1);
-                    let pool = DbPool::new(&DbPoolConfig {
-                        database_url: database_url.clone(),
-                        ..DbPoolConfig::default()
-                    })
-                    .expect("live database pool");
-                    let project = ensure_project_row(&cx, &pool, "/live-inbox-receipts").await;
-                    let recipient =
-                        register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
-                    let message = match queries::create_message_with_recipients(
-                        &cx,
-                        &pool,
-                        project.id.unwrap(),
-                        recipient.id.unwrap(),
-                        "live inbox receipt",
-                        "persistent body",
+        with_messaging_mailbox(&[], |mailbox| {
+            let database_path = &mailbox.database_path;
+            let database_url = &mailbox.database_url;
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime installs inbox receipt test context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let pool = DbPool::new(&DbPoolConfig {
+                    database_url: database_url.clone(),
+                    ..DbPoolConfig::default()
+                })
+                .expect("live database pool");
+                let project = ensure_project_row(&cx, &pool, "/live-inbox-receipts").await;
+                let recipient =
+                    register_agent_row(&cx, &pool, project.id.unwrap(), "BlueLake").await;
+                let message = match queries::create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project.id.unwrap(),
+                    recipient.id.unwrap(),
+                    "live inbox receipt",
+                    "persistent body",
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &[(recipient.id.unwrap(), "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(message) => message,
+                    outcome => panic!("seed live message: {outcome:?}"),
+                };
+                let mut first_read_ts = None;
+                for mark_read in [Some(false), None, Some(false), Some(true)] {
+                    let response = fetch_inbox(
+                        &ctx,
+                        project.human_key.clone(),
+                        recipient.name.clone(),
                         None,
-                        "normal",
-                        true,
-                        "[]",
-                        &[(recipient.id.unwrap(), "to")],
+                        None,
+                        None,
+                        Some(true),
+                        None,
+                        None,
+                        None,
+                        mark_read,
                     )
                     .await
-                    {
-                        Outcome::Ok(message) => message,
-                        outcome => panic!("seed live message: {outcome:?}"),
-                    };
-                    let mut first_read_ts = None;
-                    for mark_read in [Some(false), None, Some(false), Some(true)] {
-                        let response = fetch_inbox(
-                            &ctx,
-                            project.human_key.clone(),
-                            recipient.name.clone(),
-                            None,
-                            None,
-                            None,
-                            Some(true),
-                            None,
-                            None,
-                            None,
-                            mark_read,
-                        )
-                        .await
-                        .expect("fetch live inbox");
-                        let messages: serde_json::Value =
-                            serde_json::from_str(&response).expect("inbox JSON");
-                        assert_eq!(messages.as_array().expect("inbox array").len(), 1);
-                        assert_eq!(messages[0]["id"].as_i64(), message.id);
-                        assert_eq!(messages[0]["body_md"], "persistent body");
-                        let conn = mcp_agent_mail_db::DbConn::open_file(
-                            database_path.to_str().expect("database path"),
-                        )
-                        .expect("independent live database connection");
-                        let rows = conn
-                            .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
-                            .expect("read durable receipt");
-                        assert_eq!(rows.len(), 1);
-                        let read_ts = rows[0].get_named::<Option<i64>>("read_ts").unwrap();
-                        let ack_ts = rows[0].get_named::<Option<i64>>("ack_ts").unwrap();
-                        if mark_read.unwrap_or(true) {
-                            assert!(
-                                read_ts.is_some(),
-                                "live fetch must persist its read receipt"
-                            );
-                            first_read_ts = first_read_ts.or(read_ts);
-                        }
-                        assert_eq!(
-                            read_ts, first_read_ts,
-                            "peek and repeated reads preserve the first receipt"
+                    .expect("fetch live inbox");
+                    let messages: serde_json::Value =
+                        serde_json::from_str(&response).expect("inbox JSON");
+                    assert_eq!(messages.as_array().expect("inbox array").len(), 1);
+                    assert_eq!(messages[0]["id"].as_i64(), message.id);
+                    assert_eq!(messages[0]["body_md"], "persistent body");
+                    let conn = mcp_agent_mail_db::DbConn::open_file(
+                        database_path.to_str().expect("database path"),
+                    )
+                    .expect("independent live database connection");
+                    let rows = conn
+                        .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                        .expect("read durable receipt");
+                    assert_eq!(rows.len(), 1);
+                    let read_ts = rows[0].get_named::<Option<i64>>("read_ts").unwrap();
+                    let ack_ts = rows[0].get_named::<Option<i64>>("ack_ts").unwrap();
+                    if mark_read.unwrap_or(true) {
+                        assert!(
+                            read_ts.is_some(),
+                            "live fetch must persist its read receipt"
                         );
-                        assert_eq!(
-                            messages[0]["read_ts"],
-                            serde_json::to_value(read_ts.map(micros_to_iso)).unwrap()
-                        );
-                        assert!(ack_ts.is_none(), "reading must not acknowledge a message");
-                        assert!(messages[0]["ack_ts"].is_null());
+                        first_read_ts = first_read_ts.or(read_ts);
                     }
-                });
-            },
-        );
+                    assert_eq!(
+                        read_ts, first_read_ts,
+                        "peek and repeated reads preserve the first receipt"
+                    );
+                    assert_eq!(
+                        messages[0]["read_ts"],
+                        serde_json::to_value(read_ts.map(micros_to_iso)).unwrap()
+                    );
+                    assert!(ack_ts.is_none(), "reading must not acknowledge a message");
+                    assert!(messages[0]["ack_ts"].is_null());
+                }
+            });
+        });
     }
 
     #[test]
@@ -5524,315 +5531,280 @@ mod tests {
         // ecosystem client deadline (bounded by DB commit, not the archive path),
         // (b) be durable in the DB at reply time (a real row id is assigned), and the
         // archive must converge afterward with the lag metric returning to zero.
-        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let temp = tempfile::tempdir().expect("ack-fast tempdir");
-        let storage_root = temp.path().join("storage");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = format!("sqlite:///{}", database_path.display());
-        let storage_root_text = storage_root.to_string_lossy().into_owned();
-
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_text.as_str()),
-                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
-            ],
-            || {
-                Config::reset_cached();
-                let rt = RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("build runtime");
-                rt.block_on(async {
-                    let cx = Cx::current().expect("runtime installs durable reply test context");
-                    let ctx = McpContext::new(cx.clone(), 1);
-                    let project_key = format!(
-                        "/data/projects/ack-fast-{}",
-                        mcp_agent_mail_db::now_micros()
-                    );
-                    eprintln!("[ack-fast setup] ensuring project");
-                    crate::ensure_project(&ctx, project_key.clone(), None)
-                        .await
-                        .expect("ensure project");
-                    eprintln!("[ack-fast setup] registering sender");
-                    crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5".to_string(),
-                        Some("BlueLake".to_string()),
-                        Some("sender".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
+        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "0")], |_| {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime installs durable reply test context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!(
+                    "/data/projects/ack-fast-{}",
+                    mcp_agent_mail_db::now_micros()
+                );
+                eprintln!("[ack-fast setup] ensuring project");
+                crate::ensure_project(&ctx, project_key.clone(), None)
                     .await
-                    .expect("register sender");
-                    eprintln!("[ack-fast setup] registering recipient");
-                    crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5".to_string(),
-                        Some("GreenStone".to_string()),
-                        Some("recipient".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("register recipient");
+                    .expect("ensure project");
+                eprintln!("[ack-fast setup] registering sender");
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("BlueLake".to_string()),
+                    Some("sender".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("register sender");
+                eprintln!("[ack-fast setup] registering recipient");
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("GreenStone".to_string()),
+                    Some("recipient".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("register recipient");
 
-                    // ~6 KB markdown body, matching the br-hpv61 field workload shape.
-                    let body = "x".repeat(6 * 1024);
-                    eprintln!("[ack-fast send] awaiting durable reply");
-                    let started = std::time::Instant::now();
-                    let response = crate::send_message(
-                        &ctx,
-                        project_key.clone(),
-                        "BlueLake".to_string(),
-                        vec!["GreenStone".to_string()],
-                        "ack-fast latency probe".to_string(),
-                        body,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("send_message should return at the storage commit");
-                    let elapsed = started.elapsed();
+                // ~6 KB markdown body, matching the br-hpv61 field workload shape.
+                let body = "x".repeat(6 * 1024);
+                eprintln!("[ack-fast send] awaiting durable reply");
+                let started = std::time::Instant::now();
+                let response = crate::send_message(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["GreenStone".to_string()],
+                    "ack-fast latency probe".to_string(),
+                    body,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("send_message should return at the storage commit");
+                let elapsed = started.elapsed();
 
-                    // (a) reply-at-commit: bounded under the 30s ecosystem deadline with
-                    // margin, i.e. NOT gated on the archive coalescer tail.
-                    assert!(
-                        elapsed < std::time::Duration::from_secs(25),
-                        "send_message reply must be bounded by DB commit and stay under the 30s \
+                // (a) reply-at-commit: bounded under the 30s ecosystem deadline with
+                // margin, i.e. NOT gated on the archive coalescer tail.
+                assert!(
+                    elapsed < std::time::Duration::from_secs(25),
+                    "send_message reply must be bounded by DB commit and stay under the 30s \
                          deadline, not track the archive coalescer; took {elapsed:?}"
-                    );
-                    eprintln!(
-                        "[ack-fast acceptance a] send_message reply latency (archive async, \
+                );
+                eprintln!(
+                    "[ack-fast acceptance a] send_message reply latency (archive async, \
                          coalescer window pinned to 5s): {elapsed:?}"
-                    );
+                );
 
-                    // Durable in the DB at reply time: the response carries a real row id
-                    // (assigned by the committed INSERT), before any git commit runs.
-                    let response_json: serde_json::Value =
-                        serde_json::from_str(&response).expect("parse send response");
-                    assert_eq!(
-                        response_json["count"].as_i64(),
-                        Some(1),
-                        "exactly one delivery expected: {response_json}"
-                    );
-                    let message_id = response_json["deliveries"][0]["payload"]["id"]
-                        .as_i64()
-                        .expect("message id in response");
-                    assert!(
-                        message_id > 0,
-                        "message must be durable (assigned a DB row id) at reply time"
-                    );
+                // Durable in the DB at reply time: the response carries a real row id
+                // (assigned by the committed INSERT), before any git commit runs.
+                let response_json: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse send response");
+                assert_eq!(
+                    response_json["count"].as_i64(),
+                    Some(1),
+                    "exactly one delivery expected: {response_json}"
+                );
+                let message_id = response_json["deliveries"][0]["payload"]["id"]
+                    .as_i64()
+                    .expect("message id in response");
+                assert!(
+                    message_id > 0,
+                    "message must be durable (assigned a DB row id) at reply time"
+                );
 
-                    // (b) the archive converges once materialization runs, and the lag
-                    // metric returns to zero backlog.
-                    eprintln!("[ack-fast archive] draining retry backlog");
-                    assert!(
-                        mcp_agent_mail_storage::archive_backlog_flush_blocking(
-                            std::time::Duration::from_secs(15)
-                        ),
-                        "archive retry backlog drains"
-                    );
-                    eprintln!("[ack-fast archive] flushing write-back queue");
-                    mcp_agent_mail_storage::wbq_flush();
-                    eprintln!("[ack-fast archive] flushing asynchronous commits");
-                    mcp_agent_mail_storage::flush_async_commits();
-                    let lag = mcp_agent_mail_storage::archive_lag_snapshot();
-                    assert_eq!(
-                        lag.backlog_depth, 0,
-                        "archive retry backlog must converge to empty after flush: {lag:?}"
-                    );
-                    eprintln!("[ack-fast acceptance b] archive lag after convergence: {lag:?}");
-                });
-            },
-        );
+                // (b) the archive converges once materialization runs, and the lag
+                // metric returns to zero backlog.
+                eprintln!("[ack-fast archive] draining retry backlog");
+                assert!(
+                    mcp_agent_mail_storage::archive_backlog_flush_blocking(
+                        std::time::Duration::from_secs(15)
+                    ),
+                    "archive retry backlog drains"
+                );
+                eprintln!("[ack-fast archive] flushing write-back queue");
+                mcp_agent_mail_storage::wbq_flush();
+                eprintln!("[ack-fast archive] flushing asynchronous commits");
+                mcp_agent_mail_storage::flush_async_commits();
+                let lag = mcp_agent_mail_storage::archive_lag_snapshot();
+                assert_eq!(
+                    lag.backlog_depth, 0,
+                    "archive retry backlog must converge to empty after flush: {lag:?}"
+                );
+                eprintln!("[ack-fast acceptance b] archive lag after convergence: {lag:?}");
+            });
+        });
     }
 
     #[test]
     fn send_message_delivers_all_recipients_after_recipient_row_replacement() {
-        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let temp = tempfile::tempdir().expect("messaging upsert test tempdir");
-        let storage_root = temp.path().join("storage");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = format!("sqlite:///{}", database_path.display());
-        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "0")], |_| {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime installs recipient replacement context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!(
+                    "/data/projects/messaging-upsert-{}",
+                    mcp_agent_mail_db::now_micros()
+                );
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_text.as_str()),
-                ("CONTACT_ENFORCEMENT_ENABLED", "0"),
-            ],
-            || {
-                Config::reset_cached();
-                let rt = RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("build runtime");
-                rt.block_on(async {
-                    let cx = Cx::current().expect("runtime installs recipient replacement context");
-                    let ctx = McpContext::new(cx.clone(), 1);
-                    let project_key = format!(
-                        "/data/projects/messaging-upsert-{}",
-                        mcp_agent_mail_db::now_micros()
-                    );
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure project");
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("BlueLake".to_string()),
+                    Some("sender".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("register sender");
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("GreenStone".to_string()),
+                    Some("stable recipient".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("register stable recipient");
+                let initial = crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("AzureCanyon".to_string()),
+                    Some("recipient before replacement".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("register replaceable recipient");
+                let initial: serde_json::Value =
+                    serde_json::from_str(&initial).expect("parse initial recipient");
+                let initial_id = initial["id"].as_i64().expect("initial recipient id");
+                let refreshed = crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5.1".to_string(),
+                    Some("AzureCanyon".to_string()),
+                    Some("recipient activity refresh".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("idempotent recipient refresh");
+                let refreshed: serde_json::Value =
+                    serde_json::from_str(&refreshed).expect("parse refreshed recipient");
+                assert_eq!(refreshed["id"].as_i64(), Some(initial_id));
 
-                    crate::ensure_project(&ctx, project_key.clone(), None)
-                        .await
-                        .expect("ensure project");
-                    crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5".to_string(),
-                        Some("BlueLake".to_string()),
-                        Some("sender".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
+                let pool = get_db_pool().expect("get test pool");
+                let conn = pool
+                    .acquire(&cx)
                     .await
-                    .expect("register sender");
-                    crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5".to_string(),
-                        Some("GreenStone".to_string()),
-                        Some("stable recipient".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("register stable recipient");
-                    let initial = crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5".to_string(),
-                        Some("AzureCanyon".to_string()),
-                        Some("recipient before replacement".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("register replaceable recipient");
-                    let initial: serde_json::Value =
-                        serde_json::from_str(&initial).expect("parse initial recipient");
-                    let initial_id = initial["id"].as_i64().expect("initial recipient id");
-                    let refreshed = crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5.1".to_string(),
-                        Some("AzureCanyon".to_string()),
-                        Some("recipient activity refresh".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("idempotent recipient refresh");
-                    let refreshed: serde_json::Value =
-                        serde_json::from_str(&refreshed).expect("parse refreshed recipient");
-                    assert_eq!(refreshed["id"].as_i64(), Some(initial_id));
+                    .into_result()
+                    .expect("acquire test connection");
+                conn.execute_raw(&format!("DELETE FROM agents WHERE id = {initial_id}"))
+                    .expect("replace recipient row");
+                drop(conn);
+                drop(pool);
 
-                    let pool = get_db_pool().expect("get test pool");
-                    let conn = pool
-                        .acquire(&cx)
-                        .await
-                        .into_result()
-                        .expect("acquire test connection");
-                    conn.execute_raw(&format!("DELETE FROM agents WHERE id = {initial_id}"))
-                        .expect("replace recipient row");
-                    drop(conn);
-                    drop(pool);
+                // This mirrors a recipient re-registering after its row was
+                // replaced between recipient resolution attempts.
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("AzureCanyon".to_string()),
+                    Some("replacement recipient".to_string()),
+                    Some("auto".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("idempotent replacement registration");
 
-                    // This mirrors a recipient re-registering after its row was
-                    // replaced between recipient resolution attempts.
-                    crate::register_agent(
-                        &ctx,
-                        project_key.clone(),
-                        "codex-cli".to_string(),
-                        "gpt-5".to_string(),
-                        Some("AzureCanyon".to_string()),
-                        Some("replacement recipient".to_string()),
-                        Some("auto".to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    .expect("idempotent replacement registration");
-
-                    let sent = send_message(
-                        &ctx,
-                        project_key,
-                        "BlueLake".to_string(),
-                        vec!["GreenStone".to_string(), "AzureCanyon".to_string()],
-                        "recipient replacement does not abort send".to_string(),
-                        "both recipients must receive this message".to_string(),
-                        None,
-                        None,
-                        None,
-                        Some(false),
-                        None,
-                        Some(false),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None, // idempotency_key
-                    )
-                    .await
-                    .expect("multi-recipient send after replacement");
-                    let sent: serde_json::Value =
-                        serde_json::from_str(&sent).expect("parse send response");
-                    assert_eq!(sent["count"].as_u64(), Some(1));
-                    assert_eq!(
-                        sent["deliveries"][0]["payload"]["to"]
-                            .as_array()
-                            .map(Vec::len),
-                        Some(2)
-                    );
-                });
-            },
-        );
-        Config::reset_cached();
+                let sent = send_message(
+                    &ctx,
+                    project_key,
+                    "BlueLake".to_string(),
+                    vec!["GreenStone".to_string(), "AzureCanyon".to_string()],
+                    "recipient replacement does not abort send".to_string(),
+                    "both recipients must receive this message".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                    Some(false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None, // idempotency_key
+                )
+                .await
+                .expect("multi-recipient send after replacement");
+                let sent: serde_json::Value =
+                    serde_json::from_str(&sent).expect("parse send response");
+                assert_eq!(sent["count"].as_u64(), Some(1));
+                assert_eq!(
+                    sent["deliveries"][0]["payload"]["to"]
+                        .as_array()
+                        .map(Vec::len),
+                    Some(2)
+                );
+            });
+        });
     }
 
     /// br-ivw0d: when the approved-contact lookup fails, an already-approved
@@ -5840,70 +5812,28 @@ mod tests {
     /// the lookup fails open and counts the bypass (br-1i11.2.6).
     #[test]
     fn contact_lookup_failure_is_not_reported_as_contact_required() {
-        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let temp = tempfile::tempdir().expect("contact lookup test tempdir");
-        let storage_root = temp.path().join("storage");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = format!("sqlite:///{}", database_path.display());
-        let storage_root_text = storage_root.to_string_lossy().into_owned();
-
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_text.as_str()),
-                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
-            ],
-            || {
-                Config::reset_cached();
-                let rt = RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("build runtime");
-                rt.block_on(async {
-                    let cx = Cx::current().expect("runtime installs contact lookup context");
-                    let ctx = McpContext::new(cx.clone(), 1);
-                    let project_key = format!(
-                        "/data/projects/contact-lookup-{}",
-                        mcp_agent_mail_db::now_micros()
-                    );
-                    crate::ensure_project(&ctx, project_key.clone(), None)
-                        .await
-                        .expect("ensure project");
-                    for name in ["BlueLake", "RedPeak", "GreenCastle"] {
-                        crate::register_agent(
-                            &ctx,
-                            project_key.clone(),
-                            "codex-cli".to_string(),
-                            "gpt-5".to_string(),
-                            Some(name.to_string()),
-                            Some("contact lookup".to_string()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
-                        .expect("register agent");
-                    }
-                    for recipient in ["RedPeak", "GreenCastle"] {
-                        crate::set_contact_policy(
-                            &ctx,
-                            project_key.clone(),
-                            recipient.to_string(),
-                            "contacts_only".to_string(),
-                        )
-                        .await
-                        .expect("recipient requires approved contacts");
-                    }
-                    crate::request_contact(
+        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "1")], |_| {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime installs contact lookup context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!(
+                    "/data/projects/contact-lookup-{}",
+                    mcp_agent_mail_db::now_micros()
+                );
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure project");
+                for name in ["BlueLake", "RedPeak", "GreenCastle"] {
+                    crate::register_agent(
                         &ctx,
                         project_key.clone(),
-                        "BlueLake".to_string(),
-                        "RedPeak".to_string(),
-                        None,
-                        None,
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some(name.to_string()),
+                        Some("contact lookup".to_string()),
                         None,
                         None,
                         None,
@@ -5911,189 +5841,52 @@ mod tests {
                         None,
                     )
                     .await
-                    .expect("request contact");
-                    crate::respond_contact(
-                        &ctx,
-                        project_key.clone(),
-                        "RedPeak".to_string(),
-                        "BlueLake".to_string(),
-                        None,
-                        true,
-                        None,
-                    )
-                    .await
-                    .expect("approve contact");
-
-                    let send = |recipient: &str, subject: &str| {
-                        send_message(
-                            &ctx,
-                            project_key.clone(),
-                            "BlueLake".to_string(),
-                            vec![recipient.to_string()],
-                            subject.to_string(),
-                            "body".to_string(),
-                            None,
-                            None,
-                            None,
-                            Some(false),
-                            None,
-                            Some(false),
-                            None,
-                            None,
-                            None,
-                            Some(false),
-                            None,
-                            None,
-                        )
-                    };
-                    // Positive control: the approved contact may send.
-                    send("RedPeak", "approved contact")
-                        .await
-                        .expect("approved send");
-                    // Negative control: a recipient with no approved link is
-                    // still refused by policy.
-                    let refused = send("GreenCastle", "no contact")
-                        .await
-                        .expect_err("an unapproved recipient is refused");
-                    assert!(
-                        format!("{refused:?}").contains("CONTACT_REQUIRED"),
-                        "an unapproved recipient must be a policy refusal: {refused:?}"
-                    );
-
-                    // The approved-contact lookup now fails.
-                    let pool = get_db_pool().expect("get test pool");
-                    let conn = pool
-                        .acquire(&cx)
-                        .await
-                        .into_result()
-                        .expect("acquire test connection");
-                    conn.execute_raw("ALTER TABLE agent_links RENAME TO agent_links_hidden")
-                        .expect("hide approved contacts");
-                    drop(conn);
-                    drop(pool);
-
-                    let bypasses = || {
-                        mcp_agent_mail_core::global_metrics()
-                            .tools
-                            .snapshot()
-                            .contact_enforcement_bypass_total
-                    };
-                    let before = bypasses();
-                    send("RedPeak", "lookup failure")
-                        .await
-                        .expect("a failed contact lookup fails open, not CONTACT_REQUIRED");
-                    assert!(
-                        bypasses() > before,
-                        "the fail-open lookup must count the enforcement bypass"
-                    );
-                });
-            },
-        );
-        Config::reset_cached();
-    }
-
-    /// br-xhfoz: requesting contact again with an already-approved peer (what a
-    /// concurrent first-contact auto-handshake does) must not revoke the
-    /// approval or send the peer another actionable intro.
-    #[test]
-    fn repeated_contact_request_keeps_an_approved_pair_sending() {
-        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let temp = tempfile::tempdir().expect("repeated request test tempdir");
-        let storage_root = temp.path().join("storage");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = format!("sqlite:///{}", database_path.display());
-        let storage_root_text = storage_root.to_string_lossy().into_owned();
-
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_text.as_str()),
-                ("CONTACT_ENFORCEMENT_ENABLED", "1"),
-            ],
-            || {
-                Config::reset_cached();
-                let rt = RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("build runtime");
-                rt.block_on(async {
-                    let cx = Cx::current().expect("runtime installs repeated request context");
-                    let ctx = McpContext::new(cx.clone(), 1);
-                    let project_key = format!(
-                        "/data/projects/repeated-contact-{}",
-                        mcp_agent_mail_db::now_micros()
-                    );
-                    crate::ensure_project(&ctx, project_key.clone(), None)
-                        .await
-                        .expect("ensure project");
-                    for name in ["BlueLake", "RedPeak"] {
-                        crate::register_agent(
-                            &ctx,
-                            project_key.clone(),
-                            "codex-cli".to_string(),
-                            "gpt-5".to_string(),
-                            Some(name.to_string()),
-                            Some("repeated request".to_string()),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
-                        .expect("register agent");
-                    }
+                    .expect("register agent");
+                }
+                for recipient in ["RedPeak", "GreenCastle"] {
                     crate::set_contact_policy(
                         &ctx,
                         project_key.clone(),
-                        "RedPeak".to_string(),
+                        recipient.to_string(),
                         "contacts_only".to_string(),
                     )
                     .await
                     .expect("recipient requires approved contacts");
-                    let request = || {
-                        crate::request_contact(
-                            &ctx,
-                            project_key.clone(),
-                            "BlueLake".to_string(),
-                            "RedPeak".to_string(),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    };
-                    let first: Value =
-                        serde_json::from_str(&request().await.expect("first request"))
-                            .expect("request json");
-                    assert_eq!(first["status"], "pending");
-                    crate::respond_contact(
-                        &ctx,
-                        project_key.clone(),
-                        "RedPeak".to_string(),
-                        "BlueLake".to_string(),
-                        None,
-                        true,
-                        None,
-                    )
-                    .await
-                    .expect("approve contact");
+                }
+                crate::request_contact(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    "RedPeak".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("request contact");
+                crate::respond_contact(
+                    &ctx,
+                    project_key.clone(),
+                    "RedPeak".to_string(),
+                    "BlueLake".to_string(),
+                    None,
+                    true,
+                    None,
+                )
+                .await
+                .expect("approve contact");
 
-                    let again: Value =
-                        serde_json::from_str(&request().await.expect("repeated request"))
-                            .expect("request json");
-                    assert_eq!(again["status"], "approved", "the approval is kept: {again}");
-
+                let send = |recipient: &str, subject: &str| {
                     send_message(
                         &ctx,
                         project_key.clone(),
                         "BlueLake".to_string(),
-                        vec!["RedPeak".to_string()],
-                        "still approved".to_string(),
+                        vec![recipient.to_string()],
+                        subject.to_string(),
                         "body".to_string(),
                         None,
                         None,
@@ -6108,34 +5901,176 @@ mod tests {
                         None,
                         None,
                     )
+                };
+                // Positive control: the approved contact may send.
+                send("RedPeak", "approved contact")
                     .await
-                    .expect("an approved pair still sends after a repeated request");
+                    .expect("approved send");
+                // Negative control: a recipient with no approved link is
+                // still refused by policy.
+                let refused = send("GreenCastle", "no contact")
+                    .await
+                    .expect_err("an unapproved recipient is refused");
+                assert!(
+                    format!("{refused:?}").contains("CONTACT_REQUIRED"),
+                    "an unapproved recipient must be a policy refusal: {refused:?}"
+                );
 
-                    let pool = get_db_pool().expect("get test pool");
-                    let conn = pool
-                        .acquire(&cx)
-                        .await
-                        .into_result()
-                        .expect("acquire test connection");
-                    let rows = conn
-                        .query_sync(
-                            "SELECT COUNT(*) AS n FROM messages \
+                // The approved-contact lookup now fails.
+                let pool = get_db_pool().expect("get test pool");
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("acquire test connection");
+                conn.execute_raw("ALTER TABLE agent_links RENAME TO agent_links_hidden")
+                    .expect("hide approved contacts");
+                drop(conn);
+                drop(pool);
+
+                let bypasses = || {
+                    mcp_agent_mail_core::global_metrics()
+                        .tools
+                        .snapshot()
+                        .contact_enforcement_bypass_total
+                };
+                let before = bypasses();
+                send("RedPeak", "lookup failure")
+                    .await
+                    .expect("a failed contact lookup fails open, not CONTACT_REQUIRED");
+                assert!(
+                    bypasses() > before,
+                    "the fail-open lookup must count the enforcement bypass"
+                );
+            });
+        });
+    }
+
+    /// br-xhfoz: requesting contact again with an already-approved peer (what a
+    /// concurrent first-contact auto-handshake does) must not revoke the
+    /// approval or send the peer another actionable intro.
+    #[test]
+    fn repeated_contact_request_keeps_an_approved_pair_sending() {
+        with_messaging_mailbox(&[("CONTACT_ENFORCEMENT_ENABLED", "1")], |_| {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime installs repeated request context");
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!(
+                    "/data/projects/repeated-contact-{}",
+                    mcp_agent_mail_db::now_micros()
+                );
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure project");
+                for name in ["BlueLake", "RedPeak"] {
+                    crate::register_agent(
+                        &ctx,
+                        project_key.clone(),
+                        "codex-cli".to_string(),
+                        "gpt-5".to_string(),
+                        Some(name.to_string()),
+                        Some("repeated request".to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("register agent");
+                }
+                crate::set_contact_policy(
+                    &ctx,
+                    project_key.clone(),
+                    "RedPeak".to_string(),
+                    "contacts_only".to_string(),
+                )
+                .await
+                .expect("recipient requires approved contacts");
+                let request = || {
+                    crate::request_contact(
+                        &ctx,
+                        project_key.clone(),
+                        "BlueLake".to_string(),
+                        "RedPeak".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                };
+                let first: Value = serde_json::from_str(&request().await.expect("first request"))
+                    .expect("request json");
+                assert_eq!(first["status"], "pending");
+                crate::respond_contact(
+                    &ctx,
+                    project_key.clone(),
+                    "RedPeak".to_string(),
+                    "BlueLake".to_string(),
+                    None,
+                    true,
+                    None,
+                )
+                .await
+                .expect("approve contact");
+
+                let again: Value =
+                    serde_json::from_str(&request().await.expect("repeated request"))
+                        .expect("request json");
+                assert_eq!(again["status"], "approved", "the approval is kept: {again}");
+
+                send_message(
+                    &ctx,
+                    project_key.clone(),
+                    "BlueLake".to_string(),
+                    vec!["RedPeak".to_string()],
+                    "still approved".to_string(),
+                    "body".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                    Some(false),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                    None,
+                )
+                .await
+                .expect("an approved pair still sends after a repeated request");
+
+                let pool = get_db_pool().expect("get test pool");
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("acquire test connection");
+                let rows = conn
+                    .query_sync(
+                        "SELECT COUNT(*) AS n FROM messages \
                              WHERE subject = 'Contact request from BlueLake'",
-                            &[],
-                        )
-                        .expect("count intros");
-                    let intros = rows
-                        .first()
-                        .and_then(|row| row.get_named::<i64>("n").ok())
-                        .expect("intro count");
-                    assert_eq!(
-                        intros, 1,
-                        "only the first request sends an actionable intro"
-                    );
-                });
-            },
-        );
-        Config::reset_cached();
+                        &[],
+                    )
+                    .expect("count intros");
+                let intros = rows
+                    .first()
+                    .and_then(|row| row.get_named::<i64>("n").ok())
+                    .expect("intro count");
+                assert_eq!(
+                    intros, 1,
+                    "only the first request sends an actionable intro"
+                );
+            });
+        });
     }
 
     // ── Durable ack-intent replay (br-bvq1x.8.3 / H3) ────────────────────────

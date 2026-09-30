@@ -3027,6 +3027,99 @@ pub fn tool_cluster(tool_name: &str) -> Option<&'static str> {
         .map(|(_, cluster)| *cluster)
 }
 
+/// Shared harness for unit tests that drive tools against a private mailbox.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Paths of the private mailbox a test runs against.
+    pub struct IsolatedMailbox {
+        /// SQLite file named by `DATABASE_URL`.
+        pub database_path: PathBuf,
+        /// `DATABASE_URL` pointing at `database_path`.
+        pub database_url: String,
+        /// `STORAGE_ROOT` (git archive), created before `f` runs.
+        pub storage_root: PathBuf,
+    }
+
+    fn drain_archive_writes() {
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
+    }
+
+    /// Run `f` with `DATABASE_URL` and `STORAGE_ROOT` pointed at a fresh
+    /// tempdir (plus `extra_overrides`), serialized by `lock`.
+    ///
+    /// The write-back queue and the async commit coalescer are process-global.
+    /// If a test's archive writes are still queued when its tempdir is removed,
+    /// they fail with ENOENT after retries and set the sticky durability flag.
+    /// Every later `send_message` in the same test binary then refuses with
+    /// `DURABILITY_DEGRADED`, far from the test that caused it. This harness
+    /// drains both queues before the tempdir is removed, and fails the test
+    /// that degraded durability instead of an unrelated later one.
+    pub fn with_isolated_mailbox<T>(
+        lock: &Mutex<()>,
+        label: &str,
+        extra_overrides: &[(&str, &str)],
+        f: impl FnOnce(&IsolatedMailbox) -> T,
+    ) -> T {
+        let _lock = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Settle whatever an earlier test (possibly from a module that does
+        // not use this harness) left queued, so any degradation seen below
+        // belongs to this test.
+        mcp_agent_mail_storage::wbq_start();
+        drain_archive_writes();
+        mcp_agent_mail_storage::clear_durability_degraded();
+
+        let temp = tempfile::tempdir().expect("isolated mailbox tempdir");
+        let storage_root = temp.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("isolated mailbox storage root");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&database_path);
+        let mailbox = IsolatedMailbox {
+            database_path,
+            database_url,
+            storage_root,
+        };
+        let storage_root_text = mailbox
+            .storage_root
+            .to_str()
+            .expect("isolated mailbox storage root is UTF-8");
+        let mut overrides = vec![
+            ("DATABASE_URL", mailbox.database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text),
+        ];
+        overrides.extend_from_slice(extra_overrides);
+
+        let (result, stats, degraded) =
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mailbox)));
+                drain_archive_writes();
+                let stats = mcp_agent_mail_storage::wbq_stats();
+                let degraded = mcp_agent_mail_storage::durability_degraded();
+                mcp_agent_mail_storage::clear_durability_degraded();
+                (result, stats, degraded)
+            });
+        mcp_agent_mail_core::Config::reset_cached();
+        drop(temp);
+
+        match result {
+            Ok(value) => {
+                assert!(
+                    !degraded,
+                    "{label} test degraded WBQ durability (its own archive writes failed): {stats:?}"
+                );
+                value
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

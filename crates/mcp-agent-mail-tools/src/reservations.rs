@@ -3380,54 +3380,23 @@ mod tests {
     where
         F: FnOnce() -> T,
     {
-        let _lock = RESERVATION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        mcp_agent_mail_storage::wbq_start();
-        mcp_agent_mail_storage::wbq_flush();
-        mcp_agent_mail_storage::flush_async_commits();
-        mcp_agent_mail_storage::clear_durability_degraded();
-
-        let temp = tempfile::tempdir().expect("reservation test tempdir");
-        let storage_root = temp.path().join("storage-root");
-        std::fs::create_dir_all(&storage_root).expect("reservation test storage root");
-        let database_path = temp.path().join("storage.sqlite3");
-        let database_url = format!("sqlite://{}", database_path.display());
-        let storage_root_str = storage_root
-            .to_str()
-            .expect("reservation test storage root utf-8")
-            .to_string();
-
-        let (result, stats, degraded) =
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[
-                    ("DATABASE_URL", database_url.as_str()),
-                    ("STORAGE_ROOT", storage_root_str.as_str()),
-                ],
-                || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-                    AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| *hook = None);
-                    AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| *hook = None);
-                    mcp_agent_mail_storage::wbq_flush();
-                    mcp_agent_mail_storage::flush_async_commits();
-                    let stats = mcp_agent_mail_storage::wbq_stats();
-                    let degraded = mcp_agent_mail_storage::durability_degraded();
-                    mcp_agent_mail_storage::clear_durability_degraded();
-                    (result, stats, degraded)
-                },
-            );
-
-        match result {
-            Ok(value) => {
-                assert!(
-                    !degraded,
-                    "reservation test caused WBQ durability degradation after cleanup flush: {stats:?}"
-                );
-                value
-            }
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        crate::test_support::with_isolated_mailbox(
+            &RESERVATION_TEST_LOCK,
+            "reservation",
+            &[],
+            |_| {
+                // Clear the test hooks even when `f` unwinds.
+                struct ClearHooks;
+                impl Drop for ClearHooks {
+                    fn drop(&mut self) {
+                        AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| *hook = None);
+                        AFTER_RESERVATION_CONFLICT.with_borrow_mut(|hook| *hook = None);
+                    }
+                }
+                let _clear_hooks = ClearHooks;
+                f()
+            },
+        )
     }
 
     fn run_async<F, Fut, T>(f: F) -> T
