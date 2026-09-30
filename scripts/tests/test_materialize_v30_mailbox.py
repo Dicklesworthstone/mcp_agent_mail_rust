@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import closing
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -40,15 +41,17 @@ PRAGMA application_id = 12345;
 """
 
 
-def make_mailbox(path: Path, *, rows: int = 2, alter: bool = True) -> None:
+def make_mailbox(path: Path, *, rows: int = 2, alter: bool = True,
+                 page_size: int = 4096, body: str = 'body\x00with newline\n') -> None:
     with closing(sqlite3.connect(path)) as conn:
+        conn.execute(f'PRAGMA page_size = {page_size}')
         conn.executescript(PRE_V30)
         for offset in range(rows):
             message_id = 42900 + offset
             conn.execute("INSERT INTO messages VALUES (?, 7, 11, ?, ?, ?, ?, 'high', 1, ?, ?, ?)", (
                 message_id, None if offset % 2 == 0 else 'thread-1',
                 None if offset % 2 == 0 else 'topic-1', 'Subject é 💌',
-                'body\x00with newline\n', 1790650014000000 + offset,
+                body, 1790650014000000 + offset,
                 '{"to":["BlueLake"]}', '[]',
             ))
             conn.execute("INSERT INTO message_recipients VALUES (?,12,'to',NULL,NULL)", (message_id,))
@@ -243,6 +246,193 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(result.stdout, '')
         self.assertIn('never overwritten', result.stderr)
         self.assert_source_unchanged()
+
+    def test_inspection_detects_short_records_even_when_integrity_is_ok(self) -> None:
+        report = repair.inspect_mailbox(self.source)
+        self.assertEqual(report['status'], 'requires_materialization')
+        self.assertEqual(report['physical_layout']['field_counts'], {'12': 2})
+        self.assertEqual(report['physical_layout']['short_record_sample_ids'], [42900, 42901])
+        self.assertFalse(self.output.exists())
+        self.assert_source_unchanged()
+
+    def test_inspection_after_repair_reports_full_records(self) -> None:
+        report = repair.prepare_repair(self.source, self.output)
+        self.assertEqual(report['physical_layout_before']['short_records'], 2)
+        self.assertEqual(report['physical_layout_after']['short_records'], 0)
+        checked = repair.inspect_mailbox(self.output)
+        self.assertEqual(checked['status'], 'full_records')
+        self.assertEqual(checked['physical_layout']['field_counts'], {'13': 2})
+
+    def test_large_multilevel_mailbox_with_overflow_and_small_pages(self) -> None:
+        source = self.root / 'many-pages.sqlite3'
+        make_mailbox(source, rows=1200, page_size=512, body='long body\n' * 300)
+        original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        checked = repair.inspect_mailbox(source)
+        layout = checked['physical_layout']
+        self.assertEqual(layout['short_records'], 1200)
+        self.assertGreater(layout['table_pages'], 100)
+        self.assertGreater(layout['overflow_pages'], 1200)
+        self.assertEqual(len(layout['short_record_sample_ids']), 8)
+        report = repair.prepare_repair(source, self.output)
+        self.assertEqual(report['physical_layout_after']['field_counts'], {'13': 1200})
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
+
+    def test_maximum_page_size_and_empty_page_encoding(self) -> None:
+        for rows in (0, 5):
+            source = self.root / f'64k-{rows}.sqlite3'
+            make_mailbox(source, rows=rows, page_size=65536, body='x' * 100000)
+            checked = repair.inspect_mailbox(source)
+            self.assertEqual(checked['physical_layout']['rows'], rows)
+            self.assertEqual(checked['physical_layout']['short_records'], rows)
+            output = self.root / f'64k-{rows}-repaired.sqlite3'
+            report = repair.prepare_repair(source, output)
+            self.assertEqual(report['physical_layout_after']['short_records'], 0)
+
+    def test_signed_nine_byte_rowids_are_preserved(self) -> None:
+        source = self.root / 'signed-rowids.sqlite3'
+        make_mailbox(source, rows=0, alter=False)
+        ids = (-(1 << 63), -1, 0, (1 << 63) - 1)
+        with closing(sqlite3.connect(source)) as conn:
+            for message_id in ids:
+                conn.execute("INSERT INTO messages VALUES (?,7,11,NULL,NULL,'subject','body','normal',0,1,'{}','[]')", (message_id,))
+            conn.execute('ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT')
+            conn.commit()
+        report = repair.prepare_repair(source, self.output)
+        self.assertEqual(report['physical_layout_before']['short_record_sample_ids'], list(ids))
+        self.assertEqual(report['physical_layout_after']['field_counts'], {'13': 4})
+
+    def test_cli_check_exit_codes_and_source_bytes(self) -> None:
+        result = subprocess.run([sys.executable, str(SCRIPT), '--check', str(self.source)],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)['status'], 'requires_materialization')
+        self.assertEqual(result.stderr, '')
+        repair.prepare_repair(self.source, self.output)
+        result = subprocess.run([sys.executable, str(SCRIPT), '--check', str(self.output)],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)['status'], 'full_records')
+        self.assert_source_unchanged()
+
+    def test_cli_check_rejects_destination_and_repair_requires_one(self) -> None:
+        for arguments in ((str(self.source),), ('--check', str(self.source), str(self.output))):
+            result = subprocess.run([sys.executable, str(SCRIPT), *arguments],
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('error:', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_physical_validation_failure_never_publishes_repair(self) -> None:
+        original_probe = repair._physical_layout
+        def residual_short_records(path: Path, root: int, count: int) -> dict:
+            result = original_probe(path, root, count)
+            # Fault injection: simulate an engine that elides a no-op UPDATE.
+            result['short_records'] = count
+            return result
+        with mock.patch.object(repair, '_physical_layout', side_effect=residual_short_records):
+            with self.assertRaisesRegex(repair.RepairError, 'short records remain'):
+                repair.prepare_repair(self.source, self.output)
+        self.assertFalse(self.output.exists())
+        self.assert_source_unchanged()
+
+    def test_physical_probe_rejects_bad_size_count_and_root(self) -> None:
+        with closing(sqlite3.connect(self.source)) as conn:
+            root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name='messages'").fetchone()[0]
+        with self.assertRaisesRegex(repair.RepairError, 'message count differs'):
+            repair._physical_layout(self.source, root, 1)
+        with self.assertRaisesRegex(repair.RepairError, 'outside the database'):
+            repair._physical_layout(self.source, 2**32, 2)
+        for index, raw in enumerate((self.original[:-1], b'bad header',
+                                    self.original[:16] + b'\x00\x00' + self.original[18:])):
+            broken = self.root / f'broken-{index}.sqlite3'
+            broken.write_bytes(raw)
+            with self.subTest(index=index), self.assertRaises(repair.RepairError):
+                repair._physical_layout(broken, root, 2)
+
+    def test_physical_probe_rejects_btree_cycles(self) -> None:
+        source = self.root / 'cycle.sqlite3'
+        make_mailbox(source, rows=100, page_size=512)
+        with closing(sqlite3.connect(source)) as conn:
+            root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name='messages'").fetchone()[0]
+        raw = bytearray(source.read_bytes())
+        offset = (root - 1) * 512
+        self.assertEqual(raw[offset], 5)
+        pointer = int.from_bytes(raw[offset + 12:offset + 14], 'big')
+        raw[offset + pointer:offset + pointer + 4] = root.to_bytes(4, 'big')
+        # Only the disposable malformed fixture is written, never a mailbox.
+        broken = self.root / 'cycle-broken.sqlite3'
+        broken.write_bytes(raw)
+        with self.assertRaisesRegex(repair.RepairError, 'cycle or shared page'):
+            repair._physical_layout(broken, root, 100)
+
+    def test_physical_probe_rejects_overflow_cycles(self) -> None:
+        source = self.root / 'overflow.sqlite3'
+        make_mailbox(source, rows=1, page_size=512, body='x' * 5000)
+        with closing(sqlite3.connect(source)) as conn:
+            root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name='messages'").fetchone()[0]
+        raw = bytearray(source.read_bytes())
+        offset = (root - 1) * 512
+        pointer = int.from_bytes(raw[offset + 8:offset + 10], 'big')
+        payload, position = repair._varint(raw, offset + pointer, offset + 512)
+        _, position = repair._varint(raw, position, offset + 512)
+        local = 39 + (payload - 39) % 508
+        if local > 477:
+            local = 39
+        overflow = int.from_bytes(raw[position + local:position + local + 4], 'big')
+        raw[(overflow - 1) * 512:(overflow - 1) * 512 + 4] = overflow.to_bytes(4, 'big')
+        broken = self.root / 'overflow-broken.sqlite3'
+        broken.write_bytes(raw)
+        with self.assertRaisesRegex(repair.RepairError, 'cycle or shared page'):
+            repair._physical_layout(broken, root, 1)
+
+    def test_record_header_spanning_overflow_is_read_completely(self) -> None:
+        source = self.root / 'split-header.sqlite3'
+        make_mailbox(source, rows=1, page_size=512, body='x' * 400)
+        with closing(sqlite3.connect(source)) as conn:
+            root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name='messages'").fetchone()[0]
+        raw = bytearray(source.read_bytes())
+        offset = (root - 1) * 512
+        cell = offset + int.from_bytes(raw[offset + 8:offset + 10], 'big')
+        payload, key_start = repair._varint(raw, cell, offset + 512)
+        _, start = repair._varint(raw, key_start, offset + 512)
+        self.assertLessEqual(payload, 477)
+        header_size, position = repair._varint(raw, start, start + payload)
+        serials = []
+        while position < start + header_size:
+            serial, position = repair._varint(raw, position, start + header_size)
+            serials.append(serial)
+
+        # Legal, deliberately wide varints force the header into overflow
+        # without allocating huge message bodies. Canonical SQLite below is
+        # the independent authority that this remains a valid logical mailbox.
+        def wide_varint(value: int) -> bytes:
+            return bytes(128 | ((value >> shift) & 127) for shift in (21, 14, 7)) + bytes([value & 127])
+
+        body = raw[start + header_size:start + payload]
+        record = bytes([1 + 4 * len(serials)]) + b''.join(map(wide_varint, serials)) + body
+        self.assertTrue(477 < len(record) < 548)
+        local = 39
+        overflow_page = len(raw) // 512 + 1
+        new_cell = (wide_varint(len(record)) + raw[key_start:start]
+                    + record[:local] + overflow_page.to_bytes(4, 'big'))
+        leaf = bytearray(512)
+        leaf[0] = 13
+        leaf[3:5] = (1).to_bytes(2, 'big')
+        leaf[5:7] = leaf[8:10] = (512 - len(new_cell)).to_bytes(2, 'big')
+        leaf[-len(new_cell):] = new_cell
+        raw[offset:offset + 512] = leaf
+        raw.extend(b'\x00' * 4 + record[local:] + b'\x00' * (508 - len(record[local:])))
+        raw[28:32] = overflow_page.to_bytes(4, 'big')
+        split_source = self.root / 'legal-split-header.sqlite3'
+        split_source.write_bytes(raw)
+        with closing(sqlite3.connect(split_source)) as conn:
+            self.assertEqual(conn.execute('PRAGMA integrity_check').fetchall(), [('ok',)])
+            self.assertEqual(conn.execute('SELECT body_md FROM messages').fetchone(), ('x' * 400,))
+        report = repair.prepare_repair(split_source, self.output)
+        self.assertEqual(report['physical_layout_before']['field_counts'], {'12': 1})
+        self.assertEqual(report['physical_layout_before']['overflow_pages'], 1)
+        self.assertEqual(report['physical_layout_after']['field_counts'], {'13': 1})
 
 
 if __name__ == '__main__':

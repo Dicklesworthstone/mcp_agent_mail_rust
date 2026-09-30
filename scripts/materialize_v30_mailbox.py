@@ -135,6 +135,172 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
         raise RepairError("messages.id must be the INTEGER PRIMARY KEY")
 
 
+def _varint(data: bytes, position: int, limit: int) -> tuple[int, int]:
+    """Decode a bounded SQLite varint, including the eight-bit ninth byte."""
+    value = 0
+    for index in range(9):
+        if position >= limit:
+            raise RepairError("truncated SQLite record varint")
+        byte = data[position]
+        position += 1
+        value = (value << (8 if index == 8 else 7)) | (byte if index == 8 else byte & 127)
+        if index == 8 or byte < 128:
+            return value, position
+    raise RepairError("invalid SQLite varint")
+
+
+def _physical_layout(path: Path, root_page: int, expected_rows: int) -> dict[str, Any]:
+    """Count stored fields, not SQL's default-filled projection of a record.
+
+    Format: https://www.sqlite.org/fileformat2.html, sections 1.6, 1.7, 2.1.
+    Read one page at a time and retain only each record's bounded header. Visit
+    each reachable table/overflow page once, rejecting cycles and bad pointers.
+    This is a targeted v30 layout probe, not a replacement for integrity_check.
+    """
+    widths: dict[str, int] = {}
+    samples: list[int] = []
+    rows = short = table_pages = overflow_pages = 0
+    previous_rowid: int | None = None
+    with path.open("rb") as stream:
+        header = stream.read(100)
+        if len(header) != 100 or header[:16] != b"SQLite format 3\x00":
+            raise RepairError("invalid SQLite database header")
+        size = int.from_bytes(header[16:18], "big")
+        size = 65536 if size == 1 else size
+        length = os.fstat(stream.fileno()).st_size
+        if size < 512 or size > 65536 or size & (size - 1) or length % size:
+            raise RepairError("invalid SQLite page size or truncated file")
+        usable = size - header[20]
+        if usable < 480:
+            raise RepairError("invalid reserved space in SQLite pages")
+        page_count = length // size
+        visited: set[int] = set()
+
+        def read_page(number: int) -> bytes:
+            if not 1 <= number <= page_count:
+                raise RepairError("SQLite page pointer is outside the database")
+            if number in visited:
+                raise RepairError("cycle or shared page in messages b-tree")
+            visited.add(number)
+            stream.seek((number - 1) * size)
+            data = stream.read(usable)
+            if len(data) != usable:
+                raise RepairError("truncated SQLite page")
+            return data
+
+        pending = [root_page]
+        while pending:
+            number = pending.pop()
+            page = read_page(number)
+            table_pages += 1
+            start = 100 if number == 1 else 0
+            kind = page[start]
+            if kind not in (5, 13):
+                raise RepairError("messages must use a rowid table b-tree")
+            count = int.from_bytes(page[start + 3:start + 5], "big")
+            pointers = start + (12 if kind == 5 else 8)
+            pointer_end = pointers + 2 * count
+            content = int.from_bytes(page[start + 5:start + 7], "big") or 65536
+            if not pointer_end <= content <= usable:
+                raise RepairError("invalid SQLite cell pointer array")
+            children = []
+            for index in range(count):
+                cell = int.from_bytes(page[pointers + 2 * index:pointers + 2 * index + 2], "big")
+                if not content <= cell < usable:
+                    raise RepairError("SQLite cell pointer is outside the content area")
+                if kind == 5:
+                    if cell + 4 >= usable:
+                        raise RepairError("truncated SQLite interior cell")
+                    children.append(int.from_bytes(page[cell:cell + 4], "big"))
+                    _varint(page, cell + 4, usable)
+                    continue
+                payload, position = _varint(page, cell, usable)
+                rowid, position = _varint(page, position, usable)
+                rowid = rowid - (1 << 64) if rowid >= (1 << 63) else rowid
+                if previous_rowid is not None and rowid <= previous_rowid:
+                    raise RepairError("messages rowids are not strictly ordered")
+                previous_rowid = rowid
+                maximum = usable - 35
+                minimum = ((usable - 12) * 32 // 255) - 23
+                candidate = minimum + (payload - minimum) % (usable - 4)
+                local = payload if payload <= maximum else (
+                    candidate if candidate <= maximum else minimum
+                )
+                end = position + local
+                if end + (4 if local < payload else 0) > usable:
+                    raise RepairError("SQLite record extends beyond its page")
+                header_size, _ = _varint(page, position, end)
+                if not 1 <= header_size <= min(payload, 9 * (len(MESSAGE_COLUMNS) + 1)):
+                    raise RepairError("invalid or oversized v30 record header")
+                record = page[position:min(end, position + header_size)]
+                remaining = payload - local
+                next_page = int.from_bytes(page[end:end + 4], "big") if remaining else 0
+                while remaining:
+                    block = read_page(next_page)
+                    overflow_pages += 1
+                    take = min(remaining, usable - 4)
+                    needed = max(0, header_size - len(record))
+                    record += block[4:4 + min(take, needed)]
+                    remaining -= take
+                    next_page = int.from_bytes(block[:4], "big")
+                if next_page:
+                    raise RepairError("overflow chain exceeds the record payload")
+                _, position = _varint(record, 0, len(record))
+                fields = body_size = 0
+                while position < header_size:
+                    serial, position = _varint(record, position, header_size)
+                    if serial in (10, 11):
+                        raise RepairError("reserved SQLite serial type in message record")
+                    body_size += (
+                        (0, 1, 2, 3, 4, 6, 8, 8, 0, 0)[serial]
+                        if serial < 10 else (serial - 12) // 2
+                    )
+                    fields += 1
+                if not 1 <= fields <= len(MESSAGE_COLUMNS) or header_size + body_size != payload:
+                    raise RepairError("message field count or payload length is inconsistent")
+                rows += 1
+                widths[str(fields)] = widths.get(str(fields), 0) + 1
+                if fields < len(MESSAGE_COLUMNS):
+                    short += 1
+                    if len(samples) < 8:
+                        samples.append(rowid)
+            if kind == 5:
+                children.append(int.from_bytes(page[start + 8:start + 12], "big"))
+                # Bound corrupt fan-out before it can grow an unbounded worklist.
+                if len(children) + len(pending) > page_count:
+                    raise RepairError("messages b-tree fan-out exceeds database size")
+                pending.extend(reversed(children))
+    if rows != expected_rows:
+        raise RepairError("physical message count differs from canonical SQLite")
+    return {
+        "rows": rows, "short_records": short, "full_records": rows - short,
+        "field_counts": widths, "short_record_sample_ids": samples,
+        "table_pages": table_pages, "overflow_pages": overflow_pages,
+    }
+
+
+def inspect_mailbox(source: Path) -> dict[str, Any]:
+    """Diagnose an offline mailbox via a private copy; never mutate the source."""
+    source = source.resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix=".am-v30-inspect-") as directory:
+        staged = Path(directory) / "mailbox.sqlite3"
+        source_hash = _snapshot(source, staged)
+        with closing(sqlite3.connect(staged.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
+            _validate_schema(conn)
+            _integrity(conn)
+            root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name = 'messages'").fetchone()[0]
+            count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        layout = _physical_layout(staged, root, count)
+        _no_companions(source)
+        if _hash_file(source) != source_hash:
+            raise RepairError("source changed during inspection")
+    return {
+        "incident": "br-2hpuk", "source": str(source), "source_sha256": source_hash,
+        "status": "requires_materialization" if layout["short_records"] else "full_records",
+        "physical_layout": layout, "live_mailbox_replaced": False,
+    }
+
+
 def _logical_state(conn: sqlite3.Connection) -> dict[str, Any]:
     """Stream hashes of the entire logical database, including row identities.
 
@@ -210,6 +376,8 @@ def prepare_repair(source: Path, destination: Path) -> dict[str, Any]:
             _validate_schema(conn)
             _integrity(conn)
             before = _logical_state(conn)
+            root = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name = 'messages'").fetchone()[0]
+            layout_before = _physical_layout(staged, root, before["tables"]["messages"]["rows"])
             conn.execute("BEGIN IMMEDIATE")
             try:
                 changed = conn.execute(
@@ -230,6 +398,9 @@ def prepare_repair(source: Path, destination: Path) -> dict[str, Any]:
                 raise RepairError("committed logical state differs; no repair published")
             _integrity(conn)
         _no_companions(staged)
+        layout_after = _physical_layout(staged, root, layout_before["rows"])
+        if layout_after["short_records"]:
+            raise RepairError("short records remain after materialization; no repair published")
         _no_companions(source)
         if _hash_file(source) != source_hash:
             raise RepairError("source changed while preparing repair; no repair published")
@@ -254,6 +425,8 @@ def prepare_repair(source: Path, destination: Path) -> dict[str, Any]:
         "source_sha256": source_hash,
         "destination_sha256": result_hash,
         "messages_materialized": changed,
+        "physical_layout_before": layout_before,
+        "physical_layout_after": layout_after,
         "logical_state": before,
         "live_mailbox_replaced": False,
     }
@@ -261,16 +434,21 @@ def prepare_repair(source: Path, destination: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="diagnose physical records without preparing a repair output")
     parser.add_argument("source", type=Path, help="standalone, offline v30 mailbox backup")
-    parser.add_argument("destination", type=Path, help="new repair copy; must not already exist")
+    parser.add_argument("destination", type=Path, nargs="?", help="new repair copy; must not already exist")
     args = parser.parse_args(argv)
+    if args.check and args.destination is not None:
+        parser.error("--check does not accept a destination")
+    if not args.check and args.destination is None:
+        parser.error("a destination is required unless --check is used")
     try:
-        report = prepare_repair(args.source, args.destination)
+        report = inspect_mailbox(args.source) if args.check else prepare_repair(args.source, args.destination)
     except (RepairError, OSError, sqlite3.Error, UnicodeError) as error:
         print(f"v30 repair refused: {error}", file=sys.stderr)
         return 1
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return 2 if report["status"] == "requires_materialization" else 0
 
 
 if __name__ == "__main__":
