@@ -3068,13 +3068,6 @@ pub(crate) mod test_support {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Settle whatever an earlier test (possibly from a module that does
-        // not use this harness) left queued, so any degradation seen below
-        // belongs to this test.
-        mcp_agent_mail_storage::wbq_start();
-        drain_archive_writes();
-        mcp_agent_mail_storage::clear_durability_degraded();
-
         let temp = tempfile::tempdir().expect("isolated mailbox tempdir");
         let storage_root = temp.path().join("storage-root");
         std::fs::create_dir_all(&storage_root).expect("isolated mailbox storage root");
@@ -3097,6 +3090,15 @@ pub(crate) mod test_support {
 
         let (result, stats, degraded) =
             mcp_agent_mail_core::config::with_process_env_overrides_for_test(&overrides, || {
+                // Settle whatever an earlier test (possibly from a module that
+                // does not use this harness) left queued, so any degradation
+                // seen below belongs to this test. This runs under the global
+                // env-override serializer: each module passes its own `lock`,
+                // so clearing the flag before taking the serializer could wipe
+                // a degradation another module's running test just caused.
+                mcp_agent_mail_storage::wbq_start();
+                drain_archive_writes();
+                mcp_agent_mail_storage::clear_durability_degraded();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mailbox)));
                 drain_archive_writes();
                 let stats = mcp_agent_mail_storage::wbq_stats();

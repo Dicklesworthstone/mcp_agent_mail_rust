@@ -1888,6 +1888,11 @@ mod tests {
 
     #[test]
     fn cadence_rebuild_uses_latched_dirty_signal() {
+        // The runtime snapshot is process-global: tool calls recorded by other
+        // tests in this binary would otherwise hydrate and rebuild the list on
+        // the non-cadence tick under plain `cargo test`.
+        let _guard = lock_tool_metrics_runtime_test();
+        reset_tool_metrics();
         let state = test_state();
         let mut screen = ToolMetricsScreen::new();
 
