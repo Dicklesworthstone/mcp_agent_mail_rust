@@ -647,7 +647,8 @@ fn split_qualified_recipient(raw: &str) -> McpResult<Option<(String, String)>> {
     let parts = if let Some(rest) = raw.strip_prefix("project:")
         && rest.contains('#')
     {
-        rest.split_once('#').map(|(project, name)| (name, project))
+        // Agent names never contain '#'; a human key may.
+        rest.rsplit_once('#').map(|(project, name)| (name, project))
     } else {
         raw.split_once('@')
     };
@@ -6519,6 +6520,10 @@ mod tests {
         assert_eq!(
             split("project:work-backend#GreenCastle"),
             Some(("GreenCastle".to_string(), "work-backend".to_string()))
+        );
+        assert_eq!(
+            split("project:/work/issue#12#GreenCastle"),
+            Some(("GreenCastle".to_string(), "/work/issue#12".to_string()))
         );
         for malformed in [
             "GreenCastle@",

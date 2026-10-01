@@ -397,7 +397,8 @@ macro_file_reservation_cycle(project_key="/abs/path/to/repo", agent_name="GreenC
 
 # Contact handshake between agents in different projects: approves the link and
 # delivers the welcome into the target's project (without auto_accept the link
-# stays pending, no welcome is sent, and the response says why)
+# stays pending, no welcome is sent, and the response says why; auto_accept never
+# overrides a link the target has blocked)
 macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle",
                         target="BlueLake", to_project="/abs/path/to/other/repo",
                         auto_accept=true, welcome_subject="Coordination channel",

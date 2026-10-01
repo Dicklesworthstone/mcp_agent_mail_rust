@@ -1188,3 +1188,185 @@ fn qualified_recipient_is_delivered_into_its_project_over_an_approved_link() {
         );
     });
 }
+
+/// GH#335 review: consent for a qualified send is the target's, and only the
+/// target can grant it back. A requester the target blocked cannot re-approve
+/// the link through `macro_contact_handshake(auto_accept=true)`, an expired
+/// approval or a link with a different agent does not authorize delivery, and
+/// a `block_all` recipient refuses even over an approved link.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn qualified_send_consent_cannot_be_forged_by_the_sender() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let frontend = format!("/tmp/xc-frontend-{}", unique_suffix());
+        let backend = format!("/tmp/xc-backend-{}", unique_suffix());
+        let other = format!("/tmp/xc-other-{}", unique_suffix());
+        register_open_agent(&ctx, &frontend, "BlueLake").await;
+        register_open_agent(&ctx, &backend, "GreenCastle").await;
+        register_open_agent(&ctx, &backend, "RedPeak").await;
+        register_open_agent(&ctx, &other, "GreenCastle").await;
+        let backend_slug = serde_json::from_str::<Value>(
+            &ensure_project(&ctx, backend.clone(), None)
+                .await
+                .expect("backend project"),
+        )
+        .expect("project JSON")["slug"]
+            .as_str()
+            .expect("slug")
+            .to_string();
+        let handshake = |target: &'static str, project: String, auto_accept: bool| {
+            macro_contact_handshake(
+                &ctx,
+                frontend.clone(),
+                Some("BlueLake".to_string()),
+                Some(target.to_string()),
+                None,
+                None,
+                Some(project),
+                Some("coordination".to_string()),
+                Some(auto_accept),
+                None,
+                Some("hello".to_string()),
+                Some("hi".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let send = |to: String, subject: &'static str| {
+            send_message(
+                &ctx,
+                frontend.clone(),
+                "BlueLake".to_string(),
+                vec![to],
+                subject.to_string(),
+                "body".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let code = |err: &fastmcp::McpError| {
+            mcp_agent_mail_tools::tool_util::tool_error_code(err).map(str::to_string)
+        };
+        let green = format!("GreenCastle@{backend_slug}");
+
+        // A link with GreenCastle of ANOTHER project authorizes nothing here.
+        handshake("GreenCastle", other.clone(), true)
+            .await
+            .expect("approved link with the other project's GreenCastle");
+        let err = send(green.clone(), "wrong namesake")
+            .await
+            .expect_err("link is with a different agent");
+        assert_eq!(code(&err).as_deref(), Some("CONTACT_REQUIRED"), "{err:?}");
+
+        // The target blocks a pending request...
+        handshake("GreenCastle", backend.clone(), false)
+            .await
+            .expect("pending request");
+        respond_contact(
+            &ctx,
+            backend.clone(),
+            "GreenCastle".to_string(),
+            "BlueLake".to_string(),
+            Some(frontend.clone()),
+            false,
+            None,
+        )
+        .await
+        .expect("target blocks the requester");
+        // ...and the blocked requester cannot approve it on the target's behalf.
+        let before = delivery_counts(&cx).await;
+        let forged: Value = serde_json::from_str(
+            &handshake("GreenCastle", backend.clone(), true)
+                .await
+                .expect("handshake against a blocked link reports, not fails"),
+        )
+        .expect("handshake JSON");
+        assert_eq!(forged["request"]["status"], "blocked", "{forged}");
+        assert!(forged["response"].is_null(), "{forged}");
+        assert!(forged["welcome_message"].is_null(), "{forged}");
+        assert!(
+            forged["welcome_skipped_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("contact_blocked")),
+            "{forged}"
+        );
+        assert_eq!(delivery_counts(&cx).await, before, "nothing may be written");
+        let err = send(green.clone(), "after forged approval")
+            .await
+            .expect_err("still blocked");
+        assert_eq!(code(&err).as_deref(), Some("CONTACT_BLOCKED"), "{err:?}");
+
+        // The target itself can lift its block.
+        respond_contact(
+            &ctx,
+            backend.clone(),
+            "GreenCastle".to_string(),
+            "BlueLake".to_string(),
+            Some(frontend.clone()),
+            true,
+            None,
+        )
+        .await
+        .expect("target approves");
+        send(green.clone(), "approved by the target")
+            .await
+            .expect("delivered once the target approves");
+
+        // An approval that has expired no longer authorizes delivery.
+        {
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("pool");
+            let conn = pool.acquire(&cx).await.into_result().expect("checkout");
+            conn.execute_sync(
+                "UPDATE agent_links SET expires_ts = 1 WHERE status = 'approved' \
+                 AND b_agent_id = (SELECT a.id FROM agents a JOIN projects p \
+                 ON p.id = a.project_id WHERE a.name = 'GreenCastle' AND p.slug = ?)",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                    backend_slug.clone(),
+                )],
+            )
+            .expect("expire the approval");
+        }
+        let err = send(green.clone(), "after expiry")
+            .await
+            .expect_err("expired approval");
+        assert_eq!(code(&err).as_deref(), Some("CONTACT_REQUIRED"), "{err:?}");
+
+        // block_all refuses even over a fresh approval.
+        handshake("RedPeak", backend.clone(), true)
+            .await
+            .expect("approved link with RedPeak");
+        let red = format!("RedPeak@{backend_slug}");
+        send(red.clone(), "before block_all")
+            .await
+            .expect("approved link delivers");
+        mcp_agent_mail_tools::contacts::set_contact_policy(
+            &ctx,
+            backend.clone(),
+            "RedPeak".to_string(),
+            "block_all".to_string(),
+        )
+        .await
+        .expect("block_all");
+        let before = delivery_counts(&cx).await;
+        let err = send(red, "after block_all")
+            .await
+            .expect_err("block_all recipient");
+        assert_eq!(code(&err).as_deref(), Some("CONTACT_BLOCKED"), "{err:?}");
+        assert_eq!(delivery_counts(&cx).await, before, "nothing may be written");
+    });
+}
