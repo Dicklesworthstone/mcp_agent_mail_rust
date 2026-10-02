@@ -16676,55 +16676,70 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
     ))
 }
 
+/// Whether `database_url` names an existing, initialized mailbox file.
+///
+/// Read-only verbs may initialize a missing or empty mailbox, which has no
+/// data to migrate, but must never run migrations or recovery against an
+/// existing one (br-2hpuk): that file may be owned by a running server of a
+/// different version, and a read verb once applied a schema migration to a
+/// live mailbox that way.
+fn read_verb_mailbox_is_initialized(database_url: &str) -> bool {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let Ok(path) = cfg.sqlite_path() else {
+        return false;
+    };
+    if path == ":memory:" {
+        return false;
+    }
+    let path = resolve_sqlite_runtime_path(&path);
+    std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0)
+}
+
+fn read_verb_refused_migrating_open(verb: &str, read_error: &CliError) -> CliError {
+    CliError::Other(format!(
+        "{verb} could not read the mailbox without changing it ({read_error}). Read-only \
+         commands never migrate or recover an existing mailbox. If the mailbox schema is \
+         older than this `am`, let the server that owns it upgrade it (restart `am serve-http` \
+         with this version) or run `am migrate` while no server is running; if it is busy, \
+         retry."
+    ))
+}
+
+/// Open the mailbox for a robot read.
+///
+/// An existing mailbox is opened read-only or not at all; only a missing or
+/// empty mailbox takes the initializing open (br-2hpuk).
 pub(crate) fn open_db_sync_robot_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
-    if let Ok(conn) = open_db_sync_robot_best_effort_with_database_url(database_url) {
-        return Ok(conn);
+    let read_error = match open_db_sync_robot_best_effort_with_database_url(database_url) {
+        Ok(conn) => return Ok(conn),
+        Err(error) => error,
+    };
+    if read_verb_mailbox_is_initialized(database_url) {
+        return Err(read_verb_refused_migrating_open("robot read", &read_error));
     }
-    match open_db_sync_with_database_url(database_url) {
-        Ok(conn) => Ok(conn),
-        Err(error) if is_resource_busy_cli_error(&error) => {
-            match open_db_sync_robot_best_effort_with_database_url(database_url) {
-                Ok(conn) => {
-                    tracing::warn!(
-                        database_url,
-                        "robot command falling back to best-effort sqlite read after busy init/recovery path"
-                    );
-                    Ok(conn)
-                }
-                Err(_) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    }
+    open_db_sync_with_database_url(database_url)
 }
 
 pub(crate) fn open_db_sync_robot_attachments_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
-    match open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
-        Ok(conn) => return Ok(conn),
-        Err(error) => {
-            tracing::debug!(%error, "robot attachment read-only admission failed before full initialization");
-        }
+    let read_error =
+        match open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
+            Ok(conn) => return Ok(conn),
+            Err(error) => error,
+        };
+    if read_verb_mailbox_is_initialized(database_url) {
+        return Err(read_verb_refused_migrating_open(
+            "robot attachments read",
+            &read_error,
+        ));
     }
-    match open_db_sync_with_database_url(database_url) {
-        Ok(conn) => Ok(conn),
-        Err(error) if is_resource_busy_cli_error(&error) => {
-            match open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
-                Ok(conn) => {
-                    tracing::warn!(
-                        database_url,
-                        "robot attachments falling back to best-effort sqlite read after busy init/recovery path"
-                    );
-                    Ok(conn)
-                }
-                Err(_) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    }
+    open_db_sync_with_database_url(database_url)
 }
 
 pub(crate) fn open_db_sync_robot() -> CliResult<mcp_agent_mail_db::DbConn> {
@@ -77235,6 +77250,73 @@ startup_timeout_sec = 42
         release_tx.send(()).expect("release lock thread");
         open_thread.join().expect("join open thread");
         lock_thread.join().expect("join lock thread");
+    }
+
+    /// br-2hpuk: a robot read once applied a schema migration to a live
+    /// mailbox by falling back to the initializing open. An existing mailbox
+    /// that the read-only admission refuses must be left byte-for-byte alone.
+    #[test]
+    fn robot_reads_never_migrate_an_existing_older_schema_mailbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("older-schema.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        {
+            let seed =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("open seed db");
+            for stmt in [
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at DATETIME NOT NULL)",
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'old', '/tmp/old', '2026-09-01 00:00:00')",
+            ] {
+                seed.execute_raw(stmt).expect("seed statement");
+            }
+        }
+        let schema_of = |path: &std::path::Path| {
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+                    .expect("open for inspection");
+            conn.query_sync(
+                "SELECT type, name, COALESCE(sql, '') AS sql FROM sqlite_master ORDER BY type, name",
+                &[],
+            )
+            .expect("read sqlite_master")
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("type").unwrap(),
+                    row.get_named::<String>("name").unwrap(),
+                    row.get_named::<String>("sql").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+        let before = schema_of(&db_path);
+
+        for (verb, result) in [
+            (
+                "robot read",
+                open_db_sync_robot_with_database_url(&db_url).map(drop),
+            ),
+            (
+                "robot attachments read",
+                open_db_sync_robot_attachments_with_database_url(&db_url).map(drop),
+            ),
+        ] {
+            let error =
+                result.expect_err("an older-schema mailbox must not be opened by migrating it");
+            let message = error.to_string();
+            assert!(
+                message.contains(verb) && message.contains("never migrate"),
+                "{verb}: {message}"
+            );
+        }
+
+        assert_eq!(
+            schema_of(&db_path),
+            before,
+            "a robot read changed the mailbox schema or migration ledger"
+        );
     }
 
     #[test]

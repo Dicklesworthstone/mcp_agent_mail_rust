@@ -2464,6 +2464,21 @@ pub fn schema_migrations() -> Vec<Migration> {
         "ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT".to_string(),
         String::new(),
     ));
+    // br-2hpuk: rows stored before v30 keep their 12-field records after the
+    // ADD COLUMN. On a live mailbox FrankenSQLite decoded such short records
+    // shifted by one column (project_id read the rowid, subject read topic,
+    // ...), while C SQLite read them correctly. Rewriting every legacy row through C
+    // SQLite stores full 13-field records with unchanged values. This runs
+    // only in the canonical pass (see is_runtime_canonical_followup_migration):
+    // a FrankenSQLite UPDATE would decode the short record first and persist
+    // the shifted values.
+    migrations.push(Migration::new(
+        "v31_materialize_archive_metadata_json_on_messages".to_string(),
+        "rewrite pre-v30 messages rows as full records".to_string(),
+        "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NULL"
+            .to_string(),
+        String::new(),
+    ));
 
     // These indexes are also present in the latest static DDL, which gives
     // them generated v1 migration IDs. On an existing pre-v27/v28 database,
@@ -2573,6 +2588,7 @@ fn is_runtime_canonical_followup_migration(id: &str) -> bool {
                 | "v15_add_recipients_json_to_messages"
                 | "v15b_backfill_recipients_json"
                 | "v15c_trg_messages_default_recipients_json"
+                | "v31_materialize_archive_metadata_json_on_messages"
         )
 }
 
@@ -5372,6 +5388,7 @@ mod tests {
     #[test]
     fn archive_metadata_upgrade_preserves_the_complete_pre_v30_migration_ledger() {
         const V30: &str = "v30_add_archive_metadata_json_to_messages";
+        const V31: &str = "v31_materialize_archive_metadata_json_on_messages";
         // FNV-1a witness independently calculated from the pre-change v1 SQL.
         // Deriving both the old ledger and assertion from mutable latest DDL
         // would miss the upgrade-blocking checksum drift this test prevents.
@@ -5384,7 +5401,7 @@ mod tests {
                 .expect("initialize old migration ledger");
             let old = schema_migrations()
                 .into_iter()
-                .filter(|migration| migration.id != V30)
+                .filter(|migration| migration.id != V30 && migration.id != V31)
                 .collect::<Vec<_>>();
             let original = old
                 .iter()
@@ -5415,7 +5432,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect("upgrade old checked ledger without checksum drift");
-            assert_eq!(applied, vec![V30.to_string()]);
+            assert_eq!(applied, vec![V30.to_string(), V31.to_string()]);
             let after = conn.query_sync(&format!("SELECT checksum, applied_at FROM {MIGRATIONS_TABLE_NAME} WHERE id = 'v1_create_table_messages'"), &[]).unwrap();
             assert_eq!(
                 after[0].get_named::<String>("checksum").unwrap(),
@@ -5450,6 +5467,259 @@ mod tests {
                 "completed migrations must not run again: {repeated:?}"
             );
         });
+    }
+
+    /// Stored field count of every record in the `messages` table, read from
+    /// the database file itself. SQL cannot observe this: SQLite fills absent
+    /// trailing fields from the schema. Handles the small fixture below only:
+    /// a single leaf root page and no overflow.
+    fn messages_record_field_counts(path: &str) -> Vec<(i64, usize)> {
+        fn varint(bytes: &[u8], at: &mut usize) -> u64 {
+            let mut value = 0_u64;
+            for i in 0..9 {
+                let byte = bytes[*at];
+                *at += 1;
+                if i == 8 {
+                    return (value << 8) | u64::from(byte);
+                }
+                value = (value << 7) | u64::from(byte & 0x7f);
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+            }
+            value
+        }
+        let root = {
+            let conn = crate::CanonicalDbConn::open_file(path).expect("open for rootpage");
+            let rows = conn
+                .query_sync(
+                    "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                    &[],
+                )
+                .expect("read messages rootpage");
+            let root = rows[0].get_named::<i64>("rootpage").unwrap();
+            crate::queries::close_canonical_db_conn(conn, "v31 record probe");
+            usize::try_from(root).unwrap()
+        };
+        assert!(
+            !std::path::Path::new(&format!("{path}-wal")).exists(),
+            "the probe reads a checkpointed file"
+        );
+        let file = std::fs::read(path).expect("read database file");
+        let page_size = match u16::from_be_bytes([file[16], file[17]]) {
+            1 => 65_536,
+            size => usize::from(size),
+        };
+        let page = &file[(root - 1) * page_size..root * page_size];
+        let header = if root == 1 { 100 } else { 0 };
+        assert_eq!(page[header], 0x0d, "fixture root must be a table leaf page");
+        let cells = usize::from(u16::from_be_bytes([page[header + 3], page[header + 4]]));
+        let mut counts = Vec::with_capacity(cells);
+        for cell in 0..cells {
+            let pointer = header + 8 + cell * 2;
+            let mut at = usize::from(u16::from_be_bytes([page[pointer], page[pointer + 1]]));
+            let payload = usize::try_from(varint(page, &mut at)).unwrap();
+            let rowid = i64::try_from(varint(page, &mut at)).unwrap();
+            assert!(
+                at + payload <= page.len(),
+                "fixture records must not overflow"
+            );
+            let header_start = at;
+            let header_size = usize::try_from(varint(page, &mut at)).unwrap();
+            let mut fields = 0;
+            while at < header_start + header_size {
+                varint(page, &mut at);
+                fields += 1;
+            }
+            counts.push((rowid, fields));
+        }
+        counts.sort_unstable();
+        counts
+    }
+
+    /// br-2hpuk: rows written before v30 keep 12-field records after the ADD
+    /// COLUMN, and on a live mailbox FrankenSQLite decoded those short records
+    /// shifted by one column. v31 must rewrite them through C SQLite as full
+    /// 13-field records (checked physically, since this small fixture does not
+    /// trigger the misread) whose values the runtime engine reads unchanged.
+    #[test]
+    fn v31_materializes_pre_v30_messages_for_the_runtime_engine() {
+        const V30: &str = "v30_add_archive_metadata_json_to_messages";
+        const V31: &str = "v31_materialize_archive_metadata_json_on_messages";
+        assert!(
+            !schema_migrations_base().iter().any(|m| m.id == V31),
+            "a FrankenSQLite UPDATE would persist the shifted decode"
+        );
+        assert!(
+            schema_migrations_runtime_canonical_followup()
+                .iter()
+                .any(|m| m.id == V31)
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("pre_v30_messages.sqlite3")
+            .display()
+            .to_string();
+        {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("open canonical database");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    init_migrations_table(&cx, conn)
+                        .await
+                        .into_result()
+                        .expect("initialize migration ledger");
+                    let pre_v30 = schema_migrations()
+                        .into_iter()
+                        .filter(|m| m.id != V30 && m.id != V31)
+                        .collect::<Vec<_>>();
+                    run_specific_migrations(&cx, conn, pre_v30)
+                        .await
+                        .into_result()
+                        .expect("apply the pre-v30 ledger");
+                }
+            });
+            let columns = canonical
+                .query_sync("PRAGMA table_info(messages)", &[])
+                .expect("read pre-v30 columns");
+            assert_eq!(columns.len(), 12, "pre-v30 messages rows have 12 fields");
+            canonical
+                .execute_raw(
+                    "INSERT INTO projects(id,slug,human_key,created_at) VALUES(7,'p','/p',1); \
+                     INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                     VALUES(11,7,'BlueLake','test','test',1,1); \
+                     INSERT INTO messages(id,project_id,sender_id,thread_id,topic,subject,body_md,\
+                     importance,ack_required,created_ts,recipients_json,attachments) VALUES \
+                     (42900,7,11,'t-1',NULL,'first subject','first body','high',1,100,'{\"to\":[\"A\"]}','[]'), \
+                     (42901,7,11,NULL,'release','second subject','second body','normal',0,200,'{}','[]')",
+                )
+                .expect("seed pre-v30 rows");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    let through_v30 = schema_migrations()
+                        .into_iter()
+                        .filter(|m| m.id != V31)
+                        .collect::<Vec<_>>();
+                    let applied = run_specific_migrations(&cx, conn, through_v30)
+                        .await
+                        .into_result()
+                        .expect("upgrade through v30");
+                    assert_eq!(applied, vec![V30.to_string()]);
+                }
+            });
+            crate::queries::close_canonical_db_conn(canonical, "v31 regression canonical");
+        }
+        assert_eq!(
+            messages_record_field_counts(&path),
+            vec![(42900, 12), (42901, 12)],
+            "ADD COLUMN leaves the pre-v30 records short"
+        );
+        {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    let applied = run_specific_migrations(&cx, conn, schema_migrations())
+                        .await
+                        .into_result()
+                        .expect("upgrade through v31");
+                    assert_eq!(applied, vec![V31.to_string()]);
+                }
+            });
+            crate::queries::close_canonical_db_conn(canonical, "v31 regression canonical");
+        }
+        assert_eq!(
+            messages_record_field_counts(&path),
+            vec![(42900, 13), (42901, 13)],
+            "v31 must store every legacy row as a full record"
+        );
+
+        let runtime = DbConn::open_file(&path).expect("open runtime engine");
+        let rows = runtime
+            .query_sync(
+                "SELECT id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+                 ack_required, created_ts, recipients_json, attachments, archive_metadata_json \
+                 FROM messages ORDER BY id",
+                &[],
+            )
+            .expect("runtime engine reads migrated rows");
+        // Split in two: tuples implement Debug/PartialEq up to 12 fields.
+        let identity = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<i64>("id").unwrap(),
+                    row.get_named::<i64>("project_id").unwrap(),
+                    row.get_named::<i64>("sender_id").unwrap(),
+                    row.get_named::<Option<String>>("thread_id").unwrap(),
+                    row.get_named::<Option<String>>("topic").unwrap(),
+                    row.get_named::<String>("subject").unwrap(),
+                    row.get_named::<String>("body_md").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rest = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("importance").unwrap(),
+                    row.get_named::<i64>("ack_required").unwrap(),
+                    row.get_named::<i64>("created_ts").unwrap(),
+                    row.get_named::<String>("recipients_json").unwrap(),
+                    row.get_named::<String>("attachments").unwrap(),
+                    row.get_named::<Option<String>>("archive_metadata_json")
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identity,
+            vec![
+                (
+                    42900,
+                    7,
+                    11,
+                    Some("t-1".to_string()),
+                    None,
+                    "first subject".to_string(),
+                    "first body".to_string(),
+                ),
+                (
+                    42901,
+                    7,
+                    11,
+                    None,
+                    Some("release".to_string()),
+                    "second subject".to_string(),
+                    "second body".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            rest,
+            vec![
+                (
+                    "high".to_string(),
+                    1,
+                    100,
+                    "{\"to\":[\"A\"]}".to_string(),
+                    "[]".to_string(),
+                    None,
+                ),
+                (
+                    "normal".to_string(),
+                    0,
+                    200,
+                    "{}".to_string(),
+                    "[]".to_string(),
+                    None,
+                ),
+            ]
+        );
     }
 
     #[test]
