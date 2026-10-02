@@ -4185,7 +4185,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
 // File Reservation Resources
 // ============================================================================
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReservationPatternActivity {
     pub(crate) matches: bool,
     pub(crate) fs_activity_micros: Option<i64>,
@@ -4683,36 +4683,7 @@ pub(crate) fn reservation_compute_pattern_activity(
             return ReservationPatternActivity::default();
         }
     } else {
-        let candidate = workspace.join(&normalized);
-        if candidate.exists() {
-            matched_paths = true;
-
-            if candidate.is_dir() {
-                // For directory reservations, scan contents for most recent modification
-                // to avoid missing activity because the directory mtime didn't update.
-                let pattern_with_glob = if normalized.ends_with('/') {
-                    format!("{normalized}**")
-                } else {
-                    format!("{normalized}/**")
-                };
-                if let Some(matcher) = reservation_glob_matcher(&pattern_with_glob) {
-                    let (_, latest) =
-                        reservation_glob_walk_latest_micros(workspace, &candidate, &matcher);
-                    fs_latest = latest;
-                }
-                // Fallback to directory mtime if scan found nothing or failed
-                if fs_latest.is_none()
-                    && let Ok(meta) = std::fs::metadata(&candidate)
-                    && let Ok(modified) = meta.modified()
-                {
-                    fs_latest = reservation_system_time_to_micros(modified);
-                }
-            } else if let Ok(meta) = std::fs::metadata(&candidate)
-                && let Ok(modified) = meta.modified()
-            {
-                fs_latest = reservation_system_time_to_micros(modified);
-            }
-        }
+        (matched_paths, fs_latest) = reservation_literal_fs_activity(workspace, &normalized);
     }
 
     let git_activity = if matched_paths && want_git {
@@ -4738,6 +4709,296 @@ pub(crate) fn reservation_compute_pattern_activity(
         fs_activity_micros: fs_latest,
         git_activity_micros: git_activity,
     }
+}
+
+/// Filesystem activity for a literal (non-glob) reservation pattern: the
+/// file's mtime, or the newest mtime under a directory (falling back to the
+/// directory's own mtime).
+fn reservation_literal_fs_activity(workspace: &Path, normalized: &str) -> (bool, Option<i64>) {
+    let candidate = workspace.join(normalized);
+    if !candidate.exists() {
+        return (false, None);
+    }
+    let mut fs_latest = None;
+    if candidate.is_dir() {
+        // For directory reservations, scan contents for most recent modification
+        // to avoid missing activity because the directory mtime didn't update.
+        let pattern_with_glob = if normalized.ends_with('/') {
+            format!("{normalized}**")
+        } else {
+            format!("{normalized}/**")
+        };
+        if let Some(matcher) = reservation_glob_matcher(&pattern_with_glob) {
+            let (_, latest) = reservation_glob_walk_latest_micros(workspace, &candidate, &matcher);
+            fs_latest = latest;
+        }
+        // Fallback to directory mtime if scan found nothing or failed
+        if fs_latest.is_none()
+            && let Ok(meta) = std::fs::metadata(&candidate)
+            && let Ok(modified) = meta.modified()
+        {
+            fs_latest = reservation_system_time_to_micros(modified);
+        }
+    } else if let Ok(meta) = std::fs::metadata(&candidate)
+        && let Ok(modified) = meta.modified()
+    {
+        fs_latest = reservation_system_time_to_micros(modified);
+    }
+    (true, fs_latest)
+}
+
+/// Upper bound on untracked/modified status entries collected once per
+/// listing request (tracked entries come from the index and are not capped).
+const RESERVATION_STATUS_LISTING_MAX: usize = 100_000;
+
+/// Repository paths (relative to the repo root) that a glob reservation can
+/// match: every index entry plus untracked/modified, non-ignored files.
+///
+/// GH #337: built once per `file_reservations` read and shared by every glob
+/// pattern, instead of one index scan and one full `statuses()` walk of the
+/// working tree per pattern.
+fn reservation_repo_candidate_paths(repo: &git2::Repository) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Ok(index) = repo.index() {
+        for entry in index.iter() {
+            if let Ok(rel) = std::str::from_utf8(&entry.path) {
+                paths.push(rel.to_string());
+            }
+        }
+    }
+    let mut status_opts = git2::StatusOptions::new();
+    status_opts
+        .include_untracked(true)
+        .include_ignored(false)
+        .recurse_untracked_dirs(true)
+        .include_unmodified(false);
+    if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
+        for entry in statuses.iter().take(RESERVATION_STATUS_LISTING_MAX) {
+            if let Ok(rel) = entry.path() {
+                paths.push(rel.to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// Latest commit time (micros) touching each pathspec, from ONE history walk
+/// shared by all of them (GH #337).
+///
+/// Per pathspec this matches `reservation_git_latest_activity_micros`:
+/// commits are visited newest-first and a pathspec takes the first commit
+/// whose diff against its first parent (or, for a root commit, whose tree)
+/// has a matching path. The walk stops once every pathspec is resolved.
+fn reservation_git_latest_activity_micros_batch(
+    repo: &git2::Repository,
+    pathspecs: &[String],
+) -> Vec<Option<i64>> {
+    let mut results = vec![None; pathspecs.len()];
+    let mut pending: Vec<(usize, git2::Pathspec)> = pathspecs
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, spec)| {
+            let spec = spec
+                .strip_prefix(":(glob)")
+                .or_else(|| spec.strip_prefix(":(icase)"))
+                .unwrap_or(spec);
+            git2::Pathspec::new(std::iter::once(spec))
+                .ok()
+                .map(|pathspec| (slot, pathspec))
+        })
+        .collect();
+    if pending.is_empty() {
+        return results;
+    }
+    let Ok(mut revwalk) = repo.revwalk() else {
+        return results;
+    };
+    if revwalk.push_head().is_err() || revwalk.set_sorting(git2::Sort::TIME).is_err() {
+        return results;
+    }
+
+    let mut changed: Vec<PathBuf> = Vec::new();
+    for oid_result in revwalk {
+        let Ok(oid) = oid_result else { continue };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        let Ok(commit_tree) = commit.tree() else {
+            continue;
+        };
+        let parent_tree = if commit.parent_count() == 0 {
+            None
+        } else {
+            let Ok(parent) = commit.parent(0) else {
+                continue;
+            };
+            let Ok(tree) = parent.tree() else { continue };
+            Some(tree)
+        };
+        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), None)
+        else {
+            continue;
+        };
+        changed.clear();
+        for delta in diff.deltas() {
+            for path in [delta.new_file().path(), delta.old_file().path()]
+                .into_iter()
+                .flatten()
+            {
+                changed.push(path.to_path_buf());
+            }
+        }
+        if changed.is_empty() {
+            continue;
+        }
+        let micros = commit.time().seconds().saturating_mul(1_000_000);
+        pending.retain(|(slot, pathspec)| {
+            let touched = changed
+                .iter()
+                .any(|path| pathspec.matches_path(path, git2::PathspecFlags::DEFAULT));
+            if touched {
+                results[*slot] = Some(micros);
+            }
+            !touched
+        });
+        if pending.is_empty() {
+            break;
+        }
+    }
+    results
+}
+
+/// Activity for every distinct pattern of one `file_reservations` read.
+///
+/// Gives the same per-pattern result as `reservation_compute_pattern_activity`,
+/// but the repository is opened once, its candidate path list is built once,
+/// and one history walk serves every pattern. GH #337: the per-pattern index
+/// scans, working-tree status walks and history walks made each read cost
+/// seconds of CPU per live reservation on a large repository.
+pub(crate) fn reservation_compute_patterns_activity(
+    workspace: Option<&Path>,
+    repo_root: Option<&Path>,
+    workspace_rel: Option<&Path>,
+    patterns: &[String],
+) -> HashMap<String, ReservationPatternActivity> {
+    let mut out: HashMap<String, ReservationPatternActivity> =
+        HashMap::with_capacity(patterns.len());
+    let Some(workspace) = workspace else {
+        for pattern in patterns {
+            out.insert(pattern.clone(), ReservationPatternActivity::default());
+        }
+        return out;
+    };
+    let ls_files_shell = std::env::var("AM_GIT_LS_FILES_SHELL").ok().as_deref() == Some("1");
+    let activity_shell = std::env::var("AM_GIT_RESERVATION_ACTIVITY_SHELL")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if ls_files_shell || activity_shell {
+        // The CLI escape hatches keep their per-pattern behaviour.
+        for pattern in patterns {
+            let activity = reservation_compute_pattern_activity(
+                Some(workspace),
+                repo_root,
+                workspace_rel,
+                pattern,
+            );
+            out.insert(pattern.clone(), activity);
+        }
+        return out;
+    }
+
+    let repo = repo_root.and_then(|root| git2::Repository::open(root).ok());
+    let rel_base = workspace_rel.unwrap_or_else(|| Path::new(""));
+    let want_git = repo_root.is_some() && workspace_rel.is_some();
+    let mut candidate_paths: Option<Vec<String>> = None;
+    // (pattern, git pathspec) for every matched pattern that needs git activity.
+    let mut git_specs: Vec<(String, String)> = Vec::new();
+
+    for pattern in patterns {
+        if out.contains_key(pattern) {
+            continue;
+        }
+        let normalized = reservation_normalize_pattern(pattern);
+        if normalized.is_empty() {
+            out.insert(pattern.clone(), ReservationPatternActivity::default());
+            continue;
+        }
+        let has_glob = reservation_contains_glob(&normalized);
+        let (matches, fs_latest) = if has_glob {
+            let mut matched_paths = false;
+            let mut fs_latest: Option<i64> = None;
+            if let (Some(repo), Some(root)) = (repo.as_ref(), repo_root) {
+                let spec = reservation_git_pathspec(rel_base, &normalized);
+                if let Ok(pathspec) = git2::Pathspec::new(std::iter::once(spec.as_str())) {
+                    let candidates = candidate_paths
+                        .get_or_insert_with(|| reservation_repo_candidate_paths(repo));
+                    for rel in candidates.iter() {
+                        if !pathspec
+                            .matches_path(Path::new(rel), git2::PathspecFlags::NO_MATCH_ERROR)
+                        {
+                            continue;
+                        }
+                        matched_paths = true;
+                        if let Some(micros) = std::fs::metadata(root.join(rel))
+                            .ok()
+                            .and_then(|meta| meta.modified().ok())
+                            .and_then(reservation_system_time_to_micros)
+                        {
+                            fs_latest = Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+                        }
+                    }
+                }
+            }
+            if matched_paths {
+                (true, fs_latest)
+            } else if let Some(matcher) = reservation_glob_matcher(&normalized) {
+                reservation_glob_walk_latest_micros(workspace, workspace, &matcher)
+            } else {
+                (false, None)
+            }
+        } else {
+            reservation_literal_fs_activity(workspace, &normalized)
+        };
+        if matches && want_git {
+            let spec = reservation_git_pathspec(rel_base, &normalized);
+            let spec = if has_glob {
+                format!(":(glob){spec}")
+            } else {
+                spec
+            };
+            git_specs.push((pattern.clone(), spec));
+        }
+        out.insert(
+            pattern.clone(),
+            ReservationPatternActivity {
+                matches,
+                fs_activity_micros: fs_latest,
+                git_activity_micros: None,
+            },
+        );
+    }
+
+    if let Some(repo) = repo.as_ref()
+        && !git_specs.is_empty()
+    {
+        let specs: Vec<String> = git_specs.iter().map(|(_, spec)| spec.clone()).collect();
+        let start = std::time::Instant::now();
+        let latest = reservation_git_latest_activity_micros_batch(repo, &specs);
+        tracing::debug!(
+            target: "mcp_agent_mail::tools::reservations::activity",
+            patterns = specs.len(),
+            duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            via = "libgit2_batch",
+            "reservation_activity_batch_result"
+        );
+        for ((pattern, _), micros) in git_specs.iter().zip(latest) {
+            if let Some(activity) = out.get_mut(pattern) {
+                activity.git_activity_micros = micros;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -4829,6 +5090,140 @@ mod reservation_activity_tests {
         );
         let after_fs = after.fs_activity_micros.expect("updated fs activity");
         assert!(after_fs >= before_fs);
+    }
+
+    fn commit_at(repo_root: &Path, message: &str, epoch_seconds: i64) {
+        let date = format!("{epoch_seconds} +0000");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["commit", "-q", "-m", message])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .expect("run git commit");
+        assert!(
+            out.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// GH #337: the batched computation (one repository context, one history
+    /// walk) must give exactly the per-pattern result for every pattern.
+    #[test]
+    fn reservation_compute_patterns_activity_matches_per_pattern_results() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, body).expect("write");
+        };
+
+        run_git(root, &["init", "-q", "-b", "main"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+        write("src/a.rs", "a1\n");
+        write("src/b.rs", "b1\n");
+        write("docs/guide.md", "g1\n");
+        write("README.md", "r1\n");
+        write(".gitignore", "ignored/\n");
+        run_git(root, &["add", "."]);
+        commit_at(root, "root", 1_700_000_000);
+        write("src/a.rs", "a2\n");
+        run_git(root, &["add", "."]);
+        commit_at(root, "touch a", 1_700_000_100);
+        write("docs/guide.md", "g2\n");
+        write("docs/deep/notes.md", "n1\n");
+        run_git(root, &["add", "."]);
+        commit_at(root, "touch docs", 1_700_000_200);
+        write("README.md", "r2\n");
+        run_git(root, &["add", "."]);
+        commit_at(root, "touch readme", 1_700_000_300);
+        // Untracked and ignored files are not history; the ignored one must
+        // not count as a repository match.
+        write("untracked/new.txt", "u\n");
+        write("ignored/skip.txt", "i\n");
+
+        let (repo_root, workspace_rel) =
+            reservation_open_repo_root(root).expect("repo root discoverable");
+        let patterns: Vec<String> = [
+            "src/**",
+            "src/a.rs",
+            "src/b.rs",
+            "src/*.rs",
+            "docs",
+            "docs/",
+            "docs/**/*.md",
+            "*.md",
+            "**/*.md",
+            "README.md",
+            "untracked/*.txt",
+            "ignored/*.txt",
+            "nope/**",
+            "missing.rs",
+            "./src/b.rs",
+            "",
+            "src/**",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+        let batched = reservation_compute_patterns_activity(
+            Some(root),
+            Some(repo_root.as_path()),
+            Some(workspace_rel.as_path()),
+            &patterns,
+        );
+        for pattern in &patterns {
+            let single = reservation_compute_pattern_activity(
+                Some(root),
+                Some(repo_root.as_path()),
+                Some(workspace_rel.as_path()),
+                pattern,
+            );
+            assert_eq!(
+                batched.get(pattern),
+                Some(&single),
+                "pattern {pattern:?} diverged from the per-pattern computation"
+            );
+        }
+
+        // Spot-check the history values the walk must find.
+        let git = |pattern: &str| batched[pattern].git_activity_micros;
+        assert_eq!(git("src/b.rs"), Some(1_700_000_000_000_000));
+        assert_eq!(git("src/a.rs"), Some(1_700_000_100_000_000));
+        assert_eq!(git("src/**"), Some(1_700_000_100_000_000));
+        assert_eq!(git("docs"), Some(1_700_000_200_000_000));
+        assert_eq!(git("*.md"), Some(1_700_000_300_000_000));
+        assert!(batched["untracked/*.txt"].matches);
+        assert_eq!(git("untracked/*.txt"), None);
+        assert!(!batched["nope/**"].matches);
+        assert!(!batched["missing.rs"].matches);
+    }
+
+    #[test]
+    fn reservation_compute_patterns_activity_without_workspace_or_repo() {
+        let patterns = vec!["src/**".to_string(), "a.rs".to_string()];
+        let none = reservation_compute_patterns_activity(None, None, None, &patterns);
+        assert_eq!(none.len(), 2);
+        assert!(
+            none.values()
+                .all(|a| *a == ReservationPatternActivity::default())
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rs"), "x\n").expect("write");
+        let plain = reservation_compute_patterns_activity(Some(tmp.path()), None, None, &patterns);
+        for pattern in &patterns {
+            let single =
+                reservation_compute_pattern_activity(Some(tmp.path()), None, None, pattern);
+            assert_eq!(plain.get(pattern), Some(&single), "{pattern}");
+        }
+        assert!(plain["a.rs"].matches);
+        assert_eq!(plain["a.rs"].git_activity_micros, None);
     }
 }
 
@@ -4939,8 +5334,31 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         .collect();
     let mut mail_activity_cache: HashMap<i64, Option<i64>> =
         HashMap::with_capacity(agent_by_id.len());
-    let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> =
-        HashMap::with_capacity(rows.len());
+    // One repository context and one history walk for every distinct
+    // pattern on the page (GH #337).
+    let mut distinct_patterns: Vec<String> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if !distinct_patterns.contains(&row.path_pattern) {
+            distinct_patterns.push(row.path_pattern.clone());
+        }
+    }
+    let pattern_activity: HashMap<String, ReservationPatternActivity> =
+        if distinct_patterns.is_empty() {
+            HashMap::new()
+        } else {
+            let workspace_clone = workspace.clone();
+            let repo_root_clone = repo_root.map(std::path::PathBuf::from);
+            let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
+            asupersync::runtime::spawn_blocking(move || {
+                reservation_compute_patterns_activity(
+                    workspace_clone.as_deref(),
+                    repo_root_clone.as_deref(),
+                    workspace_rel_clone.as_deref(),
+                    &distinct_patterns,
+                )
+            })
+            .await
+        };
 
     let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -4967,26 +5385,10 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             out
         };
 
-        let pat_activity = if let Some(val) = pattern_activity_cache.get(&row.path_pattern) {
-            val.clone()
-        } else {
-            let path_pattern = row.path_pattern.clone();
-            let workspace_clone = workspace.as_deref().map(std::path::PathBuf::from);
-            let repo_root_clone = repo_root.map(std::path::PathBuf::from);
-            let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
-
-            let computed = asupersync::runtime::spawn_blocking(move || {
-                reservation_compute_pattern_activity(
-                    workspace_clone.as_deref(),
-                    repo_root_clone.as_deref(),
-                    workspace_rel_clone.as_deref(),
-                    &path_pattern,
-                )
-            })
-            .await;
-            pattern_activity_cache.insert(row.path_pattern.clone(), computed.clone());
-            computed
-        };
+        let pat_activity = pattern_activity
+            .get(&row.path_pattern)
+            .cloned()
+            .unwrap_or_default();
 
         let agent_inactive =
             agent_last_active.is_some_and(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
