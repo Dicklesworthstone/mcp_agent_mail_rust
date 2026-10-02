@@ -16695,7 +16695,12 @@ fn read_verb_mailbox_is_initialized(database_url: &str) -> bool {
         return false;
     }
     let path = resolve_sqlite_runtime_path(&path);
-    std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0)
+    // Committed data can live only in the WAL (or a hot rollback journal)
+    // while the main file is still empty or missing; recovery of that family
+    // is exactly what a read verb must not start.
+    ["", "-wal", "-journal"].iter().any(|suffix| {
+        std::fs::metadata(format!("{path}{suffix}")).is_ok_and(|metadata| metadata.len() > 0)
+    })
 }
 
 fn read_verb_refused_migrating_open(verb: &str, read_error: &CliError) -> CliError {
@@ -77250,6 +77255,45 @@ startup_timeout_sec = 42
         release_tx.send(()).expect("release lock thread");
         open_thread.join().expect("join open thread");
         lock_thread.join().expect("join lock thread");
+    }
+
+    /// br-2hpuk: a family whose committed data lives only in its WAL (main
+    /// file empty or missing) is an existing mailbox too. The initializing
+    /// open would recover it, so a refused read must not fall back to it.
+    #[test]
+    fn read_verb_mailbox_is_initialized_counts_wal_only_families() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("wal-only.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        assert!(!read_verb_mailbox_is_initialized(&db_url), "missing family");
+        std::fs::write(&db_path, b"").expect("empty main");
+        assert!(
+            !read_verb_mailbox_is_initialized(&db_url),
+            "empty main only"
+        );
+        let wal = dir.path().join("wal-only.sqlite3-wal");
+        std::fs::write(&wal, b"").expect("empty wal");
+        assert!(
+            !read_verb_mailbox_is_initialized(&db_url),
+            "empty main and wal"
+        );
+        std::fs::write(&wal, [0x37_u8, 0x7f, 0x06, 0x82]).expect("non-empty wal");
+        assert!(
+            read_verb_mailbox_is_initialized(&db_url),
+            "empty main, data in wal"
+        );
+        std::fs::remove_file(&db_path).expect("remove main");
+        assert!(
+            read_verb_mailbox_is_initialized(&db_url),
+            "missing main, data in wal"
+        );
+        std::fs::remove_file(&wal).expect("remove wal");
+        std::fs::write(dir.path().join("wal-only.sqlite3-journal"), b"journal")
+            .expect("hot journal");
+        assert!(
+            read_verb_mailbox_is_initialized(&db_url),
+            "hot rollback journal"
+        );
     }
 
     /// br-2hpuk: a robot read once applied a schema migration to a live
