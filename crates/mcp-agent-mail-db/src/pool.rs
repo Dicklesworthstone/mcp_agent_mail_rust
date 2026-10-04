@@ -4614,6 +4614,21 @@ impl DbPool {
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            match quarantine_stale_proactive_backup_companions(&bak_path) {
+                Ok(Some(quarantine)) => tracing::warn!(
+                    backup = %bak_path.display(),
+                    quarantine = %quarantine.display(),
+                    "moved stale -wal/-shm companions of the proactive backup aside so the backup can refresh"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    backup = %bak_path.display(),
+                    %error,
+                    "could not quarantine stale proactive-backup companions"
+                ),
+            }
+        }
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             return Err(DbError::Sqlite(format!(
                 "proactive backup destination {} has companion SQLite or FrankenSQLite state; refusing to treat one file from a multi-file generation as a published backup",
                 bak_path.display()
@@ -14000,6 +14015,96 @@ where
             ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(error.to_string())
         }
     }
+}
+
+/// Move provably stale `-wal`/`-shm` companions of the proactive backup into
+/// `<backup dir>/doctor/reclaimable/stale-backup-companions-<ts>[-n]/`
+/// (br-31eew, GH#337).
+///
+/// A leftover `.bak-shm` and empty `.bak-wal` made every refresh refuse the
+/// destination for weeks. They are stale when every occupied companion is a
+/// regular `-wal` without committed frames or a regular `-shm`, and no process
+/// holds the backup or a companion open. Any other companion (journal,
+/// wal-cert, FrankenSQLite namespace files) keeps the refusal. Nothing is
+/// deleted. Returns the quarantine directory when companions were moved.
+#[cfg(target_os = "linux")]
+fn quarantine_stale_proactive_backup_companions(
+    backup_path: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    let mut stale = Vec::new();
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
+        let companion = sqlite_sidecar_path(backup_path, suffix);
+        if !path_is_occupied(&companion) {
+            continue;
+        }
+        if !matches!(*suffix, "-wal" | "-shm") {
+            return Ok(None);
+        }
+        let metadata = std::fs::symlink_metadata(&companion)?;
+        if !metadata.file_type().is_file()
+            || (*suffix == "-wal" && sqlite_wal_has_committed_frames(metadata.len()))
+        {
+            return Ok(None);
+        }
+        stale.push((companion, metadata));
+    }
+    if stale.is_empty()
+        || std::iter::once(backup_path)
+            .chain(stale.iter().map(|(companion, _)| companion.as_path()))
+            .any(|path| !pids_holding_file_via_proc(path).is_empty())
+    {
+        return Ok(None);
+    }
+    let parent = backup_path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup has no parent")
+    })?;
+    let stem = format!(
+        "stale-backup-companions-{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+    );
+    let reclaimable = parent.join("doctor").join("reclaimable");
+    const MAX_QUARANTINE_ATTEMPTS: u32 = 128;
+    let mut quarantine = None;
+    for attempt in 0..MAX_QUARANTINE_ATTEMPTS {
+        let leaf = if attempt == 0 {
+            stem.clone()
+        } else {
+            format!("{stem}-{attempt}")
+        };
+        match crate::recovery_retention::ReclaimDirectory::claim(&reclaimable.join(leaf)) {
+            Ok(directory) => {
+                quarantine = Some(directory);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let quarantine = quarantine.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "no unique quarantine directory under {}",
+                reclaimable.display()
+            ),
+        )
+    })?;
+    for (companion, metadata) in &stale {
+        quarantine.stage_inventoried_file(companion, metadata)?;
+    }
+    Ok(Some(quarantine.path().to_path_buf()))
+}
+
+/// Without Linux `/proc`, open handles cannot be ruled out, so stale
+/// companions keep the refusal and stay in place.
+#[cfg(not(target_os = "linux"))]
+fn quarantine_stale_proactive_backup_companions(
+    _backup_path: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 fn rotate_existing_proactive_backup(
@@ -30180,6 +30285,94 @@ mod tests {
             b"companion-generation-witness",
             "rejection must preserve the companion witness"
         );
+    }
+
+    /// A pool over `<dir>/<name>` with a healthy primary and an older `.bak`
+    /// that carries `-wal`/`-shm` companions holding `wal_bytes` / 32 KiB.
+    #[cfg(target_os = "linux")]
+    fn proactive_backup_with_companions(
+        dir: &Path,
+        name: &str,
+        wal_bytes: usize,
+    ) -> (DbPool, PathBuf, PathBuf, PathBuf) {
+        let db_path = dir.join(name);
+        let bak_path = dir.join(format!("{name}.bak"));
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        write_marker_db(&db_path, "healthy-primary");
+        write_marker_db(&bak_path, "weeks-old-backup");
+        let bak_wal = sqlite_sidecar_path(&bak_path, "-wal");
+        let bak_shm = sqlite_sidecar_path(&bak_path, "-shm");
+        std::fs::write(&bak_wal, vec![0_u8; wal_bytes]).unwrap();
+        std::fs::write(&bak_shm, vec![7_u8; 32 * 1024]).unwrap();
+        (pool, bak_path, bak_wal, bak_shm)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proactive_backup_quarantines_stale_wal_and_shm_companions_and_refreshes() {
+        // br-31eew / GH#337: an empty .bak-wal and a leftover .bak-shm that
+        // nothing holds open no longer block every refresh for weeks.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, bak_path, bak_wal, bak_shm) =
+            proactive_backup_with_companions(dir.path(), "stale_family.db", 0);
+
+        let refreshed = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect("stale companions must not block the refresh");
+        assert_eq!(refreshed.as_deref(), Some(bak_path.as_path()));
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("healthy-primary")
+        );
+        assert!(!bak_wal.exists() && !bak_shm.exists());
+
+        let quarantines = std::fs::read_dir(dir.path().join("doctor").join("reclaimable"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantines.len(), 1, "{quarantines:?}");
+        let moved = |companion: &Path| quarantines[0].join(companion.file_name().unwrap());
+        assert_eq!(std::fs::read(moved(&bak_wal)).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            std::fs::read(moved(&bak_shm)).unwrap(),
+            vec![7_u8; 32 * 1024]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proactive_backup_keeps_companions_with_frames_or_open_handles() {
+        // A -wal with committed frames is real data.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _bak_path, bak_wal, bak_shm) =
+            proactive_backup_with_companions(dir.path(), "framed_family.db", 4096);
+        let error = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect_err("a -wal with frames must keep the refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("has companion SQLite or FrankenSQLite state"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&bak_wal).unwrap().len(), 4096);
+        assert!(bak_shm.exists());
+        assert!(!dir.path().join("doctor").exists());
+
+        // An open handle means some process may still use the family.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _bak_path, bak_wal, bak_shm) =
+            proactive_backup_with_companions(dir.path(), "held_family.db", 0);
+        let held = std::fs::File::open(&bak_shm).unwrap();
+        pool.create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect_err("a held companion must keep the refusal");
+        drop(held);
+        assert!(bak_wal.exists() && bak_shm.exists());
+        assert!(!dir.path().join("doctor").exists());
     }
 
     #[test]
