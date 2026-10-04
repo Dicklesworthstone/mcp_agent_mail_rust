@@ -7700,6 +7700,31 @@ fn is_canonical_second_opinion_inconclusive(message: &str) -> bool {
     message.contains(CANONICAL_SECOND_OPINION_INCONCLUSIVE)
 }
 
+/// What became of a canonical second opinion that [`reconcile_with_canonical`]
+/// defers on, phrased for operators (GH#278).
+///
+/// The text must stay neutral for the corruption and recovery classifiers so
+/// the deferral error cannot re-escalate the reconstruct it defers.
+#[must_use]
+fn canonical_second_opinion_deferral_detail(canonical_error: &str) -> &'static str {
+    if is_canonical_second_opinion_inconclusive(canonical_error) {
+        if canonical_error.contains("staged copy") {
+            "canonical SQLite ran on a staged copy of the live database and also rejected that \
+             copy, but a copy taken while a writer is active can be torn, so its rejection is \
+             not authoritative"
+        } else {
+            "no authoritative canonical verdict was available for the live database"
+        }
+    } else if crate::error::is_lock_error(canonical_error) {
+        "the canonical second-opinion probe could not run because of lock/busy contention"
+    } else if is_sqlite_snapshot_conflict_error_message(canonical_error) {
+        "the canonical second-opinion probe could not run because of a stale WAL or snapshot \
+         conflict"
+    } else {
+        "the canonical second-opinion probe could not run because of a transient recovery error"
+    }
+}
+
 /// Whether the SQLite family at `path` carries FrankenSQLite namespace
 /// authority.
 ///
@@ -8313,16 +8338,20 @@ fn reconcile_with_canonical(
                     || is_sqlite_recovery_error_message(&canonical_error_msg)
                     || is_canonical_second_opinion_inconclusive(&canonical_error_msg)
                 {
+                    // GH#278: say what actually happened. A staged-copy
+                    // second opinion DID run; it rejected a copy that a live
+                    // writer may have torn, which is not authoritative.
+                    let second_opinion =
+                        canonical_second_opinion_deferral_detail(&canonical_error_msg);
                     tracing::warn!(
                         phase,
                         path = %path_for_log,
                         check = %kind,
                         primary_error = %message,
                         canonical_error = %canonical_error_msg,
-                        "integrity probe rejected the file but the canonical second-opinion probe \
-                         could not run due to lock/busy contention; deferring (NOT reconstructing) \
-                         so a divergent-engine false positive cannot trigger a spurious recovery \
-                         under concurrent write load (GH#151)"
+                        "integrity probe rejected the file and {second_opinion}; deferring (NOT \
+                         reconstructing) so a divergent-engine false positive cannot trigger a \
+                         spurious recovery under concurrent write load (GH#151)"
                     );
                     // IMPORTANT: do NOT embed the raw primary `message` or the
                     // raw `canonical_error_msg` here — either can contain
@@ -8335,18 +8364,8 @@ fn reconcile_with_canonical(
                     // non-recovery by a regression test). The full primary
                     // verdict and the raw canonical-probe error were already
                     // logged above with structured fields.
-                    let contention_kind = if crate::error::is_lock_error(&canonical_error_msg) {
-                        "lock/busy"
-                    } else if is_sqlite_snapshot_conflict_error_message(&canonical_error_msg) {
-                        "stale-wal/snapshot-conflict"
-                    } else if is_canonical_second_opinion_inconclusive(&canonical_error_msg) {
-                        "staged-copy-inconclusive"
-                    } else {
-                        "transient-recovery"
-                    };
                     return Err(DbError::Sqlite(format!(
-                        "integrity reconcile deferred under {contention_kind} contention: the \
-                         canonical second-opinion probe could not run; the primary verdict is \
+                        "integrity reconcile deferred: {second_opinion}; the primary verdict is \
                          unconfirmed and will be re-probed on the next integrity cycle"
                     )));
                 }
@@ -23926,6 +23945,55 @@ mod tests {
                 msg.contains("deferred"),
                 "deferral error should be self-describing: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn reconcile_canonical_deferral_says_whether_the_second_opinion_ran() {
+        // GH#278: when canonical SQLite ran on a staged copy and rejected it,
+        // the deferral must say so instead of claiming the probe could not run
+        // under lock/busy contention. A probe that really was blocked keeps
+        // the "could not run" wording.
+        let staged_rejection = format!(
+            "{CANONICAL_SECOND_OPINION_INCONCLUSIVE}: canonical SQLite integrity diagnostic could \
+             only inspect a private staged copy of the live family at /tmp/storage.sqlite3 and \
+             that copy did not pass; the copy may be torn under a live writer, so this is not a \
+             canonical rejection"
+        );
+        let defer = |canonical_error: String| {
+            let primary: DbResult<integrity::IntegrityCheckResult> =
+                Err(DbError::IntegrityCorruption {
+                    message: "database disk image is malformed: page 77 is never used".to_string(),
+                    details: Vec::new(),
+                });
+            reconcile_with_canonical(
+                primary,
+                integrity::CheckKind::Full,
+                "full-cycle",
+                "/tmp/storage.sqlite3",
+                || Err(SqlError::Custom(canonical_error)),
+                || false,
+            )
+            .expect_err("an unconfirmed verdict must defer")
+            .to_string()
+        };
+
+        let staged = defer(staged_rejection);
+        assert!(
+            staged.contains("ran on a staged copy") && staged.contains("not authoritative"),
+            "{staged}"
+        );
+        assert!(!staged.contains("could not run"), "{staged}");
+        let locked = defer("database is locked".to_string());
+        assert!(
+            locked.contains("could not run because of lock/busy contention"),
+            "{locked}"
+        );
+        for msg in [&staged, &locked] {
+            assert!(msg.contains("deferred"), "{msg}");
+            assert!(!is_corruption_error_message(msg), "{msg}");
+            assert!(!is_sqlite_recovery_error_message(msg), "{msg}");
+            assert!(!is_canonical_second_opinion_inconclusive(msg), "{msg}");
         }
     }
 

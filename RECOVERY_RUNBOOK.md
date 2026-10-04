@@ -18,6 +18,27 @@
 - `integrity-check` (SQLite + archive)
 - `doctor repair` (wraps the above with backups)
 
+## Keep pre-incident backups before restarting
+
+A cold start of the HTTP/TUI server (no Agent Mail server already answering on
+the port) rotates the backup files next to `storage.sqlite3`. It keeps the
+newest `AM_BACKUP_KEEP_COUNT` (default 3, minimum 1) of each kind: `.bak*` and
+`manual-backup-*`, `corrupt-*`, `reconstruct-*`, `archive-reconcile-*`,
+`salvage-*`, and `pre-migrate*` / `pre-python-import*` / `pre-acfs-import*` /
+`pre-reindex*`. By default the older ones are moved to
+`<storage_root>/doctor/reclaimable/rotation-<timestamp>/`. With
+`AM_BACKUP_ROTATION_DELETE=1` they are deleted.
+
+A restart after an integrity incident writes new backups, which can rotate the
+last pre-incident backup out (GH#278). Before restarting a server that reported
+corruption, copy the backups somewhere outside the storage root:
+
+```bash
+db=$(am doctor locks --json | jq -r .database_path)   # read-only
+mkdir -p ~/am-incident-backups
+cp -p "$db".bak* ~/am-incident-backups/
+```
+
 ---
 
 ## Git 2.51.0 Index Race

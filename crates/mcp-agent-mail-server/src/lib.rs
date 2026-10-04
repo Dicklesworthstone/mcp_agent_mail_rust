@@ -9273,6 +9273,12 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
+    stable_tui_diff_config_with(full_redraw_max_interval_from_env())
+}
+
+fn stable_tui_diff_config_with(
+    full_redraw_max_interval: Option<Duration>,
+) -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
     // Explicitly tune the runtime diff path so sparse TUI updates remain
     // incremental and strategy switches do not thrash at overlay boundaries.
     let strategy = ftui_render::diff_strategy::DiffStrategyConfig {
@@ -9300,34 +9306,40 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         .with_dirty_span_config(dirty_spans)
         .with_tile_diff_config(tiles)
         // The TUI runs for days inside mux panes. If the visible terminal buffer
-        // is cleared or desynchronized outside the process, sparse diffs cannot
-        // reconstruct it, so force a bounded physical repaint.
+        // is cleared or desynchronized outside the process (a tmux/zellij pane
+        // swap, a detach/reattach), sparse diffs cannot reconstruct it, so a
+        // wall-clock bound forces a physical repaint whether the UI is idle or
+        // busy.
         //
-        // Two complementary bounds:
-        //  - frame-count: resync every N *rendered* frames. Cheap, but advances
-        //    only while the UI is actively rendering.
-        //  - wall-clock: resync at least every `full_redraw_max_secs` of elapsed
-        //    time, *regardless* of render cadence. This is what bounds visible
-        //    terminal-state desync (incremental-diff corruption, a tmux/zellij
-        //    pane swap, or a detach/reattach) when the TUI is idle or rendering
-        //    sparsely — exactly the case where the frame counter stalls and the
-        //    garbage would otherwise persist on screen. Tunable via
-        //    `AM_TUI_FULL_REDRAW_MAX_SECS` (default 1.0; <= 0 disables).
-        .with_full_redraw_interval_frames(20)
-        .with_full_redraw_max_interval(full_redraw_max_interval_from_env())
+        // That repaint re-emits every cell. A 1 s bound plus a 20-frame bound
+        // made an idle TUI resend the whole screen about once a second
+        // (~65 KB/s on an 86x382 pane) and made it the largest terminal writer
+        // on a swarm host (GH#338). The wall-clock bound alone limits how long
+        // a desync stays visible, so the frame-count bound is off and the
+        // default interval is `DEFAULT_FULL_REDRAW_MAX_SECS`; operators can
+        // shorten it with `AM_TUI_FULL_REDRAW_MAX_SECS`.
+        .with_full_redraw_interval_frames(0)
+        .with_full_redraw_max_interval(full_redraw_max_interval)
 }
 
+/// Default wall-clock bound, in seconds, between forced full TUI redraws.
+const DEFAULT_FULL_REDRAW_MAX_SECS: f64 = 30.0;
+
 /// Wall-clock bound between forced physical full redraws (see
-/// [`stable_tui_diff_config`]). Reads `AM_TUI_FULL_REDRAW_MAX_SECS`
-/// (floating-point seconds); defaults to 1.0s. A value <= 0 (or unparseable)
-/// disables the time-based resync, leaving only the frame-count bound.
+/// [`stable_tui_diff_config`]), from `AM_TUI_FULL_REDRAW_MAX_SECS`.
 fn full_redraw_max_interval_from_env() -> Option<Duration> {
-    let secs = std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS")
-        .ok()
+    full_redraw_max_interval_from(std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS").ok().as_deref())
+}
+
+/// Parse floating-point seconds. Unset or unparseable falls back to
+/// [`DEFAULT_FULL_REDRAW_MAX_SECS`]; a value <= 0, non-finite, or too large
+/// for a `Duration` disables the wall-clock resync.
+fn full_redraw_max_interval_from(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw
         .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(1.0);
-    if secs.is_finite() && secs > 0.0 {
-        Some(Duration::from_secs_f64(secs))
+        .unwrap_or(DEFAULT_FULL_REDRAW_MAX_SECS);
+    if secs > 0.0 {
+        Duration::try_from_secs_f64(secs).ok()
     } else {
         None
     }
@@ -18632,16 +18644,106 @@ mod tests {
         (entry.calls, entry.errors, entry.rejections)
     }
 
+    /// `Write` sink whose bytes the test can read while a `TerminalWriter`
+    /// still owns the writer.
+    #[derive(Clone, Default)]
+    struct SharedTerminalSink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedTerminalSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Present a full 200x50 screen, then `frames` frames that each change one
+    /// eight-cell "clock" run. Returns, per frame, the bytes it emitted and
+    /// whether the writer forced a full redraw.
+    fn present_clock_ticks(
+        config: ftui_runtime::terminal_writer::RuntimeDiffConfig,
+        frames: usize,
+    ) -> Vec<(usize, bool)> {
+        use ftui_render::cell::Cell;
+        use ftui_render::diff_strategy::DiffStrategy;
+
+        let sink = SharedTerminalSink::default();
+        let mut writer = ftui_runtime::terminal_writer::TerminalWriter::with_diff_config(
+            sink.clone(),
+            ftui::ScreenMode::AltScreen,
+            ftui::UiAnchor::Bottom,
+            ftui::TerminalCapabilities::basic(),
+            config,
+        );
+        writer.set_size(200, 50);
+        let mut buffer = ftui_render::buffer::Buffer::new(200, 50);
+        for y in 0..50_u16 {
+            for x in 0..200_u16 {
+                let letter = char::from(b'a' + u8::try_from((x + y) % 26).unwrap_or(0));
+                buffer.set_raw(x, y, Cell::from_char(letter));
+            }
+        }
+        writer.present_ui(&buffer, None, false).unwrap();
+        assert_eq!(writer.last_diff_strategy(), Some(DiffStrategy::FullRedraw));
+
+        let mut emitted = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let digit = char::from(b'0' + u8::try_from(frame % 10).unwrap_or(0));
+            for x in 190..198_u16 {
+                buffer.set_raw(x, 49, Cell::from_char(digit));
+            }
+            let before = sink.0.borrow().len();
+            writer.present_ui(&buffer, None, false).unwrap();
+            let bytes = sink.0.borrow().len() - before;
+            emitted.push((
+                bytes,
+                writer.last_diff_strategy() == Some(DiffStrategy::FullRedraw),
+            ));
+        }
+        emitted
+    }
+
     #[test]
-    fn stable_tui_diff_config_forces_periodic_terminal_resync() {
-        let config = stable_tui_diff_config();
-        assert_eq!(config.full_redraw_interval_frames, 20);
-        // The wall-clock resync is enabled by default (env unset => 1s), so an
-        // idle / sparsely-rendering TUI still resynchronizes the physical
-        // terminal on a time cadence — not only on rendered-frame count.
+    fn stable_tui_diff_config_emits_only_changed_cells_between_resyncs() {
+        // GH#338: with the default 30 s wall-clock bound, a TUI whose only
+        // change is its status-line clock must not repaint the screen.
+        let config = stable_tui_diff_config_with(full_redraw_max_interval_from(None));
+        assert_eq!(config.full_redraw_interval_frames, 0);
+        assert_eq!(
+            config.full_redraw_max_interval,
+            Some(Duration::from_secs(30))
+        );
+        for (frame, (bytes, full_redraw)) in present_clock_ticks(config, 60).into_iter().enumerate()
+        {
+            assert!(!full_redraw, "frame {frame} was a forced full redraw");
+            assert!(bytes < 512, "frame {frame} emitted {bytes} bytes");
+        }
+
+        // Negative control: the previous 20-frame bound repaints all 10,000
+        // cells after 20 incremental frames.
+        let previous = stable_tui_diff_config_with(None).with_full_redraw_interval_frames(20);
+        let ticks = present_clock_ticks(previous, 25);
+        let first_full = ticks
+            .iter()
+            .position(|(_, full_redraw)| *full_redraw)
+            .expect("the 20-frame bound must force a full redraw within 25 frames");
+        assert_eq!(first_full, 20);
         assert!(
-            config.full_redraw_max_interval.is_some(),
-            "wall-clock terminal resync must be enabled by default"
+            ticks[first_full].0 >= 10_000,
+            "full redraw emitted only {} bytes",
+            ticks[first_full].0
+        );
+
+        // The wall-clock bound is still wired: a zero interval forces every
+        // frame to be a full redraw.
+        let always_due = stable_tui_diff_config_with(Some(Duration::ZERO));
+        assert!(
+            present_clock_ticks(always_due, 2)
+                .iter()
+                .all(|(_, full_redraw)| *full_redraw)
         );
     }
 
@@ -18662,15 +18764,24 @@ mod tests {
     }
 
     #[test]
-    fn full_redraw_max_interval_env_parsing() {
-        // Default (env unset path is covered by the config test above); here we
-        // exercise the pure parsing branches via Duration::from_secs_f64 so the
-        // disable/clamp semantics are pinned without mutating process env.
-        assert_eq!(Duration::from_secs_f64(1.0), Duration::from_millis(1000));
-        // Non-positive / non-finite seconds must disable the bound.
-        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
-            let enabled = bad.is_finite() && bad > 0.0;
-            assert!(!enabled, "{bad} must disable the wall-clock resync");
+    fn full_redraw_max_interval_parsing() {
+        let default = Some(Duration::from_secs(30));
+        assert_eq!(full_redraw_max_interval_from(None), default);
+        assert_eq!(full_redraw_max_interval_from(Some("not-a-number")), default);
+        assert_eq!(
+            full_redraw_max_interval_from(Some(" 0.25 ")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            full_redraw_max_interval_from(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        for disabled in ["0", "-1", "NaN", "inf", "1e300"] {
+            assert_eq!(
+                full_redraw_max_interval_from(Some(disabled)),
+                None,
+                "{disabled} must disable the wall-clock resync"
+            );
         }
     }
 

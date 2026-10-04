@@ -12729,6 +12729,15 @@ fn doctor_locks_owner_state(
 
     match ownership.disposition {
         Unowned => {
+            // GH#336: the ownership scan can file the live server as a
+            // read-only reader (it saw only storage.sqlite3) while this
+            // report's own lock inspection attributes a held activity lock to
+            // it. A held activity lock is owner evidence: repair cannot take
+            // the lock, so the mailbox must never be reported safe to mutate.
+            if let Some(state) = doctor_locks_held_lock_owner_state(storage_root_lock, sqlite_lock)
+            {
+                return state;
+            }
             let stale_artifact_count = [storage_root_lock, sqlite_lock]
                 .into_iter()
                 .filter(|lock| lock.exists && lock.holder_pids.is_empty())
@@ -12784,6 +12793,49 @@ fn doctor_locks_owner_state(
             doctor_locks_process_inspection_command(ownership.competing_pids.iter().copied()),
         ),
     }
+}
+
+/// The owner state for activity locks that another process currently holds,
+/// or `None` when neither lock has a holder other than this process.
+fn doctor_locks_held_lock_owner_state(
+    storage_root_lock: &DoctorLockPathReport,
+    sqlite_lock: &DoctorLockPathReport,
+) -> Option<DoctorLockOwnerState> {
+    let current_pid = std::process::id();
+    let mut holder_pids = BTreeSet::new();
+    let mut held = Vec::new();
+    for lock in [storage_root_lock, sqlite_lock] {
+        let pids = lock
+            .holder_pids
+            .iter()
+            .copied()
+            .filter(|pid| *pid != current_pid)
+            .collect::<Vec<_>>();
+        if pids.is_empty() {
+            continue;
+        }
+        held.push(format!(
+            "the {} activity lock is held {} by PID {}",
+            lock.name,
+            lock.mode.as_deref().unwrap_or("in an unknown mode"),
+            pids.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        holder_pids.extend(pids);
+    }
+    if holder_pids.is_empty() {
+        return None;
+    }
+    Some(doctor_lock_owner_state_value(
+        DoctorLockOwnerClass::Live,
+        format!(
+            "{}; a process holding a mailbox activity lock owns the mailbox even when the ownership scan lists it only as a database reader",
+            held.join("; ")
+        ),
+        doctor_locks_process_inspection_command(holder_pids),
+    ))
 }
 
 fn doctor_lock_owner_state_value(
@@ -56379,6 +56431,82 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(doctor_mutation_blocked_by_owner(state.class, false));
         assert_ne!(state.class, DoctorLockOwnerClass::UnsafeToTouch);
         assert_ne!(state.class, DoctorLockOwnerClass::Wedged);
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_held_activity_lock_beats_reader_classification() {
+        // GH#336: the ownership scan saw the interactive `am` server only as a
+        // database reader (disposition Unowned), but the lock report shows it
+        // holding the storage-root activity lock exclusively. locks/drain must
+        // call that a live owner, not a stale mailbox that is safe to mutate.
+        let mut ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned,
+            Vec::new(),
+        );
+        ownership.readers = vec![4242];
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![4242]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", true, Vec::new());
+        let mut server = doctor_locks_test_process(4242, true, false, true);
+        server.command = Some("am".to_string());
+
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &[server],
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Live, "{}", state.reason);
+        assert!(
+            state
+                .reason
+                .contains("storage_root activity lock is held exclusive by PID 4242"),
+            "{}",
+            state.reason
+        );
+        assert_eq!(
+            state.safe_next_command,
+            "ps -p 4242 -o pid,ppid,stat,lstart,cmd"
+        );
+        assert!(doctor_mutation_blocked_by_owner(state.class, false));
+        let protocol =
+            supervised_drain_protocol_steps(!doctor_mutation_blocked_by_owner(state.class, false));
+        assert!(
+            protocol
+                .iter()
+                .any(|step| step.contains("Gracefully stop it via your supervisor")),
+            "{protocol:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_locks_owner_state_reader_without_lock_stays_stale() {
+        // Negative control for GH#336: a reader that holds no activity lock
+        // (and a lock "held" only by this doctor process) must not turn an
+        // unowned mailbox into a live one.
+        let mut ownership = doctor_locks_test_ownership(
+            mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned,
+            Vec::new(),
+        );
+        ownership.readers = vec![17];
+        let storage_lock = doctor_locks_test_lock("storage_root", true, vec![std::process::id()]);
+        let sqlite_lock = doctor_locks_test_lock("sqlite", true, Vec::new());
+        let mut reader = doctor_locks_test_process(17, false, false, true);
+        reader.command = Some("am robot handoff".to_string());
+
+        let state = doctor_locks_owner_state(
+            &ownership,
+            &storage_lock,
+            &sqlite_lock,
+            &[reader],
+            &[],
+            &DoctorReclaimContext::inert(),
+        );
+
+        assert_eq!(state.class, DoctorLockOwnerClass::Stale, "{}", state.reason);
+        assert!(!doctor_mutation_blocked_by_owner(state.class, false));
     }
 
     // ─── br-z41ij: reclaimable-owner classification + supervised takeover ────
