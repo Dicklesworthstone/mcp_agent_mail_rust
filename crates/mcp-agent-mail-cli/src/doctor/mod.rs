@@ -549,10 +549,15 @@ fn proactive_backup_health(
     standalone: bool,
 ) -> (&'static str, String) {
     let hours = |secs: u64| format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60);
+    let unattested = if guard_attested {
+        ""
+    } else {
+        " (the server did not report whether its integrity guard runs)"
+    };
     if !guard_enabled {
         return (
             "ok",
-            "the integrity guard is off, so no proactive backup is expected".to_string(),
+            format!("the integrity guard is off, so no proactive backup is expected{unattested}"),
         );
     }
     let settled = owner_age_secs.is_some_and(|age| age >= PROACTIVE_BACKUP_GRACE_SECS);
@@ -579,12 +584,7 @@ fn proactive_backup_health(
             if guard_attested {
                 ("fail", detail)
             } else {
-                (
-                    "warn",
-                    format!(
-                        "{detail} (the server did not report whether its integrity guard runs)"
-                    ),
-                )
+                ("warn", format!("{detail}{unattested}"))
             }
         }
         Some(age) => ("ok", format!("age {}{companions}", hours(age))),
@@ -3822,6 +3822,14 @@ mod tests {
             proactive_backup_health(true, false, Some(2 * day), Some(3 * day), true);
         assert_eq!(status, "warn", "{detail}");
         assert!(detail.contains("did not report"), "{detail}");
+        let (status, detail) = proactive_backup_health(false, false, None, Some(3 * day), true);
+        assert_eq!(status, "ok", "{detail}");
+        assert!(detail.contains("did not report"), "{detail}");
+        assert!(
+            !proactive_backup_health(false, true, None, Some(3 * day), true)
+                .1
+                .contains("did not report")
+        );
 
         // Negative controls: a fresh backup, a server that just started
         // (the guard has not had a cycle yet), an unknown owner age, and a

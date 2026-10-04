@@ -1219,7 +1219,7 @@ mod tests {
         for error in [
             DbError::ResourceBusy("database is locked".to_string()),
             DbError::Pool("pool exhausted".to_string()),
-            DbError::Sqlite("integrity reconcile deferred: the canonical second-opinion probe could not run because of lock/busy contention; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
+            DbError::Sqlite("integrity reconcile deferred: the canonical second-opinion probe could not run (database busy, locked or unavailable); the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
             DbError::Sqlite("integrity reconcile deferred: canonical SQLite ran on a staged copy of the live database and also rejected that copy, but a copy taken while a writer is active can be torn, so its rejection is not authoritative; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
         ] {
             let expected = error.to_string();
