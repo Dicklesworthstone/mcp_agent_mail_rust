@@ -11279,6 +11279,8 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+    /// Aggregates the failed-request WARN for repeated 401/404 probes.
+    probe_rejection_log: HttpProbeRejectionLog,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11472,6 +11474,7 @@ impl HttpState {
             web_root,
             ws_state_fallback,
             request_diagnostics,
+            probe_rejection_log: HttpProbeRejectionLog::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11577,15 +11580,32 @@ impl HttpState {
         // requests even when the optional high-volume request log is disabled;
         // never include body or authorization data.
         if resp.status >= 400 {
-            tracing::warn!(
-                event = "http_request_error",
-                method = %method_name,
-                path = %path_for_diag,
-                status = resp.status,
-                duration_ms = dur_ms,
-                client_ip = %client_ip.as_deref().unwrap_or("-"),
-                "HTTP request failed"
-            );
+            let client = client_ip.as_deref().unwrap_or("-");
+            match self
+                .probe_rejection_log
+                .admit(client, resp.status, Instant::now())
+            {
+                HttpRejectionLogDecision::Log => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    "HTTP request failed"
+                ),
+                HttpRejectionLogDecision::LogWindowStart { suppressed_before } => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    suppressed_before,
+                    "HTTP request failed; further responses with this status to this client in the next 60 s are counted, not logged"
+                ),
+                HttpRejectionLogDecision::Suppress => {}
+            }
         }
 
         if !needs_request_log {
@@ -17852,6 +17872,66 @@ fn http_request_log_fallback_line(
     format!("http method={method} path={path} status={status} ms={duration_ms} client={client_ip}")
 }
 
+/// Window in which repeated 401/404 rejections from one client are counted
+/// instead of logged (br-5804q).
+const HTTP_PROBE_REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Tracked `(client, status)` pairs; beyond this, rejections are logged.
+const HTTP_PROBE_REJECTION_LOG_MAX_KEYS: usize = 1024;
+
+/// Whether to emit the failed-request WARN for one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRejectionLogDecision {
+    /// Not a probe status: always logged.
+    Log,
+    /// First probe rejection of a window, with the count suppressed in the
+    /// previous window for this client and status.
+    LogWindowStart { suppressed_before: u64 },
+    /// A repeat inside the window: counted, not logged.
+    Suppress,
+}
+
+/// Aggregates the failed-request WARN for repeated 401/404 responses per
+/// client (br-5804q, GH#337). An unauthenticated client probing `/mcp`
+/// draws a 401 on every request and then 404s on OAuth `.well-known`
+/// probes, several a minute, which buried real warnings. The first rejection
+/// of each window is logged and says that repeats are counted; the next
+/// logged line carries the count. Other 4xx and every 5xx are always logged.
+#[derive(Default)]
+struct HttpProbeRejectionLog {
+    windows: Mutex<HashMap<(String, u16), (Instant, u64)>>,
+}
+
+impl HttpProbeRejectionLog {
+    fn admit(&self, client_ip: &str, status: u16, now: Instant) -> HttpRejectionLogDecision {
+        if !matches!(status, 401 | 404) {
+            return HttpRejectionLogDecision::Log;
+        }
+        let mut windows = lock_mutex(&self.windows);
+        let key = (client_ip.to_string(), status);
+        if let Some((started, suppressed)) = windows.get_mut(&key) {
+            if now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW {
+                *suppressed += 1;
+                return HttpRejectionLogDecision::Suppress;
+            }
+            let suppressed_before = std::mem::take(suppressed);
+            *started = now;
+            return HttpRejectionLogDecision::LogWindowStart { suppressed_before };
+        }
+        if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            windows.retain(|_, (started, _)| {
+                now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW
+            });
+            if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+                return HttpRejectionLogDecision::Log;
+            }
+        }
+        windows.insert(key, (now, 0));
+        HttpRejectionLogDecision::LogWindowStart {
+            suppressed_before: 0,
+        }
+    }
+}
+
 // render_http_request_panel moved to console.rs (br-1m6a.13)
 
 // ---------------------------------------------------------------------------
@@ -18761,6 +18841,65 @@ mod tests {
             config.conformal_config.is_none(),
             "the conformal gate can bypass the configured quality floor"
         );
+    }
+
+    #[test]
+    fn probe_rejection_log_counts_repeats_per_client_and_status() {
+        use HttpRejectionLogDecision::{Log, LogWindowStart, Suppress};
+        // br-5804q (GH#337): one client's stream of 401s and .well-known
+        // 404s logs once per status per window and reports the count later.
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let first = LogWindowStart {
+            suppressed_before: 0,
+        };
+        assert_eq!(log.admit("10.0.0.1", 401, at(0)), first);
+        assert_eq!(log.admit("10.0.0.1", 401, at(1)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 401, at(30)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 404, at(2)), first);
+        assert_eq!(log.admit("10.0.0.2", 401, at(3)), first);
+        assert_eq!(
+            log.admit("10.0.0.1", 401, at(61)),
+            LogWindowStart {
+                suppressed_before: 2
+            }
+        );
+        assert_eq!(log.admit("10.0.0.1", 401, at(62)), Suppress);
+
+        // Negative controls: other statuses are never aggregated.
+        for status in [400, 403, 405, 429, 500, 503] {
+            for _ in 0..3 {
+                assert_eq!(log.admit("10.0.0.1", status, at(5)), Log, "{status}");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_rejection_log_stays_bounded_and_logs_when_full() {
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        for client in 0..HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            log.admit(&format!("client-{client}"), 401, t0);
+        }
+        // A new client while every window is live is logged, not tracked.
+        assert_eq!(
+            log.admit("late-client", 401, t0),
+            HttpRejectionLogDecision::Log
+        );
+        assert_eq!(
+            lock_mutex(&log.windows).len(),
+            HTTP_PROBE_REJECTION_LOG_MAX_KEYS
+        );
+        // Once windows expire, the map is pruned and tracking resumes.
+        let later = t0 + HTTP_PROBE_REJECTION_LOG_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            log.admit("late-client", 401, later),
+            HttpRejectionLogDecision::LogWindowStart {
+                suppressed_before: 0
+            }
+        );
+        assert_eq!(lock_mutex(&log.windows).len(), 1);
     }
 
     #[test]
