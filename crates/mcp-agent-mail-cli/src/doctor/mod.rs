@@ -532,6 +532,57 @@ struct DoctorLiveProbeTarget {
 /// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]) so
 /// the MCP `health_check` `retention` block and this `am doctor health`
 /// surface consume ONE implementation (GH#210).
+/// A proactive backup older than this, while the live owner has run past
+/// [`PROACTIVE_BACKUP_GRACE_SECS`], means the integrity guard's refreshes
+/// (attempted hourly) are failing.
+const STALE_PROACTIVE_BACKUP_SECS: u64 = 24 * 60 * 60;
+/// Owner uptime after which the integrity guard has had cycles to refresh.
+const PROACTIVE_BACKUP_GRACE_SECS: u64 = 2 * 60 * 60;
+
+/// `(status, detail)` for the live mailbox's proactive `.bak` (br-31eew).
+/// `backup_age_secs` is `None` when no backup exists; `standalone` is false
+/// when the backup carries `-wal`/`-shm`/sidecar companions, which block every
+/// refresh.
+fn proactive_backup_health(
+    guard_enabled: bool,
+    backup_age_secs: Option<u64>,
+    owner_age_secs: Option<u64>,
+    standalone: bool,
+) -> (&'static str, String) {
+    let hours = |secs: u64| format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60);
+    if !guard_enabled {
+        return (
+            "ok",
+            "INTEGRITY_CHECK_ON_STARTUP is off, so no proactive backup is expected".to_string(),
+        );
+    }
+    let settled = owner_age_secs.is_some_and(|age| age >= PROACTIVE_BACKUP_GRACE_SECS);
+    let companions = if standalone {
+        ""
+    } else {
+        "; the backup has -wal/-shm or other companion files, which block every refresh"
+    };
+    match backup_age_secs {
+        None if settled => (
+            "warn",
+            format!(
+                "no proactive backup after {} of server uptime; check the server log for 'proactive backup refresh failed'",
+                hours(owner_age_secs.unwrap_or_default())
+            ),
+        ),
+        None => ("ok", "no proactive backup yet".to_string()),
+        Some(age) if age > STALE_PROACTIVE_BACKUP_SECS && settled => (
+            "fail",
+            format!(
+                "proactive backup is {} old although the server has run {}: refreshes are failing{companions}; check the server log for 'proactive backup refresh failed'",
+                hours(age),
+                hours(owner_age_secs.unwrap_or_default())
+            ),
+        ),
+        Some(age) => ("ok", format!("age {}{companions}", hours(age))),
+    }
+}
+
 fn doctor_retention_resident_stats(
     probe_target: &DoctorLiveProbeTarget,
 ) -> Result<mcp_agent_mail_db::recovery_retention::RetentionResidentStats, String> {
@@ -3319,6 +3370,32 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         if descriptors.status == "fail" {
             return Err(CliError::ExitCode(1));
         }
+        // br-31eew (GH#337): a proactive backup that silently stopped
+        // refreshing left one mailbox with a 3.5-week-old backup and only a
+        // repeated log warning. With a live owner, say so here.
+        if let Ok(resolved) =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        {
+            let backup = PathBuf::from(format!("{}.bak", resolved.canonical_path));
+            let backup_age_secs = std::fs::symlink_metadata(&backup)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| modified.elapsed().map_or(0, |age| age.as_secs()));
+            let owner_age_secs = owner_pids
+                .iter()
+                .filter_map(|pid| crate::process_age_seconds(*pid))
+                .max();
+            let (status, detail) = proactive_backup_health(
+                config.integrity_check_on_startup,
+                backup_age_secs,
+                owner_age_secs,
+                mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&backup),
+            );
+            ftui_runtime::ftui_println!("proactive_backup: {status} ({detail})");
+            if status == "fail" {
+                return Err(CliError::ExitCode(1));
+            }
+        }
     }
 
     match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
@@ -3699,6 +3776,38 @@ mod tests {
     const FIX_ONLY_LOCK_INVOKER_TEST: &str = "doctor::tests::fix_only_exclusive_lock_invoker_child";
     const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
     const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
+
+    #[test]
+    fn proactive_backup_health_fails_on_a_backup_that_stopped_refreshing() {
+        // br-31eew (GH#337): a 3.5-week-old backup under a long-running
+        // server with blocking companions is a failure, not a quiet warning.
+        let day = 24 * 60 * 60;
+        let (status, detail) = proactive_backup_health(true, Some(25 * day), Some(30 * day), false);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("600h00m old"), "{detail}");
+        assert!(detail.contains("companion files"), "{detail}");
+        let (status, detail) = proactive_backup_health(true, Some(2 * day), Some(3 * day), true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(!detail.contains("companion"), "{detail}");
+        assert_eq!(
+            proactive_backup_health(true, None, Some(day), true).0,
+            "warn"
+        );
+
+        // Negative controls: a fresh backup, a server that just started
+        // (the guard has not had a cycle yet), an unknown owner age, and a
+        // disabled guard are all ok.
+        for (age, owner, guard) in [
+            (Some(3_600), Some(30 * day), true),
+            (Some(30 * day), Some(600), true),
+            (Some(30 * day), None, true),
+            (None, Some(600), true),
+            (Some(30 * day), Some(30 * day), false),
+        ] {
+            let (status, detail) = proactive_backup_health(guard, age, owner, true);
+            assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
+        }
+    }
 
     // ---- GH#315: stale unusable doctor reports must not break live health ----
 
