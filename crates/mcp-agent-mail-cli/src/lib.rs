@@ -12815,13 +12815,13 @@ fn doctor_locks_held_lock_owner_state(
             continue;
         }
         held.push(format!(
-            "the {} activity lock is held {} by PID {}",
+            "the {} activity lock is held by PID {} (mode {})",
             lock.name,
-            lock.mode.as_deref().unwrap_or("in an unknown mode"),
             pids.iter()
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            lock.mode.as_deref().unwrap_or("unknown"),
         ));
         holder_pids.extend(pids);
     }
@@ -56462,7 +56462,7 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             state
                 .reason
-                .contains("storage_root activity lock is held exclusive by PID 4242"),
+                .contains("storage_root activity lock is held by PID 4242 (mode exclusive)"),
             "{}",
             state.reason
         );

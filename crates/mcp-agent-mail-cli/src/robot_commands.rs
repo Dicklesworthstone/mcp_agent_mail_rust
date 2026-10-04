@@ -12729,6 +12729,9 @@ fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_
 pub(crate) struct LiveServerMailboxConfig {
     pub database_url: String,
     pub storage_root: std::path::PathBuf,
+    /// Whether the server's integrity guard runs (and so refreshes the
+    /// proactive backup); `None` when an older server does not say.
+    pub integrity_guard_enabled: Option<bool>,
 }
 
 fn live_server_mailbox_config_from_ws_state(
@@ -12756,6 +12759,9 @@ fn live_server_mailbox_config_from_ws_state(
     Ok(LiveServerMailboxConfig {
         database_url,
         storage_root,
+        integrity_guard_enabled: config
+            .get("integrity_guard_enabled")
+            .and_then(serde_json::Value::as_bool),
     })
 }
 
@@ -17871,6 +17877,19 @@ mod tests {
             parsed.storage_root,
             std::path::PathBuf::from("/srv/agent-mail/archive")
         );
+        // A server that predates the field does not say whether its
+        // integrity guard runs.
+        assert_eq!(parsed.integrity_guard_enabled, None);
+
+        let parsed = live_server_mailbox_config_from_ws_state(&serde_json::json!({
+            "config": {
+                "database_url": "sqlite:////srv/agent-mail/server.sqlite3",
+                "storage_root": "/srv/agent-mail/archive",
+                "integrity_guard_enabled": false
+            }
+        }))
+        .expect("parse server mailbox config");
+        assert_eq!(parsed.integrity_guard_enabled, Some(false));
     }
 
     #[test]
@@ -17895,6 +17914,7 @@ mod tests {
             Some(LiveServerMailboxConfig {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: std::path::PathBuf::from("/srv/agent-mail/archive"),
+                integrity_guard_enabled: None,
             }),
             None,
         );
@@ -17919,6 +17939,7 @@ mod tests {
             Some(LiveServerMailboxConfig {
                 database_url: config.database_url.clone(),
                 storage_root: config.storage_root.clone(),
+                integrity_guard_enabled: None,
             }),
             None,
         );

@@ -210,11 +210,16 @@ fn resolve_integrity_guard_sqlite_path(config: &Config) -> Option<PathBuf> {
     crate::resolve_server_database_url_sqlite_path(&config.database_url)
 }
 
+/// Whether the guard runs for `config`, and so refreshes the proactive
+/// `.bak`. Published in the ws-state config so `am doctor health` judges a
+/// backup's age by the server's settings, not the CLI's environment.
+#[must_use]
+pub fn enabled_for(config: &Config) -> bool {
+    config.integrity_check_on_startup && !is_sqlite_memory_database_url(&config.database_url)
+}
+
 pub fn start(config: &Config) {
-    if !config.integrity_check_on_startup {
-        return;
-    }
-    if is_sqlite_memory_database_url(&config.database_url) {
+    if !enabled_for(config) {
         return;
     }
 

@@ -9313,11 +9313,10 @@ fn stable_tui_diff_config_with(
         //
         // That repaint re-emits every cell. A 1 s bound plus a 20-frame bound
         // made an idle TUI resend the whole screen about once a second
-        // (~65 KB/s on an 86x382 pane) and made it the largest terminal writer
-        // on a swarm host (GH#338). The wall-clock bound alone limits how long
-        // a desync stays visible, so the frame-count bound is off and the
-        // default interval is `DEFAULT_FULL_REDRAW_MAX_SECS`; operators can
-        // shorten it with `AM_TUI_FULL_REDRAW_MAX_SECS`.
+        // (~65 KB/s on an 86x382 pane; GH#338). The wall-clock bound alone
+        // limits how long a desync stays visible, so the frame-count bound is
+        // off and the default interval is `DEFAULT_FULL_REDRAW_MAX_SECS`;
+        // operators can shorten it with `AM_TUI_FULL_REDRAW_MAX_SECS`.
         .with_full_redraw_interval_frames(0)
         .with_full_redraw_max_interval(full_redraw_max_interval)
 }
@@ -11602,7 +11601,8 @@ impl HttpState {
                     duration_ms = dur_ms,
                     client_ip = %client,
                     suppressed_before,
-                    "HTTP request failed; further responses with this status to this client in the next 60 s are counted, not logged"
+                    window_secs = HTTP_PROBE_REJECTION_LOG_WINDOW.as_secs(),
+                    "HTTP request failed; further responses with this status to this client within window_secs are counted, not logged"
                 ),
                 HttpRejectionLogDecision::Suppress => {}
             }

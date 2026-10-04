@@ -4694,6 +4694,7 @@ mod tests {
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "127.0.0.1");
@@ -4716,6 +4717,7 @@ mod tests {
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "::1");
@@ -5617,6 +5619,7 @@ mod tests {
             console_theme: String::new(),
             tool_filter_profile: String::new(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "127.0.0.1");
@@ -5639,6 +5642,7 @@ mod tests {
             console_theme: String::new(),
             tool_filter_profile: String::new(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let err = parse_http_endpoint(&cfg).unwrap_err();
         assert!(err.contains("unsupported endpoint scheme"));
@@ -5659,6 +5663,7 @@ mod tests {
             console_theme: String::new(),
             tool_filter_profile: String::new(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "127.0.0.1");

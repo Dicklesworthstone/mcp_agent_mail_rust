@@ -4614,6 +4614,10 @@ impl DbPool {
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            // A backup with companions is not the verified generation, and the
+            // retained witness keeps the backup open: drop it first, or the
+            // open-handle check below would count this process as a user.
+            *verified_backup = None;
             match quarantine_stale_proactive_backup_companions(&bak_path) {
                 Ok(Some(quarantine)) => tracing::warn!(
                     backup = %bak_path.display(),
@@ -7736,7 +7740,7 @@ fn canonical_second_opinion_deferral_detail(canonical_error: &str) -> &'static s
         "the canonical second-opinion probe could not run because of a stale WAL or snapshot \
          conflict"
     } else {
-        "the canonical second-opinion probe could not run because of a transient recovery error"
+        "the canonical second-opinion probe failed with a recovery-class error"
     }
 }
 
@@ -24094,7 +24098,12 @@ mod tests {
             locked.contains("could not run because of lock/busy contention"),
             "{locked}"
         );
-        for msg in [&staged, &locked] {
+        let recovery = defer("internal error".to_string());
+        assert!(
+            recovery.contains("failed with a recovery-class error"),
+            "{recovery}"
+        );
+        for msg in [&staged, &locked, &recovery] {
             assert!(msg.contains("deferred"), "{msg}");
             assert!(!is_corruption_error_message(msg), "{msg}");
             assert!(!is_sqlite_recovery_error_message(msg), "{msg}");
@@ -30317,8 +30326,23 @@ mod tests {
         // br-31eew / GH#337: an empty .bak-wal and a leftover .bak-shm that
         // nothing holds open no longer block every refresh for weeks.
         let dir = tempfile::tempdir().unwrap();
-        let (pool, bak_path, bak_wal, bak_shm) =
-            proactive_backup_with_companions(dir.path(), "stale_family.db", 0);
+        let db_path = dir.path().join("stale_family.db");
+        let bak_path = dir.path().join("stale_family.db.bak");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        write_marker_db(&db_path, "healthy-primary");
+        // Publish through the pool first, as a long-running server does: the
+        // pool then retains a witness that keeps the backup open, which must
+        // not count as another user of the backup family.
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("publish the first backup");
+        let bak_wal = sqlite_sidecar_path(&bak_path, "-wal");
+        let bak_shm = sqlite_sidecar_path(&bak_path, "-shm");
+        std::fs::write(&bak_wal, b"").unwrap();
+        std::fs::write(&bak_shm, vec![7_u8; 32 * 1024]).unwrap();
 
         let refreshed = pool
             .create_proactive_backup(std::time::Duration::from_hours(1))
