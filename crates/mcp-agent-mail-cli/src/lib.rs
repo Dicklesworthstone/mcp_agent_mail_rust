@@ -995,7 +995,7 @@ pub enum ReleaseCommand {
             default_value = "tests/artifacts/ci/gate_report.json"
         )]
         ci_report: PathBuf,
-        /// Doctor evidence report from `am doctor --json` or `am doctor health`.
+        /// Doctor evidence report from `am doctor check --json` or `am doctor health`.
         #[arg(long = "doctor-report")]
         doctor_report: Option<PathBuf>,
         /// Robot health evidence report from `am robot health --format json`.
@@ -2752,7 +2752,7 @@ pub enum DoctorCommand {
         /// always refuse.
         #[arg(long)]
         force: bool,
-        /// Output format: human (default) or json.
+        /// Output format: table (default, a human-readable report) or json.
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
     },
@@ -3037,7 +3037,7 @@ pub enum DoctorCommand {
     /// `Op` write pattern, auto-fixability, and one-line description.
     /// JSON by default for agent consumption. Use this to discover what
     /// concrete per-FM remediations are available before invoking
-    /// `am doctor --fix --only <fm-id>`.
+    /// `am doctor fix --only <fm-id>`.
     #[command(name = "fixers")]
     Fixers {
         /// Output format. JSON is the default.
@@ -12752,7 +12752,7 @@ fn doctor_locks_owner_state(
             doctor_lock_owner_state_value(
                 DoctorLockOwnerClass::Stale,
                 reason,
-                "am doctor --dry-run --fix".to_string(),
+                "am doctor fix --dry-run".to_string(),
             )
         }
         ActiveOtherOwner => doctor_lock_owner_state_value(
@@ -56331,7 +56331,9 @@ http_headers = { Authorization = "Bearer secret" }
         );
 
         assert_eq!(state.class, DoctorLockOwnerClass::Stale);
-        assert_eq!(state.safe_next_command, "am doctor --dry-run --fix");
+        assert_eq!(state.safe_next_command, "am doctor fix --dry-run");
+        // The advertised command must be one clap accepts.
+        assert!(Cli::try_parse_from(state.safe_next_command.split_whitespace()).is_ok());
         assert!(state.reason.contains("activity lock artifact"));
     }
 
@@ -56918,8 +56920,8 @@ http_headers = { Authorization = "Bearer secret" }
             storage_root: "/data/storage".to_string(),
             database_path: "/data/storage/storage.sqlite3".to_string(),
             detail: "unowned".to_string(),
-            recommended_next_action: "am doctor --dry-run --fix".to_string(),
-            safe_next_command: "am doctor --dry-run --fix".to_string(),
+            recommended_next_action: "am doctor fix --dry-run".to_string(),
+            safe_next_command: "am doctor fix --dry-run".to_string(),
             supervised_protocol: supervised_drain_protocol_steps(true),
             read_only: true,
         };

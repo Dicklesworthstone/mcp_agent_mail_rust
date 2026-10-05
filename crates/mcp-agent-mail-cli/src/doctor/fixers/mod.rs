@@ -670,6 +670,16 @@ pub struct FindingRemediation {
     pub estimated_actions: usize,
 }
 
+/// The command that applies one FM's fix through the `mutate()` chokepoint.
+///
+/// `--yes` is part of it: agents run without a TTY, where `fix --only`
+/// refuses to prompt, so a hint without it fails for exactly the callers it
+/// is written for.
+#[must_use]
+pub fn fix_only_command(fm_id: &str) -> String {
+    format!("am doctor fix --only {fm_id} --yes")
+}
+
 /// Outcome of a fix attempt — what mutate() actions were taken.
 #[derive(Debug, Default)]
 pub struct FixOutcome {
@@ -3029,6 +3039,42 @@ mod tests {
     use sqlmodel_sqlite::SqliteConnection;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn fix_only_command_parses_as_a_noninteractive_fix_of_that_fm() {
+        use clap::Parser as _;
+        for spec in registry() {
+            let command = fix_only_command(spec.id);
+            let argv: Vec<&str> = command.split_whitespace().collect();
+            let cli = crate::Cli::try_parse_from(&argv)
+                .unwrap_or_else(|err| panic!("`{command}` does not parse: {err}"));
+            match cli.command {
+                Some(crate::Commands::Doctor {
+                    action:
+                        crate::DoctorCommand::Fix {
+                            only,
+                            yes,
+                            dry_run,
+                            list,
+                            ..
+                        },
+                }) => {
+                    assert_eq!(only.as_deref(), Some(spec.id), "`{command}`");
+                    assert!(
+                        yes && !dry_run && !list,
+                        "`{command}` must apply, unprompted"
+                    );
+                }
+                other => panic!("`{command}` parsed as {other:?}"),
+            }
+        }
+        // The pre-fix spelling, which clap rejects, so a regression to it
+        // cannot pass the parse above.
+        assert!(
+            crate::Cli::try_parse_from(["am", "doctor", "--fix", "--only", "fm-x", "--yes"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn sqlite_immutable_uri_escapes_uri_delimiters_in_paths() {

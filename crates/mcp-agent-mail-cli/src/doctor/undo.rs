@@ -374,7 +374,7 @@ fn ensure_parent_dir_strict(dir: &Path) -> std::io::Result<()> {
 
 /// Acquire the per-path `.<basename>.doctor-lock` for `target_file`.
 /// Round-10 (round-7 Gemini F6 / Codex F2): mirrors the chokepoint's
-/// own per-target advisory lock so concurrent `am doctor --fix` and
+/// own per-target advisory lock so concurrent `am doctor fix` and
 /// `am doctor undo` are properly serialized on the same path.
 /// Without this, mutate could be hashing/writing the file while
 /// undo is hashing/restoring it, producing torn intermediate state.
@@ -992,7 +992,7 @@ pub fn run_undo_with_scopes(
         }
         // Round-10 (round-7 Codex F2 / Gemini F6): acquire the
         // per-path `.<basename>.doctor-lock` so concurrent
-        // `am doctor --fix` and `am doctor undo` cannot interleave
+        // `am doctor fix` and `am doctor undo` cannot interleave
         // a hash/restore step on the same target. For `Rename`
         // both sides need locking — handled inside the Rename arm
         // via `acquire_pair_locks`; the target_file lock here is
@@ -3303,7 +3303,7 @@ mod tests {
     fn undo_refuses_when_concurrent_fix_holds_target_lock() {
         // Round-10 (round-7 Codex F2 / Gemini F6): undo must
         // acquire the per-path `.<basename>.doctor-lock` so a
-        // concurrent `am doctor --fix` can't interleave a
+        // concurrent `am doctor fix` can't interleave a
         // hash/write step against the same target. Simulated by
         // manually grabbing the lock before invoking undo;
         // strict mode must surface WouldBlock.

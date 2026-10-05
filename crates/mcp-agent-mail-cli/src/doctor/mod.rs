@@ -331,24 +331,15 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         // An active live-probe failure outranks any cached-report advice.
         live
     } else if total_findings.unwrap_or(0) == 0 {
-        if report_path.is_none() {
-            "am doctor".to_string()
-        } else {
+        if report_usable {
             "am doctor health".to_string()
+        } else {
+            // No usable report says what is broken: the next step is the
+            // read-only scan of every registered FM.
+            TRIAGE_SCAN_COMMAND.to_string()
         }
     } else {
-        let has_p0 = findings
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .any(|f| f.get("severity").and_then(|s| s.as_str()) == Some("P0"))
-            })
-            .unwrap_or(false);
-        if has_p0 {
-            "am doctor --fix --yes".to_string()
-        } else {
-            "am doctor --dry-run --fix".to_string()
-        }
+        triage_findings_command(&findings)
     };
 
     let actions_planned: Vec<serde_json::Value> = findings
@@ -387,7 +378,7 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                     Some(serde_json::json!({
                         "id": id,
                         "severity": severity,
-                        "fix_command": format!("am doctor --fix --only {} --yes", id),
+                        "fix_command": fixers::fix_only_command(id),
                         "explain_command": format!("am doctor explain {}", id),
                     }))
                 })
@@ -423,15 +414,41 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
     if !report_available && let Some(map) = envelope.as_object_mut() {
         map.insert(
             "report_note".to_string(),
-            serde_json::Value::String(
+            serde_json::Value::String(format!(
                 "No doctor report exists yet for this target — the finding count is unknown, \
-                 not zero. Run `am doctor` (or `am doctor --json`) to produce one."
-                    .to_string(),
-            ),
+                 not zero. A report is written only by a fix that changed something; run \
+                 `{TRIAGE_SCAN_COMMAND}` to scan every registered failure mode read-only."
+            )),
         );
     }
 
     Ok(envelope)
+}
+
+/// The read-only scan of every registered FM: triage's next step whenever no
+/// usable report names what is broken.
+const TRIAGE_SCAN_COMMAND: &str = "am doctor fix --list --json";
+
+/// Triage's next step for findings carried by a stored report: apply the
+/// first P0 FM's fix, else rehearse the first FM's fix. A report that names
+/// no finding (per-FM run envelopes carry only counts) sends the agent back
+/// to the scan, which re-detects from current state.
+fn triage_findings_command(findings: &serde_json::Value) -> String {
+    fn id_of(finding: &serde_json::Value) -> Option<&str> {
+        finding.get("id").and_then(serde_json::Value::as_str)
+    }
+    let findings = findings.as_array().map_or(&[][..], Vec::as_slice);
+    let p0 = findings
+        .iter()
+        .filter(|f| f.get("severity").and_then(serde_json::Value::as_str) == Some("P0"))
+        .find_map(id_of);
+    if let Some(id) = p0 {
+        fixers::fix_only_command(id)
+    } else if let Some(id) = findings.iter().find_map(id_of) {
+        format!("am doctor fix --only {id} --dry-run")
+    } else {
+        TRIAGE_SCAN_COMMAND.to_string()
+    }
 }
 
 /// A small archive-only parity discrepancy is operational debt, not evidence
@@ -671,8 +688,8 @@ fn doctor_live_probe_target(config: &Config) -> DoctorLiveProbeTarget {
 ///    keeps `am doctor explain <fm-id>` informative regardless of run
 ///    history.
 /// 3. If neither stage matches, exit 64 with a hint pointing operators
-///    at `am doctor fixers` (enumerate registry) and `am doctor --json`
-///    (list current findings).
+///    at `am doctor fixers` (enumerate registry) and
+///    `am doctor fix --list --json` (list current findings).
 pub fn handle_explain(
     target: &std::path::Path,
     finding_id: &str,
@@ -683,6 +700,8 @@ pub fn handle_explain(
     // than aborting — silently better UX for `explain` on a registered
     // FM that simply hasn't fired in any run yet.
     let root = runs::doctor_root(target);
+    let specs = fixers::registry();
+    let spec = specs.iter().find(|s| s.id == finding_id);
     let latest_envelope = latest_doctor_report_path_for_root(&root).and_then(|report_path| {
         let body = std::fs::read_to_string(&report_path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -691,6 +710,13 @@ pub fn handle_explain(
             f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
                 || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
         })?;
+        // A legacy check name matched above is not an FM id; `fix --only`
+        // would refuse it with exit 64, so only an FM gets a fix command.
+        let first_action = if spec.is_some() {
+            fixers::fix_only_command(finding_id)
+        } else {
+            TRIAGE_SCAN_COMMAND.to_string()
+        };
         Some(serde_json::json!({
             "schema_version": "1.0",
             "mode": "latest_run",
@@ -698,7 +724,7 @@ pub fn handle_explain(
             "finding": matched,
             "report_path": report_path.to_string_lossy(),
             "next_actions": [
-                format!("am doctor --fix --only {finding_id} --yes"),
+                first_action,
                 "am doctor capabilities --json".to_string(),
             ],
         }))
@@ -711,8 +737,7 @@ pub fn handle_explain(
 
     // Stage 2: registry fallback. Useful for `explain <fm-id>` when
     // the FM is registered but hasn't fired in any run.
-    let specs = fixers::registry();
-    if let Some(spec) = specs.iter().find(|s| s.id == finding_id) {
+    if let Some(spec) = spec {
         let envelope = serde_json::json!({
             "schema_version": "1.0",
             "mode": "registry",
@@ -721,7 +746,7 @@ pub fn handle_explain(
             "note": "No matching finding in latest run; showing the FM's static contract from the registry.",
             "next_actions": [
                 format!("am doctor fix --only {finding_id} --list --json"),
-                format!("am doctor --fix --only {finding_id} --yes"),
+                fixers::fix_only_command(finding_id),
                 "am doctor fixers --format json".to_string(),
                 "am doctor capabilities --json".to_string(),
             ],
@@ -733,7 +758,7 @@ pub fn handle_explain(
     // Stage 3: not in latest run, not in registry → truly unknown.
     eprintln!("error: finding `{finding_id}` not found in latest run AND not a registered FM.");
     eprintln!(
-        "       Run `am doctor fixers` to enumerate registered FM ids, or `am doctor --json` to list current findings."
+        "       Run `am doctor fixers` to enumerate registered FM ids, or `{TRIAGE_SCAN_COMMAND}` to list current findings."
     );
     Err(CliError::ExitCode(64))
 }
@@ -2979,7 +3004,7 @@ fn print_skipped_doctor_report(skipped: &SkippedDoctorReport) {
 /// per invocation, however many reports were skipped.
 fn print_doctor_history_recovery_hint() {
     ftui_runtime::ftui_println!(
-        "doctor_history: next: am doctor  (writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
+        "doctor_history: next: {TRIAGE_SCAN_COMMAND}  (re-detects from current state; the next fix that changes something writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
     );
 }
 
@@ -3335,7 +3360,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
     if corruption.corruption_class_total > 0 {
         ftui_runtime::ftui_println!(
-            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor --json",
+            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor check --json",
             corruption.corruption_class_total,
             corruption.detections_total
         );
@@ -3742,7 +3767,7 @@ pub fn handle_undo(
     Ok(())
 }
 
-/// Compute the canonical write_scopes for `am doctor --fix`.
+/// Compute the canonical write_scopes for `am doctor fix`.
 ///
 /// These match `analysis/safety_envelope.md` (Phase 3 synthesis).
 pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
@@ -4814,13 +4839,61 @@ mod tests {
             .as_str()
             .expect("absent report must carry a human-readable note");
         assert!(
-            note.contains("No doctor report exists yet") && note.contains("am doctor"),
-            "note must say the report is missing and how to produce one: {note}"
+            note.contains("No doctor report exists yet") && note.contains(TRIAGE_SCAN_COMMAND),
+            "note must say the report is missing and what to run instead: {note}"
         );
-        assert_eq!(report["recommended_command"], "am doctor");
+        // Bare `am doctor` is a clap usage error (exit 2); the next step must
+        // be a command that parses and runs read-only.
+        assert_eq!(report["recommended_command"], TRIAGE_SCAN_COMMAND);
+        assert_doctor_command_parses(TRIAGE_SCAN_COMMAND);
         // The live probe is healthy, so no synthetic finding materializes.
         assert_eq!(report["live_health"]["status"], "ok");
         assert_eq!(report["findings"], serde_json::json!([]));
+    }
+
+    fn assert_doctor_command_parses(command: &str) {
+        use clap::Parser as _;
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        if let Err(err) = crate::Cli::try_parse_from(&argv) {
+            panic!("`{command}` does not parse: {err}");
+        }
+    }
+
+    #[test]
+    fn triage_findings_command_targets_a_registered_fm_and_parses() {
+        let p0 = fixers::registry()
+            .into_iter()
+            .find(|spec| spec.severity == "P0")
+            .expect("registry has a P0 FM")
+            .id;
+        let p2 = "fm-db-state-files-legacy-fts-residue";
+        // A P0 anywhere wins and is applied; otherwise the first FM is only
+        // rehearsed.
+        let mixed = serde_json::json!([
+            {"id": p2, "severity": "P2"},
+            {"id": p0, "severity": "P0"},
+        ]);
+        assert_eq!(
+            triage_findings_command(&mixed),
+            fixers::fix_only_command(p0)
+        );
+        let minor = serde_json::json!([{"id": p2, "severity": "P2"}]);
+        assert_eq!(
+            triage_findings_command(&minor),
+            format!("am doctor fix --only {p2} --dry-run")
+        );
+        // Per-FM run envelopes carry counts, not findings: re-detect.
+        assert_eq!(
+            triage_findings_command(&serde_json::json!([])),
+            TRIAGE_SCAN_COMMAND
+        );
+        for command in [
+            triage_findings_command(&mixed),
+            triage_findings_command(&minor),
+            triage_findings_command(&serde_json::Value::Null),
+        ] {
+            assert_doctor_command_parses(&command);
+        }
     }
 
     #[cfg(unix)]

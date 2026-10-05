@@ -18,8 +18,7 @@ those signals.
 - Field names are `snake_case`.
 - Units are encoded in field names: `duration_ms`, `wait_seconds`,
   `size_bytes`. Do not use a bare field such as `duration`.
-- Raw git arguments are never logged by default. Use `args_hash`; raw args are
-  only allowed when `AM_LOG_GIT_ARGS=1`.
+- Raw git arguments are never logged. Use `args_hash`.
 - Use stable, tokenized identifiers such as `repo_slug` in operator-facing
   events instead of high-cardinality absolute paths when possible.
 
@@ -31,7 +30,7 @@ Every `run_git_locked`-adjacent event must carry these fields:
 |---|---|---|
 | `repo_slug` | string | Tokenized project or repository identifier. |
 | `caller` | string | Static call-site name, populated by the wrapper or macro. |
-| `args_hash` | string | SHA-256 of the joined argv. Raw argv requires `AM_LOG_GIT_ARGS=1`. |
+| `args_hash` | string | SHA-256 of the joined argv. Raw argv is never logged. |
 | `duration_ms` | number | End-to-end duration in milliseconds. |
 | `outcome` | enum | One of `success`, `retrying`, `succeeded_after_retry`, `exhausted`, `error`. |
 | `git_version` | string | Cached resolved git version, or `unknown`. |

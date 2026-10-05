@@ -140,7 +140,7 @@ impl StalePythonLauncherEntryFinding {
             }),
             remediation: FindingRemediation {
                 command: if fixable > 0 {
-                    format!("am doctor fix --only {FM_ID}")
+                    super::fix_only_command(FM_ID)
                 } else {
                     format!("am doctor explain {FM_ID}")
                 },

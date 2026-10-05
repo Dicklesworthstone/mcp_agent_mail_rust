@@ -3066,7 +3066,7 @@ fn wbq_circuit_breaker_escalate(storage_root: &Path, project_slug: &str, consecu
             storage_root = %storage_root.display(),
             "[wbq-circuit-breaker] boot-check found no repairable git-shape issue; the failure \
              cause is elsewhere (disk full / permissions / DB corruption) — run \
-             `am robot health --include-host` then `am doctor --json`",
+             `am robot health --include-host` then `am doctor check --json`",
         );
     }
 }

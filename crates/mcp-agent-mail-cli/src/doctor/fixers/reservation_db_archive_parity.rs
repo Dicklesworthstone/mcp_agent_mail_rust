@@ -96,7 +96,7 @@ impl ReservationDbArchiveParityFinding {
         // registered-agent roster and reports honest taken/skipped counts.
         let estimated_actions = collisions + reconcilable;
         let command = if auto_fixable {
-            format!("am doctor fix --only {FM_ID} --yes")
+            super::fix_only_command(FM_ID)
         } else {
             format!("am doctor fix --only {FM_ID} --list --json")
         };

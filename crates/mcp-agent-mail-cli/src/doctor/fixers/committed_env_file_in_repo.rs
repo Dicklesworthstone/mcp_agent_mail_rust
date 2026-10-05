@@ -193,7 +193,7 @@ impl CommittedEnvFileFinding {
             }),
             remediation: FindingRemediation {
                 command: if auto_fixable {
-                    format!("am doctor --fix --only {FM_ID} --yes")
+                    super::fix_only_command(FM_ID)
                 } else {
                     "manual remediation required — see evidence.manual_remediation".to_string()
                 },
@@ -655,7 +655,10 @@ mod tests {
         let g = f.to_finding();
         assert!(g.remediation.auto_fixable);
         assert_eq!(g.remediation.estimated_actions, 1);
-        assert!(g.remediation.command.contains("--fix"));
+        assert_eq!(
+            g.remediation.command,
+            format!("am doctor fix --only {FM_ID} --yes")
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ discover the doctor's surface programmatically.
       "description": "<one-line>",
       "estimated_cost_ms": 30,       // for budget calculations
       "online_required": false,
-      "quick_mode_eligible": true    // included in `am doctor --quick`
+      "quick_mode_eligible": true    // included in `am doctor triage --quick`
     }
   ],
   "fixers": [
@@ -127,7 +127,9 @@ The following fields may grow without contract bump:
 ## 2. `report.json` (per-run artifact)
 
 Written to `<repo>/.doctor/runs/<ISO8601>__<run-id>/report.json` by every
-`am doctor` (default `check`) and `am doctor --fix` invocation.
+`am doctor fix --only <fm-id>` or `am doctor archive-normalize` run that
+changes something. Read-only verbs (`check`, `health`, `triage`, `fix --list`)
+write no report.
 
 **Shape:**
 
@@ -164,7 +166,7 @@ Written to `<repo>/.doctor/runs/<ISO8601>__<run-id>/report.json` by every
         "hash": "sha256:..."
       },
       "remediation": {
-        "command": "am doctor --fix --only <id>",
+        "command": "am doctor fix --only <id> --yes",
         "explain_command": "am doctor explain <id>",
         "auto_fixable": true,
         "estimated_actions": 2
@@ -173,14 +175,14 @@ Written to `<repo>/.doctor/runs/<ISO8601>__<run-id>/report.json` by every
   ],
   "exit_code": 1,
   "next_steps": [
-    "Run: am doctor --fix",
-    "Or scope: am doctor --fix --only <id>",
+    "Rehearse: am doctor fix --only <id> --dry-run",
+    "Run: am doctor fix --only <id> --yes",
     "Inspect: am doctor explain <id>"
   ]
 }
 ```
 
-For `--fix` runs, the report adds:
+For fix runs, the report adds:
 - `actions_jsonl_path`
 - `backups_dir`
 - `undo_command`

@@ -15537,10 +15537,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 env = env.with_alert(
                     "error",
                     format!(
-                        "{} corruption-class error(s) classified since start; run `am doctor --json`",
+                        "{} corruption-class error(s) classified since start; run `am doctor check --json`",
                         corruption.corruption_class_total
                     ),
-                    Some("am doctor --json".to_string()),
+                    Some("am doctor check --json".to_string()),
                 );
             } else if corruption.detections_total > 0 {
                 env = env.with_alert(
@@ -24693,12 +24693,12 @@ mod tests {
             "am doctor health",
             "am doctor check --json",
             "am doctor locks",
-            "am doctor --json",
+            "am doctor triage --quick",
             "am robot status",
-            "am doctor fix --only fm-db-state-files-world-readable-storage-db",
+            "am doctor fix --only fm-db-state-files-world-readable-storage-db --yes",
             "am doctor fix --list --json",
-            "am doctor --dry-run --fix",
-            "am doctor migrate --check",
+            "am doctor fix --dry-run",
+            "am migrate --check",
             "route the write through the running Agent Mail server",
         ] {
             assert!(

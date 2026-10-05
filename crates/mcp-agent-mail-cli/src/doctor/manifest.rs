@@ -713,7 +713,7 @@ fn ledger_lock_path(path: &Path) -> PathBuf {
 /// compaction *and* the append is what makes concurrent `am doctor` seals
 /// correct: without it, a lock-free appender could hold an fd to the inode
 /// a concurrent compaction orphans by rename, silently losing the append.
-/// Seals are infrequent (once per `am doctor --fix`), so serializing them
+/// Seals are infrequent (once per `am doctor fix`), so serializing them
 /// costs nothing in practice. Readers ([`read_ledger_entries`]) take no
 /// lock — compaction publishes via atomic rename and appends are
 /// whole-line, so a reader always sees a consistent snapshot.

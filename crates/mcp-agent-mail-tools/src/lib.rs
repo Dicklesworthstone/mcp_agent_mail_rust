@@ -2530,7 +2530,7 @@ body
             );
             assert_eq!(
                 data["error"]["data"]["db_error_classification"]["recommended_command"],
-                "am doctor migrate --check"
+                "am migrate --check"
             );
         }
 

@@ -99,7 +99,7 @@ impl UnexpectedSymlinkFinding {
                 },
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor fix --only {FM_ID}"),
+                command: super::fix_only_command(FM_ID),
                 explain_command: format!("am doctor explain {FM_ID}"),
                 auto_fixable: !self.entries.is_empty(),
                 estimated_actions: self.entries.len(),

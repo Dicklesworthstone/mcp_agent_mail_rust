@@ -104,7 +104,7 @@ impl OrphanDoctorRunDirFinding {
                 "remediation_strategy": "quarantine the whole run dir via directory-tree Op::Rename; runs with recorded actions are crash evidence and are never touched",
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor fix --only {FM_ID} --yes"),
+                command: super::fix_only_command(FM_ID),
                 explain_command: format!("am doctor explain {FM_ID}"),
                 auto_fixable: true,
                 estimated_actions: 1,

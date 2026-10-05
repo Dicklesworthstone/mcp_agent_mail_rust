@@ -331,10 +331,9 @@ Semantic embedding generation can be slow without GPU:
 ```bash
 # Disable semantic temporarily
 export AM_SEARCH_SEMANTIC_ENABLED=false
-
-# Or reduce embedding batch size
-export AM_SEARCH_EMBEDDING_BATCH_SIZE=10
 ```
+
+There is no environment knob for the embedding batch size.
 
 ### Shadow Metrics Show High Divergence
 

@@ -3921,7 +3921,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup failed; binding the HTTP listener in DB-degraded mode. \
                  /healthz stays live and /health reports unavailable until the DB recovers. \
-                 Run `am doctor --json` to diagnose/repair."
+                 Run `am doctor check --json` to diagnose/repair."
             );
         }
         Err(_timeout) => {
@@ -3931,7 +3931,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup still running after the bind deadline; binding the HTTP \
                  listener NOW so the server is reachable (degraded). Recovery continues in the \
-                 background. If this persists, stop the service and run `am doctor --json`."
+                 background. If this persists, stop the service and run `am doctor check --json`."
             );
             // Detach: let the warmup finish in the background; never join here.
         }

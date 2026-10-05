@@ -56,7 +56,7 @@ const FM_SUBSYSTEM: &str = "environment_toolchain";
 // vars. The fixer used to carry a hardcoded `["2.51.0"]` list,
 // which silently drifted away from the registry: an operator
 // extending the JSON would see the core path refuse the bad
-// binary, but `am doctor --fix --only ...` would still report
+// binary, but `am doctor fix --only ...` would still report
 // "no findings". Routing detection through `match_known_bad`
 // makes that drift structurally impossible — same defect class
 // as pass-18 (BACKUP_SUFFIX_HINTS) and pass-19 (stale_seconds).

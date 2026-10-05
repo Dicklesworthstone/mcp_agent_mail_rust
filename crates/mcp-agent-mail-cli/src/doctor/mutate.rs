@@ -1,4 +1,4 @@
-//! The `mutate()` chokepoint — every disk write under `am doctor --fix`
+//! The `mutate()` chokepoint — every disk write under `am doctor fix`
 //! flows through here.
 //!
 //! Routing every fixer-driven mutation through one function buys us:

@@ -67,25 +67,30 @@ should be escalated immediately.
 
 ## Ledger / analytics sanity (30 seconds)
 
+Git segfault retries are logged by the server, not reported by
+`am robot analytics` (it takes no `--since` and has no git-retry field):
+
 ```bash
-# Count retries in the evidence ledger (requires a running session)
-am robot analytics --format json --since 1h \
-  | jq '.git_instability // empty'
+# Retry attempts and exhausted retry budgets in the last hour
+journalctl --user -u agent-mail.service --since -1h --no-pager \
+  | grep -cE 'git_segfault_retry_attempt|git segfaulted [0-9]+ times in a row'
 ```
 
-Expect: `null` or `{"exhausted_retries": 0}` on a healthy box.
+Expect: `0` on a healthy box.
 
-**FAIL signal:** `"exhausted_retries"` > 0. This means retries
-ran out of budget and the operator has an unresolved problem.
+**FAIL signal:** any `git segfaulted N times in a row` line. Retries
+ran out of budget; point `AM_GIT_BINARY` at a supported git (see
+`docs/RECOVERY_RUNBOOK.md`).
 
 ---
 
 ## fix-orphan-refs dry-run (1-2 minutes)
 
-Surveys every registered project for orphan refs:
+Surveys every registered project for orphan refs (a dry run unless
+`--apply` is passed):
 
 ```bash
-am doctor fix-orphan-refs --all --dry-run --format json \
+am doctor fix-orphan-refs --all --format json \
   | jq '{findings: [.projects[] | .summary.findings] | add,
          projects: .summary.total_projects}'
 ```
@@ -97,7 +102,7 @@ registered project count.
 
 ```bash
 # Review what would be pruned
-am doctor fix-orphan-refs --all --dry-run --format human
+am doctor fix-orphan-refs --all --format table
 
 # If safe, apply
 am doctor fix-orphan-refs --all --apply

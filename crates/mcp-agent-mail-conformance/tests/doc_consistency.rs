@@ -417,20 +417,31 @@ fn intentionally_mutated_readme_is_rejected() {
 
 /// Validate plain doctor command examples against the shipped CLI.
 ///
-/// Recipes can include trailing redirection or a pipeline. Parse their argv;
-/// do not execute a doctor's repair while validating documentation.
+/// Recipes can include trailing redirection, a pipeline, or a line
+/// continuation. Parse their argv; do not execute a doctor's repair while
+/// validating documentation. A `<placeholder>` or a shell variable such as
+/// `"$MESSAGE_ID"` stands for one argument, checked as `1` so it satisfies a
+/// string, path, or numeric value alike.
 fn validate_doctor_recipes(doc: &str) -> Result<usize, String> {
     use clap::CommandFactory;
 
     let mut checked = 0;
     for (index, line) in doc.lines().enumerate() {
         let line = line.trim();
-        if !line.starts_with("am doctor ") {
+        if !line.starts_with("am doctor ") && !line.starts_with("am robot ") {
             continue;
         }
+        let placeholder = |word: &str| {
+            (word.len() > 2 && word.starts_with('<') && word.ends_with('>')) || word.contains('$')
+        };
         let args: Vec<_> = line
             .split_whitespace()
-            .take_while(|word| !word.starts_with(['|', '>', '<', '#']) && !word.starts_with("2>"))
+            .take_while(|word| {
+                *word != "\\"
+                    && (placeholder(word) || !word.starts_with(['|', '>', '<', '#']))
+                    && !word.starts_with("2>")
+            })
+            .map(|word| if placeholder(word) { "1" } else { word })
             .collect();
         mcp_agent_mail_cli::Cli::command()
             .try_get_matches_from(args)
@@ -456,4 +467,35 @@ fn release_doctor_recipes_parse_with_live_cli() {
             "{relative}: obsolete doctor syntax escaped the CLI parser"
         );
     }
+}
+
+/// The docs agents copy doctor and robot commands from. Each once published
+/// a spelling clap rejects (`am doctor --json`, `--reconstruct-from-archive`,
+/// `health --format json`, `fix-orphan-refs --dry-run`, `robot atc --toon`).
+#[test]
+fn agent_facing_doctor_recipes_parse_with_live_cli() {
+    for relative in [
+        "README.md",
+        "AGENTS.md",
+        "docs/OPERATOR_COOKBOOK.md",
+        "docs/OPERATOR_RUNBOOK.md",
+        "docs/OPERATOR_VERIFICATION_RUNBOOK.md",
+        "docs/RECOVERY_RUNBOOK.md",
+        "docs/RUNBOOK-atc-rollback.md",
+        "docs/MIGRATION_GUIDE.md",
+    ] {
+        let doc = read_file(workspace_root().join(relative));
+        let count =
+            validate_doctor_recipes(&doc).unwrap_or_else(|error| panic!("{relative}: {error}"));
+        assert!(count > 0, "{relative}: no doctor recipes were checked");
+    }
+    // Placeholders count as one argument, and the old flag spellings still
+    // fail through them.
+    assert_eq!(
+        validate_doctor_recipes("am doctor fix --only <fm-id> --yes\n"),
+        Ok(1)
+    );
+    assert!(validate_doctor_recipes("am doctor --fix --only <fm-id> --yes\n").is_err());
+    assert!(validate_doctor_recipes("am doctor fix-orphan-refs --all --dry-run \\\n").is_err());
+    assert!(validate_doctor_recipes("am robot atc --summary-only --toon | grep x\n").is_err());
 }

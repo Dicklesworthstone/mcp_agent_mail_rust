@@ -434,8 +434,9 @@ Every `--fix` run creates `<repo>/.doctor/runs/<ISO>__<run-id>/`:
 # Startup health probe (CI-safe; cheap)
 am doctor health
 
-# Full diagnose (offline by default)
-am doctor check --json | jq '.findings[] | select(.severity == "P0")'
+# Full diagnose (offline by default; --json exits 0, so branch on .healthy)
+am doctor check --json | jq '.checks[] | select(.status != "ok")'
+am doctor fix --list --json | jq '.per_fm[] | select(.findings_count > 0 and .severity == "P0")'
 
 # Plan-then-fix
 am doctor fix --dry-run

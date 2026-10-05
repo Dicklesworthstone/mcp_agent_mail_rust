@@ -117,12 +117,13 @@ PROJECT=/abs/path/project
 AGENT=BlueLake
 
 am robot status --project "$PROJECT" --agent "$AGENT" --format toon
-am robot inbox --project "$PROJECT" --agent "$AGENT" --urgent --format md
+am robot inbox --project "$PROJECT" --agent "$AGENT" --urgent --format toon
 am robot inbox --project "$PROJECT" --agent "$AGENT" --ack-overdue --format toon
 ```
 
-**Expected output:** A compact status summary, then a human-readable urgent
-inbox view, then a focused list of ack-overdue items.
+**Expected output:** A compact status summary, then the urgent inbox, then a
+focused list of ack-overdue items. (`--format md` is only accepted by
+`am robot thread` and `am robot message`.)
 
 **Troubleshooting:** If the inbox comes back empty unexpectedly, confirm the
 agent name spelling with `am agents list --project "$PROJECT"`. If the mailbox
@@ -164,7 +165,7 @@ print((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec='sec
 PY
 )"
 
-am robot timeline --project "$PROJECT" --agent "$AGENT" --since "$SINCE" --format md
+am robot timeline --project "$PROJECT" --agent "$AGENT" --since "$SINCE" --format toon
 am robot analytics --project "$PROJECT" --agent "$AGENT" --format toon
 ```
 
@@ -339,7 +340,7 @@ am doctor check "$PROJECT" --format toon
 am doctor backups --format toon
 
 # Reliability diagnostics (all read-only; run before any mutating repair):
-am doctor health --format json        # one-line multi-verdict health rollup
+am doctor health                      # one-line multi-verdict health rollup; exit 1 on findings
 am doctor locks --json                # owner intelligence: who holds the mailbox (live/wedged/stale)
 am doctor drain                       # is it safe_to_mutate right now? (no live owner)
 am doctor mcp-selftest --format json  # live MCP round-trip self-test

@@ -90,10 +90,10 @@ the 2.51.0 bug. (Disassemble `/usr/bin/git` around `0x1db240` if you
 want to see the faulting `testb $0x1,0x52(%r12)` — it's reading
 `cache_entry::ce_flags` after the backing mmap was invalidated.)
 
-Run `am doctor check` for a structured report (once A2 ships this):
+The doctor's known-bad-git detector gives a structured report:
 
 ```bash
-am doctor check --format json | jq '.findings[] | select(.code == "GIT_2_51_0_INDEX_RACE")'
+am doctor fix --only fm-environment_toolchain-known-bad-git-no-override --list --json
 ```
 
 ### Remediate (in order)
@@ -126,7 +126,7 @@ am doctor check --format json | jq '.findings[] | select(.code == "GIT_2_51_0_IN
 
    ```bash
    # Dry-run (default): see what would be pruned
-   am doctor fix-orphan-refs --all --dry-run --format json
+   am doctor fix-orphan-refs --all --format json
 
    # Review, then apply
    am doctor fix-orphan-refs --all --apply

@@ -5,7 +5,7 @@
 //!
 //! ## What's broken
 //!
-//! `am doctor --fix` writes per-run artifacts to `<repo>/.doctor/`.
+//! `am doctor fix` writes per-run artifacts to `<repo>/.doctor/`.
 //! If `.gitignore` doesn't exclude that directory, the operator's
 //! next `git status` shows hundreds of `.doctor/runs/<id>/backups/...`
 //! files as untracked, and a subsequent `git add -A` commits them.
@@ -131,7 +131,7 @@ impl MissingGitignoreEntryFinding {
                 "file_existed": self.file_existed,
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor --fix --only {FM_ID} --yes"),
+                command: super::fix_only_command(FM_ID),
                 explain_command: format!("am doctor explain {FM_ID}"),
                 auto_fixable: true,
                 estimated_actions: 1,

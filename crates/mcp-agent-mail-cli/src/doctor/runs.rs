@@ -1,8 +1,8 @@
 //! Per-run artifact directory management for `am doctor`.
 //!
-//! Each invocation that writes (`am doctor --fix`, future `am doctor fix`
-//! subcommand) creates `.doctor/runs/<ISO8601>__<run-id>/` inside the
-//! target repo. The layout follows OUTPUT-SCHEMA.md from the
+//! Each mutating `am doctor fix --only <fm-id>` or `am doctor
+//! archive-normalize` invocation creates `.doctor/runs/<ISO8601>__<run-id>/`
+//! inside the target repo. The layout follows OUTPUT-SCHEMA.md from the
 //! world-class-doctor-mode-for-cli-tools skill:
 //!
 //! ```text

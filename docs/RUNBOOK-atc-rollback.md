@@ -15,7 +15,7 @@ the kill-switch reference.
 
 ### Detection
 
-- `atc_derivation_errors_total` counter rising (check via `am robot atc --toon`)
+- `atc_derivation_errors_total` counter rising (check via `am robot atc --format toon`)
 - Manual spot-check of recent experience rows reveals incorrect feature vectors
   or misattributed event kinds
 - Downstream policy outputs shift without corresponding agent-behavior changes
@@ -28,12 +28,12 @@ echo "derivation bug — bad feature vectors $(date -u +%FT%TZ)" \
   > ~/.mcp_agent_mail_git_mailbox_repo/.atc_kill_switch
 
 # 2. Verify writes stopped (wait one ATC tick, ~5 sec)
-am robot atc --toon | grep -E 'kill_switch|effective_mode'
+am robot atc --format toon | grep -E 'kill_switch|effective_mode'
 # Expected: kill_switch.active = true, effective_mode = "off"
 
 # 3. Identify the bad-data window
 #    Check the last N experience rows for anomalies:
-sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 \
+sqlite3 -readonly ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 \
   "SELECT id, event_kind, created_at FROM atc_experiences ORDER BY created_at DESC LIMIT 50;"
 ```
 
@@ -56,7 +56,7 @@ sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 \
 
 - `atc.insert_experience` span p95 latency exceeds 500 microseconds
 - `send_message` tool p95 exceeds 5% over baseline (check via
-  `am robot metrics --toon` or TUI Metrics screen)
+  `am robot metrics --format toon` or TUI Metrics screen)
 - Users or agents report sluggish message delivery
 
 ### Rollback procedure
@@ -67,7 +67,7 @@ export AM_ATC_WRITE_MODE=shadow
 # Restart the server or set via runtime config
 
 # Step 2: Verify latency returns to baseline
-am robot metrics --toon | grep send_message
+am robot metrics --format toon | grep send_message
 # If p95 is still elevated after 2 minutes in shadow mode:
 
 # Step 3: Full kill switch
@@ -102,24 +102,31 @@ echo "perf regression — send_message p95 above budget $(date -u +%FT%TZ)" \
 echo "db corruption — atc tables inconsistent $(date -u +%FT%TZ)" \
   > ~/.mcp_agent_mail_git_mailbox_repo/.atc_kill_switch
 
-# 2. Take a backup before any repair
-cp ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 \
-   ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3.pre-repair-$(date +%s)
+# 2. Stop the server before touching the database file directly: the steps
+#    below write with a second SQLite engine, which must never share the file
+#    with a running Agent Mail owner. Confirm with `am doctor drain`
+#    (safe_to_mutate = true).
 
-# 3. Option A: Aggressive retention compaction (preserves good data)
-sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 \
+# 3. Take a backup before any repair (the -wal/-shm companions belong to it)
+for f in storage.sqlite3 storage.sqlite3-wal storage.sqlite3-shm; do
+  [ -e ~/.mcp_agent_mail_git_mailbox_repo/$f ] && \
+    cp ~/.mcp_agent_mail_git_mailbox_repo/$f ~/.mcp_agent_mail_git_mailbox_repo/$f.pre-repair-$(date +%s)
+done
+
+# 4. Option A: Aggressive retention compaction (preserves good data)
+sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 \
   "DELETE FROM atc_experience_rollups; DELETE FROM atc_experiences WHERE state = 'resolved';"
 
-# 3. Option B: Full truncate (loses all learning data, schema preserved)
-sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 \
+# 4. Option B: Full truncate (loses all learning data, schema preserved)
+sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 \
   "DELETE FROM atc_experience_rollups; DELETE FROM atc_experiences;"
 
-# 4. Rebuild integrity
-sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 "PRAGMA integrity_check;"
+# 5. Rebuild integrity
+sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 "PRAGMA integrity_check;"
 # Must return "ok"
 
-# 5. VACUUM to reclaim space
-sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 "VACUUM;"
+# 6. VACUUM to reclaim space
+sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 "VACUUM;"
 ```
 
 **Expected time-to-rollback:** < 1 minute (kill switch + backup), 1-5 minutes
@@ -153,13 +160,14 @@ sqlite3 ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3 "VACUUM;"
 echo "schema migration failure $(date -u +%FT%TZ)" \
   > ~/.mcp_agent_mail_git_mailbox_repo/.atc_kill_switch
 
-# 3. Restore pre-migration backup
-#    If automatic backup exists:
-cp ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3.pre-migration \
-   ~/.mcp_agent_mail_git_mailbox_repo/agent_mail.sqlite3
+# 3. Restore a backup taken before the migration, if one exists:
+am doctor backups                          # list available backups
+am doctor restore <backup-path> --dry-run
+am doctor restore <backup-path> --yes
 
 #    If no backup, reconstruct from Git archive:
-am doctor --reconstruct-from-archive
+am doctor reconstruct --dry-run
+am doctor reconstruct --yes
 
 # 4. Downgrade binary to previous version
 #    (use the previous release binary or git checkout the prior tag)
