@@ -217,6 +217,7 @@ pub fn try_begin_write_activity() -> Option<WriteActivityGuard> {
         return None;
     }
     state.writers = state.writers.checked_add(1)?;
+    drop(state);
     Some(WriteActivityGuard { _priv: () })
 }
 
@@ -1409,7 +1410,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !barrier().state.lock().unwrap().promotion_active {
-            assert!(Instant::now() < deadline, "promotion never closed admission");
+            assert!(
+                Instant::now() < deadline,
+                "promotion never closed admission"
+            );
             std::thread::yield_now();
         }
         // Model a replay batch already holding its generation lease. This
@@ -1432,11 +1436,16 @@ mod tests {
         if run_in_isolated_process() {
             return;
         }
-        assert!(std::thread::spawn(|| {
-            let _state = barrier().state.lock().unwrap();
-            panic!("poison admission metadata");
-        }).join().is_err());
-        let writer = try_begin_write_activity().expect("same poison recovery as blocking admission");
+        assert!(
+            std::thread::spawn(|| {
+                let _state = barrier().state.lock().unwrap();
+                panic!("poison admission metadata");
+            })
+            .join()
+            .is_err()
+        );
+        let writer =
+            try_begin_write_activity().expect("same poison recovery as blocking admission");
         assert_eq!(active_writer_count(), 1);
         drop(writer);
         assert_eq!(active_writer_count(), 0);
