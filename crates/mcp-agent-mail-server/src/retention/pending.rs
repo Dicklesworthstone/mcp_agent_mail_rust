@@ -1,14 +1,16 @@
 //! Replay durable closeout intents without requiring the original client to return.
 //!
 //! This worker is independent of archive maintenance and destructive retention.
-//! A pass reads independent verified ACK and release snapshots, then attempts
-//! at most sixteen mutations per kind. The reader bounds each record and pins
-//! its initial EOF; the mutation bound is not a hard deadline on filesystem I/O. Failed
-//! intents remain queued without appending another failure record every tick.
+//! Independent, incremental ACK and release scans admit no mutation before a
+//! complete, handle-validated snapshot. A scan step consumes at most 256 KiB or
+//! 256 records; snapshots, retained identities and pending payloads have explicit
+//! admission bounds. At most sixteen mutations follow per kind. These are work
+//! bounds, not hard deadlines on filesystem I/O or an individual DB operation.
+//! Failed intents remain queued without another failure record every tick.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::{Cx, Outcome};
 use fastmcp::prelude::McpContext;
@@ -20,11 +22,13 @@ use mcp_agent_mail_tools::degraded_intents::{
 use mcp_agent_mail_tools::tool_util::{resolve_agent, resolve_existing_project};
 use serde_json::json;
 
+mod journal_scan;
 mod releases;
 
 const MAX_ATTEMPTS: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CATCH_UP_INTERVAL: Duration = Duration::from_secs(1);
+const SCAN_INTERVAL: Duration = Duration::from_millis(100);
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -90,23 +94,114 @@ struct ReplayCursors {
 }
 
 struct Snapshots {
-    acknowledgements: std::io::Result<Vec<QueuedAckIntent>>,
-    releases: std::io::Result<Vec<QueuedReleaseIntentView>>,
+    // None means scanning or waiting for this lane's next poll. It must not
+    // reset the mutation cursor or authorize opening a database connection.
+    acknowledgements: std::io::Result<Option<Vec<QueuedAckIntent>>>,
+    releases: std::io::Result<Option<Vec<QueuedReleaseIntentView>>>,
 }
 
 impl Snapshots {
+    #[cfg(test)]
     fn read(config: &Config) -> Self {
-        // An unknown schema or damaged journal in one kind must not suppress
-        // the other kind's independent, verified recovery work.
+        fn complete(config: &Config, kind: journal_scan::Kind) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
+            let mut scanner = journal_scan::Scanner::new(kind);
+            loop {
+                match scanner.poll(config, &AtomicBool::new(false))? {
+                    Some(items) => return Ok(Some(items)),
+                    None => continue,
+                }
+            }
+        }
         Self {
-            acknowledgements: journal::read_queued_ack_intents(config),
-            releases: journal::read_queued_release_intents(config),
+            acknowledgements: ack_snapshot(complete(config, journal_scan::Kind::Ack)),
+            releases: release_snapshot(complete(config, journal_scan::Kind::Release)),
         }
     }
 
     fn needs_db(&self) -> bool {
-        self.acknowledgements.as_ref().is_ok_and(|items| !items.is_empty())
-            || self.releases.as_ref().is_ok_and(|items| !items.is_empty())
+        self.acknowledgements.as_ref().is_ok_and(|items| items.as_ref().is_some_and(|items| !items.is_empty()))
+            || self.releases.as_ref().is_ok_and(|items| items.as_ref().is_some_and(|items| !items.is_empty()))
+    }
+}
+
+fn ack_snapshot(result: std::io::Result<Option<Vec<journal_scan::Intent>>>) -> std::io::Result<Option<Vec<QueuedAckIntent>>> {
+    result?.map(|items| items.into_iter().map(|item| match item {
+        journal_scan::Intent::Ack(intent) => Ok(intent),
+        journal_scan::Intent::Release(_) => Err(std::io::Error::other("release in acknowledgement snapshot")),
+    }).collect()).transpose()
+}
+
+fn release_snapshot(result: std::io::Result<Option<Vec<journal_scan::Intent>>>) -> std::io::Result<Option<Vec<QueuedReleaseIntentView>>> {
+    result?.map(|items| items.into_iter().map(|item| match item {
+        journal_scan::Intent::Release(intent) => Ok(intent),
+        journal_scan::Intent::Ack(_) => Err(std::io::Error::other("acknowledgement in release snapshot")),
+    }).collect()).transpose()
+}
+
+struct ScanLane {
+    scanner: journal_scan::Scanner,
+    scanning: bool,
+    next_scan: Option<Instant>,
+}
+
+impl ScanLane {
+    fn new(kind: journal_scan::Kind) -> Self {
+        Self { scanner: journal_scan::Scanner::new(kind), scanning: false, next_scan: None }
+    }
+
+    fn poll(&mut self, config: &Config, shutdown: &AtomicBool, now: Instant) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
+        if !shutdown.load(Ordering::Acquire) && !self.scanning
+            && self.next_scan.is_some_and(|next| now < next)
+        {
+            return Ok(None);
+        }
+        let result = self.scanner.poll(config, shutdown);
+        self.scanning = matches!(result.as_ref(), Ok(None));
+        if !self.scanning {
+            // Errors, missing journals, and completed scans all have their own
+            // backoff. Another lane's catch-up cannot hammer this source.
+            self.next_scan = Some(now + POLL_INTERVAL);
+        }
+        result
+    }
+
+    fn replay_finished(&mut self, report: &ReplayReport, now: Instant) {
+        if report.completed > 0 && report.more && report.deferred == 0 && !report.interrupted {
+            self.next_scan = Some(now + CATCH_UP_INTERVAL);
+        }
+    }
+
+    fn next_delay(&self, now: Instant) -> Duration {
+        if self.scanning {
+            SCAN_INTERVAL
+        } else {
+            self.next_scan.map_or(Duration::ZERO, |next| next.saturating_duration_since(now))
+        }
+    }
+}
+
+struct SnapshotReaders {
+    acknowledgements: ScanLane,
+    releases: ScanLane,
+}
+
+impl SnapshotReaders {
+    fn new() -> Self {
+        Self {
+            acknowledgements: ScanLane::new(journal_scan::Kind::Ack),
+            releases: ScanLane::new(journal_scan::Kind::Release),
+        }
+    }
+
+    fn poll(&mut self, config: &Config, shutdown: &AtomicBool, now: Instant) -> Snapshots {
+        Snapshots {
+            acknowledgements: ack_snapshot(self.acknowledgements.poll(config, shutdown, now)),
+            releases: release_snapshot(self.releases.poll(config, shutdown, now)),
+        }
+    }
+
+    fn next_delay(&self, now: Instant) -> Duration {
+        self.acknowledgements.next_delay(now).min(self.releases.next_delay(now))
     }
 }
 
@@ -187,6 +282,7 @@ fn pool_config(config: &Config) -> DbPoolConfig {
 
 fn run(config: &Config) {
     let mut cursors = ReplayCursors::default();
+    let mut readers = SnapshotReaders::new();
     let mut pool = None;
     // Give startup admission priority; no client request is needed thereafter.
     if sleep_until_next_pass(CATCH_UP_INTERVAL) {
@@ -196,7 +292,7 @@ fn run(config: &Config) {
         if SHUTDOWN.load(Ordering::Acquire) {
             return;
         }
-        let snapshots = Snapshots::read(config);
+        let snapshots = readers.poll(config, &SHUTDOWN, Instant::now());
         if !snapshots.needs_db() {
             // Do not retain a connection for an idle, healthy mailbox.
             pool = None;
@@ -219,9 +315,11 @@ fn run(config: &Config) {
                 ],
             }
         });
-        let mut catch_up = false;
         let mut deferred = false;
-        for (kind, result) in ["acknowledgement", "release"].into_iter().zip(results) {
+        for ((kind, lane), result) in [
+            ("acknowledgement", &mut readers.acknowledgements),
+            ("release", &mut readers.releases),
+        ].into_iter().zip(results) {
             match result {
                 Ok(report) => {
                     if report.attempted > 0 || report.interrupted {
@@ -232,7 +330,7 @@ fn run(config: &Config) {
                             more = report.more, interrupted = report.interrupted,
                             "durable closeout replay pass completed");
                     }
-                    catch_up |= report.completed > 0 && report.more;
+                    lane.replay_finished(&report, Instant::now());
                     deferred |= report.deferred > 0 || report.interrupted;
                 }
                 Err(error) => {
@@ -246,11 +344,7 @@ fn run(config: &Config) {
             // A repaired database may have replaced the old generation.
             pool = None;
         }
-        let interval = if catch_up && !deferred {
-            CATCH_UP_INTERVAL
-        } else {
-            POLL_INTERVAL
-        };
+        let interval = readers.next_delay(Instant::now());
         if sleep_until_next_pass(interval) {
             return;
         }
@@ -268,11 +362,12 @@ async fn replay_snapshots(
     snapshots: Snapshots,
 ) -> [Result<ReplayReport, String>; 2] {
     let ack = match snapshots.acknowledgements {
-        Ok(intents) if intents.is_empty() => {
+        Ok(None) => Ok(ReplayReport::default()),
+        Ok(Some(intents)) if intents.is_empty() => {
             cursors.acknowledgements = RoundCursor::default();
             Ok(ReplayReport::default())
         }
-        Ok(intents) => match pool {
+        Ok(Some(intents)) => match pool {
             Some(pool) => replay_ack_batch(
                 cx, pool, config, &mut cursors.acknowledgements, shutdown, &intents,
             ).await,
@@ -281,11 +376,12 @@ async fn replay_snapshots(
         Err(error) => Err(format!("durable acknowledgement journal unavailable: {error}")),
     };
     let release = match snapshots.releases {
-        Ok(intents) if intents.is_empty() => {
+        Ok(None) => Ok(ReplayReport::default()),
+        Ok(Some(intents)) if intents.is_empty() => {
             cursors.releases = RoundCursor::default();
             Ok(ReplayReport::default())
         }
-        Ok(intents) => match pool {
+        Ok(Some(intents)) => match pool {
             Some(pool) => releases::replay_batch(
                 cx, pool, config, &mut cursors.releases, shutdown, &intents,
             ).await,
@@ -492,6 +588,142 @@ fn append_ack_completion(
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
+
+    fn append_release_fixture(config: &Config, lease_id: i64) {
+        let mut record = json!({
+            "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
+            "created_ts": mcp_agent_mail_db::now_micros(),
+            "project_key": "/replay", "agent_name": "BlueLake",
+            "paths": null, "file_reservation_ids": [lease_id],
+            "failure": {"stage": "test", "error_detail": "busy"},
+        });
+        let hash = journal::hash_json_value(&record);
+        record["intent_id"] = json!(&hash[..16]);
+        record["content_sha256"] = json!(hash);
+        journal::append_jsonl(config, journal::RELEASE_INTENT_LOG_FILE,
+            ".release_file_reservations.jsonl.lock", &record).unwrap();
+    }
+
+    #[test]
+    fn partial_scans_do_not_reset_cursors_or_admit_database_work() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config { storage_root: temp.path().to_path_buf(), ..Config::default() };
+        journal::append_ack_intent(&config, "/replay", "BlueLake", 1, "test", "busy", None).unwrap();
+        let path = journal::log_path(&config, journal::ACK_INTENT_LOG_FILE);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(&vec![b'\n'; 256]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let stop = AtomicBool::new(false);
+        let now = Instant::now();
+        let mut readers = SnapshotReaders::new();
+        let first = readers.poll(&config, &stop, now);
+        assert!(first.acknowledgements.as_ref().unwrap().is_none());
+        assert!(!first.needs_db(), "a valid prefix is not an admitted snapshot");
+        assert_eq!(readers.next_delay(now), SCAN_INTERVAL);
+        let mut cursors = ReplayCursors::default();
+        let after = (100, "a".repeat(64));
+        cursors.acknowledgements.after = Some(after.clone());
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let cx = Cx::current().unwrap();
+            let results = replay_snapshots(&cx, None, &config, &mut cursors, &stop, first).await;
+            assert!(results.into_iter().all(|result| result.unwrap().attempted == 0));
+        });
+        assert_eq!(cursors.acknowledgements.after, Some(after));
+        let second = readers.poll(&config, &stop, now + SCAN_INTERVAL);
+        assert!(second.needs_db());
+        assert_eq!(second.acknowledgements.unwrap().unwrap().len(), 1);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn source_error_backoff_does_not_throttle_the_other_lanes_catch_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config { storage_root: temp.path().to_path_buf(), ..Config::default() };
+        journal::append_jsonl(&config, journal::ACK_INTENT_LOG_FILE, journal::ACK_INTENT_LOCK_FILE,
+            &json!({"schema_version": 99, "kind": journal::ACK_INTENT_KIND})).unwrap();
+        append_release_fixture(&config, 1);
+        let now = Instant::now();
+        let stop = AtomicBool::new(false);
+        let mut readers = SnapshotReaders::new();
+        let first = readers.poll(&config, &stop, now);
+        assert!(first.acknowledgements.is_err());
+        assert_eq!(first.releases.unwrap().unwrap().len(), 1);
+        readers.releases.replay_finished(&ReplayReport {
+            completed: MAX_ATTEMPTS, more: true, ..ReplayReport::default()
+        }, now);
+        assert_eq!(readers.next_delay(now), CATCH_UP_INTERVAL);
+        let fast = readers.poll(&config, &stop, now + CATCH_UP_INTERVAL);
+        assert!(fast.acknowledgements.unwrap().is_none(), "error lane keeps its own backoff");
+        assert_eq!(fast.releases.unwrap().unwrap().len(), 1);
+        assert!(readers.poll(&config, &stop, now + POLL_INTERVAL).acknowledgements.is_err());
+    }
+
+    #[test]
+    fn late_unknown_ack_schema_cannot_mutate_db_while_release_lane_recovers() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            database_url: format!("sqlite://{}", temp.path().join("mail.sqlite3").display()),
+            ..Config::default()
+        };
+        let mut selected = pool_config(&config);
+        selected.run_migrations = true;
+        let pool = DbPool::new(&selected).unwrap();
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let cx = Cx::current().unwrap();
+            let project = queries::ensure_project(&cx, &pool, "/replay").await.into_result().unwrap();
+            let project_id = project.id.unwrap();
+            let agent = queries::register_agent(&cx, &pool, project_id, "BlueLake",
+                "codex-cli", "test", None, None, None).await.into_result().unwrap();
+            let agent_id = agent.id.unwrap();
+            let message = queries::create_message_with_recipients(&cx, &pool, project_id,
+                agent_id, "must stay unacknowledged", "body", None, "normal", true,
+                "[]", &[(agent_id, "to")]).await.into_result().unwrap();
+            let leases = queries::create_file_reservations(&cx, &pool, project_id, agent_id,
+                &["src/recover.rs"], 3600, true, "pending release").await.into_result().unwrap();
+            let lease_id = leases[0].id.unwrap();
+            append_release_fixture(&config, lease_id);
+            journal::append_ack_intent(&config, "/replay", "BlueLake", message.id.unwrap(),
+                "test", "busy", None).unwrap();
+            let path = journal::log_path(&config, journal::ACK_INTENT_LOG_FILE);
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap()
+                .write_all(&vec![b'\n'; 256]).unwrap();
+            journal::append_jsonl(&config, journal::ACK_INTENT_LOG_FILE, journal::ACK_INTENT_LOCK_FILE,
+                &json!({"schema_version": 99, "kind": journal::ACK_INTENT_REPLAY_KIND})).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let stop = AtomicBool::new(false);
+            let now = Instant::now();
+            let mut readers = SnapshotReaders::new();
+            let mut cursors = ReplayCursors::default();
+            let first = readers.poll(&config, &stop, now);
+            assert!(first.acknowledgements.as_ref().unwrap().is_none());
+            assert!(first.needs_db(), "the independent release is ready");
+            let [ack, release] = replay_snapshots(&cx, Some(&pool), &config,
+                &mut cursors, &stop, first).await;
+            assert_eq!(ack.unwrap().attempted, 0);
+            assert_eq!(release.unwrap().completed, 1);
+            let next = readers.poll(&config, &stop, now + SCAN_INTERVAL);
+            assert!(next.acknowledgements.is_err());
+            let [ack, release] = replay_snapshots(&cx, Some(&pool), &config,
+                &mut cursors, &stop, next).await;
+            assert!(ack.is_err());
+            assert_eq!(release.unwrap().attempted, 0);
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT ack_ts FROM message_recipients WHERE message_id = ?",
+                &[message.id.unwrap().into()]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+            drop(conn);
+            let rows = queries::get_reservations_by_ids(&cx, &pool, &[lease_id]).await.into_result().unwrap();
+            assert!(rows[0].released_ts.is_some_and(|ts| ts > 0));
+            assert!(journal::read_queued_release_intents(&config).unwrap().is_empty());
+            assert_eq!(std::fs::read(path).unwrap(), before);
+            mcp_agent_mail_storage::flush_async_commits();
+        });
+    }
 
     fn keys(values: &[i64]) -> Vec<IntentKey> {
         values.iter().map(|value| (*value, format!("{value:064}"))).collect()
