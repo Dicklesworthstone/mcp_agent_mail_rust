@@ -3,8 +3,10 @@
 //! A queued release is not a standing order against future leases. Resolve
 //! only existing identities, intersect path and ID filters, and recheck the
 //! original creation cutoff inside the database mutation transaction. Archive
-//! publication follows the existing terminal-release path; its result is not
-//! a certificate for the entire archive.
+//! repair re-reads live terminal authority and writes only a generation-stamped
+//! stable artifact. Captured release payloads are never queued: a digest alias
+//! may already name a newer lease. Completion receipts certify the DB operation,
+//! not the entire archive.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use asupersync::Cx;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, pattern_overlap::CompiledPattern};
-use mcp_agent_mail_db::{DbPool, FileReservationRow, micros_to_iso, queries};
+use mcp_agent_mail_db::{DbPool, FileReservationRow, queries};
+use mcp_agent_mail_storage::recovery::reservation_reconcile::reconcile_released_reservation;
 use mcp_agent_mail_tools::degraded_intents::{self as journal, QueuedReleaseIntentView};
 use mcp_agent_mail_tools::tool_util::{resolve_agent, resolve_existing_project};
 use serde_json::json;
@@ -20,6 +23,7 @@ use serde_json::json;
 use super::{MAX_ATTEMPTS, ReplayReport, RoundCursor, db_value, validate_live_pool};
 
 const RELEASE_LOCK: &str = ".release_file_reservations.jsonl.lock";
+const MAX_ARCHIVE_REPAIRS_PER_BATCH: usize = 4;
 
 pub(super) async fn replay_batch(
     cx: &Cx,
@@ -42,6 +46,7 @@ pub(super) async fn replay_batch(
     let candidates = cursor.candidates(&keys);
     report.more = candidates.len() > MAX_ATTEMPTS;
     let ctx = McpContext::new(cx.clone(), 0);
+    let mut archive_budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
     for index in candidates.into_iter().take(MAX_ATTEMPTS) {
         if shutdown.load(Ordering::Acquire) || ctx.checkpoint().is_err() {
             report.interrupted = true;
@@ -51,7 +56,7 @@ pub(super) async fn replay_batch(
         let intent = &intents[index];
         cursor.after = Some(keys[index].clone());
         report.attempted += 1;
-        match apply_release(&ctx, pool, config, intent).await {
+        match apply_release(&ctx, pool, config, intent, &mut archive_budget).await {
             Ok(released) => {
                 report.applied += 1;
                 report.rows_released += released;
@@ -189,6 +194,7 @@ async fn apply_release(
     pool: &DbPool,
     config: &Config,
     intent: &QueuedReleaseIntentView,
+    archive_budget: &mut usize,
 ) -> Result<usize, String> {
     if intent.created_ts <= 0 {
         return Err("queued release has no positive creation cutoff".to_string());
@@ -227,6 +233,10 @@ async fn apply_release(
     } else {
         None
     };
+    // Capture authority before the mutation, never stamp old rows with a token
+    // read after recovery may have replaced the database. A failed lookup can
+    // defer archive repair but must not turn into an unstamped legacy write.
+    let generation = db_value(queries::db_generation_id(ctx.cx(), pool).await);
     // Some(empty) stays an empty selection, never an unrestricted release.
     // Ownership and the original cutoff are enforced again by the transaction.
     let released = db_value(
@@ -241,49 +251,55 @@ async fn apply_release(
         )
         .await,
     )?;
-    if !released.is_empty() {
-        let generation = db_value(queries::db_generation_id(ctx.cx(), pool).await)
-            .ok()
-            .flatten();
-        let reservations = released
-            .iter()
-            .map(|row| {
-                let mut value = json!({
-                    "id": row.id.unwrap_or(0), "project": project.human_key, "agent": agent.name,
-                    "path_pattern": row.path_pattern, "exclusive": row.exclusive != 0,
-                    "reason": row.reason, "created_ts": micros_to_iso(row.created_ts),
-                    "expires_ts": micros_to_iso(row.expires_ts),
-                    "released_ts": row.released_ts.map(micros_to_iso),
-                });
-                if let Some(generation) = generation.as_ref().filter(|value| !value.is_empty()) {
-                    value["db_generation"] = json!(generation);
-                }
-                value
-            })
-            .collect();
-        let op = mcp_agent_mail_storage::WriteOp::FileReservation {
-            project_slug: project.slug,
-            config: config.clone(),
-            reservations,
-        };
-        match mcp_agent_mail_storage::write_op_sync_direct(&op) {
-            mcp_agent_mail_storage::DirectArchiveWrite::Written => {}
-            mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {
-                tracing::warn!("release applied; disk pressure defers archive convergence");
+    reconcile_release_archive(ctx.cx(), pool, config, &released, &generation, archive_budget);
+    Ok(released.len())
+}
+
+/// Repair at most the remaining per-pass budget; failures consume it too.
+/// The release ledger, not a queued snapshot of these rows, is the retry source.
+fn reconcile_release_archive(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    released: &[FileReservationRow],
+    captured_generation: &Result<Option<String>, String>,
+    budget: &mut usize,
+) -> usize {
+    if released.is_empty() {
+        return 0;
+    }
+    let generation = match captured_generation {
+        Ok(Some(generation)) if !generation.is_empty() => generation.as_str(),
+        Ok(_) => {
+            tracing::warn!(released = released.len(),
+                "release applied; missing generation defers archive repair without a legacy write");
+            return 0;
+        }
+        Err(error) => {
+            tracing::warn!(%error, released = released.len(),
+                "release applied; generation lookup failed, archive repair deferred");
+            return 0;
+        }
+    };
+    let attempted = released.len().min(*budget);
+    *budget -= attempted;
+    for row in released.iter().take(attempted) {
+        match reconcile_released_reservation(cx, pool, config, row, generation) {
+            Ok(repaired) => {
+                tracing::debug!(reservation_id = ?row.id, repaired,
+                    "replayed release stable artifact verified against the live mailbox");
             }
-            mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
-                // Only terminal artifacts are queued here. A later retry cannot
-                // resurrect an ACTIVE grant or act on the agent's future leases.
-                let queued = match mcp_agent_mail_storage::archive_backlog_push(op) {
-                    mcp_agent_mail_storage::ArchiveBacklogPush::Queued => "durable",
-                    mcp_agent_mail_storage::ArchiveBacklogPush::QueuedEphemeral => "ephemeral",
-                    mcp_agent_mail_storage::ArchiveBacklogPush::Dropped => "full",
-                };
-                tracing::warn!(%error, queued, "release applied; archive retry requested");
+            Err(error) => {
+                tracing::warn!(reservation_id = ?row.id, %error,
+                    "release applied; archive evidence preserved for live-state reconciliation");
             }
         }
     }
-    Ok(released.len())
+    if attempted < released.len() {
+        tracing::debug!(remaining = released.len() - attempted,
+            "release archive repair budget exhausted; history reconciliation retains the remaining work");
+    }
+    attempted
 }
 
 fn append_completion(
@@ -311,6 +327,7 @@ fn append_completion(
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
+    use mcp_agent_mail_db::micros_to_iso;
 
     fn queue(config: &Config, created_ts: i64, paths: Option<Vec<String>>, ids: Option<Vec<i64>>) {
         let mut payload = json!({
@@ -652,5 +669,213 @@ mod tests {
             );
             mcp_agent_mail_storage::flush_async_commits();
         });
+    }
+
+    fn with_replay_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config, &str, &str)) {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let config = Config {
+                storage_root: temp.path().join("archive"),
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
+                ..Config::default()
+            };
+            std::fs::create_dir_all(&config.storage_root).unwrap();
+            let project_root = temp.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let project_key = project_root.to_string_lossy().into_owned();
+            let mut selected = super::super::pool_config(&config);
+            selected.run_migrations = true;
+            let pool = DbPool::new(&selected).unwrap();
+            let cx = Cx::for_testing();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let escaped_key = project_key.replace('\'', "''");
+            conn.execute_raw(&format!("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'replay', '{escaped_key}', 1)")).unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
+            drop(conn);
+            let generation = fastmcp_core::block_on(queries::db_generation_id(&cx, &pool))
+                .into_result().unwrap().expect("file mailbox generation");
+            test(&cx, &pool, &config, &generation, &project_key);
+            mcp_agent_mail_storage::flush_async_commits();
+        });
+    }
+
+    fn seed_replay_lease(cx: &Cx, pool: &DbPool, id: i64, pattern: &str, created: i64) -> FileReservationRow {
+        let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+        let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
+        conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, '{pattern}', 1, 'test lease', {created}, {expires}, NULL)")).unwrap();
+        drop(conn);
+        fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[id]))
+            .into_result().unwrap().into_iter().next().unwrap()
+    }
+
+    fn queue_fixture_release(config: &Config, cutoff: i64, id: i64) {
+        let mut record = json!({
+            "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
+            "created_ts": cutoff, "project_key": "replay", "agent_name": "BlueLake",
+            "paths": null, "file_reservation_ids": [id],
+            "failure": {"stage": "test", "error_detail": "database unavailable"},
+        });
+        let hash = journal::hash_json_value(&record);
+        record["intent_id"] = json!(&hash[..16]);
+        record["content_sha256"] = json!(hash);
+        journal::append_jsonl(config, journal::RELEASE_INTENT_LOG_FILE, RELEASE_LOCK, &record).unwrap();
+    }
+
+    fn replay_fixture(cx: &Cx, pool: &DbPool, config: &Config, intents: &[QueuedReleaseIntentView]) -> ReplayReport {
+        fastmcp_core::block_on(replay_batch(
+            cx, pool, config, &mut RoundCursor::default(), &AtomicBool::new(false), intents,
+        )).unwrap()
+    }
+
+    fn lease_artifact(row: &FileReservationRow, generation: &str, project_key: &str) -> serde_json::Value {
+        json!({
+            "id": row.id, "project": project_key, "agent": "BlueLake",
+            "path_pattern": row.path_pattern, "exclusive": row.exclusive != 0,
+            "reason": row.reason, "created_ts": micros_to_iso(row.created_ts),
+            "expires_ts": micros_to_iso(row.expires_ts),
+            "released_ts": row.released_ts.map(micros_to_iso),
+            "db_generation": generation,
+        })
+    }
+
+    #[test]
+    fn replay_does_not_overwrite_a_newer_live_lease_digest_alias() {
+        with_replay_mailbox(|cx, pool, config, generation, project_key| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/shared.rs", cutoff - 1);
+            let newer = seed_replay_lease(cx, pool, 402, "src/shared.rs", cutoff + 1);
+            let archive = mcp_agent_mail_storage::ensure_archive(config, "replay").unwrap();
+            mcp_agent_mail_storage::write_file_reservation_record(
+                &archive, config, &lease_artifact(&newer, generation, project_key),
+            ).unwrap();
+            mcp_agent_mail_storage::flush_async_commits();
+            let directory = archive.root.join("file_reservations");
+            // sha1("src/shared.rs"), the actual reusable path written above.
+            let alias = directory.join("137d3ab6a41fd6fbc01bec4392b65aa81bb8ae90.json");
+            let stable = |id| directory.join(
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), id),
+            );
+            let alias_before = std::fs::read(&alias).unwrap();
+            let newer_before = std::fs::read(stable(402)).unwrap();
+            queue_fixture_release(config, cutoff, 401);
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            let report = replay_fixture(cx, pool, config, &intents);
+            assert_eq!((report.completed, report.rows_released, report.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401, 402]))
+                .into_result().unwrap();
+            assert!(rows.iter().find(|row| row.id == Some(401)).unwrap().released_ts.is_some());
+            assert!(rows.iter().find(|row| row.id == Some(402)).unwrap().is_active());
+            let released: serde_json::Value = serde_json::from_slice(&std::fs::read(stable(401)).unwrap()).unwrap();
+            assert_eq!(released["db_generation"], generation);
+            assert!(released["released_ts"].is_string());
+            assert_eq!(std::fs::read(&alias).unwrap(), alias_before);
+            assert_eq!(std::fs::read(stable(402)).unwrap(), newer_before);
+            let repeated = replay_fixture(cx, pool, config, &intents);
+            assert_eq!(repeated.rows_released, 0);
+            assert_eq!(std::fs::read(&alias).unwrap(), alias_before);
+        });
+    }
+
+    #[test]
+    fn replay_completes_db_release_without_overwriting_conflicting_archive_evidence() {
+        with_replay_mailbox(|cx, pool, config, generation, project_key| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            let old = seed_replay_lease(cx, pool, 401, "src/owned.rs", cutoff - 1);
+            let archive = mcp_agent_mail_storage::ensure_archive(config, "replay").unwrap();
+            let directory = archive.root.join("file_reservations");
+            std::fs::create_dir_all(&directory).unwrap();
+            let stable = directory.join(
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), 401),
+            );
+            let foreign = lease_artifact(&old, &format!("ff{generation}"), project_key);
+            let before = serde_json::to_vec_pretty(&foreign).unwrap();
+            std::fs::write(&stable, &before).unwrap();
+            queue_fixture_release(config, cutoff, 401);
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            let report = replay_fixture(cx, pool, config, &intents);
+            assert_eq!((report.completed, report.rows_released, report.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            mcp_agent_mail_storage::flush_async_commits();
+            assert_eq!(std::fs::read(&stable).unwrap(), before);
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
+                .into_result().unwrap();
+            assert!(rows[0].released_ts.is_some());
+        });
+    }
+
+    #[test]
+    fn missing_generation_never_falls_back_to_an_unstamped_archive_write() {
+        with_replay_mailbox(|cx, pool, config, generation, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/owned.rs", cutoff - 1);
+            let released = fastmcp_core::block_on(queries::release_reservations_with_created_cutoff(
+                cx, pool, 71, 81, None, Some(&[401]), Some(cutoff),
+            )).into_result().unwrap();
+            assert_eq!(released.len(), 1);
+            let archive = mcp_agent_mail_storage::ensure_archive(config, "replay").unwrap();
+            let directory = archive.root.join("file_reservations");
+            std::fs::create_dir_all(&directory).unwrap();
+            let legacy = directory.join("id-401.json");
+            let before = b"prior generation evidence must not be interpreted as a current lease";
+            std::fs::write(&legacy, before).unwrap();
+            let stable = directory.join(
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), 401),
+            );
+            for unavailable in [Ok(None), Ok(Some(String::new())), Err("generation read failed".to_string())] {
+                let mut budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
+                assert_eq!(reconcile_release_archive(cx, pool, config, &released, &unavailable, &mut budget), 0);
+                assert_eq!(budget, MAX_ARCHIVE_REPAIRS_PER_BATCH);
+                assert_eq!(std::fs::read(&legacy).unwrap(), before);
+                assert!(!stable.exists());
+            }
+        });
+    }
+
+    #[test]
+    fn replay_archive_budget_is_shared_across_intents_and_failed_publications() {
+        for fail_git in [false, true] {
+            with_replay_mailbox(|cx, pool, config, generation, _| {
+                let cutoff = mcp_agent_mail_db::now_micros();
+                let ids: Vec<_> = (401..407).collect();
+                for &id in &ids {
+                    seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+                    queue_fixture_release(config, cutoff, id);
+                }
+                let archive = mcp_agent_mail_storage::ensure_archive(config, "replay").unwrap();
+                let mut selected = config.clone();
+                if fail_git {
+                    selected.git_author_name = "invalid\0author".into();
+                }
+                let intents = journal::read_queued_release_intents(config).unwrap();
+                let report = replay_fixture(cx, pool, &selected, &intents);
+                assert_eq!((report.attempted, report.completed, report.rows_released, report.deferred), (6, 6, 6, 0));
+                assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+                let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                    .into_result().unwrap();
+                assert!(rows.iter().all(|row| row.released_ts.is_some()));
+                let path = |id| archive.root.join("file_reservations").join(
+                    mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), id),
+                );
+                assert_eq!(ids.iter().filter(|&&id| path(id).exists()).count(), MAX_ARCHIVE_REPAIRS_PER_BATCH);
+
+                // Remaining or uncommitted rows converge from the release
+                // ledger; no captured WriteOp needs to survive this pass.
+                let mut cursor = mcp_agent_mail_storage::recovery::reservation_reconcile::ReservationReconcileCursor::default();
+                for _ in 0..3 {
+                    mcp_agent_mail_storage::recovery::reservation_reconcile::reconcile_reservation_releases(
+                        cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                    ).unwrap();
+                }
+                for id in ids {
+                    let artifact: serde_json::Value = serde_json::from_slice(&std::fs::read(path(id)).unwrap()).unwrap();
+                    assert_eq!(artifact["id"], id);
+                    assert_eq!(artifact["db_generation"], generation);
+                    assert!(artifact["released_ts"].is_string());
+                }
+            });
+        }
     }
 }
