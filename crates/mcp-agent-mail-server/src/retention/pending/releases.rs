@@ -425,10 +425,9 @@ mod tests {
         queue(&config, 10, None, None);
         let intents = journal::read_queued_release_intents(&config).unwrap();
         append_completion(&config, &intents[0], 2).unwrap();
-        assert!(
-            journal::read_queued_release_intents(&config)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            journal::read_queued_release_intents(&config).unwrap(),
+            [] as [QueuedReleaseIntentView; 0]
         );
         journal::append_jsonl(
             &config,
@@ -585,10 +584,9 @@ mod tests {
                 ),
                 (1, 1, 1, 0)
             );
-            assert!(
-                journal::read_queued_release_intents(&config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(&config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             let rows =
                 queries::get_reservations_by_ids(&cx, &pool, &[old_id, doc_id, fresh_id, other_id])
@@ -605,10 +603,10 @@ mod tests {
                 .await
                 .into_result()
                 .unwrap();
-            let file = match generation.filter(|value| !value.is_empty()) {
-                Some(generation) => format!("id-{old_id}-g{generation}.json"),
-                None => format!("id-{old_id}.json"),
-            };
+            let file = generation.filter(|value| !value.is_empty()).map_or_else(
+                || format!("id-{old_id}.json"),
+                |generation| format!("id-{old_id}-g{generation}.json"),
+            );
             let artifact: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(archive.root.join("file_reservations").join(file)).unwrap(),
             )
@@ -643,10 +641,9 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(empty.rows_released, 0);
-                assert!(
-                    journal::read_queued_release_intents(&config)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    journal::read_queued_release_intents(&config).unwrap(),
+                    [] as [QueuedReleaseIntentView; 0]
                 );
             }
             // Unfiltered replay still applies the original transaction cutoff.

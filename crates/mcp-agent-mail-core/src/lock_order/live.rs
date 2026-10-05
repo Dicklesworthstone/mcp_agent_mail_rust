@@ -4,7 +4,7 @@
 //! only on first use and inspection, never on every acquisition. Registry and
 //! metadata locks are private leaves: no protected application value, logging
 //! callback, or application lock is accessed while either is held. Inspection
-//! uses try_lock throughout, so a diagnostic cannot wait behind the stall it is
+//! uses `try_lock` throughout, so a diagnostic cannot wait behind the stall it is
 //! meant to explain. Observations across instances are not an atomic snapshot.
 
 use std::panic::Location;
@@ -202,7 +202,7 @@ impl Registry {
         }
         let Ok(id) = self
             .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -213,6 +213,7 @@ impl Registry {
             state: Mutex::new(State::default()),
         });
         instances.push(Arc::downgrade(&instance));
+        drop(instances);
         Some(instance)
     }
 
@@ -434,6 +435,7 @@ impl ActivityGuard {
                 phase,
             });
         }
+        drop(state);
         Self {
             instance: Arc::clone(instance),
             token,
@@ -528,6 +530,7 @@ mod tests {
         let state = instance.state.lock().unwrap();
         assert_eq!((state.holders, state.waiters), (0, 0));
         assert!(state.participants.is_empty());
+        drop(state);
     }
 
     #[test]
@@ -651,7 +654,7 @@ mod tests {
         assert!(failed);
         let instance = snapshot.unwrap();
         assert_eq!((instance.holder_count, instance.waiter_count), (1, 0));
-        assert!(instance.waiters.is_empty());
+        assert_eq!(instance.waiters, [] as [LockParticipant; 0]);
         let owner = lock.try_lock().expect("successful try_lock is tracked");
         let snapshot = observe_activity(id, |lock| lock.holder_count == 1);
         drop(owner);
@@ -660,6 +663,9 @@ mod tests {
     }
 
     #[test]
+    // The fixture thread must panic while its guard is held, or nothing is
+    // poisoned.
+    #[allow(clippy::significant_drop_tightening)]
     fn poisoned_mutex_recovery_and_unwind_leave_no_phantom_owners() {
         let lock = Arc::new(OrderedMutex::new(LockLevel::DbSqliteInitGates, 0));
         let peer = Arc::clone(&lock);
@@ -772,7 +778,7 @@ mod tests {
         );
         assert!(!snapshot.is_complete());
         drop(guards);
-        assert!(registry.snapshot().locks.is_empty());
+        assert_eq!(registry.snapshot().locks, [] as [LockActivity; 0]);
         assert!(registry.snapshot().is_complete());
     }
 
@@ -807,7 +813,7 @@ mod tests {
             (1, 0)
         );
         drop(next_owner);
-        assert!(registry.snapshot().locks.is_empty());
+        assert_eq!(registry.snapshot().locks, [] as [LockActivity; 0]);
     }
 
     #[test]
@@ -815,7 +821,7 @@ mod tests {
         let registry = Registry::new(MAX_SNAPSHOT_LOCKS + 2);
         let mut instances = Vec::new();
         let mut guards = Vec::new();
-        for _ in 0..MAX_SNAPSHOT_LOCKS + 1 {
+        for _ in 0..=MAX_SNAPSHOT_LOCKS {
             let instance = registry.register(LockLevel::DbPoolCache).unwrap();
             guards.push(ActivityGuard::begin(
                 &instance,
@@ -906,7 +912,7 @@ mod tests {
                 *slot.borrow_mut() = Some(LateUse {
                     instance: Arc::clone(&retained),
                     result: result_tx,
-                })
+                });
             });
             drop(ActivityGuard::begin(
                 &retained,
@@ -930,5 +936,6 @@ mod tests {
         let state = instance.state.lock().unwrap();
         assert_eq!((state.holders, state.waiters), (0, 0));
         assert!(state.participants.is_empty());
+        drop(state);
     }
 }

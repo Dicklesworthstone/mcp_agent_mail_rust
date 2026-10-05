@@ -77,9 +77,9 @@ fn pause(duration: Duration, stop: &AtomicBool) -> bool {
         if stop.load(Ordering::Acquire) {
             return true;
         }
-        let step = remaining.min(Duration::from_millis(100));
-        std::thread::sleep(step);
-        remaining = remaining.saturating_sub(step);
+        let slice = remaining.min(Duration::from_millis(100));
+        std::thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
     }
     stop.load(Ordering::Acquire)
 }
@@ -234,7 +234,7 @@ mod tests {
             let worker = TestWorker {
                 stop,
                 thread: Some(std::thread::spawn(move || {
-                    run(&worker_config, &worker_stop)
+                    run(&worker_config, &worker_stop);
                 })),
             };
             let deadline = std::time::Instant::now() + Duration::from_secs(20);

@@ -15,8 +15,8 @@ use mcp_agent_mail_core::disk::DiskPressure;
 use mcp_agent_mail_core::lock_order::{LockActivity, LockActivitySnapshot, lock_activity_snapshot};
 use mcp_agent_mail_core::memory::MemoryPressure;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -78,9 +78,9 @@ impl LockWaitWatchdog {
                     continue;
                 }
                 let previous = self.reported.get(&lock.instance_id);
-                if previous.is_some_and(|last| {
-                    elapsed.saturating_sub(*last) < LOCK_WAIT_REMINDER_INTERVAL
-                }) {
+                if previous
+                    .is_some_and(|last| elapsed.saturating_sub(*last) < LOCK_WAIT_REMINDER_INTERVAL)
+                {
                     continue;
                 }
                 if update.stalled.len() >= MAX_LOCK_REPORTS_PER_SAMPLE
@@ -100,9 +100,9 @@ impl LockWaitWatchdog {
         if !complete || update.deferred_reports > 0 {
             let since = *self.incomplete_since.get_or_insert(elapsed);
             if elapsed.saturating_sub(since) >= LOCK_WAIT_THRESHOLD
-                && self.last_coverage_report.is_none_or(|last| {
-                    elapsed.saturating_sub(last) >= LOCK_WAIT_REMINDER_INTERVAL
-                })
+                && self
+                    .last_coverage_report
+                    .is_none_or(|last| elapsed.saturating_sub(last) >= LOCK_WAIT_REMINDER_INTERVAL)
             {
                 update.report_incomplete = true;
                 self.last_coverage_report = Some(elapsed);
@@ -513,17 +513,26 @@ mod tests {
     fn lock_watchdog_reports_threshold_and_reminders_without_completed_acquisitions() {
         let mut watchdog = LockWaitWatchdog::default();
         let mut snapshot = lock_snapshot(vec![waiting_lock(1, 29)]);
-        assert!(observe_waits(&mut watchdog, &snapshot, 0).stalled.is_empty());
+        assert_eq!(
+            observe_waits(&mut watchdog, &snapshot, 0).stalled,
+            [] as [&LockActivity; 0]
+        );
         snapshot.locks[0] = waiting_lock(1, 30);
         let first = observe_waits(&mut watchdog, &snapshot, 1);
         assert_eq!(first.stalled.len(), 1);
         assert_eq!(first.stalled[0].holders[0].line, 11);
         assert_eq!(first.stalled[0].waiters[0].line, 42);
-        assert!(observe_waits(&mut watchdog, &snapshot, 60).stalled.is_empty());
+        assert_eq!(
+            observe_waits(&mut watchdog, &snapshot, 60).stalled,
+            [] as [&LockActivity; 0]
+        );
         assert_eq!(observe_waits(&mut watchdog, &snapshot, 61).stalled.len(), 1);
         // Wall-clock changes are irrelevant; even an out-of-order supplied
         // elapsed value must not underflow or trigger an immediate reminder.
-        assert!(observe_waits(&mut watchdog, &snapshot, 0).stalled.is_empty());
+        assert_eq!(
+            observe_waits(&mut watchdog, &snapshot, 0).stalled,
+            [] as [&LockActivity; 0]
+        );
     }
 
     #[test]
@@ -536,9 +545,12 @@ mod tests {
         snapshot.locks[0].waiters.clear();
         let cleared = observe_waits(&mut watchdog, &snapshot, 5);
         assert_eq!(cleared.cleared, vec![1]);
-        assert!(cleared.stalled.is_empty());
+        assert_eq!(cleared.stalled, [] as [&LockActivity; 0]);
         assert!(watchdog.reported.is_empty());
-        assert!(observe_waits(&mut watchdog, &snapshot, 10).cleared.is_empty());
+        assert_eq!(
+            observe_waits(&mut watchdog, &snapshot, 10).cleared,
+            [] as [u64; 0]
+        );
         snapshot.locks[0] = waiting_lock(1, 30);
         assert_eq!(observe_waits(&mut watchdog, &snapshot, 15).stalled.len(), 1);
     }
@@ -564,10 +576,13 @@ mod tests {
         for partial in partials {
             let mut watchdog = LockWaitWatchdog::default();
             assert_eq!(observe_waits(&mut watchdog, &initial, 0).stalled.len(), 1);
-            assert!(observe_waits(&mut watchdog, &partial, 5).cleared.is_empty());
+            assert_eq!(
+                observe_waits(&mut watchdog, &partial, 5).cleared,
+                [] as [u64; 0]
+            );
             let unknown = observe_waits(&mut watchdog, &partial, 35);
             assert!(unknown.report_incomplete);
-            assert!(unknown.cleared.is_empty());
+            assert_eq!(unknown.cleared, [] as [u64; 0]);
             assert_eq!(watchdog.reported.len(), 1);
             assert!(!observe_waits(&mut watchdog, &partial, 40).report_incomplete);
             assert!(observe_waits(&mut watchdog, &partial, 95).report_incomplete);
@@ -589,7 +604,10 @@ mod tests {
         // An unavailable sample cannot lend authority even to a populated list.
         snapshot.locks[0] = waiting_lock(2, 30);
         snapshot.available = false;
-        assert!(observe_waits(&mut watchdog, &snapshot, 10).stalled.is_empty());
+        assert_eq!(
+            observe_waits(&mut watchdog, &snapshot, 10).stalled,
+            [] as [&LockActivity; 0]
+        );
     }
 
     #[test]
@@ -603,7 +621,10 @@ mod tests {
             reported.extend(update.stalled.iter().map(|lock| lock.instance_id));
         }
         assert_eq!(reported, (1..=12).collect::<Vec<_>>());
-        assert!(observe_waits(&mut watchdog, &snapshot, 15).stalled.is_empty());
+        assert_eq!(
+            observe_waits(&mut watchdog, &snapshot, 15).stalled,
+            [] as [&LockActivity; 0]
+        );
     }
 
     #[test]
@@ -617,15 +638,15 @@ mod tests {
             };
             let update = observe_waits(&mut watchdog, &snapshot, 0);
             assert_eq!(update.stalled.len(), 1);
-            assert!(update.cleared.is_empty());
+            assert_eq!(update.cleared, [] as [u64; 0]);
         }
         let mut snapshot = LockActivitySnapshot {
             busy_instances: 1,
             ..lock_snapshot(vec![waiting_lock(10_000, 30)])
         };
         let capped = observe_waits(&mut watchdog, &snapshot, 30);
-        assert!(capped.stalled.is_empty());
-        assert!(capped.cleared.is_empty());
+        assert_eq!(capped.stalled, [] as [&LockActivity; 0]);
+        assert_eq!(capped.cleared, [] as [u64; 0]);
         assert_eq!(capped.deferred_reports, 1);
         assert!(capped.report_incomplete);
         assert_eq!(watchdog.reported.len(), MAX_TRACKED_LOCK_WAITS);
@@ -657,9 +678,10 @@ mod tests {
         let observed = loop {
             let snapshot = lock_activity_snapshot();
             if let Some(activity) = snapshot.locks.into_iter().find(|activity| {
-                activity.waiters.iter().any(|waiter| {
-                    waiter.thread_name.as_deref() == Some("lock-watchdog-contender")
-                })
+                activity
+                    .waiters
+                    .iter()
+                    .any(|waiter| waiter.thread_name.as_deref() == Some("lock-watchdog-contender"))
             }) {
                 break Some(activity);
             }
@@ -676,7 +698,7 @@ mod tests {
         let observed = observed.expect("real contender must appear before acquisition completes");
         assert_eq!(observed.holder_count, 1);
         assert_eq!(observed.waiter_count, 1);
-        assert!(!observed.holders.is_empty());
+        assert_ne!(observed.holders, [] as [LockParticipant; 0]);
         let id = observed.instance_id;
         let snapshot = lock_snapshot(vec![observed]);
         let mut watchdog = LockWaitWatchdog::default();
@@ -684,9 +706,12 @@ mod tests {
         assert_eq!(blocked.stalled.len(), 1);
         let _held_again = lock.lock();
         let after = lock_activity_snapshot();
-        assert!(after.locks.iter().any(|activity| {
-            activity.instance_id == id && activity.waiter_count == 0
-        }));
+        assert!(
+            after
+                .locks
+                .iter()
+                .any(|activity| { activity.instance_id == id && activity.waiter_count == 0 })
+        );
         let cleared = watchdog.observe(Duration::from_secs(5), &after, Duration::ZERO);
         assert_eq!(cleared.cleared, vec![id]);
     }
@@ -715,9 +740,10 @@ mod tests {
         let sampler = LockWatchdogWorker::spawn(Duration::from_millis(5), move |_| {
             let snapshot = lock_activity_snapshot();
             if let Some(activity) = snapshot.locks.into_iter().find(|activity| {
-                activity.waiters.iter().any(|waiter| {
-                    waiter.thread_name.as_deref() == Some("blocked-resource-probe")
-                })
+                activity
+                    .waiters
+                    .iter()
+                    .any(|waiter| waiter.thread_name.as_deref() == Some("blocked-resource-probe"))
             }) {
                 // A slow test receiver must not block sampler cancellation.
                 let _ = evidence.try_send(activity);
@@ -736,7 +762,7 @@ mod tests {
         assert!(still_blocked);
         assert_eq!(observed.holder_count, 1);
         assert_eq!(observed.waiter_count, 1);
-        assert!(!observed.holders.is_empty());
+        assert_ne!(observed.holders, [] as [LockParticipant; 0]);
         assert!(acquired.load(Ordering::Acquire));
     }
 
@@ -751,7 +777,10 @@ mod tests {
         .unwrap();
         let first = receive_sample.recv_timeout(Duration::from_secs(5));
         drop(worker);
-        assert!(first.is_ok(), "the first sample does not wait for the interval");
+        assert!(
+            first.is_ok(),
+            "the first sample does not wait for the interval"
+        );
         // Sender destruction proves the sampling closure and its thread have
         // actually exited, rather than merely detaching a sleeping worker.
         assert!(matches!(

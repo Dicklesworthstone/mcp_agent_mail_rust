@@ -113,9 +113,8 @@ impl Snapshots {
         ) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
             let mut scanner = journal_scan::Scanner::new(kind);
             loop {
-                match scanner.poll(config, &AtomicBool::new(false))? {
-                    Some(items) => return Ok(Some(items)),
-                    None => continue,
+                if let Some(items) = scanner.poll(config, &AtomicBool::new(false))? {
+                    return Ok(Some(items));
                 }
             }
         }
@@ -905,10 +904,9 @@ mod tests {
                 .into_result()
                 .unwrap();
             assert!(rows[0].released_ts.is_some_and(|ts| ts > 0));
-            assert!(
-                journal::read_queued_release_intents(&config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(&config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             assert_eq!(std::fs::read(path).unwrap(), before);
             mcp_agent_mail_storage::flush_async_commits();
@@ -944,7 +942,7 @@ mod tests {
         assert_eq!(cursor.candidates(&original), vec![0]);
         let compacted = keys(&[2]);
         assert_eq!(cursor.candidates(&compacted), vec![0]);
-        assert!(cursor.candidates(&[]).is_empty());
+        assert_eq!(cursor.candidates(&[]), [] as [usize; 0]);
         assert!(cursor.after.is_none());
         assert!(cursor.ceiling.is_none());
     }
@@ -972,10 +970,9 @@ mod tests {
         .unwrap();
         let intents = journal::read_queued_ack_intents(&config).unwrap();
         append_ack_completion(&config, &intents[0], Completion::Replayed).unwrap();
-        assert!(
-            journal::read_queued_ack_intents(&config)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            journal::read_queued_ack_intents(&config).unwrap(),
+            [] as [QueuedAckIntent; 0]
         );
         let text =
             std::fs::read_to_string(journal::log_path(&config, journal::ACK_INTENT_LOG_FILE))
@@ -1075,10 +1072,9 @@ mod tests {
                 ),
                 (1, 1, 1, 0)
             );
-            assert!(
-                journal::read_queued_ack_intents(&config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_ack_intents(&config).unwrap(),
+                [] as [QueuedAckIntent; 0]
             );
             let conn = pool.acquire(&cx).await.into_result().unwrap();
             let first = conn
@@ -1167,10 +1163,9 @@ mod tests {
                 (conflict.applied, conflict.completed, conflict.abandoned),
                 (0, 1, 1)
             );
-            assert!(
-                journal::read_queued_ack_intents(&config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_ack_intents(&config).unwrap(),
+                [] as [QueuedAckIntent; 0]
             );
             let conn = pool.acquire(&cx).await.into_result().unwrap();
             let rows = conn
@@ -1331,20 +1326,18 @@ mod tests {
                 if broken_release {
                     assert_eq!(ack.unwrap().completed, 1);
                     assert!(release.is_err());
-                    assert!(
-                        journal::read_queued_ack_intents(&config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        journal::read_queued_ack_intents(&config).unwrap(),
+                        [] as [QueuedAckIntent; 0]
                     );
                     assert!(journal::read_queued_release_intents(&config).is_err());
                 } else {
                     assert!(ack.is_err());
                     assert_eq!(release.unwrap().completed, 1);
                     assert!(journal::read_queued_ack_intents(&config).is_err());
-                    assert!(
-                        journal::read_queued_release_intents(&config)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        journal::read_queued_release_intents(&config).unwrap(),
+                        [] as [QueuedReleaseIntentView; 0]
                     );
                 }
                 mcp_agent_mail_storage::flush_async_commits();

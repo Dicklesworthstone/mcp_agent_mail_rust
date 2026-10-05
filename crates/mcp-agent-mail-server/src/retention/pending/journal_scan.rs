@@ -267,18 +267,19 @@ impl Snapshot {
         Ok(false)
     }
 
+    // A new terminal key passes `admit_key` before it is inserted: the limit
+    // counts the identities already held, so inserting first would refuse one
+    // identity early.
+    #[allow(clippy::set_contains_or_insert)]
     fn accept_line(&mut self) -> io::Result<()> {
         let bytes = self.line.len();
         let decoded = if self.line.iter().all(u8::is_ascii_whitespace) {
             None
+        } else if let Ok(value) = serde_json::from_slice::<Value>(&self.line) {
+            Some(decode(self.kind, value)?)
         } else {
-            match serde_json::from_slice::<Value>(&self.line) {
-                Ok(value) => Some(decode(self.kind, value)?),
-                Err(_) => {
-                    self.skipped = self.skipped.saturating_add(1);
-                    None
-                }
-            }
+            self.skipped = self.skipped.saturating_add(1);
+            None
         };
         self.line.clear();
         match decoded {
@@ -847,7 +848,7 @@ mod tests {
             );
             let snapshot = scanner.snapshot.as_ref().unwrap();
             assert_eq!(snapshot.reader.get_ref().limit(), snapshot.initial_bytes);
-            assert!(snapshot.line.is_empty());
+            assert_eq!(snapshot.line, [] as [u8; 0]);
         }
         assert_eq!(finish(&mut scanner, &config).unwrap().len(), 1);
     }

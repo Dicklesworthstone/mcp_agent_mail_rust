@@ -1171,7 +1171,7 @@ mod tests {
         let entry: LockContentionEntry = serde_json::from_value(payload).unwrap();
         assert!(!entry.live.available);
         assert!(!entry.live.is_complete());
-        assert!(entry.live.locks.is_empty());
+        assert_eq!(entry.live.locks, [] as [LockActivity; 0]);
     }
 
     // -----------------------------------------------------------------------
