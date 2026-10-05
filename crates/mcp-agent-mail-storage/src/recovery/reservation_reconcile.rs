@@ -557,6 +557,9 @@ fn publish_release(
 /// bytes. On failure the DB release remains authoritative for the background
 /// history reconciler. `Ok(false)` means the verified artifact already matches;
 /// `Ok(true)` means its exact bytes were verified in Git after publication.
+/// Recovery promotion or admission contention defers repair before DB/archive
+/// access. In particular, a replay caller's existing writer lease must never
+/// wait for a promotion that is itself trying to drain that caller.
 pub fn reconcile_released_reservation(
     cx: &Cx,
     pool: &DbPool,
@@ -584,7 +587,8 @@ pub fn reconcile_released_reservation(
     {
         return Err("disk pressure defers targeted reservation archive repair".into());
     }
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    let _write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or_else(|| "reservation reconciliation deferred: recovery promotion or admission contention".to_string())?;
     validate_source(pool, config)?;
     if corruption_circuit_breaker().is_tripped() {
         return Err("reservation reconciliation refused: corruption breaker open".into());
@@ -631,6 +635,7 @@ pub fn reconcile_released_reservation(
 /// for manual review. A finite cursor revisits failures on later rounds. Source
 /// connections are released before Git I/O; a write-activity lease prevents
 /// recovery promotion from replacing the source generation during the pass.
+/// Closed or contended admission defers the pass without advancing either cursor.
 pub fn reconcile_reservation_releases(
     cx: &Cx,
     pool: &DbPool,
@@ -643,7 +648,8 @@ pub fn reconcile_reservation_releases(
         report.interrupted = true;
         return Ok(report);
     }
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    let _write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or_else(|| "reservation reconciliation deferred: recovery promotion or admission contention".to_string())?;
     validate_source(pool, config)?;
     if corruption_circuit_breaker().is_tripped() {
         return Err("reservation reconciliation refused: corruption breaker open".into());
@@ -1333,5 +1339,114 @@ mod tests {
             assert!(reconcile_released_reservation(cx, pool, &different_root, &captured, "aabb").is_err());
             assert!(!config.storage_root.join("projects").exists());
         });
+    }
+
+    fn isolated_admission_test() -> bool {
+        const CHILD: &str = "AM_TEST_RESERVATION_ADMISSION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .expect("run isolated reservation admission test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    fn exercise_closed_admission(parent_writer: bool) {
+        use mcp_agent_mail_db::write_barrier::{
+            DrainOutcome, acquire_promotion_barrier_draining, active_writer_count,
+            begin_write_activity, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::time::Duration;
+
+        fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let captured = captured_row(cx, pool, 401);
+            let (stable, before) = seed_artifact(config, &source, "aabb", false);
+            crate::flush_async_commits();
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let head_before = repo.head().unwrap().target();
+            let parent = parent_writer.then(begin_write_activity);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let recovery = std::thread::spawn(move || {
+                let owner = if parent_writer {
+                    let (owner, result) = acquire_promotion_barrier_draining(Duration::ZERO);
+                    assert!(matches!(result, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                    owner
+                } else {
+                    try_acquire_promotion_barrier_if_idle().expect("idle promotion")
+                };
+                ready_tx.send(()).unwrap();
+                // Cleanup bound only: the assertions require explicit release
+                // after repair returns, not expiry of this timeout.
+                let released = release_rx.recv_timeout(Duration::from_secs(20));
+                drop(owner);
+                released
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut cursor = ReservationReconcileCursor {
+                source_identity: "retained-round".to_string(),
+                priority: ScanPosition { after: 9, ceiling: Some(99) },
+                history: ScanPosition { after: 7, ceiling: Some(401) },
+            };
+            let targeted = reconcile_released_reservation(cx, pool, config, &captured, "aabb");
+            let historical = reconcile_reservation_releases(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            );
+            let held_writers = active_writer_count();
+            let bytes_before_release = fs::read(&stable).unwrap();
+            let head_before_release = repo.head().unwrap().target();
+            drop(parent);
+            let _ = release_tx.send(());
+            let explicitly_released = recovery.join().unwrap();
+            assert!(explicitly_released.is_ok(), "repair waited for the promotion owner's cleanup timeout");
+            assert!(targeted.unwrap_err().contains("admission contention"));
+            assert!(historical.unwrap_err().contains("admission contention"));
+            assert_eq!(held_writers, usize::from(parent_writer));
+            assert_eq!(active_writer_count(), 0);
+            assert_eq!(bytes_before_release, before);
+            assert_eq!(head_before_release, head_before);
+            assert_eq!(cursor.source_identity, "retained-round");
+            assert_eq!((cursor.priority.after, cursor.priority.ceiling), (9, Some(99)));
+            assert_eq!((cursor.history.after, cursor.history.ceiling), (7, Some(401)));
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+
+            // Once admission reopens, the same durable source repairs normally.
+            assert!(reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
+            assert_eq!(read_artifact(&stable).unwrap().unwrap().value["released_ts"], source.artifact["released_ts"]);
+            let resumed = reconcile_reservation_releases(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!(resumed.deferred, 0);
+            assert!(resumed.unchanged > 0);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+        });
+    }
+
+    #[test]
+    fn reservation_repair_defers_under_promotion_without_mutating_files_or_cursors() {
+        if isolated_admission_test() {
+            return;
+        }
+        exercise_closed_admission(false);
+    }
+
+    #[test]
+    fn nested_release_repair_does_not_wait_on_promotion_draining_its_parent() {
+        if isolated_admission_test() {
+            return;
+        }
+        exercise_closed_admission(true);
     }
 }
