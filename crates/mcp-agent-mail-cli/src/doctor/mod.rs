@@ -30,6 +30,7 @@ pub mod undo;
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_storage::recovery::reservation_reconcile;
 use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
 };
@@ -456,6 +457,54 @@ fn triage_findings_command(findings: &serde_json::Value) -> String {
 /// Keep the threshold deliberately tight: larger drift, parse failures, and
 /// any mismatch to reservation semantics remain unhealthy and retain exit 1.
 const COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD: usize = 3;
+
+/// How recently the mailbox owner's reservation reconciler must have finished
+/// a pass, and republished a release, for health to call its drift converging.
+const RESERVATION_RECONCILE_PROGRESS_WINDOW_US: i64 = 10 * 60 * 1_000_000;
+
+/// Whether reservation drift is the background reconciler's work in progress
+/// (br-kp1in.19). `Ok(note)` only when every drift item belongs to a row
+/// released in `SQLite` whose artifact still reads active (the one direction
+/// the reconciler repairs) and the reconciler has both run and republished a
+/// release within the window. A reconciler that is absent, idle, or running
+/// without repairing anything keeps health failing; `Err(Some(note))` says
+/// which, for drift it would otherwise own.
+fn reservation_parity_reconciling(
+    report: &ReservationParityReport,
+    progress: Option<&reservation_reconcile::ReservationReconcileProgress>,
+    now_us: i64,
+) -> Result<String, Option<String>> {
+    let drift = &report.drift;
+    if drift.total() == 0 || drift.release_pending_mismatches != drift.total() {
+        return Err(None);
+    }
+    let rows = drift.release_pending_rows;
+    let fix = fixers::fix_only_command("fm-db-state-files-reservation-db-archive-parity");
+    let recent =
+        |ts_us: i64| now_us.saturating_sub(ts_us) <= RESERVATION_RECONCILE_PROGRESS_WINDOW_US;
+    let window_min = RESERVATION_RECONCILE_PROGRESS_WINDOW_US / 60_000_000;
+    let Some(progress) = progress.filter(|progress| recent(progress.pass_us)) else {
+        return Err(Some(format!(
+            "reservation_parity: {rows} released reservation(s) await the background \
+             reconciler, which has not run in the last {window_min} min (is the server up?); \
+             next: {fix}"
+        )));
+    };
+    match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
+        Some(last_repair_us) => Ok(format!(
+            "warn: reservation parity: reconciling {rows} released reservation(s); the \
+             background reconciler (pid {}) last republished one {}s ago",
+            progress.pid,
+            now_us.saturating_sub(last_repair_us) / 1_000_000
+        )),
+        None => Err(Some(format!(
+            "reservation_parity: the background reconciler (pid {}) is running but has not \
+             republished any of {rows} pending release(s) in the last {window_min} min; \
+             next: {fix}",
+            progress.pid
+        ))),
+    }
+}
 
 fn reservation_parity_is_cosmetic(report: &ReservationParityReport) -> bool {
     let drift = &report.drift;
@@ -3461,7 +3510,19 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                         COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD,
                     );
                 } else {
-                    return Err(CliError::ExitCode(1));
+                    let progress = reservation_reconcile::read_progress(&probe_target.storage_root);
+                    match reservation_parity_reconciling(
+                        &report,
+                        progress.as_ref(),
+                        mcp_agent_mail_core::timestamps::now_micros(),
+                    ) {
+                        Ok(note) => ftui_runtime::ftui_println!("{note}"),
+                        Err(Some(stalled)) => {
+                            ftui_runtime::ftui_println!("{stalled}");
+                            return Err(CliError::ExitCode(1));
+                        }
+                        Err(None) => return Err(CliError::ExitCode(1)),
+                    }
                 }
             }
         }
@@ -4673,6 +4734,86 @@ mod tests {
         };
 
         assert!(!reservation_parity_is_cosmetic(&report));
+    }
+
+    #[test]
+    fn health_reports_converging_release_drift_but_never_a_stuck_reconciler() {
+        use mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary;
+        let report = |drift: ReservationParityDriftSummary| ReservationParityReport {
+            schema_version:
+                mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
+            ok: false,
+            live_generation: None,
+            db_reservations: 32,
+            archive_reservations: 32,
+            drift,
+            examples: Vec::new(),
+        };
+        // The live-host shape: 16 released-in-DB / active-in-archive rows.
+        let pending = report(ReservationParityDriftSummary {
+            released_ts_mismatches: 16,
+            active_status_mismatches: 16,
+            release_pending_rows: 16,
+            release_pending_mismatches: 32,
+            ..Default::default()
+        });
+        let minute = 60 * 1_000_000;
+        let now = 1_000 * minute;
+        let progress =
+            |pass_us, last_repair_us| reservation_reconcile::ReservationReconcileProgress {
+                pid: 7,
+                pass_us,
+                last_repair_us,
+            };
+
+        let converging = reservation_parity_reconciling(
+            &pending,
+            Some(&progress(now - minute, Some(now - 2 * minute))),
+            now,
+        )
+        .expect("a reconciler that just republished a release is converging");
+        assert!(converging.contains("reconciling 16"), "{converging}");
+
+        // No reconciler evidence, a reconciler that stopped running, and one
+        // that runs without repairing anything all keep health failing.
+        for (label, progress) in [
+            ("absent", None),
+            (
+                "stale pass",
+                Some(progress(now - 11 * minute, Some(now - 11 * minute))),
+            ),
+            (
+                "no recent repair",
+                Some(progress(now - minute, Some(now - 30 * minute))),
+            ),
+            ("never repaired", Some(progress(now - minute, None))),
+        ] {
+            let stalled = reservation_parity_reconciling(&pending, progress.as_ref(), now)
+                .expect_err(label)
+                .expect("pending releases get a reason");
+            assert!(
+                stalled.contains("am doctor fix --only"),
+                "{label}: {stalled}"
+            );
+        }
+
+        // Drift the reconciler does not own fails without a reconciler note,
+        // even while it is visibly repairing other rows.
+        let mixed = report(ReservationParityDriftSummary {
+            released_ts_mismatches: 16,
+            active_status_mismatches: 17,
+            release_pending_rows: 16,
+            release_pending_mismatches: 32,
+            ..Default::default()
+        });
+        assert_eq!(
+            reservation_parity_reconciling(
+                &mixed,
+                Some(&progress(now - minute, Some(now - minute))),
+                now
+            ),
+            Err(None)
+        );
     }
 
     #[test]

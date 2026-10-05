@@ -14,7 +14,7 @@ use fastmcp_core::block_on;
 use git2::{ObjectType, Oid, Repository};
 use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
 use mcp_agent_mail_db::{DbError, DbPool, FileReservationRow, corruption_circuit_breaker};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest as _, Sha1};
 
@@ -68,6 +68,68 @@ pub struct ReservationReconcileReport {
     pub deferred: usize,
     pub interrupted: bool,
     pub budget_exhausted: bool,
+}
+
+const PROGRESS_FILE: &str = "reservation-reconcile.json";
+const MAX_PROGRESS_BYTES: u64 = 4096;
+
+/// What `am doctor health` needs to tell a converging reconciler from a stuck
+/// or absent one: when the last pass completed and when one last republished
+/// a release. The mailbox owner records it after every pass (br-kp1in.19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservationReconcileProgress {
+    pub pid: u32,
+    /// Completion of the last pass, microseconds since the epoch.
+    pub pass_us: i64,
+    /// The last pass, by any owner of this mailbox, that republished at least
+    /// one release.
+    pub last_repair_us: Option<i64>,
+}
+
+#[must_use]
+pub fn progress_path(storage_root: &Path) -> PathBuf {
+    storage_root.join("doctor").join(PROGRESS_FILE)
+}
+
+/// Replace the progress record atomically. When several processes own
+/// reconcilers for one mailbox, the latest repair any of them recorded is
+/// kept, so one idle owner cannot hide another's progress. A `doctor` path
+/// that is not a plain directory is refused, never followed.
+pub fn record_progress(
+    storage_root: &Path,
+    progress: &ReservationReconcileProgress,
+) -> std::io::Result<()> {
+    let dir = storage_root.join("doctor");
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "{} is not a plain directory",
+                dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&dir)?,
+        Err(error) => return Err(error),
+    }
+    let mut merged = progress.clone();
+    if let Some(previous) = read_progress(storage_root) {
+        merged.last_repair_us = merged.last_repair_us.max(previous.last_repair_us);
+    }
+    let body = serde_json::to_vec(&merged).map_err(std::io::Error::other)?;
+    let tmp = dir.join(format!(".{PROGRESS_FILE}.{}.tmp", std::process::id()));
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, progress_path(storage_root))
+}
+
+/// The last recorded progress; `None` when absent, oversized, or unreadable.
+#[must_use]
+pub fn read_progress(storage_root: &Path) -> Option<ReservationReconcileProgress> {
+    let path = progress_path(storage_root);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PROGRESS_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
 #[derive(Debug, PartialEq)]
@@ -736,6 +798,52 @@ pub fn reconcile_reservation_releases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_round_trips_and_keeps_the_latest_repair_across_owners() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read_progress(root.path()), None);
+        let repaired = ReservationReconcileProgress {
+            pid: 1,
+            pass_us: 100,
+            last_repair_us: Some(90),
+        };
+        record_progress(root.path(), &repaired).unwrap();
+        assert_eq!(read_progress(root.path()), Some(repaired));
+        // A second owner whose passes repair nothing must not erase the
+        // first one's evidence of progress.
+        let idle = ReservationReconcileProgress {
+            pid: 2,
+            pass_us: 200,
+            last_repair_us: None,
+        };
+        record_progress(root.path(), &idle).unwrap();
+        assert_eq!(
+            read_progress(root.path()),
+            Some(ReservationReconcileProgress {
+                last_repair_us: Some(90),
+                ..idle
+            })
+        );
+        // Garbage reads as absent rather than as progress.
+        fs::write(progress_path(root.path()), b"not json").unwrap();
+        assert_eq!(read_progress(root.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_refuses_a_symlinked_doctor_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("doctor")).unwrap();
+        let progress = ReservationReconcileProgress {
+            pid: 1,
+            pass_us: 1,
+            last_repair_us: None,
+        };
+        assert!(record_progress(root.path(), &progress).is_err());
+        assert!(fs::read_dir(elsewhere.path()).unwrap().next().is_none());
+    }
 
     fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {

@@ -209,6 +209,8 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
     let mut cursor = ReconcileCursor::settled_before(settled_before_us);
     let mut agent_cursor = AgentReconcileCursor::default();
     let mut reservation_cursor = ReservationReconcileCursor::default();
+    let mut reservation_last_repair_us: Option<i64> = None;
+    let mut reservation_progress_warned = false;
     let mut prune_cursor = ArchivePruneCursor::default();
     let mut last_report: Option<Instant> = None;
 
@@ -353,6 +355,31 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                             attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
                             interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
                             "bounded terminal reservation release reconciliation pass completed");
+                    }
+                    // `am doctor health` reads this to tell drift that is
+                    // converging from a reconciler that stopped repairing it.
+                    if !report.interrupted {
+                        let pass_us = now_micros();
+                        if report.repaired > 0 {
+                            reservation_last_repair_us = Some(pass_us);
+                        }
+                        let progress = reservation_reconcile::ReservationReconcileProgress {
+                            pid: std::process::id(),
+                            pass_us,
+                            last_repair_us: reservation_last_repair_us,
+                        };
+                        match reservation_reconcile::record_progress(
+                            &config.storage_root,
+                            &progress,
+                        ) {
+                            Ok(()) => reservation_progress_warned = false,
+                            Err(error) if !reservation_progress_warned => {
+                                reservation_progress_warned = true;
+                                warn!(target: "maintenance", event = "reservation_reconcile_progress_unrecorded",
+                                    error = %error, "could not record reservation reconciliation progress for doctor health");
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
                 Err(error) => {
