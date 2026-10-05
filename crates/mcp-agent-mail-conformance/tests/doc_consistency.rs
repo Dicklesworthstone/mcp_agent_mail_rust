@@ -415,27 +415,79 @@ fn intentionally_mutated_readme_is_rejected() {
     );
 }
 
-/// Validate plain doctor command examples against the shipped CLI.
+/// Split a documented command into shell words: whitespace separates words
+/// outside quotes, and the quotes are removed. No other expansion.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = None;
+    for c in command.chars() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => word.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            None => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Validate `am` command examples that start with one of `prefixes` against
+/// the shipped CLI, reporting every command clap rejects.
 ///
-/// Recipes can include trailing redirection, a pipeline, or a line
-/// continuation. Parse their argv; do not execute a doctor's repair while
-/// validating documentation. A `<placeholder>` or a shell variable such as
-/// `"$MESSAGE_ID"` stands for one argument, checked as `1` so it satisfies a
-/// string, path, or numeric value alike.
-fn validate_doctor_recipes(doc: &str) -> Result<usize, String> {
+/// Recipes can include quoted arguments, trailing redirection, a pipeline, a
+/// comment, or backslash line continuations. Parse their argv; never execute
+/// a documented command while validating documentation. A `<placeholder>` or
+/// a shell variable such as `"$MESSAGE_ID"` stands for one argument, checked
+/// as `1` so it satisfies a string, path, or numeric value alike. An example
+/// that elides arguments with `...` cannot be checked and is skipped.
+fn validate_cli_recipes(doc: &str, prefixes: &[&str]) -> Result<usize, String> {
     use clap::CommandFactory;
 
+    let lines: Vec<&str> = doc.lines().collect();
     let mut checked = 0;
-    for (index, line) in doc.lines().enumerate() {
-        let line = line.trim();
-        if !line.starts_with("am doctor ") && !line.starts_with("am robot ") {
+    let mut rejected = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line_number = index + 1;
+        let mut line = lines[index].trim().to_string();
+        index += 1;
+        if !prefixes.iter().any(|prefix| line.starts_with(prefix)) {
+            continue;
+        }
+        while let Some(head) = line.strip_suffix('\\') {
+            let Some(next) = lines.get(index) else {
+                break;
+            };
+            line = format!("{} {}", head.trim_end(), next.trim());
+            index += 1;
+        }
+        let words = shell_words(&line);
+        if words.iter().any(|word| word == "...") {
             continue;
         }
         let placeholder = |word: &str| {
             (word.len() > 2 && word.starts_with('<') && word.ends_with('>')) || word.contains('$')
         };
-        let args: Vec<_> = line
-            .split_whitespace()
+        let args: Vec<_> = words
+            .iter()
+            .map(String::as_str)
             .take_while(|word| {
                 *word != "\\"
                     && (placeholder(word) || !word.starts_with(['|', '>', '<', '#']))
@@ -443,37 +495,59 @@ fn validate_doctor_recipes(doc: &str) -> Result<usize, String> {
             })
             .map(|word| if placeholder(word) { "1" } else { word })
             .collect();
-        mcp_agent_mail_cli::Cli::command()
-            .try_get_matches_from(args)
-            .map_err(|error| format!("invalid doctor recipe on line {}: {error}", index + 1))?;
-        checked += 1;
+        match mcp_agent_mail_cli::Cli::command().try_get_matches_from(args) {
+            Ok(_) => checked += 1,
+            // `--help` and `--version` are valid requests clap answers early.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                checked += 1;
+            }
+            Err(error) => rejected.push(format!(
+                "line {line_number}: `{line}`: {}",
+                error.to_string().lines().next().unwrap_or_default()
+            )),
+        }
     }
-    Ok(checked)
+    if rejected.is_empty() {
+        Ok(checked)
+    } else {
+        Err(format!("invalid `am` recipes:\n{}", rejected.join("\n")))
+    }
 }
+
+const DOCTOR_AND_ROBOT: &[&str] = &["am doctor ", "am robot "];
+const EVERY_AM_COMMAND: &[&str] = &["am "];
 
 #[test]
 fn release_doctor_recipes_parse_with_live_cli() {
     for relative in ["docs/RELEASE_CHECKLIST.md", "docs/ROLLOUT_PLAYBOOK.md"] {
         let doc = read_file(workspace_root().join(relative));
-        let count =
-            validate_doctor_recipes(&doc).unwrap_or_else(|error| panic!("{relative}: {error}"));
+        let count = validate_cli_recipes(&doc, DOCTOR_AND_ROBOT)
+            .unwrap_or_else(|error| panic!("{relative}: {error}"));
         assert!(count > 0, "{relative}: no doctor recipes were checked");
 
         // Reproduce the obsolete placement of --json on the doctor root.
         let mutated = doc.replace("am doctor check --json", "am doctor --json");
         assert_ne!(mutated, doc, "{relative}: negative control did not mutate");
         assert!(
-            validate_doctor_recipes(&mutated).is_err(),
+            validate_cli_recipes(&mutated, DOCTOR_AND_ROBOT).is_err(),
             "{relative}: obsolete doctor syntax escaped the CLI parser"
         );
     }
 }
 
-/// The docs agents copy doctor and robot commands from. Each once published
-/// a spelling clap rejects (`am doctor --json`, `--reconstruct-from-archive`,
-/// `health --format json`, `fix-orphan-refs --dry-run`, `robot atc --toon`).
+/// The docs agents copy `am` commands from. Each once published a spelling
+/// clap rejects (`am doctor --json`, `--reconstruct-from-archive`,
+/// `health --format json`, `fix-orphan-refs --dry-run`, `robot atc --toon`,
+/// `guard check <project>`, `archive create`, `share export` without
+/// `--output`).
 #[test]
-fn agent_facing_doctor_recipes_parse_with_live_cli() {
+fn agent_facing_cli_recipes_parse_with_live_cli() {
+    let mut failures = Vec::new();
     for relative in [
         "README.md",
         "AGENTS.md",
@@ -485,17 +559,23 @@ fn agent_facing_doctor_recipes_parse_with_live_cli() {
         "docs/MIGRATION_GUIDE.md",
     ] {
         let doc = read_file(workspace_root().join(relative));
-        let count =
-            validate_doctor_recipes(&doc).unwrap_or_else(|error| panic!("{relative}: {error}"));
-        assert!(count > 0, "{relative}: no doctor recipes were checked");
+        match validate_cli_recipes(&doc, EVERY_AM_COMMAND) {
+            Ok(0) => failures.push(format!("{relative}: no am recipes were checked")),
+            Ok(_) => {}
+            Err(error) => failures.push(format!("{relative}: {error}")),
+        }
     }
-    // Placeholders count as one argument, and the old flag spellings still
-    // fail through them.
-    assert_eq!(
-        validate_doctor_recipes("am doctor fix --only <fm-id> --yes\n"),
-        Ok(1)
-    );
-    assert!(validate_doctor_recipes("am doctor --fix --only <fm-id> --yes\n").is_err());
-    assert!(validate_doctor_recipes("am doctor fix-orphan-refs --all --dry-run \\\n").is_err());
-    assert!(validate_doctor_recipes("am robot atc --summary-only --toon | grep x\n").is_err());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // Placeholders count as one argument, and the old spellings still fail
+    // through them.
+    let check = |recipe: &str| validate_cli_recipes(recipe, EVERY_AM_COMMAND);
+    assert_eq!(check("am doctor fix --only <fm-id> --yes\n"), Ok(1));
+    assert!(check("am doctor --fix --only <fm-id> --yes\n").is_err());
+    assert!(check("am doctor fix-orphan-refs --all --dry-run \\\n").is_err());
+    assert!(check("am robot atc --summary-only --toon | grep x\n").is_err());
+    assert!(check("am guard check my-proj\n").is_err());
+    assert!(check("am archive create my-proj\n").is_err());
+    // Every rejected line is reported, not just the first.
+    let both = check("am archive create a\nam guard check b\n").unwrap_err();
+    assert!(both.contains("line 1") && both.contains("line 2"), "{both}");
 }

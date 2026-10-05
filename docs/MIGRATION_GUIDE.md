@@ -70,20 +70,20 @@ am serve-http
 
 ```bash
 # Before (if you mistakenly used the server binary):
-mcp-agent-mail share export --project my-proj
+mcp-agent-mail share export --project my-proj --output ./bundle
 
 # After (use the CLI binary):
-am share export --project my-proj
+am share export --project my-proj --output ./bundle
 
-# Guard operations
-am guard install my-proj
-am guard check my-proj
+# Guard operations (check reads staged paths from stdin)
+am guard install my-proj /abs/path/to/repo
+git diff --cached --name-only -z | am guard check --stdin-nul --repo /abs/path/to/repo
 
 # Doctor
 am doctor check --json
 
 # Archive
-am archive create my-proj
+am archive save --project my-proj
 
 # Schema migration
 am migrate
@@ -96,11 +96,11 @@ These commands are new — they previously required MCP tool calls:
 ```bash
 # Messaging
 am mail send -p my-proj --from BlueLake --to RedFox --subject "Hello" --body "Hi"
-am mail reply -p my-proj --message-id 42 --body "Got it"
+am mail reply -p my-proj --from RedFox --message-id 42 --body "Got it"
 am mail inbox -p my-proj -a BlueLake --json
-am mail read -p my-proj --message-id 42
-am mail ack -p my-proj --message-id 42 --json
-am mail search -p my-proj -a BlueLake --query "keyword" --json
+am mail read -p my-proj -a BlueLake 42
+am mail ack -p my-proj -a BlueLake 42
+am mail search -p my-proj "keyword" --json
 am mail summarize-thread -p my-proj <thread-id>
 
 # Contacts
@@ -112,7 +112,7 @@ am contacts policy -p my-proj -a BlueLake contacts_only
 # File reservations
 am file_reservations reserve my-proj BlueLake "src/**" --ttl 7200
 am file_reservations release my-proj BlueLake --paths "src/**"
-am file_reservations list my-proj --json
+am file_reservations list my-proj --all
 
 # Agents
 am agents list --project my-proj --json
@@ -133,13 +133,13 @@ Find and replace the binary name:
 
 ```bash
 # Before:
-mcp-agent-mail share export --project "$PROJ"
-mcp-agent-mail guard install "$PROJ"
+mcp-agent-mail share export --project "$PROJ" --output "$OUT"
+mcp-agent-mail guard install "$PROJ" "$REPO"
 mcp-agent-mail doctor check --json
 
 # After:
-am share export --project "$PROJ"
-am guard install "$PROJ"
+am share export --project "$PROJ" --output "$OUT"
+am guard install "$PROJ" "$REPO"
 am doctor check --json
 ```
 
