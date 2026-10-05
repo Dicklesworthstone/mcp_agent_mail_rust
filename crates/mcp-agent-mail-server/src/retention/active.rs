@@ -27,7 +27,9 @@ pub(super) fn start(config: &Config) {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished)
+    if worker
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
         && let Some(stale) = worker.take()
     {
         let _ = stale.join();
@@ -155,7 +157,10 @@ mod tests {
         };
         let selected = selected_pool(&config);
         assert_eq!(selected.database_url, config.database_url);
-        assert_eq!(selected.storage_root.as_deref(), Some(config.storage_root.as_path()));
+        assert_eq!(
+            selected.storage_root.as_deref(),
+            Some(config.storage_root.as_path())
+        );
         assert_eq!((selected.min_connections, selected.max_connections), (1, 1));
         assert_eq!(selected.warmup_connections, 0);
         assert!(!selected.run_migrations);
@@ -206,22 +211,31 @@ mod tests {
             selected.run_migrations = true;
             let pool = DbPool::new(&selected).unwrap();
             let cx = Cx::for_testing();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'project', '/project', 1)").unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
-            conn.execute_raw("INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')").unwrap();
+            conn.execute_raw(
+                "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')",
+            )
+            .unwrap();
             let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
             conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(401, 71, 81, 'src/*.rs', 1, 'worker-test', 1000000, {expires}, NULL)")).unwrap();
             drop(conn);
             drop(pool);
-            let path = config.storage_root.join("projects/project/file_reservations/id-401-gaabb.json");
+            let path = config
+                .storage_root
+                .join("projects/project/file_reservations/id-401-gaabb.json");
             assert!(!path.exists());
             let stop = std::sync::Arc::new(AtomicBool::new(false));
             let worker_stop = stop.clone();
             let worker_config = config.clone();
             let worker = TestWorker {
                 stop,
-                thread: Some(std::thread::spawn(move || run(&worker_config, &worker_stop))),
+                thread: Some(std::thread::spawn(move || {
+                    run(&worker_config, &worker_stop)
+                })),
             };
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while !path.exists() && std::time::Instant::now() < deadline {
@@ -229,15 +243,26 @@ mod tests {
             }
             // Join before inspecting results, including on assertion failure.
             drop(worker);
-            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             assert_eq!(value["id"], 401);
             assert_eq!(value["agent"], "BlueLake");
             assert_eq!(value["db_generation"], "aabb");
             assert!(value["released_ts"].is_null());
             let pool = DbPool::new(&selected_pool(&config)).unwrap();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
-            let rows = conn.query_sync("SELECT released_ts, expires_ts FROM file_reservations WHERE id=401", &[]).unwrap();
-            assert_eq!(rows[0].get_named::<Option<i64>>("released_ts").unwrap(), None);
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT released_ts, expires_ts FROM file_reservations WHERE id=401",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                rows[0].get_named::<Option<i64>>("released_ts").unwrap(),
+                None
+            );
             assert_eq!(rows[0].get_named::<i64>("expires_ts").unwrap(), expires);
         });
     }

@@ -400,7 +400,7 @@ mod tests {
     ) -> StoredAttachment {
         let source = config.storage_root.join(name);
         std::fs::write(&source, bytes).unwrap();
-        let stored = crate::store_raw_attachment(&archive, &source, 0).unwrap();
+        let stored = crate::store_raw_attachment(archive, &source, 0).unwrap();
         commit_attachment(archive, config, &stored);
         stored
     }
@@ -944,7 +944,10 @@ mod tests {
         assert_eq!(prepared, vec![(path.clone(), bytes.to_vec())]);
         assert!(!path.exists());
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
-        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
         assert!(prepare(&repo, &archive, &message, bytes.len() - 1).is_err());
 
         let result = repair(&archive, &config, &message, &recipients).unwrap();
@@ -1006,10 +1009,19 @@ mod tests {
             (webp, &webp_bytes, "retained.webp"),
             (original, &original_bytes, "retained.png"),
         ] {
-            assert_eq!(std::fs::read(archive.repo_root.join(relative)).unwrap(), *bytes);
-            assert_eq!(std::fs::read(config.storage_root.join(retained)).unwrap(), *bytes);
+            assert_eq!(
+                std::fs::read(archive.repo_root.join(relative)).unwrap(),
+                *bytes
+            );
+            assert_eq!(
+                std::fs::read(config.storage_root.join(retained)).unwrap(),
+                *bytes
+            );
             let entry = tree.get_path(Path::new(relative)).unwrap();
-            assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes.as_slice());
+            assert_eq!(
+                repo.find_blob(entry.id()).unwrap().content(),
+                bytes.as_slice()
+            );
         }
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
@@ -1078,7 +1090,10 @@ mod tests {
         assert!(!paths.outbox.exists());
         assert!(paths.inbox.iter().all(|path| !path.exists()));
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
-        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
         assert_eq!(
             std::fs::read(config.storage_root.join("retained-first.bin")).unwrap(),
             b"first"
@@ -1117,7 +1132,10 @@ mod tests {
             assert!(repair(&archive, &config, &message, &recipients).is_err());
             assert!(!archive.root.join("messages").exists());
             assert_eq!(repo.head().unwrap().target().unwrap(), head);
-            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                index_before
+            );
             if committed {
                 assert!(!path.exists());
                 assert_eq!(
@@ -1177,7 +1195,10 @@ mod tests {
             let prepared = prepare(&repo, &archive, &message, 7).unwrap();
             assert_eq!(prepared.len(), 1);
             assert_eq!(prepared[0].1, b"healthy");
-            assert_eq!(std::fs::read(index_path).unwrap(), b"invalid unrelated index");
+            assert_eq!(
+                std::fs::read(index_path).unwrap(),
+                b"invalid unrelated index"
+            );
         }
     }
 
@@ -1208,7 +1229,11 @@ mod tests {
         })));
         assert!(prepare(&repo, &archive, &message, 9).is_err());
         assert_eq!(prepare(&repo, &archive, &message, 10).unwrap().len(), 2);
-        assert!(paths.iter().all(|path| !archive.repo_root.join(path).exists()));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !archive.repo_root.join(path).exists())
+        );
     }
 
     fn retain_committed_object(
@@ -1262,7 +1287,10 @@ mod tests {
             assert!(prepare(&repo, &archive, &message, bytes.len() - 1).is_err());
             assert_committed_object_missing(&archive, oid);
             assert_eq!(repo.head().unwrap().target().unwrap(), head);
-            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                index_before
+            );
             drop(repo);
 
             let result = repair(&archive, &config, &message, &recipients).unwrap();
@@ -1319,8 +1347,7 @@ mod tests {
         assert_eq!(result.files_created, 4);
         assert!(result.git_commit_needed);
         let repo = Repository::open(&archive.repo_root).unwrap();
-        for ((oid, retained, encoded), bytes) in
-            objects.iter().zip([&webp_bytes, &original_bytes])
+        for ((oid, retained, encoded), bytes) in objects.iter().zip([&webp_bytes, &original_bytes])
         {
             assert_eq!(repo.find_blob(*oid).unwrap().content(), bytes.as_slice());
             assert_eq!(std::fs::read(retained).unwrap(), *encoded);
@@ -1364,7 +1391,10 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"after!");
         assert_eq!(std::fs::read(retained).unwrap(), encoded);
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
-        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
     }
 
     #[test]
@@ -1388,7 +1418,10 @@ mod tests {
         assert_eq!(std::fs::read(retained_file).unwrap(), b"before");
         assert_eq!(std::fs::read(retained_object).unwrap(), encoded);
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
-        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
     }
 
     #[test]
@@ -1420,7 +1453,10 @@ mod tests {
             assert_committed_object_missing(&archive, oid);
         }
         assert_eq!(repo.head().unwrap().target().unwrap(), head);
-        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
     }
 
     #[test]
@@ -1429,11 +1465,8 @@ mod tests {
             let (_dir, config, archive, mut message, recipients) = fixture();
             let stored = raw(&archive, &config, "copy-conflict.bin", b"before");
             let retained = config.storage_root.join("retained-copy-conflict-object");
-            let (oid, encoded) = retain_committed_object(
-                &archive,
-                stored.meta.path.as_ref().unwrap(),
-                &retained,
-            );
+            let (oid, encoded) =
+                retain_committed_object(&archive, stored.meta.path.as_ref().unwrap(), &retained);
             message["attachments"] = json!([stored.meta]);
             let paths =
                 crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
@@ -1471,12 +1504,11 @@ mod tests {
     fn missing_committed_blob_preflight_does_not_consult_an_unrelated_index() {
         let (_dir, config, archive, mut message, _recipients) = fixture();
         let stored = raw(&archive, &config, "independent-index.bin", b"before");
-        let retained = config.storage_root.join("retained-index-independent-object");
-        let (oid, _) = retain_committed_object(
-            &archive,
-            stored.meta.path.as_ref().unwrap(),
-            &retained,
-        );
+        let retained = config
+            .storage_root
+            .join("retained-index-independent-object");
+        let (oid, _) =
+            retain_committed_object(&archive, stored.meta.path.as_ref().unwrap(), &retained);
         message["attachments"] = json!([stored.meta]);
         let repo = Repository::open(&archive.repo_root).unwrap();
         let index = repo.path().join("index");

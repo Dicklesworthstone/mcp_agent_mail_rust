@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use asupersync::{Cx, Outcome};
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, IdempotentOutcome, IdempotencyClaim, queries};
+use mcp_agent_mail_db::{
+    DbError, DbPool, DbPoolConfig, IdempotencyClaim, IdempotentOutcome, queries,
+};
 use mcp_agent_mail_tools::degraded_intents::{
     self as journal, QueuedAckIntent, QueuedReleaseIntentView,
 };
@@ -103,7 +105,10 @@ struct Snapshots {
 impl Snapshots {
     #[cfg(test)]
     fn read(config: &Config) -> Self {
-        fn complete(config: &Config, kind: journal_scan::Kind) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
+        fn complete(
+            config: &Config,
+            kind: journal_scan::Kind,
+        ) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
             let mut scanner = journal_scan::Scanner::new(kind);
             loop {
                 match scanner.poll(config, &AtomicBool::new(false))? {
@@ -119,23 +124,50 @@ impl Snapshots {
     }
 
     fn needs_db(&self) -> bool {
-        self.acknowledgements.as_ref().is_ok_and(|items| items.as_ref().is_some_and(|items| !items.is_empty()))
-            || self.releases.as_ref().is_ok_and(|items| items.as_ref().is_some_and(|items| !items.is_empty()))
+        self.acknowledgements
+            .as_ref()
+            .is_ok_and(|items| items.as_ref().is_some_and(|items| !items.is_empty()))
+            || self
+                .releases
+                .as_ref()
+                .is_ok_and(|items| items.as_ref().is_some_and(|items| !items.is_empty()))
     }
 }
 
-fn ack_snapshot(result: std::io::Result<Option<Vec<journal_scan::Intent>>>) -> std::io::Result<Option<Vec<QueuedAckIntent>>> {
-    result?.map(|items| items.into_iter().map(|item| match item {
-        journal_scan::Intent::Ack(intent) => Ok(intent),
-        journal_scan::Intent::Release(_) => Err(std::io::Error::other("release in acknowledgement snapshot")),
-    }).collect()).transpose()
+fn ack_snapshot(
+    result: std::io::Result<Option<Vec<journal_scan::Intent>>>,
+) -> std::io::Result<Option<Vec<QueuedAckIntent>>> {
+    result?
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| match item {
+                    journal_scan::Intent::Ack(intent) => Ok(intent),
+                    journal_scan::Intent::Release(_) => {
+                        Err(std::io::Error::other("release in acknowledgement snapshot"))
+                    }
+                })
+                .collect()
+        })
+        .transpose()
 }
 
-fn release_snapshot(result: std::io::Result<Option<Vec<journal_scan::Intent>>>) -> std::io::Result<Option<Vec<QueuedReleaseIntentView>>> {
-    result?.map(|items| items.into_iter().map(|item| match item {
-        journal_scan::Intent::Release(intent) => Ok(intent),
-        journal_scan::Intent::Ack(_) => Err(std::io::Error::other("acknowledgement in release snapshot")),
-    }).collect()).transpose()
+fn release_snapshot(
+    result: std::io::Result<Option<Vec<journal_scan::Intent>>>,
+) -> std::io::Result<Option<Vec<QueuedReleaseIntentView>>> {
+    result?
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| match item {
+                    journal_scan::Intent::Release(intent) => Ok(intent),
+                    journal_scan::Intent::Ack(_) => {
+                        Err(std::io::Error::other("acknowledgement in release snapshot"))
+                    }
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 struct ScanLane {
@@ -146,11 +178,21 @@ struct ScanLane {
 
 impl ScanLane {
     fn new(kind: journal_scan::Kind) -> Self {
-        Self { scanner: journal_scan::Scanner::new(kind), scanning: false, next_scan: None }
+        Self {
+            scanner: journal_scan::Scanner::new(kind),
+            scanning: false,
+            next_scan: None,
+        }
     }
 
-    fn poll(&mut self, config: &Config, shutdown: &AtomicBool, now: Instant) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
-        if !shutdown.load(Ordering::Acquire) && !self.scanning
+    fn poll(
+        &mut self,
+        config: &Config,
+        shutdown: &AtomicBool,
+        now: Instant,
+    ) -> std::io::Result<Option<Vec<journal_scan::Intent>>> {
+        if !shutdown.load(Ordering::Acquire)
+            && !self.scanning
             && self.next_scan.is_some_and(|next| now < next)
         {
             return Ok(None);
@@ -175,7 +217,8 @@ impl ScanLane {
         if self.scanning {
             SCAN_INTERVAL
         } else {
-            self.next_scan.map_or(Duration::ZERO, |next| next.saturating_duration_since(now))
+            self.next_scan
+                .map_or(Duration::ZERO, |next| next.saturating_duration_since(now))
         }
     }
 }
@@ -201,7 +244,9 @@ impl SnapshotReaders {
     }
 
     fn next_delay(&self, now: Instant) -> Duration {
-        self.acknowledgements.next_delay(now).min(self.releases.next_delay(now))
+        self.acknowledgements
+            .next_delay(now)
+            .min(self.releases.next_delay(now))
     }
 }
 
@@ -213,8 +258,7 @@ enum Completion {
 
 pub(super) fn start(config: &Config) {
     // There is no persistent mailbox to recover for an in-memory database.
-    if mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
-        .is_none()
+    if mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url).is_none()
     {
         return;
     }
@@ -306,9 +350,17 @@ fn run(config: &Config) {
         }
         let results = fastmcp_core::block_on(async {
             match Cx::current() {
-                Some(cx) => replay_snapshots(
-                    &cx, pool.as_ref(), config, &mut cursors, &SHUTDOWN, snapshots,
-                ).await,
+                Some(cx) => {
+                    replay_snapshots(
+                        &cx,
+                        pool.as_ref(),
+                        config,
+                        &mut cursors,
+                        &SHUTDOWN,
+                        snapshots,
+                    )
+                    .await
+                }
                 None => [
                     Err("durable replay has no runtime context".to_string()),
                     Err("durable replay has no runtime context".to_string()),
@@ -319,7 +371,10 @@ fn run(config: &Config) {
         for ((kind, lane), result) in [
             ("acknowledgement", &mut readers.acknowledgements),
             ("release", &mut readers.releases),
-        ].into_iter().zip(results) {
+        ]
+        .into_iter()
+        .zip(results)
+        {
             match result {
                 Ok(report) => {
                     if report.attempted > 0 || report.interrupted {
@@ -368,12 +423,22 @@ async fn replay_snapshots(
             Ok(ReplayReport::default())
         }
         Ok(Some(intents)) => match pool {
-            Some(pool) => replay_ack_batch(
-                cx, pool, config, &mut cursors.acknowledgements, shutdown, &intents,
-            ).await,
+            Some(pool) => {
+                replay_ack_batch(
+                    cx,
+                    pool,
+                    config,
+                    &mut cursors.acknowledgements,
+                    shutdown,
+                    &intents,
+                )
+                .await
+            }
             None => Err("durable acknowledgement database unavailable".to_string()),
         },
-        Err(error) => Err(format!("durable acknowledgement journal unavailable: {error}")),
+        Err(error) => Err(format!(
+            "durable acknowledgement journal unavailable: {error}"
+        )),
     };
     let release = match snapshots.releases {
         Ok(None) => Ok(ReplayReport::default()),
@@ -382,9 +447,10 @@ async fn replay_snapshots(
             Ok(ReplayReport::default())
         }
         Ok(Some(intents)) => match pool {
-            Some(pool) => releases::replay_batch(
-                cx, pool, config, &mut cursors.releases, shutdown, &intents,
-            ).await,
+            Some(pool) => {
+                releases::replay_batch(cx, pool, config, &mut cursors.releases, shutdown, &intents)
+                    .await
+            }
             None => Err("durable release database unavailable".to_string()),
         },
         Err(error) => Err(format!("durable release journal unavailable: {error}")),
@@ -409,7 +475,12 @@ fn validate_pool_binding(pool: &DbPool, config: &Config) -> Result<(), String> {
 async fn validate_live_pool(cx: &Cx, pool: &DbPool, config: &Config) -> Result<(), String> {
     validate_pool_binding(pool, config)?;
     // Even a correctly named archive snapshot must not authorize live mutation.
-    let conn = db_value(pool.acquire(cx).await)?;
+    let conn = db_value(match pool.acquire(cx).await {
+        Outcome::Ok(conn) => Outcome::Ok(conn),
+        Outcome::Err(error) => Outcome::Err(DbError::Sqlite(error.to_string())),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    })?;
     let rows = conn
         .query_sync("PRAGMA query_only", &[])
         .map_err(|e| e.to_string())?;
@@ -523,7 +594,11 @@ async fn apply_ack(
         };
         let outcome = db_value(
             queries::acknowledge_message_idempotent(
-                ctx.cx(), pool, agent_id, intent.message_id, claim,
+                ctx.cx(),
+                pool,
+                agent_id,
+                intent.message_id,
+                claim,
             )
             .await,
         )?;
@@ -532,9 +607,7 @@ async fn apply_ack(
             IdempotentOutcome::Conflict(_) => Completion::KeyConflict,
         })
     } else {
-        db_value(
-            queries::acknowledge_message(ctx.cx(), pool, agent_id, intent.message_id).await,
-        )?;
+        db_value(queries::acknowledge_message(ctx.cx(), pool, agent_id, intent.message_id).await)?;
         Ok(Completion::Replayed)
     }
 }
@@ -600,26 +673,42 @@ mod tests {
         let hash = journal::hash_json_value(&record);
         record["intent_id"] = json!(&hash[..16]);
         record["content_sha256"] = json!(hash);
-        journal::append_jsonl(config, journal::RELEASE_INTENT_LOG_FILE,
-            ".release_file_reservations.jsonl.lock", &record).unwrap();
+        journal::append_jsonl(
+            config,
+            journal::RELEASE_INTENT_LOG_FILE,
+            ".release_file_reservations.jsonl.lock",
+            &record,
+        )
+        .unwrap();
     }
 
     #[test]
     fn partial_scans_do_not_reset_cursors_or_admit_database_work() {
         use std::io::Write;
         let temp = tempfile::tempdir().unwrap();
-        let config = Config { storage_root: temp.path().to_path_buf(), ..Config::default() };
-        journal::append_ack_intent(&config, "/replay", "BlueLake", 1, "test", "busy", None).unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        journal::append_ack_intent(&config, "/replay", "BlueLake", 1, "test", "busy", None)
+            .unwrap();
         let path = journal::log_path(&config, journal::ACK_INTENT_LOG_FILE);
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap()
-            .write_all(&vec![b'\n'; 256]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![b'\n'; 256])
+            .unwrap();
         let before = std::fs::read(&path).unwrap();
         let stop = AtomicBool::new(false);
         let now = Instant::now();
         let mut readers = SnapshotReaders::new();
         let first = readers.poll(&config, &stop, now);
         assert!(first.acknowledgements.as_ref().unwrap().is_none());
-        assert!(!first.needs_db(), "a valid prefix is not an admitted snapshot");
+        assert!(
+            !first.needs_db(),
+            "a valid prefix is not an admitted snapshot"
+        );
         assert_eq!(readers.next_delay(now), SCAN_INTERVAL);
         let mut cursors = ReplayCursors::default();
         let after = (100, "a".repeat(64));
@@ -628,7 +717,11 @@ mod tests {
         rt.block_on(async {
             let cx = Cx::current().unwrap();
             let results = replay_snapshots(&cx, None, &config, &mut cursors, &stop, first).await;
-            assert!(results.into_iter().all(|result| result.unwrap().attempted == 0));
+            assert!(
+                results
+                    .into_iter()
+                    .all(|result| result.unwrap().attempted == 0)
+            );
         });
         assert_eq!(cursors.acknowledgements.after, Some(after));
         let second = readers.poll(&config, &stop, now + SCAN_INTERVAL);
@@ -640,9 +733,17 @@ mod tests {
     #[test]
     fn source_error_backoff_does_not_throttle_the_other_lanes_catch_up() {
         let temp = tempfile::tempdir().unwrap();
-        let config = Config { storage_root: temp.path().to_path_buf(), ..Config::default() };
-        journal::append_jsonl(&config, journal::ACK_INTENT_LOG_FILE, journal::ACK_INTENT_LOCK_FILE,
-            &json!({"schema_version": 99, "kind": journal::ACK_INTENT_KIND})).unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        journal::append_jsonl(
+            &config,
+            journal::ACK_INTENT_LOG_FILE,
+            journal::ACK_INTENT_LOCK_FILE,
+            &json!({"schema_version": 99, "kind": journal::ACK_INTENT_KIND}),
+        )
+        .unwrap();
         append_release_fixture(&config, 1);
         let now = Instant::now();
         let stop = AtomicBool::new(false);
@@ -650,14 +751,27 @@ mod tests {
         let first = readers.poll(&config, &stop, now);
         assert!(first.acknowledgements.is_err());
         assert_eq!(first.releases.unwrap().unwrap().len(), 1);
-        readers.releases.replay_finished(&ReplayReport {
-            completed: MAX_ATTEMPTS, more: true, ..ReplayReport::default()
-        }, now);
+        readers.releases.replay_finished(
+            &ReplayReport {
+                completed: MAX_ATTEMPTS,
+                more: true,
+                ..ReplayReport::default()
+            },
+            now,
+        );
         assert_eq!(readers.next_delay(now), CATCH_UP_INTERVAL);
         let fast = readers.poll(&config, &stop, now + CATCH_UP_INTERVAL);
-        assert!(fast.acknowledgements.unwrap().is_none(), "error lane keeps its own backoff");
+        assert!(
+            fast.acknowledgements.unwrap().is_none(),
+            "error lane keeps its own backoff"
+        );
         assert_eq!(fast.releases.unwrap().unwrap().len(), 1);
-        assert!(readers.poll(&config, &stop, now + POLL_INTERVAL).acknowledgements.is_err());
+        assert!(
+            readers
+                .poll(&config, &stop, now + POLL_INTERVAL)
+                .acknowledgements
+                .is_err()
+        );
     }
 
     #[test]
@@ -675,25 +789,81 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let cx = Cx::current().unwrap();
-            let project = queries::ensure_project(&cx, &pool, "/replay").await.into_result().unwrap();
+            let project = queries::ensure_project(&cx, &pool, "/replay")
+                .await
+                .into_result()
+                .unwrap();
             let project_id = project.id.unwrap();
-            let agent = queries::register_agent(&cx, &pool, project_id, "BlueLake",
-                "codex-cli", "test", None, None, None).await.into_result().unwrap();
+            let agent = queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
             let agent_id = agent.id.unwrap();
-            let message = queries::create_message_with_recipients(&cx, &pool, project_id,
-                agent_id, "must stay unacknowledged", "body", None, "normal", true,
-                "[]", &[(agent_id, "to")]).await.into_result().unwrap();
-            let leases = queries::create_file_reservations(&cx, &pool, project_id, agent_id,
-                &["src/recover.rs"], 3600, true, "pending release").await.into_result().unwrap();
+            let message = queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                "must stay unacknowledged",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(agent_id, "to")],
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let leases = queries::create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/recover.rs"],
+                3600,
+                true,
+                "pending release",
+            )
+            .await
+            .into_result()
+            .unwrap();
             let lease_id = leases[0].id.unwrap();
             append_release_fixture(&config, lease_id);
-            journal::append_ack_intent(&config, "/replay", "BlueLake", message.id.unwrap(),
-                "test", "busy", None).unwrap();
+            journal::append_ack_intent(
+                &config,
+                "/replay",
+                "BlueLake",
+                message.id.unwrap(),
+                "test",
+                "busy",
+                None,
+            )
+            .unwrap();
             let path = journal::log_path(&config, journal::ACK_INTENT_LOG_FILE);
-            std::fs::OpenOptions::new().append(true).open(&path).unwrap()
-                .write_all(&vec![b'\n'; 256]).unwrap();
-            journal::append_jsonl(&config, journal::ACK_INTENT_LOG_FILE, journal::ACK_INTENT_LOCK_FILE,
-                &json!({"schema_version": 99, "kind": journal::ACK_INTENT_REPLAY_KIND})).unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&vec![b'\n'; 256])
+                .unwrap();
+            journal::append_jsonl(
+                &config,
+                journal::ACK_INTENT_LOG_FILE,
+                journal::ACK_INTENT_LOCK_FILE,
+                &json!({"schema_version": 99, "kind": journal::ACK_INTENT_REPLAY_KIND}),
+            )
+            .unwrap();
             let before = std::fs::read(&path).unwrap();
             let stop = AtomicBool::new(false);
             let now = Instant::now();
@@ -702,31 +872,45 @@ mod tests {
             let first = readers.poll(&config, &stop, now);
             assert!(first.acknowledgements.as_ref().unwrap().is_none());
             assert!(first.needs_db(), "the independent release is ready");
-            let [ack, release] = replay_snapshots(&cx, Some(&pool), &config,
-                &mut cursors, &stop, first).await;
+            let [ack, release] =
+                replay_snapshots(&cx, Some(&pool), &config, &mut cursors, &stop, first).await;
             assert_eq!(ack.unwrap().attempted, 0);
             assert_eq!(release.unwrap().completed, 1);
             let next = readers.poll(&config, &stop, now + SCAN_INTERVAL);
             assert!(next.acknowledgements.is_err());
-            let [ack, release] = replay_snapshots(&cx, Some(&pool), &config,
-                &mut cursors, &stop, next).await;
+            let [ack, release] =
+                replay_snapshots(&cx, Some(&pool), &config, &mut cursors, &stop, next).await;
             assert!(ack.is_err());
             assert_eq!(release.unwrap().attempted, 0);
             let conn = pool.acquire(&cx).await.into_result().unwrap();
-            let rows = conn.query_sync("SELECT ack_ts FROM message_recipients WHERE message_id = ?",
-                &[message.id.unwrap().into()]).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = ?",
+                    &[message.id.unwrap().into()],
+                )
+                .unwrap();
             assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
             drop(conn);
-            let rows = queries::get_reservations_by_ids(&cx, &pool, &[lease_id]).await.into_result().unwrap();
+            let rows = queries::get_reservations_by_ids(&cx, &pool, &[lease_id])
+                .await
+                .into_result()
+                .unwrap();
             assert!(rows[0].released_ts.is_some_and(|ts| ts > 0));
-            assert!(journal::read_queued_release_intents(&config).unwrap().is_empty());
+            assert!(
+                journal::read_queued_release_intents(&config)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(std::fs::read(path).unwrap(), before);
             mcp_agent_mail_storage::flush_async_commits();
         });
     }
 
     fn keys(values: &[i64]) -> Vec<IntentKey> {
-        values.iter().map(|value| (*value, format!("{value:064}"))).collect()
+        values
+            .iter()
+            .map(|value| (*value, format!("{value:064}")))
+            .collect()
     }
 
     #[test]
@@ -759,14 +943,36 @@ mod tests {
     #[test]
     fn completion_receipts_use_existing_reader_contract_and_do_not_expose_keys() {
         let temp = tempfile::tempdir().unwrap();
-        let config = Config { storage_root: temp.path().to_path_buf(), ..Config::default() };
-        let claim = journal::AckIntentIdempotency { key: "private-key".into(), fingerprint: "a".repeat(64) };
-        journal::append_ack_intent(&config, "/replay", "BlueLake", 42, "test", "busy", Some(&claim)).unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let claim = journal::AckIntentIdempotency {
+            key: "private-key".into(),
+            fingerprint: "a".repeat(64),
+        };
+        journal::append_ack_intent(
+            &config,
+            "/replay",
+            "BlueLake",
+            42,
+            "test",
+            "busy",
+            Some(&claim),
+        )
+        .unwrap();
         let intents = journal::read_queued_ack_intents(&config).unwrap();
         append_ack_completion(&config, &intents[0], Completion::Replayed).unwrap();
-        assert!(journal::read_queued_ack_intents(&config).unwrap().is_empty());
-        let text = std::fs::read_to_string(journal::log_path(&config, journal::ACK_INTENT_LOG_FILE)).unwrap();
-        let receipt: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert!(
+            journal::read_queued_ack_intents(&config)
+                .unwrap()
+                .is_empty()
+        );
+        let text =
+            std::fs::read_to_string(journal::log_path(&config, journal::ACK_INTENT_LOG_FILE))
+                .unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_str(text.lines().last().unwrap()).unwrap();
         assert!(!receipt.to_string().contains("private-key"));
         assert_eq!(receipt["intent_content_sha256"], intents[0].content_sha256);
     }
@@ -785,64 +991,185 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let cx = Cx::current().unwrap();
-            let project = queries::ensure_project(&cx, &pool, "/replay").await.into_result().unwrap();
-            let agent = queries::register_agent(&cx, &pool, project.id.unwrap(), "BlueLake",
-                "codex-cli", "test", None, None, None).await.into_result().unwrap();
-            let message = queries::create_message_with_recipients(&cx, &pool,
-                project.id.unwrap(), agent.id.unwrap(), "queued ack", "body", None,
-                "normal", true, "[]", &[(agent.id.unwrap(), "to")]).await.into_result().unwrap();
+            let project = queries::ensure_project(&cx, &pool, "/replay")
+                .await
+                .into_result()
+                .unwrap();
+            let agent = queries::register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                "BlueLake",
+                "codex-cli",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let message = queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                agent.id.unwrap(),
+                "queued ack",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(agent.id.unwrap(), "to")],
+            )
+            .await
+            .into_result()
+            .unwrap();
             let claim = journal::AckIntentIdempotency {
                 key: "original-key".into(),
                 fingerprint: mcp_agent_mail_tools::idempotency::compute_fingerprint(
-                    "acknowledge_message", &[("agent", "BlueLake".into()),
-                        ("message_id", message.id.unwrap().to_string())]),
+                    "acknowledge_message",
+                    &[
+                        ("agent", "BlueLake".into()),
+                        ("message_id", message.id.unwrap().to_string()),
+                    ],
+                ),
             };
-            journal::append_ack_intent(&config, "/replay", "BlueLake", message.id.unwrap(),
-                "test", "database unavailable", Some(&claim)).unwrap();
+            journal::append_ack_intent(
+                &config,
+                "/replay",
+                "BlueLake",
+                message.id.unwrap(),
+                "test",
+                "database unavailable",
+                Some(&claim),
+            )
+            .unwrap();
             let intents = journal::read_queued_ack_intents(&config).unwrap();
             let stop = AtomicBool::new(false);
-            let report = replay_ack_batch(&cx, &pool, &config, &mut RoundCursor::default(), &stop, &intents).await.unwrap();
-            assert_eq!((report.attempted, report.applied, report.completed, report.deferred), (1, 1, 1, 0));
-            assert!(journal::read_queued_ack_intents(&config).unwrap().is_empty());
+            let report = replay_ack_batch(
+                &cx,
+                &pool,
+                &config,
+                &mut RoundCursor::default(),
+                &stop,
+                &intents,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (
+                    report.attempted,
+                    report.applied,
+                    report.completed,
+                    report.deferred
+                ),
+                (1, 1, 1, 0)
+            );
+            assert!(
+                journal::read_queued_ack_intents(&config)
+                    .unwrap()
+                    .is_empty()
+            );
             let conn = pool.acquire(&cx).await.into_result().unwrap();
-            let first = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[]).unwrap();
+            let first = conn
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
             let read_ts = first[0].get_named::<Option<i64>>("read_ts").unwrap();
             let ack_ts = first[0].get_named::<Option<i64>>("ack_ts").unwrap();
             assert!(read_ts.is_some() && ack_ts.is_some());
             drop(conn);
             // Model a concurrent worker holding a pre-completion snapshot.
-            let repeated = replay_ack_batch(&cx, &pool, &config, &mut RoundCursor::default(), &stop, &intents).await.unwrap();
+            let repeated = replay_ack_batch(
+                &cx,
+                &pool,
+                &config,
+                &mut RoundCursor::default(),
+                &stop,
+                &intents,
+            )
+            .await
+            .unwrap();
             assert_eq!(repeated.completed, 1);
             let conn = pool.acquire(&cx).await.into_result().unwrap();
-            let repeated = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[]).unwrap();
-            assert_eq!(repeated[0].get_named::<Option<i64>>("read_ts").unwrap(), read_ts);
-            assert_eq!(repeated[0].get_named::<Option<i64>>("ack_ts").unwrap(), ack_ts);
+            let repeated = conn
+                .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                .unwrap();
+            assert_eq!(
+                repeated[0].get_named::<Option<i64>>("read_ts").unwrap(),
+                read_ts
+            );
+            assert_eq!(
+                repeated[0].get_named::<Option<i64>>("ack_ts").unwrap(),
+                ack_ts
+            );
             drop(conn);
 
             // The original claim must not be bypassed when another queued
             // payload attempts to reuse its key after recovery.
             let second = queries::create_message_with_recipients(
-                &cx, &pool, project.id.unwrap(), agent.id.unwrap(), "second", "body",
-                None, "normal", true, "[]", &[(agent.id.unwrap(), "to")],
-            ).await.into_result().unwrap();
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                agent.id.unwrap(),
+                "second",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(agent.id.unwrap(), "to")],
+            )
+            .await
+            .into_result()
+            .unwrap();
             let conflicting = journal::AckIntentIdempotency {
                 key: claim.key.clone(),
                 fingerprint: mcp_agent_mail_tools::idempotency::compute_fingerprint(
-                    "acknowledge_message", &[("agent", "BlueLake".into()),
-                        ("message_id", second.id.unwrap().to_string())]),
+                    "acknowledge_message",
+                    &[
+                        ("agent", "BlueLake".into()),
+                        ("message_id", second.id.unwrap().to_string()),
+                    ],
+                ),
             };
-            journal::append_ack_intent(&config, "/replay", "BlueLake", second.id.unwrap(),
-                "test", "database unavailable", Some(&conflicting)).unwrap();
+            journal::append_ack_intent(
+                &config,
+                "/replay",
+                "BlueLake",
+                second.id.unwrap(),
+                "test",
+                "database unavailable",
+                Some(&conflicting),
+            )
+            .unwrap();
             let queued = journal::read_queued_ack_intents(&config).unwrap();
-            let conflict = replay_ack_batch(&cx, &pool, &config,
-                &mut RoundCursor::default(), &stop, &queued).await.unwrap();
-            assert_eq!((conflict.applied, conflict.completed, conflict.abandoned), (0, 1, 1));
-            assert!(journal::read_queued_ack_intents(&config).unwrap().is_empty());
+            let conflict = replay_ack_batch(
+                &cx,
+                &pool,
+                &config,
+                &mut RoundCursor::default(),
+                &stop,
+                &queued,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (conflict.applied, conflict.completed, conflict.abandoned),
+                (0, 1, 1)
+            );
+            assert!(
+                journal::read_queued_ack_intents(&config)
+                    .unwrap()
+                    .is_empty()
+            );
             let conn = pool.acquire(&cx).await.into_result().unwrap();
-            let rows = conn.query_sync(
-                "SELECT ack_ts FROM message_recipients WHERE message_id = ?",
-                &[second.id.unwrap().into()],
-            ).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = ?",
+                    &[second.id.unwrap().into()],
+                )
+                .unwrap();
             assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
         });
     }
@@ -866,30 +1193,75 @@ mod tests {
             rt.block_on(async {
                 let cx = Cx::current().unwrap();
                 let project = queries::ensure_project(&cx, &pool, "/replay")
-                    .await.into_result().unwrap();
+                    .await
+                    .into_result()
+                    .unwrap();
                 let project_id = project.id.unwrap();
                 let agent = queries::register_agent(
-                    &cx, &pool, project_id, "BlueLake", "codex-cli", "test", None, None, None,
-                ).await.into_result().unwrap();
+                    &cx,
+                    &pool,
+                    project_id,
+                    "BlueLake",
+                    "codex-cli",
+                    "test",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .unwrap();
                 let agent_id = agent.id.unwrap();
                 let message = queries::create_message_with_recipients(
-                    &cx, &pool, project_id, agent_id, "queued", "body", None,
-                    "normal", true, "[]", &[(agent_id, "to")],
-                ).await.into_result().unwrap();
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    "queued",
+                    "body",
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &[(agent_id, "to")],
+                )
+                .await
+                .into_result()
+                .unwrap();
                 let lease = queries::create_file_reservations(
-                    &cx, &pool, project_id, agent_id, &["src/owned.rs"], 3600, true, "queued",
-                ).await.into_result().unwrap();
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/owned.rs"],
+                    3600,
+                    true,
+                    "queued",
+                )
+                .await
+                .into_result()
+                .unwrap();
                 let lease_id = lease[0].id.unwrap();
                 let cutoff = mcp_agent_mail_db::now_micros();
                 let release_lock = ".release_file_reservations.jsonl.lock";
                 if broken_release {
                     journal::append_ack_intent(
-                        &config, "/replay", "BlueLake", message.id.unwrap(), "test", "busy", None,
-                    ).unwrap();
+                        &config,
+                        "/replay",
+                        "BlueLake",
+                        message.id.unwrap(),
+                        "test",
+                        "busy",
+                        None,
+                    )
+                    .unwrap();
                     journal::append_jsonl(
-                        &config, journal::RELEASE_INTENT_LOG_FILE, release_lock,
+                        &config,
+                        journal::RELEASE_INTENT_LOG_FILE,
+                        release_lock,
                         &json!({"schema_version": 2, "kind": journal::RELEASE_INTENT_KIND}),
-                    ).unwrap();
+                    )
+                    .unwrap();
                 } else {
                     let mut record = json!({
                         "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
@@ -901,8 +1273,12 @@ mod tests {
                     record["intent_id"] = json!(&hash[..16]);
                     record["content_sha256"] = json!(hash);
                     journal::append_jsonl(
-                        &config, journal::RELEASE_INTENT_LOG_FILE, release_lock, &record,
-                    ).unwrap();
+                        &config,
+                        journal::RELEASE_INTENT_LOG_FILE,
+                        release_lock,
+                        &record,
+                    )
+                    .unwrap();
                     // A non-file journal is a real read error, not an empty queue.
                     std::fs::create_dir(journal::log_path(&config, journal::ACK_INTENT_LOG_FILE))
                         .unwrap();
@@ -912,29 +1288,55 @@ mod tests {
                 assert_eq!(snapshots.acknowledgements.is_err(), !broken_release);
                 assert_eq!(snapshots.releases.is_err(), broken_release);
                 let [ack, release] = replay_snapshots(
-                    &cx, Some(&pool), &config, &mut ReplayCursors::default(),
-                    &AtomicBool::new(false), snapshots,
-                ).await;
+                    &cx,
+                    Some(&pool),
+                    &config,
+                    &mut ReplayCursors::default(),
+                    &AtomicBool::new(false),
+                    snapshots,
+                )
+                .await;
                 let conn = pool.acquire(&cx).await.into_result().unwrap();
-                let rows = conn.query_sync(
-                    "SELECT ack_ts FROM message_recipients WHERE message_id = ?",
-                    &[message.id.unwrap().into()],
-                ).unwrap();
-                assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap().is_some(), broken_release);
+                let rows = conn
+                    .query_sync(
+                        "SELECT ack_ts FROM message_recipients WHERE message_id = ?",
+                        &[message.id.unwrap().into()],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    rows[0]
+                        .get_named::<Option<i64>>("ack_ts")
+                        .unwrap()
+                        .is_some(),
+                    broken_release
+                );
                 drop(conn);
                 let rows = queries::get_reservations_by_ids(&cx, &pool, &[lease_id])
-                    .await.into_result().unwrap();
-                assert_eq!(rows[0].released_ts.is_some_and(|ts| ts > 0), !broken_release);
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(
+                    rows[0].released_ts.is_some_and(|ts| ts > 0),
+                    !broken_release
+                );
                 if broken_release {
                     assert_eq!(ack.unwrap().completed, 1);
                     assert!(release.is_err());
-                    assert!(journal::read_queued_ack_intents(&config).unwrap().is_empty());
+                    assert!(
+                        journal::read_queued_ack_intents(&config)
+                            .unwrap()
+                            .is_empty()
+                    );
                     assert!(journal::read_queued_release_intents(&config).is_err());
                 } else {
                     assert!(ack.is_err());
                     assert_eq!(release.unwrap().completed, 1);
                     assert!(journal::read_queued_ack_intents(&config).is_err());
-                    assert!(journal::read_queued_release_intents(&config).unwrap().is_empty());
+                    assert!(
+                        journal::read_queued_release_intents(&config)
+                            .unwrap()
+                            .is_empty()
+                    );
                 }
                 mcp_agent_mail_storage::flush_async_commits();
             });
@@ -955,24 +1357,70 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let cx = Cx::current().unwrap();
-            let project = queries::ensure_project(&cx, &pool, "/replay").await.into_result().unwrap();
-            let agent = queries::register_agent(&cx, &pool, project.id.unwrap(), "BlueLake",
-                "codex-cli", "test", None, None, None).await.into_result().unwrap();
-            let message = queries::create_message_with_recipients(&cx, &pool,
-                project.id.unwrap(), agent.id.unwrap(), "valid last", "body", None,
-                "normal", true, "[]", &[(agent.id.unwrap(), "to")]).await.into_result().unwrap();
+            let project = queries::ensure_project(&cx, &pool, "/replay")
+                .await
+                .into_result()
+                .unwrap();
+            let agent = queries::register_agent(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                "BlueLake",
+                "codex-cli",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            let message = queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project.id.unwrap(),
+                agent.id.unwrap(),
+                "valid last",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(agent.id.unwrap(), "to")],
+            )
+            .await
+            .into_result()
+            .unwrap();
             for offset in 0..=MAX_ATTEMPTS {
-                journal::append_ack_intent(&config, "/missing-project", "BlueLake",
-                    i64::try_from(offset).unwrap() + 1000, "test", "busy", None).unwrap();
+                journal::append_ack_intent(
+                    &config,
+                    "/missing-project",
+                    "BlueLake",
+                    i64::try_from(offset).unwrap() + 1000,
+                    "test",
+                    "busy",
+                    None,
+                )
+                .unwrap();
             }
-            journal::append_ack_intent(&config, "/replay", "BlueLake", message.id.unwrap(),
-                "test", "busy", None).unwrap();
+            journal::append_ack_intent(
+                &config,
+                "/replay",
+                "BlueLake",
+                message.id.unwrap(),
+                "test",
+                "busy",
+                None,
+            )
+            .unwrap();
             let intents = journal::read_queued_ack_intents(&config).unwrap();
             let path = journal::log_path(&config, journal::ACK_INTENT_LOG_FILE);
             let before = std::fs::read(&path).unwrap();
             let stop = AtomicBool::new(true);
             let mut cursor = RoundCursor::default();
-            let stopped = replay_ack_batch(&cx, &pool, &config, &mut cursor, &stop, &intents).await.unwrap();
+            let stopped = replay_ack_batch(&cx, &pool, &config, &mut cursor, &stop, &intents)
+                .await
+                .unwrap();
             assert!(stopped.interrupted);
             assert_eq!(stopped.attempted, 0);
             assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -984,21 +1432,41 @@ mod tests {
                 database_url: format!("sqlite://{}", foreign_path.display()),
                 ..config.clone()
             };
-            assert!(replay_ack_batch(&cx, &pool, &foreign, &mut cursor, &stop, &intents).await.is_err());
+            assert!(
+                replay_ack_batch(&cx, &pool, &foreign, &mut cursor, &stop, &intents)
+                    .await
+                    .is_err()
+            );
             assert_eq!(std::fs::read(&path).unwrap(), before);
 
-            let first = replay_ack_batch(&cx, &pool, &config, &mut cursor, &stop, &intents).await.unwrap();
+            let first = replay_ack_batch(&cx, &pool, &config, &mut cursor, &stop, &intents)
+                .await
+                .unwrap();
             assert_eq!(first.attempted, MAX_ATTEMPTS);
             assert_eq!(first.deferred, MAX_ATTEMPTS);
             assert_eq!(first.completed, 0);
             assert!(first.more);
-            assert_eq!(std::fs::read(&path).unwrap(), before, "no repeated failure records");
-            let second = replay_ack_batch(&cx, &pool, &config, &mut cursor, &stop, &intents).await.unwrap();
-            assert_eq!((second.attempted, second.completed, second.deferred), (2, 1, 1));
-            assert_eq!(journal::read_queued_ack_intents(&config).unwrap().len(), MAX_ATTEMPTS + 1);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "no repeated failure records"
+            );
+            let second = replay_ack_batch(&cx, &pool, &config, &mut cursor, &stop, &intents)
+                .await
+                .unwrap();
+            assert_eq!(
+                (second.attempted, second.completed, second.deferred),
+                (2, 1, 1)
+            );
+            assert_eq!(
+                journal::read_queued_ack_intents(&config).unwrap().len(),
+                MAX_ATTEMPTS + 1
+            );
             // A missing identity was not silently created by replay.
             let conn = pool.acquire(&cx).await.into_result().unwrap();
-            let rows = conn.query_sync("SELECT COUNT(*) AS count FROM projects", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 1);
         });
     }

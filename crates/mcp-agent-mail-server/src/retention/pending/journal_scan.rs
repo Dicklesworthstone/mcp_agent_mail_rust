@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::journal_io::{JournalDirectory, JournalFileMode};
-use mcp_agent_mail_tools::degraded_intents::{self as journal, QueuedAckIntent, QueuedReleaseIntentView};
+use mcp_agent_mail_tools::degraded_intents::{
+    self as journal, QueuedAckIntent, QueuedReleaseIntentView,
+};
 use serde_json::{Value, json};
 
 const BYTES_PER_POLL: usize = 256 * 1024;
@@ -98,7 +100,11 @@ pub(super) struct Scanner {
 
 impl Scanner {
     pub(super) fn new(kind: Kind) -> Self {
-        Self { kind, snapshot: None, limits: Limits::default() }
+        Self {
+            kind,
+            snapshot: None,
+            limits: Limits::default(),
+        }
     }
 
     pub(super) fn poll(
@@ -144,12 +150,18 @@ impl Scanner {
             return Ok(None);
         }
         if snapshot.skipped > 0 {
-            tracing::warn!(skipped_records = snapshot.skipped,
-                "malformed closeout journal records ignored; intact records retained");
+            tracing::warn!(
+                skipped_records = snapshot.skipped,
+                "malformed closeout journal records ignored; intact records retained"
+            );
         }
-        let mut pending: Vec<_> = std::mem::take(&mut snapshot.pending).into_values().collect();
+        let mut pending: Vec<_> = std::mem::take(&mut snapshot.pending)
+            .into_values()
+            .collect();
         pending.sort_unstable_by_key(|(order, _, _)| *order);
-        Ok(Some(pending.into_iter().map(|(_, intent, _)| intent).collect()))
+        Ok(Some(
+            pending.into_iter().map(|(_, intent, _)| intent).collect(),
+        ))
     }
 }
 
@@ -170,7 +182,9 @@ struct Snapshot {
 impl Snapshot {
     fn open(config: &Config, kind: Kind, limits: Limits) -> io::Result<Option<Self>> {
         let directory = match JournalDirectory::open(
-            &config.storage_root, journal::DEGRADED_INTENTS_DIR, false,
+            &config.storage_root,
+            journal::DEGRADED_INTENTS_DIR,
+            false,
         ) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -183,12 +197,22 @@ impl Snapshot {
         };
         let initial_bytes = file.metadata()?.len();
         if initial_bytes > limits.snapshot_bytes {
-            return Err(invalid("closeout journal snapshot exceeds the background scan byte limit; journal preserved; operator review required"));
+            return Err(invalid(
+                "closeout journal snapshot exceeds the background scan byte limit; journal preserved; operator review required",
+            ));
         }
         Ok(Some(Self {
-            kind, directory, reader: io::BufReader::with_capacity(8192, file.take(initial_bytes)),
-            initial_bytes, line: Vec::new(), pending: HashMap::new(), terminal: HashSet::new(),
-            pending_bytes: 0, next_order: 0, skipped: 0, limits,
+            kind,
+            directory,
+            reader: io::BufReader::with_capacity(8192, file.take(initial_bytes)),
+            initial_bytes,
+            line: Vec::new(),
+            pending: HashMap::new(),
+            terminal: HashSet::new(),
+            pending_bytes: 0,
+            next_order: 0,
+            skipped: 0,
+            limits,
         }))
     }
 
@@ -196,19 +220,28 @@ impl Snapshot {
         let file = self.reader.get_ref().get_ref();
         self.directory.validate_file(self.kind.file_name(), file)?;
         if file.metadata()?.len() < self.initial_bytes {
-            return Err(invalid("closeout journal truncated during snapshot admission; partial queue refused"));
+            return Err(invalid(
+                "closeout journal truncated during snapshot admission; partial queue refused",
+            ));
         }
         Ok(())
     }
 
-    fn advance(&mut self, shutdown: &AtomicBool, mut bytes: usize, mut records: usize) -> io::Result<bool> {
+    fn advance(
+        &mut self,
+        shutdown: &AtomicBool,
+        mut bytes: usize,
+        mut records: usize,
+    ) -> io::Result<bool> {
         while bytes > 0 && records > 0 {
             check_shutdown(shutdown)?;
             let available = self.reader.fill_buf()?;
             if available.is_empty() {
                 if self.reader.get_ref().limit() != 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                        "closeout journal truncated before its pinned EOF"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "closeout journal truncated before its pinned EOF",
+                    ));
                 }
                 if !self.line.is_empty() {
                     self.accept_line()?;
@@ -219,7 +252,9 @@ impl Snapshot {
             let newline = available.iter().position(|byte| *byte == b'\n');
             let consumed = newline.map_or(available.len(), |index| index + 1);
             if consumed > self.limits.record_bytes.saturating_sub(self.line.len()) {
-                return Err(invalid("closeout journal record exceeds its byte limit; partial queue refused"));
+                return Err(invalid(
+                    "closeout journal record exceeds its byte limit; partial queue refused",
+                ));
             }
             self.line.extend_from_slice(&available[..consumed]);
             self.reader.consume(consumed);
@@ -254,10 +289,13 @@ impl Snapshot {
                 }
                 self.admit_key()?;
                 if bytes > self.limits.pending_bytes.saturating_sub(self.pending_bytes) {
-                    return Err(invalid("closeout journal pending payload limit exceeded; partial queue refused"));
+                    return Err(invalid(
+                        "closeout journal pending payload limit exceeded; partial queue refused",
+                    ));
                 }
                 let order = self.next_order;
-                self.next_order = order.checked_add(1)
+                self.next_order = order
+                    .checked_add(1)
                     .ok_or_else(|| invalid("closeout journal sequence overflow"))?;
                 self.pending_bytes += bytes;
                 self.pending.insert(key, (order, intent, bytes));
@@ -278,7 +316,9 @@ impl Snapshot {
 
     fn admit_key(&self) -> io::Result<()> {
         if self.pending.len().saturating_add(self.terminal.len()) >= self.limits.identities {
-            return Err(invalid("closeout journal identity limit exceeded; partial queue refused"));
+            return Err(invalid(
+                "closeout journal identity limit exceeded; partial queue refused",
+            ));
         }
         Ok(())
     }
@@ -300,10 +340,13 @@ fn decode(kind: Kind, record: Value) -> io::Result<Record> {
     // Validate the schema even on a nonterminal marker. Unknown semantics
     // cannot prove either a pending instruction or successful completion.
     let version = record.get("schema_version").and_then(Value::as_u64);
-    let keyed = matches!(kind, Kind::Ack) && is_intent
+    let keyed = matches!(kind, Kind::Ack)
+        && is_intent
         && version == Some(u64::from(journal::KEYED_ACK_INTENT_SCHEMA_VERSION));
     if version != Some(1) && !keyed {
-        return Err(invalid("closeout journal has an unsupported schema; replay stopped and evidence preserved"));
+        return Err(invalid(
+            "closeout journal has an unsupported schema; replay stopped and evidence preserved",
+        ));
     }
     let mut payload = if is_intent {
         match kind {
@@ -331,7 +374,9 @@ fn decode(kind: Kind, record: Value) -> io::Result<Record> {
     if keyed {
         payload["idempotency"] = record["idempotency"].clone();
     } else if matches!(kind, Kind::Ack) && is_intent && record.get("idempotency").is_some() {
-        return Err(invalid("legacy acknowledgement contains an unsupported retry claim; replay refused"));
+        return Err(invalid(
+            "legacy acknowledgement contains an unsupported retry claim; replay refused",
+        ));
     }
     if matches!(kind, Kind::Release) && is_replay {
         payload["released"] = record["released"].clone();
@@ -349,8 +394,12 @@ fn decode(kind: Kind, record: Value) -> io::Result<Record> {
         let Some(target) = record.get("intent_content_sha256").and_then(Value::as_str) else {
             return Ok(Record::Ignored);
         };
-        if target.len() == 64 && target.starts_with(id)
-            && record.get("status").and_then(Value::as_str).is_some_and(journal::is_terminal_replay_status)
+        if target.len() == 64
+            && target.starts_with(id)
+            && record
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(journal::is_terminal_replay_status)
         {
             return Ok(Record::Terminal((id.to_string(), target.to_string())));
         }
@@ -361,17 +410,26 @@ fn decode(kind: Kind, record: Value) -> io::Result<Record> {
     }
     match kind {
         Kind::Ack => {
-            let intent: QueuedAckIntent = serde_json::from_value(record)
-                .map_err(|_| invalid("verified acknowledgement has an invalid payload; replay refused"))?;
+            let intent: QueuedAckIntent = serde_json::from_value(record).map_err(|_| {
+                invalid("verified acknowledgement has an invalid payload; replay refused")
+            })?;
             if keyed {
-                let claim = intent.idempotency.as_ref()
-                    .ok_or_else(|| invalid("keyed acknowledgement lost its retry claim; replay refused"))?;
-                if claim.key.is_empty() || claim.key.trim() != claim.key
-                    || claim.key.chars().count() > mcp_agent_mail_tools::idempotency::MAX_IDEMPOTENCY_KEY_LEN
+                let claim = intent.idempotency.as_ref().ok_or_else(|| {
+                    invalid("keyed acknowledgement lost its retry claim; replay refused")
+                })?;
+                if claim.key.is_empty()
+                    || claim.key.trim() != claim.key
+                    || claim.key.chars().count()
+                        > mcp_agent_mail_tools::idempotency::MAX_IDEMPOTENCY_KEY_LEN
                     || claim.fingerprint.len() != 64
-                    || !claim.fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || !claim
+                        .fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
                 {
-                    return Err(invalid("keyed acknowledgement has an invalid retry claim; replay refused"));
+                    return Err(invalid(
+                        "keyed acknowledgement has an invalid retry claim; replay refused",
+                    ));
                 }
             }
             Ok(Record::Intent(Intent::Ack(intent)))
@@ -384,7 +442,10 @@ fn decode(kind: Kind, record: Value) -> io::Result<Record> {
 
 fn check_shutdown(shutdown: &AtomicBool) -> io::Result<()> {
     if shutdown.load(Ordering::Acquire) {
-        Err(io::Error::new(io::ErrorKind::Interrupted, "closeout journal admission cancelled"))
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "closeout journal admission cancelled",
+        ))
     } else {
         Ok(())
     }
@@ -401,7 +462,10 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config { storage_root: dir.path().to_path_buf(), ..Config::default() };
+        let config = Config {
+            storage_root: dir.path().to_path_buf(),
+            ..Config::default()
+        };
         (dir, config)
     }
 
@@ -463,18 +527,27 @@ mod tests {
     fn assert_same_as_existing_reader(kind: Kind, config: &Config, intents: Vec<Intent>) {
         match kind {
             Kind::Ack => {
-                let observed: Vec<_> = intents.into_iter().map(|intent| match intent {
-                    Intent::Ack(intent) => intent,
-                    Intent::Release(_) => panic!("wrong lane"),
-                }).collect();
+                let observed: Vec<_> = intents
+                    .into_iter()
+                    .map(|intent| match intent {
+                        Intent::Ack(intent) => intent,
+                        Intent::Release(_) => panic!("wrong lane"),
+                    })
+                    .collect();
                 assert_eq!(observed, journal::read_queued_ack_intents(config).unwrap());
             }
             Kind::Release => {
-                let observed: Vec<_> = intents.into_iter().map(|intent| match intent {
-                    Intent::Release(intent) => intent,
-                    Intent::Ack(_) => panic!("wrong lane"),
-                }).collect();
-                assert_eq!(observed, journal::read_queued_release_intents(config).unwrap());
+                let observed: Vec<_> = intents
+                    .into_iter()
+                    .map(|intent| match intent {
+                        Intent::Release(intent) => intent,
+                        Intent::Ack(_) => panic!("wrong lane"),
+                    })
+                    .collect();
+                assert_eq!(
+                    observed,
+                    journal::read_queued_release_intents(config).unwrap()
+                );
             }
         }
     }
@@ -486,18 +559,33 @@ mod tests {
             let first = intent(kind, 1);
             let second = intent(kind, 2);
             let third = intent(kind, 3);
-            append(&config, kind, &marker(kind, &third, journal::REPLAY_STATUS_ABANDONED));
+            append(
+                &config,
+                kind,
+                &marker(kind, &third, journal::REPLAY_STATUS_ABANDONED),
+            );
             append(&config, kind, &first);
             append(&config, kind, &second);
-            append(&config, kind, &marker(kind, &first, journal::REPLAY_STATUS_REPLAYED));
+            append(
+                &config,
+                kind,
+                &marker(kind, &first, journal::REPLAY_STATUS_REPLAYED),
+            );
             append(&config, kind, &first);
             append(&config, kind, &third);
-            append(&config, kind, &marker(kind, &second, journal::REPLAY_STATUS_FAILED));
+            append(
+                &config,
+                kind,
+                &marker(kind, &second, journal::REPLAY_STATUS_FAILED),
+            );
             let mut scanner = Scanner::new(kind);
             let pending = finish(&mut scanner, &config).unwrap();
             assert_eq!(pending.len(), 1);
             assert_same_as_existing_reader(kind, &config, pending);
-            assert!(scanner.snapshot.is_none(), "completed scan releases its file handles");
+            assert!(
+                scanner.snapshot.is_none(),
+                "completed scan releases its file handles"
+            );
         }
     }
 
@@ -506,10 +594,19 @@ mod tests {
         let (_dir, config) = fixture();
         let first = intent(Kind::Ack, 1);
         append(&config, Kind::Ack, &first);
-        append(&config, Kind::Ack, &marker(Kind::Ack, &first, journal::REPLAY_STATUS_REPLAYED));
+        append(
+            &config,
+            Kind::Ack,
+            &marker(Kind::Ack, &first, journal::REPLAY_STATUS_REPLAYED),
+        );
         let mut scanner = Scanner::new(Kind::Ack);
         let stop = AtomicBool::new(false);
-        assert!(scanner.poll_bounded(&config, &stop, 1, 1).unwrap().is_none());
+        assert!(
+            scanner
+                .poll_bounded(&config, &stop, 1, 1)
+                .unwrap()
+                .is_none()
+        );
         assert!(scanner.snapshot.is_some());
         assert!(finish(&mut scanner, &config).unwrap().is_empty());
     }
@@ -523,7 +620,9 @@ mod tests {
                 append(&config, kind, &first);
                 let mut future = if terminal {
                     marker(kind, &first, journal::REPLAY_STATUS_REPLAYED)
-                } else { intent(kind, 2) };
+                } else {
+                    intent(kind, 2)
+                };
                 future["schema_version"] = json!(99);
                 future = seal(future, !terminal);
                 append(&config, kind, &future);
@@ -541,8 +640,20 @@ mod tests {
     #[test]
     fn keyed_acknowledgements_preserve_claims_and_refuse_downgrades() {
         let (_dir, config) = fixture();
-        let claim = journal::AckIntentIdempotency { key: "private-key".into(), fingerprint: "a".repeat(64) };
-        journal::append_ack_intent(&config, "/replay", "BlueLake", 42, "test", "busy", Some(&claim)).unwrap();
+        let claim = journal::AckIntentIdempotency {
+            key: "private-key".into(),
+            fingerprint: "a".repeat(64),
+        };
+        journal::append_ack_intent(
+            &config,
+            "/replay",
+            "BlueLake",
+            42,
+            "test",
+            "busy",
+            Some(&claim),
+        )
+        .unwrap();
         let pending = finish(&mut Scanner::new(Kind::Ack), &config).unwrap();
         assert_eq!(pending.len(), 1);
         assert!(!format!("{:?}", pending[0]).contains("private-key"));
@@ -580,7 +691,12 @@ mod tests {
         let (_dir, config) = fixture();
         append(&config, Kind::Ack, &intent(Kind::Ack, 1));
         let mut scanner = Scanner::new(Kind::Ack);
-        assert!(scanner.poll_bounded(&config, &AtomicBool::new(false), 1, 1).unwrap().is_none());
+        assert!(
+            scanner
+                .poll_bounded(&config, &AtomicBool::new(false), 1, 1)
+                .unwrap()
+                .is_none()
+        );
         append(&config, Kind::Ack, &intent(Kind::Ack, 2));
         assert_eq!(finish(&mut scanner, &config).unwrap().len(), 1);
         assert_eq!(finish(&mut scanner, &config).unwrap().len(), 2);
@@ -592,9 +708,17 @@ mod tests {
         append(&config, Kind::Ack, &intent(Kind::Ack, 1));
         let mut scanner = Scanner::new(Kind::Ack);
         let stop = AtomicBool::new(false);
-        assert!(scanner.poll_bounded(&config, &stop, 1, 1).unwrap().is_none());
+        assert!(
+            scanner
+                .poll_bounded(&config, &stop, 1, 1)
+                .unwrap()
+                .is_none()
+        );
         stop.store(true, Ordering::Release);
-        assert_eq!(scanner.poll(&config, &stop).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            scanner.poll(&config, &stop).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
         assert!(scanner.snapshot.is_none());
         assert_eq!(finish(&mut scanner, &config).unwrap().len(), 1);
     }
@@ -606,14 +730,24 @@ mod tests {
             append(&config, Kind::Ack, &intent(Kind::Ack, 1));
             let path = journal::log_path(&config, Kind::Ack.file_name());
             let mut scanner = Scanner::new(Kind::Ack);
-            assert!(scanner.poll_bounded(&config, &AtomicBool::new(false), 1, 1).unwrap().is_none());
+            assert!(
+                scanner
+                    .poll_bounded(&config, &AtomicBool::new(false), 1, 1)
+                    .unwrap()
+                    .is_none()
+            );
             if replace {
                 std::fs::rename(&path, config.storage_root.join("retained-journal.jsonl")).unwrap();
                 append(&config, Kind::Ack, &intent(Kind::Ack, 2));
             } else {
                 // Fixture models an external truncation; production never truncates.
                 std::fs::copy(&path, config.storage_root.join("retained-journal.jsonl")).unwrap();
-                std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
             }
             assert!(finish(&mut scanner, &config).is_err());
             assert!(scanner.snapshot.is_none());
@@ -646,8 +780,14 @@ mod tests {
     fn duplicate_records_do_not_consume_identity_or_payload_budgets_twice() {
         let (_dir, config) = fixture();
         let first = intent(Kind::Ack, 1);
-        for _ in 0..3 { append(&config, Kind::Ack, &first); }
-        append(&config, Kind::Ack, &marker(Kind::Ack, &first, journal::REPLAY_STATUS_REPLAYED));
+        for _ in 0..3 {
+            append(&config, Kind::Ack, &first);
+        }
+        append(
+            &config,
+            Kind::Ack,
+            &marker(Kind::Ack, &first, journal::REPLAY_STATUS_REPLAYED),
+        );
         append(&config, Kind::Ack, &first);
         let mut scanner = Scanner::new(Kind::Ack);
         scanner.limits.identities = 1;
@@ -660,15 +800,22 @@ mod tests {
         let (_dir, config) = fixture();
         append(&config, Kind::Ack, &intent(Kind::Ack, 1));
         let path = journal::log_path(&config, Kind::Ack.file_name());
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         file.write_all(b"{torn\n\xff\xfe\n").unwrap();
         drop(file);
         append(&config, Kind::Ack, &intent(Kind::Ack, 2));
         let mut scanner = Scanner::new(Kind::Ack);
         let mut result = None;
         for _ in 0..10_000 {
-            result = scanner.poll_bounded(&config, &AtomicBool::new(false), 1, 1).unwrap();
-            if result.is_some() { break; }
+            result = scanner
+                .poll_bounded(&config, &AtomicBool::new(false), 1, 1)
+                .unwrap();
+            if result.is_some() {
+                break;
+            }
         }
         let pending = result.expect("bounded scan reaches EOF");
         assert_eq!(pending.len(), 2);
@@ -678,12 +825,26 @@ mod tests {
     #[test]
     fn missing_sources_and_zero_budgets_never_create_or_consume_journals() {
         let (_dir, config) = fixture();
-        assert!(finish(&mut Scanner::new(Kind::Ack), &config).unwrap().is_empty());
-        assert!(!config.storage_root.join(journal::DEGRADED_INTENTS_DIR).exists());
+        assert!(
+            finish(&mut Scanner::new(Kind::Ack), &config)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !config
+                .storage_root
+                .join(journal::DEGRADED_INTENTS_DIR)
+                .exists()
+        );
         append(&config, Kind::Ack, &intent(Kind::Ack, 1));
         let mut scanner = Scanner::new(Kind::Ack);
         for (bytes, records) in [(0, 1), (1, 0)] {
-            assert!(scanner.poll_bounded(&config, &AtomicBool::new(false), bytes, records).unwrap().is_none());
+            assert!(
+                scanner
+                    .poll_bounded(&config, &AtomicBool::new(false), bytes, records)
+                    .unwrap()
+                    .is_none()
+            );
             let snapshot = scanner.snapshot.as_ref().unwrap();
             assert_eq!(snapshot.reader.get_ref().limit(), snapshot.initial_bytes);
             assert!(snapshot.line.is_empty());

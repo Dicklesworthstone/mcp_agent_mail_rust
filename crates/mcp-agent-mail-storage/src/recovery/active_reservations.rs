@@ -66,13 +66,10 @@ fn source_error(error: impl std::fmt::Display) -> String {
     format!("active reservation source unavailable: {error}")
 }
 
-fn outcome<T>(value: Outcome<T, DbError>) -> Result<T, String> {
+fn outcome<T, E: std::fmt::Display>(value: Outcome<T, E>) -> Result<T, String> {
     match value {
         Outcome::Ok(value) => Ok(value),
-        Outcome::Err(error) => {
-            corruption_circuit_breaker().observe_error(&error);
-            Err(error.to_string())
-        }
+        Outcome::Err(error) => Err(source_error(error)),
         Outcome::Cancelled(_) => Err("active reservation repair cancelled".into()),
         Outcome::Panicked(_) => Err("active reservation source panicked".into()),
     }
@@ -81,17 +78,18 @@ fn outcome<T>(value: Outcome<T, DbError>) -> Result<T, String> {
 fn timestamp(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value.as_str().and_then(|text| {
-            text.trim().parse().ok().or_else(|| {
-                mcp_agent_mail_core::iso_to_micros(text.trim())
-            })
+            text.trim()
+                .parse()
+                .ok()
+                .or_else(|| mcp_agent_mail_core::iso_to_micros(text.trim()))
         })
     })
 }
 
 fn validate_source(cx: &Cx, pool: &DbPool, config: &Config) -> Result<(), String> {
-    let selected = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(
-        &config.database_url,
-    ).ok_or("active reservation repair requires a file-backed mailbox")?;
+    let selected =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)
+            .ok_or("active reservation repair requires a file-backed mailbox")?;
     if fs::canonicalize(selected).map_err(source_error)?
         != fs::canonicalize(pool.sqlite_path()).map_err(source_error)?
         || pool.search_identity_path() != pool.sqlite_path()
@@ -101,7 +99,9 @@ fn validate_source(cx: &Cx, pool: &DbPool, config: &Config) -> Result<(), String
         return Err("active reservation repair refuses a foreign source or archive root".into());
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    let rows = conn.query_sync("PRAGMA query_only", &[]).map_err(source_error)?;
+    let rows = conn
+        .query_sync("PRAGMA query_only", &[])
+        .map_err(source_error)?;
     if rows.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
         return Err("query-only snapshots cannot authorize active reservation repair".into());
     }
@@ -130,15 +130,22 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, String
         &[id.into(), SOURCE_BYTES.into()],
     ).map_err(source_error)?;
     let [row] = rows.as_slice() else {
-        return Err("active reservation source missing, oversized, or without holder authority".into());
+        return Err(
+            "active reservation source missing, oversized, or without holder authority".into(),
+        );
     };
     let integer = |key| row.get_named::<i64>(key).map_err(source_error);
     let text = |key| row.get_named::<String>(key).map_err(source_error);
-    let hot = row.get_named::<Option<String>>("hot_release").map_err(source_error)?;
-    let ledger = row.get_named::<Option<i64>>("ledger_release").map_err(source_error)?;
+    let hot = row
+        .get_named::<Option<String>>("hot_release")
+        .map_err(source_error)?;
+    let ledger = row
+        .get_named::<Option<i64>>("ledger_release")
+        .map_err(source_error)?;
     // A malformed release is uncertainty, never proof that this lease is active.
     if let Some(hot) = hot {
-        let hot = timestamp(&Value::String(hot)).ok_or("malformed reservation release timestamp")?;
+        let hot =
+            timestamp(&Value::String(hot)).ok_or("malformed reservation release timestamp")?;
         if hot > 0 {
             return Ok(None);
         }
@@ -155,9 +162,12 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, String
     if expires <= now || created > now.saturating_sub(GRANT_GRACE_US) {
         return Ok(None);
     }
-    let generation = row.get_named::<Option<String>>("generation_id")
-        .map_err(source_error)?.ok_or("active reservation repair requires a database generation")?;
-    if generation.is_empty() || generation.len() > 128
+    let generation = row
+        .get_named::<Option<String>>("generation_id")
+        .map_err(source_error)?
+        .ok_or("active reservation repair requires a database generation")?;
+    if generation.is_empty()
+        || generation.len() > 128
         || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err("active reservation database generation is invalid".into());
@@ -170,17 +180,29 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, String
     let pattern = text("path_pattern")?;
     let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern.trim());
     let exclusive = integer("exclusive")?;
-    if id <= 0 || integer("id")? != id || integer("project_id")? <= 0 || integer("agent_id")? <= 0
-        || !Path::new(&key).is_absolute() || pattern.trim().is_empty()
-        || pattern.contains("..") || Path::new(pattern.trim()).is_absolute()
+    if id <= 0
+        || integer("id")? != id
+        || integer("project_id")? <= 0
+        || integer("agent_id")? <= 0
+        || !Path::new(&key).is_absolute()
+        || pattern.trim().is_empty()
+        || pattern.contains("..")
+        || Path::new(pattern.trim()).is_absolute()
         || !compiled.is_matchable()
-        || !matches!(exclusive, 0 | 1) || created <= 0 || expires <= created
-        || [created, expires].into_iter().any(|ts| chrono::DateTime::from_timestamp_micros(ts).is_none())
+        || !matches!(exclusive, 0 | 1)
+        || created <= 0
+        || expires <= created
+        || [created, expires]
+            .into_iter()
+            .any(|ts| chrono::DateTime::from_timestamp_micros(ts).is_none())
     {
         return Err("active reservation identity or timestamps are invalid".into());
     }
     Ok(Some(Source {
-        id, project_id: integer("project_id")?, agent_id: integer("agent_id")?, slug,
+        id,
+        project_id: integer("project_id")?,
+        agent_id: integer("agent_id")?,
+        slug,
         generation: generation.clone(),
         artifact: json!({
             "id": id, "project": key, "agent": name, "path_pattern": pattern.trim(),
@@ -193,23 +215,36 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, String
 }
 
 fn validate_evidence(source: &Source, value: &Value) -> crate::Result<()> {
-    for field in ["id", "project", "agent", "path_pattern", "exclusive", "db_generation"] {
+    for field in [
+        "id",
+        "project",
+        "agent",
+        "path_pattern",
+        "exclusive",
+        "db_generation",
+    ] {
         if value.get(field) != source.artifact.get(field) {
-            return Err(invalid(format!("active reservation {field} conflicts; evidence preserved")));
+            return Err(invalid(format!(
+                "active reservation {field} conflicts; evidence preserved"
+            )));
         }
     }
     if timestamp(&value["created_ts"]) != timestamp(&source.artifact["created_ts"]) {
-        return Err(invalid("active reservation creation identity conflicts; preserved"));
+        return Err(invalid(
+            "active reservation creation identity conflicts; preserved",
+        ));
     }
-    if !value["released_ts"].is_null()
-        && timestamp(&value["released_ts"]).is_none_or(|ts| ts > 0)
+    if !value["released_ts"].is_null() && timestamp(&value["released_ts"]).is_none_or(|ts| ts > 0) {
+        return Err(invalid(
+            "terminal or malformed archive release cannot become active",
+        ));
+    }
+    if timestamp(&value["expires_ts"])
+        .is_none_or(|ts| Some(ts) > timestamp(&source.artifact["expires_ts"]))
     {
-        return Err(invalid("terminal or malformed archive release cannot become active"));
-    }
-    if timestamp(&value["expires_ts"]).is_none_or(|ts| {
-        Some(ts) > timestamp(&source.artifact["expires_ts"])
-    }) {
-        return Err(invalid("archive expiry is missing or newer than the live source; preserved"));
+        return Err(invalid(
+            "archive expiry is missing or newer than the live source; preserved",
+        ));
     }
     Ok(())
 }
@@ -221,25 +256,41 @@ fn publish_missing(path: &Path, bytes: &[u8]) -> crate::Result<()> {
     if crate::path_existing_prefix_has_symlink(path)? {
         return Err(invalid("active reservation destination contains a symlink"));
     }
-    let parent = path.parent().ok_or_else(|| invalid("reservation has no parent directory"))?;
-    let mut staged = tempfile::Builder::new().prefix(".active-reservation-").tempfile_in(parent)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("reservation has no parent directory"))?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".active-reservation-")
+        .tempfile_in(parent)?;
     staged.write_all(bytes)?;
     staged.as_file().sync_all()?;
-    let file = staged.persist_noclobber(path).map_err(|error| error.error)?;
+    let file = staged
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
     file.sync_all()?;
     #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
-fn repair_one(cx: &Cx, pool: &DbPool, config: &Config, original: &Source,
-    attempted: &mut bool) -> Result<bool, String>
-{
+fn repair_one(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    original: &Source,
+    attempted: &mut bool,
+) -> Result<bool, String> {
     let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
     let archive = crate::ensure_archive(config, &original.slug).map_err(source_error)?;
     crate::with_project_lock(&archive, || {
-        if read_source(cx, pool, original.id).map_err(invalid)?.as_ref() != Some(original) {
-            return Err(invalid("active reservation source changed before publication"));
+        if read_source(cx, pool, original.id)
+            .map_err(invalid)?
+            .as_ref()
+            != Some(original)
+        {
+            return Err(invalid(
+                "active reservation source changed before publication",
+            ));
         }
         let root = crate::archive_project_root_checked(&archive)?;
         let repo_root = crate::archive_repo_root_checked(&archive)?;
@@ -247,16 +298,27 @@ fn repair_one(cx: &Cx, pool: &DbPool, config: &Config, original: &Source,
         let tree = head_tree(&repo)?;
         let project_path = root.join("project.json");
         let project_rel = crate::rel_path_cached(&archive.canonical_repo_root, &project_path)?;
-        for artifact in [read_artifact(&project_path)?, committed_artifact(&repo, tree.as_ref(), &project_rel)?]
-            .into_iter().flatten()
+        for artifact in [
+            read_artifact(&project_path)?,
+            committed_artifact(&repo, tree.as_ref(), &project_rel)?,
+        ]
+        .into_iter()
+        .flatten()
         {
-            if artifact.value["slug"] != original.slug || artifact.value["human_key"] != original.artifact["project"] {
-                return Err(invalid("archived project conflicts with active reservation source"));
+            if artifact.value["slug"] != original.slug
+                || artifact.value["human_key"] != original.artifact["project"]
+            {
+                return Err(invalid(
+                    "archived project conflicts with active reservation source",
+                ));
             }
         }
-        let path = root.join("file_reservations").join(reservation_artifact_filename(
-            Some(&original.generation), original.id,
-        ));
+        let path = root
+            .join("file_reservations")
+            .join(reservation_artifact_filename(
+                Some(&original.generation),
+                original.id,
+            ));
         let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path)?;
         let working = read_artifact(&path)?;
         let committed = committed_artifact(&repo, tree.as_ref(), &relative)?;
@@ -267,17 +329,27 @@ fn repair_one(cx: &Cx, pool: &DbPool, config: &Config, original: &Source,
             // Existing files are never rewritten, even to extend an old expiry.
             for field in ["expires_ts", "reason"] {
                 if working.value[field] != original.artifact[field] {
-                    return Err(invalid("existing active artifact differs; create-only repair refused"));
+                    return Err(invalid(
+                        "existing active artifact differs; create-only repair refused",
+                    ));
                 }
             }
             working.bytes.clone()
         } else {
-            let mut value = committed.as_ref().map_or_else(|| json!({}), |a| a.value.clone());
+            let mut value = committed
+                .as_ref()
+                .map_or_else(|| json!({}), |a| a.value.clone());
             let object = value.as_object_mut().expect("validated artifact object");
             // Source absence is authoritative. Do not retain a historical
             // nonpositive release spelling that another reader could misread.
             object.remove("released_ts");
-            object.extend(original.artifact.as_object().expect("source object").clone());
+            object.extend(
+                original
+                    .artifact
+                    .as_object()
+                    .expect("source object")
+                    .clone(),
+            );
             serde_json::to_vec_pretty(&value)?
         };
         if bytes.len() > ARTIFACT_BYTES {
@@ -286,8 +358,14 @@ fn repair_one(cx: &Cx, pool: &DbPool, config: &Config, original: &Source,
         if working.is_some() && committed.as_ref().is_some_and(|a| a.bytes == bytes) {
             return Ok(false);
         }
-        if read_source(cx, pool, original.id).map_err(invalid)?.as_ref() != Some(original) {
-            return Err(invalid("active reservation source changed during verification"));
+        if read_source(cx, pool, original.id)
+            .map_err(invalid)?
+            .as_ref()
+            != Some(original)
+        {
+            return Err(invalid(
+                "active reservation source changed during verification",
+            ));
         }
         *attempted = true;
         if working.is_none() {
@@ -296,20 +374,30 @@ fn repair_one(cx: &Cx, pool: &DbPool, config: &Config, original: &Source,
         // The commit helper reads the current file, not the captured ACTIVE
         // payload. A racing terminal writer can therefore only supersede it;
         // no stale active WriteOp is ever queued for a later overwrite.
-        crate::commit_paths_with_retry(repo_root, config,
-            &format!("repair: missing active reservation {}", original.id), &[relative.as_str()])?;
+        crate::commit_paths_with_retry(
+            repo_root,
+            config,
+            &format!("repair: missing active reservation {}", original.id),
+            &[relative.as_str()],
+        )?;
         let verified = Repository::open(repo_root)?;
-        let tree = head_tree(&verified)?.ok_or_else(|| invalid("active reservation commit has no HEAD"))?;
+        let tree = head_tree(&verified)?
+            .ok_or_else(|| invalid("active reservation commit has no HEAD"))?;
         let entry = tree.get_path(Path::new(&relative))?;
-        if entry.kind() != Some(ObjectType::Blob) || !matches!(entry.filemode(), 0o100644 | 0o100755)
-            || entry.id() != Oid::hash_object_ext(ObjectType::Blob, &bytes, entry.id().object_format())?
+        if entry.kind() != Some(ObjectType::Blob)
+            || !matches!(entry.filemode(), 0o100644 | 0o100755)
+            || entry.id()
+                != Oid::hash_object_ext(ObjectType::Blob, &bytes, entry.id().object_format())?
             || verified.find_blob(entry.id())?.content() != bytes
             || read_artifact(&path)?.is_none_or(|a| a.bytes != bytes)
         {
-            return Err(invalid("active reservation changed during commit; current evidence retained"));
+            return Err(invalid(
+                "active reservation changed during commit; current evidence retained",
+            ));
         }
         Ok(true)
-    }).map_err(|error| error.to_string())
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Repair missing generation-stamped stable artifacts for settled active leases.
@@ -317,9 +405,13 @@ fn repair_one(cx: &Cx, pool: &DbPool, config: &Config, original: &Source,
 /// Thirty-second-old grants are eligible; expired, released, unversioned and
 /// ambiguous sources remain untouched. Row selection and writes are bounded,
 /// but this is not a hard deadline on SQLite, Git or filesystem operations.
-pub fn reconcile_active_reservations(cx: &Cx, pool: &DbPool, config: &Config,
-    cursor: &mut ActiveReservationCursor, stop: &AtomicBool) -> Result<ActiveReservationReport, String>
-{
+pub fn reconcile_active_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ActiveReservationCursor,
+    stop: &AtomicBool,
+) -> Result<ActiveReservationReport, String> {
     let mut report = ActiveReservationReport::default();
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
@@ -332,14 +424,22 @@ pub fn reconcile_active_reservations(cx: &Cx, pool: &DbPool, config: &Config,
     validate_source(cx, pool, config)?;
     let identity = pool.sqlite_identity_key();
     if cursor.identity != identity {
-        *cursor = ActiveReservationCursor { identity, ..Default::default() };
+        *cursor = ActiveReservationCursor {
+            identity,
+            ..Default::default()
+        };
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
     if cursor.ceiling.is_none() {
-        let rows = conn.query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
+        let rows = conn
+            .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
             .map_err(source_error)?;
-        cursor.ceiling = Some(rows.first().ok_or("reservation ID aggregate missing")?
-            .get_as::<i64>(0).map_err(source_error)?);
+        cursor.ceiling = Some(
+            rows.first()
+                .ok_or("reservation ID aggregate missing")?
+                .get_as::<i64>(0)
+                .map_err(source_error)?,
+        );
         cursor.after = 0;
     }
     let rows = conn.query_sync(
@@ -351,7 +451,9 @@ pub fn reconcile_active_reservations(cx: &Cx, pool: &DbPool, config: &Config,
           mcp_agent_mail_db::now_micros().into(),
           mcp_agent_mail_db::now_micros().saturating_sub(GRANT_GRACE_US).into(), IDS_PER_PASS.into()],
     ).map_err(source_error)?;
-    let ids = rows.iter().map(|row| row.get_named::<i64>("id").map_err(source_error))
+    let ids = rows
+        .iter()
+        .map(|row| row.get_named::<i64>("id").map_err(source_error))
         .collect::<Result<Vec<_>, _>>()?;
     drop(conn);
     report.more = ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound");
@@ -370,7 +472,9 @@ pub fn reconcile_active_reservations(cx: &Cx, pool: &DbPool, config: &Config,
         }
         let mut attempted = false;
         let result = read_source(cx, pool, id).and_then(|source| {
-            source.map_or(Ok(false), |source| repair_one(cx, pool, config, &source, &mut attempted))
+            source.map_or(Ok(false), |source| {
+                repair_one(cx, pool, config, &source, &mut attempted)
+            })
         });
         report.scanned += 1;
         report.attempted += usize::from(attempted);
@@ -412,12 +516,16 @@ mod tests {
                 min_connections: 1,
                 max_connections: 1,
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
             let cx = Cx::for_testing();
             let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'project', '/project', 1)").unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
-            conn.execute_raw("INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')").unwrap();
+            conn.execute_raw(
+                "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')",
+            )
+            .unwrap();
             let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
             conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(401, 71, 81, 'src/*.rs', 1, 'active-test', 1000000, {expires}, NULL)")).unwrap();
             drop(conn);
@@ -426,12 +534,20 @@ mod tests {
     }
 
     fn target(config: &Config) -> std::path::PathBuf {
-        config.storage_root.join("projects/project/file_reservations/id-401-gaabb.json")
+        config
+            .storage_root
+            .join("projects/project/file_reservations/id-401-gaabb.json")
     }
 
     fn pass(cx: &Cx, pool: &DbPool, config: &Config) -> ActiveReservationReport {
-        reconcile_active_reservations(cx, pool, config, &mut ActiveReservationCursor::default(),
-            &AtomicBool::new(false)).unwrap()
+        reconcile_active_reservations(
+            cx,
+            pool,
+            config,
+            &mut ActiveReservationCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -444,18 +560,32 @@ mod tests {
             crate::ensure_parent_dir(&foreign).unwrap();
             fs::write(&foreign, b"retained foreign-generation evidence").unwrap();
             let report = pass(cx, pool, config);
-            assert_eq!((report.scanned, report.repaired, report.deferred), (1, 1, 0));
+            assert_eq!(
+                (report.scanned, report.repaired, report.deferred),
+                (1, 1, 0)
+            );
             let path = target(config);
-            assert_eq!(read_artifact(&path).unwrap().unwrap().value, source.artifact);
-            assert_eq!(fs::read(&foreign).unwrap(), b"retained foreign-generation evidence");
+            assert_eq!(
+                read_artifact(&path).unwrap().unwrap().value,
+                source.artifact
+            );
+            assert_eq!(
+                fs::read(&foreign).unwrap(),
+                b"retained foreign-generation evidence"
+            );
             let files = fs::read_dir(path.parent().unwrap()).unwrap().count();
             assert_eq!(files, 2, "no digest or legacy alias is manufactured");
             let repo = Repository::open(&config.storage_root).unwrap();
             let head = repo.head().unwrap().target().unwrap();
             let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
-            assert_eq!(committed_artifact(&repo, Some(&tree), &relative).unwrap().unwrap().value,
-                source.artifact);
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), &relative)
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                source.artifact
+            );
             assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
             let repeated = pass(cx, pool, config);
             assert_eq!((repeated.repaired, repeated.unchanged), (0, 1));
@@ -514,7 +644,13 @@ mod tests {
             let bytes = serde_json::to_vec_pretty(&terminal).unwrap();
             fs::write(&path, &bytes).unwrap();
             let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
-            crate::commit_paths_with_retry(&archive.repo_root, config, "fixture: release", &[&relative]).unwrap();
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                config,
+                "fixture: release",
+                &[&relative],
+            )
+            .unwrap();
             let retained = config.storage_root.join("retained-terminal.json");
             fs::rename(&path, &retained).unwrap();
             let repo = Repository::open(&archive.repo_root).unwrap();
@@ -552,7 +688,10 @@ mod tests {
             assert_eq!(pass(cx, pool, config).repaired, 1);
             assert_eq!(fs::read(&path).unwrap(), bytes);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401").unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401",
+            )
+            .unwrap();
             drop(conn);
             let report = pass(cx, pool, config);
             assert_eq!((report.repaired, report.deferred), (0, 1));
@@ -572,14 +711,28 @@ mod tests {
             crate::ensure_parent_dir(&path).unwrap();
             fs::write(&path, b"malformed retained evidence").unwrap();
             let mut cursor = ActiveReservationCursor::default();
-            let first = reconcile_active_reservations(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            let first = reconcile_active_reservations(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!((first.repaired, first.deferred), (WRITES_PER_PASS, 1));
             assert!(first.more);
             let ceiling = cursor.ceiling;
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT 900, project_id, agent_id, 'new.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401").unwrap();
             drop(conn);
-            let second = reconcile_active_reservations(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            let second = reconcile_active_reservations(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!(second.repaired, WRITES_PER_PASS);
             assert_eq!(cursor.ceiling, ceiling);
             assert!(cursor.after < 900);
@@ -609,7 +762,14 @@ mod tests {
     fn shutdown_and_foreign_mailbox_binding_do_not_authorize_writes() {
         fixture(|cx, pool, config| {
             let mut cursor = ActiveReservationCursor::default();
-            let report = reconcile_active_reservations(cx, pool, config, &mut cursor, &AtomicBool::new(true)).unwrap();
+            let report = reconcile_active_reservations(
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(true),
+            )
+            .unwrap();
             assert!(report.interrupted);
             assert_eq!(report.scanned, 0);
             assert!(!target(config).exists());
@@ -619,7 +779,16 @@ mod tests {
                 database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&other),
                 ..config.clone()
             };
-            assert!(reconcile_active_reservations(cx, pool, &foreign, &mut cursor, &AtomicBool::new(false)).is_err());
+            assert!(
+                reconcile_active_reservations(
+                    cx,
+                    pool,
+                    &foreign,
+                    &mut cursor,
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+            );
             assert!(!target(config).exists());
             assert_eq!(fs::read(other).unwrap(), b"not this mailbox");
         });

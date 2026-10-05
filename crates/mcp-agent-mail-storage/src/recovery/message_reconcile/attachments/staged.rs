@@ -92,25 +92,33 @@ impl Snapshot {
     ) -> crate::Result<Option<Vec<u8>>> {
         let key = Path::new(relative);
         if (1..=3).any(|stage| self.index.get_path(key, stage).is_some()) {
-            return Err(invalid("staged attachment has unresolved merge stages; preserved"));
+            return Err(invalid(
+                "staged attachment has unresolved merge stages; preserved",
+            ));
         }
         let Some(entry) = self.index.get_path(key, 0) else {
             return Ok(None);
         };
         if entry.path != relative.as_bytes() || !matches!(entry.mode, 0o100644 | 0o100755) {
-            return Err(invalid("staged attachment is not an exact regular-file entry"));
+            return Err(invalid(
+                "staged attachment is not an exact regular-file entry",
+            ));
         }
         // Check the header before materializing a potentially large object.
         let (size, kind) = repo.odb()?.read_header(entry.id)?;
         if kind != ObjectType::Blob || size > remaining_bytes {
-            return Err(invalid("staged attachment recovery bundle byte budget exceeded"));
+            return Err(invalid(
+                "staged attachment recovery bundle byte budget exceeded",
+            ));
         }
         let blob = repo.find_blob(entry.id)?;
         if blob.content().len() != size
             || Oid::hash_object_ext(ObjectType::Blob, blob.content(), entry.id.object_format())?
                 != entry.id
         {
-            return Err(invalid("staged attachment content does not match its object identity"));
+            return Err(invalid(
+                "staged attachment content does not match its object identity",
+            ));
         }
         Ok(Some(blob.content().to_vec()))
     }
@@ -142,12 +150,23 @@ mod tests {
         let index_path = repo.path().join("index");
         let before = std::fs::read(&index_path).unwrap();
         let mut staged = StagedAttachments::default();
-        assert_eq!(staged.read(&repo, KEY, BYTES.len()).unwrap().unwrap(), BYTES);
+        assert_eq!(
+            staged.read(&repo, KEY, BYTES.len()).unwrap().unwrap(),
+            BYTES
+        );
         assert_eq!(std::fs::read(index_path).unwrap(), before);
         assert!(!dir.path().join(KEY).exists());
-        assert_eq!(std::fs::read(dir.path().join("retained.bin")).unwrap(), BYTES);
+        assert_eq!(
+            std::fs::read(dir.path().join("retained.bin")).unwrap(),
+            BYTES
+        );
         assert!(staged.read(&repo, KEY, BYTES.len() - 1).is_err());
-        assert!(staged.read(&repo, "projects/test/attachments/absent", 0).unwrap().is_none());
+        assert!(
+            staged
+                .read(&repo, "projects/test/attachments/absent", 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -162,7 +181,10 @@ mod tests {
         index.write().unwrap();
         assert_eq!(staged.read(&repo, KEY, 1024).unwrap().unwrap(), BYTES);
         assert_eq!(
-            StagedAttachments::default().read(&repo, KEY, 1024).unwrap().unwrap(),
+            StagedAttachments::default()
+                .read(&repo, KEY, 1024)
+                .unwrap()
+                .unwrap(),
             b"replacement"
         );
     }
@@ -178,7 +200,10 @@ mod tests {
         std::fs::rename(&retained, &index_path).unwrap();
         assert!(staged.read(&repo, KEY, 1024).unwrap().is_none());
         assert_eq!(
-            StagedAttachments::default().read(&repo, KEY, 1024).unwrap().unwrap(),
+            StagedAttachments::default()
+                .read(&repo, KEY, 1024)
+                .unwrap()
+                .unwrap(),
             BYTES
         );
     }
@@ -224,7 +249,13 @@ mod tests {
     #[test]
     fn missing_staged_object_is_an_error_not_an_absent_attachment() {
         let (_dir, repo) = fixture();
-        let oid = repo.index().unwrap().get_path(Path::new(KEY), 0).unwrap().id.to_string();
+        let oid = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new(KEY), 0)
+            .unwrap()
+            .id
+            .to_string();
         let object = repo.path().join("objects").join(&oid[..2]).join(&oid[2..]);
         let retained = repo.path().join("retained-object");
         std::fs::rename(&object, &retained).unwrap();

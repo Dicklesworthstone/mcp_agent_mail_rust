@@ -11,9 +11,8 @@ mod archive;
 mod pending;
 
 pub use archive::{
-    ArtifactDiskReport, ArtifactRetentionReport, ArtifactRetentionTotals,
-    ArtifactRetentionWarning, ArtifactRootReport, anchor_settled_writes,
-    artifact_retention_report,
+    ArtifactDiskReport, ArtifactRetentionReport, ArtifactRetentionTotals, ArtifactRetentionWarning,
+    ArtifactRootReport, anchor_settled_writes, artifact_retention_report,
 };
 
 /// Start archive maintenance, durable-intent replay and active lease repair.
