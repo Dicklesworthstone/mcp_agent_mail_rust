@@ -176,7 +176,7 @@ struct Registry {
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| Registry::new(MAX_INSTANCES));
 
 impl Registry {
-    fn new(limit: usize) -> Self {
+    const fn new(limit: usize) -> Self {
         Self {
             instances: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
@@ -284,7 +284,7 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn priority(&self) -> (bool, u64, std::cmp::Reverse<u64>) {
+    const fn priority(&self) -> (bool, u64, std::cmp::Reverse<u64>) {
         (self.waiters > 0, self.wait_ns, std::cmp::Reverse(self.id))
     }
 
@@ -371,18 +371,21 @@ impl ActivityGuard {
     fn begin(instance: &Arc<Instance>, access: LockAccess,
         site: &'static Location<'static>, since: Instant, phase: Phase) -> Self
     {
-        let thread = THREAD_LABEL.with(Arc::clone);
+        // A later TLS destructor can still acquire application locks after
+        // the cached label has been destroyed. Instrumentation must not add
+        // a teardown panic: retain anonymous counts and disclose omissions.
+        let thread = THREAD_LABEL.try_with(Arc::clone).ok();
         let mut state = instance.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match phase {
             Phase::Holding => state.holders += 1,
             Phase::Waiting => state.waiters += 1,
         }
-        let token = if state.participants.len() < MAX_PARTICIPANTS {
+        let token = if thread.is_some() && state.participants.len() < MAX_PARTICIPANTS {
             state.next_token.checked_add(1)
         } else {
             None
         };
-        if let Some(token) = token {
+        if let (Some(token), Some(thread)) = (token, thread) {
             state.next_token = token;
             state.participants.push(Participant { token, thread, access, site, since, phase });
         }
@@ -716,5 +719,60 @@ mod tests {
         assert!(truncated);
         assert_eq!(bounded_label("ok", 64), ("ok".to_string(), false));
         assert_eq!(bounded_label("é", 0), (String::new(), true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destroyed_thread_label_retains_anonymous_counts_without_panicking() {
+        struct LateUse {
+            instance: Arc<Instance>,
+            result: mpsc::Sender<(bool, bool)>,
+        }
+        impl Drop for LateUse {
+            fn drop(&mut self) {
+                let label_gone = THREAD_LABEL.try_with(|_| ()).is_err();
+                let instance = Arc::clone(&self.instance);
+                // Catch the old with() panic inside the destructor, so a
+                // regression fails this test instead of aborting the suite.
+                let outcome = std::panic::catch_unwind(move || {
+                    let guard = ActivityGuard::begin(
+                        &instance, LockAccess::Mutex, Location::caller(),
+                        Instant::now(), Phase::Holding,
+                    );
+                    let state = instance.state.lock().unwrap();
+                    let anonymous = state.holders == 1 && state.participants.is_empty();
+                    drop(state);
+                    drop(guard);
+                    anonymous
+                });
+                let _ = self.result.send((label_gone, outcome.unwrap_or(false)));
+            }
+        }
+        thread_local! {
+            static LATE_USE: std::cell::RefCell<Option<LateUse>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        let registry = Registry::new(1);
+        let instance = registry.register(LockLevel::StorageCommitQueue).unwrap();
+        let retained = Arc::clone(&instance);
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Initialize this destructor before the label cache, so it runs
+            // after that cache has been destroyed at this real thread's exit.
+            LATE_USE.with(|slot| *slot.borrow_mut() = Some(LateUse {
+                instance: Arc::clone(&retained), result: result_tx,
+            }));
+            drop(ActivityGuard::begin(
+                &retained, LockAccess::Mutex, Location::caller(),
+                Instant::now(), Phase::Holding,
+            ));
+        }).join().unwrap();
+        let (label_gone, anonymous) = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(label_gone, "exercise a destroyed TLS label, not the ordinary cache path");
+        assert!(anonymous, "missing labels must not prevent lock-activity cleanup");
+        let state = instance.state.lock().unwrap();
+        assert_eq!((state.holders, state.waiters), (0, 0));
+        assert!(state.participants.is_empty());
     }
 }
