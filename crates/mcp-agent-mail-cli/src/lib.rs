@@ -70190,7 +70190,7 @@ startup_timeout_sec = 42
         let output = capture.drain_to_string();
         assert!(
             result.is_err(),
-            "a missing project cannot authorize a reservation"
+            "a missing project cannot authorize a reservation: {result:?} {output}"
         );
         assert!(
             !output.contains("\"granted\""),

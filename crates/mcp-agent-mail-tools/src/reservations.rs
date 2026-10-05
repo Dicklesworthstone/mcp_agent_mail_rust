@@ -1686,6 +1686,20 @@ pub async fn file_reservation_paths(
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
+    // An orphaned-project placeholder names data whose project row is gone;
+    // it is readable but cannot authorize a new reservation.
+    if mcp_agent_mail_db::queries::is_orphan_project_placeholder(&project) {
+        return Err(legacy_tool_error(
+            "NOT_FOUND",
+            format!(
+                "Project '{}' has no project row (its data is orphaned), so it cannot hold new \
+                 file reservations. Use ensure_project for a real project path.",
+                project.slug
+            ),
+            true,
+            json!({"identifier": project_key, "orphaned_project_id": project.id}),
+        ));
+    }
     let project_id = project.id.unwrap_or(0);
 
     // Limit: max 200 patterns per call, preventing resource exhaustion.

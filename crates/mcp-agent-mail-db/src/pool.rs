@@ -4539,9 +4539,12 @@ impl DbPool {
     /// - Before export/snapshot (no loose WAL journal)
     /// - Idle periods (reclaim WAL disk space)
     ///
-    /// Returns the number of WAL frames checkpointed, or an error. Errors if
-    /// SQLite reports that the TRUNCATE checkpoint was busy or incomplete.
-    /// No-ops silently for `:memory:` databases.
+    /// Returns the engine's reported checkpointed-frame count, or an error.
+    /// A completed TRUNCATE resets the WAL first, so stock SQLite and
+    /// FrankenSQLite 0.4.9 report 0 on success; do not treat the count as
+    /// progress evidence. Errors if SQLite reports that the TRUNCATE
+    /// checkpoint was busy or incomplete. No-ops silently for `:memory:`
+    /// databases.
     pub fn wal_checkpoint(&self) -> DbResult<u64> {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
@@ -19847,12 +19850,32 @@ mod tests {
                  INSERT INTO checkpoint_probe(value) VALUES ('alpha'), ('beta'), ('gamma');",
             )
             .expect("create committed WAL frames");
-        let checkpointed = pool
-            .wal_checkpoint()
-            .expect("TRUNCATE checkpoint should succeed after rollback");
+        let wal_path = format!("{}-wal", db_path.display());
+        let wal_len = |path: &str| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        let page_size = writer
+            .query_sync("PRAGMA page_size", &[])
+            .expect("read page size")[0]
+            .get_as::<i64>(0)
+            .expect("decode page size");
+        let one_frame = 32 + 24 + u64::try_from(page_size).expect("positive page size");
+        let before = wal_len(&wal_path);
         assert!(
-            checkpointed > 0,
-            "semantic checkpoint fixture must move at least one committed WAL frame"
+            before >= one_frame,
+            "semantic checkpoint fixture must leave at least one committed frame in the WAL, found {before} bytes"
+        );
+        // Stock SQLite reports a completed TRUNCATE checkpoint as 0|0|0 (the
+        // WAL is reset), and FrankenSQLite 0.4.9 matches it, so the returned
+        // count is not the evidence: a WAL with no frame left (stock SQLite
+        // truncates it to 0 bytes; FrankenSQLite may keep only the 32-byte
+        // header) plus the preserved rows below are.
+        pool.wal_checkpoint()
+            .expect("TRUNCATE checkpoint should succeed after rollback");
+        const WAL_HEADER_BYTES: u64 = 32;
+        const WAL_FRAME_HEADER_BYTES: u64 = 24;
+        let after = wal_len(&wal_path);
+        assert!(
+            after < WAL_HEADER_BYTES + WAL_FRAME_HEADER_BYTES,
+            "a completed TRUNCATE checkpoint must leave no WAL frame, found {after} WAL bytes"
         );
         let rows = writer
             .query_sync("SELECT COUNT(*) AS count FROM checkpoint_probe", &[])
