@@ -2819,6 +2819,68 @@ fn guard_check_advisory_does_not_exit_1() {
     );
 }
 
+/// An archive root holding one active exclusive reservation on `foo.txt` by
+/// another agent.
+fn guard_repo_with_foreign_reservation(env: &TestEnv) -> String {
+    let repo = env.tmp.path().join("archive_root");
+    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
+    let reservation = serde_json::json!({
+        "path_pattern": "foo.txt",
+        "agent_name": "OtherAgent",
+        "exclusive": true,
+        "expires_ts": "2999-01-01T00:00:00Z",
+        "released_ts": serde_json::Value::Null,
+    });
+    std::fs::write(
+        repo.join("file_reservations").join("res.json"),
+        serde_json::to_string_pretty(&reservation).unwrap(),
+    )
+    .expect("write reservation");
+    repo.to_string_lossy().to_string()
+}
+
+/// `am guard check` honors the installed hook's switches; without one, the
+/// same conflict exits 1 (guard_check_conflict_exits_1_when_not_advisory).
+#[test]
+fn guard_check_honors_bypass_warn_mode_and_disabled_enforcement() {
+    for (var, value, expect_conflict_listed, marker) in [
+        ("AGENT_MAIL_BYPASS", "1", false, "AGENT_MAIL_BYPASS is set"),
+        ("AGENT_MAIL_GUARD_MODE", "warn", true, "not blocking"),
+        (
+            "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+            "false",
+            false,
+            "enforcement is disabled",
+        ),
+    ] {
+        let env = TestEnv::new();
+        let repo_str = guard_repo_with_foreign_reservation(&env);
+        let mut child_env = env.base_env();
+        child_env.push((var.to_string(), value.to_string()));
+        let out = run_am(
+            &child_env,
+            Some(env.tmp.path()),
+            &["guard", "check", "--repo", &repo_str],
+            Some(b"foo.txt\n"),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{var}={value}: expected exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("CONFLICT: pattern"),
+            expect_conflict_listed,
+            "{var}={value}: conflict listing\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains(marker) || stderr.contains(marker),
+            "{var}={value}: expected '{marker}'\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn projects_mark_identity_no_commit_writes_marker_file() {
     let env = TestEnv::new();

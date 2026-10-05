@@ -1797,11 +1797,20 @@ pub enum GuardCommand {
     Status {
         repo: PathBuf,
     },
+    /// Check paths read from stdin against other agents' active exclusive
+    /// reservations; exit 1 on a conflict.
+    ///
+    /// Honors the installed hook's switches: AGENT_MAIL_BYPASS=1 skips the
+    /// check, AGENT_MAIL_GUARD_MODE=warn reports conflicts without failing,
+    /// and FILE_RESERVATIONS_ENFORCEMENT_ENABLED=false disables it.
     Check {
+        /// Read NUL-separated paths (as from `git diff -z`) instead of lines.
         #[arg(long)]
         stdin_nul: bool,
+        /// Report conflicts but exit 0.
         #[arg(long)]
         advisory: bool,
+        /// Repository to check (default: the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
     },
@@ -11341,12 +11350,25 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             let config = mcp_agent_mail_core::Config::from_env();
             let archive_root = resolve_guard_archive_root_for_check(&repo_path, &config);
 
-            let conflicts =
-                mcp_agent_mail_guard::guard_check(&archive_root, &repo_path, &paths, advisory)?;
-            if conflicts.is_empty() {
+            // Honor the same escape hatches as the installed hook: bypass,
+            // disabled enforcement, and warn mode.
+            let result = mcp_agent_mail_guard::guard_check_full(&archive_root, &repo_path, &paths)?;
+            if result.bypassed {
+                ftui_runtime::ftui_eprintln!(
+                    "AGENT_MAIL_BYPASS is set: file reservation guard skipped."
+                );
+                return Ok(());
+            }
+            if result.gated {
+                ftui_runtime::ftui_println!(
+                    "File reservation enforcement is disabled (FILE_RESERVATIONS_ENFORCEMENT_ENABLED); nothing checked."
+                );
+                return Ok(());
+            }
+            if result.conflicts.is_empty() {
                 ftui_runtime::ftui_println!("No file reservation conflicts detected.");
             } else {
-                for c in &conflicts {
+                for c in &result.conflicts {
                     ftui_runtime::ftui_eprintln!(
                         "CONFLICT: pattern '{}' held by {} (expires {})",
                         c.pattern,
@@ -11354,7 +11376,11 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
                         c.expires_ts
                     );
                 }
-                if !advisory {
+                if result.mode == mcp_agent_mail_guard::GuardMode::Warn {
+                    ftui_runtime::ftui_eprintln!(
+                        "AGENT_MAIL_GUARD_MODE=warn: conflicts reported, not blocking."
+                    );
+                } else if !advisory {
                     return Err(CliError::ExitCode(1));
                 }
             }
