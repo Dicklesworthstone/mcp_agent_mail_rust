@@ -3850,6 +3850,7 @@ fn run_unified_search(
         redaction_policy: None,
         track_telemetry: true,
         search_engine: Some(mode.search_engine()),
+        surface: None,
     };
     match runtime.block_on(async {
         mcp_agent_mail_db::search_service::execute_search(

@@ -671,26 +671,39 @@ pub async fn search_messages_product(
     phase.mark("planner_query_build");
 
     // Product search always routes through the unified Search V3 service.
+    let search_options = mcp_agent_mail_db::search_service::SearchOptions {
+        track_telemetry: true,
+        surface: Some("search_messages_product"),
+        ..Default::default()
+    };
     let planner_response = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
-            .await,
+        mcp_agent_mail_db::search_service::execute_search(
+            ctx.cx(),
+            &pool,
+            &search_query,
+            &search_options,
+        )
+        .await,
     )?;
     phase.mark("search_service_query");
 
     let result: Vec<ProductSearchItem> = planner_response
         .results
         .into_iter()
-        .map(|r| ProductSearchItem {
-            id: r.id,
-            subject: r.title,
-            importance: r.importance.unwrap_or_default(),
-            ack_required: i32::from(r.ack_required.unwrap_or(false)),
-            created_ts: r.created_ts.map(micros_to_iso),
-            thread_id: r.thread_id,
-            topic: r.topic,
-            from: r.from_agent.unwrap_or_default(),
-            project_id: r.project_id.unwrap_or(0),
-            body_md: if include_body_md { Some(r.body) } else { None },
+        .map(|row| {
+            let r = row.result;
+            ProductSearchItem {
+                id: r.id,
+                subject: r.title,
+                importance: r.importance.unwrap_or_default(),
+                ack_required: i32::from(r.ack_required.unwrap_or(false)),
+                created_ts: r.created_ts.map(micros_to_iso),
+                thread_id: r.thread_id,
+                topic: r.topic,
+                from: r.from_agent.unwrap_or_default(),
+                project_id: r.project_id.unwrap_or(0),
+                body_md: if include_body_md { Some(r.body) } else { None },
+            }
         })
         .collect();
     phase.set_rows_returned(result.len());

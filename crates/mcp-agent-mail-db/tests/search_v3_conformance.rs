@@ -409,6 +409,7 @@ fn v3_conformance_engine_routing_legacy() {
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(SearchEngine::Legacy),
+        surface: None,
     };
 
     let resp = block_on(|cx| {
@@ -446,6 +447,7 @@ fn v3_conformance_engine_routing_lexical_degrades() {
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(SearchEngine::Lexical),
+        surface: None,
     };
 
     // Without initializing the Tantivy bridge, Lexical should fall back to FTS5
@@ -483,6 +485,7 @@ fn v3_conformance_engine_routing_hybrid_degrades() {
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(SearchEngine::Hybrid),
+        surface: None,
     };
 
     let resp = block_on(|cx| {
@@ -535,6 +538,7 @@ fn v3_conformance_scope_denies_cross_project() {
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(SearchEngine::Legacy),
+        surface: None,
     };
 
     let resp = block_on(|cx| {
@@ -585,6 +589,7 @@ fn v3_conformance_operator_mode_no_filtering() {
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(SearchEngine::Legacy),
+        surface: None,
     };
 
     let resp = block_on(|cx| {
@@ -631,6 +636,7 @@ fn v3_conformance_audit_summary_counts() {
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(SearchEngine::Legacy),
+        surface: None,
     };
 
     let resp = block_on(|cx| {

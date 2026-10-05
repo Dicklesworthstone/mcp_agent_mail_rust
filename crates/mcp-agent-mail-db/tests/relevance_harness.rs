@@ -899,6 +899,7 @@ fn evaluate_query_with_engine(
         redaction_policy: None,
         track_telemetry: false,
         search_engine: Some(engine),
+        surface: None,
     };
 
     let response = block_on(move |cx| async move {
