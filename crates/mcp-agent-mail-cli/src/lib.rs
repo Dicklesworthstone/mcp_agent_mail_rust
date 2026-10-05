@@ -39807,7 +39807,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             }
 
-            let ctx = context::AsyncCliContext::open()?;
+            let ctx = context::AsyncCliContext::open_for_read("agents list")?;
             let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
@@ -39893,7 +39893,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 }
             }
 
-            let ctx = context::AsyncCliContext::open()?;
+            let ctx = context::AsyncCliContext::open_for_read("agents show")?;
             let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
@@ -39958,7 +39958,7 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             // matches what registration used; an absolute path needs no DB.
             let mut candidate_keys = vec![project_key.clone()];
             if !std::path::Path::new(&project_key).is_absolute()
-                && let Ok(ctx) = context::AsyncCliContext::open()
+                && let Ok(ctx) = context::AsyncCliContext::open_for_read("agents resolve-pane")
             {
                 let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
                 if let Ok(proj) = resolve_project_async(&cx, &ctx.pool, &project_key).await
@@ -40078,7 +40078,12 @@ async fn handle_agents_reap(
     json: bool,
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
-    let ctx = context::AsyncCliContext::open()?;
+    // A dry run is a read: it must not migrate the mailbox it inspects.
+    let ctx = if dry_run {
+        context::AsyncCliContext::open_for_read("agents reap --dry-run")?
+    } else {
+        context::AsyncCliContext::open()?
+    };
     let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let payload = agents_reap_payload(&cx, &ctx.pool, stale_days, project_key, dry_run).await?;
     render_agents_reap_payload(&payload, fmt, dry_run, stale_days);
@@ -77360,6 +77365,104 @@ startup_timeout_sec = 42
             schema_of(&db_path),
             before,
             "a robot read changed the mailbox schema or migration ledger"
+        );
+    }
+
+    /// br-2hpuk: pool-backed read verbs (`agents list`/`show` fallback,
+    /// `agents resolve-pane`, `agents reap --dry-run`) used a pool on the live
+    /// mailbox, whose first use runs the full schema init and migrations. They
+    /// now read a private snapshot: the live mailbox keeps its older schema
+    /// and migration ledger byte-for-byte, and the read still answers.
+    #[test]
+    fn pool_backed_read_verbs_never_migrate_the_live_mailbox() {
+        use sqlmodel_core::Value;
+        const V31: &str = "v31_materialize_archive_metadata_json_on_messages";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("archive");
+        std::fs::create_dir_all(&storage_root).expect("storage root");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let db_url = format!("sqlite:///{db_path_str}");
+        drop(open_db_sync_with_database_url(&db_url).expect("create a mailbox"));
+
+        // Simulate a mailbox last migrated by an older binary, with one
+        // stale agent for the dry-run reap to find.
+        let idle_40d = mcp_agent_mail_db::timestamps::now_micros() - 40 * 86_400_000_000;
+        {
+            let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_str)
+                .expect("open canonical");
+            conn.execute_raw(&format!(
+                "DELETE FROM {} WHERE id = '{V31}'",
+                mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME
+            ))
+            .expect("drop the v31 ledger row");
+            conn.execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'old-proj', '/tmp/old-proj', ?)",
+                &[Value::BigInt(idle_40d)],
+            )
+            .expect("seed project");
+            conn.execute_sync(
+                "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                 retired_at) VALUES (1, 1, 'StaleAgent', 'test', 'test', '', ?, ?, 'auto', 'auto', 0, NULL)",
+                &[Value::BigInt(idle_40d), Value::BigInt(idle_40d)],
+            )
+            .expect("seed agent");
+            drop(conn);
+        }
+        let live_state = |path: &str| {
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(path).expect("open for inspection");
+            let mut state = conn
+                .query_sync(
+                    &format!(
+                        "SELECT id AS item FROM {} UNION ALL \
+                         SELECT type || ':' || name || ':' || COALESCE(sql, '') FROM sqlite_master \
+                         ORDER BY 1",
+                        mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME
+                    ),
+                    &[],
+                )
+                .expect("read ledger and schema")
+                .iter()
+                .map(|row| row.get_as::<String>(0).unwrap())
+                .collect::<Vec<_>>();
+            state.push(format!(
+                "user_version={}",
+                conn.query_sync("PRAGMA user_version", &[])
+                    .expect("user_version")[0]
+                    .get_as::<i64>(0)
+                    .unwrap()
+            ));
+            drop(conn);
+            state
+        };
+        let before = live_state(&db_path_str);
+        assert!(!before.iter().any(|item| item == V31));
+
+        let config = mcp_agent_mail_core::Config {
+            storage_root: storage_root.clone(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let ctx =
+            context::AsyncCliContext::open_for_read_with(config, &db_url, "agents reap --dry-run")
+                .expect("a read verb opens an older-schema mailbox through a snapshot");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+        let dry = rt
+            .block_on(async { agents_reap_payload(&cx, &ctx.pool, 30, None, true).await })
+            .expect("dry-run reap reads the snapshot");
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["candidate_count"], 1, "{dry}");
+        assert_eq!(dry["reaped_count"], 0);
+        drop(ctx);
+
+        assert_eq!(
+            live_state(&db_path_str),
+            before,
+            "a read verb migrated or changed the live mailbox"
         );
     }
 
