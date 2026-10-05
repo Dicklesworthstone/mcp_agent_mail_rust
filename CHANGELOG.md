@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-Scope window: [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
-and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...main). Entries use git diffs, tag targets,
+Scope window: [v0.3.36 → v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...v0.3.37)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.37...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -17,6 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.37) | 2026-10-04 | **Release** | Safe mailbox upgrades after the v30 short-record incident (br-2hpuk); FrankenSQLite 0.4.9; bounded descriptors and write-behind drain under load |
 | [v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.36) | 2026-09-16 | **Release** | Windows/WAL recovery, contention and search fixes; six signed platform archives and matching GHCR images |
 | [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers; six-platform binary assets |
 | [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
@@ -26,9 +27,62 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-These changes are not a published release. Dependency upgrades and the full
-release validation remain in progress; selected passing tests do not establish
-release readiness.
+No changes since v0.3.37.
+
+## v0.3.37 — 2026-10-04 [Release]
+
+Changes after the [v0.3.36 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.36).
+
+### Upgrade notes (read first)
+
+- **Stop every v0.3.36 `am` process that uses a mailbox (server, TUI and CLI)
+  before starting v0.3.37 on it.** v0.3.36 embeds FrankenSQLite 0.3.18 and
+  v0.3.37 embeds 0.4.9; the two engine lines must not share a live database.
+  FrankenSQLite 0.4.9 refuses a read-write open while a 0.3.x engine holds the
+  file, and v0.3.37 read-only commands never migrate a mailbox (below), but an
+  old process joining a mailbox that a v0.3.37 server already has open is not
+  detected.
+- **The first v0.3.37 server start migrates the mailbox to schema v31.** v30
+  adds `messages.archive_metadata_json`; v31 then rewrites every existing
+  message row once through C SQLite (values unchanged) and checkpoints the
+  WAL. On a large mailbox this takes a few seconds and temporarily needs free
+  disk about the size of the `messages` table; the lexical search index is
+  refreshed afterwards. Take a backup first (`sqlite3 storage.sqlite3
+  ".backup storage.sqlite3.pre-v0.3.37"`) if you have no recent one.
+- If an `am robot` or other read-only command reports that the mailbox schema
+  is older than the binary, upgrade and restart the server that owns the
+  mailbox (or run `am migrate` with no server running).
+
+### Mailbox upgrade safety (br-2hpuk, P0)
+
+- **Pre-v30 message rows read correctly after the v30 column is added.**
+  v0.3.36 (FrankenSQLite 0.3.18) stored each row's rowid in the INTEGER
+  PRIMARY KEY slot. After `ALTER TABLE messages ADD COLUMN
+  archive_metadata_json` those records are one field short, and FrankenSQLite
+  0.4.4 decoded them shifted by one column: inboxes looked empty and search
+  found nothing, although C SQLite read the same bytes correctly and
+  `integrity_check` passed. Two independent fixes: migration
+  `v31_materialize_archive_metadata_json_on_messages` rewrites every legacy
+  row as a full canonical record through C SQLite, and the mailbox engine moves
+  to registry FrankenSQLite 0.4.9, which decodes such short records correctly
+  (upstream a2398978a). A regression test writes the legacy rowid-in-slot
+  layout and compares the runtime engine with C SQLite after v30 alone and
+  after v31; on the previous engine pin it fails without v31 and passes with
+  it.
+- **Read-only commands never migrate or recover an existing mailbox.** A
+  read-only `am robot` command used to fall back to the initializing open when
+  its read-only admission refused, and so applied v30 to a live mailbox owned
+  by a running v0.3.36 server. Robot reads now open an existing mailbox
+  read-only or fail with an upgrade hint. The local fallbacks of `am agents
+  list` and `am agents show`, `am agents resolve-pane`, and `am agents reap
+  --dry-run` read a private snapshot of the mailbox, like `am mail inbox`,
+  instead of a pool whose first use migrates the live file.
+- **FrankenSQLite 0.4.9 replaces the patched 0.4.4 revision.** 0.4.9 contains
+  the SQL compatibility, NOCASE, INSERT SELECT UPSERT and Linux descriptor
+  repairs that the former pin backported, plus the short-record decoder fix
+  and a guard against mixing engine lines on one database.
+
+### Other changes since v0.3.36
 
 - **Recover small archive deltas containing empty projects in place.** Missing
   project records no longer force a full mailbox reconstruction merely because
