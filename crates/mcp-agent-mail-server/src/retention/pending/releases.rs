@@ -6,7 +6,8 @@
 //! repair re-reads live terminal authority and writes only a generation-stamped
 //! stable artifact. Captured release payloads are never queued: a digest alias
 //! may already name a newer lease. Completion receipts certify the DB operation,
-//! not the entire archive.
+//! not the entire archive. Bulk intents advance one bounded page per pass and
+//! remain queued until their complete, finite scope has been examined.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,10 @@ use mcp_agent_mail_tools::degraded_intents::{self as journal, QueuedReleaseInten
 use mcp_agent_mail_tools::tool_util::{resolve_agent, resolve_existing_project};
 use serde_json::json;
 
-use super::{MAX_ATTEMPTS, ReplayReport, RoundCursor, db_value, validate_live_pool};
+use super::{MAX_ATTEMPTS, ReplayReport, db_value, validate_live_pool};
+
+mod paging;
+pub(super) use paging::Cursor;
 
 const RELEASE_LOCK: &str = ".release_file_reservations.jsonl.lock";
 const MAX_ARCHIVE_REPAIRS_PER_BATCH: usize = 4;
@@ -29,7 +33,7 @@ pub(super) async fn replay_batch(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
-    cursor: &mut RoundCursor,
+    cursor: &mut Cursor,
     shutdown: &AtomicBool,
     intents: &[QueuedReleaseIntentView],
 ) -> Result<ReplayReport, String> {
@@ -38,12 +42,17 @@ pub(super) async fn replay_batch(
         report.interrupted = true;
         return Ok(report);
     }
+    // This path deliberately bypasses public tool handlers and their WriteDbPool
+    // lease. Retain the same promotion exclusion through identity resolution,
+    // page mutation, archive verification and completion receipt publication.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     validate_live_pool(cx, pool, config).await?;
     let keys: Vec<_> = intents
         .iter()
         .map(|intent| (intent.created_ts, intent.content_sha256.clone()))
         .collect();
-    let candidates = cursor.candidates(&keys);
+    cursor.prepare(pool.sqlite_identity_key(), &keys)?;
+    let candidates = cursor.round.candidates(&keys);
     report.more = candidates.len() > MAX_ATTEMPTS;
     let ctx = McpContext::new(cx.clone(), 0);
     let mut archive_budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
@@ -54,14 +63,26 @@ pub(super) async fn replay_batch(
             break;
         }
         let intent = &intents[index];
-        cursor.after = Some(keys[index].clone());
+        let key = &keys[index];
+        cursor.round.after = Some(key.clone());
         report.attempted += 1;
-        match apply_release(&ctx, pool, config, intent, &mut archive_budget).await {
-            Ok(released) => {
+        let position = cursor.pages.entry(key.clone()).or_default();
+        match apply_release(&ctx, pool, config, intent, position, &mut archive_budget).await {
+            Ok((released, complete)) => {
+                // Applied counts successful pages, including a sparse page
+                // that advanced without finding a matching path. It does not
+                // imply that the whole intent has completed.
                 report.applied += 1;
                 report.rows_released += released;
-                match append_completion(config, intent, released) {
-                    Ok(()) => report.completed += 1,
+                if !complete {
+                    report.more = true;
+                    continue;
+                }
+                match append_completion(config, intent, position.released) {
+                    Ok(()) => {
+                        report.completed += 1;
+                        cursor.pages.remove(key);
+                    }
                     Err(error) => {
                         report.deferred += 1;
                         tracing::warn!(intent_id = %intent.intent_id, %error,
@@ -76,6 +97,7 @@ pub(super) async fn replay_batch(
             }
         }
     }
+    report.more |= !cursor.pages.is_empty();
     Ok(report)
 }
 
@@ -194,8 +216,9 @@ async fn apply_release(
     pool: &DbPool,
     config: &Config,
     intent: &QueuedReleaseIntentView,
+    position: &mut paging::Position,
     archive_budget: &mut usize,
-) -> Result<usize, String> {
+) -> Result<(usize, bool), String> {
     if intent.created_ts <= 0 {
         return Err("queued release has no positive creation cutoff".to_string());
     }
@@ -221,38 +244,47 @@ async fn apply_release(
         .id
         .filter(|id| *id > 0)
         .ok_or_else(|| "release agent has no positive identity".to_string())?;
-    let ids = if paths.is_some() || intent.file_reservation_ids.is_some() {
-        let rows =
-            db_value(queries::list_unreleased_file_reservations(ctx.cx(), pool, project_id).await)?;
-        Some(
-            rows.iter()
-                .filter(|row| matches_scope(row, agent_id, intent, paths.as_deref()))
-                .filter_map(|row| row.id)
-                .collect::<Vec<_>>(),
-        )
+    // An explicit empty filter is complete without scanning any lease rows.
+    if paths.as_ref().is_some_and(Vec::is_empty)
+        || intent.file_reservation_ids.as_ref().is_some_and(Vec::is_empty)
+    {
+        return Ok((0, true));
+    }
+    // A failed authority query cannot advance a multi-pass scan. A legitimately
+    // unseeded generation is allowed, but any later identity/generation change
+    // restarts the finite scan rather than carrying a numeric cursor across it.
+    let generation = db_value(queries::db_generation_id(ctx.cx(), pool).await)?;
+    position.bind(project_id, agent_id, generation.clone());
+    let page = paging::select(ctx.cx(), pool, intent.created_ts, position).await?;
+    let rows = if page.ids.is_empty() {
+        Vec::new()
     } else {
-        None
+        db_value(queries::get_reservations_by_ids(ctx.cx(), pool, &page.ids).await)?
     };
-    // Capture authority before the mutation, never stamp old rows with a token
-    // read after recovery may have replaced the database. A failed lookup can
-    // defer archive repair but must not turn into an unstamped legacy write.
-    let generation = db_value(queries::db_generation_id(ctx.cx(), pool).await);
-    // Some(empty) stays an empty selection, never an unrestricted release.
-    // Ownership and the original cutoff are enforced again by the transaction.
-    let released = db_value(
-        queries::release_reservations_with_created_cutoff(
-            ctx.cx(),
-            pool,
-            project_id,
-            agent_id,
-            None,
-            ids.as_deref(),
-            Some(intent.created_ts),
-        )
-        .await,
-    )?;
-    reconcile_release_archive(ctx.cx(), pool, config, &released, &generation, archive_budget);
-    Ok(released.len())
+    if rows.len() > paging::PAGE_SIZE {
+        return Err("release page payload exceeded its row limit".to_string());
+    }
+    let ids: Vec<_> = rows.iter()
+        .filter(|row| row.project_id == project_id)
+        .filter(|row| matches_scope(row, agent_id, intent, paths.as_deref()))
+        .filter_map(|row| row.id.filter(|id| page.ids.contains(id)))
+        .collect();
+    ctx.checkpoint().map_err(|error| error.to_string())?;
+    // Every transaction receives explicit, page-bounded IDs. The query repeats
+    // ownership/cutoff checks, and an empty selection never means release-all.
+    let released = if ids.is_empty() {
+        Vec::new()
+    } else {
+        db_value(
+            queries::release_reservations_with_created_cutoff(
+                ctx.cx(), pool, project_id, agent_id, None, Some(&ids),
+                Some(intent.created_ts),
+            ).await,
+        )?
+    };
+    position.applied(&page, released.len());
+    reconcile_release_archive(ctx.cx(), pool, config, &released, &Ok(generation), archive_budget);
+    Ok((released.len(), page.complete))
 }
 
 /// Repair at most the remaining per-pass budget; failures consume it too.
@@ -538,7 +570,7 @@ mod tests {
                 &cx,
                 &pool,
                 &config,
-                &mut RoundCursor::default(),
+                &mut Cursor::default(),
                 &stop,
                 &intents,
             )
@@ -589,7 +621,7 @@ mod tests {
                 &cx,
                 &pool,
                 &config,
-                &mut RoundCursor::default(),
+                &mut Cursor::default(),
                 &stop,
                 &intents,
             )
@@ -604,7 +636,7 @@ mod tests {
                     &cx,
                     &pool,
                     &config,
-                    &mut RoundCursor::default(),
+                    &mut Cursor::default(),
                     &stop,
                     &queued,
                 )
@@ -624,7 +656,7 @@ mod tests {
                 &cx,
                 &pool,
                 &config,
-                &mut RoundCursor::default(),
+                &mut Cursor::default(),
                 &stop,
                 &queued,
             )
@@ -647,7 +679,7 @@ mod tests {
             let invalid = journal::read_queued_release_intents(&config).unwrap();
             let log = journal::log_path(&config, journal::RELEASE_INTENT_LOG_FILE);
             let before = std::fs::read(&log).unwrap();
-            let mut cursor = RoundCursor::default();
+            let mut cursor = Cursor::default();
             for _ in 0..2 {
                 let rejected = replay_batch(&cx, &pool, &config, &mut cursor, &stop, &invalid)
                     .await
@@ -725,7 +757,7 @@ mod tests {
 
     fn replay_fixture(cx: &Cx, pool: &DbPool, config: &Config, intents: &[QueuedReleaseIntentView]) -> ReplayReport {
         fastmcp_core::block_on(replay_batch(
-            cx, pool, config, &mut RoundCursor::default(), &AtomicBool::new(false), intents,
+            cx, pool, config, &mut Cursor::default(), &AtomicBool::new(false), intents,
         )).unwrap()
     }
 
@@ -877,5 +909,141 @@ mod tests {
                 }
             });
         }
+    }
+
+    fn queue_scope(config: &Config, cutoff: i64, agent: &str, paths: Option<Vec<String>>, ids: Option<Vec<i64>>) {
+        let mut record = json!({
+            "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
+            "created_ts": cutoff, "project_key": "replay", "agent_name": agent,
+            "paths": paths, "file_reservation_ids": ids,
+            "failure": {"stage": "test", "error_detail": "database unavailable"},
+        });
+        let hash = journal::hash_json_value(&record);
+        record["intent_id"] = json!(&hash[..16]);
+        record["content_sha256"] = json!(hash);
+        journal::append_jsonl(config, journal::RELEASE_INTENT_LOG_FILE, RELEASE_LOCK, &record).unwrap();
+    }
+
+    fn page_pass(cx: &Cx, pool: &DbPool, config: &Config, cursor: &mut Cursor) -> ReplayReport {
+        let intents = journal::read_queued_release_intents(config).unwrap();
+        fastmcp_core::block_on(replay_batch(cx, pool, config, cursor, &AtomicBool::new(false), &intents)).unwrap()
+    }
+
+    #[test]
+    fn bulk_release_stays_pending_across_pages_cancellation_and_restart() {
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=129 {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+            }
+            queue_scope(config, cutoff, "BlueLake", None, None);
+            let mut cursor = Cursor::default();
+            let first = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((first.rows_released, first.completed, first.deferred), (64, 0, 0));
+            assert!(first.more);
+            let original = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1]))
+                .into_result().unwrap()[0].released_ts;
+            assert!(original.is_some());
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let before = std::fs::read(&log).unwrap();
+            let queued = journal::read_queued_release_intents(config).unwrap();
+            let stopped = fastmcp_core::block_on(replay_batch(
+                cx, pool, config, &mut cursor, &AtomicBool::new(true), &queued,
+            )).unwrap();
+            assert!(stopped.interrupted);
+            assert_eq!(stopped.attempted, 0);
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+            // Restart loses only the cursor. Rescanning committed pages must
+            // not change terminal timestamps or issue a premature receipt.
+            let mut restarted = Cursor::default();
+            for (released, completed) in [(0, 0), (64, 0), (1, 1)] {
+                let report = page_pass(cx, pool, config, &mut restarted);
+                assert_eq!((report.rows_released, report.completed, report.deferred), (released, completed, 0));
+                assert_eq!(journal::read_queued_release_intents(config).unwrap().is_empty(), completed == 1);
+            }
+            let ids: Vec<_> = (1..=129).collect();
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids)).into_result().unwrap();
+            assert_eq!(rows.len(), 129);
+            assert!(rows.iter().all(|row| row.released_ts.is_some()));
+            assert_eq!(rows.iter().find(|row| row.id == Some(1)).unwrap().released_ts, original);
+        });
+    }
+
+    #[test]
+    fn sparse_paths_advance_without_releasing_unmatched_or_future_leases() {
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=128 {
+                seed_replay_lease(cx, pool, id, &format!("docs/{id}.md"), cutoff - 1);
+            }
+            seed_replay_lease(cx, pool, 129, "src/selected.rs", cutoff - 1);
+            seed_replay_lease(cx, pool, 130, "src/future.rs", cutoff + 1);
+            queue_scope(config, cutoff, "BlueLake", Some(vec!["src/*.rs".into()]), Some(vec![129, 130]));
+            let mut cursor = Cursor::default();
+            for _ in 0..2 {
+                let report = page_pass(cx, pool, config, &mut cursor);
+                assert_eq!((report.applied, report.rows_released, report.completed, report.deferred), (1, 0, 0, 0));
+                assert!(report.more);
+            }
+            let last = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((last.rows_released, last.completed), (1, 1));
+            let ids: Vec<_> = (1..=130).collect();
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids)).into_result().unwrap();
+            for row in rows {
+                assert_eq!(row.released_ts.is_some(), row.id == Some(129));
+            }
+        });
+    }
+
+    #[test]
+    fn small_closeout_progresses_beside_a_bulk_intent_and_a_failed_intent() {
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=65 {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+            }
+            let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 71, 'GreenStone', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES(501, 71, 82, 'small.rs', 1, '', 1, {})", cutoff + 1000000)).unwrap();
+            drop(conn);
+            queue_scope(config, cutoff, "BlueLake", None, None);
+            queue_scope(config, cutoff, "GreenStone", None, Some(vec![501]));
+            queue_scope(config, cutoff - 1, "BlueLake", Some(vec!["../escape".into()]), None);
+            let mut cursor = Cursor::default();
+            let first = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((first.attempted, first.completed, first.deferred, first.rows_released), (3, 1, 1, 65));
+            let queued = journal::read_queued_release_intents(config).unwrap();
+            assert_eq!(queued.len(), 2);
+            assert!(queued.iter().all(|intent| intent.agent_name == "BlueLake"));
+            let second = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((second.completed, second.deferred, second.rows_released), (1, 1, 1));
+            let queued = journal::read_queued_release_intents(config).unwrap();
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].paths, Some(vec!["../escape".to_string()]));
+        });
+    }
+
+    #[test]
+    fn failed_readonly_admission_preserves_a_partial_scan_and_its_journal() {
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=65 {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+            }
+            queue_scope(config, cutoff, "BlueLake", None, None);
+            let mut cursor = Cursor::default();
+            assert_eq!(page_pass(cx, pool, config, &mut cursor).rows_released, 64);
+            let readonly = DbPool::new_query_only(&super::super::pool_config(config)).unwrap();
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let before = std::fs::read(&log).unwrap();
+            let queued = journal::read_queued_release_intents(config).unwrap();
+            assert!(fastmcp_core::block_on(replay_batch(
+                cx, &readonly, config, &mut cursor, &AtomicBool::new(false), &queued,
+            )).is_err());
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+            let resumed = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+        });
     }
 }

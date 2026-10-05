@@ -4,8 +4,9 @@
 //! Independent, incremental ACK and release scans admit no mutation before a
 //! complete, handle-validated snapshot. A scan step consumes at most 256 KiB or
 //! 256 records; snapshots, retained identities and pending payloads have explicit
-//! admission bounds. At most sixteen mutations follow per kind. These are work
-//! bounds, not hard deadlines on filesystem I/O or an individual DB operation.
+//! admission bounds. At most sixteen acknowledgements and sixteen release pages
+//! of up to 64 candidate rows follow per pass. These are row/work bounds, not
+//! hard deadlines on filesystem I/O or SQLite's internal query execution.
 //! Failed intents remain queued without another failure record every tick.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +81,7 @@ impl RoundCursor {
 #[derive(Debug, Default)]
 struct ReplayReport {
     attempted: usize,
+    /// Successful ACK operations or release pages, not necessarily full intents.
     applied: usize,
     completed: usize,
     abandoned: usize,
@@ -92,7 +94,7 @@ struct ReplayReport {
 #[derive(Default)]
 struct ReplayCursors {
     acknowledgements: RoundCursor,
-    releases: RoundCursor,
+    releases: releases::Cursor,
 }
 
 struct Snapshots {
@@ -208,7 +210,11 @@ impl ScanLane {
     }
 
     fn replay_finished(&mut self, report: &ReplayReport, now: Instant) {
-        if report.completed > 0 && report.more && report.deferred == 0 && !report.interrupted {
+        if (report.completed > 0 || report.applied > 0)
+            && report.more
+            && report.deferred == 0
+            && !report.interrupted
+        {
             self.next_scan = Some(now + CATCH_UP_INTERVAL);
         }
     }
@@ -443,7 +449,7 @@ async fn replay_snapshots(
     let release = match snapshots.releases {
         Ok(None) => Ok(ReplayReport::default()),
         Ok(Some(intents)) if intents.is_empty() => {
-            cursors.releases = RoundCursor::default();
+            cursors.releases = releases::Cursor::default();
             Ok(ReplayReport::default())
         }
         Ok(Some(intents)) => match pool {
@@ -509,6 +515,9 @@ async fn replay_ack_batch(
         report.interrupted = true;
         return Ok(report);
     }
+    // Background replay bypasses the public tool's WriteDbPool guard. Keep
+    // identities, mutation and completion on one live database generation.
+    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     validate_live_pool(cx, pool, config).await?;
     let keys: Vec<_> = intents
         .iter()
@@ -1469,5 +1478,26 @@ mod tests {
                 .unwrap();
             assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 1);
         });
+    }
+
+    #[test]
+    fn successful_partial_pages_catch_up_without_accelerating_failed_or_idle_work() {
+        let now = Instant::now();
+        for (applied, completed, more, deferred, interrupted, fast) in [
+            (1, 0, true, 0, false, true),
+            (0, 1, true, 0, false, true),
+            (1, 0, true, 1, false, false),
+            (1, 0, true, 0, true, false),
+            (0, 0, true, 0, false, false),
+            (1, 1, false, 0, false, false),
+        ] {
+            let mut lane = ScanLane::new(journal_scan::Kind::Release);
+            lane.next_scan = Some(now + POLL_INTERVAL);
+            lane.replay_finished(&ReplayReport {
+                applied, completed, more, deferred, interrupted,
+                ..ReplayReport::default()
+            }, now);
+            assert_eq!(lane.next_delay(now), if fast { CATCH_UP_INTERVAL } else { POLL_INTERVAL });
+        }
     }
 }
