@@ -1297,8 +1297,8 @@ impl MailScreen for ArchiveBrowserScreen {
                 action: "Collapse dir / go to parent",
             },
             HelpEntry {
-                key: "Tab",
-                action: "Switch pane focus",
+                key: "Enter / Esc, Tab",
+                action: "Focus file preview / back to tree",
             },
             HelpEntry {
                 key: "/",
@@ -1331,6 +1331,19 @@ impl MailScreen for ArchiveBrowserScreen {
 
     fn consumes_text_input(&self) -> bool {
         self.filter_active
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // The file tree filters with `/`; the focused preview pages with
+        // Ctrl+D/U (Esc returns to the tree, where Ctrl+D detaches again)
+        // and returns to the tree with Tab.
+        if self.preview_focused {
+            matches!(key.code, KeyCode::Tab)
+                || (key.modifiers.contains(Modifiers::CTRL)
+                    && matches!(key.code, KeyCode::Char('d' | 'u')))
+        } else {
+            matches!(key.code, KeyCode::Char('/'))
+        }
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -1478,6 +1491,22 @@ mod tests {
         assert!(screen.preview_content.is_none());
         assert_eq!(screen.title(), "Archive Browser");
         assert_eq!(screen.tab_label(), "Archive");
+    }
+
+    #[test]
+    fn preview_claims_its_paging_keys_and_the_tree_leaves_detach_global() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c)).with_modifiers(Modifiers::CTRL);
+        let mut screen = ArchiveBrowserScreen::new();
+        // In the tree, Ctrl+D stays the shell's detach and `/` filters.
+        assert!(!screen.claims_key(&ctrl('d')));
+        assert!(screen.claims_key(&KeyEvent::new(KeyCode::Char('/'))));
+        assert!(!screen.claims_key(&KeyEvent::new(KeyCode::Tab)));
+        // The focused preview pages with Ctrl+D/U and returns with Tab.
+        screen.preview_focused = true;
+        assert!(screen.claims_key(&ctrl('d')));
+        assert!(screen.claims_key(&ctrl('u')));
+        assert!(screen.claims_key(&KeyEvent::new(KeyCode::Tab)));
+        assert!(!screen.claims_key(&ctrl('c')));
     }
 
     #[test]

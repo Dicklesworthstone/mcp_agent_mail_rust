@@ -715,6 +715,11 @@ impl MailScreen for ProjectsScreen {
         self.filter_active
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let idx = self.table_state.selected?;
         let proj = self.projects.get(idx)?;

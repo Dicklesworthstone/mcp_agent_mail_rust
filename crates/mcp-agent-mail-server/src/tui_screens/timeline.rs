@@ -633,7 +633,7 @@ enum TimelineViewMode {
     Events,
     Commits,
     Combined,
-    #[allow(dead_code)] // Will be constructed via keybinding in a future bead.
+    /// The event stream as a scrolling log (same rows and cursor as Events).
     LogViewer,
 }
 
@@ -664,7 +664,8 @@ impl TimelineViewMode {
         match self {
             Self::Events => Self::Commits,
             Self::Commits => Self::Combined,
-            Self::Combined | Self::LogViewer => Self::Events,
+            Self::Combined => Self::LogViewer,
+            Self::LogViewer => Self::Events,
         }
     }
 }
@@ -1416,7 +1417,7 @@ impl MailScreen for TimelineScreen {
                         }
                     }
 
-                    // Capital-V cycles timeline views (Events -> Commits -> Combined).
+                    // Capital-V cycles timeline views (Events -> Commits -> Combined -> Log).
                     KeyCode::Char('V') => {
                         self.view_mode = self.view_mode.next_primary();
                         if matches!(
@@ -1506,7 +1507,10 @@ impl MailScreen for TimelineScreen {
 
                     // Correlation link navigation (1-9 when dock is visible)
                     KeyCode::Char(c @ '1'..='9') if self.dock.visible => {
-                        if self.view_mode == TimelineViewMode::Events {
+                        if matches!(
+                            self.view_mode,
+                            TimelineViewMode::Events | TimelineViewMode::LogViewer
+                        ) {
                             if let Some(event) = self.pane.selected_event() {
                                 let idx = (c as u8 - b'0') as usize;
                                 if let Some(target) = super::inspector::resolve_link(event, idx) {
@@ -1789,7 +1793,10 @@ impl MailScreen for TimelineScreen {
             }
         }
         if let Some(dock_area) = detail_area {
-            let event_ref = if self.view_mode == TimelineViewMode::Events {
+            let event_ref = if matches!(
+                self.view_mode,
+                TimelineViewMode::Events | TimelineViewMode::LogViewer
+            ) {
                 self.pane.selected_event()
             } else {
                 combined_selected_event.as_ref()
@@ -1840,7 +1847,7 @@ impl MailScreen for TimelineScreen {
             },
             HelpEntry {
                 key: "V",
-                action: "Cycle Events/Commits/Combined",
+                action: "Cycle Events/Commits/Combined/Log",
             },
             HelpEntry {
                 key: "Z",
@@ -1949,6 +1956,12 @@ impl MailScreen for TimelineScreen {
             );
         }
         rows.get(self.pane.cursor).map(|row| row.copy_text.clone())
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        // The preset dialogs are modal: typing a preset name must not fire
+        // single-key global shortcuts (`q` would quit).
+        self.preset_dialog_mode != PresetDialogMode::None
     }
 
     fn title(&self) -> &'static str {
@@ -3588,7 +3601,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_v_cycles_events_commits_combined_views() {
+    fn capital_v_cycles_events_commits_combined_log_views() {
         let mut screen = TimelineScreen::new();
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         assert_eq!(screen.view_mode, TimelineViewMode::Events);
@@ -3599,6 +3612,10 @@ mod tests {
 
         screen.update(&key, &state);
         assert_eq!(screen.view_mode, TimelineViewMode::Combined);
+
+        // The log viewer used to be unreachable: the cycle skipped it.
+        screen.update(&key, &state);
+        assert_eq!(screen.view_mode, TimelineViewMode::LogViewer);
 
         screen.update(&key, &state);
         assert_eq!(screen.view_mode, TimelineViewMode::Events);

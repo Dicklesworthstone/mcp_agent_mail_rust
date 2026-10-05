@@ -790,6 +790,11 @@ impl MailScreen for ContactsScreen {
         self.filter_active
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
+    }
+
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
         let selected_idx = self.table_state.selected?;
         let contact = self.contacts.get(selected_idx)?;

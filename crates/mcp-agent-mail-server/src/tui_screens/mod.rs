@@ -251,6 +251,14 @@ pub trait MailScreen {
         false
     }
 
+    /// Whether this screen binds `key` itself, outranking the shell's global
+    /// shortcut for it (for example `/` opening the screen's own filter
+    /// instead of the global search). Ctrl+C is never delivered this way: it
+    /// always reaches quit confirmation.
+    fn claims_key(&self, _key: &ftui::KeyEvent) -> bool {
+        false
+    }
+
     /// Return the currently focused/selected event, if any.
     ///
     /// Used by the command palette to inject context-aware quick actions

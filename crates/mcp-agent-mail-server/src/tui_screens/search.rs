@@ -31,7 +31,7 @@ use mcp_agent_mail_db::search_planner::{
 };
 use mcp_agent_mail_db::search_recipes::{
     MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
-    list_recent_history, list_recipes, touch_recipe,
+    list_recent_history, list_recipes, prune_history, touch_recipe,
 };
 use mcp_agent_mail_db::search_service::SearchOptions;
 use mcp_agent_mail_db::sqlmodel::Value;
@@ -50,6 +50,10 @@ use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 // ──────────────────────────────────────────────────────────────────────
 // Constants
 // ──────────────────────────────────────────────────────────────────────
+
+/// Persisted search history kept per mailbox; the most `list_recent_history`
+/// ever returns.
+const QUERY_HISTORY_KEEP: usize = 500;
 
 fn sanitize_diagnostic_value(value: &str) -> String {
     value
@@ -2619,7 +2623,11 @@ impl SearchCockpitScreen {
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         if let Ok(conn) = self.open_live_metadata_operation_db_connection() {
             let conn = mcp_agent_mail_db::guard_db_conn(conn, "search screen insert history");
-            let _ = insert_history(&conn, &entry);
+            // History is a convenience list in the live mailbox: keep it
+            // bounded instead of growing a row per search forever.
+            if insert_history(&conn, &entry).is_ok() {
+                let _ = prune_history(&conn, QUERY_HISTORY_KEEP);
+            }
         }
         // Prepend to in-memory history
         self.query_history.insert(0, entry);
@@ -3769,7 +3777,7 @@ impl MailScreen for SearchCockpitScreen {
     }
 
     fn consumes_text_input(&self) -> bool {
-        matches!(self.focus, Focus::QueryBar)
+        matches!(self.focus, Focus::QueryBar) || self.preset_dialog_mode != PresetDialogMode::None
     }
 
     fn copyable_content(&self) -> Option<String> {

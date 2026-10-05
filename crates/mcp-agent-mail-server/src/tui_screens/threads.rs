@@ -2253,6 +2253,11 @@ impl MailScreen for ThreadExplorerScreen {
         self.filter_editing
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let thread = self.threads.get(self.cursor)?;
         Some(format!("[{}] {}", thread.thread_id, thread.last_subject))

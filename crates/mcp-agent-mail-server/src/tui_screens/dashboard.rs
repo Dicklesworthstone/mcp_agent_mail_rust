@@ -1885,6 +1885,11 @@ impl MailScreen for DashboardScreen {
         self.quick_query_active
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` starts this screen's quick query rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
+    }
+
     fn title(&self) -> &'static str {
         "Dashboard"
     }

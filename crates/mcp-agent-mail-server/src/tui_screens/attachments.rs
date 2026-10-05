@@ -1267,6 +1267,11 @@ impl MailScreen for AttachmentExplorerScreen {
         self.text_filter_active
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let entry = self.selected_entry()?;
         Some(entry.path.clone().unwrap_or_else(|| entry.sha1.clone()))

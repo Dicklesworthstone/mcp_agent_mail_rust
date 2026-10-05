@@ -3846,7 +3846,13 @@ impl MailScreen for MessageBrowserScreen {
     fn consumes_text_input(&self) -> bool {
         self.compose_form.is_some()
             || self.quick_reply_form.is_some()
+            || self.preset_dialog_mode != PresetDialogMode::None
             || matches!(self.focus, Focus::SearchBar)
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` focuses this screen's search bar rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {

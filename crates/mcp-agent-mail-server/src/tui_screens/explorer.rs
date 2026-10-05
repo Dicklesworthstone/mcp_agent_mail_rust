@@ -1724,6 +1724,11 @@ impl MailScreen for MailExplorerScreen {
         matches!(self.focus, Focus::SearchBar)
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` focuses this screen's search bar rather than the global search.
+        matches!(key.code, KeyCode::Char('/'))
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let entry = self.entries.get(self.cursor)?;
         if entry.body_preview.is_empty() {
