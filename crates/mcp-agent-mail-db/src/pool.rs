@@ -5922,10 +5922,13 @@ async fn run_sqlite_init_once(
 
         drop(canonical_conn);
 
+        // v31 rewrites every messages row once (br-2hpuk); fold that WAL into
+        // the main file before the runtime engine opens it.
         if (dropped_legacy_atc
-            || full_applied
-                .iter()
-                .any(|id| schema::is_atc_runtime_canonical_migration(id)))
+            || full_applied.iter().any(|id| {
+                schema::is_atc_runtime_canonical_migration(id)
+                    || id == "v31_materialize_archive_metadata_json_on_messages"
+            }))
             && let Err(err) = wal_checkpoint_truncate_path(Path::new(sqlite_path))
         {
             return Outcome::Err(SqlError::Custom(format!(

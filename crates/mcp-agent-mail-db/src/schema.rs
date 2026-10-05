@@ -5474,6 +5474,16 @@ mod tests {
     /// trailing fields from the schema. Handles the small fixture below only:
     /// a single leaf root page and no overflow.
     fn messages_record_field_counts(path: &str) -> Vec<(i64, usize)> {
+        messages_record_layout(path)
+            .into_iter()
+            .map(|(rowid, fields, _ipk_serial_type)| (rowid, fields))
+            .collect()
+    }
+
+    /// Like [`messages_record_field_counts`], plus the serial type stored in
+    /// the INTEGER PRIMARY KEY slot (field 0): SQLite writes NULL (0) there,
+    /// FrankenSQLite 0.3.x wrote the rowid (an integer serial type).
+    fn messages_record_layout(path: &str) -> Vec<(i64, usize, u64)> {
         fn varint(bytes: &[u8], at: &mut usize) -> u64 {
             let mut value = 0_u64;
             for i in 0..9 {
@@ -5527,11 +5537,15 @@ mod tests {
             let header_start = at;
             let header_size = usize::try_from(varint(page, &mut at)).unwrap();
             let mut fields = 0;
+            let mut ipk_serial_type = 0;
             while at < header_start + header_size {
-                varint(page, &mut at);
+                let serial_type = varint(page, &mut at);
+                if fields == 0 {
+                    ipk_serial_type = serial_type;
+                }
                 fields += 1;
             }
-            counts.push((rowid, fields));
+            counts.push((rowid, fields, ipk_serial_type));
         }
         counts.sort_unstable();
         counts
@@ -5722,6 +5736,225 @@ mod tests {
         );
     }
 
+    const MESSAGES_SNAPSHOT_SQL: &str = "SELECT id, project_id, sender_id, thread_id, topic, \
+        subject, body_md, importance, ack_required, created_ts, recipients_json, attachments, \
+        archive_metadata_json FROM messages ORDER BY id";
+
+    /// Every row as Debug strings of the decoded values, so a shifted decode
+    /// shows up as a value diff instead of a type error. Integer widths are
+    /// unified: the two drivers report the same SQLite integer as `Int` or
+    /// `BigInt`.
+    fn messages_snapshot(rows: &[sqlmodel_core::Row]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| {
+                row.values()
+                    .map(|value| match value {
+                        Value::TinyInt(v) => format!("Integer({v})"),
+                        Value::SmallInt(v) => format!("Integer({v})"),
+                        Value::Int(v) => format!("Integer({v})"),
+                        Value::BigInt(v) => format!("Integer({v})"),
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn canonical_messages_snapshot(path: &str) -> Vec<Vec<String>> {
+        let conn = crate::CanonicalDbConn::open_file(path).expect("open canonical reader");
+        let rows = conn
+            .query_sync(MESSAGES_SNAPSHOT_SQL, &[])
+            .expect("C SQLite reads messages");
+        crate::queries::close_canonical_db_conn(conn, "legacy slot oracle");
+        messages_snapshot(&rows)
+    }
+
+    /// Read through the runtime engine from a copy, so the probed file keeps
+    /// no runtime-engine sidecars.
+    fn runtime_messages_snapshot(path: &str, label: &str) -> Vec<Vec<String>> {
+        let copy = format!("{path}.{label}");
+        std::fs::copy(path, &copy).expect("copy for the runtime read");
+        let conn = DbConn::open_file(&copy).expect("open runtime engine");
+        let rows = conn
+            .query_sync(MESSAGES_SNAPSHOT_SQL, &[])
+            .expect("runtime engine reads messages");
+        messages_snapshot(&rows)
+    }
+
+    /// br-2hpuk, the live failure mode. FrankenSQLite 0.3.x (am <= v0.3.36)
+    /// stored each row's rowid in the INTEGER PRIMARY KEY slot, where SQLite
+    /// stores NULL. After v30's ADD COLUMN those 12-field records are short,
+    /// and FrankenSQLite 0.4.4 decoded them as a legacy layout without the
+    /// slot: every column shifted by one, so inboxes and search came back
+    /// empty. The fixture writes that layout with C SQLite (`id` declared as a
+    /// plain INTEGER while the rows go in, then retyped through
+    /// writable_schema, like the upstream engine oracle) and compares the
+    /// runtime engine with C SQLite on the same file twice: after v30 alone,
+    /// which needs the engine's short-record decoder fix (FrankenSQLite
+    /// a2398978a, released in 0.4.8), and after v31, which rewrites every row
+    /// as a full canonical record.
+    #[test]
+    fn v30_legacy_rowid_slot_records_read_correctly_before_and_after_v31() {
+        const V30: &str = "v30_add_archive_metadata_json_to_messages";
+        const V31: &str = "v31_materialize_archive_metadata_json_on_messages";
+        const IPK: &str = "id INTEGER PRIMARY KEY AUTOINCREMENT,";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("legacy_rowid_slot.sqlite3")
+            .display()
+            .to_string();
+        let set_messages_sql = |conn: &crate::CanonicalDbConn, sql: &str| {
+            conn.execute_raw(&format!(
+                "PRAGMA writable_schema = ON; \
+                 UPDATE sqlite_master SET sql = '{}' WHERE type = 'table' AND name = 'messages'; \
+                 PRAGMA writable_schema = OFF",
+                sql.replace('\'', "''")
+            ))
+            .expect("rewrite the stored messages DDL");
+        };
+        let original_sql = {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("open canonical database");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    init_migrations_table(&cx, conn)
+                        .await
+                        .into_result()
+                        .expect("initialize migration ledger");
+                    let pre_v30 = schema_migrations()
+                        .into_iter()
+                        .filter(|m| m.id != V30 && m.id != V31)
+                        .collect::<Vec<_>>();
+                    run_specific_migrations(&cx, conn, pre_v30)
+                        .await
+                        .into_result()
+                        .expect("apply the pre-v30 ledger");
+                }
+            });
+            let sql = canonical
+                .query_sync(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                    &[],
+                )
+                .expect("read messages DDL")[0]
+                .get_named::<String>("sql")
+                .unwrap();
+            assert!(sql.contains(IPK), "unexpected messages DDL: {sql}");
+            set_messages_sql(&canonical, &sql.replace(IPK, "id INTEGER,"));
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+            sql
+        };
+        {
+            // A fresh connection loads the retyped schema, so `id` is stored
+            // in the record like the legacy engine stored it. While `id` is not
+            // the key, child tables' foreign keys have no parent key to check.
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            canonical
+                .execute_raw(
+                    "PRAGMA foreign_keys = OFF; \
+                     INSERT INTO projects(id,slug,human_key,created_at) VALUES(7,'p','/p',1); \
+                     INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+                     VALUES(11,7,'IcyBay','test','test',1,1); \
+                     INSERT INTO messages(rowid,id,project_id,sender_id,thread_id,topic,subject,\
+                     body_md,importance,ack_required,created_ts,recipients_json,attachments) VALUES \
+                     (42900,42900,7,11,'t-1',NULL,'first subject','first body','high',1,100,\
+                     '{\"to\":[\"ChartreuseCarp\"]}','[]'), \
+                     (42901,42901,7,11,NULL,'release','second subject','second body','normal',0,\
+                     200,'{}','[]')",
+                )
+                .expect("seed legacy-layout rows");
+            set_messages_sql(&canonical, &original_sql);
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+        }
+        {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            let check = canonical
+                .query_sync("PRAGMA integrity_check", &[])
+                .expect("integrity_check");
+            assert_eq!(
+                check[0].get_as::<String>(0).unwrap(),
+                "ok",
+                "C SQLite accepts the legacy layout, as on the live mailbox"
+            );
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    let through_v30 = schema_migrations()
+                        .into_iter()
+                        .filter(|m| m.id != V31)
+                        .collect::<Vec<_>>();
+                    let applied = run_specific_migrations(&cx, conn, through_v30)
+                        .await
+                        .into_result()
+                        .expect("upgrade through v30");
+                    assert_eq!(applied, vec![V30.to_string()]);
+                }
+            });
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+        }
+        let layout = messages_record_layout(&path);
+        assert_eq!(
+            layout
+                .iter()
+                .map(|(rowid, fields, _)| (*rowid, *fields))
+                .collect::<Vec<_>>(),
+            vec![(42900, 12), (42901, 12)],
+            "v30 leaves the legacy records short"
+        );
+        assert!(
+            layout.iter().all(|(_, _, ipk)| *ipk != 0),
+            "the fixture must store the rowid in the INTEGER PRIMARY KEY slot: {layout:?}"
+        );
+
+        let expected = canonical_messages_snapshot(&path);
+        assert_eq!(expected.len(), 2);
+        assert!(
+            expected[0].iter().any(|v| v.contains("first subject"))
+                && expected[0].iter().any(|v| v.contains("ChartreuseCarp"))
+                && expected[1].iter().any(|v| v.contains("release")),
+            "C SQLite oracle: {expected:?}"
+        );
+        assert_eq!(
+            runtime_messages_snapshot(&path, "after-v30"),
+            expected,
+            "the runtime engine must decode short legacy records like C SQLite"
+        );
+
+        {
+            let canonical =
+                crate::CanonicalDbConn::open_file(&path).expect("reopen canonical database");
+            block_on({
+                let conn = &canonical;
+                move |cx| async move {
+                    let applied = run_specific_migrations(&cx, conn, schema_migrations())
+                        .await
+                        .into_result()
+                        .expect("upgrade through v31");
+                    assert_eq!(applied, vec![V31.to_string()]);
+                }
+            });
+            crate::queries::close_canonical_db_conn(canonical, "legacy slot fixture");
+        }
+        assert_eq!(
+            messages_record_layout(&path),
+            vec![(42900, 13, 0), (42901, 13, 0)],
+            "v31 stores every legacy row as a full canonical record"
+        );
+        assert_eq!(
+            canonical_messages_snapshot(&path),
+            expected,
+            "v31 must not change any value"
+        );
+        assert_eq!(
+            runtime_messages_snapshot(&path, "after-v31"),
+            expected,
+            "the runtime engine reads v31-materialized rows like C SQLite"
+        );
+    }
     #[test]
     fn archive_metadata_migration_preserves_unknown_legacy_lineage_and_known_values() {
         let dir = tempfile::tempdir().expect("tempdir");
