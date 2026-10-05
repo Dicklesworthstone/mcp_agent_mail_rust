@@ -84,7 +84,10 @@ impl LockActivitySnapshot {
             && self.registrations_dropped == 0
             && self.locks.iter().all(|lock| {
                 lock.omitted_participants == 0
-                    && lock.holders.iter().chain(&lock.waiters)
+                    && lock
+                        .holders
+                        .iter()
+                        .chain(&lock.waiters)
                         .all(|participant| !participant.labels_truncated)
             })
     }
@@ -197,9 +200,10 @@ impl Registry {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let Ok(id) = self.next_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            id.checked_add(1)
-        }) else {
+        let Ok(id) = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         };
@@ -243,10 +247,16 @@ impl Registry {
                 continue;
             }
             active_count += 1;
-            let wait_ns = state.participants.iter()
+            let wait_ns = state
+                .participants
+                .iter()
                 .filter(|participant| participant.phase == Phase::Waiting)
-                .map(|participant| now.saturating_duration_since(participant.since).as_nanos_u64())
-                .max().unwrap_or(0);
+                .map(|participant| {
+                    now.saturating_duration_since(participant.since)
+                        .as_nanos_u64()
+                })
+                .max()
+                .unwrap_or(0);
             let candidate = Candidate {
                 id: instance.id,
                 level: instance.level,
@@ -289,7 +299,8 @@ impl Candidate {
     }
 
     fn snapshot(mut self, now: Instant, remaining: &mut usize) -> LockActivity {
-        self.participants.sort_unstable_by_key(|participant| participant.since);
+        self.participants
+            .sort_unstable_by_key(|participant| participant.since);
         let mut lock = LockActivity {
             instance_id: self.id,
             lock_name: format!("{:?}", self.level),
@@ -309,7 +320,9 @@ impl Candidate {
             } else {
                 &mut lock.waiters
             };
-            for participant in self.participants.iter()
+            for participant in self
+                .participants
+                .iter()
                 .filter(|participant| participant.phase == phase)
                 .take(MAX_PARTICIPANTS_PER_PHASE.min(*remaining))
             {
@@ -336,25 +349,43 @@ pub(super) struct LiveLock {
 
 impl LiveLock {
     pub(super) const fn new() -> Self {
-        Self { instance: OnceLock::new() }
+        Self {
+            instance: OnceLock::new(),
+        }
     }
 
-    pub(super) fn holding(&self, level: LockLevel, access: LockAccess,
-        site: &'static Location<'static>, since: Instant) -> Option<ActivityGuard>
-    {
+    pub(super) fn holding(
+        &self,
+        level: LockLevel,
+        access: LockAccess,
+        site: &'static Location<'static>,
+        since: Instant,
+    ) -> Option<ActivityGuard> {
         self.begin(level, access, site, since, Phase::Holding)
     }
 
-    pub(super) fn waiting(&self, level: LockLevel, access: LockAccess,
-        site: &'static Location<'static>, since: Instant) -> Option<ActivityGuard>
-    {
+    pub(super) fn waiting(
+        &self,
+        level: LockLevel,
+        access: LockAccess,
+        site: &'static Location<'static>,
+        since: Instant,
+    ) -> Option<ActivityGuard> {
         self.begin(level, access, site, since, Phase::Waiting)
     }
 
-    fn begin(&self, level: LockLevel, access: LockAccess,
-        site: &'static Location<'static>, since: Instant, phase: Phase) -> Option<ActivityGuard>
-    {
-        let instance = self.instance.get_or_init(|| REGISTRY.register(level)).as_ref()?;
+    fn begin(
+        &self,
+        level: LockLevel,
+        access: LockAccess,
+        site: &'static Location<'static>,
+        since: Instant,
+        phase: Phase,
+    ) -> Option<ActivityGuard> {
+        let instance = self
+            .instance
+            .get_or_init(|| REGISTRY.register(level))
+            .as_ref()?;
         Some(ActivityGuard::begin(instance, access, site, since, phase))
     }
 }
@@ -368,14 +399,21 @@ pub(super) struct ActivityGuard {
 }
 
 impl ActivityGuard {
-    fn begin(instance: &Arc<Instance>, access: LockAccess,
-        site: &'static Location<'static>, since: Instant, phase: Phase) -> Self
-    {
+    fn begin(
+        instance: &Arc<Instance>,
+        access: LockAccess,
+        site: &'static Location<'static>,
+        since: Instant,
+        phase: Phase,
+    ) -> Self {
         // A later TLS destructor can still acquire application locks after
         // the cached label has been destroyed. Instrumentation must not add
         // a teardown panic: retain anonymous counts and disclose omissions.
         let thread = THREAD_LABEL.try_with(Arc::clone).ok();
-        let mut state = instance.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = instance
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match phase {
             Phase::Holding => state.holders += 1,
             Phase::Waiting => state.waiters += 1,
@@ -387,16 +425,33 @@ impl ActivityGuard {
         };
         if let (Some(token), Some(thread)) = (token, thread) {
             state.next_token = token;
-            state.participants.push(Participant { token, thread, access, site, since, phase });
+            state.participants.push(Participant {
+                token,
+                thread,
+                access,
+                site,
+                since,
+                phase,
+            });
         }
-        Self { instance: Arc::clone(instance), token, phase }
+        Self {
+            instance: Arc::clone(instance),
+            token,
+            phase,
+        }
     }
 
     pub(super) fn acquired(mut self, since: Instant) -> Self {
-        let mut state = self.instance.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .instance
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.waiters = state.waiters.saturating_sub(1);
         state.holders += 1;
-        if let Some(participant) = state.participants.iter_mut()
+        if let Some(participant) = state
+            .participants
+            .iter_mut()
             .find(|participant| Some(participant.token) == self.token)
         {
             participant.phase = Phase::Holding;
@@ -410,12 +465,18 @@ impl ActivityGuard {
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
-        let mut state = self.instance.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .instance
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match self.phase {
             Phase::Holding => state.holders = state.holders.saturating_sub(1),
             Phase::Waiting => state.waiters = state.waiters.saturating_sub(1),
         }
-        if let Some(index) = state.participants.iter()
+        if let Some(index) = state
+            .participants
+            .iter()
             .position(|participant| Some(participant.token) == self.token)
         {
             // Preserve chronological order so bounded observations retain the
@@ -427,8 +488,8 @@ impl Drop for ActivityGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{OrderedMutex, OrderedRwLock};
+    use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -438,10 +499,15 @@ mod tests {
 
     // Poll only diagnostic metadata. Callers always release/join workers
     // before asserting, including when this bounded observation times out.
-    fn observe_activity(id: u64, predicate: impl Fn(&LockActivity) -> bool) -> Option<LockActivity> {
+    fn observe_activity(
+        id: u64,
+        predicate: impl Fn(&LockActivity) -> bool,
+    ) -> Option<LockActivity> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(lock) = lock_activity_snapshot().locks.into_iter()
+            if let Some(lock) = lock_activity_snapshot()
+                .locks
+                .into_iter()
                 .find(|lock| lock.instance_id == id && predicate(lock))
             {
                 return Some(lock);
@@ -466,7 +532,10 @@ mod tests {
 
     #[test]
     fn real_mutex_exposes_unfinished_wait_and_exact_acquisition_sites() {
-        let mutex = Arc::new(OrderedMutex::new(LockLevel::StorageCommitQueue, "private mailbox value"));
+        let mutex = Arc::new(OrderedMutex::new(
+            LockLevel::StorageCommitQueue,
+            "private mailbox value",
+        ));
         let owner_line = line!() + 1;
         let owner = mutex.lock();
         let id = instance_id(&mutex.activity);
@@ -474,14 +543,16 @@ mod tests {
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let peer = Arc::clone(&mutex);
-        let worker = std::thread::Builder::new().name("blocked-archive-worker".into())
+        let worker = std::thread::Builder::new()
+            .name("blocked-archive-worker".into())
             .spawn(move || {
                 site_tx.send(line!() + 1).unwrap();
                 let guard = peer.lock();
                 acquired_tx.send(()).unwrap();
                 let _ = release_rx.recv_timeout(Duration::from_secs(10));
                 assert_eq!(*guard, "private mailbox value");
-            }).unwrap();
+            })
+            .unwrap();
         let waiter_line = site_rx.recv_timeout(Duration::from_secs(5));
         let before = observe_waiter(id);
         drop(owner);
@@ -495,10 +566,17 @@ mod tests {
         assert_eq!(before.holders[0].line, owner_line);
         assert_eq!(before.waiters[0].line, waiter_line.unwrap());
         assert_eq!(before.waiters[0].file, file!());
-        assert_eq!(before.waiters[0].thread_name.as_deref(), Some("blocked-archive-worker"));
+        assert_eq!(
+            before.waiters[0].thread_name.as_deref(),
+            Some("blocked-archive-worker")
+        );
         assert_ne!(before.holders[0].thread_id, before.waiters[0].thread_id);
         assert!(before.oldest_observed_wait_ns > 0);
-        assert!(!serde_json::to_string(&before).unwrap().contains("private mailbox value"));
+        assert!(
+            !serde_json::to_string(&before)
+                .unwrap()
+                .contains("private mailbox value")
+        );
         acquired.unwrap();
         let after = after.expect("acquired waiter must replace, not duplicate, the old holder");
         assert_eq!((after.holder_count, after.waiter_count), (1, 0));
@@ -532,7 +610,12 @@ mod tests {
         let snapshot = snapshot.unwrap();
         assert_eq!((snapshot.holder_count, snapshot.waiter_count), (2, 1));
         assert_eq!(snapshot.holders.len(), 2);
-        assert!(snapshot.holders.iter().all(|holder| holder.access == LockAccess::Read));
+        assert!(
+            snapshot
+                .holders
+                .iter()
+                .all(|holder| holder.access == LockAccess::Read)
+        );
         assert_eq!(snapshot.waiters[0].access, LockAccess::Write);
         assert_ne!(snapshot.holders[0].thread_id, snapshot.holders[1].thread_id);
         assert_eq!(*lock.read(), 42);
@@ -560,7 +643,9 @@ mod tests {
         let owner = lock.lock();
         let id = instance_id(&lock.activity);
         let peer = Arc::clone(&lock);
-        let failed = std::thread::spawn(move || peer.try_lock().is_none()).join().unwrap();
+        let failed = std::thread::spawn(move || peer.try_lock().is_none())
+            .join()
+            .unwrap();
         let snapshot = observe_activity(id, |lock| lock.holder_count == 1);
         drop(owner);
         assert!(failed);
@@ -578,11 +663,15 @@ mod tests {
     fn poisoned_mutex_recovery_and_unwind_leave_no_phantom_owners() {
         let lock = Arc::new(OrderedMutex::new(LockLevel::DbSqliteInitGates, 0));
         let peer = Arc::clone(&lock);
-        assert!(std::thread::spawn(move || {
-            let mut guard = peer.lock();
-            *guard = 7;
-            panic!("fixture: poison the application mutex, not its metadata");
-        }).join().is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let mut guard = peer.lock();
+                *guard = 7;
+                panic!("fixture: poison the application mutex, not its metadata");
+            })
+            .join()
+            .is_err()
+        );
         let id = instance_id(&lock.activity);
         assert_inactive(&lock.activity);
         let recovered = lock.lock();
@@ -632,8 +721,13 @@ mod tests {
     fn metadata_and_registry_contention_are_partial_not_empty_successes() {
         let registry = Registry::new(2);
         let instance = registry.register(LockLevel::DbPoolCache).unwrap();
-        let owner = ActivityGuard::begin(&instance, LockAccess::Mutex,
-            Location::caller(), Instant::now(), Phase::Holding);
+        let owner = ActivityGuard::begin(
+            &instance,
+            LockAccess::Mutex,
+            Location::caller(),
+            Instant::now(),
+            Phase::Holding,
+        );
         let held = instance.state.lock().unwrap();
         let snapshot = registry.snapshot();
         drop(held);
@@ -653,16 +747,29 @@ mod tests {
     fn participant_bound_keeps_counts_and_cleans_up_unrecorded_guards() {
         let registry = Registry::new(1);
         let instance = registry.register(LockLevel::DbPoolCache).unwrap();
-        let guards: Vec<_> = (0..MAX_PARTICIPANTS + 3).map(|_| {
-            ActivityGuard::begin(&instance, LockAccess::Read, Location::caller(),
-                Instant::now(), Phase::Holding)
-        }).collect();
-        assert_eq!(instance.state.lock().unwrap().participants.len(), MAX_PARTICIPANTS);
+        let guards: Vec<_> = (0..MAX_PARTICIPANTS + 3)
+            .map(|_| {
+                ActivityGuard::begin(
+                    &instance,
+                    LockAccess::Read,
+                    Location::caller(),
+                    Instant::now(),
+                    Phase::Holding,
+                )
+            })
+            .collect();
+        assert_eq!(
+            instance.state.lock().unwrap().participants.len(),
+            MAX_PARTICIPANTS
+        );
         let snapshot = registry.snapshot();
         let lock = &snapshot.locks[0];
         assert_eq!(lock.holder_count, MAX_PARTICIPANTS + 3);
         assert_eq!(lock.holders.len(), MAX_PARTICIPANTS_PER_PHASE);
-        assert_eq!(lock.omitted_participants, lock.holder_count - lock.holders.len());
+        assert_eq!(
+            lock.omitted_participants,
+            lock.holder_count - lock.holders.len()
+        );
         assert!(!snapshot.is_complete());
         drop(guards);
         assert!(registry.snapshot().locks.is_empty());
@@ -673,16 +780,32 @@ mod tests {
     fn wait_to_hold_transition_is_one_identity_and_drop_removes_only_it() {
         let registry = Registry::new(1);
         let instance = registry.register(LockLevel::StorageCommitQueue).unwrap();
-        let owner = ActivityGuard::begin(&instance, LockAccess::Mutex, Location::caller(),
-            Instant::now(), Phase::Holding);
-        let waiting = ActivityGuard::begin(&instance, LockAccess::Mutex, Location::caller(),
-            Instant::now(), Phase::Waiting);
+        let owner = ActivityGuard::begin(
+            &instance,
+            LockAccess::Mutex,
+            Location::caller(),
+            Instant::now(),
+            Phase::Holding,
+        );
+        let waiting = ActivityGuard::begin(
+            &instance,
+            LockAccess::Mutex,
+            Location::caller(),
+            Instant::now(),
+            Phase::Waiting,
+        );
         let before = registry.snapshot();
-        assert_eq!((before.locks[0].holder_count, before.locks[0].waiter_count), (1, 1));
+        assert_eq!(
+            (before.locks[0].holder_count, before.locks[0].waiter_count),
+            (1, 1)
+        );
         let next_owner = waiting.acquired(Instant::now());
         drop(owner);
         let after = registry.snapshot();
-        assert_eq!((after.locks[0].holder_count, after.locks[0].waiter_count), (1, 0));
+        assert_eq!(
+            (after.locks[0].holder_count, after.locks[0].waiter_count),
+            (1, 0)
+        );
         drop(next_owner);
         assert!(registry.snapshot().locks.is_empty());
     }
@@ -694,19 +817,35 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..MAX_SNAPSHOT_LOCKS + 1 {
             let instance = registry.register(LockLevel::DbPoolCache).unwrap();
-            guards.push(ActivityGuard::begin(&instance, LockAccess::Mutex,
-                Location::caller(), Instant::now(), Phase::Holding));
+            guards.push(ActivityGuard::begin(
+                &instance,
+                LockAccess::Mutex,
+                Location::caller(),
+                Instant::now(),
+                Phase::Holding,
+            ));
             instances.push(instance);
         }
         let stalled = registry.register(LockLevel::StorageCommitQueue).unwrap();
-        let waiter = ActivityGuard::begin(&stalled, LockAccess::Mutex,
-            Location::caller(), Instant::now(), Phase::Waiting);
+        let waiter = ActivityGuard::begin(
+            &stalled,
+            LockAccess::Mutex,
+            Location::caller(),
+            Instant::now(),
+            Phase::Waiting,
+        );
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.locks.len(), MAX_SNAPSHOT_LOCKS);
         assert_eq!(snapshot.locks[0].instance_id, stalled.id);
         assert_eq!(snapshot.omitted_active_instances, 2);
-        assert!(snapshot.locks.iter().map(|lock| lock.holders.len() + lock.waiters.len())
-            .sum::<usize>() <= MAX_SNAPSHOT_PARTICIPANTS);
+        assert!(
+            snapshot
+                .locks
+                .iter()
+                .map(|lock| lock.holders.len() + lock.waiters.len())
+                .sum::<usize>()
+                <= MAX_SNAPSHOT_PARTICIPANTS
+        );
         drop(waiter);
         drop(guards);
         drop(instances);
@@ -736,8 +875,11 @@ mod tests {
                 // regression fails this test instead of aborting the suite.
                 let outcome = std::panic::catch_unwind(move || {
                     let guard = ActivityGuard::begin(
-                        &instance, LockAccess::Mutex, Location::caller(),
-                        Instant::now(), Phase::Holding,
+                        &instance,
+                        LockAccess::Mutex,
+                        Location::caller(),
+                        Instant::now(),
+                        Phase::Holding,
                     );
                     let state = instance.state.lock().unwrap();
                     let anonymous = state.holders == 1 && state.participants.is_empty();
@@ -760,17 +902,31 @@ mod tests {
         std::thread::spawn(move || {
             // Initialize this destructor before the label cache, so it runs
             // after that cache has been destroyed at this real thread's exit.
-            LATE_USE.with(|slot| *slot.borrow_mut() = Some(LateUse {
-                instance: Arc::clone(&retained), result: result_tx,
-            }));
+            LATE_USE.with(|slot| {
+                *slot.borrow_mut() = Some(LateUse {
+                    instance: Arc::clone(&retained),
+                    result: result_tx,
+                })
+            });
             drop(ActivityGuard::begin(
-                &retained, LockAccess::Mutex, Location::caller(),
-                Instant::now(), Phase::Holding,
+                &retained,
+                LockAccess::Mutex,
+                Location::caller(),
+                Instant::now(),
+                Phase::Holding,
             ));
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
         let (label_gone, anonymous) = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(label_gone, "exercise a destroyed TLS label, not the ordinary cache path");
-        assert!(anonymous, "missing labels must not prevent lock-activity cleanup");
+        assert!(
+            label_gone,
+            "exercise a destroyed TLS label, not the ordinary cache path"
+        );
+        assert!(
+            anonymous,
+            "missing labels must not prevent lock-activity cleanup"
+        );
         let state = instance.state.lock().unwrap();
         assert_eq!((state.holders, state.waiters), (0, 0));
         assert!(state.participants.is_empty());

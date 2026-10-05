@@ -1941,6 +1941,7 @@ mod tests {
             max_wait_ns: 1_000_000,
             max_hold_ns: 2_000_000,
             contention_ratio: 0.2, // 20%
+            live: crate::lock_order::LockActivitySnapshot::default(),
         }];
         let mut recs = Vec::new();
         operational_recommendations(&snap, &locks, 0, &mut recs);
@@ -1964,6 +1965,7 @@ mod tests {
             max_wait_ns: 50_000,
             max_hold_ns: 200_000,
             contention_ratio: 0.02, // 2%
+            live: crate::lock_order::LockActivitySnapshot::default(),
         }];
         let mut recs = Vec::new();
         operational_recommendations(&snap, &locks, 0, &mut recs);

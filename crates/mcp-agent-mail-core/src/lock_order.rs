@@ -336,7 +336,9 @@ pub fn lock_contention_snapshot() -> Vec<LockContentionEntry> {
             let acquires = s.acquire_count.load(Ordering::Relaxed);
             let activity = LockActivitySnapshot {
                 available: live.available,
-                locks: live.locks.iter()
+                locks: live
+                    .locks
+                    .iter()
                     .filter(|lock| lock.rank == level.rank())
                     .cloned()
                     .collect(),
@@ -427,7 +429,10 @@ fn did_release(level: LockLevel) {
     #[cfg(debug_assertions)]
     HELD_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
-        if let Some(pos) = held.iter().rposition(|&(held_level, _)| held_level == level) {
+        if let Some(pos) = held
+            .iter()
+            .rposition(|&(held_level, _)| held_level == level)
+        {
             held.remove(pos);
         } else {
             panic!(
@@ -472,7 +477,10 @@ impl<T> OrderedMutex<T> {
             Ok(guard) => {
                 let acquired_at = Instant::now();
                 let activity = self.activity.holding(
-                    self.level, LockAccess::Mutex, Location::caller(), acquired_at,
+                    self.level,
+                    LockAccess::Mutex,
+                    Location::caller(),
+                    acquired_at,
                 );
                 stats.record_acquire(false, 0);
                 did_acquire(self.level);
@@ -486,9 +494,9 @@ impl<T> OrderedMutex<T> {
             Err(std::sync::TryLockError::WouldBlock) => {
                 // Slow path: contended — measure wait time.
                 let start = Instant::now();
-                let waiting = self.activity.waiting(
-                    self.level, LockAccess::Mutex, Location::caller(), start,
-                );
+                let waiting =
+                    self.activity
+                        .waiting(self.level, LockAccess::Mutex, Location::caller(), start);
                 let guard = self
                     .inner
                     .lock()
@@ -507,7 +515,10 @@ impl<T> OrderedMutex<T> {
             Err(std::sync::TryLockError::Poisoned(e)) => {
                 let acquired_at = Instant::now();
                 let activity = self.activity.holding(
-                    self.level, LockAccess::Mutex, Location::caller(), acquired_at,
+                    self.level,
+                    LockAccess::Mutex,
+                    Location::caller(),
+                    acquired_at,
                 );
                 stats.record_acquire(false, 0);
                 did_acquire(self.level);
@@ -528,7 +539,10 @@ impl<T> OrderedMutex<T> {
         let guard = self.inner.try_lock().ok()?;
         let acquired_at = Instant::now();
         let activity = self.activity.holding(
-            self.level, LockAccess::Mutex, Location::caller(), acquired_at,
+            self.level,
+            LockAccess::Mutex,
+            Location::caller(),
+            acquired_at,
         );
         let stats = &global_lock_stats()[self.level.ordinal()];
         stats.record_acquire(false, 0);
@@ -606,7 +620,10 @@ impl<T> OrderedRwLock<T> {
             Ok(guard) => {
                 let acquired_at = Instant::now();
                 let activity = self.activity.holding(
-                    self.level, LockAccess::Read, Location::caller(), acquired_at,
+                    self.level,
+                    LockAccess::Read,
+                    Location::caller(),
+                    acquired_at,
                 );
                 stats.record_acquire(false, 0);
                 did_acquire(self.level);
@@ -619,9 +636,9 @@ impl<T> OrderedRwLock<T> {
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 let start = Instant::now();
-                let waiting = self.activity.waiting(
-                    self.level, LockAccess::Read, Location::caller(), start,
-                );
+                let waiting =
+                    self.activity
+                        .waiting(self.level, LockAccess::Read, Location::caller(), start);
                 let guard = self
                     .inner
                     .read()
@@ -640,7 +657,10 @@ impl<T> OrderedRwLock<T> {
             Err(std::sync::TryLockError::Poisoned(e)) => {
                 let acquired_at = Instant::now();
                 let activity = self.activity.holding(
-                    self.level, LockAccess::Read, Location::caller(), acquired_at,
+                    self.level,
+                    LockAccess::Read,
+                    Location::caller(),
+                    acquired_at,
                 );
                 stats.record_acquire(false, 0);
                 did_acquire(self.level);
@@ -663,7 +683,10 @@ impl<T> OrderedRwLock<T> {
             Ok(guard) => {
                 let acquired_at = Instant::now();
                 let activity = self.activity.holding(
-                    self.level, LockAccess::Write, Location::caller(), acquired_at,
+                    self.level,
+                    LockAccess::Write,
+                    Location::caller(),
+                    acquired_at,
                 );
                 stats.record_acquire(false, 0);
                 did_acquire(self.level);
@@ -676,9 +699,9 @@ impl<T> OrderedRwLock<T> {
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 let start = Instant::now();
-                let waiting = self.activity.waiting(
-                    self.level, LockAccess::Write, Location::caller(), start,
-                );
+                let waiting =
+                    self.activity
+                        .waiting(self.level, LockAccess::Write, Location::caller(), start);
                 let guard = self
                     .inner
                     .write()
@@ -697,7 +720,10 @@ impl<T> OrderedRwLock<T> {
             Err(std::sync::TryLockError::Poisoned(e)) => {
                 let acquired_at = Instant::now();
                 let activity = self.activity.holding(
-                    self.level, LockAccess::Write, Location::caller(), acquired_at,
+                    self.level,
+                    LockAccess::Write,
+                    Location::caller(),
+                    acquired_at,
                 );
                 stats.record_acquire(false, 0);
                 did_acquire(self.level);
@@ -932,7 +958,9 @@ mod tests {
         let snap = lock_contention_snapshot();
         for entry in &snap {
             assert!(
-                entry.acquire_count > 0 || !entry.live.locks.is_empty() || !entry.live.is_complete(),
+                entry.acquire_count > 0
+                    || !entry.live.locks.is_empty()
+                    || !entry.live.is_complete(),
                 "verified-idle zero-acquire entry should be filtered: {}",
                 entry.lock_name
             );
@@ -977,20 +1005,24 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let held = Arc::clone(&mutex);
-        let owner = thread::Builder::new().name("diagnostic-owner".into())
+        let owner = thread::Builder::new()
+            .name("diagnostic-owner".into())
             .spawn(move || {
                 let guard = held.lock();
                 ready_tx.send(()).unwrap();
                 let _ = release_rx.recv_timeout(Duration::from_secs(10));
                 drop(guard);
-            }).unwrap();
+            })
+            .unwrap();
         let ready = ready_rx.recv_timeout(Duration::from_secs(5));
         // Live leases are not historical counters. Resetting counters cannot
         // erase an existing owner or make its blocked contender disappear.
         global_lock_stats()[level.ordinal()].reset();
         let held = Arc::clone(&mutex);
-        let waiter = thread::Builder::new().name("diagnostic-waiter".into())
-            .spawn(move || drop(held.lock())).unwrap();
+        let waiter = thread::Builder::new()
+            .name("diagnostic-waiter".into())
+            .spawn(move || drop(held.lock()))
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let captured = loop {
             // This is the same builder/serializer used by the real
@@ -998,18 +1030,21 @@ mod tests {
             let report = crate::diagnostics::DiagnosticReport::build(vec![], vec![]);
             let payload: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
             let found = payload["locks"].as_array().and_then(|entries| {
-                entries.iter().find(|entry| {
-                    entry["lock_name"] == "ServerLiveDashboard"
-                        && entry["live"]["locks"].as_array().is_some_and(|locks| {
-                            locks.iter().any(|lock| {
-                                lock["waiters"].as_array().is_some_and(|waiters| {
-                                    waiters.iter().any(|waiter| {
-                                        waiter["thread_name"] == "diagnostic-waiter"
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry["lock_name"] == "ServerLiveDashboard"
+                            && entry["live"]["locks"].as_array().is_some_and(|locks| {
+                                locks.iter().any(|lock| {
+                                    lock["waiters"].as_array().is_some_and(|waiters| {
+                                        waiters.iter().any(|waiter| {
+                                            waiter["thread_name"] == "diagnostic-waiter"
+                                        })
                                     })
                                 })
                             })
-                        })
-                }).cloned()
+                    })
+                    .cloned()
             });
             if found.is_some() || Instant::now() >= deadline {
                 break found;
@@ -1025,11 +1060,16 @@ mod tests {
         assert_eq!(captured["contention_ratio"], 0.0);
         assert_eq!(captured["live"]["available"], true);
         let locks = captured["live"]["locks"].as_array().unwrap();
-        let instance = locks.iter().find(|lock| {
-            lock["holders"].as_array().is_some_and(|holders| {
-                holders.iter().any(|holder| holder["thread_name"] == "diagnostic-owner")
+        let instance = locks
+            .iter()
+            .find(|lock| {
+                lock["holders"].as_array().is_some_and(|holders| {
+                    holders
+                        .iter()
+                        .any(|holder| holder["thread_name"] == "diagnostic-owner")
+                })
             })
-        }).unwrap();
+            .unwrap();
         assert_eq!(instance["holder_count"], 1);
         assert_eq!(instance["waiter_count"], 1);
         assert!(instance["oldest_observed_wait_ns"].as_u64().unwrap() > 0);
@@ -1045,29 +1085,43 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let mut owners = Vec::new();
         let mut releases = Vec::new();
-        for (name, mutex) in [("shard-a", Arc::clone(&first)), ("shard-b", Arc::clone(&second))] {
+        for (name, mutex) in [
+            ("shard-a", Arc::clone(&first)),
+            ("shard-b", Arc::clone(&second)),
+        ] {
             let (release_tx, release_rx) = mpsc::channel();
             releases.push(release_tx);
             let ready_tx = ready_tx.clone();
-            owners.push(thread::Builder::new().name(name.into()).spawn(move || {
-                let guard = mutex.lock();
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(10));
-                drop(guard);
-            }).unwrap());
+            owners.push(
+                thread::Builder::new()
+                    .name(name.into())
+                    .spawn(move || {
+                        let guard = mutex.lock();
+                        ready_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                        drop(guard);
+                    })
+                    .unwrap(),
+            );
         }
         let ready_a = ready_rx.recv_timeout(Duration::from_secs(5));
         let ready_b = ready_rx.recv_timeout(Duration::from_secs(5));
         let waiting = Arc::clone(&first);
-        let waiter = thread::Builder::new().name("shard-a-waiter".into())
-            .spawn(move || *waiting.lock() += 1).unwrap();
+        let waiter = thread::Builder::new()
+            .name("shard-a-waiter".into())
+            .spawn(move || *waiting.lock() += 1)
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let observed = loop {
-            let locks: Vec<_> = lock_contention_snapshot().into_iter()
+            let locks: Vec<_> = lock_contention_snapshot()
+                .into_iter()
                 .flat_map(|level| level.live.locks)
-                .filter(|lock| lock.holders.iter().any(|holder| {
-                    matches!(holder.thread_name.as_deref(), Some("shard-a" | "shard-b"))
-                })).collect();
+                .filter(|lock| {
+                    lock.holders.iter().any(|holder| {
+                        matches!(holder.thread_name.as_deref(), Some("shard-a" | "shard-b"))
+                    })
+                })
+                .collect();
             if observed_shards_ready(&locks) || Instant::now() >= deadline {
                 break locks;
             }
@@ -1090,14 +1144,21 @@ mod tests {
 
     fn observed_shards_ready(locks: &[LockActivity]) -> bool {
         locks.len() == 2
-            && locks.iter().any(|lock| lock.holders.iter().any(|holder| {
-                holder.thread_name.as_deref() == Some("shard-a")
-            }) && lock.waiters.iter().any(|waiter| {
-                waiter.thread_name.as_deref() == Some("shard-a-waiter")
-            }))
-            && locks.iter().any(|lock| lock.holders.iter().any(|holder| {
-                holder.thread_name.as_deref() == Some("shard-b")
-            }) && lock.waiter_count == 0)
+            && locks.iter().any(|lock| {
+                lock.holders
+                    .iter()
+                    .any(|holder| holder.thread_name.as_deref() == Some("shard-a"))
+                    && lock
+                        .waiters
+                        .iter()
+                        .any(|waiter| waiter.thread_name.as_deref() == Some("shard-a-waiter"))
+            })
+            && locks.iter().any(|lock| {
+                lock.holders
+                    .iter()
+                    .any(|holder| holder.thread_name.as_deref() == Some("shard-b"))
+                    && lock.waiter_count == 0
+            })
     }
 
     #[test]
