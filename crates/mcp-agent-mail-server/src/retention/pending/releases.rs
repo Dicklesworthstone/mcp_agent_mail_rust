@@ -334,17 +334,40 @@ fn reconcile_release_archive(
     };
     let attempted = released.len().min(*budget);
     *budget -= attempted;
-    for row in released.iter().take(attempted) {
-        match reconcile_released_reservation(cx, pool, config, row, generation) {
-            Ok(repaired) => {
-                tracing::debug!(reservation_id = ?row.id, repaired,
-                    "replayed release stable artifact verified against the live mailbox");
-            }
-            Err(error) => {
-                tracing::warn!(reservation_id = ?row.id, %error,
-                    "release applied; archive evidence preserved for live-state reconciliation");
-            }
-        }
+    // The storage repair blocks on the pool internally. Replay runs inside the
+    // worker's `block_on`, where a nested one panics and ends the worker, so
+    // the repairs run on their own thread, as blocking dispatch does.
+    let repairs = &released[..attempted];
+    let joined = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("release-archive-repair".into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn_scoped(scope, || {
+                for row in repairs {
+                    match reconcile_released_reservation(cx, pool, config, row, generation) {
+                        Ok(repaired) => {
+                            tracing::debug!(reservation_id = ?row.id, repaired,
+                                "replayed release stable artifact verified against the live mailbox");
+                        }
+                        Err(error) => {
+                            tracing::warn!(reservation_id = ?row.id, %error,
+                                "release applied; archive evidence preserved for live-state reconciliation");
+                        }
+                    }
+                }
+            })
+            .map(std::thread::ScopedJoinHandle::join)
+    });
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => tracing::warn!(
+            attempted,
+            "release archive repair panicked; history reconciliation retains the work"
+        ),
+        Err(error) => tracing::warn!(
+            %error, attempted,
+            "release archive repair thread unavailable; history reconciliation retains the work"
+        ),
     }
     if attempted < released.len() {
         tracing::debug!(
