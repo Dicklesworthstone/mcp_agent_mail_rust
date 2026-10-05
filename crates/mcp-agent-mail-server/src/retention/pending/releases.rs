@@ -334,7 +334,7 @@ fn reconcile_release_archive(
     attempted
 }
 
-fn append_completion(
+pub(super) fn append_completion(
     config: &Config,
     intent: &QueuedReleaseIntentView,
     released: usize,

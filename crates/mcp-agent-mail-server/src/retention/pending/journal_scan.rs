@@ -15,7 +15,7 @@ use mcp_agent_mail_core::journal_io::{JournalDirectory, JournalFileMode};
 use mcp_agent_mail_tools::degraded_intents::{
     self as journal, QueuedAckIntent, QueuedReleaseIntentView,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 const BYTES_PER_POLL: usize = 256 * 1024;
 const RECORDS_PER_POLL: usize = 256;
@@ -349,39 +349,20 @@ fn decode(kind: Kind, record: Value) -> io::Result<Record> {
             "closeout journal has an unsupported schema; replay stopped and evidence preserved",
         ));
     }
-    let mut payload = if is_intent {
-        match kind {
-            Kind::Ack => json!({
-                "schema_version": record["schema_version"], "kind": record["kind"],
-                "created_ts": record["created_ts"], "project_key": record["project_key"],
-                "agent_name": record["agent_name"], "message_id": record["message_id"],
-                "failure": record["failure"],
-            }),
-            Kind::Release => json!({
-                "schema_version": record["schema_version"], "kind": record["kind"],
-                "created_ts": record["created_ts"], "project_key": record["project_key"],
-                "agent_name": record["agent_name"], "paths": record["paths"],
-                "file_reservation_ids": record["file_reservation_ids"], "failure": record["failure"],
-            }),
-        }
-    } else {
-        json!({
-            "schema_version": record["schema_version"], "kind": record["kind"],
-            "intent_id": record["intent_id"], "intent_content_sha256": record["intent_content_sha256"],
-            "replayed_ts": record["replayed_ts"], "status": record["status"],
-            "error_detail": record["error_detail"],
-        })
-    };
-    if keyed {
-        payload["idempotency"] = record["idempotency"].clone();
-    } else if matches!(kind, Kind::Ack) && is_intent && record.get("idempotency").is_some() {
+    if !keyed && matches!(kind, Kind::Ack) && is_intent && record.get("idempotency").is_some() {
         return Err(invalid(
             "legacy acknowledgement contains an unsupported retry claim; replay refused",
         ));
     }
-    if matches!(kind, Kind::Release) && is_replay {
-        payload["released"] = record["released"].clone();
-    }
+    // Field order is part of the hash, so hash through the writers' own
+    // projections. A local copy once put a release marker's `released` after
+    // `error_detail` and ignored every real completion.
+    let payload = match (kind, is_intent) {
+        (Kind::Ack, true) => journal::ack_intent_hash_payload(&record),
+        (Kind::Ack, false) => journal::ack_replay_hash_payload(&record),
+        (Kind::Release, true) => journal::release_intent_hash_payload(&record),
+        (Kind::Release, false) => journal::release_replay_hash_payload(&record),
+    };
     let Some(hash) = record.get("content_sha256").and_then(Value::as_str) else {
         return Ok(Record::Ignored);
     };
@@ -459,6 +440,7 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Write;
 
     fn fixture() -> (tempfile::TempDir, Config) {
@@ -483,19 +465,21 @@ mod tests {
         record
     }
 
+    // Fixtures use the writers' field order: the hash covers it.
     fn intent(kind: Kind, sequence: i64) -> Value {
-        let mut record = json!({
-            "schema_version": 1, "kind": kind.intent_kind(), "created_ts": sequence,
-            "project_key": "/replay", "agent_name": "BlueLake",
-            "failure": {"stage": "test", "error_detail": "busy"},
-        });
-        match kind {
-            Kind::Ack => record["message_id"] = json!(sequence),
-            Kind::Release => {
-                record["paths"] = Value::Null;
-                record["file_reservation_ids"] = json!([sequence]);
-            }
-        }
+        let record = match kind {
+            Kind::Ack => json!({
+                "schema_version": 1, "kind": kind.intent_kind(), "created_ts": sequence,
+                "project_key": "/replay", "agent_name": "BlueLake", "message_id": sequence,
+                "failure": {"stage": "test", "error_detail": "busy"},
+            }),
+            Kind::Release => json!({
+                "schema_version": 1, "kind": kind.intent_kind(), "created_ts": sequence,
+                "project_key": "/replay", "agent_name": "BlueLake", "paths": null,
+                "file_reservation_ids": [sequence],
+                "failure": {"stage": "test", "error_detail": "busy"},
+            }),
+        };
         seal(record, true)
     }
 
@@ -503,11 +487,12 @@ mod tests {
         let mut record = json!({
             "schema_version": 1, "kind": kind.replay_kind(),
             "intent_id": intent["intent_id"], "intent_content_sha256": intent["content_sha256"],
-            "replayed_ts": 100, "status": status, "error_detail": null,
+            "replayed_ts": 100, "status": status,
         });
         if matches!(kind, Kind::Release) {
             record["released"] = json!(0);
         }
+        record["error_detail"] = Value::Null;
         seal(record, false)
     }
 
@@ -551,6 +536,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn completions_from_the_production_writers_are_terminal() {
+        // The hash covers field order. A scanner hashing a release marker's
+        // fields in its own order ignored every real completion: each
+        // replayed release stayed pending, was replayed again on every pass,
+        // and grew the journal toward the snapshot limit.
+        let (_dir, config) = fixture();
+        let done =
+            journal::append_ack_intent(&config, "/replay", "BlueLake", 1, "test", "busy", None)
+                .unwrap();
+        journal::append_ack_replay_record(
+            &config,
+            &done.intent_id,
+            &done.content_sha256,
+            journal::REPLAY_STATUS_REPLAYED,
+            None,
+        );
+        let open =
+            journal::append_ack_intent(&config, "/replay", "BlueLake", 2, "test", "busy", None)
+                .unwrap();
+        let pending = finish(&mut Scanner::new(Kind::Ack), &config).unwrap();
+        let ids: Vec<_> = pending.iter().map(|intent| intent.key().0).collect();
+        assert_eq!(ids, [open.intent_id]);
+        assert_same_as_existing_reader(Kind::Ack, &config, pending);
+
+        append(&config, Kind::Release, &intent(Kind::Release, 1));
+        append(&config, Kind::Release, &intent(Kind::Release, 2));
+        let queued = journal::read_queued_release_intents(&config).unwrap();
+        assert_eq!(queued.len(), 2);
+        super::super::releases::append_completion(&config, &queued[0], 1).unwrap();
+        let pending = finish(&mut Scanner::new(Kind::Release), &config).unwrap();
+        let ids: Vec<_> = pending.iter().map(|intent| intent.key().0).collect();
+        assert_eq!(ids, [queued[1].intent_id.clone()]);
+        assert_same_as_existing_reader(Kind::Release, &config, pending);
     }
 
     #[test]
