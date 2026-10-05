@@ -5,6 +5,8 @@
 //! Long ordered-lock waits also emit bounded holder/waiter evidence without a
 //! client diagnostic request. These observations do not prove a deadlock or
 //! replace the archive queue-progress health verdict.
+//! The lock sampler has its own joinable thread: a blocked filesystem or memory
+//! probe must not suppress the evidence needed to diagnose that probe.
 
 #![forbid(unsafe_code)]
 
@@ -13,15 +15,18 @@ use mcp_agent_mail_core::disk::DiskPressure;
 use mcp_agent_mail_core::lock_order::{LockActivity, LockActivitySnapshot, lock_activity_snapshot};
 use mcp_agent_mail_core::memory::MemoryPressure;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+static LOCK_WORKER: std::sync::LazyLock<Mutex<Option<LockWatchdogWorker>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 const STARTUP_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1GiB
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const LOCK_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 const LOCK_WAIT_THRESHOLD: Duration = Duration::from_secs(30);
 const LOCK_WAIT_REMINDER_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_TRACKED_LOCK_WAITS: usize = 128;
@@ -156,6 +161,96 @@ impl LockWaitWatchdog {
     }
 }
 
+/// Own the sampler and join it on every drop path. Each worker incarnation has
+/// its own cancellation flag; restarting cannot revive an older thread.
+struct LockWatchdogWorker {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LockWatchdogWorker {
+    fn spawn(
+        interval: Duration,
+        sample: impl FnMut(Duration) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        if interval.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lock sampling interval must be positive",
+            ));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("lock-watchdog".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || run_lock_sampler(&worker_stop, interval, sample))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+}
+
+impl Drop for LockWatchdogWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_lock_sampler(stop: &AtomicBool, interval: Duration, mut sample: impl FnMut(Duration)) {
+    let started = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        sample(started.elapsed());
+        // Wait after each completed observation; missed intervals never cause
+        // a catch-up burst. No database, filesystem, or application lock is
+        // involved in this wait. A blocked tracing sink is not interruptible.
+        let paused = Instant::now();
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            let remaining = interval.saturating_sub(paused.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(100)));
+        }
+    }
+}
+
+/// Start and stop take WORKER before LOCK_WORKER, serializing the lifecycle.
+/// The sampler itself takes neither lifecycle mutex.
+fn start_lock_watchdog() {
+    let mut worker = LOCK_WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if worker.as_ref().is_some_and(LockWatchdogWorker::is_finished) {
+        drop(worker.take());
+    }
+    if worker.is_none() {
+        let mut observations = LockWaitWatchdog::default();
+        match LockWatchdogWorker::spawn(LOCK_SAMPLE_INTERVAL, move |elapsed| {
+            observations.sample(elapsed);
+        }) {
+            Ok(started) => *worker = Some(started),
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to start independent lock watchdog; resource monitoring remains enabled"
+            ),
+        }
+    }
+}
+
 /// Independent elapsed-time schedules; large configured disk intervals must
 /// neither delay RSS sampling nor overflow an `Instant` deadline.
 struct MonitorSchedule {
@@ -232,6 +327,9 @@ pub fn start(config: &Config) {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Start before synchronous resource probes: even a startup probe can wait
+    // on an instrumented lock. Retrying start never duplicates a live sampler.
+    start_lock_watchdog();
     if worker
         .as_ref()
         .is_some_and(std::thread::JoinHandle::is_finished)
@@ -290,6 +388,12 @@ pub fn shutdown() {
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
+    // Keep reporting while a resource probe is draining. Only after that
+    // worker joins do we cancel and join the independent sampler.
+    let mut lock_worker = LOCK_WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(lock_worker.take());
 }
 
 fn monitor_loop(
@@ -300,7 +404,6 @@ fn monitor_loop(
     let mut schedule = MonitorSchedule::new(config);
     let started = Instant::now();
     let mut descriptor_growth_reported = false;
-    let mut lock_waits = LockWaitWatchdog::default();
     tracing::info!(
         disk_enabled = schedule.disk_enabled,
         disk_interval_secs = schedule.disk_interval.as_secs(),
@@ -325,7 +428,6 @@ fn monitor_loop(
         // Sample RSS first when both probes are due. The schedules share a
         // worker, so slow filesystem probes can still delay a later sample.
         if memory_due {
-            lock_waits.sample(started.elapsed());
             let sample = mcp_agent_mail_core::memory::sample_and_record(config);
             if last_memory_pressure != sample.pressure {
                 tracing::info!(
@@ -587,6 +689,89 @@ mod tests {
         }));
         let cleared = watchdog.observe(Duration::from_secs(5), &after, Duration::ZERO);
         assert_eq!(cleared.cleared, vec![id]);
+    }
+
+    #[test]
+    fn independent_lock_sampler_progresses_and_stops_while_a_probe_is_blocked() {
+        use mcp_agent_mail_core::{LockLevel, OrderedMutex};
+        use std::sync::mpsc;
+
+        let lock = Arc::new(OrderedMutex::new(LockLevel::StorageCommitQueue, ()));
+        let guard = lock.lock();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let peer = Arc::clone(&lock);
+        let peer_acquired = Arc::clone(&acquired);
+        let (ready, receive_ready) = mpsc::channel();
+        let probe = std::thread::Builder::new()
+            .name("blocked-resource-probe".to_string())
+            .spawn(move || {
+                ready.send(()).unwrap();
+                let _guard = peer.lock();
+                peer_acquired.store(true, Ordering::Release);
+            })
+            .unwrap();
+        let ready = receive_ready.recv_timeout(Duration::from_secs(5));
+        let (evidence, receive_evidence) = mpsc::sync_channel(1);
+        let sampler = LockWatchdogWorker::spawn(Duration::from_millis(5), move |_| {
+            let snapshot = lock_activity_snapshot();
+            if let Some(activity) = snapshot.locks.into_iter().find(|activity| {
+                activity.waiters.iter().any(|waiter| {
+                    waiter.thread_name.as_deref() == Some("blocked-resource-probe")
+                })
+            }) {
+                // A slow test receiver must not block sampler cancellation.
+                let _ = evidence.try_send(activity);
+            }
+        })
+        .unwrap();
+        let observed = receive_evidence.recv_timeout(Duration::from_secs(5));
+        // The sampler joins while the probe is still blocked; neither its
+        // reads nor its cancellation require the protected application lock.
+        drop(sampler);
+        let still_blocked = !acquired.load(Ordering::Acquire);
+        drop(guard);
+        probe.join().unwrap();
+        ready.unwrap();
+        let observed = observed.expect("independent sampler must observe the blocked probe");
+        assert!(still_blocked);
+        assert_eq!(observed.holder_count, 1);
+        assert_eq!(observed.waiter_count, 1);
+        assert!(!observed.holders.is_empty());
+        assert!(acquired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn lock_sampler_drop_joins_without_waiting_for_the_next_sampling_interval() {
+        use std::sync::mpsc;
+
+        let (sampled, receive_sample) = mpsc::channel();
+        let worker = LockWatchdogWorker::spawn(Duration::from_secs(3600), move |elapsed| {
+            let _ = sampled.send(elapsed);
+        })
+        .unwrap();
+        let first = receive_sample.recv_timeout(Duration::from_secs(5));
+        drop(worker);
+        assert!(first.is_ok(), "the first sample does not wait for the interval");
+        // Sender destruction proves the sampling closure and its thread have
+        // actually exited, rather than merely detaching a sleeping worker.
+        assert!(matches!(
+            receive_sample.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn lock_sampler_refuses_zero_interval_and_honors_preexisting_cancellation() {
+        let error = LockWatchdogWorker::spawn(Duration::ZERO, |_| {
+            panic!("invalid interval must not start a worker");
+        })
+        .err()
+        .expect("zero interval must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let stop = AtomicBool::new(true);
+        let mut samples = 0;
+        run_lock_sampler(&stop, LOCK_SAMPLE_INTERVAL, |_| samples += 1);
+        assert_eq!(samples, 0);
     }
 
     #[test]
