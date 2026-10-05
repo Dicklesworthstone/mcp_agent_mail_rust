@@ -633,7 +633,9 @@ pub fn reconcile_released_reservation(
         .map_err(|_| "reservation reconciliation cancelled".to_string())?;
     if expected_generation.is_empty()
         || expected_generation.len() > 128
-        || !expected_generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !expected_generation
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     {
         return Err("targeted release repair requires a valid captured generation".into());
     }
@@ -1007,8 +1009,8 @@ mod tests {
                     ReleaseTargets::WithOwnedAliases,
                     &mut false,
                 )
-                    .unwrap_err()
-                    .contains("source/generation changed")
+                .unwrap_err()
+                .contains("source/generation changed")
             );
             assert_eq!(fs::read(path).unwrap(), before);
         });
@@ -1281,11 +1283,9 @@ mod tests {
     }
 
     fn captured_row(cx: &Cx, pool: &DbPool, id: i64) -> FileReservationRow {
-        outcome(block_on(mcp_agent_mail_db::queries::get_reservations_by_ids(
-            cx,
-            pool,
-            &[id],
-        )))
+        outcome(block_on(
+            mcp_agent_mail_db::queries::get_reservations_by_ids(cx, pool, &[id]),
+        ))
         .unwrap()
         .into_iter()
         .next()
@@ -1319,14 +1319,22 @@ mod tests {
 
             assert!(reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
             let artifact = read_artifact(&stable).unwrap().unwrap();
-            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(
+                artifact.value["released_ts"],
+                source.artifact["released_ts"]
+            );
             assert_eq!(artifact.value["operator_note"], "preserve this note");
             assert_eq!(fs::read(&alias).unwrap(), newer_bytes);
             assert_eq!(fs::read(&legacy).unwrap(), foreign_bytes);
             assert_eq!(fs::read(&foreign).unwrap(), foreign_bytes);
             assert_eq!(captured_row(cx, pool, 402).released_ts, None);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            let hot = conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap();
+            let hot = conn
+                .query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=401",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(hot[0].get_as::<Option<i64>>(0).unwrap(), None);
             drop(conn);
 
@@ -1334,13 +1342,18 @@ mod tests {
             let head = repo.head().unwrap().peel_to_commit().unwrap();
             let tree = head.tree().unwrap();
             let parent_tree = head.parent(0).unwrap().tree().unwrap();
-            let diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None).unwrap();
-            let changed: Vec<_> = diff.deltas()
+            let diff = repo
+                .diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
+                .unwrap();
+            let changed: Vec<_> = diff
+                .deltas()
                 .map(|delta| delta.new_file().path().unwrap().to_path_buf())
                 .collect();
             assert_eq!(
                 changed,
-                vec![PathBuf::from("projects/project/file_reservations/id-401-gaabb.json")]
+                vec![PathBuf::from(
+                    "projects/project/file_reservations/id-401-gaabb.json"
+                )]
             );
             assert!(!reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
             assert_eq!(repo.head().unwrap().target(), Some(head.id()));
@@ -1352,7 +1365,10 @@ mod tests {
         fixture(|cx, pool, config| {
             let captured = captured_row(cx, pool, 401);
             for generation in ["", "ccdd", "not-a-generation"] {
-                assert!(reconcile_released_reservation(cx, pool, config, &captured, generation).is_err());
+                assert!(
+                    reconcile_released_reservation(cx, pool, config, &captured, generation)
+                        .is_err()
+                );
             }
             for field in 0..5 {
                 let mut changed = captured.clone();
@@ -1363,10 +1379,13 @@ mod tests {
                     3 => changed.path_pattern = "different/*.rs".into(),
                     _ => changed.exclusive = 0,
                 }
-                assert!(reconcile_released_reservation(cx, pool, config, &changed, "aabb").is_err());
+                assert!(
+                    reconcile_released_reservation(cx, pool, config, &changed, "aabb").is_err()
+                );
             }
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0").unwrap();
+            conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0")
+                .unwrap();
             drop(conn);
             assert!(reconcile_released_reservation(cx, pool, config, &captured, "aabb").is_err());
             assert!(!config.storage_root.join("projects").exists());
@@ -1412,10 +1431,19 @@ mod tests {
             let (stable, _) = seed_artifact(config, &source, "aabb", false);
             let mut bad_signature = config.clone();
             bad_signature.git_author_name = "invalid\0author".into();
-            assert!(reconcile_released_reservation(cx, pool, &bad_signature, &captured, "aabb").is_err());
-            assert_eq!(read_artifact(&stable).unwrap().unwrap().value["released_ts"], source.artifact["released_ts"]);
+            assert!(
+                reconcile_released_reservation(cx, pool, &bad_signature, &captured, "aabb")
+                    .is_err()
+            );
+            assert_eq!(
+                read_artifact(&stable).unwrap().unwrap().value["released_ts"],
+                source.artifact["released_ts"]
+            );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='current database metadata' WHERE id=401").unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET reason='current database metadata' WHERE id=401",
+            )
+            .unwrap();
             drop(conn);
             assert!(reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap());
             let artifact = read_artifact(&stable).unwrap().unwrap();
@@ -1424,7 +1452,13 @@ mod tests {
             let repo = Repository::open(&config.storage_root).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
             let relative = "projects/project/file_reservations/id-401-gaabb.json";
-            assert_eq!(committed_artifact(&repo, Some(&tree), relative).unwrap().unwrap().bytes, artifact.bytes);
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), relative)
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                artifact.bytes
+            );
         });
     }
 
@@ -1438,13 +1472,20 @@ mod tests {
                 min_connections: 1,
                 max_connections: 1,
                 ..Default::default()
-            }).unwrap();
-            assert!(reconcile_released_reservation(cx, &readonly, config, &captured, "aabb")
-                .unwrap_err().contains("query-only"));
+            })
+            .unwrap();
+            assert!(
+                reconcile_released_reservation(cx, &readonly, config, &captured, "aabb")
+                    .unwrap_err()
+                    .contains("query-only")
+            );
             let mut different_root = config.clone();
             different_root.storage_root = config.storage_root.join("different");
             fs::create_dir_all(&different_root.storage_root).unwrap();
-            assert!(reconcile_released_reservation(cx, pool, &different_root, &captured, "aabb").is_err());
+            assert!(
+                reconcile_released_reservation(cx, pool, &different_root, &captured, "aabb")
+                    .is_err()
+            );
             assert!(!config.storage_root.join("projects").exists());
         });
     }

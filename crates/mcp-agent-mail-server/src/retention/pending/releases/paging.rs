@@ -59,9 +59,16 @@ pub(super) struct Position {
 
 impl Position {
     pub(super) fn bind(&mut self, project_id: i64, agent_id: i64, generation: Option<String>) {
-        let authority = Authority { project_id, agent_id, generation };
+        let authority = Authority {
+            project_id,
+            agent_id,
+            generation,
+        };
         if self.authority.as_ref() != Some(&authority) {
-            *self = Self { authority: Some(authority), ..Self::default() };
+            *self = Self {
+                authority: Some(authority),
+                ..Self::default()
+            };
         }
     }
 
@@ -95,8 +102,11 @@ pub(super) async fn select(
     cutoff: i64,
     position: &mut Position,
 ) -> Result<Page, String> {
-    cx.checkpoint().map_err(|_| "release page selection cancelled".to_string())?;
-    let authority = position.authority.as_ref()
+    cx.checkpoint()
+        .map_err(|_| "release page selection cancelled".to_string())?;
+    let authority = position
+        .authority
+        .as_ref()
         .ok_or_else(|| "release page has no resolved authority".to_string())?;
     if cutoff <= 0 || authority.project_id <= 0 || authority.agent_id <= 0 {
         return Err("release page requires positive identities and cutoff".to_string());
@@ -108,24 +118,34 @@ pub(super) async fn select(
         Outcome::Panicked(_) => return Err("release page selection panicked".to_string()),
     };
     if position.ceiling.is_none() {
-        let rows = conn.query_sync(
-            "SELECT COALESCE(MAX(id), 0) AS ceiling FROM file_reservations", &[],
-        ).map_err(source_error)?;
-        let ceiling = rows.first()
+        let rows = conn
+            .query_sync(
+                "SELECT COALESCE(MAX(id), 0) AS ceiling FROM file_reservations",
+                &[],
+            )
+            .map_err(source_error)?;
+        let ceiling = rows
+            .first()
             .ok_or_else(|| "release page ceiling is missing".to_string())?
-            .get_named::<i64>("ceiling").map_err(source_error)?;
+            .get_named::<i64>("ceiling")
+            .map_err(source_error)?;
         position.ceiling = Some(ceiling.max(0));
     }
     let ceiling = position.ceiling.unwrap_or(0);
-    let rows = conn.query_sync(
-        "SELECT id FROM file_reservations WHERE project_id = ? AND agent_id = ? \
+    let rows = conn
+        .query_sync(
+            "SELECT id FROM file_reservations WHERE project_id = ? AND agent_id = ? \
          AND created_ts <= ? AND id > ? AND id <= ? ORDER BY id LIMIT ?",
-        &[
-            authority.project_id.into(), authority.agent_id.into(), cutoff.into(),
-            position.after.into(), ceiling.into(),
-            i64::try_from(PAGE_SIZE).expect("bounded page size").into(),
-        ],
-    ).map_err(source_error)?;
+            &[
+                authority.project_id.into(),
+                authority.agent_id.into(),
+                cutoff.into(),
+                position.after.into(),
+                ceiling.into(),
+                i64::try_from(PAGE_SIZE).expect("bounded page size").into(),
+            ],
+        )
+        .map_err(source_error)?;
     let mut ids = Vec::with_capacity(rows.len().min(PAGE_SIZE));
     let mut after = position.after;
     if rows.len() > PAGE_SIZE {
@@ -139,7 +159,11 @@ pub(super) async fn select(
         after = id;
         ids.push(id);
     }
-    Ok(Page { complete: ids.len() < PAGE_SIZE, ids, after })
+    Ok(Page {
+        complete: ids.len() < PAGE_SIZE,
+        ids,
+        after,
+    })
 }
 
 #[cfg(test)]
@@ -154,7 +178,13 @@ mod tests {
     fn cursor_discards_completed_intents_and_resets_for_a_replaced_mailbox() {
         let mut cursor = Cursor::default();
         cursor.prepare("first".into(), &[key(1), key(2)]).unwrap();
-        cursor.pages.insert(key(1), Position { after: 64, ..Position::default() });
+        cursor.pages.insert(
+            key(1),
+            Position {
+                after: 64,
+                ..Position::default()
+            },
+        );
         cursor.pages.insert(key(2), Position::default());
         cursor.round.after = Some(key(1));
         cursor.prepare("first".into(), &[key(1)]).unwrap();
@@ -170,8 +200,18 @@ mod tests {
     fn oversized_snapshot_does_not_evict_existing_progress() {
         let mut cursor = Cursor::default();
         cursor.prepare("mailbox".into(), &[key(1)]).unwrap();
-        cursor.pages.insert(key(1), Position { after: 64, ..Position::default() });
-        assert!(cursor.prepare("other".into(), &vec![key(2); MAX_TRACKED_INTENTS + 1]).is_err());
+        cursor.pages.insert(
+            key(1),
+            Position {
+                after: 64,
+                ..Position::default()
+            },
+        );
+        assert!(
+            cursor
+                .prepare("other".into(), &vec![key(2); MAX_TRACKED_INTENTS + 1])
+                .is_err()
+        );
         assert_eq!(cursor.pages[&key(1)].after, 64);
         assert_eq!(cursor.source_identity, "mailbox");
     }
@@ -181,16 +221,38 @@ mod tests {
         let mut position = Position::default();
         position.bind(71, 81, Some("aabb".into()));
         position.ceiling = Some(300);
-        position.applied(&Page { ids: vec![64], after: 64, complete: false }, 5);
+        position.applied(
+            &Page {
+                ids: vec![64],
+                after: 64,
+                complete: false,
+            },
+            5,
+        );
         position.bind(71, 81, Some("aabb".into()));
-        assert_eq!((position.after, position.ceiling, position.released), (64, Some(300), 5));
+        assert_eq!(
+            (position.after, position.ceiling, position.released),
+            (64, Some(300), 5)
+        );
         for (project, agent, generation) in [
-            (71, 81, Some("ccdd".into())), (72, 81, Some("ccdd".into())),
-            (72, 82, Some("ccdd".into())), (72, 82, None),
+            (71, 81, Some("ccdd".into())),
+            (72, 81, Some("ccdd".into())),
+            (72, 82, Some("ccdd".into())),
+            (72, 82, None),
         ] {
             position.bind(project, agent, generation);
-            assert_eq!((position.after, position.ceiling, position.released), (0, None, 0));
-            position.applied(&Page { ids: vec![90], after: 90, complete: false }, 2);
+            assert_eq!(
+                (position.after, position.ceiling, position.released),
+                (0, None, 0)
+            );
+            position.applied(
+                &Page {
+                    ids: vec![90],
+                    after: 90,
+                    complete: false,
+                },
+                2,
+            );
         }
     }
 
@@ -199,13 +261,19 @@ mod tests {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
-                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("mail.sqlite3")),
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
                 storage_root: Some(temp.path().join("archive")),
-                min_connections: 1, max_connections: 1,
+                min_connections: 1,
+                max_connections: 1,
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
             let cx = Cx::for_testing();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'pages', '/pages', 1)").unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1), (82, 71, 'GreenStone', 'test', 'test', 1, 1)").unwrap();
             for id in 1..=129 {
@@ -218,11 +286,16 @@ mod tests {
             let first = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();
             assert_eq!(first.ids, (1..=64).collect::<Vec<_>>());
             assert!(!first.complete);
-            assert_eq!(position.after, 0, "selection alone must not acknowledge a page");
+            assert_eq!(
+                position.after, 0,
+                "selection alone must not acknowledge a page"
+            );
             let repeated = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();
             assert_eq!(repeated.ids, first.ids);
             position.applied(&first, 0);
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES(500, 71, 81, 'late.rs', 1, '', 1, 1000000)").unwrap();
             drop(conn);
             let second = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();

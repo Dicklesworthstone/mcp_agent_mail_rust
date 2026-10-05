@@ -246,7 +246,10 @@ async fn apply_release(
         .ok_or_else(|| "release agent has no positive identity".to_string())?;
     // An explicit empty filter is complete without scanning any lease rows.
     if paths.as_ref().is_some_and(Vec::is_empty)
-        || intent.file_reservation_ids.as_ref().is_some_and(Vec::is_empty)
+        || intent
+            .file_reservation_ids
+            .as_ref()
+            .is_some_and(Vec::is_empty)
     {
         return Ok((0, true));
     }
@@ -264,7 +267,8 @@ async fn apply_release(
     if rows.len() > paging::PAGE_SIZE {
         return Err("release page payload exceeded its row limit".to_string());
     }
-    let ids: Vec<_> = rows.iter()
+    let ids: Vec<_> = rows
+        .iter()
         .filter(|row| row.project_id == project_id)
         .filter(|row| matches_scope(row, agent_id, intent, paths.as_deref()))
         .filter_map(|row| row.id.filter(|id| page.ids.contains(id)))
@@ -277,13 +281,26 @@ async fn apply_release(
     } else {
         db_value(
             queries::release_reservations_with_created_cutoff(
-                ctx.cx(), pool, project_id, agent_id, None, Some(&ids),
+                ctx.cx(),
+                pool,
+                project_id,
+                agent_id,
+                None,
+                Some(&ids),
                 Some(intent.created_ts),
-            ).await,
+            )
+            .await,
         )?
     };
     position.applied(&page, released.len());
-    reconcile_release_archive(ctx.cx(), pool, config, &released, &Ok(generation), archive_budget);
+    reconcile_release_archive(
+        ctx.cx(),
+        pool,
+        config,
+        &released,
+        &Ok(generation),
+        archive_budget,
+    );
     Ok((released.len(), page.complete))
 }
 
@@ -303,8 +320,10 @@ fn reconcile_release_archive(
     let generation = match captured_generation {
         Ok(Some(generation)) if !generation.is_empty() => generation.as_str(),
         Ok(_) => {
-            tracing::warn!(released = released.len(),
-                "release applied; missing generation defers archive repair without a legacy write");
+            tracing::warn!(
+                released = released.len(),
+                "release applied; missing generation defers archive repair without a legacy write"
+            );
             return 0;
         }
         Err(error) => {
@@ -328,8 +347,10 @@ fn reconcile_release_archive(
         }
     }
     if attempted < released.len() {
-        tracing::debug!(remaining = released.len() - attempted,
-            "release archive repair budget exhausted; history reconciliation retains the remaining work");
+        tracing::debug!(
+            remaining = released.len() - attempted,
+            "release archive repair budget exhausted; history reconciliation retains the remaining work"
+        );
     }
     attempted
 }
@@ -565,16 +586,9 @@ mod tests {
             );
             let intents = journal::read_queued_release_intents(&config).unwrap();
             let stop = AtomicBool::new(false);
-            let report = replay_batch(
-                &cx,
-                &pool,
-                &config,
-                &mut Cursor::default(),
-                &stop,
-                &intents,
-            )
-            .await
-            .unwrap();
+            let report = replay_batch(&cx, &pool, &config, &mut Cursor::default(), &stop, &intents)
+                .await
+                .unwrap();
             assert_eq!(
                 (
                     report.attempted,
@@ -615,31 +629,19 @@ mod tests {
             assert_eq!(artifact["path_pattern"], "src/old.rs");
             assert!(artifact["released_ts"].is_string());
             // A stale snapshot cannot act on the new lease, even on retry.
-            let repeated = replay_batch(
-                &cx,
-                &pool,
-                &config,
-                &mut Cursor::default(),
-                &stop,
-                &intents,
-            )
-            .await
-            .unwrap();
+            let repeated =
+                replay_batch(&cx, &pool, &config, &mut Cursor::default(), &stop, &intents)
+                    .await
+                    .unwrap();
             assert_eq!(repeated.rows_released, 0);
             // Explicit empty IDs and explicit empty paths must never mean all.
             for (paths, ids) in [(Some(vec![]), None), (None, Some(vec![]))] {
                 queue(&config, cutoff, paths, ids);
                 let queued = journal::read_queued_release_intents(&config).unwrap();
-                let empty = replay_batch(
-                    &cx,
-                    &pool,
-                    &config,
-                    &mut Cursor::default(),
-                    &stop,
-                    &queued,
-                )
-                .await
-                .unwrap();
+                let empty =
+                    replay_batch(&cx, &pool, &config, &mut Cursor::default(), &stop, &queued)
+                        .await
+                        .unwrap();
                 assert_eq!(empty.rows_released, 0);
                 assert_eq!(
                     journal::read_queued_release_intents(&config).unwrap(),
@@ -649,16 +651,9 @@ mod tests {
             // Unfiltered replay still applies the original transaction cutoff.
             queue(&config, cutoff, None, None);
             let queued = journal::read_queued_release_intents(&config).unwrap();
-            let all = replay_batch(
-                &cx,
-                &pool,
-                &config,
-                &mut Cursor::default(),
-                &stop,
-                &queued,
-            )
-            .await
-            .unwrap();
+            let all = replay_batch(&cx, &pool, &config, &mut Cursor::default(), &stop, &queued)
+                .await
+                .unwrap();
             assert_eq!(all.rows_released, 1); // only docs/keep.md
             let remaining = queries::get_reservations_by_ids(&cx, &pool, &[fresh_id, other_id])
                 .await
@@ -718,25 +713,41 @@ mod tests {
             selected.run_migrations = true;
             let pool = DbPool::new(&selected).unwrap();
             let cx = Cx::for_testing();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             let escaped_key = project_key.replace('\'', "''");
             conn.execute_raw(&format!("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'replay', '{escaped_key}', 1)")).unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
             drop(conn);
             let generation = fastmcp_core::block_on(queries::db_generation_id(&cx, &pool))
-                .into_result().unwrap().expect("file mailbox generation");
+                .into_result()
+                .unwrap()
+                .expect("file mailbox generation");
             test(&cx, &pool, &config, &generation, &project_key);
             mcp_agent_mail_storage::flush_async_commits();
         });
     }
 
-    fn seed_replay_lease(cx: &Cx, pool: &DbPool, id: i64, pattern: &str, created: i64) -> FileReservationRow {
+    fn seed_replay_lease(
+        cx: &Cx,
+        pool: &DbPool,
+        id: i64,
+        pattern: &str,
+        created: i64,
+    ) -> FileReservationRow {
         let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
-        let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
+        let conn = fastmcp_core::block_on(pool.acquire(cx))
+            .into_result()
+            .unwrap();
         conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, '{pattern}', 1, 'test lease', {created}, {expires}, NULL)")).unwrap();
         drop(conn);
         fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[id]))
-            .into_result().unwrap().into_iter().next().unwrap()
+            .into_result()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn queue_fixture_release(config: &Config, cutoff: i64, id: i64) {
@@ -749,16 +760,37 @@ mod tests {
         let hash = journal::hash_json_value(&record);
         record["intent_id"] = json!(&hash[..16]);
         record["content_sha256"] = json!(hash);
-        journal::append_jsonl(config, journal::RELEASE_INTENT_LOG_FILE, RELEASE_LOCK, &record).unwrap();
+        journal::append_jsonl(
+            config,
+            journal::RELEASE_INTENT_LOG_FILE,
+            RELEASE_LOCK,
+            &record,
+        )
+        .unwrap();
     }
 
-    fn replay_fixture(cx: &Cx, pool: &DbPool, config: &Config, intents: &[QueuedReleaseIntentView]) -> ReplayReport {
+    fn replay_fixture(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        intents: &[QueuedReleaseIntentView],
+    ) -> ReplayReport {
         fastmcp_core::block_on(replay_batch(
-            cx, pool, config, &mut Cursor::default(), &AtomicBool::new(false), intents,
-        )).unwrap()
+            cx,
+            pool,
+            config,
+            &mut Cursor::default(),
+            &AtomicBool::new(false),
+            intents,
+        ))
+        .unwrap()
     }
 
-    fn lease_artifact(row: &FileReservationRow, generation: &str, project_key: &str) -> serde_json::Value {
+    fn lease_artifact(
+        row: &FileReservationRow,
+        generation: &str,
+        project_key: &str,
+    ) -> serde_json::Value {
         json!({
             "id": row.id, "project": project_key, "agent": "BlueLake",
             "path_pattern": row.path_pattern, "exclusive": row.exclusive != 0,
@@ -777,27 +809,55 @@ mod tests {
             let newer = seed_replay_lease(cx, pool, 402, "src/shared.rs", cutoff + 1);
             let archive = mcp_agent_mail_storage::ensure_archive(config, "replay").unwrap();
             mcp_agent_mail_storage::write_file_reservation_record(
-                &archive, config, &lease_artifact(&newer, generation, project_key),
-            ).unwrap();
+                &archive,
+                config,
+                &lease_artifact(&newer, generation, project_key),
+            )
+            .unwrap();
             mcp_agent_mail_storage::flush_async_commits();
             let directory = archive.root.join("file_reservations");
             // sha1("src/shared.rs"), the actual reusable path written above.
             let alias = directory.join("137d3ab6a41fd6fbc01bec4392b65aa81bb8ae90.json");
-            let stable = |id| directory.join(
-                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), id),
-            );
+            let stable = |id| {
+                directory.join(
+                    mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                        Some(generation),
+                        id,
+                    ),
+                )
+            };
             let alias_before = std::fs::read(&alias).unwrap();
             let newer_before = std::fs::read(stable(402)).unwrap();
             queue_fixture_release(config, cutoff, 401);
             let intents = journal::read_queued_release_intents(config).unwrap();
             let report = replay_fixture(cx, pool, config, &intents);
-            assert_eq!((report.completed, report.rows_released, report.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
-            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401, 402]))
-                .into_result().unwrap();
-            assert!(rows.iter().find(|row| row.id == Some(401)).unwrap().released_ts.is_some());
-            assert!(rows.iter().find(|row| row.id == Some(402)).unwrap().is_active());
-            let released: serde_json::Value = serde_json::from_slice(&std::fs::read(stable(401)).unwrap()).unwrap();
+            assert_eq!(
+                (report.completed, report.rows_released, report.deferred),
+                (1, 1, 0)
+            );
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
+            );
+            let rows =
+                fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401, 402]))
+                    .into_result()
+                    .unwrap();
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == Some(401))
+                    .unwrap()
+                    .released_ts
+                    .is_some()
+            );
+            assert!(
+                rows.iter()
+                    .find(|row| row.id == Some(402))
+                    .unwrap()
+                    .is_active()
+            );
+            let released: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(stable(401)).unwrap()).unwrap();
             assert_eq!(released["db_generation"], generation);
             assert!(released["released_ts"].is_string());
             assert_eq!(std::fs::read(&alias).unwrap(), alias_before);
@@ -817,7 +877,10 @@ mod tests {
             let directory = archive.root.join("file_reservations");
             std::fs::create_dir_all(&directory).unwrap();
             let stable = directory.join(
-                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), 401),
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    Some(generation),
+                    401,
+                ),
             );
             let foreign = lease_artifact(&old, &format!("ff{generation}"), project_key);
             let before = serde_json::to_vec_pretty(&foreign).unwrap();
@@ -825,12 +888,19 @@ mod tests {
             queue_fixture_release(config, cutoff, 401);
             let intents = journal::read_queued_release_intents(config).unwrap();
             let report = replay_fixture(cx, pool, config, &intents);
-            assert_eq!((report.completed, report.rows_released, report.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(
+                (report.completed, report.rows_released, report.deferred),
+                (1, 1, 0)
+            );
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
+            );
             mcp_agent_mail_storage::flush_async_commits();
             assert_eq!(std::fs::read(&stable).unwrap(), before);
             let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
-                .into_result().unwrap();
+                .into_result()
+                .unwrap();
             assert!(rows[0].released_ts.is_some());
         });
     }
@@ -840,9 +910,18 @@ mod tests {
         with_replay_mailbox(|cx, pool, config, generation, _| {
             let cutoff = mcp_agent_mail_db::now_micros();
             seed_replay_lease(cx, pool, 401, "src/owned.rs", cutoff - 1);
-            let released = fastmcp_core::block_on(queries::release_reservations_with_created_cutoff(
-                cx, pool, 71, 81, None, Some(&[401]), Some(cutoff),
-            )).into_result().unwrap();
+            let released =
+                fastmcp_core::block_on(queries::release_reservations_with_created_cutoff(
+                    cx,
+                    pool,
+                    71,
+                    81,
+                    None,
+                    Some(&[401]),
+                    Some(cutoff),
+                ))
+                .into_result()
+                .unwrap();
             assert_eq!(released.len(), 1);
             let archive = mcp_agent_mail_storage::ensure_archive(config, "replay").unwrap();
             let directory = archive.root.join("file_reservations");
@@ -851,11 +930,28 @@ mod tests {
             let before = b"prior generation evidence must not be interpreted as a current lease";
             std::fs::write(&legacy, before).unwrap();
             let stable = directory.join(
-                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), 401),
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    Some(generation),
+                    401,
+                ),
             );
-            for unavailable in [Ok(None), Ok(Some(String::new())), Err("generation read failed".to_string())] {
+            for unavailable in [
+                Ok(None),
+                Ok(Some(String::new())),
+                Err("generation read failed".to_string()),
+            ] {
                 let mut budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
-                assert_eq!(reconcile_release_archive(cx, pool, config, &released, &unavailable, &mut budget), 0);
+                assert_eq!(
+                    reconcile_release_archive(
+                        cx,
+                        pool,
+                        config,
+                        &released,
+                        &unavailable,
+                        &mut budget
+                    ),
+                    0
+                );
                 assert_eq!(budget, MAX_ARCHIVE_REPAIRS_PER_BATCH);
                 assert_eq!(std::fs::read(&legacy).unwrap(), before);
                 assert!(!stable.exists());
@@ -880,15 +976,35 @@ mod tests {
                 }
                 let intents = journal::read_queued_release_intents(config).unwrap();
                 let report = replay_fixture(cx, pool, &selected, &intents);
-                assert_eq!((report.attempted, report.completed, report.rows_released, report.deferred), (6, 6, 6, 0));
-                assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
-                let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
-                    .into_result().unwrap();
-                assert!(rows.iter().all(|row| row.released_ts.is_some()));
-                let path = |id| archive.root.join("file_reservations").join(
-                    mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(Some(generation), id),
+                assert_eq!(
+                    (
+                        report.attempted,
+                        report.completed,
+                        report.rows_released,
+                        report.deferred
+                    ),
+                    (6, 6, 6, 0)
                 );
-                assert_eq!(ids.iter().filter(|&&id| path(id).exists()).count(), MAX_ARCHIVE_REPAIRS_PER_BATCH);
+                assert_eq!(
+                    journal::read_queued_release_intents(config).unwrap(),
+                    [] as [QueuedReleaseIntentView; 0]
+                );
+                let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                    .into_result()
+                    .unwrap();
+                assert!(rows.iter().all(|row| row.released_ts.is_some()));
+                let path = |id| {
+                    archive.root.join("file_reservations").join(
+                        mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                            Some(generation),
+                            id,
+                        ),
+                    )
+                };
+                assert_eq!(
+                    ids.iter().filter(|&&id| path(id).exists()).count(),
+                    MAX_ARCHIVE_REPAIRS_PER_BATCH
+                );
 
                 // Remaining or uncommitted rows converge from the release
                 // ledger; no captured WriteOp needs to survive this pass.
@@ -899,7 +1015,8 @@ mod tests {
                     ).unwrap();
                 }
                 for id in ids {
-                    let artifact: serde_json::Value = serde_json::from_slice(&std::fs::read(path(id)).unwrap()).unwrap();
+                    let artifact: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(path(id)).unwrap()).unwrap();
                     assert_eq!(artifact["id"], id);
                     assert_eq!(artifact["db_generation"], generation);
                     assert!(artifact["released_ts"].is_string());
@@ -908,7 +1025,13 @@ mod tests {
         }
     }
 
-    fn queue_scope(config: &Config, cutoff: i64, agent: &str, paths: Option<Vec<String>>, ids: Option<Vec<i64>>) {
+    fn queue_scope(
+        config: &Config,
+        cutoff: i64,
+        agent: &str,
+        paths: Option<Vec<String>>,
+        ids: Option<Vec<i64>>,
+    ) {
         let mut record = json!({
             "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
             "created_ts": cutoff, "project_key": "replay", "agent_name": agent,
@@ -918,12 +1041,26 @@ mod tests {
         let hash = journal::hash_json_value(&record);
         record["intent_id"] = json!(&hash[..16]);
         record["content_sha256"] = json!(hash);
-        journal::append_jsonl(config, journal::RELEASE_INTENT_LOG_FILE, RELEASE_LOCK, &record).unwrap();
+        journal::append_jsonl(
+            config,
+            journal::RELEASE_INTENT_LOG_FILE,
+            RELEASE_LOCK,
+            &record,
+        )
+        .unwrap();
     }
 
     fn page_pass(cx: &Cx, pool: &DbPool, config: &Config, cursor: &mut Cursor) -> ReplayReport {
         let intents = journal::read_queued_release_intents(config).unwrap();
-        fastmcp_core::block_on(replay_batch(cx, pool, config, cursor, &AtomicBool::new(false), &intents)).unwrap()
+        fastmcp_core::block_on(replay_batch(
+            cx,
+            pool,
+            config,
+            cursor,
+            &AtomicBool::new(false),
+            &intents,
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -936,17 +1073,28 @@ mod tests {
             queue_scope(config, cutoff, "BlueLake", None, None);
             let mut cursor = Cursor::default();
             let first = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((first.rows_released, first.completed, first.deferred), (64, 0, 0));
+            assert_eq!(
+                (first.rows_released, first.completed, first.deferred),
+                (64, 0, 0)
+            );
             assert!(first.more);
             let original = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1]))
-                .into_result().unwrap()[0].released_ts;
+                .into_result()
+                .unwrap()[0]
+                .released_ts;
             assert!(original.is_some());
             let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
             let before = std::fs::read(&log).unwrap();
             let queued = journal::read_queued_release_intents(config).unwrap();
             let stopped = fastmcp_core::block_on(replay_batch(
-                cx, pool, config, &mut cursor, &AtomicBool::new(true), &queued,
-            )).unwrap();
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(true),
+                &queued,
+            ))
+            .unwrap();
             assert!(stopped.interrupted);
             assert_eq!(stopped.attempted, 0);
             assert_eq!(std::fs::read(&log).unwrap(), before);
@@ -955,14 +1103,30 @@ mod tests {
             let mut restarted = Cursor::default();
             for (released, completed) in [(0, 0), (64, 0), (1, 1)] {
                 let report = page_pass(cx, pool, config, &mut restarted);
-                assert_eq!((report.rows_released, report.completed, report.deferred), (released, completed, 0));
-                assert_eq!(journal::read_queued_release_intents(config).unwrap().is_empty(), completed == 1);
+                assert_eq!(
+                    (report.rows_released, report.completed, report.deferred),
+                    (released, completed, 0)
+                );
+                assert_eq!(
+                    journal::read_queued_release_intents(config)
+                        .unwrap()
+                        .is_empty(),
+                    completed == 1
+                );
             }
             let ids: Vec<_> = (1..=129).collect();
-            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids)).into_result().unwrap();
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                .into_result()
+                .unwrap();
             assert_eq!(rows.len(), 129);
             assert!(rows.iter().all(|row| row.released_ts.is_some()));
-            assert_eq!(rows.iter().find(|row| row.id == Some(1)).unwrap().released_ts, original);
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.id == Some(1))
+                    .unwrap()
+                    .released_ts,
+                original
+            );
         });
     }
 
@@ -975,17 +1139,33 @@ mod tests {
             }
             seed_replay_lease(cx, pool, 129, "src/selected.rs", cutoff - 1);
             seed_replay_lease(cx, pool, 130, "src/future.rs", cutoff + 1);
-            queue_scope(config, cutoff, "BlueLake", Some(vec!["src/*.rs".into()]), Some(vec![129, 130]));
+            queue_scope(
+                config,
+                cutoff,
+                "BlueLake",
+                Some(vec!["src/*.rs".into()]),
+                Some(vec![129, 130]),
+            );
             let mut cursor = Cursor::default();
             for _ in 0..2 {
                 let report = page_pass(cx, pool, config, &mut cursor);
-                assert_eq!((report.applied, report.rows_released, report.completed, report.deferred), (1, 0, 0, 0));
+                assert_eq!(
+                    (
+                        report.applied,
+                        report.rows_released,
+                        report.completed,
+                        report.deferred
+                    ),
+                    (1, 0, 0, 0)
+                );
                 assert!(report.more);
             }
             let last = page_pass(cx, pool, config, &mut cursor);
             assert_eq!((last.rows_released, last.completed), (1, 1));
             let ids: Vec<_> = (1..=130).collect();
-            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids)).into_result().unwrap();
+            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                .into_result()
+                .unwrap();
             for row in rows {
                 assert_eq!(row.released_ts.is_some(), row.id == Some(129));
             }
@@ -999,21 +1179,40 @@ mod tests {
             for id in 1..=65 {
                 seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
             }
-            let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(cx))
+                .into_result()
+                .unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 71, 'GreenStone', 'test', 'test', 1, 1)").unwrap();
-            conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES(501, 71, 82, 'small.rs', 1, '', 1, {})", cutoff + 1000000)).unwrap();
+            conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES(501, 71, 82, 'small.rs', 1, '', 1, {})", cutoff + 1_000_000)).unwrap();
             drop(conn);
             queue_scope(config, cutoff, "BlueLake", None, None);
             queue_scope(config, cutoff, "GreenStone", None, Some(vec![501]));
-            queue_scope(config, cutoff - 1, "BlueLake", Some(vec!["../escape".into()]), None);
+            queue_scope(
+                config,
+                cutoff - 1,
+                "BlueLake",
+                Some(vec!["../escape".into()]),
+                None,
+            );
             let mut cursor = Cursor::default();
             let first = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((first.attempted, first.completed, first.deferred, first.rows_released), (3, 1, 1, 65));
+            assert_eq!(
+                (
+                    first.attempted,
+                    first.completed,
+                    first.deferred,
+                    first.rows_released
+                ),
+                (3, 1, 1, 65)
+            );
             let queued = journal::read_queued_release_intents(config).unwrap();
             assert_eq!(queued.len(), 2);
             assert!(queued.iter().all(|intent| intent.agent_name == "BlueLake"));
             let second = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((second.completed, second.deferred, second.rows_released), (1, 1, 1));
+            assert_eq!(
+                (second.completed, second.deferred, second.rows_released),
+                (1, 1, 1)
+            );
             let queued = journal::read_queued_release_intents(config).unwrap();
             assert_eq!(queued.len(), 1);
             assert_eq!(queued[0].paths, Some(vec!["../escape".to_string()]));
@@ -1034,13 +1233,27 @@ mod tests {
             let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
             let before = std::fs::read(&log).unwrap();
             let queued = journal::read_queued_release_intents(config).unwrap();
-            assert!(fastmcp_core::block_on(replay_batch(
-                cx, &readonly, config, &mut cursor, &AtomicBool::new(false), &queued,
-            )).is_err());
+            assert!(
+                fastmcp_core::block_on(replay_batch(
+                    cx,
+                    &readonly,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                    &queued,
+                ))
+                .is_err()
+            );
             assert_eq!(std::fs::read(&log).unwrap(), before);
             let resumed = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(
+                (resumed.rows_released, resumed.completed, resumed.deferred),
+                (1, 1, 0)
+            );
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
+            );
         });
     }
 }

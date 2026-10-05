@@ -1486,11 +1486,25 @@ mod tests {
         ] {
             let mut lane = ScanLane::new(journal_scan::Kind::Release);
             lane.next_scan = Some(now + POLL_INTERVAL);
-            lane.replay_finished(&ReplayReport {
-                applied, completed, more, deferred, interrupted,
-                ..ReplayReport::default()
-            }, now);
-            assert_eq!(lane.next_delay(now), if fast { CATCH_UP_INTERVAL } else { POLL_INTERVAL });
+            lane.replay_finished(
+                &ReplayReport {
+                    applied,
+                    completed,
+                    deferred,
+                    more,
+                    interrupted,
+                    ..ReplayReport::default()
+                },
+                now,
+            );
+            assert_eq!(
+                lane.next_delay(now),
+                if fast {
+                    CATCH_UP_INTERVAL
+                } else {
+                    POLL_INTERVAL
+                }
+            );
         }
     }
 }
