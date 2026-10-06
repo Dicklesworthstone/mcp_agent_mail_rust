@@ -1195,9 +1195,15 @@ mod tests {
                     assert!(report.more);
                 }
                 let last = page_pass(cx, pool, config, &mut cursor);
-                assert_eq!((last.rows_released, last.completed, last.deferred), (1, 1, 0));
+                assert_eq!(
+                    (last.rows_released, last.completed, last.deferred),
+                    (1, 1, 0)
+                );
                 assert!(!last.more);
-                assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+                assert_eq!(
+                    journal::read_queued_release_intents(config).unwrap(),
+                    [] as [QueuedReleaseIntentView; 0]
+                );
                 let ids: Vec<_> = (1..=130).collect();
                 let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
                     .into_result()

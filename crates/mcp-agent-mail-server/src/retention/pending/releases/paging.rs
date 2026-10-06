@@ -333,14 +333,16 @@ mod tests {
             drop(conn);
             let mut position = Position::default();
             position.bind(71, 81, None);
-            let first = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
+            let first =
+                fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(first.ids, (1..=64).collect::<Vec<_>>());
             assert!(!first.complete);
             assert_eq!(
                 position.after, 0,
                 "selection alone must not acknowledge a page"
             );
-            let repeated = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
+            let repeated =
+                fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(repeated.ids, first.ids);
             position.applied(&first, 0);
             let conn = fastmcp_core::block_on(pool.acquire(&cx))
@@ -348,7 +350,8 @@ mod tests {
                 .unwrap();
             conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES(500, 71, 81, 'late.rs', 1, '', 1, 1000000)").unwrap();
             drop(conn);
-            let second = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
+            let second =
+                fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(second.ids, (65..=128).collect::<Vec<_>>());
             position.applied(&second, 0);
             let last = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
@@ -452,7 +455,8 @@ mod tests {
             conn.execute_raw(&format!(
                 "INSERT INTO projects(id, slug, human_key, created_at) \
                  VALUES(71, 'id-pages', '{project_key}', 1), (72, 'foreign', '/foreign', 1)"
-            )).unwrap();
+            ))
+            .unwrap();
             conn.execute_raw(
                 "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) \
                  VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1), \
@@ -511,14 +515,16 @@ mod tests {
                     "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
                      \"exclusive\", reason, created_ts, expires_ts, released_ts) \
                      VALUES({id}, 71, 81, 'history/{id}.rs', 1, '', 1, 9000000, 2)"
-                )).unwrap();
+                ))
+                .unwrap();
             }
             let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
             conn.execute_raw(&format!(
                 "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
                  \"exclusive\", reason, created_ts, expires_ts) \
                  VALUES(900, 71, 81, 'src/target.rs', 1, '', 1, {future})"
-            )).unwrap();
+            ))
+            .unwrap();
             drop(conn);
             queue_requested_ids(config, &[900, 900], serde_json::Value::Null);
             let report = replay_requested_ids(cx, pool, config, &mut Cursor::default());
@@ -528,10 +534,17 @@ mod tests {
             );
             assert_eq!(report.deferred, 0);
             assert!(!report.more);
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
-            let rows = block_on(queries::get_reservations_by_ids(cx, pool, &[1, 64, 129, 900]))
-                .into_result()
-                .unwrap();
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [journal::QueuedReleaseIntentView; 0]
+            );
+            let rows = block_on(queries::get_reservations_by_ids(
+                cx,
+                pool,
+                &[1, 64, 129, 900],
+            ))
+            .into_result()
+            .unwrap();
             assert_eq!(rows.len(), 4);
             for row in rows {
                 if row.id == Some(900) {
@@ -556,7 +569,8 @@ mod tests {
                  (3, 71, 81, 'src/future.rs', 1, '', 11, {future}), \
                  (4, 71, 81, 'docs/keep.md', 1, '', 1, {future}), \
                  (65, 71, 81, 'src/target.rs', 1, '', 1, {future})"
-            )).unwrap();
+            ))
+            .unwrap();
             drop(conn);
             let mut requested: Vec<_> = (1..=65).rev().collect();
             requested.extend([0, -1, 1, 500]);
@@ -564,18 +578,30 @@ mod tests {
             let mut cursor = Cursor::default();
             let first = replay_requested_ids(cx, pool, config, &mut cursor);
             assert_eq!(
-                (first.applied, first.completed, first.rows_released, first.deferred),
+                (
+                    first.applied,
+                    first.completed,
+                    first.rows_released,
+                    first.deferred
+                ),
                 (1, 0, 0, 0)
             );
-            assert!(first.more, "an empty matching page is not an empty remaining request");
-            assert_eq!(journal::read_queued_release_intents(config).unwrap().len(), 1);
+            assert!(
+                first.more,
+                "an empty matching page is not an empty remaining request"
+            );
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap().len(),
+                1
+            );
             let conn = block_on(pool.acquire(cx)).into_result().unwrap();
             // Even a backdated new arrival cannot extend the frozen ID window.
             conn.execute_raw(&format!(
                 "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
                  \"exclusive\", reason, created_ts, expires_ts) \
                  VALUES(500, 71, 81, 'src/late.rs', 1, '', 1, {future})"
-            )).unwrap();
+            ))
+            .unwrap();
             drop(conn);
             let second = replay_requested_ids(cx, pool, config, &mut cursor);
             assert_eq!(
@@ -583,10 +609,17 @@ mod tests {
                 (1, 1, 0)
             );
             assert!(!second.more);
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
-            let rows = block_on(queries::get_reservations_by_ids(cx, pool, &[1, 2, 3, 4, 65, 500]))
-                .into_result()
-                .unwrap();
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [journal::QueuedReleaseIntentView; 0]
+            );
+            let rows = block_on(queries::get_reservations_by_ids(
+                cx,
+                pool,
+                &[1, 2, 3, 4, 65, 500],
+            ))
+            .into_result()
+            .unwrap();
             assert_eq!(rows.len(), 6);
             for row in rows {
                 assert_eq!(row.released_ts.is_some_and(|ts| ts > 0), row.id == Some(65));
