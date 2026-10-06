@@ -96,11 +96,15 @@ fn source_error(error: impl std::fmt::Display) -> String {
 /// deliberately included: the typed query owns release-ledger interpretation,
 /// and advancing by selected IDs also makes sparse path filters progress.
 /// The frozen upper ID prevents new arrivals from extending an existing scan.
+/// Explicit-ID intents page over their requested IDs instead of the owner's
+/// entire reservation history. Those IDs are candidates, not authorization:
+/// the caller must still enforce project, owner, path and creation cutoff.
 pub(super) async fn select(
     cx: &Cx,
     pool: &DbPool,
     cutoff: i64,
     position: &mut Position,
+    requested_ids: Option<&[i64]>,
 ) -> Result<Page, String> {
     cx.checkpoint()
         .map_err(|_| "release page selection cancelled".to_string())?;
@@ -132,6 +136,12 @@ pub(super) async fn select(
         position.ceiling = Some(ceiling.max(0));
     }
     let ceiling = position.ceiling.unwrap_or(0);
+    if let Some(requested) = requested_ids {
+        // Payload lookup and mutation already use page-bounded primary keys.
+        // Do not walk unrelated historical leases just to find those keys.
+        drop(conn);
+        return requested_page(cx, requested, position.after, ceiling);
+    }
     let rows = conn
         .query_sync(
             "SELECT id FROM file_reservations WHERE project_id = ? AND agent_id = ? \
@@ -166,9 +176,49 @@ pub(super) async fn select(
     })
 }
 
+/// Keep only the next page and one lookahead ID, not a sorted copy of a
+/// potentially large request. Advance by requested IDs even when their rows
+/// are absent or fail authorization, otherwise sparse requests can stall or
+/// appear complete before later requested IDs have been examined.
+fn requested_page(cx: &Cx, requested: &[i64], after: i64, ceiling: i64) -> Result<Page, String> {
+    let mut selected = BTreeSet::new();
+    for chunk in requested.chunks(1024) {
+        cx.checkpoint()
+            .map_err(|_| "release ID page selection cancelled".to_string())?;
+        for &id in chunk {
+            if id <= 0 || id <= after || id > ceiling || selected.contains(&id) {
+                continue;
+            }
+            if selected.len() == PAGE_SIZE + 1 {
+                if selected.last().is_some_and(|last| id >= *last) {
+                    continue;
+                }
+                // Remove before insertion to retain at most 65 IDs, including
+                // lookahead. Duplicates must not evict an existing candidate.
+                let _ = selected.pop_last();
+            }
+            selected.insert(id);
+        }
+    }
+    let complete = selected.len() <= PAGE_SIZE;
+    if !complete {
+        let _ = selected.pop_last();
+    }
+    Ok(Page {
+        after: selected.last().copied().unwrap_or(after),
+        ids: selected.into_iter().collect(),
+        complete,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_core::block_on;
+    use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_db::queries;
+    use mcp_agent_mail_tools::degraded_intents as journal;
+    use std::sync::atomic::AtomicBool;
 
     fn key(id: i64) -> IntentKey {
         (id, format!("{id:064x}"))
@@ -283,14 +333,14 @@ mod tests {
             drop(conn);
             let mut position = Position::default();
             position.bind(71, 81, None);
-            let first = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();
+            let first = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(first.ids, (1..=64).collect::<Vec<_>>());
             assert!(!first.complete);
             assert_eq!(
                 position.after, 0,
                 "selection alone must not acknowledge a page"
             );
-            let repeated = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();
+            let repeated = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(repeated.ids, first.ids);
             position.applied(&first, 0);
             let conn = fastmcp_core::block_on(pool.acquire(&cx))
@@ -298,13 +348,249 @@ mod tests {
                 .unwrap();
             conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES(500, 71, 81, 'late.rs', 1, '', 1, 1000000)").unwrap();
             drop(conn);
-            let second = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();
+            let second = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(second.ids, (65..=128).collect::<Vec<_>>());
             position.applied(&second, 0);
-            let last = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position)).unwrap();
+            let last = fastmcp_core::block_on(select(&cx, &pool, 10, &mut position, None)).unwrap();
             assert_eq!(last.ids, vec![129]);
             assert!(last.complete);
             assert_eq!(position.ceiling, Some(201));
+        });
+    }
+
+    #[test]
+    fn requested_id_pages_are_sorted_unique_and_bounded_without_skipping_duplicates() {
+        let cx = Cx::for_testing();
+        let mut requested: Vec<_> = (1..=129).rev().collect();
+        requested.extend((1..=129).rev());
+        requested.extend([0, -1, i64::MIN, i64::MAX, 500]);
+        let mut after = 0;
+        for (expected, complete) in [
+            ((1..=64).collect::<Vec<_>>(), false),
+            ((65..=128).collect(), false),
+            (vec![129], true),
+        ] {
+            let page = requested_page(&cx, &requested, after, 129).unwrap();
+            assert_eq!(page.ids, expected);
+            assert_eq!(page.complete, complete);
+            assert!(page.ids.len() <= PAGE_SIZE);
+            let retry = requested_page(&cx, &requested, after, 129).unwrap();
+            assert_eq!(retry.ids, page.ids, "selection alone cannot consume IDs");
+            after = page.after;
+        }
+        let finished = requested_page(&cx, &requested, after, 129).unwrap();
+        assert!(finished.ids.is_empty() && finished.complete);
+        assert_eq!(finished.after, 129);
+    }
+
+    #[test]
+    fn requested_id_page_completion_uses_unique_lookahead_not_raw_request_length() {
+        let cx = Cx::for_testing();
+        for count in [0, 1, 63, 64, 65] {
+            let requested: Vec<i64> = (1..=count)
+                .rev()
+                .cycle()
+                .take(count * 4)
+                .map(|id| i64::try_from(id).unwrap())
+                .collect();
+            let page = requested_page(&cx, &requested, 0, 100).unwrap();
+            assert_eq!(page.ids.len(), count.min(PAGE_SIZE));
+            assert_eq!(page.complete, count <= PAGE_SIZE);
+        }
+        let empty = requested_page(&cx, &[0, -1, 64, 500], 64, 129).unwrap();
+        assert!(empty.ids.is_empty() && empty.complete);
+        assert_eq!(empty.after, 64);
+    }
+
+    #[test]
+    fn requested_id_pages_match_a_full_sort_oracle_across_request_orderings() {
+        let cx = Cx::for_testing();
+        for multiplier in [1, 3, 5, 17, 129, 255] {
+            let requested: Vec<i64> = (0..512)
+                .map(|index| (index * multiplier) % 257 - 20)
+                .collect();
+            for after in [0, 1, 63, 64, 128, 200] {
+                let expected: BTreeSet<_> = requested
+                    .iter()
+                    .copied()
+                    .filter(|id| *id > 0 && *id > after && *id <= 220)
+                    .collect();
+                let page = requested_page(&cx, &requested, after, 220).unwrap();
+                assert_eq!(page.complete, expected.len() <= PAGE_SIZE);
+                assert_eq!(
+                    page.ids,
+                    expected.into_iter().take(PAGE_SIZE).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    fn with_id_replay_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config)) {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let config = Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
+                storage_root: temp.path().join("archive"),
+                ..Default::default()
+            };
+            std::fs::create_dir_all(&config.storage_root).unwrap();
+            let project = temp.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let cx = Cx::for_testing();
+            let conn = block_on(pool.acquire(&cx)).into_result().unwrap();
+            let project_key = project.to_string_lossy().replace('\'', "''");
+            conn.execute_raw(&format!(
+                "INSERT INTO projects(id, slug, human_key, created_at) \
+                 VALUES(71, 'id-pages', '{project_key}', 1), (72, 'foreign', '/foreign', 1)"
+            )).unwrap();
+            conn.execute_raw(
+                "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) \
+                 VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1), \
+                 (82, 71, 'GreenStone', 'test', 'test', 1, 1), \
+                 (83, 72, 'BlueLake', 'test', 'test', 1, 1)"
+            ).unwrap();
+            drop(conn);
+            test(&cx, &pool, &config);
+            mcp_agent_mail_storage::flush_async_commits();
+        });
+    }
+
+    fn queue_requested_ids(config: &Config, ids: &[i64], paths: serde_json::Value) {
+        let mut record = serde_json::json!({
+            "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
+            "created_ts": 10, "project_key": "id-pages", "agent_name": "BlueLake",
+            "paths": paths, "file_reservation_ids": ids,
+            "failure": {"stage": "test", "error_detail": "database unavailable"},
+        });
+        let hash = journal::hash_json_value(&record);
+        record["intent_id"] = serde_json::json!(&hash[..16]);
+        record["content_sha256"] = serde_json::json!(hash);
+        journal::append_jsonl(
+            config,
+            journal::RELEASE_INTENT_LOG_FILE,
+            super::super::RELEASE_LOCK,
+            &record,
+        )
+        .unwrap();
+    }
+
+    fn replay_requested_ids(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        cursor: &mut Cursor,
+    ) -> super::super::super::ReplayReport {
+        let intents = journal::read_queued_release_intents(config).unwrap();
+        block_on(super::super::replay_batch(
+            cx,
+            pool,
+            config,
+            cursor,
+            &AtomicBool::new(false),
+            &intents,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_release_reaches_its_lease_without_scanning_older_history() {
+        with_id_replay_mailbox(|cx, pool, config| {
+            let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+            for id in 1..=129 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+                     \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+                     VALUES({id}, 71, 81, 'history/{id}.rs', 1, '', 1, 9000000, 2)"
+                )).unwrap();
+            }
+            let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+                 \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES(900, 71, 81, 'src/target.rs', 1, '', 1, {future})"
+            )).unwrap();
+            drop(conn);
+            queue_requested_ids(config, &[900, 900], serde_json::Value::Null);
+            let report = replay_requested_ids(cx, pool, config, &mut Cursor::default());
+            assert_eq!(
+                (report.attempted, report.completed, report.rows_released),
+                (1, 1, 1)
+            );
+            assert_eq!(report.deferred, 0);
+            assert!(!report.more);
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            let rows = block_on(queries::get_reservations_by_ids(cx, pool, &[1, 64, 129, 900]))
+                .into_result()
+                .unwrap();
+            assert_eq!(rows.len(), 4);
+            for row in rows {
+                if row.id == Some(900) {
+                    assert!(row.released_ts.is_some_and(|ts| ts > 2));
+                } else {
+                    assert_eq!(row.released_ts, Some(2), "history was not replayed");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn sparse_requested_pages_keep_scope_and_finish_only_after_the_last_candidate() {
+        with_id_replay_mailbox(|cx, pool, config| {
+            let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+            let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+                 \"exclusive\", reason, created_ts, expires_ts) VALUES \
+                 (1, 71, 82, 'src/owner.rs', 1, '', 1, {future}), \
+                 (2, 72, 83, 'src/project.rs', 1, '', 1, {future}), \
+                 (3, 71, 81, 'src/future.rs', 1, '', 11, {future}), \
+                 (4, 71, 81, 'docs/keep.md', 1, '', 1, {future}), \
+                 (65, 71, 81, 'src/target.rs', 1, '', 1, {future})"
+            )).unwrap();
+            drop(conn);
+            let mut requested: Vec<_> = (1..=65).rev().collect();
+            requested.extend([0, -1, 1, 500]);
+            queue_requested_ids(config, &requested, serde_json::json!(["src/*.rs"]));
+            let mut cursor = Cursor::default();
+            let first = replay_requested_ids(cx, pool, config, &mut cursor);
+            assert_eq!(
+                (first.applied, first.completed, first.rows_released, first.deferred),
+                (1, 0, 0, 0)
+            );
+            assert!(first.more, "an empty matching page is not an empty remaining request");
+            assert_eq!(journal::read_queued_release_intents(config).unwrap().len(), 1);
+            let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+            // Even a backdated new arrival cannot extend the frozen ID window.
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \
+                 \"exclusive\", reason, created_ts, expires_ts) \
+                 VALUES(500, 71, 81, 'src/late.rs', 1, '', 1, {future})"
+            )).unwrap();
+            drop(conn);
+            let second = replay_requested_ids(cx, pool, config, &mut cursor);
+            assert_eq!(
+                (second.completed, second.rows_released, second.deferred),
+                (1, 1, 0)
+            );
+            assert!(!second.more);
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            let rows = block_on(queries::get_reservations_by_ids(cx, pool, &[1, 2, 3, 4, 65, 500]))
+                .into_result()
+                .unwrap();
+            assert_eq!(rows.len(), 6);
+            for row in rows {
+                assert_eq!(row.released_ts.is_some_and(|ts| ts > 0), row.id == Some(65));
+            }
         });
     }
 }

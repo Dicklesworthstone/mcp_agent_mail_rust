@@ -258,7 +258,14 @@ async fn apply_release(
     // restarts the finite scan rather than carrying a numeric cursor across it.
     let generation = db_value(queries::db_generation_id(ctx.cx(), pool).await)?;
     position.bind(project_id, agent_id, generation.clone());
-    let page = paging::select(ctx.cx(), pool, intent.created_ts, position).await?;
+    let page = paging::select(
+        ctx.cx(),
+        pool,
+        intent.created_ts,
+        position,
+        intent.file_reservation_ids.as_deref(),
+    )
+    .await?;
     let rows = if page.ids.is_empty() {
         Vec::new()
     } else {
@@ -1155,44 +1162,52 @@ mod tests {
 
     #[test]
     fn sparse_paths_advance_without_releasing_unmatched_or_future_leases() {
-        with_replay_mailbox(|cx, pool, config, _, _| {
-            let cutoff = mcp_agent_mail_db::now_micros();
-            for id in 1..=128 {
-                seed_replay_lease(cx, pool, id, &format!("docs/{id}.md"), cutoff - 1);
-            }
-            seed_replay_lease(cx, pool, 129, "src/selected.rs", cutoff - 1);
-            seed_replay_lease(cx, pool, 130, "src/future.rs", cutoff + 1);
-            queue_scope(
-                config,
-                cutoff,
-                "BlueLake",
-                Some(vec!["src/*.rs".into()]),
-                Some(vec![129, 130]),
-            );
-            let mut cursor = Cursor::default();
-            for _ in 0..2 {
-                let report = page_pass(cx, pool, config, &mut cursor);
-                assert_eq!(
-                    (
-                        report.applied,
-                        report.rows_released,
-                        report.completed,
-                        report.deferred
-                    ),
-                    (1, 0, 0, 0)
+        for explicit_ids in [false, true] {
+            with_replay_mailbox(|cx, pool, config, _, _| {
+                let cutoff = mcp_agent_mail_db::now_micros();
+                for id in 1..=128 {
+                    seed_replay_lease(cx, pool, id, &format!("docs/{id}.md"), cutoff - 1);
+                }
+                seed_replay_lease(cx, pool, 129, "src/selected.rs", cutoff - 1);
+                seed_replay_lease(cx, pool, 130, "src/future.rs", cutoff + 1);
+                queue_scope(
+                    config,
+                    cutoff,
+                    "BlueLake",
+                    Some(vec!["src/*.rs".into()]),
+                    explicit_ids.then(|| vec![129, 130]),
                 );
-                assert!(report.more);
-            }
-            let last = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((last.rows_released, last.completed), (1, 1));
-            let ids: Vec<_> = (1..=130).collect();
-            let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
-                .into_result()
-                .unwrap();
-            for row in rows {
-                assert_eq!(row.released_ts.is_some(), row.id == Some(129));
-            }
-        });
+                let mut cursor = Cursor::default();
+                // A path-only request still walks bounded sparse pages. An
+                // explicit-ID intersection must not walk unrelated history.
+                let empty_pages = if explicit_ids { 0 } else { 2 };
+                for _ in 0..empty_pages {
+                    let report = page_pass(cx, pool, config, &mut cursor);
+                    assert_eq!(
+                        (
+                            report.applied,
+                            report.rows_released,
+                            report.completed,
+                            report.deferred
+                        ),
+                        (1, 0, 0, 0)
+                    );
+                    assert!(report.more);
+                }
+                let last = page_pass(cx, pool, config, &mut cursor);
+                assert_eq!((last.rows_released, last.completed, last.deferred), (1, 1, 0));
+                assert!(!last.more);
+                assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+                let ids: Vec<_> = (1..=130).collect();
+                let rows = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                    .into_result()
+                    .unwrap();
+                assert_eq!(rows.len(), 130);
+                for row in rows {
+                    assert_eq!(row.released_ts.is_some(), row.id == Some(129));
+                }
+            });
+        }
     }
 
     #[test]
