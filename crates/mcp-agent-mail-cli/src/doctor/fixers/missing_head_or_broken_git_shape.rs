@@ -5,11 +5,13 @@
 //!
 //! ## What's broken
 //!
-//! Each `<storage_root>/projects/<slug>/.git/` archive must
+//! The shared `<storage_root>/.git/` archive and any legacy
+//! `<storage_root>/projects/<slug>/.git/` archives must
 //! have a valid `HEAD` file that either:
 //! - Points to a SHA directly (detached HEAD), OR
 //! - Contains `ref: refs/heads/<branch>` AND the target ref
-//!   resolves via a loose ref file OR `packed-refs`.
+//!   resolves via a loose ref file OR `packed-refs` (or is the
+//!   unborn branch of a newly initialized repository).
 //!
 //! If HEAD is missing, empty, unreadable, a symlink, or points
 //! at a dangling ref, the project's git archive can't be opened
@@ -18,7 +20,7 @@
 //!
 //! ## Detection
 //!
-//! For each `archive_root` (a project dir):
+//! For the shared storage root and each legacy project archive:
 //! 1. If `.git/` doesn't exist, skip (sibling FM territory).
 //! 2. lstat `.git/HEAD`:
 //!    - Symlink → `HeadIsSymlink` (rejected for security).
@@ -32,17 +34,17 @@
 //!
 //! ## Fix
 //!
-//! **Detect-only.** Rebuilding a broken `.git` archive needs
-//! `am doctor reconstruct` (an explicit opt-in command per the
-//! repair_spec). The doctor FM surfaces the broken project
-//! list; operators run reconstruct on each.
+//! **Detect-only.** Preserve the archive and database before investigating
+//! Git refs, reflogs and backups. Restoring HEAD requires an authoritative
+//! branch or commit; never guess it. `am doctor reconstruct` rebuilds the
+//! database FROM the archive and cannot repair missing Git history.
 
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
 use serde::Serialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-archive-state-files-missing-head-or-broken-git-shape";
 const FM_SEVERITY: &str = "P0";
@@ -100,7 +102,7 @@ pub struct MissingHeadOrBrokenGitShapeFinding {
 impl MissingHeadOrBrokenGitShapeFinding {
     pub fn to_finding(&self) -> super::Finding {
         let title = format!(
-            "{} project archive(s) have broken .git shape (missing / empty / symlinked / dangling HEAD, or HEAD pointing at a missing object)",
+            "{} Git archive(s) have broken .git shape (missing / empty / symlinked / dangling HEAD, or HEAD pointing at a missing object)",
             self.broken.len(),
         );
         super::Finding {
@@ -114,13 +116,14 @@ impl MissingHeadOrBrokenGitShapeFinding {
                 "count": self.broken.len(),
                 "manual_remediation": {
                     "steps": [
-                        "For each broken repo: run `am doctor reconstruct --project <repo_path>` to rebuild the archive from the SQLite mirror.",
-                        "Reconstruct refuses by default; pass `--yes` after backing up the broken repo.",
-                        "After reconstruct, re-run `am doctor fix --only fm-archive-state-files-missing-head-or-broken-git-shape --list` to confirm.",
+                        "Run `am doctor locks --json` and use the reported supervisor protocol to drain the mailbox before any repair.",
+                        "Preserve the entire archive, including .git, and the SQLite database with its sidecars before changing either authority.",
+                        "Inspect refs, reflogs and backups to identify the authoritative branch or commit. Restore a known HEAD or repository backup reversibly; do not guess HEAD or reinitialize over existing history.",
+                        "After recovery, re-run `am doctor fix --only fm-archive-state-files-missing-head-or-broken-git-shape --list --json` and verify that new mail reaches its canonical Markdown archive.",
                     ],
-                    "warning": "A symlinked HEAD is a SECURITY signal (attacker may be aliasing HEAD at an arbitrary file). Investigate the symlink target before reconstructing.",
+                    "warning": "A symlinked HEAD is a SECURITY signal (attacker may be aliasing HEAD at an arbitrary file). Investigate it before repair. `am doctor reconstruct` rebuilds SQLite FROM the archive; do not use an empty or incomplete archive to recover a healthy database.",
                     "note": "Auto-fix via Op::WriteFile is intentionally not implemented — repairing a broken git shape needs operator judgment about which branch HEAD should point at.",
-                    "head_points_to_missing_object": "This variant ('fatal: bad object HEAD' after an interrupted gc/repack) self-heals: the commit coalescer re-roots onto the intact working tree on the next archive write (br-bvq1x.9.7). If new mail is not committing, run `am doctor reconstruct --project <repo_path>`.",
+                    "head_points_to_missing_object": "The commit coalescer can recover this variant from an intact working tree (br-bvq1x.9.7). Preserve available history and inspect the refs and object store before manual recovery.",
                 },
             }),
             remediation: FindingRemediation {
@@ -136,13 +139,19 @@ impl MissingHeadOrBrokenGitShapeFinding {
 /// Detector. Read-only: file-level HEAD/ref inspection, plus (when the repo
 /// opens) a read-only git2 probe that the HEAD tip object actually loads.
 ///
-/// `project_dirs` is typically `inputs.archive_roots` — each
-/// entry is a `<storage_root>/projects/<slug>/` directory. The
-/// detector skips entries without a `.git/` subdir (sibling
-/// FM territory).
-pub fn detect(project_dirs: &[PathBuf]) -> Vec<MissingHeadOrBrokenGitShapeFinding> {
+/// Scan the shared root even when no project directories exist yet. Legacy
+/// project repositories remain supported; entries without `.git/` are skipped.
+pub fn detect(
+    project_dirs: &[PathBuf],
+    storage_root: Option<&Path>,
+) -> Vec<MissingHeadOrBrokenGitShapeFinding> {
     let mut broken: Vec<BrokenShape> = Vec::new();
-    for repo_path in project_dirs {
+    for repo_path in storage_root.into_iter().chain(
+        project_dirs
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|path| Some(*path) != storage_root),
+    ) {
         let git_dir = repo_path.join(".git");
         if !git_dir.is_dir() {
             continue;
@@ -209,6 +218,19 @@ fn inspect_head(git_dir: &std::path::Path, repo_path: &std::path::Path) -> Optio
                 })
                 .unwrap_or(false);
         if !resolved_loose && !resolved_packed {
+            // `git init` creates HEAD before the first branch ref. A real
+            // empty repository is valid; a dangling HEAD alongside existing
+            // refs still needs operator investigation.
+            if let Ok(repo) = git2::Repository::open(repo_path)
+                && repo
+                    .head()
+                    .is_err_and(|error| error.code() == git2::ErrorCode::UnbornBranch)
+                && repo
+                    .references()
+                    .is_ok_and(|mut refs| refs.next().is_none())
+            {
+                return None;
+            }
             return Some(BrokenShape::HeadDanglingRef {
                 repo_path: repo_path.to_path_buf(),
                 target_ref: target_ref.to_string(),
@@ -268,7 +290,7 @@ mod tests {
     fn detector_skips_healthy_repos() {
         let td = TempDir::new().unwrap();
         let repo = make_healthy_repo(&td, "a");
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert!(
             findings.is_empty(),
             "healthy HEAD must not produce a finding"
@@ -282,7 +304,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let repo = td.path().join("a");
         fs::create_dir_all(&repo).unwrap();
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert!(findings.is_empty());
     }
 
@@ -299,13 +321,49 @@ mod tests {
             "deadbeefcafebabe1234567890abcdef00000000\n",
         )
         .unwrap();
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn detector_skips_empty_input() {
-        assert!(detect(&[]).is_empty());
+        assert!(detect(&[], None).is_empty());
+    }
+
+    #[test]
+    fn detector_checks_shared_root_before_any_project_exists() {
+        let td = TempDir::new().unwrap();
+        fs::create_dir(td.path().join(".git")).unwrap();
+        let findings = detect(&[], Some(td.path()));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].broken,
+            vec![BrokenShape::HeadMissing {
+                repo_path: td.path().to_path_buf(),
+            }]
+        );
+        assert!(!td.path().join("projects").exists());
+        assert!(!td.path().join(".git/HEAD").exists());
+    }
+
+    #[test]
+    fn detector_accepts_real_unborn_shared_root() {
+        let td = TempDir::new().unwrap();
+        git2::Repository::init(td.path()).unwrap();
+        assert!(detect(&[], Some(td.path())).is_empty());
+    }
+
+    #[test]
+    fn detector_checks_shared_and_legacy_roots_once_each() {
+        let td = TempDir::new().unwrap();
+        let legacy = td.path().join("projects/legacy");
+        fs::create_dir_all(legacy.join(".git")).unwrap();
+        fs::create_dir(td.path().join(".git")).unwrap();
+        let findings = detect(&[td.path().to_path_buf(), legacy.clone()], Some(td.path()));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].broken.len(), 2);
+        assert_eq!(findings[0].broken[0].repo_path(), td.path());
+        assert_eq!(findings[0].broken[1].repo_path(), &legacy);
     }
 
     /// br-bvq1x.9.8 (ts2): a real repo whose HEAD tip object is missing
@@ -328,7 +386,7 @@ mod tests {
                 .expect("commit");
         }
         // Healthy now: the tip object loads, so no finding.
-        assert!(detect(std::slice::from_ref(&repo_path)).is_empty());
+        assert!(detect(std::slice::from_ref(&repo_path), None).is_empty());
 
         // Corrupt the branch tip to a SHA that is not in the object store.
         let refname = repo.head().unwrap().name().expect("refname").to_string();
@@ -339,7 +397,7 @@ mod tests {
         )
         .unwrap();
 
-        let findings = detect(std::slice::from_ref(&repo_path));
+        let findings = detect(std::slice::from_ref(&repo_path), None);
         assert_eq!(findings.len(), 1, "missing-tip-object HEAD must be flagged");
         assert!(
             matches!(
@@ -357,7 +415,7 @@ mod tests {
         let repo = td.path().join("a");
         let git_dir = repo.join(".git");
         fs::create_dir_all(&git_dir).unwrap();
-        let findings = detect(std::slice::from_ref(&repo));
+        let findings = detect(std::slice::from_ref(&repo), None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].broken.len(), 1);
         assert!(matches!(
@@ -373,7 +431,7 @@ mod tests {
         let git_dir = repo.join(".git");
         fs::create_dir_all(&git_dir).unwrap();
         fs::write(git_dir.join("HEAD"), "  \n").unwrap();
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert_eq!(findings.len(), 1);
         assert!(matches!(
             &findings[0].broken[0],
@@ -390,7 +448,7 @@ mod tests {
         let target = td.path().join("bogus_target");
         fs::write(&target, b"deadbeef").unwrap();
         std::os::unix::fs::symlink(&target, git_dir.join("HEAD")).unwrap();
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert_eq!(findings.len(), 1);
         assert!(matches!(
             &findings[0].broken[0],
@@ -406,7 +464,7 @@ mod tests {
         fs::create_dir_all(&git_dir).unwrap();
         // HEAD points at a ref that doesn't exist (loose or packed).
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/missing\n").unwrap();
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert_eq!(findings.len(), 1);
         assert!(matches!(
             &findings[0].broken[0],
@@ -427,7 +485,7 @@ mod tests {
             "# pack-refs with: peeled fully-peeled sorted \ndeadbeef refs/heads/main\n",
         )
         .unwrap();
-        let findings = detect(&[repo]);
+        let findings = detect(&[repo], None);
         assert!(
             findings.is_empty(),
             "HEAD resolvable via packed-refs must not flag"
@@ -446,7 +504,7 @@ mod tests {
         fs::create_dir_all(&git_b).unwrap();
         fs::write(git_b.join("HEAD"), "").unwrap();
         // b: empty HEAD
-        let findings = detect(&[repo_a, repo_b]);
+        let findings = detect(&[repo_a, repo_b], None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].broken.len(), 2);
     }

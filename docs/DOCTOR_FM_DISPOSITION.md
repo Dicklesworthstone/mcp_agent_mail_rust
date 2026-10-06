@@ -100,7 +100,7 @@ The registry is wired in `crates/mcp-agent-mail-cli/src/doctor/fixers/mod.rs`
 |---------------|-------------|------------------------|
 | stale .archive.lock | AUTO-FIX | `fm-archive-state-files-stale-archive-lock-from-dead-pid` (Op::Rename). |
 | stale .git/index.lock | AUTO-FIX (HEAD/ref locks) | `fm-archive-state-files-stale-head-or-ref-update-lock` (Op::Rename). Covers HEAD/ref locks; index.lock specifically is the same stale-lock class. |
-| missing ODB objects / broken git shape | DETECT-ONLY (fix = reconstruct) | `fm-archive-state-files-missing-head-or-broken-git-shape` (P0). |
+| missing ODB objects / broken git shape | DETECT-ONLY (restore an authoritative HEAD or repository backup; `reconstruct` rebuilds SQLite from the archive and cannot repair Git history) | `fm-archive-state-files-missing-head-or-broken-git-shape` (P0). Scans the shared `<storage_root>/.git` archive and legacy per-project archives. |
 | duplicate canonical message IDs | DETECT-ONLY | `fm-archive-state-files-duplicate-canonical-message-ids` (P0; quarantine via archive-normalize). |
 | malformed project.json | AUTO-FIX (partial) | `fm-archive-state-files-missing-or-malformed-project-json` (Op::WriteFile; rewrites only when canonical human_key is known). |
 | suspicious ephemeral roots | DETECT-ONLY | `fm-archive-state-files-suspicious-ephemeral-archive-root`. |

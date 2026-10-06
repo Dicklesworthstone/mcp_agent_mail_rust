@@ -804,7 +804,7 @@ pub fn registry() -> Vec<FixerSpec> {
             subsystem: "archive_state_files",
             op_pattern: "detect-only",
             auto_fixable: false,
-            one_line_description: "One or more `<storage_root>/projects/<slug>/.git/HEAD` files are missing / empty / symlinked / dangling — archive replay broken; manual: `am doctor reconstruct`",
+            one_line_description: "Shared or legacy project archive HEAD is missing / empty / symlinked / dangling — preserve the database and Git history, then restore an authoritative HEAD or repository backup",
             source_module: "doctor::fixers::missing_head_or_broken_git_shape",
         },
         FixerSpec {
@@ -1570,7 +1570,10 @@ pub fn dispatch_only(
             outcome.actions_skipped += result.actions_skipped;
         }
     } else if fm_id == missing_head_or_broken_git_shape::FM_ID {
-        let findings = missing_head_or_broken_git_shape::detect(&inputs.archive_roots);
+        let findings = missing_head_or_broken_git_shape::detect(
+            &inputs.archive_roots,
+            inputs.storage_root.as_deref(),
+        );
         outcome.findings_count = findings.len();
         for f in &findings {
             outcome.findings.push(f.to_finding());
@@ -2459,10 +2462,13 @@ fn detect_only_with_db_reads(
             .map(|f| f.to_finding())
             .collect()
     } else if fm_id == missing_head_or_broken_git_shape::FM_ID {
-        missing_head_or_broken_git_shape::detect(&inputs.archive_roots)
-            .iter()
-            .map(|f| f.to_finding())
-            .collect()
+        missing_head_or_broken_git_shape::detect(
+            &inputs.archive_roots,
+            inputs.storage_root.as_deref(),
+        )
+        .iter()
+        .map(|f| f.to_finding())
+        .collect()
     } else if fm_id == agent_profile_anomalies::FM_ID {
         let ap_inputs = agent_profile_anomalies::DetectInputs {
             storage_root_override: inputs.storage_root.clone(),
