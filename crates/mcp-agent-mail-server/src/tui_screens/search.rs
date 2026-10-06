@@ -18,6 +18,7 @@ use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
 use ftui_widgets::virtualized::{RenderItem, VirtualizedList, VirtualizedListState};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -33,7 +34,7 @@ use mcp_agent_mail_db::search_recipes::{
     MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
     list_recent_history, list_recipes, prune_history, touch_recipe,
 };
-use mcp_agent_mail_db::search_service::SearchOptions;
+use mcp_agent_mail_db::search_service::{SEMANTIC_TIER_COMPILED, SearchOptions};
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, now_micros};
 use mcp_agent_mail_db::{DbConn, QueryAssistance, parse_query_assistance};
@@ -490,6 +491,21 @@ impl SearchModeFilter {
             Self::Semantic => SearchEngine::Semantic,
             Self::Hybrid => SearchEngine::Hybrid,
         }
+    }
+
+    /// The label the screen shows: an explicit semantic or hybrid choice
+    /// names what runs instead when the semantic switch
+    /// (`AM_SEARCH_SEMANTIC_ENABLED`) is off or this build lacks the tier.
+    fn shown_label(self, semantic_enabled: bool) -> Cow<'static, str> {
+        let instead = match self {
+            Self::Semantic | Self::Hybrid if !semantic_enabled => Some("lexical"),
+            Self::Semantic if !SEMANTIC_TIER_COMPILED => Some("not built"),
+            Self::Hybrid if !SEMANTIC_TIER_COMPILED => Some("lexical"),
+            _ => None,
+        };
+        instead.map_or(Cow::Borrowed(self.label()), |runs| {
+            Cow::Owned(format!("{} ({runs})", self.label()))
+        })
     }
 
     fn from_persist(value: &str) -> Self {
@@ -1189,6 +1205,8 @@ pub struct SearchCockpitScreen {
     sort_direction: SortDirection,
     field_scope: FieldScope,
     search_mode: SearchModeFilter,
+    /// The search service's semantic switch, read once at startup as it is.
+    semantic_enabled: bool,
     explain_toggle: ExplainToggle,
     thread_filter: Option<String>,
     highlight_terms: Vec<QueryTerm>,
@@ -1314,6 +1332,9 @@ impl SearchCockpitScreen {
             sort_direction: SortDirection::NewestFirst,
             field_scope: FieldScope::default(),
             search_mode: SearchModeFilter::default(),
+            semantic_enabled: mcp_agent_mail_core::Config::get()
+                .search_rollout
+                .semantic_enabled,
             explain_toggle: ExplainToggle::default(),
             thread_filter: None,
             highlight_terms: Vec::new(),
@@ -3687,7 +3708,7 @@ impl MailScreen for SearchCockpitScreen {
             },
             HelpEntry {
                 key: "Tab",
-                action: "Cycle focus",
+                action: "Query bar → facets → results",
             },
             HelpEntry {
                 key: "j/k",
@@ -3778,6 +3799,24 @@ impl MailScreen for SearchCockpitScreen {
 
     fn consumes_text_input(&self) -> bool {
         matches!(self.focus, Focus::QueryBar) || self.preset_dialog_mode != PresetDialogMode::None
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // The facet rail returns to the results with Esc, Tab, or q, so there
+        // they neither arm quit, switch screens, nor quit the TUI. The result
+        // list jumps to the Timeline with T, which the global Shift+T theme
+        // cycle would otherwise take; Ctrl+T still cycles the theme anywhere.
+        // `/` stays global: the global search focuses this same query bar.
+        match self.focus {
+            Focus::FacetRail => matches!(
+                key.code,
+                KeyCode::Escape | KeyCode::Tab | KeyCode::Char('q')
+            ),
+            Focus::ResultList => {
+                key.code == KeyCode::Char('T') && !key.modifiers.contains(Modifiers::CTRL)
+            }
+            Focus::QueryBar => false,
+        }
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -4682,7 +4721,7 @@ fn render_collapsed_facet_hint(frame: &mut Frame<'_>, area: Rect, screen: &Searc
         screen.doc_kind_filter.label(),
         screen.importance_filter.label(),
         screen.sort_direction.label(),
-        screen.search_mode.label(),
+        screen.search_mode.shown_label(screen.semantic_enabled),
     );
     Paragraph::new(truncate_display_width(&hint, area.width as usize))
         .style(crate::tui_theme::text_hint(&tp))
@@ -4762,6 +4801,7 @@ fn render_facet_rail(
 
     let in_rail = screen.focus == Focus::FacetRail;
     let w = inner.width as usize;
+    let search_mode = screen.search_mode.shown_label(screen.semantic_enabled);
 
     let facets: &[(FacetSlot, &str, &str)] = &[
         (FacetSlot::Scope, "Scope", screen.scope_mode.label()),
@@ -4770,11 +4810,7 @@ fn render_facet_rail(
             "Doc Type",
             screen.doc_kind_filter.label(),
         ),
-        (
-            FacetSlot::SearchMode,
-            "Search Mode",
-            screen.search_mode.label(),
-        ),
+        (FacetSlot::SearchMode, "Search Mode", &*search_mode),
         (
             FacetSlot::Importance,
             "Importance",
@@ -6473,6 +6509,47 @@ mod tests {
     }
 
     #[test]
+    fn facet_rail_claims_its_exit_keys_and_the_result_list_claims_only_timeline_t() {
+        let mut screen = SearchCockpitScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let exits = [KeyCode::Escape, KeyCode::Tab, KeyCode::Char('q')];
+        let shift_t = ftui::KeyEvent::new(KeyCode::Char('T')).with_modifiers(Modifiers::SHIFT);
+        let ctrl_shift_t = shift_t.with_modifiers(Modifiers::CTRL | Modifiers::SHIFT);
+        // The result list leaves Esc (quit confirmation), Tab (next screen),
+        // and q (quit) to the shell, but takes T for its Timeline jump; Ctrl+T
+        // still cycles the theme.
+        assert_eq!(screen.focus, Focus::ResultList);
+        for code in exits {
+            assert!(!screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+        }
+        assert!(screen.claims_key(&shift_t));
+        assert!(screen.claims_key(&ftui::KeyEvent::new(KeyCode::Char('T'))));
+        assert!(!screen.claims_key(&ctrl_shift_t));
+
+        // `f` enters the facet rail, where each exit key returns to the
+        // results instead, and the claim drops once it has. Shift+T stays the
+        // theme cycle there.
+        let f = Event::Key(ftui::KeyEvent::new(KeyCode::Char('f')));
+        for code in exits {
+            screen.update(&f, &state);
+            assert_eq!(screen.focus, Focus::FacetRail);
+            assert!(!screen.claims_key(&shift_t));
+            assert!(screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+            assert_eq!(screen.focus, Focus::ResultList, "{code:?}");
+            assert!(!screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+        }
+
+        // The query bar takes text, so it needs no claims at all.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('/'))), &state);
+        assert_eq!(screen.focus, Focus::QueryBar);
+        assert!(!screen.claims_key(&shift_t));
+        for code in exits {
+            assert!(!screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+        }
+    }
+
+    #[test]
     fn screen_title_and_label() {
         let screen = SearchCockpitScreen::new();
         assert_eq!(screen.title(), "Search");
@@ -6697,6 +6774,28 @@ mod tests {
         assert_eq!(m, SearchModeFilter::Lexical);
         m = m.prev();
         assert_eq!(m, SearchModeFilter::Auto);
+    }
+
+    #[test]
+    fn search_mode_label_names_the_engine_that_runs() {
+        // With the semantic switch off, an explicit semantic or hybrid
+        // choice runs lexical and says so; Auto and Lexical are honest as is.
+        for mode in [SearchModeFilter::Semantic, SearchModeFilter::Hybrid] {
+            assert_eq!(
+                mode.shown_label(false),
+                format!("{} (lexical)", mode.label())
+            );
+        }
+        assert_eq!(SearchModeFilter::Auto.shown_label(false), "Auto");
+        assert_eq!(SearchModeFilter::Lexical.shown_label(false), "Lexical");
+        // Switched on, the label depends on whether the build has the tier.
+        let (semantic, hybrid) = if SEMANTIC_TIER_COMPILED {
+            ("Semantic", "Hybrid")
+        } else {
+            ("Semantic (not built)", "Hybrid (lexical)")
+        };
+        assert_eq!(SearchModeFilter::Semantic.shown_label(true), semantic);
+        assert_eq!(SearchModeFilter::Hybrid.shown_label(true), hybrid);
     }
 
     #[test]

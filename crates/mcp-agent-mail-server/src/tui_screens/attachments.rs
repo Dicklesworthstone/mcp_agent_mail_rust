@@ -1240,6 +1240,10 @@ impl MailScreen for AttachmentExplorerScreen {
                 key: "r",
                 action: "Reload data",
             },
+            HelpEntry {
+                key: "Esc",
+                action: "Clear filter",
+            },
         ]
     }
 
@@ -1268,8 +1272,14 @@ impl MailScreen for AttachmentExplorerScreen {
     }
 
     fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
-        // `/` opens this screen's filter rather than the global search.
-        matches!(key.code, KeyCode::Char('/'))
+        // `/` opens this screen's filter rather than the global search. Esc
+        // clears a committed filter; with no filter it stays the global quit
+        // confirmation.
+        match key.code {
+            KeyCode::Char('/') => true,
+            KeyCode::Escape => !self.text_filter_active && !self.text_filter.is_empty(),
+            _ => false,
+        }
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -1612,6 +1622,57 @@ mod tests {
         let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
         screen.update(&esc, &state);
         assert!(!screen.text_filter_active);
+    }
+
+    #[test]
+    fn esc_is_claimed_only_while_a_committed_filter_can_be_cleared() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        for (message_id, sender) in [(1, "Alice"), (2, "Bob")] {
+            screen.entries.push(AttachmentEntry {
+                media_type: "image/png".to_string(),
+                bytes: 1000,
+                sha1: format!("sha{message_id}"),
+                width: 0,
+                height: 0,
+                mode: "inline".to_string(),
+                path: None,
+                message_id,
+                sender_name: sender.to_string(),
+                subject: "Hello".to_string(),
+                thread_id: None,
+                created_ts: message_id * 1_000_000,
+                project_slug: "proj".to_string(),
+            });
+        }
+        screen.rebuild_display();
+        assert_eq!(screen.display_indices.len(), 2);
+
+        // With no filter Esc stays global, so it still arms quit confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('a'),
+            KeyCode::Char('l'),
+            KeyCode::Char('i'),
+            KeyCode::Enter,
+        ] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert!(!screen.consumes_text_input());
+        assert_eq!(screen.display_indices.len(), 1);
+        assert!(screen.claims_key(&esc));
+
+        screen.update(&Event::Key(esc), &state);
+        assert_eq!(screen.text_filter, "");
+        assert_eq!(
+            screen.display_indices.len(),
+            2,
+            "clearing the filter rebuilds the list"
+        );
+        assert!(!screen.claims_key(&esc));
     }
 
     #[test]

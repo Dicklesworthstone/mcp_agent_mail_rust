@@ -1640,6 +1640,12 @@ impl MailScreen for ToolMetricsScreen {
         false
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // Inside the evidence drill-down Esc steps up a level and finally
+        // leaves it; outside it stays the global quit confirmation.
+        self.drilldown_active && matches!(key.code, KeyCode::Escape)
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let idx = self.table_state.selected?;
         let tool_name = self.sorted_tools.get(idx)?;
@@ -2874,6 +2880,38 @@ mod tests {
             DisclosureLevel::Summary,
             "2 -> Summary"
         );
+    }
+
+    #[test]
+    fn esc_is_claimed_only_inside_the_evidence_drilldown() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+        screen.evidence_entries = vec![EvidenceLedgerEntry::new(
+            "drill-esc",
+            "tui.diff_strategy",
+            "incremental",
+            0.85,
+            serde_json::json!({}),
+        )];
+
+        // Outside the drill-down Esc stays global, so it still arms quit
+        // confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        screen.update(&enter, &state);
+        assert!(screen.drilldown_active);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Detail);
+
+        // Detail -> Summary -> Badge -> leave: every step is claimed.
+        for _ in 0..3 {
+            assert!(screen.claims_key(&esc));
+            screen.update(&Event::Key(esc), &state);
+        }
+        assert!(!screen.drilldown_active);
+        assert_eq!(screen.disclosure_level, DisclosureLevel::Badge);
+        assert!(!screen.claims_key(&esc));
     }
 
     // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────

@@ -1459,7 +1459,7 @@ fn render_card_list(
                 "detail:hidden"
             };
             let guide_text = format!(
-                "Tab switch focus · Enter open deep link\ns severity filter · o sort mode · {detail_state}\n{} cards visible · alerts {}",
+                "l/h detail/list · Enter open deep link\ns severity filter · o sort mode · {detail_state}\n{} cards visible · alerts {}",
                 cards.len(),
                 alerts_processed
             );
@@ -1494,7 +1494,7 @@ fn render_card_detail(
     ]));
     lines.push(confidence_bar_colored(card.confidence, card.severity));
     lines.push(Line::styled(
-        "Navigate: Tab focus • j/k active panel • J/K fast scroll • s/o modes • Enter deep-link",
+        "Navigate: l/h focus • j/k active panel • J/K fast scroll • s/o modes • Enter deep-link",
         crate::tui_theme::text_hint(&tp),
     ));
     lines.push(Line::raw(""));
@@ -1860,7 +1860,7 @@ fn analytics_status_strip_line(area_width: u16, status: AnalyticsStatusStripLine
 
     if area_width >= 104 {
         return format!(
-            "{focus_label} • {filter_label} • {sort_label} • {detail_state} • cards:{active_count}/{total_count} • Tab focus • s/o modes • Enter link"
+            "{focus_label} • {filter_label} • {sort_label} • {detail_state} • cards:{active_count}/{total_count} • l/h focus • s/o modes • Enter link"
         );
     }
     if area_width >= 80 {
@@ -2520,12 +2520,26 @@ impl MailScreen for AnalyticsScreen {
                 }
                 Cmd::None
             }
+            // Tab/Shift+Tab are claimed only from the detail pane (see
+            // `claims_key`); from the list they cycle screens instead.
             KeyCode::Tab | KeyCode::BackTab => {
                 if self.detail_focus_available.get() {
                     self.toggle_focus();
                 } else {
                     self.focus = AnalyticsFocus::List;
                 }
+                Cmd::None
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.focus = if self.detail_focus_available.get() {
+                    AnalyticsFocus::Detail
+                } else {
+                    AnalyticsFocus::List
+                };
+                Cmd::None
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.focus = AnalyticsFocus::List;
                 Cmd::None
             }
             KeyCode::Enter => self.navigate_deep_link(),
@@ -3159,8 +3173,8 @@ impl MailScreen for AnalyticsScreen {
                 action: "Fast scroll focused panel",
             },
             HelpEntry {
-                key: "Tab/Shift+Tab",
-                action: "Focus list/detail",
+                key: "l/Right / h/Left, Tab",
+                action: "Focus detail / back to list",
             },
             HelpEntry {
                 key: "Enter",
@@ -3187,6 +3201,14 @@ impl MailScreen for AnalyticsScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some("Message volume, response times, and agent activity analytics.")
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `l`/Right focuses the detail pane and Tab/Shift+Tab there return
+        // to the list; in the list they stay the shell's screen cycling.
+        self.focus == AnalyticsFocus::Detail
+            && self.detail_focus_available.get()
+            && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -3380,7 +3402,7 @@ mod tests {
         let bindings = screen.keybindings();
         assert!(!bindings.is_empty());
         assert!(bindings.iter().any(|b| b.key == "j/k"));
-        assert!(bindings.iter().any(|b| b.key == "Tab/Shift+Tab"));
+        assert!(bindings.iter().any(|b| b.key == "l/Right / h/Left, Tab"));
         assert!(bindings.iter().any(|b| b.key == "Enter"));
         assert!(bindings.iter().any(|b| b.key == "s"));
         assert!(bindings.iter().any(|b| b.key == "o"));
@@ -3436,6 +3458,48 @@ mod tests {
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Tab)), &state);
         assert_eq!(screen.focus, AnalyticsFocus::List);
+    }
+
+    #[test]
+    fn l_enters_detail_which_claims_tab_back_and_the_list_leaves_it_global() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        let tab = ftui::KeyEvent::new(KeyCode::Tab);
+        let back_tab = ftui::KeyEvent::new(KeyCode::BackTab);
+        let focus_detail = Event::Key(ftui::KeyEvent::new(KeyCode::Char('l')));
+        let mut screen = AnalyticsScreen::new();
+
+        // Without a rendered detail pane `l` stays on the list, and the list
+        // leaves Tab/Shift+Tab to the shell's screen cycling.
+        screen.detail_focus_available.set(false);
+        screen.update(&focus_detail, &state);
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+        assert!(!screen.claims_key(&tab));
+        assert!(!screen.claims_key(&back_tab));
+
+        // With the detail pane shown, `l` focuses it and Tab returns to the
+        // list, which releases the claim again.
+        screen.detail_focus_available.set(true);
+        assert!(!screen.claims_key(&tab));
+        screen.update(&focus_detail, &state);
+        assert_eq!(screen.focus, AnalyticsFocus::Detail);
+        assert!(screen.claims_key(&tab));
+        assert!(screen.claims_key(&back_tab));
+        assert!(!screen.claims_key(&ftui::KeyEvent::new(KeyCode::Escape)));
+        screen.update(&Event::Key(tab), &state);
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+        assert!(!screen.claims_key(&tab));
+
+        // Right/Left are the arrow aliases; once the detail pane is hidden
+        // its stale focus no longer claims Tab.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Right)), &state);
+        assert_eq!(screen.focus, AnalyticsFocus::Detail);
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Left)), &state);
+        assert_eq!(screen.focus, AnalyticsFocus::List);
+        screen.update(&focus_detail, &state);
+        assert!(screen.claims_key(&tab));
+        screen.detail_focus_available.set(false);
+        assert!(!screen.claims_key(&tab));
     }
 
     #[test]
@@ -3590,11 +3654,11 @@ mod tests {
         // to keep the strip under the width budget. We only assert the
         // invariants that are actually meaningful at this width: the
         // "Detail hidden" hint is surfaced, cards count is still shown,
-        // and the long-form controls ("Tab focus", "Enter link") are NOT.
+        // and the long-form controls ("l/h focus", "Enter link") are NOT.
         assert!(text.contains("Detail hidden"));
         assert!(text.contains("cards:1/1"));
         assert!(text.contains("Enter"));
-        assert!(!text.contains("Tab focus"));
+        assert!(!text.contains("l/h focus"));
         assert!(!text.contains("Enter link"));
     }
 

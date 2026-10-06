@@ -9715,6 +9715,10 @@ mod tests {
         press(&mut model, KeyCode::Tab, Modifiers::NONE);
         assert_eq!(model.active_screen(), MailScreenId::Search);
         assert!(!model.consumes_text_input(), "Tab left the query bar");
+        // The facet rail claims Tab to return to the results ...
+        press(&mut model, KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        // ... and from the results Tab is the shell's next screen again.
         press(&mut model, KeyCode::Tab, Modifiers::NONE);
         assert_ne!(model.active_screen(), MailScreenId::Search);
     }

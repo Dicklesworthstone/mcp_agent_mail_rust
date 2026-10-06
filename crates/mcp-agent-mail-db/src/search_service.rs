@@ -247,6 +247,10 @@ pub struct SearchOptions {
     pub surface: Option<&'static str>,
 }
 
+/// Whether this build compiled the semantic tier (`feature = "hybrid"`).
+/// Without it a hybrid or auto query runs lexical and a semantic one fails.
+pub const SEMANTIC_TIER_COMPILED: bool = cfg!(feature = "hybrid");
+
 fn resolve_search_engine(options: &SearchOptions) -> SearchEngine {
     engine_for(options, &mcp_agent_mail_core::Config::get().search_rollout)
 }
