@@ -12470,6 +12470,10 @@ struct ArchiveIndexSyncState {
     /// Git directories whose current run of failures was already logged.
     warned: HashSet<PathBuf>,
     worker_started: bool,
+    /// A sync is rewriting an index right now.
+    in_flight: bool,
+    /// Shutdown: start no further syncs.
+    stopping: bool,
 }
 
 /// When an index fell behind HEAD, and when its latest commit landed.
@@ -12530,6 +12534,30 @@ fn note_archive_commit_for_index_sync(git_dir: &Path) {
     wake.notify_one();
 }
 
+/// Stop the index sync worker for shutdown: start no further syncs and wait up
+/// to `timeout` for one in progress, so the process does not exit holding
+/// `.git/index.lock`. A sync still owed is left to the next process's commits.
+pub fn stop_archive_index_sync(timeout: Duration) {
+    let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+    let mut state = state_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.stopping = true;
+    wake.notify_all();
+    let deadline = Instant::now() + timeout;
+    while state.in_flight {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            tracing::warn!("archive index sync still running at shutdown; not waiting longer");
+            break;
+        }
+        state = wake
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
 /// The pending Git directory to synchronize at `now`, or how long until the
 /// earliest pending one is due (`None` when nothing is pending).
 fn next_archive_index_sync(
@@ -12571,9 +12599,13 @@ fn archive_index_sync_worker() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
+                if state.stopping {
+                    return;
+                }
                 match next_archive_index_sync(&state, Instant::now()) {
                     Ok(git_dir) => {
                         state.pending.remove(&git_dir);
+                        state.in_flight = true;
                         break git_dir;
                     }
                     Err(Some(wait)) => {
@@ -12600,13 +12632,19 @@ fn archive_index_sync_worker() {
         let mut state = state_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = false;
+        wake.notify_all();
         state.next_due.insert(
             git_dir.clone(),
             Instant::now() + archive_index_sync_backoff(started.elapsed()),
         );
         match result {
-            Ok(()) => {
+            Ok(ArchiveIndexSync::Settled) => {
                 state.warned.remove(&git_dir);
+            }
+            // Someone else holds the lock: this commit's sync is still owed.
+            Ok(ArchiveIndexSync::Locked) => {
+                mark_archive_index_pending(&mut state, &git_dir, Instant::now());
             }
             Err(error) if state.warned.insert(git_dir.clone()) => tracing::warn!(
                 git_dir = %git_dir.display(),
@@ -12644,7 +12682,8 @@ fn archive_index_file_identity(metadata: &fs::Metadata) -> String {
 }
 
 /// The tree recorded by the last sync, if the record describes `identity`.
-fn recorded_archive_index_tree(git_dir: &Path, identity: &str) -> Option<git2::Oid> {
+/// The tree the last sync wrote and the identity of the index file it wrote.
+fn read_archive_index_sync_record(git_dir: &Path) -> Option<(git2::Oid, String)> {
     let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
         &git_dir.join(ARCHIVE_INDEX_SYNC_FILE_NAME),
         512,
@@ -12656,7 +12695,8 @@ fn recorded_archive_index_tree(git_dir: &Path, identity: &str) -> Option<git2::O
         return None;
     }
     let tree = git2::Oid::from_str(lines.next()?).ok()?;
-    (lines.next()? == identity && lines.next().is_none()).then_some(tree)
+    let identity = lines.next()?.to_string();
+    lines.next().is_none().then_some((tree, identity))
 }
 
 fn write_archive_index_sync_record(
@@ -12693,16 +12733,72 @@ fn tree_on_recent_first_parent_chain(head: &git2::Commit<'_>, tree: git2::Oid) -
     false
 }
 
+/// Whether `tree` is the tree of `head` or of a recent first-parent ancestor
+/// committed after the newest commit whose tree is `since`.
+fn tree_committed_since(head: &git2::Commit<'_>, tree: git2::Oid, since: git2::Oid) -> bool {
+    let mut commit = head.clone();
+    for _ in 0..ARCHIVE_INDEX_SYNC_ANCESTOR_LIMIT {
+        let current = commit.tree_id();
+        if current == since {
+            return false;
+        }
+        if current == tree {
+            return true;
+        }
+        match commit.parent(0) {
+            Ok(parent) => commit = parent,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// What one synchronization attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveIndexSync {
+    /// The index is current, was rewritten, or is foreign and left alone.
+    Settled,
+    /// Another writer holds `index.lock`: try again later.
+    Locked,
+}
+
+/// Age after which an `index.lock` whose owner is gone may be reclaimed: the
+/// rule commits apply on their first retry.
+const ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS: f64 = 30.0;
+
+fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Removes this process's `index.lock.owner` record when dropped.
+struct IndexLockOwner<'a>(Option<&'a Path>);
+
+impl Drop for IndexLockOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(repo_root) = self.0 {
+            remove_lock_owner(repo_root);
+        }
+    }
+}
+
 /// Bring the shared `.git/index` up to HEAD when it holds nothing but this
 /// maintenance's own earlier result.
 ///
 /// The index is ours when it is the exact file the last sync wrote (per
-/// [`ARCHIVE_INDEX_SYNC_FILE_NAME`]), when it is empty, or when it equals HEAD
-/// or one of its recent first-parent ancestors (a sync that fell behind). Git's
-/// exclusive index lock is held from observation through atomic replacement.
-/// Staged, conflicted, corrupt, oversized, locked or otherwise foreign indexes
-/// stay untouched: they may hold an interrupted writer's only evidence.
-fn sync_archive_index_to_head(git_dir: &Path) -> Result<()> {
+/// [`ARCHIVE_INDEX_SYNC_FILE_NAME`]); when it was rewritten since but holds
+/// HEAD's tree, the tree that sync wrote (a `git status` stat refresh), or the
+/// tree of a commit made after it (a reset); when it is missing; or, without
+/// any record, when it is empty or equals HEAD or one of its recent
+/// first-parent ancestors (a sync that fell behind before the record
+/// existed). Git's exclusive index lock is held from observation through
+/// atomic replacement, with an owner record so a lock left by a process that
+/// exited mid-sync can be reclaimed. Staged, conflicted, corrupt, oversized,
+/// locked or otherwise foreign indexes stay untouched: they may hold an
+/// interrupted writer's only evidence.
+fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
     const MAX_INDEX_BYTES: u64 = 128 * 1024 * 1024;
     const MAX_INDEX_ENTRIES: u32 = 500_000;
     let index_path = git_dir.join("index");
@@ -12715,18 +12811,23 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<()> {
         ));
     }
     let repo = Repository::open(git_dir)?;
-    let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
-        return Ok(());
-    };
-    let head = repo.find_commit(head_oid)?;
-    let head_tree = head.tree_id();
-    let lock_file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
+    let repo_root = repo.workdir().map(Path::to_path_buf);
+    let lock_file = match create_index_lock(&lock_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A process that exited mid-sync never releases its lock, which
+            // would block every later sync and every archive read stamp.
+            let reclaimed = repo_root.as_deref().is_some_and(|root| {
+                try_clean_stale_git_lock(root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS)
+            });
+            match reclaimed.then(|| create_index_lock(&lock_path)) {
+                Some(Ok(file)) => file,
+                Some(Err(error)) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                    return Err(error.into());
+                }
+                _ => return Ok(ArchiveIndexSync::Locked),
+            }
+        }
         Err(error) => return Err(error.into()),
     };
     // Adopt only the lock we just created; dropping it never touches another
@@ -12735,6 +12836,20 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<()> {
         lock_file,
         tempfile::TempPath::try_from_path(lock_path)?,
     );
+    // Written only once the lock is ours and declared after it, so it is
+    // removed before the lock is released on every path: it can never erase
+    // the record of whoever takes the lock next.
+    if let Some(root) = repo_root.as_deref() {
+        write_lock_owner(root);
+    }
+    let owner = IndexLockOwner(repo_root.as_deref());
+    // HEAD is read under the lock, so a slow sync cannot publish a tree older
+    // than one another writer synced while this one waited.
+    let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
+        return Ok(ArchiveIndexSync::Settled);
+    };
+    let head = repo.find_commit(head_oid)?;
+    let head_tree = head.tree_id();
     let scratch = tempfile::tempdir()?;
     let scratch_path = scratch.path().join("index");
     let mut identity = None;
@@ -12769,31 +12884,51 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<()> {
     }
     let mut index = git2::Index::open_ext(&scratch_path, repo.object_format())?;
     if index.has_conflicts() {
-        return Ok(());
+        return Ok(ArchiveIndexSync::Settled);
     }
-    let recorded = identity
-        .as_deref()
-        .and_then(|identity| recorded_archive_index_tree(git_dir, identity));
-    match recorded {
-        Some(tree) if tree == head_tree => return Ok(()),
-        Some(_) => {}
-        None if index.is_empty() => {}
-        None => {
-            // Cheap when the index carries Git's tree cache, as every index
-            // this function writes does.
-            let index_tree = index.write_tree_to(&repo)?;
-            if index_tree == head_tree {
-                // Already current: record it so later syncs skip this check.
-                if let Some(identity) = identity.as_deref()
-                    && let Err(error) =
-                        write_archive_index_sync_record(git_dir, head_tree, identity)
-                {
-                    tracing::debug!("could not record the archive index sync: {error}");
-                }
-                return Ok(());
+    // A missing index file is simply rebuilt.
+    if let Some(identity) = identity.as_deref() {
+        // Records it as current, so later syncs skip the tree comparison.
+        let record_current = || {
+            if let Err(error) = write_archive_index_sync_record(git_dir, head_tree, identity) {
+                tracing::debug!("could not record the archive index sync: {error}");
             }
-            if !tree_on_recent_first_parent_chain(&head, index_tree) {
-                return Ok(());
+        };
+        match read_archive_index_sync_record(git_dir) {
+            Some((tree, recorded)) if recorded == identity => {
+                if tree == head_tree {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+            Some((tree, _)) => {
+                // Rewritten since the last sync. Git rewrites the file to
+                // refresh stat data (`git status`), keeping the tree we wrote,
+                // and a reset leaves the tree of a commit made since; both
+                // stage nothing, so the index is still ours. Any older tree is
+                // someone's staged change (`git rm --cached` of a recent file,
+                // `git revert --no-commit`).
+                let index_tree = index.write_tree_to(&repo)?;
+                if index_tree == head_tree {
+                    record_current();
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+                if index_tree != tree && !tree_committed_since(&head, index_tree, tree) {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+            }
+            None if index.is_empty() => {}
+            None => {
+                // No record yet (first sync after an upgrade, or a lost
+                // record). Cheap when the index carries Git's tree cache, as
+                // every index this function writes does.
+                let index_tree = index.write_tree_to(&repo)?;
+                if index_tree == head_tree {
+                    record_current();
+                    return Ok(ArchiveIndexSync::Settled);
+                }
+                if !tree_on_recent_first_parent_chain(&head, index_tree) {
+                    return Ok(ArchiveIndexSync::Settled);
+                }
             }
         }
     }
@@ -12808,12 +12943,13 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<()> {
     // A rename keeps inode, length and mtime, so this is the identity the
     // published index will have.
     let written = archive_index_file_identity(&lock.as_file().metadata()?);
+    drop(owner);
     lock.persist(&index_path)
         .map_err(|error| StorageError::Io(error.error))?;
     if let Err(error) = write_archive_index_sync_record(git_dir, head_tree, &written) {
         tracing::debug!("could not record the archive index sync: {error}");
     }
-    Ok(())
+    Ok(ArchiveIndexSync::Settled)
 }
 
 /// Add files to the git index and create a commit.
@@ -22647,6 +22783,92 @@ mod tests {
         sync_archive_index_to_head(&git_dir).unwrap();
         assert_eq!(fs::read(git_dir.join("index")).unwrap(), before);
         assert!(!git_dir.join("index.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_reclaims_dead_locks_and_keeps_staged_changes() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "index-sync-locks").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let rel = |name: &str| {
+            let path = archive.root.join(name);
+            rel_path_cached(&archive.canonical_repo_root, &path).unwrap()
+        };
+        let commit = |name: &str| {
+            fs::write(archive.root.join(name), name).unwrap();
+            commit_paths_lockfree(&repo, &config, name, &[rel(name).as_str()]).unwrap();
+        };
+        let head_tree = || repo.head().unwrap().peel_to_tree().unwrap().id();
+        let index_bytes = || fs::read(git_dir.join("index")).unwrap();
+        let lock = git_dir.join("index.lock");
+        let owner = git_dir.join("index.lock.owner");
+        let sync = || sync_archive_index_to_head(&git_dir).unwrap();
+
+        // A lock whose recorded owner is alive belongs to that writer: wait,
+        // and keep the sync owed.
+        commit("a.txt");
+        fs::write(&lock, "live writer").unwrap();
+        let me = std::process::id();
+        let ticks = process_start_ticks(me).unwrap_or(0);
+        fs::write(&owner, format!("{me}\n0\n{ticks}\n")).unwrap();
+        assert_eq!(sync(), ArchiveIndexSync::Locked);
+        assert_eq!(fs::read(&lock).unwrap(), b"live writer");
+
+        // A lock left by a process that exited mid-sync is reclaimed, so the
+        // index is not stuck behind HEAD (and reads are not stuck) forever.
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        fs::write(&owner, format!("{dead}\n0\n0\n")).unwrap();
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+        assert!(!lock.exists() && !owner.exists());
+
+        // A staged change whose tree equals an ancestor (`git rm --cached` of
+        // the file the last commit added) is someone's, not a lagging sync.
+        // Git reloads the index file before changing it; so do these steps.
+        let shared_index = || {
+            let mut index = repo.index().unwrap();
+            index.read(true).unwrap();
+            index
+        };
+        let tree_a = head_tree();
+        commit("b.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        let mut index = shared_index();
+        index.remove_path(Path::new(&rel("b.txt"))).unwrap();
+        index.write().unwrap();
+        drop(index);
+        assert_eq!(shared_index_tree(&repo), tree_a);
+        let staged = index_bytes();
+        commit("c.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(index_bytes(), staged);
+
+        // An index reset to HEAD stages nothing: it is adopted and followed
+        // after the next commit.
+        let mut index = shared_index();
+        index
+            .read_tree(&repo.head().unwrap().peel_to_tree().unwrap())
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        commit("d.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
+
+        // Git rewriting the file without changing its tree (a `git status`
+        // stat refresh) leaves it ours.
+        let mut index = shared_index();
+        index.write().unwrap();
+        drop(index);
+        commit("e.txt");
+        assert_eq!(sync(), ArchiveIndexSync::Settled);
+        assert_eq!(shared_index_tree(&repo), head_tree());
     }
 
     #[test]

@@ -1033,6 +1033,8 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     maintenance::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
+    // A sync interrupted by exit would leave `.git/index.lock` behind.
+    mcp_agent_mail_storage::stop_archive_index_sync(Duration::from_secs(10));
     cleanup_shutdown_sqlite_sidecars(config);
 }
 
