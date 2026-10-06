@@ -1,6 +1,8 @@
 //! Replay durable closeout intents without requiring the original client to return.
 //!
 //! ACK and release replay each own a worker, scan state, and lazy database pool.
+//! An owned supervisor replaces exited workers with capped retry backoff. A
+//! replacement reopens the durable journal; it never inherits a failed cursor.
 //! A blocked release archive write must not stop acknowledgement recovery (or
 //! vice versa). Shared database locks can still delay both kinds of mutation.
 //! The workers are independent of destructive retention. Scans admit no mutation
@@ -29,13 +31,14 @@ use serde_json::json;
 
 mod journal_scan;
 mod releases;
+mod supervision;
 
 const MAX_ATTEMPTS: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CATCH_UP_INTERVAL: Duration = Duration::from_secs(1);
 const SCAN_INTERVAL: Duration = Duration::from_millis(100);
 type ReplayWorkerSlots = [Option<ReplayWorker>; 2];
-static WORKERS: LazyLock<Mutex<Option<ReplayWorkerGroup>>> =
+static WORKERS: LazyLock<Mutex<Option<supervision::Service>>> =
     LazyLock::new(|| Mutex::new(None));
 const REPLAY_KINDS: [journal_scan::Kind; 2] = [journal_scan::Kind::Ack, journal_scan::Kind::Release];
 
@@ -344,6 +347,7 @@ impl Drop for ReplayWorker {
     }
 }
 
+#[cfg(test)]
 fn ensure_replay_workers(
     workers: &mut ReplayWorkerSlots,
     mut spawn: impl FnMut(journal_scan::Kind) -> std::io::Result<ReplayWorker>,
@@ -387,6 +391,7 @@ impl Drop for ReplayWorkerGroup {
     }
 }
 
+#[cfg(test)]
 fn selected_replay_group<'a>(
     group: &'a mut Option<ReplayWorkerGroup>,
     config: &Config,
@@ -406,18 +411,16 @@ pub(super) fn start(config: &Config) {
     let mut workers = WORKERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let group = selected_replay_group(&mut workers, config);
-    let selected = &group.config;
-    let retargeted = selected.database_url != config.database_url
-        || selected.storage_root != config.storage_root;
-    let errors = ensure_replay_workers(&mut group.slots, |kind| ReplayWorker::spawn(selected, kind));
+    let service = workers.get_or_insert_with(|| supervision::Service::new(config));
+    let retargeted = service.config.database_url != config.database_url
+        || service.config.storage_root != config.storage_root;
+    let started = service.ensure_running();
     drop(workers);
     if retargeted {
         tracing::warn!("durable replay retains its original mailbox until shutdown; restart required to retarget");
     }
-    for (kind, error) in errors {
-        tracing::warn!(kind = replay_kind_name(kind), %error,
-            "could not start durable intent replay lane; other lane retained");
+    if let Err(error) = started {
+        tracing::warn!(%error, "could not start durable replay supervisor; startup retry required");
     }
 }
 
