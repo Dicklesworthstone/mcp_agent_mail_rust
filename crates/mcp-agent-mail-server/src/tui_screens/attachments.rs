@@ -1965,6 +1965,78 @@ mod tests {
     }
 
     #[test]
+    fn b8_attachments_retry_reopens_the_same_mailbox_without_initializing_it() {
+        let dir = tempfile::tempdir().expect("private mailbox directory");
+        let db_path = dir.path().join("storage.sqlite3");
+        let state = TuiSharedState::new(&Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+            storage_root: dir.path().join("archive"),
+            ..Default::default()
+        });
+        let generation = state.data_generation();
+        let mut screen = AttachmentExplorerScreen::new();
+
+        screen.tick(1, &state);
+        assert!(
+            screen.db_context_unavailable,
+            "initial failed tick should mark db_context_unavailable"
+        );
+        assert!(
+            !db_path.exists(),
+            "observability must not initialize the DB"
+        );
+
+        // The first interval consumes the initial stale-generation sentinel.
+        screen.tick(RELOAD_INTERVAL_TICKS + 1, &state);
+        assert!(screen.db_context_unavailable);
+        assert_eq!(screen.last_data_gen, generation);
+        assert!(!db_path.exists());
+
+        // The same mailbox becomes available without a data-generation event.
+        // Use the runtime engine and real schema so the retry must reopen and query it.
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open mailbox");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize mailbox schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'retry-project', '/retry-project', 0);
+             INSERT INTO agents
+                (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 0, 0);
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, body_md, created_ts, attachments)
+             VALUES (7, 1, 1, 'Recovered attachment', 'body', 1000,
+                '[{\"type\":\"file\",\"path\":\"docs/recovered.txt\",\"bytes\":12}]');",
+        )
+        .expect("seed real attachment");
+        conn.close_sync().expect("close fixture writer");
+
+        screen.tick(2 * RELOAD_INTERVAL_TICKS, &state);
+        assert!(
+            screen.db_context_unavailable,
+            "retry must wait for its interval"
+        );
+        assert!(screen.entries.is_empty());
+        assert_eq!(state.data_generation(), generation);
+
+        screen.tick(2 * RELOAD_INTERVAL_TICKS + 1, &state);
+        assert!(
+            !screen.db_context_unavailable,
+            "interval retry should recover once healthy even without new data generation"
+        );
+        assert_eq!(state.data_generation(), generation);
+        assert!(screen.last_error.is_none());
+        assert_eq!(screen.entries.len(), 1);
+        assert_eq!(screen.entries[0].message_id, 7);
+        assert_eq!(screen.entries[0].sender_name, "BlueLake");
+        assert_eq!(screen.entries[0].project_slug, "retry-project");
+        assert_eq!(
+            screen.entries[0].path.as_deref(),
+            Some("docs/recovered.txt")
+        );
+    }
+
+    #[test]
     fn b8_attachments_banner_renders_when_unavailable() {
         let state = test_state();
         let mut screen = AttachmentExplorerScreen::new();
