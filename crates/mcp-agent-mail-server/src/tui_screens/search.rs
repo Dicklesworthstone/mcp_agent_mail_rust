@@ -31,8 +31,8 @@ use mcp_agent_mail_db::search_planner::{
     DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, ZeroResultGuidance,
 };
 use mcp_agent_mail_db::search_recipes::{
-    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
-    list_recent_history, list_recipes, prune_history, touch_recipe,
+    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, delete_recipe, insert_history,
+    insert_recipe, list_recent_history, list_recipes, prune_history, touch_recipe, update_recipe,
 };
 use mcp_agent_mail_db::search_service::{SEMANTIC_TIER_COMPILED, SearchOptions};
 use mcp_agent_mail_db::sqlmodel::Value;
@@ -1140,6 +1140,23 @@ impl SavePresetField {
     }
 }
 
+/// A row of the Load dialog: a preset saved on this screen, or a mailbox
+/// recipe (the web UI's saved search) that has no preset of the same name.
+#[derive(Debug, Clone)]
+enum LoadDialogEntry {
+    Preset(String),
+    Recipe(SearchRecipe),
+}
+
+impl LoadDialogEntry {
+    fn label(&self) -> String {
+        match self {
+            Self::Preset(name) => name.clone(),
+            Self::Recipe(recipe) => format!("{} (saved search)", recipe.name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DockDragState {
     Idle,
@@ -1532,6 +1549,22 @@ impl SearchCockpitScreen {
         self.filter_presets.list_names(SEARCH_PRESET_SCREEN_ID)
     }
 
+    fn load_dialog_entries(&self) -> Vec<LoadDialogEntry> {
+        let presets = self.preset_names();
+        let recipes = self
+            .saved_recipes
+            .iter()
+            .filter(|recipe| !presets.contains(&recipe.name))
+            .cloned()
+            .map(LoadDialogEntry::Recipe)
+            .collect::<Vec<_>>();
+        presets
+            .into_iter()
+            .map(LoadDialogEntry::Preset)
+            .chain(recipes)
+            .collect()
+    }
+
     fn persist_filter_presets(&self) {
         if let Err(err) =
             save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets)
@@ -1608,13 +1641,17 @@ impl SearchCockpitScreen {
         if name.is_empty() {
             return false;
         }
+        let description = description.filter(|d| !d.trim().is_empty());
         self.filter_presets.upsert(
             SEARCH_PRESET_SCREEN_ID.to_string(),
             name.to_string(),
-            description.filter(|d| !d.trim().is_empty()),
+            description.clone(),
             self.current_preset_values(),
         );
         self.persist_filter_presets();
+        // The mailbox's recipes are the web UI's saved searches: mirror the
+        // preset there so it is one click away in the browser too.
+        self.save_current_as_recipe(name, description.as_deref().unwrap_or_default());
         true
     }
 
@@ -1675,7 +1712,33 @@ impl SearchCockpitScreen {
         if removed {
             self.persist_filter_presets();
         }
-        removed
+        let recipe_removed = self.remove_recipe_named(name);
+        removed || recipe_removed
+    }
+
+    /// Delete the mailbox recipe of that name (the web UI's saved search).
+    fn remove_recipe_named(&mut self, name: &str) -> bool {
+        let Some(pos) = self.saved_recipes.iter().position(|r| r.name == name) else {
+            return false;
+        };
+        let Some(id) = self.saved_recipes[pos].id else {
+            return false;
+        };
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        let deleted = self
+            .open_live_metadata_operation_db_connection()
+            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen delete recipe"))
+            .and_then(|conn| delete_recipe(&conn, id));
+        match deleted {
+            Ok(()) => {
+                self.saved_recipes.remove(pos);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "search screen failed deleting recipe {name:?}");
+                false
+            }
+        }
     }
 
     fn open_save_preset_dialog(&mut self) {
@@ -1689,12 +1752,13 @@ impl SearchCockpitScreen {
 
     fn open_load_preset_dialog(&mut self) {
         self.preset_dialog_mode = PresetDialogMode::Load;
-        let names = self.preset_names();
-        if names.is_empty() {
-            self.load_preset_cursor = 0;
-        } else {
-            self.load_preset_cursor = self.load_preset_cursor.min(names.len().saturating_sub(1));
+        // Pick up saved searches stored since the screen last read them.
+        if !self.metadata_database_url.is_empty() {
+            self.recipes_loaded = false;
+            self.ensure_recipes_loaded();
         }
+        let entries = self.load_dialog_entries();
+        self.load_preset_cursor = self.load_preset_cursor.min(entries.len().saturating_sub(1));
     }
 
     fn handle_save_dialog_key(&mut self, key: &ftui::KeyEvent) {
@@ -1725,35 +1789,44 @@ impl SearchCockpitScreen {
     }
 
     fn handle_load_dialog_key(&mut self, key: &ftui::KeyEvent) {
-        let names = self.preset_names();
+        let entries = self.load_dialog_entries();
         match key.code {
             KeyCode::Escape => self.preset_dialog_mode = PresetDialogMode::None,
-            KeyCode::Char('j') | KeyCode::Down if !names.is_empty() => {
-                self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down if !entries.is_empty() => {
+                self.load_preset_cursor = (self.load_preset_cursor + 1).min(entries.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
             }
             KeyCode::Delete => {
-                if let Some(name) = names.get(self.load_preset_cursor) {
-                    let _ = self.remove_named_preset(name);
+                match entries.get(self.load_preset_cursor) {
+                    Some(LoadDialogEntry::Preset(name)) => {
+                        let _ = self.remove_named_preset(name);
+                    }
+                    Some(LoadDialogEntry::Recipe(recipe)) => {
+                        let _ = self.remove_recipe_named(&recipe.name);
+                    }
+                    None => {}
                 }
-                let refreshed = self.preset_names();
-                if refreshed.is_empty() {
+                let remaining = self.load_dialog_entries().len();
+                if remaining == 0 {
                     self.load_preset_cursor = 0;
                     self.preset_dialog_mode = PresetDialogMode::None;
                 } else {
-                    self.load_preset_cursor = self
-                        .load_preset_cursor
-                        .min(refreshed.len().saturating_sub(1));
+                    self.load_preset_cursor = self.load_preset_cursor.min(remaining - 1);
                 }
             }
-            KeyCode::Enter => {
-                if let Some(name) = names.get(self.load_preset_cursor) {
+            KeyCode::Enter => match entries.get(self.load_preset_cursor) {
+                Some(LoadDialogEntry::Preset(name)) => {
                     let _ = self.apply_named_preset(name);
                     self.preset_dialog_mode = PresetDialogMode::None;
                 }
-            }
+                Some(LoadDialogEntry::Recipe(recipe)) => {
+                    self.load_recipe(recipe);
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+                None => {}
+            },
             _ => {}
         }
     }
@@ -2656,11 +2729,12 @@ impl SearchCockpitScreen {
         self.history_cursor = None;
     }
 
-    /// Save current search state as a named recipe.
-    #[allow(dead_code)] // In-progress: called once recipe save UI is wired up.
-    fn save_current_as_recipe(&mut self, name: String) {
-        let recipe = SearchRecipe {
-            name,
+    /// Save the current search state as the mailbox recipe of that name,
+    /// replacing an existing one (keeping its pin and use count).
+    fn save_current_as_recipe(&mut self, name: &str, description: &str) {
+        let mut recipe = SearchRecipe {
+            name: name.to_string(),
+            description: description.to_string(),
             query_text: self.query_input.value().trim().to_string(),
             doc_kind: self.doc_kind_filter.route_value().to_string(),
             scope_mode: self.scope_mode,
@@ -2674,15 +2748,41 @@ impl SearchCockpitScreen {
             thread_filter: self.thread_filter.clone(),
             ..Default::default()
         };
+        // Decide update-or-insert against the mailbox, not a stale list (the
+        // web UI or another TUI may have changed it since it was read).
+        if !self.metadata_database_url.is_empty() {
+            self.recipes_loaded = false;
+            self.ensure_recipes_loaded();
+        }
+        let existing = self
+            .saved_recipes
+            .iter()
+            .position(|r| r.name == name)
+            .and_then(|pos| self.saved_recipes[pos].id.map(|id| (pos, id)));
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        if let Ok(conn) = self
+        let Ok(conn) = self
             .open_live_metadata_operation_db_connection()
-            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen insert recipe"))
-            && let Ok(id) = insert_recipe(&conn, &recipe)
-        {
-            let mut saved = recipe;
-            saved.id = Some(id);
-            self.saved_recipes.insert(0, saved);
+            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen save recipe"))
+        else {
+            return;
+        };
+        if let Some((pos, id)) = existing {
+            let current = &self.saved_recipes[pos];
+            recipe.id = Some(id);
+            recipe.pinned = current.pinned;
+            recipe.use_count = current.use_count;
+            recipe.created_ts = current.created_ts;
+            match update_recipe(&conn, &recipe) {
+                Ok(()) => self.saved_recipes[pos] = recipe,
+                Err(error) => {
+                    tracing::warn!(error = %error, "search screen failed updating recipe {name:?}");
+                }
+            }
+            return;
+        }
+        if let Ok(id) = insert_recipe(&conn, &recipe) {
+            recipe.id = Some(id);
+            self.saved_recipes.insert(0, recipe);
             // Evict oldest non-pinned recipes when over the cap.
             while self.saved_recipes.len() > MAX_RECIPES {
                 if let Some(pos) = self.saved_recipes.iter().rposition(|r| !r.pinned) {
@@ -2695,10 +2795,10 @@ impl SearchCockpitScreen {
     }
 
     /// Load a recipe into the current search state.
-    #[allow(dead_code)] // In-progress: called once recipe load UI is wired up.
     fn load_recipe(&mut self, recipe: &SearchRecipe) {
         self.query_input.set_value(&recipe.query_text);
         self.scope_mode = recipe.scope_mode;
+        self.importance_filter = ImportanceFilter::from_persist(&recipe.importance_filter);
         self.doc_kind_filter = match recipe.doc_kind.as_str() {
             "agents" => DocKindFilter::Agents,
             "projects" => DocKindFilter::Projects,
@@ -3365,7 +3465,8 @@ impl MailScreen for SearchCockpitScreen {
                         KeyCode::Char('L') => {
                             self.query_lab_visible = !self.query_lab_visible;
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear all (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.query_input.clear();
                             self.reset_facets();
                             self.results.clear();
@@ -3689,7 +3790,11 @@ impl MailScreen for SearchCockpitScreen {
                 self.save_preset_field,
             ),
             PresetDialogMode::Load => {
-                let names = self.preset_names();
+                let names: Vec<String> = self
+                    .load_dialog_entries()
+                    .iter()
+                    .map(LoadDialogEntry::label)
+                    .collect();
                 render_load_preset_dialog(frame, area, &names, self.load_preset_cursor);
             }
             PresetDialogMode::None => {}
@@ -3755,7 +3860,7 @@ impl MailScreen for SearchCockpitScreen {
                 action: "Timeline at time",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear all",
             },
             HelpEntry {
@@ -6191,7 +6296,7 @@ mod tests {
             "query history should load from the live configured db"
         );
 
-        screen.save_current_as_recipe("New Recipe".to_string());
+        screen.save_current_as_recipe("New Recipe", "");
         let existing_recipe = screen
             .saved_recipes
             .iter()
@@ -6221,6 +6326,42 @@ mod tests {
                 .any(|entry| entry.query_text == "archive-search-token"),
             "query history writes should persist into the live configured db"
         );
+        drop(live_conn);
+
+        // Re-saving under the same name replaces that saved search (the web
+        // UI lists each recipe as a link) instead of adding a duplicate.
+        screen.query_input.set_value("revised query");
+        screen.save_current_as_recipe("New Recipe", "revised");
+        let named = |name: &str| {
+            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+            list_recipes(&conn)
+                .expect("list recipes")
+                .into_iter()
+                .filter(|recipe| recipe.name == name)
+                .collect::<Vec<_>>()
+        };
+        let saved = named("New Recipe");
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(saved[0].query_text, "revised query");
+        assert_eq!(saved[0].description, "revised");
+
+        // The Load dialog offers it (no preset of that name exists), Enter
+        // applies it, and Del removes the saved search from the mailbox.
+        screen.query_input.set_value("something else");
+        screen.preset_dialog_mode = PresetDialogMode::Load;
+        let entries = screen.load_dialog_entries();
+        let row = entries
+            .iter()
+            .position(|entry| entry.label() == "New Recipe (saved search)")
+            .expect("saved search row");
+        screen.load_preset_cursor = row;
+        screen.handle_load_dialog_key(&ftui::KeyEvent::new(KeyCode::Enter));
+        assert_eq!(screen.query_input.value(), "revised query");
+        screen.preset_dialog_mode = PresetDialogMode::Load;
+        screen.load_preset_cursor = row;
+        screen.handle_load_dialog_key(&ftui::KeyEvent::new(KeyCode::Delete));
+        let ids: Vec<Option<i64>> = named("New Recipe").iter().map(|r| r.id).collect();
+        assert_eq!(ids, [] as [Option<i64>; 0]);
     }
 
     #[test]
@@ -6441,7 +6582,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_clears_query_and_refreshes_results_immediately() {
+    fn capital_x_clears_query_and_refreshes_results_immediately() {
         let config = mcp_agent_mail_core::Config::default();
         let state = crate::tui_bridge::TuiSharedState::new(&config);
         let mut screen = SearchCockpitScreen::new();
@@ -6468,11 +6609,8 @@ mod tests {
         });
         screen.search_dirty = true;
 
-        let clear = Event::Key(ftui::KeyEvent {
-            code: KeyCode::Char('c'),
-            kind: KeyEventKind::Press,
-            modifiers: Modifiers::CTRL,
-        });
+        // X, not Ctrl+C: the shell owns Ctrl+C, so it never reaches a screen.
+        let clear = Event::Key(ftui::KeyEvent::new(KeyCode::Char('X')));
         let _ = screen.update(&clear, &state);
 
         assert_eq!(screen.query_input.value(), "");
@@ -6506,6 +6644,19 @@ mod tests {
         assert!(screen.consumes_text_input());
         screen.focus = Focus::FacetRail;
         assert!(!screen.consumes_text_input());
+    }
+
+    #[test]
+    fn capital_x_clears_query_and_facets_from_the_result_list() {
+        let mut screen = SearchCockpitScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.query_input.set_value("deploy");
+        screen.search_mode = SearchModeFilter::Hybrid;
+        assert_eq!(screen.focus, Focus::ResultList);
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.query_input.value(), "");
+        assert_eq!(screen.search_mode, SearchModeFilter::default());
     }
 
     #[test]

@@ -3346,8 +3346,9 @@ impl MailScreen for MessageBrowserScreen {
                             }
                             return Cmd::None;
                         }
-                        // Mark selected message for keyboard move.
-                        KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Mark (cut) selected message for keyboard move. Not
+                        // Ctrl+M: terminals send it as the same byte as Enter.
+                        KeyCode::Char('x') if key.modifiers.contains(Modifiers::CTRL) => {
                             self.mark_selected_result_for_keyboard_move(state);
                             return Cmd::None;
                         }
@@ -3355,8 +3356,8 @@ impl MailScreen for MessageBrowserScreen {
                         KeyCode::Char('v') if key.modifiers.contains(Modifiers::CTRL) => {
                             return self.execute_keyboard_move_to_selected_context(state);
                         }
-                        // Clear search
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear search (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.search_input.clear();
                             self.search_dirty = true;
                             self.debounce_remaining = 0;
@@ -3799,12 +3800,12 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Exit search / cancel move",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear search",
             },
             HelpEntry {
-                key: "Ctrl+M / Ctrl+V",
-                action: "Mark message / drop to current thread",
+                key: "Ctrl+X / Ctrl+V",
+                action: "Cut message / paste into current thread",
             },
             HelpEntry {
                 key: "p/P",
@@ -7189,14 +7190,27 @@ first body
     }
 
     #[test]
-    fn ctrl_m_marks_selected_message_for_keyboard_move() {
+    fn capital_x_clears_the_search_from_the_result_list() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_input.set_value("deploy");
+        screen.focus = Focus::ResultList;
+        screen.search_dirty = false;
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.search_input.value(), "");
+        assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn ctrl_x_marks_selected_message_for_keyboard_move() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
         screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
         screen.cursor = 0;
 
-        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         assert!(matches!(cmd, Cmd::None));
         let marker = state
             .keyboard_move_snapshot()
@@ -7206,7 +7220,7 @@ first body
     }
 
     #[test]
-    fn ctrl_m_replaces_existing_keyboard_move_marker() {
+    fn ctrl_x_replaces_existing_keyboard_move_marker() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
@@ -7215,9 +7229,9 @@ first body
             test_message_entry(11, "thread-b", "Subject B"),
         ];
 
-        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let _ = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         screen.cursor = 1;
-        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let _ = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
 
         let marker = state
             .keyboard_move_snapshot()
@@ -8290,18 +8304,15 @@ first body
     }
 
     #[test]
-    fn ctrl_c_resets_preset() {
+    fn capital_x_resets_preset() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.apply_preset(2);
         assert_eq!(screen.preset_index, 2);
 
-        let ctrl_c = Event::Key(ftui::KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: Modifiers::CTRL,
-            kind: KeyEventKind::Press,
-        });
-        screen.update(&ctrl_c, &state);
+        // X, not Ctrl+C: the shell owns Ctrl+C, so it never reaches a screen.
+        let clear = Event::Key(ftui::KeyEvent::new(KeyCode::Char('X')));
+        screen.update(&clear, &state);
         assert_eq!(screen.preset_index, 0);
         assert_eq!(screen.search_input.value(), "");
     }

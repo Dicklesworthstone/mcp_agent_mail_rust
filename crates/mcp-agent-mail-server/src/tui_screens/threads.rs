@@ -1533,7 +1533,9 @@ impl MailScreen for ThreadExplorerScreen {
                 state.clear_keyboard_move_snapshot();
                 return Cmd::None;
             }
-            if key.code == KeyCode::Char('m') && key.modifiers.contains(Modifiers::CTRL) {
+            // Ctrl+X cuts (marks) and Ctrl+V pastes (moves). Not Ctrl+M:
+            // terminals send it as the same byte as Enter.
+            if key.code == KeyCode::Char('x') && key.modifiers.contains(Modifiers::CTRL) {
                 self.mark_selected_message_for_keyboard_move(state);
                 return Cmd::None;
             }
@@ -1631,8 +1633,8 @@ impl MailScreen for ThreadExplorerScreen {
                         KeyCode::Char('v') => {
                             self.view_lens = self.view_lens.next();
                         }
-                        // Clear filter
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear filter (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.filter_text.clear();
                             self.list_dirty = true;
                         }
@@ -2189,8 +2191,8 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Drag message to thread row",
             },
             HelpEntry {
-                key: "Ctrl+M / Ctrl+V",
-                action: "Mark message / drop to selected thread",
+                key: "Ctrl+X / Ctrl+V",
+                action: "Cut message / paste into selected thread",
             },
             HelpEntry {
                 key: "Left/Right",
@@ -2225,7 +2227,7 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Filter threads",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear filter",
             },
             HelpEntry {
@@ -4791,14 +4793,33 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_marks_selected_detail_message_for_keyboard_move() {
+    fn capital_x_clears_the_filter_from_the_list_but_types_while_editing() {
+        let mut screen = ThreadExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let key = |c| Event::Key(ftui::KeyEvent::new(KeyCode::Char(c)));
+        // While the filter is being edited, X is text.
+        for c in ['/', 'a', 'X'] {
+            let _ = screen.update(&key(c), &state);
+        }
+        assert_eq!(screen.filter_text, "aX");
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert!(!screen.filter_editing);
+        // From the list X clears it (Ctrl+C never reaches a screen).
+        screen.list_dirty = false;
+        let _ = screen.update(&key('X'), &state);
+        assert_eq!(screen.filter_text, "");
+        assert!(screen.list_dirty);
+    }
+
+    #[test]
+    fn ctrl_x_marks_selected_detail_message_for_keyboard_move() {
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("t1", 3, 2));
         screen.detail_messages.push(make_message(77));
         screen.focus = Focus::DetailPanel;
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
-        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         assert!(matches!(cmd, Cmd::None));
         let marker = state
             .keyboard_move_snapshot()

@@ -12,7 +12,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -1514,8 +1514,8 @@ impl MailScreen for MailExplorerScreen {
                             self.pressure_dirty = true;
                         }
                     }
-                    // Clear all
-                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                    // Clear all (not Ctrl+C: the shell always takes it)
+                    KeyCode::Char('X') => {
                         self.search_input.clear();
                         self.reset_filters();
                     }
@@ -1690,7 +1690,7 @@ impl MailScreen for MailExplorerScreen {
                 action: "Scroll detail",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear all",
             },
             HelpEntry {
@@ -2478,6 +2478,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui::Modifiers;
     use ftui_harness::buffer_to_text;
     use std::collections::HashSet;
 
@@ -3291,6 +3292,21 @@ mod tests {
             bindings.iter().any(|h| h.key == "P"),
             "P keybinding should be listed"
         );
+    }
+
+    #[test]
+    fn capital_x_clears_search_and_filters_from_the_result_list() {
+        let mut screen = MailExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.search_input.set_value("deploy");
+        screen.direction = Direction::Inbound;
+        screen.agent_filter = "TestAgent".to_string();
+        assert_eq!(screen.focus, Focus::ResultList);
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.search_input.value(), "");
+        assert_eq!(screen.direction, Direction::All);
+        assert_eq!(screen.agent_filter, "");
     }
 
     #[test]

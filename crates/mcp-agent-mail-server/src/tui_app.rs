@@ -104,6 +104,10 @@ const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const HOUSEKEEPING_EVENTS_PER_TICK: usize = 192;
+/// Message toasts closer together than this coalesce into one summary, so a
+/// busy swarm neither floods the stack nor keeps toast animations (and with
+/// them the fast tick) running continuously (GH#338).
+const MESSAGE_TOAST_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const RESERVATION_EXPIRY_SCAN_TICK_DIVISOR: u64 = 10;
 const MAX_DEFERRED_ACTIONS_PER_TICK: usize = 64;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
@@ -533,6 +537,42 @@ enum TransitionKind {
 enum TransitionDirection {
     Forward,
     Backward,
+}
+
+/// Coalesces per-message toasts: one shows, those within
+/// [`MESSAGE_TOAST_MIN_INTERVAL`] of it are counted, and the count surfaces as
+/// one summary once the interval has passed.
+#[derive(Debug, Default)]
+struct MessageToastWindow {
+    last_shown: Option<Instant>,
+    suppressed: u32,
+}
+
+impl MessageToastWindow {
+    fn quiet_since_last(&self, now: Instant) -> bool {
+        self.last_shown
+            .is_none_or(|shown| now.saturating_duration_since(shown) >= MESSAGE_TOAST_MIN_INTERVAL)
+    }
+
+    /// Whether a message toast at `now` shows; otherwise it is counted.
+    fn admit(&mut self, now: Instant) -> bool {
+        if self.quiet_since_last(now) {
+            self.last_shown = Some(now);
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    /// The number of counted toasts to summarize, once the interval allows.
+    fn take_summary(&mut self, now: Instant) -> Option<u32> {
+        if self.suppressed == 0 || !self.quiet_since_last(now) {
+            return None;
+        }
+        self.last_shown = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1516,6 +1556,8 @@ pub struct MailAppModel {
     git_segfault_toast_enabled: bool,
     /// Session state for git segfault retry toast suppression/escalation.
     git_segfault_retry_toasts: GitSegfaultRetryToastState,
+    /// Rate limit for per-message toasts under load.
+    message_toasts: MessageToastWindow,
     /// Per-severity auto-dismiss durations (seconds).
     toast_info_dismiss_secs: u64,
     toast_warn_dismiss_secs: u64,
@@ -1674,6 +1716,7 @@ impl MailAppModel {
             toast_muted: false,
             git_segfault_toast_enabled: true,
             git_segfault_retry_toasts: GitSegfaultRetryToastState::default(),
+            message_toasts: MessageToastWindow::default(),
             toast_info_dismiss_secs: 5,
             toast_warn_dismiss_secs: 8,
             toast_error_dismiss_secs: 15,
@@ -4294,6 +4337,23 @@ impl MailAppModel {
         let new_events = self
             .state
             .events_since_limited(self.last_toast_seq, HOUSEKEEPING_EVENTS_PER_TICK);
+        // Surface message toasts held back by the last burst before this
+        // batch's own, so notifications stay in order.
+        let toast_now = Instant::now();
+        if let Some(held) = self.message_toasts.take_summary(toast_now)
+            && !self.toast_muted
+        {
+            let noun = if held == 1 {
+                "notification"
+            } else {
+                "notifications"
+            };
+            let summary = Toast::new(format!("+{held} more message {noun}"))
+                .icon(ToastIcon::Info)
+                .style(Style::default().fg(toast_color_info()))
+                .duration(Duration::from_secs(4));
+            self.notifications.notify(self.apply_toast_policy(summary));
+        }
         let mut reservation_tracker_changed = false;
         for event in &new_events {
             self.last_toast_seq = event.seq().max(self.last_toast_seq);
@@ -4348,7 +4408,13 @@ impl MailAppModel {
             if !self.toast_muted
                 && let Some(toast) = safe_toast_for_event(event, self.toast_severity)
             {
-                self.notifications.notify(self.apply_toast_policy(toast));
+                let is_message = matches!(
+                    event,
+                    MailEvent::MessageSent { .. } | MailEvent::MessageReceived { .. }
+                );
+                if !is_message || self.message_toasts.admit(toast_now) {
+                    self.notifications.notify(self.apply_toast_policy(toast));
+                }
             }
         }
 
@@ -4858,6 +4924,12 @@ impl Model for MailAppModel {
 
                     if is_ctrl_d {
                         return self.detach_tui_headless();
+                    }
+                    // A pending keyboard move (Ctrl+X) is app-wide state, so
+                    // Esc cancels it from any screen before it arms quit.
+                    if is_escape && !text_mode && self.state.keyboard_move_snapshot().is_some() {
+                        self.state.clear_keyboard_move_snapshot();
+                        return Cmd::none();
                     }
                     if is_escape && !text_mode {
                         return self.handle_quit_confirmation_input(QuitConfirmSource::Escape);
@@ -9091,6 +9163,58 @@ mod tests {
     }
 
     #[test]
+    fn message_toast_window_shows_sparse_messages_and_summarizes_bursts() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut window = MessageToastWindow::default();
+        // Messages further apart than the interval each show.
+        assert!(window.admit(at(0)));
+        assert_eq!(window.take_summary(at(2_500)), None, "nothing held back");
+        assert!(window.admit(at(2_500)));
+        // A burst inside the interval is counted, then summarized once.
+        for ms in [2_600, 3_000, 4_000] {
+            assert!(!window.admit(at(ms)));
+        }
+        assert_eq!(window.take_summary(at(4_400)), None, "interval not over");
+        assert_eq!(window.take_summary(at(4_500)), Some(3));
+        assert_eq!(window.take_summary(at(9_000)), None);
+        // The summary restarts the interval like a shown toast does.
+        assert!(!window.admit(at(5_000)));
+        assert!(window.admit(at(9_000)));
+    }
+
+    #[test]
+    fn a_burst_of_message_events_raises_one_message_toast() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 64);
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        for id in 0..10 {
+            assert!(state.push_event(MailEvent::message_sent(
+                id,
+                "RedFox",
+                vec!["BlueLake".to_string()],
+                "Subject",
+                "thread-1",
+                "proj",
+                "",
+            )));
+        }
+        // Non-message toasts in the same batch are not rate limited.
+        assert!(state.push_event(MailEvent::agent_registered(
+            "GoldFox",
+            "codex-cli",
+            "gpt-5-codex",
+            "proj",
+        )));
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        let toasts = model.notifications.pending_count() + model.notifications.visible_count();
+        assert_eq!(toasts, 2, "one message toast plus the registration toast");
+        assert_eq!(model.message_toasts.suppressed, 9);
+    }
+
+    #[test]
     fn housekeeping_event_processing_is_bounded_per_tick() {
         let config = Config::default();
         let total_events = HOUSEKEEPING_EVENTS_PER_TICK + 17;
@@ -9602,6 +9726,33 @@ mod tests {
         let second = model.update(MailMsg::Terminal(esc));
         assert!(model.state.is_shutdown_requested());
         assert!(matches!(second, Cmd::Quit));
+    }
+
+    #[test]
+    fn escape_cancels_a_pending_keyboard_move_before_arming_quit() {
+        let mut model = test_model();
+        // Agents does not claim Esc, so this is the shell's own handling.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Agents));
+        model
+            .state
+            .set_keyboard_move_snapshot(Some(crate::tui_bridge::KeyboardMoveSnapshot {
+                message_id: 7,
+                subject: "Subj".to_string(),
+                source_thread_id: "t1".to_string(),
+                source_project_slug: "project".to_string(),
+            }));
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+
+        // The first Esc only cancels the move ...
+        let first = model.update(MailMsg::Terminal(esc.clone()));
+        assert!(matches!(first, Cmd::None));
+        assert!(model.state.keyboard_move_snapshot().is_none());
+        // ... so quitting still takes the usual two presses after it.
+        let second = model.update(MailMsg::Terminal(esc.clone()));
+        assert!(matches!(second, Cmd::None));
+        assert!(!model.state.is_shutdown_requested());
+        let third = model.update(MailMsg::Terminal(esc));
+        assert!(matches!(third, Cmd::Quit));
     }
 
     #[test]
