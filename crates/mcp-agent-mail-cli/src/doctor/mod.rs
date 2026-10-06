@@ -480,8 +480,12 @@ fn reservation_parity_reconciling(
     }
     let rows = drift.release_pending_rows;
     let fix = fixers::fix_only_command("fm-db-state-files-reservation-db-archive-parity");
-    let recent =
-        |ts_us: i64| now_us.saturating_sub(ts_us) <= RESERVATION_RECONCILE_PROGRESS_WINDOW_US;
+    // A time further in the future than clock skew explains is not evidence
+    // of recent progress (the clock moved back since it was written).
+    let recent = |ts_us: i64| {
+        ts_us <= now_us.saturating_add(reservation_reconcile::PROGRESS_CLOCK_SKEW_US)
+            && now_us.saturating_sub(ts_us) <= RESERVATION_RECONCILE_PROGRESS_WINDOW_US
+    };
     let window_min = RESERVATION_RECONCILE_PROGRESS_WINDOW_US / 60_000_000;
     let Some(progress) = progress.filter(|progress| recent(progress.pass_us)) else {
         return Err(Some(format!(
@@ -4787,6 +4791,15 @@ mod tests {
                 Some(progress(now - minute, Some(now - 30 * minute))),
             ),
             ("never repaired", Some(progress(now - minute, None))),
+            // Written before the clock was stepped back: not recent.
+            (
+                "future repair",
+                Some(progress(now - minute, Some(now + 30 * minute))),
+            ),
+            (
+                "future pass",
+                Some(progress(now + 30 * minute, Some(now + 30 * minute))),
+            ),
         ] {
             let stalled = reservation_parity_reconciling(&pending, progress.as_ref(), now)
                 .expect_err(label)

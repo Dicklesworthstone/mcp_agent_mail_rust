@@ -72,6 +72,10 @@ pub struct ReservationReconcileReport {
 
 const PROGRESS_FILE: &str = "reservation-reconcile.json";
 const MAX_PROGRESS_BYTES: u64 = 4096;
+/// How far in the future a recorded progress time may lie and still count:
+/// beyond it the clock moved backwards, and a future time must not read as
+/// recent progress (or survive the max-merge) indefinitely.
+pub const PROGRESS_CLOCK_SKEW_US: i64 = 60 * 1_000_000;
 
 /// What `am doctor health` needs to tell a converging reconciler from a stuck
 /// or absent one: when the last pass completed and when one last republished
@@ -113,7 +117,10 @@ pub fn record_progress(
     }
     let mut merged = progress.clone();
     if let Some(previous) = read_progress(storage_root) {
-        merged.last_repair_us = merged.last_repair_us.max(previous.last_repair_us);
+        let previous_repair = previous
+            .last_repair_us
+            .filter(|ts_us| *ts_us <= progress.pass_us.saturating_add(PROGRESS_CLOCK_SKEW_US));
+        merged.last_repair_us = merged.last_repair_us.max(previous_repair);
     }
     let body = serde_json::to_vec(&merged).map_err(std::io::Error::other)?;
     let tmp = dir.join(format!(".{PROGRESS_FILE}.{}.tmp", std::process::id()));
@@ -833,6 +840,21 @@ mod tests {
                 ..idle
             })
         );
+        // A repair time from the future (written before the clock was
+        // stepped back) is dropped, not kept "recent" forever by the merge.
+        let future = ReservationReconcileProgress {
+            pid: 3,
+            pass_us: 300 + 10 * PROGRESS_CLOCK_SKEW_US,
+            last_repair_us: Some(300 + 10 * PROGRESS_CLOCK_SKEW_US),
+        };
+        record_progress(root.path(), &future).unwrap();
+        let after_step_back = ReservationReconcileProgress {
+            pid: 4,
+            pass_us: 400,
+            last_repair_us: None,
+        };
+        record_progress(root.path(), &after_step_back).unwrap();
+        assert_eq!(read_progress(root.path()), Some(after_step_back));
         // Garbage reads as absent rather than as progress.
         fs::write(progress_path(root.path()), b"not json").unwrap();
         assert_eq!(read_progress(root.path()), None);

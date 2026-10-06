@@ -726,10 +726,29 @@ fn compare_reservation_pair(
     drift: &mut ReservationParityDriftSummary,
     examples: &mut Vec<ReservationParityExample>,
 ) {
+    let identity = |drift: &ReservationParityDriftSummary| {
+        (
+            drift.agent_id_mismatches,
+            drift.path_pattern_mismatches,
+            drift.exclusive_mismatches,
+            drift.thread_provenance_mismatches,
+        )
+    };
     let before = drift.total();
+    let identity_before = identity(drift);
     compare_reservation_fields(db, archive, drift, examples);
     let row_mismatches = drift.total() - before;
-    if row_mismatches > 0 && db.active_status() == "released" && archive.active_status() == "active"
+    // The release reconciler republishes only an artifact whose identity
+    // matches the live row (and that carries the fields it checks); it defers
+    // anything else on every pass, so only release-field drift on such an
+    // artifact is drift it is converging.
+    let republishable = identity(drift) == identity_before
+        && archive.path_pattern.is_some()
+        && archive.exclusive.is_some();
+    if row_mismatches > 0
+        && republishable
+        && db.active_status() == "released"
+        && archive.active_status() == "active"
     {
         drift.release_pending_rows += 1;
         drift.release_pending_mismatches += row_mismatches;
@@ -1639,11 +1658,16 @@ mod tests {
         assert_eq!(drift.release_pending_rows, 1);
         assert_eq!(drift.release_pending_mismatches, drift.total());
 
-        // Every other mismatch on that row converges with it (the artifact is
-        // republished whole from SQLite), so it counts as pending too.
+        // An identity mismatch (path, agent, exclusive, thread) or a legacy
+        // artifact without the fields the reconciler checks is never
+        // republished, so none of that row's drift is pending.
         let (drift, _) = run_compare(&released, &archive_state(Some("src/b.rs"), Some(true)));
         assert_eq!(drift.total(), 3);
-        assert_eq!(drift.release_pending_mismatches, 3);
+        assert_eq!(drift.release_pending_rows, 0);
+        assert_eq!(drift.release_pending_mismatches, 0);
+        let (drift, _) = run_compare(&released, &archive_state(None, Some(true)));
+        assert_eq!(drift.total(), 2);
+        assert_eq!(drift.release_pending_rows, 0);
 
         // The opposite direction is not the reconciler's to repair: the
         // archive says released while SQLite holds a live lease.
