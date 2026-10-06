@@ -3087,26 +3087,9 @@ fn guard_install_status_uninstall_smoke() {
 #[test]
 fn guard_check_conflict_exits_1_when_not_advisory() {
     let env = TestEnv::new();
-    let repo = env.tmp.path().join("archive_root");
-    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
-
-    // Active exclusive reservation held by someone else.
-    let reservation = serde_json::json!({
-        "path_pattern": "foo.txt",
-        "agent_name": "OtherAgent",
-        "exclusive": true,
-        "expires_ts": "2999-01-01T00:00:00Z",
-        "released_ts": serde_json::Value::Null,
-    });
-    std::fs::write(
-        repo.join("file_reservations").join("res.json"),
-        serde_json::to_string_pretty(&reservation).unwrap(),
-    )
-    .expect("write reservation");
-
-    let repo_str = repo.to_string_lossy().to_string();
+    let repo_str = guard_repo_with_foreign_reservation(&env);
     let out = run_am(
-        &env.base_env(),
+        &guard_blocking_env(&env),
         Some(env.tmp.path()),
         &["guard", "check", "--repo", &repo_str],
         Some(b"foo.txt\n"),
@@ -3128,25 +3111,9 @@ fn guard_check_conflict_exits_1_when_not_advisory() {
 #[test]
 fn guard_check_advisory_does_not_exit_1() {
     let env = TestEnv::new();
-    let repo = env.tmp.path().join("archive_root");
-    std::fs::create_dir_all(repo.join("file_reservations")).expect("create file_reservations dir");
-
-    let reservation = serde_json::json!({
-        "path_pattern": "foo.txt",
-        "agent_name": "OtherAgent",
-        "exclusive": true,
-        "expires_ts": "2999-01-01T00:00:00Z",
-        "released_ts": serde_json::Value::Null,
-    });
-    std::fs::write(
-        repo.join("file_reservations").join("res.json"),
-        serde_json::to_string_pretty(&reservation).unwrap(),
-    )
-    .expect("write reservation");
-
-    let repo_str = repo.to_string_lossy().to_string();
+    let repo_str = guard_repo_with_foreign_reservation(&env);
     let out = run_am(
-        &env.base_env(),
+        &guard_blocking_env(&env),
         Some(env.tmp.path()),
         &["guard", "check", "--advisory", "--repo", &repo_str],
         Some(b"foo.txt\n"),
@@ -3162,6 +3129,35 @@ fn guard_check_advisory_does_not_exit_1() {
         "expected conflict marker in stderr, got:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Without an agent identity the guard cannot tell whose reservations are
+/// foreign: warn mode (which never blocks) says nothing was checked and
+/// exits 0, while enforcing mode still refuses.
+#[test]
+fn guard_check_without_identity_warns_in_warn_mode_and_fails_when_enforcing() {
+    for (mode, warned) in [("warn", true), ("block", false)] {
+        let env = TestEnv::new();
+        let repo_str = guard_repo_with_foreign_reservation(&env);
+        let mut child_env: Vec<_> = guard_blocking_env(&env)
+            .into_iter()
+            .filter(|(var, _)| var != "AGENT_NAME")
+            .collect();
+        child_env.push(("AGENT_MAIL_GUARD_MODE".to_string(), mode.to_string()));
+        let out = run_am(
+            &child_env,
+            Some(env.tmp.path()),
+            &["guard", "check", "--repo", &repo_str],
+            Some(b"foo.txt\n"),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.success(), warned, "{mode}: stderr:\n{stderr}");
+        assert_eq!(
+            stderr.contains("no agent identity"),
+            warned,
+            "{mode}: stderr:\n{stderr}"
+        );
+    }
 }
 
 /// An archive root holding one active exclusive reservation on `foo.txt` by
@@ -3184,6 +3180,21 @@ fn guard_repo_with_foreign_reservation(env: &TestEnv) -> String {
     repo.to_string_lossy().to_string()
 }
 
+/// The guard switches pinned to "enforce", so a value exported in the shell
+/// running the tests (the hook's own refusal suggests
+/// AGENT_MAIL_GUARD_MODE=warn) cannot flip these results.
+fn guard_blocking_env(env: &TestEnv) -> Vec<(String, String)> {
+    let mut child_env = env.base_env();
+    for (var, value) in [
+        ("AGENT_MAIL_BYPASS", "0"),
+        ("AGENT_MAIL_GUARD_MODE", "block"),
+        ("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true"),
+    ] {
+        child_env.push((var.to_string(), value.to_string()));
+    }
+    child_env
+}
+
 /// `am guard check` honors the installed hook's switches; without one, the
 /// same conflict exits 1 (guard_check_conflict_exits_1_when_not_advisory).
 #[test]
@@ -3200,7 +3211,8 @@ fn guard_check_honors_bypass_warn_mode_and_disabled_enforcement() {
     ] {
         let env = TestEnv::new();
         let repo_str = guard_repo_with_foreign_reservation(&env);
-        let mut child_env = env.base_env();
+        // The pinned values first; the switch under test overrides one.
+        let mut child_env = guard_blocking_env(&env);
         child_env.push((var.to_string(), value.to_string()));
         let out = run_am(
             &child_env,

@@ -160,7 +160,7 @@ through its supervisor and confirm with `am doctor drain`; pass
 | 4 | refused_unsafe | State unsafe (schema mismatch, scope violation, unmet precondition) |
 | 5 | concurrency_lost | Another doctor invocation holds the lock |
 | 6 | online_required | Reserved; no verb takes `--online` today |
-| 64 | usage_error | Unknown flag / missing arg (POSIX EX_USAGE) |
+| 64 | usage_error | Arguments parse but name nothing valid: unknown FM or finding id, missing FM input (POSIX EX_USAGE). A flag or verb the parser rejects exits 2 |
 | 66 | no_input | Target path doesn't exist or isn't a recognized project |
 | 73 | cant_create | Couldn't create `.doctor/runs/<run-id>/` |
 | 74 | io_error | Filesystem I/O during read or non-mutating write |

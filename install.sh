@@ -3929,7 +3929,7 @@ check_git_version_known_bad() {
       warn "Remediation (in order):"
       warn "  1. Set AM_GIT_BINARY=/path/to/git-2.50.x in your shell profile"
       warn "  2. Upgrade system git to >= 2.51.1 once it is released"
-      warn "  3. Run 'am doctor fix-orphan-refs --all --dry-run' on damaged repos"
+      warn "  3. Run 'am doctor fix-orphan-refs --all' (dry run) on damaged repos"
       warn ""
       warn "Details: docs/RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
       warn ""

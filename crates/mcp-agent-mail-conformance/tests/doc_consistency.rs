@@ -417,10 +417,13 @@ fn intentionally_mutated_readme_is_rejected() {
 
 /// Split a documented command into shell words: whitespace separates words
 /// outside quotes, and the quotes are removed. No other expansion.
-fn shell_words(command: &str) -> Vec<String> {
+/// Each word records whether any of it was quoted: a quoted `#`, `|` or `>`
+/// is an argument, never a comment, pipe, or redirection.
+fn shell_words(command: &str) -> Vec<(String, bool)> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    let mut quoted = false;
     let mut quote = None;
     for c in command.chars() {
         match quote {
@@ -429,11 +432,13 @@ fn shell_words(command: &str) -> Vec<String> {
             None if c == '"' || c == '\'' => {
                 quote = Some(c);
                 in_word = true;
+                quoted = true;
             }
             None if c.is_whitespace() => {
                 if in_word {
-                    words.push(std::mem::take(&mut word));
+                    words.push((std::mem::take(&mut word), quoted));
                     in_word = false;
+                    quoted = false;
                 }
             }
             None => {
@@ -443,7 +448,7 @@ fn shell_words(command: &str) -> Vec<String> {
         }
     }
     if in_word {
-        words.push(word);
+        words.push((word, quoted));
     }
     words
 }
@@ -479,7 +484,7 @@ fn validate_cli_recipes(doc: &str, prefixes: &[&str]) -> Result<usize, String> {
             index += 1;
         }
         let words = shell_words(&line);
-        if words.iter().any(|word| word == "...") {
+        if words.iter().any(|(word, quoted)| !quoted && word == "...") {
             continue;
         }
         let placeholder = |word: &str| {
@@ -487,13 +492,19 @@ fn validate_cli_recipes(doc: &str, prefixes: &[&str]) -> Result<usize, String> {
         };
         let args: Vec<_> = words
             .iter()
-            .map(String::as_str)
-            .take_while(|word| {
-                *word != "\\"
-                    && (placeholder(word) || !word.starts_with(['|', '>', '<', '#']))
-                    && !word.starts_with("2>")
+            .take_while(|(word, quoted)| {
+                *quoted
+                    || (word != "\\"
+                        && (placeholder(word) || !word.starts_with(['|', '>', '<', '#']))
+                        && !word.starts_with("2>"))
             })
-            .map(|word| if placeholder(word) { "1" } else { word })
+            .map(|(word, _)| {
+                if placeholder(word) {
+                    "1"
+                } else {
+                    word.as_str()
+                }
+            })
             .collect();
         match mcp_agent_mail_cli::Cli::command().try_get_matches_from(args) {
             Ok(_) => checked += 1,
@@ -578,4 +589,11 @@ fn agent_facing_cli_recipes_parse_with_live_cli() {
     // Every rejected line is reported, not just the first.
     let both = check("am archive create a\nam guard check b\n").unwrap_err();
     assert!(both.contains("line 1") && both.contains("line 2"), "{both}");
+    // A quoted `#` or `|` is an argument, not a comment or pipe; an unquoted
+    // one still ends the command.
+    assert_eq!(
+        check("am mail send -p p --from A --to B --subject \"#12 | x\" --body b\n"),
+        Ok(1)
+    );
+    assert_eq!(check("am doctor check --json | jq '.healthy'\n"), Ok(1));
 }

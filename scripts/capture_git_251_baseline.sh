@@ -68,12 +68,12 @@ log "  found $segfault_count git segfault events in kernel log"
 # --- Damage census --------------------------------------------------------
 log "running per-project damage census → $out_dir/damage_census.jsonl"
 
-# Use am doctor fix-orphan-refs --all --dry-run --format json to get a
+# Use am doctor fix-orphan-refs --all --format json (a dry run) to get a
 # structured report of orphan refs across every registered project.
 # Pipe through jq to simplify to one line per project.
 : > "$out_dir/damage_census.jsonl"
 if command -v am >/dev/null 2>&1; then
-    am doctor fix-orphan-refs --all --dry-run --format json 2>/dev/null \
+    am doctor fix-orphan-refs --all --format json 2>/dev/null \
         | jq -c '.projects[]? | {
               project: .project,
               scanned_refs: .scanned_refs,

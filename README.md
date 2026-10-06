@@ -91,7 +91,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 19 agent-optimized CLI subcommands with `toon`/`json` output (`md` for thread and message views) for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing are controlled by the hybrid feature flag (`feature = "hybrid"`). |
+| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing need a build with the hybrid feature (`feature = "hybrid"`) and the runtime opt-in `AM_SEARCH_SEMANTIC_ENABLED=true`. Without both, every query runs lexical. |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -1337,7 +1337,7 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Write-behind cache** with dual-indexed ReadCache and deferred touch batching (30s flush)
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
-- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate, with portable/no-default builds retaining the deterministic lexical path.
+- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate and run only with `AM_SEARCH_SEMANTIC_ENABLED=true`; portable/no-default builds and the default runtime keep the deterministic lexical path.
 - **Compatibility testing** against intentionally retained Python wire contracts,
   plus Rust-native durability and behavior fixtures. The Rust implementation is
   authoritative; legacy parity never overrides reliability, security, bounded
@@ -1435,7 +1435,7 @@ The important boundary is this: Git stores the durable human-auditable artifacts
 
 1. A resource read, robot command, TUI view, or web request asks for mailbox or tooling state.
 2. The server resolves scope: project, agent, product, thread, search query, or tooling view.
-3. For direct state, an existing live SQLite mailbox answers through a query-only lane; it does not wait for archive reconstruction or the write-behind coalescer, and a read request does not create a missing project. `fetch_inbox` performs its optional read-receipt update separately after the bounded read. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is enabled.
+3. For direct state, an existing live SQLite mailbox answers through a query-only lane; it does not wait for archive reconstruction or the write-behind coalescer, and a read request does not create a missing project. `fetch_inbox` performs its optional read-receipt update separately after the bounded read. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is compiled in and `AM_SEARCH_SEMANTIC_ENABLED=true`.
 4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
 
 That consistency comes from a shared DB + archive + metrics pipeline. The TUI, web UI, robot CLI, and MCP resources are separate renderers over the same underlying state.
@@ -1447,7 +1447,7 @@ That consistency comes from a shared DB + archive + metrics pipeline. The TUI, w
 Search V3 is not an afterthought bolted onto mailbox rows. It is a dedicated query path with shared planning and diagnostics:
 
 - Queries are normalized, classified, and routed through a unified search service.
-- Lexical mode provides the baseline contract and diagnostics surface; semantic and hybrid modes extend that contract when the `hybrid` feature is enabled.
+- Lexical mode provides the baseline contract and diagnostics surface; semantic and hybrid modes extend that contract in a `hybrid`-feature build with `AM_SEARCH_SEMANTIC_ENABLED=true`. Otherwise a semantic, hybrid, or auto request runs lexical.
 - Candidate budgeting and fusion keep broad natural-language queries from exploding while preserving exact-match strength for identifiers and short phrases.
 - The same search path serves MCP tools, `am mail search`, `am robot search`, TUI search, and web UI search routes.
 - Empty or non-searchable queries route through a deterministic SQL plan before Search V3 candidate retrieval. Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is Search V3 plus that deterministic SQL plan, not a hidden FTS fallback.
@@ -1641,7 +1641,7 @@ These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which record
 
 #### Search V3 frankensearch lexical-tier baselines (2026-02-18)
 
-Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion are controlled by the `hybrid` feature.
+Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion need the `hybrid` feature and `AM_SEARCH_SEMANTIC_ENABLED=true`.
 
 | Corpus size | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 |
 |-------------|--------------|--------------|--------------|------------|
@@ -1790,7 +1790,7 @@ What `check` inspects:
 | Tools time out / "Database corruption detected" under heavy load | Inspect the timeout response or `health_check` timeout diagnostics: they report `contended_path`, whether that stage exceeded the client deadline, p99 pool-acquire/database-write/archive queue/archive-commit latency, and blocking-dispatch occupancy. An unattributed dispatch timeout is reported as such, not blamed on SQLite. Also run `am robot health --include-host --format json`; if `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, relieve host pressure before reconstructing. |
 | `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor check --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
-| `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |
+| `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all` (a dry run unless `--apply`). |
 
 ### Known-bad git versions
 

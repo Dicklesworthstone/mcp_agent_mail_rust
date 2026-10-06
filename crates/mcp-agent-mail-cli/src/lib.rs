@@ -2240,7 +2240,7 @@ pub enum MailCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Summarize a thread (requires LLM API key).
+    /// Summarize a thread through the running server (AI refinement only when the server's LLM is enabled).
     #[command(name = "summarize-thread")]
     SummarizeThread {
         /// Project key (slug or human_key).
@@ -11369,7 +11369,24 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
 
             // Honor the same escape hatches as the installed hook: bypass,
             // disabled enforcement, and warn mode.
-            let result = mcp_agent_mail_guard::guard_check_full(&archive_root, &repo_path, &paths)?;
+            let result = match mcp_agent_mail_guard::guard_check_full(
+                &archive_root,
+                &repo_path,
+                &paths,
+            ) {
+                // Warn mode never blocks, the hook included: without an agent
+                // identity it warns that nothing could be checked.
+                Err(mcp_agent_mail_guard::GuardError::MissingAgentName)
+                    if mcp_agent_mail_guard::GuardMode::from_env()
+                        == mcp_agent_mail_guard::GuardMode::Warn =>
+                {
+                    ftui_runtime::ftui_eprintln!(
+                        "AGENT_MAIL_GUARD_MODE=warn: no agent identity (set AGENT_NAME), so reservations were not checked."
+                    );
+                    return Ok(());
+                }
+                result => result?,
+            };
             if result.bypassed {
                 ftui_runtime::ftui_eprintln!(
                     "AGENT_MAIL_BYPASS is set: file reservation guard skipped."

@@ -436,7 +436,7 @@ scenario_banner_visible_after_findings() {
     json_file="$(wait_for_health_sweep_json "${scenario}" '.total_findings == 1 and .banner != null' 25)" || return 1
     banner="$(jq -r '.banner // ""' "${json_file}")"
     e2e_assert_contains "${scenario}: banner reports orphan refs" "${banner}" "registered projects have 1 orphan refs across 1 projects"
-    e2e_assert_contains "${scenario}: banner points to doctor dry-run" "${banner}" "am doctor fix-orphan-refs --all --dry-run"
+    e2e_assert_contains "${scenario}: banner points to doctor dry-run" "${banner}" "am doctor fix-orphan-refs --all"
 }
 
 scenario_dismissal_takes_effect_next_cycle() {

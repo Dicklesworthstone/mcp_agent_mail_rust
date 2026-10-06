@@ -103,7 +103,7 @@ am doctor check --format json | jq '.findings[] | select(.code == "GIT_2_51_0_IN
 
    ```bash
    # Dry-run (default): see what would be pruned
-   am doctor fix-orphan-refs --all --dry-run --format json
+   am doctor fix-orphan-refs --all --format json
 
    # Review, then apply
    am doctor fix-orphan-refs --all --apply
