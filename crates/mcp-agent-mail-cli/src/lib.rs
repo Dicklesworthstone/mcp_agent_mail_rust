@@ -38650,19 +38650,14 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let validated_limit = validate_mail_inbox_limit(limit)?;
-            let mut server_args = serde_json::json!({
-                "project_key": &project_key,
-                "agent_name": &agent_name,
-                "urgent_only": urgent_only,
-                "since_ts": since.as_deref(),
-                "limit": validated_limit,
-                "include_bodies": include_bodies,
-            });
-            if since.is_none()
-                && let Some(args) = server_args.as_object_mut()
-            {
-                args.remove("since_ts");
-            }
+            let server_args = mail_inbox_server_arguments(
+                &project_key,
+                &agent_name,
+                urgent_only,
+                since.as_deref(),
+                validated_limit,
+                include_bodies,
+            );
             let mut server_error: Option<String> = None;
             match try_call_server_tool(&server_url, bearer.as_deref(), "fetch_inbox", server_args)
                 .await
@@ -39533,11 +39528,13 @@ fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<String> {
     Err(CliError::InvalidArgument(message))
 }
 
-fn normalize_cli_macro_optional_agent_name(name: Option<String>) -> CliResult<String> {
-    match name {
-        Some(name) => normalize_cli_macro_agent_name_value(&name),
-        None => Ok(mcp_agent_mail_core::models::generate_agent_name()),
-    }
+/// Validate an explicit macro agent name. An omitted name stays omitted: the
+/// tool then reuses this pane's identity or draws a name no registered agent
+/// holds, whereas a name made up here is sent as explicit and would update
+/// (and rotate the token of) any existing agent that happens to own it.
+fn normalize_cli_macro_optional_agent_name(name: Option<String>) -> CliResult<Option<String>> {
+    name.map(|name| normalize_cli_macro_agent_name_value(&name))
+        .transpose()
 }
 
 fn normalize_cli_macro_required_agent_name(name: String) -> CliResult<String> {
@@ -40663,7 +40660,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     &human_key,
                     &program,
                     &model,
-                    Some(agent_name.as_str()),
+                    agent_name.as_deref(),
                     task.as_deref(),
                     &reserve_paths,
                     reserve_reason.as_deref(),
@@ -40715,7 +40712,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 human_key.clone(),
                 program.clone(),
                 model.clone(),
-                Some(agent_name),
+                agent_name,
                 task,
                 (!reserve_paths.is_empty()).then_some(reserve_paths),
                 reserve_reason,
@@ -40772,7 +40769,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                             "agent name is required when --no-register is set".into(),
                         )
                     })?;
-                (program, model, name)
+                (program, model, Some(name))
             };
             if let Some(payload) = call_contacts_tool_via_server(
                 &server_url,
@@ -40821,7 +40818,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                 thread_id,
                 program,
                 model,
-                Some(agent_name),
+                agent_name,
                 task,
                 Some(should_register),
                 Some(include_examples),
@@ -42146,6 +42143,9 @@ mod mail_server_cli_bridge_tests {
         assert!(!object.contains_key("file_reservation_paths"));
         assert!(!object.contains_key("file_reservation_ttl_seconds"));
         assert!(!object.contains_key("file_reservation_reason"));
+        // No --agent-name: the server picks (pane reuse or a collision-free
+        // fresh name), so nothing may be sent in its place.
+        assert!(!object.contains_key("agent_name"));
         assert!(!object.contains_key("agent_name"));
         assert!(!object.contains_key("task_description"));
     }
@@ -42624,12 +42624,16 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(
             crate::normalize_cli_macro_optional_agent_name(Some("bluelake".to_string()))
                 .expect("valid lowercase agent name should normalize"),
-            "BlueLake"
+            Some("BlueLake".to_string())
         );
 
-        let generated = crate::normalize_cli_macro_optional_agent_name(None)
-            .expect("omitted optional agent name should generate");
-        assert!(mcp_agent_mail_core::models::is_valid_agent_name(&generated));
+        // An omitted name is left to the tool, never invented here: a
+        // client-made name would be treated as an explicit identity.
+        assert_eq!(
+            crate::normalize_cli_macro_optional_agent_name(None)
+                .expect("omitted optional agent name is valid"),
+            None
+        );
 
         let err = crate::normalize_cli_macro_optional_agent_name(Some("   ".to_string()))
             .expect_err("blank explicit agent name should fail");
@@ -47050,6 +47054,27 @@ http_headers = { Authorization = "Bearer secret" }
     #[test]
     fn validate_mail_inbox_limit_accepts_positive_values() {
         assert_eq!(validate_mail_inbox_limit(20).expect("positive limit"), 20);
+    }
+
+    #[test]
+    fn mail_inbox_server_arguments_never_consume_unread_state() {
+        let args = mail_inbox_server_arguments("/tmp/demo", "BlueLake", true, None, 20, false);
+        // Listing must not mark rows read on the server path; the local
+        // fallback never does (GH#229 / GH#207).
+        assert_eq!(args["mark_read"], false);
+        assert_eq!(args["urgent_only"], true);
+        assert_eq!(args["limit"], 20);
+        assert!(args.get("since_ts").is_none());
+        let since = mail_inbox_server_arguments(
+            "/tmp/demo",
+            "BlueLake",
+            false,
+            Some("2026-10-05T00:00:00Z"),
+            5,
+            true,
+        );
+        assert_eq!(since["since_ts"], "2026-10-05T00:00:00Z");
+        assert_eq!(since["mark_read"], false);
     }
 
     #[test]
@@ -88838,6 +88863,34 @@ fn validate_mail_inbox_limit(limit: i64) -> CliResult<usize> {
     usize::try_from(limit).map_err(|_| {
         CliError::InvalidArgument(format!("mail inbox limit exceeds supported range: {limit}"))
     })
+}
+
+/// `fetch_inbox` arguments for `am mail inbox` when a server answers.
+///
+/// The listing never consumes unread state: fetch_inbox marks returned rows
+/// read unless told otherwise, the local fallback never does, and read state
+/// belongs to `am mail read` / ack (the contract `am inbox` and check-inbox
+/// follow, GH#229 / GH#207).
+fn mail_inbox_server_arguments(
+    project_key: &str,
+    agent_name: &str,
+    urgent_only: bool,
+    since: Option<&str>,
+    limit: usize,
+    include_bodies: bool,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({
+        "project_key": project_key,
+        "agent_name": agent_name,
+        "urgent_only": urgent_only,
+        "limit": limit,
+        "include_bodies": include_bodies,
+        "mark_read": false,
+    });
+    if let Some(since) = since {
+        args["since_ts"] = serde_json::json!(since);
+    }
+    args
 }
 
 /// Check inbox via direct SQLite query (for co-located setups).
