@@ -3571,6 +3571,20 @@ pub fn run_with_invocation_name(invocation_name: &'static str) -> i32 {
     // neither shutdown operation initializes storage for read-only commands.
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
+    let archive = mcp_agent_mail_storage::wbq_stats();
+    let pending = archive.enqueued.saturating_sub(archive.drained);
+    if archive.unrecoverable_errors > 0 || pending > 0 {
+        // CLI commands do not necessarily install a tracing subscriber. Keep
+        // the DB-authoritative result, but make failed materialization visible
+        // even when the background worker's tracing diagnostics are disabled.
+        eprintln!(
+            "warning: Git archive writes failed or remain pending (failed={}, pending={pending}). \
+             Successful mailbox writes remain in SQLite; avoid resending. Inspect archive health \
+             with `am doctor fix --only fm-archive-state-files-missing-head-or-broken-git-shape \
+             --list --json` before recovery.",
+            archive.unrecoverable_errors,
+        );
+    }
     match result {
         Ok(()) => 0,
         Err(err) => {

@@ -8275,9 +8275,11 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         // Pre-existing archive: apply gc defaults once. `configure_archive_git_defaults`
         // is idempotent and respects operator-set values, so this is safe to run
         // every time a cold process first opens the archive.
-        if let Ok(existing) = Repository::open(root) {
-            configure_archive_git_defaults(&existing);
-        }
+        // A leftover .git directory is not proof that initialization succeeded.
+        // Propagate an invalid repository before changing its configuration or
+        // caching the path; otherwise subsequent writes silently trust it.
+        let existing = Repository::open(root)?;
+        configure_archive_git_defaults(&existing);
         if ensure_archive_gitignore(root)? {
             commit_paths_with_retry(
                 root,
@@ -25153,5 +25155,60 @@ Test body.
             Some("256"),
             "pre-existing archive must have gc.auto=256 migrated in"
         );
+    }
+
+    #[test]
+    fn ensure_repo_rejects_missing_head_without_caching_or_rewriting_history() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let config = test_config(root);
+        let repo = Repository::init(root).expect("init real archive");
+        let sig = git2::Signature::now("archive-test", "archive@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let original_tip = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "preserve this history",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let head_path = root.join(".git/HEAD");
+        let saved_head = root.join("saved-HEAD");
+        let head_bytes = fs::read(&head_path).unwrap();
+        let config_bytes = fs::read(root.join(".git/config")).unwrap();
+        drop(tree);
+        drop(repo);
+        // Preserve the real HEAD, rather than deleting it to plant the fault.
+        fs::rename(&head_path, &saved_head).unwrap();
+        // Already-correct .gitignore reproduces the old silent Ok/cache path.
+        ensure_archive_gitignore(root).unwrap();
+        let ignore_bytes = fs::read(root.join(".gitignore")).unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                ensure_repo(root, &config),
+                Err(StorageError::Git(_))
+            ));
+            assert!(
+                !repo_cache_contains(root),
+                "invalid root must not be cached"
+            );
+            assert!(!head_path.exists(), "must not guess a replacement HEAD");
+            assert_eq!(fs::read(&saved_head).unwrap(), head_bytes);
+            assert_eq!(fs::read(root.join(".git/config")).unwrap(), config_bytes);
+            assert_eq!(fs::read(root.join(".gitignore")).unwrap(), ignore_bytes);
+        }
+
+        // An operator can restore the known HEAD; the failed opens must not
+        // poison later archive initialization or replace the existing history.
+        fs::rename(&saved_head, &head_path).unwrap();
+        assert!(!ensure_repo(root, &config).expect("open restored archive"));
+        let restored = Repository::open(root).unwrap();
+        assert_eq!(restored.head().unwrap().target(), Some(original_tip));
+        assert!(restored.find_commit(original_tip).is_ok());
     }
 }
