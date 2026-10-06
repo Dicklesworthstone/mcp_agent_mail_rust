@@ -2251,7 +2251,7 @@ pub enum MailCommand {
         /// Max messages per thread.
         #[arg(long, short = 'n', default_value_t = 50)]
         per_thread_limit: i64,
-        /// Skip LLM and return raw thread messages.
+        /// Skip the LLM refinement; summarize from the message text alone.
         #[arg(long)]
         no_llm: bool,
         /// Output format: table, json, or toon (default: auto-detect).
@@ -39006,6 +39006,23 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     .map(|v| v.to_string())
                     .unwrap_or_default(),
             );
+            // The summary's substance: the counts above are only its index.
+            for (title, key) in [
+                ("Key points", "key_points"),
+                ("Action items", "action_items"),
+            ] {
+                let items: Vec<&str> = summary
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+                    .unwrap_or_default();
+                if !items.is_empty() {
+                    output::section(title);
+                    for item in items {
+                        ftui_runtime::ftui_println!("  - {item}");
+                    }
+                }
+            }
             Ok(())
         }
 
