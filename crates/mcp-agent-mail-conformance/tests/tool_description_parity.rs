@@ -8,12 +8,11 @@ use fastmcp::{Cx, ListToolsParams, McpContext, Tool};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// Serialization guard for tests that instantiate temporary server instances.
 fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::process_env_lock()
 }
 
 /// A tool entry from the Python reference fixture.

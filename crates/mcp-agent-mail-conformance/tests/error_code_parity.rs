@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+fn test_lock() -> &'static Mutex<()> {
+    crate::process_env_lock()
+}
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EnvGuard {
@@ -23,6 +25,7 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn new() -> Self {
+        crate::settle_shared_storage();
         let temp_dir = tempfile::TempDir::new().expect("create isolated error parity tempdir");
         let db_path = temp_dir.path().join("error_code_parity.sqlite3");
         let db_url = format!("sqlite://{}", db_path.display());
@@ -70,6 +73,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        crate::drain_shared_storage();
         for (key, value) in self.previous.drain(..) {
             match value {
                 Some(value) => unsafe {
@@ -108,7 +112,7 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let _lock = TEST_LOCK
+    let _lock = test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _env = EnvGuard::new();
