@@ -692,7 +692,13 @@ fn serve_stdio_reconciles_db_only_mail_without_client_reads() {
     conn.close_sync().unwrap();
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
 
-    assert_idle_stdio_reconciles(&env, "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md", 1);
+    assert_idle_stdio_reconciles(
+        &env,
+        &[(
+            "2024/01/2024-01-01T00-00-00Z__idle-recovery__1.md".to_string(),
+            1,
+        )],
+    );
 }
 
 #[test]
@@ -842,10 +848,337 @@ fn serve_stdio_recovers_accepted_send_after_archive_failure_and_restart() {
         "{}__idle-recovery__{message_id}.md",
         created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
     );
-    assert_idle_stdio_reconciles(&env, &filename, message_id);
+    assert_idle_stdio_reconciles(&env, &[(filename, message_id)]);
 }
 
-fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) {
+struct ArchivePressureServer {
+    child: Option<std::process::Child>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    next_id: i64,
+}
+
+impl ArchivePressureServer {
+    fn start(env: &TestEnv) -> Self {
+        let stdout_path = env.tmp.path().join("archive-pressure.stdout");
+        let stderr_path = env.tmp.path().join("archive-pressure.stderr");
+        let child = Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_ATC_ENABLED", "false")
+            .env("AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED", "false")
+            .env("RETENTION_REPORT_ENABLED", "false")
+            .env("QUOTA_ENABLED", "false")
+            .env("AM_WBQ_CHANNEL_CAPACITY", "256")
+            .env("AM_WBQ_DRAIN_BATCH_CAP", "16")
+            .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+            .env("AM_ARCHIVE_BACKLOG_CAP", "1")
+            .env("RUST_LOG", "warn")
+            .current_dir(env.hostile_repo())
+            .arg("serve-stdio")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .expect("start private archive-pressure server");
+        let mut server = Self {
+            child: Some(child),
+            stdout_path,
+            stderr_path,
+            next_id: 2,
+        };
+        writeln!(
+            server.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+            "{}",
+            initialize_request()
+        )
+        .unwrap();
+        writeln!(
+            server.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        )
+        .unwrap();
+        server
+    }
+
+    fn request_batch(&mut self, requests: Vec<(&str, Value)>) -> Vec<Value> {
+        let ids: Vec<_> = requests
+            .into_iter()
+            .map(|(name, arguments)| {
+                let id = self.next_id;
+                self.next_id += 1;
+                writeln!(
+                    self.child.as_mut().unwrap().stdin.as_mut().unwrap(),
+                    "{}",
+                    tool_call(id, name, arguments)
+                )
+                .unwrap();
+                id
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let stdout = std::fs::read_to_string(&self.stdout_path).unwrap_or_default();
+            let responses: BTreeMap<_, _> = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|response| response["id"].as_i64().map(|id| (id, response)))
+                .collect();
+            if ids.iter().all(|id| responses.contains_key(id)) {
+                return ids
+                    .iter()
+                    .map(|id| {
+                        let response = &responses[id];
+                        assert!(response.get("error").is_none(), "{response}");
+                        assert_ne!(response["result"]["isError"], true, "{response}");
+                        serde_json::from_str(
+                            response["result"]["content"][0]["text"].as_str().unwrap(),
+                        )
+                        .expect("tool payload")
+                    })
+                    .collect();
+            }
+            assert!(
+                Instant::now() < deadline
+                    && self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "pressure request did not complete; stderr={}",
+                std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn request(&mut self, name: &str, arguments: Value) -> Value {
+        self.request_batch(vec![(name, arguments)])
+            .pop()
+            .expect("one tool result")
+    }
+
+    fn stop(&mut self) -> std::io::Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ArchivePressureServer {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+#[test]
+fn serve_stdio_recovers_journal_failure_and_full_backlog_after_restart() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    insert_project(
+        &conn,
+        1,
+        "idle-recovery",
+        env.hostile_repo.to_str().unwrap(),
+    );
+    insert_agent(&conn, 1, 1, "BlueLake", "test", "test");
+    insert_agent(&conn, 2, 1, "GreenStone", "test", "test");
+    conn.execute_raw("UPDATE agents SET contact_policy = 'open'")
+        .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+
+    let config = mcp_agent_mail_core::Config {
+        storage_root: env.storage_root.clone(),
+        ..mcp_agent_mail_core::Config::default()
+    };
+    let archive = mcp_agent_mail_storage::ensure_archive(&config, "idle-recovery").unwrap();
+    let unrelated = archive.root.join("operator-note.txt");
+    std::fs::write(&unrelated, b"retain unrelated operator content").unwrap();
+    // Hold the actual private archive flock, not a mocked write failure. The
+    // server remains able to accept DB writes while both archive drains wait.
+    let archive_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&archive.lock_path)
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&archive_lock).unwrap();
+    let blocked_journal = env.storage_root.join(".archive_backlog");
+    std::fs::write(&blocked_journal, b"retain journal obstruction").unwrap();
+    let mut server = ArchivePressureServer::start(&env);
+
+    let message_arguments = json!({
+        "project_key": env.hostile_repo.display().to_string(),
+        "sender_name": "BlueLake", "to": ["GreenStone"],
+        "subject": "idle recovery", "body_md": "Retain this accepted message.",
+        "topic": "pressure-recovery", "thread_id": "pressure-recovery"
+    });
+    // First occupy the drain with a real accepted message bundle. The held
+    // project flock prevents its archive write from completing.
+    let first = server.request("send_message", message_arguments.clone());
+    assert_eq!(first["count"], 1, "{first}");
+    let mut accepted_ids = vec![first["deliveries"][0]["payload"]["id"].as_i64().unwrap()];
+
+    // Enqueue only the observed free capacity. Profiles fill the WBQ without
+    // creating mail rows or consuming the one-entry fallback backlog. The
+    // stdio dispatcher admits at most 64 pending requests, so pipeline the
+    // profiles in batches well below that bound.
+    const PROFILE_BATCH: u64 = 32;
+    let mut health = server.request("health_check", json!({}));
+    assert_eq!(health["queues"]["wbq"]["capacity"], 256, "{health}");
+    for _ in 0..16 {
+        let depth = health["queues"]["wbq"]["depth"].as_u64().unwrap();
+        if depth == 256 {
+            break;
+        }
+        let profiles = (depth..(depth + PROFILE_BATCH).min(256))
+            .map(|_| {
+                (
+                    "register_agent",
+                    json!({
+                        "project_key": env.hostile_repo.display().to_string(),
+                        "name": "BlueLake", "program": "test", "model": "test",
+                        "task_description": "private queue pressure"
+                    }),
+                )
+            })
+            .collect();
+        server.request_batch(profiles);
+        health = server.request("health_check", json!({}));
+    }
+    assert_eq!(health["queues"]["wbq"]["depth"], 256, "{health}");
+    assert_eq!(
+        health["queues"]["archive_lag"]["backlog_ephemeral_total"], 0,
+        "{health}"
+    );
+    assert_eq!(
+        health["queues"]["archive_lag"]["backlog_dropped_total"], 0,
+        "{health}"
+    );
+
+    // Six more accepted messages exceed the production four-repair batch
+    // bound. Only the first fits the ephemeral backlog; the other five must
+    // be recovered from the DB after the process and its queues are gone.
+    for index in 0..6 {
+        let response = server.request("send_message", message_arguments.clone());
+        assert_eq!(response["count"], 1, "{response}");
+        accepted_ids.push(response["deliveries"][0]["payload"]["id"].as_i64().unwrap());
+        health = server.request("health_check", json!({}));
+        assert_eq!(
+            health["queues"]["archive_lag"]["backlog_ephemeral_total"], 1,
+            "{health}"
+        );
+        assert_eq!(
+            health["queues"]["archive_lag"]["backlog_dropped_total"], index,
+            "{health}"
+        );
+    }
+    server
+        .stop()
+        .expect("reap pressure server before restoring archive access");
+    let stderr = std::fs::read_to_string(&server.stderr_path).unwrap();
+    assert!(stderr.contains("message archive write project=idle-recovery; WBQ unavailable and archive journal write failed"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "message archive write project=idle-recovery; WBQ unavailable and retry backlog full"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&blocked_journal).unwrap(),
+        b"retain journal obstruction"
+    );
+    std::fs::rename(
+        &blocked_journal,
+        env.tmp.path().join("pressure-journal.saved"),
+    )
+    .unwrap();
+    drop(archive_lock);
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
+    let rows = conn
+        .query_sync(
+            "SELECT id, created_ts, body_md, topic, thread_id FROM messages ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        7,
+        "every accepted message must survive process death"
+    );
+    let mut expected = Vec::new();
+    let mut newest = 0;
+    for (row, accepted_id) in rows.iter().zip(&accepted_ids) {
+        let message_id = row.get_named::<i64>("id").unwrap();
+        assert_eq!(message_id, *accepted_id);
+        assert_eq!(
+            row.get_named::<String>("body_md").unwrap(),
+            "Retain this accepted message."
+        );
+        assert_eq!(
+            row.get_named::<String>("topic").unwrap(),
+            "pressure-recovery"
+        );
+        assert_eq!(
+            row.get_named::<String>("thread_id").unwrap(),
+            "pressure-recovery"
+        );
+        let created_ts = row.get_named::<i64>("created_ts").unwrap();
+        newest = newest.max(created_ts);
+        let created = chrono::DateTime::from_timestamp_micros(created_ts).unwrap();
+        expected.push((
+            format!(
+                "{}__idle-recovery__{message_id}.md",
+                created.format("%Y/%m/%Y-%m-%dT%H-%M-%SZ")
+            ),
+            message_id,
+        ));
+    }
+    conn.close_sync().unwrap();
+    for (filename, _) in &expected {
+        for location in [
+            "messages",
+            "agents/BlueLake/outbox",
+            "agents/GreenStone/inbox",
+        ] {
+            assert!(
+                !archive.root.join(location).join(filename).exists(),
+                "the pressure phase must leave every accepted archive copy missing"
+            );
+        }
+    }
+    let wait_us = newest
+        .saturating_add(31_000_000)
+        .saturating_sub(mcp_agent_mail_db::now_micros());
+    if wait_us > 0 {
+        thread::sleep(Duration::from_micros(u64::try_from(wait_us).unwrap()));
+    }
+    assert_idle_stdio_reconciles(&env, &expected);
+    for (filename, message_id) in &expected {
+        let path = archive.root.join("messages").join(filename);
+        let (metadata, body) = mcp_agent_mail_storage::read_message_file(&path).unwrap();
+        assert_eq!(metadata["id"], *message_id);
+        assert_eq!(metadata["topic"], "pressure-recovery");
+        assert_eq!(metadata["thread_id"], "pressure-recovery");
+        assert_eq!(metadata["to"], json!(["GreenStone"]));
+        assert_eq!(body, "Retain this accepted message.");
+        let canonical_bytes = std::fs::read(&path).unwrap();
+        for mailbox in ["agents/BlueLake/outbox", "agents/GreenStone/inbox"] {
+            assert_eq!(
+                std::fs::read(archive.root.join(mailbox).join(filename)).unwrap(),
+                canonical_bytes
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(unrelated).unwrap(),
+        b"retain unrelated operator content"
+    );
+}
+
+fn assert_idle_stdio_reconciles(env: &TestEnv, expected: &[(String, i64)]) {
     let stdout_path = env.tmp.path().join("stdio.stdout");
     let stderr_path = env.tmp.path().join("stdio.stderr");
     let mut child = Command::new(am_bin())
@@ -872,12 +1205,20 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
     );
     let sent = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
     let project = env.storage_root.join("projects/idle-recovery");
-    let paths = [
-        format!("messages/{filename}"),
-        format!("agents/BlueLake/outbox/{filename}"),
-        format!("agents/GreenStone/inbox/{filename}"),
-    ];
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let paths: Vec<_> = expected
+        .iter()
+        .flat_map(|(filename, _)| {
+            [
+                format!("messages/{filename}"),
+                format!("agents/BlueLake/outbox/{filename}"),
+                format!("agents/GreenStone/inbox/{filename}"),
+            ]
+        })
+        .collect();
+    // More than four messages need a second production maintenance tick:
+    // ten-second startup delay plus the unchanged sixty-second cadence.
+    let timeout_secs = if expected.len() > 4 { 105 } else { 45 };
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut committed = false;
     while sent.is_ok() && Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
@@ -894,6 +1235,8 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
                         out.status.success()
                             && String::from_utf8_lossy(&out.stdout)
                                 .contains("Retain this accepted message.")
+                            && std::fs::read(project.join(path))
+                                .is_ok_and(|bytes| bytes == out.stdout)
                     })
             });
             if committed {
@@ -921,15 +1264,17 @@ fn assert_idle_stdio_reconciles(env: &TestEnv, filename: &str, message_id: i64) 
         "idle stdio did not commit all archive copies: {stderr}"
     );
     let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string()).unwrap();
-    let rows = conn
-        .query_sync(
-            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
-            &[SqlValue::BigInt(message_id)],
-        )
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
-    assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    for (_, message_id) in expected {
+        let rows = conn
+            .query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?",
+                &[SqlValue::BigInt(*message_id)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+        assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+    }
     conn.close_sync().unwrap();
 }
 
