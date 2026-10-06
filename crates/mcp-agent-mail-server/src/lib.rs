@@ -2565,6 +2565,7 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
 fn run_http_headless_supervisor(
     config: mcp_agent_mail_core::Config,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     // The standalone headless process owns its signal policy. Embedders using
     // run_http_with_control retain their caller-supplied shutdown authority.
@@ -2586,7 +2587,8 @@ fn run_http_headless_supervisor(
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
+    let result_rx =
+        spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None, on_ready)?;
     // Serving has no deadline. Once signalled, request the normal supervisor
     // drain and use the same bounded join budget as the TUI shutdown path.
     #[cfg(any(unix, windows))]
@@ -2601,7 +2603,69 @@ fn run_http_headless_supervisor(
     result
 }
 
-fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+type HttpReadyCallback = Box<dyn FnOnce(&mcp_agent_mail_core::Config) + Send>;
+
+/// A successful HTTP preflight bound to one immutable configuration snapshot.
+/// Serving consumes this value; callers cannot substitute another config or
+/// reuse a preflight after the first server exits.
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// startup.run()?;
+/// startup.run()?; // the preparation was already consumed
+/// # Ok(()) }
+/// ```
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// let other = mcp_agent_mail_core::Config::default();
+/// startup.run(&other)?; // serving accepts no replacement configuration
+/// # Ok(()) }
+/// ```
+#[must_use]
+pub struct PreparedHttpStartup {
+    config: mcp_agent_mail_core::Config,
+    on_ready: Option<HttpReadyCallback>,
+}
+
+impl PreparedHttpStartup {
+    /// Run once after the first listener passes its readiness self-probe.
+    /// The callback receives the actual bound address (including an assigned
+    /// ephemeral port). It is never run for a failed startup or a restart.
+    pub fn with_ready_callback(
+        mut self,
+        callback: impl FnOnce(&mcp_agent_mail_core::Config) + Send + 'static,
+    ) -> Self {
+        self.on_ready = Some(Box::new(callback));
+        self
+    }
+
+    pub fn run(self) -> std::io::Result<()> {
+        run_http_supervised(self, None)
+    }
+
+    pub fn run_with_control(
+        self,
+        control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+    ) -> std::io::Result<()> {
+        run_http_supervised(self, Some(control_rx))
+    }
+
+    pub fn run_with_tui(self) -> std::io::Result<()> {
+        run_http_with_tui_prepared(self)
+    }
+}
+
+/// Run the complete HTTP startup checks once, before any client setup writes.
+/// Direct server entrypoints also use this constructor; possession of a
+/// successful report alone cannot bypass the checks.
+pub fn prepare_http_startup(
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<PreparedHttpStartup> {
+    config.validate_user_env_authority()?;
+    install_crash_marker_panic_hook(config.storage_root.clone());
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
@@ -2612,7 +2676,10 @@ fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    Ok(())
+    Ok(PreparedHttpStartup {
+        config: config.clone(),
+        on_ready: None,
+    })
 }
 
 fn boot_check_mode_from_config(
@@ -4065,7 +4132,7 @@ fn append_crash_marker(path: &Path, record: &serde_json::Value) {
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    run_http_supervised(config, None)
+    prepare_http_startup(config)?.run()
 }
 
 /// Run the headless HTTP server exactly like [`run_http`], but stoppable by
@@ -4084,13 +4151,15 @@ pub fn run_http_with_control(
     config: &mcp_agent_mail_core::Config,
     control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
 ) -> std::io::Result<()> {
-    run_http_supervised(config, Some(control_rx))
+    prepare_http_startup(config)?.run_with_control(control_rx)
 }
 
 fn run_http_supervised(
-    config: &mcp_agent_mail_core::Config,
+    startup: PreparedHttpStartup,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
 ) -> std::io::Result<()> {
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -4098,15 +4167,8 @@ fn run_http_supervised(
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: startup probes (inside `prepare_http_runtime_startup`) must
-    // run BEFORE acquiring runtime activity locks.  The probes take an
-    // exclusive flock on the activity lockfile to verify no other process
-    // is running; if we already hold a shared flock from
-    // `acquire_runtime_mailbox_activity_locks`, the exclusive attempt
-    // deadlocks (EAGAIN) against our own process.
-    prepare_http_runtime_startup(config)?;
-
-    // Safe to acquire now -- probes have confirmed we are the sole owner.
+    // Preparation ran the exclusive integrity probe before runtime locks.
+    // Acquire the real locks now; a competing owner still makes this fail.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
@@ -4143,7 +4205,7 @@ fn run_http_supervised(
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
-    let result = run_http_headless_supervisor(config.clone(), control_rx);
+    let result = run_http_headless_supervisor(config.clone(), control_rx, on_ready);
     clear_startup_readiness_fast_path();
 
     retention::shutdown();
@@ -4169,11 +4231,16 @@ fn run_http_supervised(
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    prepare_http_startup(config)?.run_with_tui()
+}
+
+fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<()> {
+    let config = &startup.config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
 
     // Guard against degenerate PTY geometry (e.g. `stty size` => `0 0`) which can
@@ -4183,30 +4250,19 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             "[warn] Detected invalid terminal size ({cols}x{rows}); \
              disabling TUI to avoid runaway CPU (headless HTTP mode)"
         );
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
+
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
 
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: probes must run BEFORE acquiring runtime activity locks.
-    // `probe_integrity` takes an exclusive flock on the activity lockfile;
-    // if we already hold a shared flock the exclusive attempt deadlocks
-    // (EAGAIN) against our own process.
-    let probe_report = startup_checks::run_startup_probes(config);
-    if !probe_report.is_ok() {
-        return Err(std::io::Error::other(probe_report.format_errors()));
-    }
-    ensure_boot_archive_preflight_pass(config)?;
-
-    // Now that probes have confirmed we are the sole owner, acquire the
-    // runtime shared lock for the lifetime of the process.
+    // Preparation already ran the probes before runtime activity locks.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
-    if config.instrumentation_enabled {
-        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
-    }
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
@@ -4244,6 +4300,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         Some(Arc::clone(&tui_state)),
         Some(server_ctl_rx),
         Some(Arc::clone(&supervisor_fail_fast_active)),
+        on_ready,
     ) {
         Ok(result_rx) => result_rx,
         Err(err) => {
@@ -4925,6 +4982,7 @@ fn spawn_http_supervisor_task(
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
     fail_fast_active: Option<Arc<AtomicBool>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let spawn_handle = runtime_handle;
@@ -4941,6 +4999,7 @@ fn spawn_http_supervisor_task(
                     config,
                     supervisor_state,
                     control_rx,
+                    on_ready,
                 ),
             )
             .await;
@@ -5236,6 +5295,7 @@ async fn run_http_server_supervisor(
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     let (updated_config, mut instance) =
         spawn_http_server_instance(&runtime_handle, config.clone()).await?;
@@ -5280,6 +5340,10 @@ async fn run_http_server_supervisor(
     // ready so `systemctl is-active` only reports `active` once clients can
     // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
     sd_notify_ready();
+
+    if let Some(on_ready) = on_ready {
+        on_ready(&config);
+    }
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
@@ -19775,6 +19839,184 @@ mod tests {
             assert!(error.to_string().contains("newer"), "{error}");
         });
         assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
+    }
+
+    fn run_prepared_http_test_in_child(test_name: &str) -> bool {
+        const CHILD_TEST: &str = "AM_PREPARED_HTTP_STARTUP_TEST_CHILD";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
+        }
+        // Runtime workers can rehydrate Config from the environment. Keep
+        // their whole lifetime in a private process, even under cargo test.
+        let dir = tempfile::tempdir().expect("private worker environment");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .env(
+                "DATABASE_URL",
+                mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &dir.path().join("mailbox.sqlite3"),
+                ),
+            )
+            .env("STORAGE_ROOT", dir.path().join("archive"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", "0")
+            .env("AM_ATC_ENABLED", "false")
+            .env("ATC_LEARNING_DISABLED", "1")
+            .env_remove("HTTP_BEARER_TOKEN")
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(dir.path())
+            .output()
+            .expect("execute isolated runtime test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "isolated {test_name} did not pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        let config = mcp_agent_mail_core::Config {
+            database_url: std::env::var("DATABASE_URL").expect("isolated child database"),
+            storage_root: std::env::var_os("STORAGE_ROOT")
+                .expect("isolated child archive")
+                .into(),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_bearer_token: None,
+            tui_enabled: false,
+            atc_enabled: false,
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("consumer context");
+            initialize_stdio_database(&cx, &config)
+                .await
+                .expect("seed real mailbox schema");
+        });
+        config
+    }
+
+    #[test]
+    fn prepared_http_startup_runs_probes_once_and_callback_after_readiness() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_runs_probes_once_and_callback_after_readiness",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let expected_storage = config.storage_root.clone();
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        startup_checks::take_startup_work_counts();
+        let startup = prepare_http_startup(&config)
+            .expect("real full preflight")
+            .with_ready_callback(move |bound| {
+                // A real connection must be possible before a setup writer runs.
+                let connected =
+                    std::net::TcpStream::connect((bound.http_host.as_str(), bound.http_port))
+                        .is_ok();
+                *callback_observed.lock().expect("callback result") =
+                    Some((bound.storage_root.clone(), bound.http_port, connected));
+                let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
+            });
+        assert_eq!(startup_checks::take_startup_work_counts(), [1, 1, 1, 1]);
+        // Mutation of the caller's config cannot retarget an existing token.
+        config.storage_root = dir.path().join("different-archive");
+        config.http_host = "invalid.invalid".to_string();
+        startup
+            .run_with_control(control_rx)
+            .expect("serve and drain");
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+        let observation = observed.lock().expect("callback result");
+        let (storage, port, connected) = observation.as_ref().expect("ready callback ran");
+        assert_eq!(storage, &expected_storage);
+        assert_ne!(*port, 0, "callback must receive actual bound port");
+        assert!(*connected, "callback must follow listener bind");
+        assert!(
+            !config.storage_root.exists(),
+            "caller mutation must not retarget startup"
+        );
+    }
+
+    #[test]
+    fn prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(false);
+    }
+
+    #[test]
+    fn prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(true);
+    }
+
+    fn assert_prepared_http_bind_failure(use_tui_entrypoint: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let available = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        config.http_port = available.local_addr().expect("address").port();
+        drop(available);
+        let setup_path = dir.path().join("client-config.json");
+        std::fs::write(&setup_path, b"original client setup").expect("seed setup");
+        let callback_path = setup_path.clone();
+        let startup = prepare_http_startup(&config)
+            .expect("preflight on available port")
+            .with_ready_callback(move |_| {
+                std::fs::write(callback_path, b"rewritten setup").expect("write setup");
+            });
+        startup_checks::take_startup_work_counts();
+        // Deterministically lose the port after preflight, before actual bind.
+        let _occupied = std::net::TcpListener::bind(("127.0.0.1", config.http_port))
+            .expect("occupy prepared port");
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let result = if use_tui_entrypoint {
+            startup.run_with_tui()
+        } else {
+            startup.run_with_control(control_rx)
+        };
+        let error = result.expect_err("bind must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
+        assert_eq!(
+            std::fs::read(setup_path).expect("setup after failure"),
+            b"original client setup"
+        );
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+    }
+
+    #[test]
+    fn prepared_http_startup_direct_entrypoints_keep_preflight_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: dir.path().join("archive"),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_path: "invalid-without-leading-slash".to_string(),
+            ..Default::default()
+        };
+        assert!(prepare_http_startup(&config).is_err());
+        assert!(run_http(&config).is_err());
+        assert!(run_http_with_tui(&config).is_err());
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(run_http_with_control(&config, rx).is_err());
     }
 
     fn config_for_boot_check_storage(

@@ -7771,33 +7771,36 @@ fn handle_serve_http(
     // LIVE peer serving this storage root is NOT killed — startup refuses
     // instead (issue #145).
     prepare_runtime_server_startup_with_takeover(&config, takeover)?;
-    let preflight_report =
-        mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
-    if !preflight_report.is_ok() {
-        // Defer explicitly requested setup until after preflight passes. Otherwise a
-        // crashed startup (#93) would silently rewrite Codex/Gemini/Claude
-        // MCP client configs to point at a port that never opened, leaving
-        // every client wedged after a single failed `am serve-http` run.
-        return Err(CliError::Other(preflight_report.format_errors()));
-    }
+    // Run the complete HTTP startup checks exactly once; serving consumes this
+    // preparation instead of repeating the integrity probe.
+    let mut startup = mcp_agent_mail_server::prepare_http_startup(&config)
+        .map_err(|error| CliError::Other(error.to_string()))?;
     // Starting a temporary server is not authority to repoint existing clients
     // to its endpoint (GH#318). The same rule applies to the default port and
     // bare interactive launch; setup requires the operator's explicit request.
-    if setup && let Err(e) = run_setup_self_heal_for_server(&config) {
-        output::warn(&format!(
-            "Agent setup self-heal encountered an issue (non-fatal): {e}"
-        ));
+    if setup {
+        // Repair client configs only once the actual listener is serving.
+        // Otherwise a crashed startup (#93), a bind failure or a failed
+        // readiness probe would silently rewrite Codex/Gemini/Claude MCP
+        // client configs to point at a port that never opened.
+        startup = startup.with_ready_callback(|bound_config| {
+            if let Err(e) = run_setup_self_heal_for_server(bound_config) {
+                output::warn(&format!(
+                    "Agent setup self-heal encountered an issue (non-fatal): {e}"
+                ));
+            }
+        });
     }
     if config.tui_enabled {
         emit_pre_tui_startup_banner(&config);
     }
     if config.tui_enabled {
-        let result = mcp_agent_mail_server::run_http_with_tui(&config);
+        let result = startup.run_with_tui();
         let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
         result?;
         cleanup_result?;
     } else {
-        let result = mcp_agent_mail_server::run_http(&config);
+        let result = startup.run();
         let cleanup_result = cleanup_database_sidecars_after_startup_use(&config.database_url);
         result?;
         cleanup_result?;
