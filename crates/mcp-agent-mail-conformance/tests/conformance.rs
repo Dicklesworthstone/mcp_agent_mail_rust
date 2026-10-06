@@ -1391,6 +1391,8 @@ fn setup_fixture_env() -> FixtureEnv {
         ("LLM_ENABLED", "1"),
         ("LLM_DEFAULT_MODEL", "conformance-stub"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        // The fixture switch is honored only inside a declared test harness.
+        ("AM_TEST_MODE", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),

@@ -7,7 +7,8 @@
 # 3. Invalid LLM stub triggers fallback to non-LLM summary
 # 4. Multi-thread summarize with LLM stub returns aggregate digest
 #
-# All tests use MCP_AGENT_MAIL_LLM_STUB=1 for deterministic offline output.
+# All tests use MCP_AGENT_MAIL_LLM_STUB=1 for deterministic offline output; the
+# server honors it only with AM_TEST_MODE=1 (br-kp1in.21).
 
 set -euo pipefail
 
@@ -57,6 +58,7 @@ if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "llm" \
     "HTTP_RATE_LIMIT_ENABLED=0" \
     "HTTP_JWT_ENABLED=0" \
     "MCP_AGENT_MAIL_LLM_STUB=1" \
+    "AM_TEST_MODE=1" \
     "LLM_ENABLED=1"; then
     e2e_fail "server failed to start"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"

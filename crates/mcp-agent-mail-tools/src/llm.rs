@@ -1040,19 +1040,41 @@ pub fn multi_thread_user_prompt(
 //   2. Offline E2E tests that exercise the JSON-extraction pipeline
 //      (brace-slice fallback, code-fence extraction) without network.
 //
-// Activation: requires `MCP_AGENT_MAIL_LLM_STUB=1` environment variable.
-// This variable is NEVER set in production, only in conformance.rs and
-// test_llm.sh. If you see it set outside those two files, that is a bug.
+// Activation: requires `MCP_AGENT_MAIL_LLM_STUB=1` AND `AM_TEST_MODE=1`
+// (the process-wide "this is a test harness" signal), as set by
+// conformance.rs and test_llm.sh. The fixture text is byte-identical to the
+// Python reference, so responses cannot carry a marker; the second gate is
+// what keeps a stray MCP_AGENT_MAIL_LLM_STUB (copied shell, service unit) from
+// silently replacing model output in a real deployment (br-kp1in.21).
 // ---------------------------------------------------------------------------
 
 fn conformance_fixture_mode_enabled() -> bool {
-    let Ok(v) = std::env::var("MCP_AGENT_MAIL_LLM_STUB") else {
-        return false;
+    conformance_fixture_mode_from(|key| std::env::var(key).ok())
+}
+
+fn conformance_fixture_mode_from(env: impl Fn(&str) -> Option<String>) -> bool {
+    let truthy = |key| {
+        env(key).is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
     };
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    if !truthy("MCP_AGENT_MAIL_LLM_STUB") {
+        return false;
+    }
+    if truthy("AM_TEST_MODE") {
+        return true;
+    }
+    static REFUSED_WARNED: OnceLock<()> = OnceLock::new();
+    REFUSED_WARNED.get_or_init(|| {
+        tracing::warn!(
+            "MCP_AGENT_MAIL_LLM_STUB is set without AM_TEST_MODE: ignoring it and calling the \
+             configured LLM. The conformance fixture switch only works inside a test harness."
+        );
+    });
+    false
 }
 
 fn conformance_fixture_completion(system: &str, user: &str) -> String {
@@ -1108,6 +1130,29 @@ mod tests {
 
     // Note: env var tests are inherently sequential and may interfere.
     // We use unique prefixes or accept test isolation limitations.
+
+    #[test]
+    fn llm_fixture_switch_needs_the_test_harness_signal_too() {
+        let mode = |pairs: &[(&str, &str)]| {
+            let env: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            conformance_fixture_mode_from(|key| env.get(key).cloned())
+        };
+        // A stray switch alone (copied shell, service unit) is refused.
+        assert!(!mode(&[("MCP_AGENT_MAIL_LLM_STUB", "1")]));
+        assert!(!mode(&[("AM_TEST_MODE", "1")]));
+        assert!(!mode(&[
+            ("MCP_AGENT_MAIL_LLM_STUB", "0"),
+            ("AM_TEST_MODE", "1")
+        ]));
+        // Conformance and test_llm.sh set both.
+        assert!(mode(&[
+            ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+            ("AM_TEST_MODE", "true")
+        ]));
+    }
 
     #[test]
     fn parse_json_clean() {
