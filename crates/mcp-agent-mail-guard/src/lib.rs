@@ -1880,12 +1880,24 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
         std::fs::create_dir_all(&run_dir)?;
 
         let chain_path = hooks_dir.join(name);
+        let orig = hooks_dir.join(format!("{name}.orig"));
+        // An earlier install chained a pre-chain-runner agent-mail guard as
+        // `.orig`, so it kept enforcing its own older rules (a hard AGENT_NAME
+        // requirement among them) behind the current guard. Park it where the
+        // chain runner does not run it; it is kept, not deleted.
+        if std::fs::read_to_string(&orig).is_ok_and(|c| is_legacy_single_file_guard(&c)) {
+            let parked = unused_path(&hooks_dir.join(format!("{name}.orig.legacy-agent-mail")));
+            std::fs::rename(&orig, &parked)?;
+        }
         if chain_path.exists() {
             let content = std::fs::read_to_string(&chain_path).unwrap_or_default();
             let content = content.trim();
-            // Idempotent: backup if not ours
-            if !content.contains(&format!("mcp-agent-mail chain-runner ({name})")) {
-                let orig = hooks_dir.join(format!("{name}.orig"));
+            // Idempotent: backup if not ours. A legacy single-file agent-mail
+            // guard is ours too, so the chain runner replaces it instead of
+            // chaining the old guard behind the new one.
+            if !content.contains(&format!("mcp-agent-mail chain-runner ({name})"))
+                && !is_legacy_single_file_guard(content)
+            {
                 if orig.exists() {
                     // The first install already chained `.orig`; this is a
                     // newer hook written since (husky, the pre-commit
@@ -3820,6 +3832,41 @@ mod tests {
             user_cmd,
             "uninstall must not delete the user's own .cmd"
         );
+    }
+
+    /// A pre-chain-runner agent-mail guard is ours: install replaces it rather
+    /// than chaining it behind the new guard, and one an earlier install
+    /// chained as `.orig` is parked where the chain runner no longer runs it.
+    #[test]
+    fn install_replaces_a_legacy_single_file_guard_instead_of_chaining_it() {
+        let legacy = "#!/usr/bin/env python3\n# mcp-agent-mail guard hook\nimport sys\n\
+                      print('AGENT_NAME environment variable is required.')\nsys.exit(2)\n";
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+        let pre_commit = hooks_dir.join("pre-commit");
+        let orig = hooks_dir.join("pre-commit.orig");
+
+        std::fs::write(&pre_commit, legacy).expect("write legacy guard");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("install");
+        let hook = std::fs::read_to_string(&pre_commit).expect("hook");
+        assert!(hook.contains("mcp-agent-mail chain-runner (pre-commit)"));
+        assert!(!orig.exists(), "the legacy guard must not be chained");
+
+        std::fs::write(&orig, legacy).expect("legacy guard chained by an older install");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("reinstall");
+        assert!(!orig.exists(), "the chain runner must no longer run it");
+        let parked = hooks_dir.join("pre-commit.orig.legacy-agent-mail");
+        assert_eq!(std::fs::read_to_string(parked).expect("kept"), legacy);
+
+        // A user's own hook is still chained as before.
+        let user_hook = "#!/bin/sh\necho mine\n";
+        std::fs::write(&pre_commit, user_hook).expect("write user hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("install over user hook");
+        assert_eq!(std::fs::read_to_string(&orig).expect("orig"), user_hook);
     }
 
     #[test]
