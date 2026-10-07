@@ -13181,7 +13181,11 @@ to skip auth for local requests.</p>
                 {
                     // Keep alias normalization tool-specific so one cluster cannot
                     // silently rewrite another tool's documented parameters.
-                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    if tool_name == "reply_message" {
+                        mcp_agent_mail_tools::normalize_reply_message_arguments(arguments)?;
+                    } else {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
                 }
 
                 // Extract format param before dispatch (TOON support)

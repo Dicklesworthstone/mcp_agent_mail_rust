@@ -93,6 +93,11 @@ pub const WELCOME_SKIPPED_CONTACT_BLOCKED: &str = "contact_blocked: the target h
      contact from this requester; auto_accept does not override a block, so the link stays \
      blocked and no welcome was sent (only the target can unblock it with respond_contact)";
 
+/// Reason reported when only one of `welcome_subject` / `welcome_body` was
+/// given: a welcome needs both, and it is not sent half-written.
+pub const WELCOME_SKIPPED_INCOMPLETE: &str = "welcome_incomplete: a welcome needs both \
+     welcome_subject and welcome_body; only one was given, so no welcome was sent";
+
 fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
     serde_json::from_str(&payload)
         .map_err(|e| McpError::internal_error(format!("{label} JSON parse error: {e}")))
@@ -854,7 +859,11 @@ pub async fn macro_contact_handshake(
                 Err(error) => return Err(error),
             }
         }
-        _ => None,
+        (Some(_), None) | (None, Some(_)) => {
+            welcome_skipped_reason = Some(WELCOME_SKIPPED_INCOMPLETE.to_string());
+            None
+        }
+        (None, None) => None,
     };
 
     let welcome_sent = welcome_val.is_some();

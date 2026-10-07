@@ -1322,7 +1322,9 @@ pub async fn summarize_thread(
         serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
     } else {
-        // Single-thread mode
+        // Single-thread mode: per_thread_limit is documented for multi-thread
+        // mode, so its default (50) must not cut a single thread to its newest
+        // messages and under-report total_messages; an explicit value applies.
         let tid = &thread_ids[0];
         let messages = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_thread_messages(
@@ -1330,7 +1332,7 @@ pub async fn summarize_thread(
                 &pool,
                 project_id,
                 tid,
-                Some(msg_limit),
+                per_thread_limit.map(|_| msg_limit),
             )
             .await,
         )?;

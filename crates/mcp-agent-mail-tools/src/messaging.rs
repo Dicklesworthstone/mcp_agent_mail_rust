@@ -1745,6 +1745,21 @@ pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> 
     Ok(())
 }
 
+/// [`normalize_send_message_arguments`] for `reply_message`.
+///
+/// A reply's `to` is optional (omitted = reply to the original sender), so an
+/// explicit `null` means omitted, as it does for every optional parameter,
+/// instead of the "must be a list" refusal `send_message` gives its required
+/// `to`.
+pub fn normalize_reply_message_arguments(arguments: &mut Value) -> McpResult<()> {
+    if let Some(args) = arguments.as_object_mut()
+        && args.get("to").is_some_and(Value::is_null)
+    {
+        args.remove("to");
+    }
+    normalize_send_message_arguments(arguments)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_recipient(
     ctx: &McpContext,
@@ -10133,6 +10148,21 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn reply_treats_null_to_as_omitted_but_send_still_refuses_it() {
+        let mut reply = json!({"project_key": "/p", "message_id": 7, "to": null});
+        normalize_reply_message_arguments(&mut reply).expect("null to is omitted on reply");
+        assert!(reply.get("to").is_none(), "{reply}");
+
+        let mut send = json!({"project_key": "/p", "to": null});
+        let err = normalize_send_message_arguments(&mut send).expect_err("send needs a to list");
+        assert!(
+            err.message.contains("list of agent names"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
