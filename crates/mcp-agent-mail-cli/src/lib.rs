@@ -6754,6 +6754,15 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
             }
             output::kv("Database checked", &result.database_checked.to_string());
             output::kv("Database valid", &result.database_verified.to_string());
+            output::kv(
+                "Files checked",
+                if result.files_checked {
+                    "true"
+                } else {
+                    "false (the manifest lists no per-file hashes; re-export to cover every file)"
+                },
+            );
+            output::kv("Files valid", &result.files_verified.to_string());
             if let Err(failure) = share_verify_outcome(&result, args.public_key.is_some()) {
                 ftui_runtime::ftui_eprintln!("  {failure}");
                 return Err(CliError::ExitCode(1));
@@ -95631,6 +95640,8 @@ fn share_verify_requires_a_signature_when_a_public_key_is_given() {
         key_source: None,
         database_checked: true,
         database_verified: true,
+        files_checked: true,
+        files_verified: true,
         error: None,
     };
     // Without --public-key an unsigned bundle may still be checked for SRI.

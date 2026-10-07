@@ -308,7 +308,10 @@ export writes the bundle directory to `OUT` and the encrypted archive beside it
 (`$OUT.zip.age`; `$OUT.zip` without `--age-recipient`). `am share verify` checks
 a bundle directory, not an archive: to check what you will ship, run
 `am share decrypt "$OUT.zip.age"` (it writes `$OUT.zip`), unzip that, and verify
-the unpacked directory.
+the unpacked directory. It hashes every file the export wrote against the
+manifest (`Files valid`), so with a signature the whole bundle is covered; the
+hosting config the deploy wizard rewrites per provider (`_headers`,
+`_redirects`, `.nojekyll`) is left out.
 
 **Troubleshooting:** If you need a different scrub profile or chunking behavior,
 add the relevant `am share export` flags explicitly. Use a real Age recipient

@@ -515,26 +515,6 @@ pub fn write_bundle_scaffolding(
     viewer_data: Option<&ViewerDataManifest>,
     viewer_sri: &HashMap<String, String>,
 ) -> ShareResult<()> {
-    // manifest.json (sorted keys for determinism — matches Python `sort_keys=True`)
-    let manifest = build_manifest(
-        scope,
-        scrub_summary,
-        attachment_manifest,
-        chunk_manifest,
-        chunk_threshold,
-        chunk_size,
-        hosting_hints,
-        fts_enabled,
-        db_path_relative,
-        db_sha256,
-        db_size_bytes,
-        viewer_data,
-        viewer_sri,
-    );
-    let sorted = sort_json_keys(&manifest);
-    let manifest_json = crate::encode_json_pretty(&sorted, "bundle manifest serialization failed")?;
-    write_output_bytes(output_dir, "manifest.json", manifest_json.as_bytes())?;
-
     // README.md
     let readme = generate_readme(scope, scrub_summary);
     write_output_bytes(output_dir, "README.md", readme.as_bytes())?;
@@ -578,7 +558,60 @@ pub fn write_bundle_scaffolding(
     let headers = hosting::generate_headers_file();
     write_output_bytes(output_dir, "_headers", headers.as_bytes())?;
 
+    // manifest.json last (sorted keys for determinism — matches Python
+    // `sort_keys=True`): it records the hash of every file written before it.
+    let mut manifest = build_manifest(
+        scope,
+        scrub_summary,
+        attachment_manifest,
+        chunk_manifest,
+        chunk_threshold,
+        chunk_size,
+        hosting_hints,
+        fts_enabled,
+        db_path_relative,
+        db_sha256,
+        db_size_bytes,
+        viewer_data,
+        viewer_sri,
+    );
+    manifest[MANIFEST_FILES_KEY] = Value::Object(hash_bundle_files(output_dir)?);
+    let sorted = sort_json_keys(&manifest);
+    let manifest_json = crate::encode_json_pretty(&sorted, "bundle manifest serialization failed")?;
+    write_output_bytes(output_dir, "manifest.json", manifest_json.as_bytes())?;
+
     Ok(())
+}
+
+/// Manifest key mapping every bundle-relative path the export wrote to its
+/// SHA-256 (hex), so a manifest signature covers the whole bundle: viewer
+/// code, rendered pages, data and attachments, not just the database and the
+/// vendored scripts in `viewer.sri`.
+pub(crate) const MANIFEST_FILES_KEY: &str = "files";
+
+/// Export outputs left out of [`MANIFEST_FILES_KEY`]: the manifest and its
+/// signature, and the hosting config the deploy wizard rewrites per provider
+/// after the bundle is signed.
+const UNHASHED_BUNDLE_FILES: [&str; 5] = [
+    "manifest.json",
+    "manifest.sig.json",
+    "_headers",
+    "_redirects",
+    ".nojekyll",
+];
+
+fn hash_bundle_files(output_dir: &Path) -> ShareResult<serde_json::Map<String, Value>> {
+    let mut entries = Vec::new();
+    collect_entries_ctx(output_dir, output_dir, &mut entries, "bundle")?;
+    let mut files = serde_json::Map::new();
+    for relative in entries {
+        if UNHASHED_BUNDLE_FILES.contains(&relative.as_str()) {
+            continue;
+        }
+        let digest = sha256_file(&output_dir.join(&relative))?;
+        files.insert(relative, Value::String(digest));
+    }
+    Ok(files)
 }
 
 /// Result of the canonical bundle export assembly path.

@@ -2250,6 +2250,44 @@ mod tests {
         let verify = verify_bundle(&output, None).unwrap();
         assert!(verify.signature_checked);
         assert!(verify.signature_verified);
+
+        // 15. The signed manifest covers every file the export wrote: a swapped
+        // viewer page fails verification; the hosting config the deploy wizard
+        // rewrites per provider does not.
+        assert!(verify.files_checked && verify.files_verified, "{verify:?}");
+        let listed = manifest["files"].as_object().expect("files map");
+        for path in [
+            "viewer/index.html",
+            "viewer/data/messages.json",
+            "mailbox.sqlite3",
+        ] {
+            assert!(listed.contains_key(path), "{path} must be hashed");
+        }
+        for path in [
+            "manifest.json",
+            "manifest.sig.json",
+            "_headers",
+            ".nojekyll",
+        ] {
+            assert!(!listed.contains_key(path), "{path} must not be hashed");
+        }
+        std::fs::write(output.join("_headers"), "/*\n  X-Provider: rewritten\n").unwrap();
+        assert!(verify_bundle(&output, None).unwrap().files_verified);
+        let viewer = output.join("viewer/index.html");
+        std::fs::write(&viewer, b"<script>exfiltrate()</script>").unwrap();
+        let tampered = verify_bundle(&output, None).unwrap();
+        assert!(
+            tampered.signature_verified,
+            "the manifest itself is untouched"
+        );
+        assert!(!tampered.files_verified);
+        assert!(
+            tampered
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("viewer/index.html")),
+            "{tampered:?}"
+        );
     }
 
     #[test]
