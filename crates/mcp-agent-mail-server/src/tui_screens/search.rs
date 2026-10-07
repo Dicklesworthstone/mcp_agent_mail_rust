@@ -28,7 +28,8 @@ use std::time::Instant;
 use asupersync::Outcome;
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_db::search_planner::{
-    DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, ZeroResultGuidance,
+    DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, TextFieldScope,
+    ZeroResultGuidance,
 };
 use mcp_agent_mail_db::search_recipes::{
     MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, delete_recipe, insert_history,
@@ -378,16 +379,13 @@ impl FieldScope {
         }
     }
 
-    /// Apply field scope to a query string for parser-recognized field filtering.
-    /// Returns the query wrapped with column prefix for SubjectOnly/BodyOnly.
-    fn apply_to_query(self, query: &str) -> String {
-        if query.is_empty() {
-            return query.to_string();
-        }
+    /// The search service's field scope: every word, on the lexical and the
+    /// SQL path alike, must match these fields.
+    const fn text_fields(self) -> TextFieldScope {
         match self {
-            Self::SubjectAndBody => query.to_string(),
-            Self::SubjectOnly => format!("subject:{query}"),
-            Self::BodyOnly => format!("body_md:{query}"),
+            Self::SubjectAndBody => TextFieldScope::SubjectAndBody,
+            Self::SubjectOnly => TextFieldScope::Subject,
+            Self::BodyOnly => TextFieldScope::Body,
         }
     }
 
@@ -2317,11 +2315,9 @@ impl SearchCockpitScreen {
             return self.search_messages_recent(conn);
         }
 
-        // Apply field scope to constrain search to subject/body/both
-        let scoped_query = self.field_scope.apply_to_query(raw);
-
         let mut query = SearchQuery {
-            text: scoped_query,
+            text: raw.to_string(),
+            text_fields: self.field_scope.text_fields(),
             doc_kind: DocKind::Message,
             limit: Some(MAX_RESULTS),
             explain: self.explain_toggle.is_on(),
@@ -4877,7 +4873,7 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
 Quotes: \"build failed\"\n\
 Prefix: deploy*\n\
 NOT: error NOT test\n\
-Column: subject:deploy\n\
+Subject or body only: Field facet (f)\n\
 Esc/any key: close";
 
     Paragraph::new(text)
@@ -6961,31 +6957,16 @@ mod tests {
     }
 
     #[test]
-    fn field_scope_subject_only_produces_fts5_column_filter() {
-        let scope = FieldScope::SubjectOnly;
-        let query = scope.apply_to_query("test query");
-        assert_eq!(query, "subject:test query");
-    }
-
-    #[test]
-    fn field_scope_body_only_produces_fts5_column_filter() {
-        let scope = FieldScope::BodyOnly;
-        let query = scope.apply_to_query("test query");
-        assert_eq!(query, "body_md:test query");
-    }
-
-    #[test]
-    fn field_scope_subject_and_body_preserves_query() {
-        let scope = FieldScope::SubjectAndBody;
-        let query = scope.apply_to_query("test query");
-        assert_eq!(query, "test query");
-    }
-
-    #[test]
-    fn field_scope_empty_query_returns_empty() {
-        assert_eq!(FieldScope::SubjectOnly.apply_to_query(""), "");
-        assert_eq!(FieldScope::BodyOnly.apply_to_query(""), "");
-        assert_eq!(FieldScope::SubjectAndBody.apply_to_query(""), "");
+    fn field_scope_is_a_search_parameter_not_a_query_prefix() {
+        assert_eq!(
+            FieldScope::SubjectAndBody.text_fields(),
+            TextFieldScope::SubjectAndBody
+        );
+        assert_eq!(
+            FieldScope::SubjectOnly.text_fields(),
+            TextFieldScope::Subject
+        );
+        assert_eq!(FieldScope::BodyOnly.text_fields(), TextFieldScope::Body);
     }
 
     #[test]
@@ -7220,10 +7201,13 @@ mod tests {
             text.contains("Query Syntax Help"),
             "expected popup title, got:\n{text}"
         );
+        // Field scoping is the Field facet, not a subject: prefix (which
+        // the default Newest sort never honoured).
         assert!(
-            text.contains("subject:deploy"),
-            "expected column example, got:\n{text}"
+            text.contains("Subject or body only: Field facet (f)"),
+            "expected field-scope hint, got:\n{text}"
         );
+        assert!(!text.contains("subject:deploy"), "{text}");
     }
 
     #[test]

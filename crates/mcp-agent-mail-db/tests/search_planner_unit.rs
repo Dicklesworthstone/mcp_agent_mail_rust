@@ -22,8 +22,8 @@
 
 use mcp_agent_mail_db::search_planner::{
     AuditAction, Direction, DocKind, Importance, PlanMethod, PlanParam, RankingMode,
-    RedactionConfig, ScopePolicy, SearchCursor, SearchQuery, SearchResult, TimeRange,
-    VisibilityContext, apply_visibility, plan_search,
+    RedactionConfig, ScopePolicy, SearchCursor, SearchQuery, SearchResult, TextFieldScope,
+    TimeRange, VisibilityContext, apply_visibility, plan_search,
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -254,6 +254,39 @@ fn parser_hyphenated_token() {
         param_strs.iter().any(|s| s.contains("POL-358")),
         "expected hyphenated token in LIKE params: {param_strs:?}"
     );
+}
+
+#[test]
+fn text_field_scope_puts_every_like_term_on_its_column() {
+    let like_terms = |scope: TextFieldScope| {
+        let mut query = msg_query("hello world", 1);
+        query.text_fields = scope;
+        let plan = plan_search(&query);
+        assert_eq!(plan.method, PlanMethod::Like);
+        let patterns = plan
+            .params
+            .iter()
+            .filter(|p| matches!(p, PlanParam::Text(s) if s.starts_with('%')))
+            .count();
+        (plan.sql, patterns)
+    };
+
+    let (sql, patterns) = like_terms(TextFieldScope::SubjectAndBody);
+    assert!(sql.contains(
+        "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\') AND \
+         (m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
+    ));
+    assert_eq!(patterns, 4);
+
+    let (sql, patterns) = like_terms(TextFieldScope::Subject);
+    assert!(sql.contains("(m.subject LIKE ? ESCAPE '\\') AND (m.subject LIKE ? ESCAPE '\\')"));
+    assert!(!sql.contains("m.body_md LIKE"), "{sql}");
+    assert_eq!(patterns, 2);
+
+    let (sql, patterns) = like_terms(TextFieldScope::Body);
+    assert!(sql.contains("(m.body_md LIKE ? ESCAPE '\\') AND (m.body_md LIKE ? ESCAPE '\\')"));
+    assert!(!sql.contains("m.subject LIKE"), "{sql}");
+    assert_eq!(patterns, 2);
 }
 
 #[test]
@@ -1196,6 +1229,7 @@ fn serde_audit_action_roundtrip() {
 fn serde_search_query_complex() {
     let q = SearchQuery {
         text: "test query".to_string(),
+        text_fields: TextFieldScope::Body,
         doc_kind: DocKind::Message,
         project_id: Some(1),
         product_id: None,
@@ -1220,6 +1254,7 @@ fn serde_search_query_complex() {
     let json = serde_json::to_string_pretty(&q).unwrap();
     let q2: SearchQuery = serde_json::from_str(&json).unwrap();
     assert_eq!(q2.text, "test query");
+    assert_eq!(q2.text_fields, TextFieldScope::Body);
     assert_eq!(q2.importance.len(), 2);
     assert_eq!(q2.time_range.min_ts, Some(100));
     assert_eq!(q2.limit, Some(25));
@@ -1670,6 +1705,7 @@ fn complex_combined_query() {
     };
     let q = SearchQuery {
         text: "deployment".to_string(),
+        text_fields: TextFieldScope::SubjectAndBody,
         doc_kind: DocKind::Message,
         project_id: Some(1),
         product_id: None,

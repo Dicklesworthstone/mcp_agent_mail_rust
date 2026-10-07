@@ -246,11 +246,29 @@ impl AuditAction {
 /// for offset pagination windows.
 pub const SEARCH_QUERY_LIMIT_MAX: usize = 5_000;
 
+/// Which message text fields the words of a query must match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextFieldScope {
+    /// Each word may match the subject or the body.
+    #[default]
+    SubjectAndBody,
+    /// Every word must match the subject.
+    Subject,
+    /// Every word must match the body.
+    Body,
+}
+
 /// A structured search query with optional facets, pagination, and ranking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// Free-text query string for the selected search backend or SQL fallback.
     pub text: String,
+
+    /// Message fields the text must match. Semantic retrieval cannot honour
+    /// a narrower scope, so a scoped query runs on the lexical tier.
+    #[serde(default)]
+    pub text_fields: TextFieldScope,
 
     /// Entity kind to search. Default: `Message`.
     #[serde(default)]
@@ -788,18 +806,24 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     let (select_cols, mut from_clause, order_clause) = match method {
         PlanMethod::Like => {
             let terms = extract_like_terms(&query.text, 5);
+            let columns: &[&str] = match query.text_fields {
+                TextFieldScope::SubjectAndBody => &["m.subject", "m.body_md"],
+                TextFieldScope::Subject => &["m.subject"],
+                TextFieldScope::Body => &["m.body_md"],
+            };
             let mut like_parts = Vec::new();
             for term in &terms {
                 let escaped = term
                     .replace('\\', "\\\\")
                     .replace('%', "\\%")
                     .replace('_', "\\_");
-                like_parts.push(
-                    "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')".to_string(),
-                );
                 let pattern = format!("%{escaped}%");
-                params.push(PlanParam::Text(pattern.clone()));
-                params.push(PlanParam::Text(pattern));
+                let mut alternatives = Vec::with_capacity(columns.len());
+                for column in columns {
+                    alternatives.push(format!("{column} LIKE ? ESCAPE '\\'"));
+                    params.push(PlanParam::Text(pattern.clone()));
+                }
+                like_parts.push(format!("({})", alternatives.join(" OR ")));
             }
             let like_filter = like_parts.join(" AND ");
             where_clauses.push(like_filter);

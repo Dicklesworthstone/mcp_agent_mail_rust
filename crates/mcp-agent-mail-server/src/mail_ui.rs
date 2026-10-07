@@ -21,6 +21,7 @@ use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
+use mcp_agent_mail_db::search_planner::TextFieldScope;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
 use mcp_agent_mail_storage::{self as storage, ensure_archive_root};
@@ -1909,17 +1910,24 @@ mod utility_tests {
     }
 
     #[test]
-    fn apply_mail_search_field_scope_prefixes_query() {
+    fn mail_search_field_is_a_search_parameter_not_a_query_prefix() {
         assert_eq!(
-            apply_mail_search_field_scope("deploy", "subject"),
-            "subject:deploy"
+            mail_search_text_fields(&parse_mail_search_field_scope("field=subject")),
+            TextFieldScope::Subject
         );
         assert_eq!(
-            apply_mail_search_field_scope("deploy", "body"),
-            "body_md:deploy"
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=body")),
+            TextFieldScope::Body
         );
-        assert_eq!(apply_mail_search_field_scope("deploy", ""), "deploy");
-        assert_eq!(apply_mail_search_field_scope("", "subject"), "");
+        assert_eq!(
+            mail_search_text_fields(&parse_mail_search_field_scope("field=both")),
+            TextFieldScope::SubjectAndBody
+        );
+        // A project/product scope value is not a field scope.
+        assert_eq!(
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=project")),
+            TextFieldScope::SubjectAndBody
+        );
     }
 
     #[test]
@@ -3966,14 +3974,12 @@ fn parse_mail_search_field_scope(query: &str) -> String {
     String::new()
 }
 
-fn apply_mail_search_field_scope(query: &str, field_scope: &str) -> String {
-    if query.is_empty() {
-        return String::new();
-    }
+/// The search service's field scope for a normalized `field` parameter.
+fn mail_search_text_fields(field_scope: &str) -> TextFieldScope {
     match field_scope {
-        "subject" => format!("subject:{query}"),
-        "body" => format!("body_md:{query}"),
-        _ => query.to_string(),
+        "subject" => TextFieldScope::Subject,
+        "body" => TextFieldScope::Body,
+        _ => TextFieldScope::SubjectAndBody,
     }
 }
 
@@ -4228,10 +4234,10 @@ fn render_search(
         };
 
         let ack_required = parse_ack_filter_param(&ack_filter);
-        let scoped_query = apply_mail_search_field_scope(&q, &field_scope);
 
         let search_query = SearchQuery {
-            text: scoped_query,
+            text: q.clone(),
+            text_fields: mail_search_text_fields(&field_scope),
             doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
             project_id: Some(pid),
             product_id: None,

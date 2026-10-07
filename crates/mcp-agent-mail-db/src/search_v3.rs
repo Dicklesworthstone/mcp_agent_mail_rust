@@ -159,7 +159,8 @@ impl TantivyBridge {
         let compiled = compile_filters(&filter, &self.handles);
 
         // Build text query
-        let parser = LexicalParser::with_defaults(self.handles.subject, self.handles.body);
+        let parser = LexicalParser::with_defaults(self.handles.subject, self.handles.body)
+            .with_text_fields(query.text_fields);
         let outcome = parser.parse(&self.index, &query.text);
 
         let text_query: Box<dyn Query> = match outcome {
@@ -2107,7 +2108,7 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     static BRIDGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    use crate::search_planner::{DocKind, SearchQuery as PlannerQuery};
+    use crate::search_planner::{DocKind, SearchQuery as PlannerQuery, TextFieldScope};
     use tantivy::{TantivyDocument, doc};
 
     fn setup_bridge_with_docs() -> TantivyBridge {
@@ -2184,6 +2185,35 @@ mod tests {
         let results = bridge.search(&query);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn text_field_scope_keeps_every_term_to_its_field() {
+        let bridge = setup_bridge_with_docs();
+        let ids = |text: &str, scope: TextFieldScope| -> Vec<i64> {
+            let mut query = PlannerQuery::messages(text, 1);
+            query.text_fields = scope;
+            let mut ids: Vec<i64> = bridge.search(&query).iter().map(|r| r.id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        // "review" is only in message 1's subject; "steps" only in message
+        // 2's body.
+        assert_eq!(ids("review", TextFieldScope::SubjectAndBody), [1]);
+        assert_eq!(ids("review", TextFieldScope::Subject), [1]);
+        assert_eq!(ids("review", TextFieldScope::Body), [] as [i64; 0]);
+        assert_eq!(ids("steps", TextFieldScope::Subject), [] as [i64; 0]);
+        assert_eq!(ids("steps", TextFieldScope::Body), [2]);
+        // Every word is scoped, not only the first: "engine" is in message
+        // 2's body, not its subject.
+        assert_eq!(ids("steps engine", TextFieldScope::Body), [2]);
+        assert_eq!(
+            ids("checklist engine", TextFieldScope::Subject),
+            [] as [i64; 0]
+        );
+        // Prefix queries are scoped too.
+        assert_eq!(ids("revi*", TextFieldScope::Subject), [1]);
+        assert_eq!(ids("revi*", TextFieldScope::Body), [] as [i64; 0]);
     }
 
     #[test]

@@ -13,8 +13,8 @@ use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
     Direction, DocKind, Importance, PlanMethod, PlanParam, RankingMode, RecoverySuggestion,
-    ScopePolicy, SearchCursor, SearchQuery, SearchResponse, SearchResult, ZeroResultGuidance,
-    plan_search,
+    ScopePolicy, SearchCursor, SearchQuery, SearchResponse, SearchResult, TextFieldScope,
+    ZeroResultGuidance, plan_search,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -253,6 +253,17 @@ pub const SEMANTIC_TIER_COMPILED: bool = cfg!(feature = "hybrid");
 
 fn resolve_search_engine(options: &SearchOptions) -> SearchEngine {
     engine_for(options, &mcp_agent_mail_core::Config::get().search_rollout)
+}
+
+/// Semantic retrieval embeds whole messages, so it cannot keep a query to
+/// the subject or the body; such a query runs on the lexical tier, whose
+/// parser and SQL plan both scope every term.
+fn engine_for_text_fields(engine: SearchEngine, query: &SearchQuery) -> SearchEngine {
+    if query.text_fields == TextFieldScope::SubjectAndBody {
+        engine
+    } else {
+        SearchEngine::Lexical
+    }
 }
 
 /// The engine a query runs on: the explicit request, else the surface's
@@ -4220,6 +4231,7 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     query.product_id.hash(&mut hasher);
     query.project_id.hash(&mut hasher);
     query.doc_kind.hash(&mut hasher);
+    query.text_fields.hash(&mut hasher);
     query.ack_required.hash(&mut hasher);
 
     match query.direction {
@@ -4359,7 +4371,7 @@ fn build_search_cache_key(
     use std::hash::{Hash, Hasher};
 
     let filter = query.to_search_filter();
-    let engine_mode = resolve_search_engine(options);
+    let engine_mode = engine_for_text_fields(resolve_search_engine(options), query);
     let mode = engine_to_search_mode(engine_mode);
     let mut discriminator_hasher = DefaultHasher::new();
     cache_scope_discriminator(query).hash(&mut discriminator_hasher);
@@ -4436,7 +4448,7 @@ pub async fn execute_search(
     let timer = std::time::Instant::now();
     let product_sql_budget = product_sql_budget_state(cx, query);
     let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
-    let engine = resolve_search_engine(options);
+    let engine = engine_for_text_fields(resolve_search_engine(options), query);
     let needs_lexical_freshness = matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
