@@ -6575,6 +6575,28 @@ mod canonicalize_existing_prefix_tests {
     }
 }
 
+/// The scrub preset `am share update` regenerates with. The stored preset comes
+/// from the bundle's own, unsigned-as-read `manifest.json`, which anyone with
+/// write access to the deploy repo can edit; so a stored `archive` (no secret
+/// scrub, no path redaction) is only used when the operator names it again.
+fn share_update_scrub_preset(
+    explicit: Option<&str>,
+    stored: &str,
+) -> Result<share::ScrubPreset, CliError> {
+    if let Some(explicit) = explicit {
+        return Ok(share::normalize_scrub_preset(explicit)?);
+    }
+    let preset = share::normalize_scrub_preset(stored)?;
+    if preset == share::ScrubPreset::Archive {
+        return Err(CliError::InvalidArgument(
+            "the bundle's manifest asks for the `archive` scrub preset (no secret scrub, no \
+             path redaction); pass --scrub-preset archive to confirm it, or another preset"
+                .to_string(),
+        ));
+    }
+    Ok(preset)
+}
+
 /// Whether `am share verify` passes. With `--public-key` the caller asked
 /// whether the publisher signed this bundle, so a missing signature fails:
 /// deleting `manifest.sig.json` after editing the manifest must not verify.
@@ -6672,11 +6694,8 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                 .into());
             }
             let stored = share::load_bundle_export_config(&args.bundle)?;
-            let preset = args
-                .scrub_preset
-                .as_deref()
-                .unwrap_or(stored.scrub_preset.as_str());
-            let _preset = share::normalize_scrub_preset(preset)?;
+            let _preset =
+                share_update_scrub_preset(args.scrub_preset.as_deref(), &stored.scrub_preset)?;
             let inline = args.inline_threshold.unwrap_or(stored.inline_threshold);
             let detach = args.detach_threshold.unwrap_or(stored.detach_threshold);
             let chunk_threshold = args.chunk_threshold.unwrap_or(stored.chunk_threshold);
@@ -95578,6 +95597,27 @@ fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let err = ensure_share_zip_target_absent(&bundle, false)
         .expect_err("existing zip archive should fail preflight");
     assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
+}
+
+#[test]
+fn share_update_does_not_take_the_archive_preset_from_the_manifest_alone() {
+    // A stored standard/strict preset is reused as before.
+    assert_eq!(
+        share_update_scrub_preset(None, "strict").expect("stored strict"),
+        share::ScrubPreset::Strict
+    );
+    // A manifest edited to `archive` must not silently drop the scrub.
+    let err = share_update_scrub_preset(None, "archive").expect_err("unconfirmed archive");
+    assert!(err.to_string().contains("--scrub-preset archive"), "{err}");
+    // Naming it again confirms it; an explicit choice always wins.
+    assert_eq!(
+        share_update_scrub_preset(Some("archive"), "archive").expect("confirmed"),
+        share::ScrubPreset::Archive
+    );
+    assert_eq!(
+        share_update_scrub_preset(Some("standard"), "archive").expect("override"),
+        share::ScrubPreset::Standard
+    );
 }
 
 #[test]
