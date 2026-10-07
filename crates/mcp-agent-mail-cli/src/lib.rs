@@ -41475,6 +41475,8 @@ fn server_inbox_payload_to_cli_json(
                     "created_ts": row.get("created_ts").and_then(|v| v.as_str()).unwrap_or_default(),
                     "kind": row.get("kind").and_then(|v| v.as_str()).unwrap_or_default(),
                     "thread_id": row.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+                    // Same shape as the local path (`inbox_row_to_json`).
+                    "topic": row.get("topic").cloned().unwrap_or(serde_json::Value::Null),
                 });
                 if include_body
                     && let Some(body) = row.get("body_md").and_then(|v| v.as_str())
@@ -43120,6 +43122,7 @@ mod mail_server_cli_bridge_tests {
                 "created_ts": "2026-03-11T21:31:00Z",
                 "kind": "to",
                 "thread_id": "br-7",
+                "topic": "deploys",
                 "body_md": "Visible body"
             }
         ]);
@@ -43128,6 +43131,8 @@ mod mail_server_cli_bridge_tests {
             server_inbox_payload_to_cli_json(&payload, false).expect("bridge without body");
         assert_eq!(without_body.len(), 1);
         assert!(without_body[0].get("body_md").is_none());
+        // The topic survives the bridge, as on the local path.
+        assert_eq!(without_body[0]["topic"], "deploys");
 
         let with_body = server_inbox_payload_to_cli_json(&payload, true).expect("bridge with body");
         assert_eq!(
@@ -89608,6 +89613,7 @@ fn fetch_mail_inbox_direct_with_database_url(
             ),
             "kind": row.kind.clone(),
             "thread_id": row.message.thread_id.clone(),
+            "topic": row.message.topic.clone(),
         });
         if include_bodies && let Some(obj) = value.as_object_mut() {
             obj.insert(
