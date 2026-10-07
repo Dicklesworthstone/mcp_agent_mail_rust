@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
 
-/// Try to extract the git remote URL for the directory.
+/// Try to extract the git remote URL for the directory, without credentials.
+///
+/// The URL feeds hosting signals that are written into the bundle's
+/// `manifest.json` and `HOW_TO_DEPLOY.md`, which are published; a remote such
+/// as `https://user:ghp_token@github.com/o/r.git` must not carry its token
+/// there, whatever the scrub preset.
 ///
 /// br-8ujfs.4.1 (D1): routes through `GitCmd` for per-repo locking.
 #[must_use]
@@ -12,10 +17,25 @@ pub fn git_remote_url(dir: &Path) -> Option<String> {
     if output.status.success() {
         let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !url.is_empty() {
-            return Some(url);
+            return Some(strip_url_credentials(&url));
         }
     }
     None
+}
+
+/// Drop the `user[:password]@` part of a `scheme://` URL. Other forms (such
+/// as scp-style `git@host:owner/repo`) carry no secret and pass unchanged.
+#[must_use]
+pub fn strip_url_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((_credentials, host)) => format!("{scheme}://{host}{tail}"),
+        None => url.to_string(),
+    }
 }
 
 /// Walk ancestor directories looking for a specific file/dir.
@@ -108,6 +128,32 @@ fn isolated_test_tempdir_from(preferred: &Path) -> tempfile::TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_urls_lose_their_credentials() {
+        assert_eq!(
+            strip_url_credentials("https://alice:ghp_secret@github.com/alice/site.git"),
+            "https://github.com/alice/site.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://x-access-token:abc@github.com/o/r"),
+            "https://github.com/o/r"
+        );
+        // A user name alone is dropped too; an '@' after the host is not
+        // credentials.
+        assert_eq!(
+            strip_url_credentials("ssh://git@example.com/o/r@v2.git"),
+            "ssh://example.com/o/r@v2.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
 
     #[test]
     fn isolated_test_tempdir_escapes_checkout_tmpdir() {
