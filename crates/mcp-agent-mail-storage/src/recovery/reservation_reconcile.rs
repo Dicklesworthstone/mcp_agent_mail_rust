@@ -1707,48 +1707,93 @@ mod tests {
 
             let mut cursor = ReservationReconcileCursor::default();
             let first = reconcile_reservation_releases(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!((first.scanned, first.deferred, first.repaired), (2, 1, 1));
             assert!(cursor.history.ceiling.is_none());
             assert_eq!(fs::read(&stable).unwrap(), before);
-            assert!(matches!(process.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            assert!(matches!(
+                process.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
             assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
             let other_artifact = read_artifact(&other).unwrap().unwrap();
-            assert_eq!(other_artifact.value["released_ts"], other_source.artifact["released_ts"]);
+            assert_eq!(
+                other_artifact.value["released_ts"],
+                other_source.artifact["released_ts"]
+            );
             assert_eq!(other_artifact.value["operator_note"], "preserve this note");
             let repo = Repository::open(&config.storage_root).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
             assert_eq!(
-                committed_artifact(&repo, Some(&tree), "projects/other/file_reservations/id-501-gaabb.json")
-                    .unwrap().unwrap().bytes,
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/other/file_reservations/id-501-gaabb.json"
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
                 other_artifact.bytes
             );
 
             // A deferred repair must re-read its live source, not publish a
             // payload captured before the lock wait or freeze the scan there.
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='latest reason' WHERE id=401").unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason='latest reason' WHERE id=401")
+                .unwrap();
             drop(conn);
             drop(held);
             let resumed = reconcile_reservation_releases(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
-            assert_eq!((resumed.repaired, resumed.unchanged, resumed.deferred), (1, 1, 0));
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                (resumed.repaired, resumed.unchanged, resumed.deferred),
+                (1, 1, 0)
+            );
             let artifact = read_artifact(&stable).unwrap().unwrap();
-            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(
+                artifact.value["released_ts"],
+                source.artifact["released_ts"]
+            );
             assert_eq!(artifact.value["reason"], "latest reason");
             assert_eq!(artifact.value["operator_note"], "preserve this note");
             let tree = head_tree(&repo).unwrap().unwrap();
             assert_eq!(
-                committed_artifact(&repo, Some(&tree), "projects/project/file_reservations/id-401-gaabb.json")
-                    .unwrap().unwrap().bytes,
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-401-gaabb.json"
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
                 artifact.bytes
             );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            let rows = conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=401",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(rows[0].get_as::<Option<i64>>(0).unwrap(), None);
-            let ledger = conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap();
+            let ledger = conn
+                .query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(ledger[0].get_as::<i64>(0).unwrap(), 5_000_000);
             drop(conn);
             crate::flush_async_commits();

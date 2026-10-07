@@ -25,7 +25,12 @@ pub(super) fn with_repair_lock<T>(
     archive: &ProjectArchive,
     repair: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    with_budget(archive, REPAIR_LOCK_BUDGET, || cx.checkpoint().is_err(), repair)
+    with_budget(
+        archive,
+        REPAIR_LOCK_BUDGET,
+        || cx.checkpoint().is_err(),
+        repair,
+    )
 }
 
 impl ProjectArchive {
@@ -133,10 +138,15 @@ mod tests {
         let held = lock.lock().unwrap();
         let called = AtomicBool::new(false);
         let started = Instant::now();
-        let result = with_budget(&archive, Duration::from_millis(20), || false, || {
-            called.store(true, Ordering::Release);
-            Ok(())
-        });
+        let result = with_budget(
+            &archive,
+            Duration::from_millis(20),
+            || false,
+            || {
+                called.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
         assert!(matches!(result, Err(StorageError::LockTimeout(_))));
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert!(!called.load(Ordering::Acquire));
@@ -157,10 +167,7 @@ mod tests {
         let metadata = archive.root.join(".archive.lock.owner.json");
         std::fs::write(&path, b"held lock evidence").unwrap();
         std::fs::write(&metadata, b"operator evidence").unwrap();
-        let held = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         held.try_lock_exclusive().unwrap();
         let result: Result<()> = with_budget(
             &archive,
@@ -171,10 +178,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::LockTimeout(_))));
         assert_eq!(std::fs::read(&path).unwrap(), b"held lock evidence");
         assert_eq!(std::fs::read(&metadata).unwrap(), b"operator evidence");
-        let contender = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let contender = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         assert!(contender.try_lock_exclusive().is_err());
         fs2::FileExt::unlock(&held).unwrap();
         assert!(with_repair_lock(&Cx::for_testing(), &archive, || Ok(())).is_ok());
@@ -191,10 +195,15 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = with_budget(&archive, Duration::from_secs(30), || {
-                let _ = entered_tx.send(());
-                observed.load(Ordering::Acquire)
-            }, || Ok(()));
+            let result = with_budget(
+                &archive,
+                Duration::from_secs(30),
+                || {
+                    let _ = entered_tx.send(());
+                    observed.load(Ordering::Acquire)
+                },
+                || Ok(()),
+            );
             let _ = done_tx.send(matches!(result, Err(StorageError::Io(ref error))
                 if error.kind() == std::io::ErrorKind::Interrupted));
         });
@@ -211,10 +220,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let archive = archive(temp.path());
         let mut checks = 0;
-        let result = with_budget(&archive, Duration::from_secs(5), || {
-            checks += 1;
-            checks == 4
-        }, || Ok("must not run"));
+        let result = with_budget(
+            &archive,
+            Duration::from_secs(5),
+            || {
+                checks += 1;
+                checks == 4
+            },
+            || Ok("must not run"),
+        );
         assert!(matches!(result, Err(StorageError::Io(ref error))
             if error.kind() == std::io::ErrorKind::Interrupted));
         assert!(with_repair_lock(&Cx::for_testing(), &archive, || Ok(())).is_ok());
@@ -228,11 +242,14 @@ mod tests {
             Err(StorageError::InvalidPath("injected repair error".into()))
         });
         assert!(matches!(result, Err(StorageError::InvalidPath(_))));
-        assert!(std::panic::catch_unwind(|| {
-            let _: Result<()> = with_repair_lock(&Cx::for_testing(), &archive, || {
-                panic!("injected repair panic");
-            });
-        }).is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _: Result<()> = with_repair_lock(&Cx::for_testing(), &archive, || {
+                    panic!("injected repair panic");
+                });
+            })
+            .is_err()
+        );
         assert!(with_repair_lock(&Cx::for_testing(), &archive, || Ok(())).is_ok());
     }
 
@@ -243,9 +260,14 @@ mod tests {
         let archive = archive(temp.path());
         let process = crate::archive_process_lock(&archive).unwrap();
         let path = archive.root.join(".archive.lock");
-        let zero: Result<()> = with_budget(&archive, Duration::ZERO, || false, || {
-            panic!("an exhausted budget cannot publish");
-        });
+        let zero: Result<()> = with_budget(
+            &archive,
+            Duration::ZERO,
+            || false,
+            || {
+                panic!("an exhausted budget cannot publish");
+            },
+        );
         assert!(matches!(zero, Err(StorageError::LockTimeout(_))));
         assert!(!path.exists());
         with_repair_lock(&Cx::for_testing(), &archive, || {

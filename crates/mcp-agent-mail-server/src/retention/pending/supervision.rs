@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use mcp_agent_mail_core::Config;
 
 use super::journal_scan::Kind;
-use super::{REPLAY_KINDS, ReplayWorker, ReplayWorkerGroup, replay_kind_name, sleep_until_next_pass};
+use super::{
+    REPLAY_KINDS, ReplayWorker, ReplayWorkerGroup, replay_kind_name, sleep_until_next_pass,
+};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -38,7 +40,11 @@ impl Service {
     }
 
     pub(super) fn ensure_running(&mut self) -> io::Result<()> {
-        if self.supervisor.as_ref().is_some_and(|worker| !worker.is_finished()) {
+        if self
+            .supervisor
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
             return Ok(());
         }
         // A failed supervisor drops and joins its group during unwinding. Join
@@ -79,7 +85,8 @@ impl Supervisor {
                     for event in events {
                         match event {
                             Event::Exited { kind, delay } => tracing::warn!(
-                                kind = replay_kind_name(kind), retry_after_secs = delay.as_secs(),
+                                kind = replay_kind_name(kind),
+                                retry_after_secs = delay.as_secs(),
                                 "durable replay worker exited; joined before scheduled replacement"
                             ),
                             Event::SpawnFailed { kind, delay, error } => tracing::warn!(
@@ -87,7 +94,8 @@ impl Supervisor {
                                 %error, "durable replay worker could not start; peer retained"
                             ),
                             Event::Started { kind, replacement } => tracing::info!(
-                                kind = replay_kind_name(kind), replacement,
+                                kind = replay_kind_name(kind),
+                                replacement,
                                 "durable replay worker started with fresh journal admission state"
                             ),
                         }
@@ -139,9 +147,11 @@ impl Retry {
     }
 
     fn failed(&mut self, now: Instant) -> Duration {
-        if self.running_since.take().is_some_and(|started| {
-            now.saturating_duration_since(started) >= STABLE_RUN
-        }) {
+        if self
+            .running_since
+            .take()
+            .is_some_and(|started| now.saturating_duration_since(started) >= STABLE_RUN)
+        {
             self.backoff = Duration::ZERO;
         }
         self.backoff = if self.backoff.is_zero() {
@@ -156,9 +166,19 @@ impl Retry {
 
 #[derive(Debug)]
 enum Event {
-    Exited { kind: Kind, delay: Duration },
-    SpawnFailed { kind: Kind, delay: Duration, error: io::Error },
-    Started { kind: Kind, replacement: bool },
+    Exited {
+        kind: Kind,
+        delay: Duration,
+    },
+    SpawnFailed {
+        kind: Kind,
+        delay: Duration,
+        error: io::Error,
+    },
+    Started {
+        kind: Kind,
+        replacement: bool,
+    },
 }
 
 /// The caller supplies a monotonic clock so backoff boundaries can be tested
@@ -178,7 +198,10 @@ fn tick(
         }
         if slot.as_ref().is_some_and(ReplayWorker::is_finished) {
             drop(slot.take());
-            events.push(Event::Exited { kind, delay: retry.failed(now) });
+            events.push(Event::Exited {
+                kind,
+                delay: retry.failed(now),
+            });
         }
         if slot.is_none() && retry.due(now) {
             match spawn(&group.config, kind) {
@@ -205,7 +228,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn group() -> ReplayWorkerGroup {
-        ReplayWorkerGroup { config: Config::default(), slots: [None, None] }
+        ReplayWorkerGroup {
+            config: Config::default(),
+            slots: [None, None],
+        }
     }
 
     fn sleeper(_: &Config, kind: Kind) -> io::Result<ReplayWorker> {
@@ -230,7 +256,10 @@ mod tests {
         for expected in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
             let delay = retry.failed(now);
             assert_eq!(delay, Duration::from_secs(expected));
-            assert!(!retry.due(now + delay - Duration::from_nanos(1)));
+            let just_before = (now + delay)
+                .checked_sub(Duration::from_nanos(1))
+                .expect("an instant after a positive delay");
+            assert!(!retry.due(just_before));
             now += delay;
             assert!(retry.due(now));
             retry.started(now);
@@ -247,27 +276,52 @@ mod tests {
         let mut retries = [Retry::default(), Retry::default()];
         let stop = AtomicBool::new(false);
         let now = Instant::now();
-        let first = tick(&mut group, &mut retries, &stop, now, &mut |config, kind| {
-            match kind {
+        let first = tick(
+            &mut group,
+            &mut retries,
+            &stop,
+            now,
+            &mut |config, kind| match kind {
                 Kind::Ack => Err(io::Error::other("injected spawn failure")),
                 Kind::Release => sleeper(config, kind),
+            },
+        );
+        assert!(matches!(
+            &first[0],
+            Event::SpawnFailed {
+                kind: Kind::Ack,
+                ..
             }
-        });
-        assert!(matches!(&first[0], Event::SpawnFailed { kind: Kind::Ack, .. }));
+        ));
         assert!(group.slots[0].is_none());
         let peer = Arc::clone(&group.slots[1].as_ref().unwrap().shutdown);
         tick(&mut group, &mut retries, &stop, now, &mut |_, _| {
             panic!("backoff must prevent a second spawn in the same tick")
         });
         let mut attempts = 0;
-        let retried = tick(&mut group, &mut retries, &stop, now + INITIAL_BACKOFF, &mut |config, kind| {
-            assert!(matches!(kind, Kind::Ack));
-            attempts += 1;
-            sleeper(config, kind)
-        });
+        let after_backoff = tick(
+            &mut group,
+            &mut retries,
+            &stop,
+            now + INITIAL_BACKOFF,
+            &mut |config, kind| {
+                assert!(matches!(kind, Kind::Ack));
+                attempts += 1;
+                sleeper(config, kind)
+            },
+        );
         assert_eq!(attempts, 1);
-        assert!(matches!(&retried[0], Event::Started { kind: Kind::Ack, replacement: true }));
-        assert!(Arc::ptr_eq(&peer, &group.slots[1].as_ref().unwrap().shutdown));
+        assert!(matches!(
+            &after_backoff[0],
+            Event::Started {
+                kind: Kind::Ack,
+                replacement: true
+            }
+        ));
+        assert!(Arc::ptr_eq(
+            &peer,
+            &group.slots[1].as_ref().unwrap().shutdown
+        ));
         assert!(!peer.load(Ordering::Acquire));
     }
 
@@ -277,9 +331,8 @@ mod tests {
         let mut retries = [Retry::default(), Retry::default()];
         let stop = AtomicBool::new(false);
         let now = Instant::now();
-        group.slots[0] = Some(ReplayWorker::spawn_with(Kind::Ack, |_| {
-            panic!("injected replay panic")
-        }).unwrap());
+        group.slots[0] =
+            Some(ReplayWorker::spawn_with(Kind::Ack, |_| panic!("injected replay panic")).unwrap());
         retries[0].started(now);
         let old_stop = Arc::clone(&group.slots[0].as_ref().unwrap().shutdown);
         wait_for_exit(group.slots[0].as_ref().unwrap());
@@ -288,14 +341,32 @@ mod tests {
         let observed = tick(&mut group, &mut retries, &stop, now, &mut |_, _| {
             panic!("an exited lane must back off before spawning")
         });
-        assert!(matches!(&observed[0], Event::Exited { kind: Kind::Ack, .. }));
+        assert!(matches!(
+            &observed[0],
+            Event::Exited {
+                kind: Kind::Ack,
+                ..
+            }
+        ));
         assert!(group.slots[0].is_none());
-        assert!(old_stop.load(Ordering::Acquire), "finished worker was joined and stopped");
-        tick(&mut group, &mut retries, &stop, now + INITIAL_BACKOFF, &mut sleeper);
+        assert!(
+            old_stop.load(Ordering::Acquire),
+            "finished worker was joined and stopped"
+        );
+        tick(
+            &mut group,
+            &mut retries,
+            &stop,
+            now + INITIAL_BACKOFF,
+            &mut sleeper,
+        );
         let fresh = &group.slots[0].as_ref().unwrap().shutdown;
         assert!(!Arc::ptr_eq(&old_stop, fresh));
         assert!(!fresh.load(Ordering::Acquire));
-        assert!(Arc::ptr_eq(&peer, &group.slots[1].as_ref().unwrap().shutdown));
+        assert!(Arc::ptr_eq(
+            &peer,
+            &group.slots[1].as_ref().unwrap().shutdown
+        ));
     }
 
     #[test]
@@ -304,12 +375,18 @@ mod tests {
         let mut retries = [Retry::default(), Retry::default()];
         let stop = AtomicBool::new(false);
         let mut attempts = 0;
-        tick(&mut group, &mut retries, &stop, Instant::now(), &mut |config, kind| {
-            attempts += 1;
-            let worker = sleeper(config, kind)?;
-            stop.store(true, Ordering::Release);
-            Ok(worker)
-        });
+        tick(
+            &mut group,
+            &mut retries,
+            &stop,
+            Instant::now(),
+            &mut |config, kind| {
+                attempts += 1;
+                let worker = sleeper(config, kind)?;
+                stop.store(true, Ordering::Release);
+                Ok(worker)
+            },
+        );
         assert_eq!(attempts, 1);
         assert!(group.slots[1].is_none());
         let first_stop = Arc::clone(&group.slots[0].as_ref().unwrap().shutdown);
@@ -319,7 +396,10 @@ mod tests {
 
     #[test]
     fn supervisor_shutdown_joins_both_children_and_preserves_the_selected_config() {
-        let config = Config { database_url: "sqlite:///selected.sqlite3".into(), ..Config::default() };
+        let config = Config {
+            database_url: "sqlite:///selected.sqlite3".into(),
+            ..Config::default()
+        };
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let exited = Arc::new(AtomicUsize::new(0));
         let worker_exited = Arc::clone(&exited);
@@ -332,12 +412,17 @@ mod tests {
                 assert!(sleep_until_next_pass(Duration::from_secs(3600), stop));
                 exited.fetch_add(1, Ordering::SeqCst);
             })
-        }).unwrap();
+        })
+        .unwrap();
         for _ in 0..2 {
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
         drop(supervisor);
-        assert_eq!(exited.load(Ordering::SeqCst), 2, "drop returned only after both children exited");
+        assert_eq!(
+            exited.load(Ordering::SeqCst),
+            2,
+            "drop returned only after both children exited"
+        );
     }
 
     fn isolated_database_test() -> bool {
@@ -353,8 +438,11 @@ mod tests {
             .output()
             .expect("run isolated replay supervision test");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success() && stdout.contains("1 passed; 0 failed"),
-            "isolated {name} failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         true
     }
 
@@ -373,7 +461,9 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
                 storage_root: temp.path().join("archive"),
-                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("mail.sqlite3")),
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
                 ..Config::default()
             };
             std::fs::create_dir_all(&config.storage_root).unwrap();
@@ -386,19 +476,41 @@ mod tests {
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
             drop(conn);
             let message = block_on(queries::create_message_with_recipients(
-                &cx, &pool, 71, 81, "survive receipt-boundary panic", "body", None,
-                "normal", true, "[]", &[(81, "to")],
-            )).into_result().unwrap();
+                &cx,
+                &pool,
+                71,
+                81,
+                "survive receipt-boundary panic",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(81, "to")],
+            ))
+            .into_result()
+            .unwrap();
             let message_id = message.id.unwrap();
             let claim = journal::AckIntentIdempotency {
                 key: "supervised-retry".into(),
                 fingerprint: mcp_agent_mail_tools::idempotency::compute_fingerprint(
                     "acknowledge_message",
-                    &[("agent", "BlueLake".into()), ("message_id", message_id.to_string())],
+                    &[
+                        ("agent", "BlueLake".into()),
+                        ("message_id", message_id.to_string()),
+                    ],
                 ),
             };
-            journal::append_ack_intent(&config, "supervision", "BlueLake", message_id,
-                "test", "database unavailable", Some(&claim)).unwrap();
+            journal::append_ack_intent(
+                &config,
+                "supervision",
+                "BlueLake",
+                message_id,
+                "test",
+                "database unavailable",
+                Some(&claim),
+            )
+            .unwrap();
             let log = journal::log_path(&config, journal::ACK_INTENT_LOG_FILE);
             let before = std::fs::read(&log).unwrap();
 
@@ -444,7 +556,11 @@ mod tests {
             }).unwrap();
             let original_ack = applied_rx.recv_timeout(Duration::from_secs(20)).unwrap();
             assert!(original_ack > 0);
-            assert_eq!(std::fs::read(&log).unwrap(), before, "the first worker wrote no completion");
+            assert_eq!(
+                std::fs::read(&log).unwrap(),
+                before,
+                "the first worker wrote no completion"
+            );
             assert_eq!(journal::read_queued_ack_intents(&config).unwrap().len(), 1);
             crash_tx.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -458,18 +574,35 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             };
             drop(supervisor);
-            assert!(completed, "the supervisor did not recover the durable ACK after a worker panic");
+            assert!(
+                completed,
+                "the supervisor did not recover the durable ACK after a worker panic"
+            );
             assert_eq!(ack_starts.load(Ordering::SeqCst), 2);
-            assert_eq!(release_starts.load(Ordering::SeqCst), 1, "healthy peer was not restarted");
+            assert_eq!(
+                release_starts.load(Ordering::SeqCst),
+                1,
+                "healthy peer was not restarted"
+            );
             let conn = block_on(pool.acquire(&cx)).into_result().unwrap();
-            let rows = conn.query_sync("SELECT ack_ts FROM message_recipients WHERE message_id = ? AND agent_id = 81",
-                &[message_id.into()]).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = ? AND agent_id = 81",
+                    &[message_id.into()],
+                )
+                .unwrap();
             assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), original_ack);
             drop(conn);
             let journal_bytes = std::fs::read_to_string(&log).unwrap();
-            let records: Vec<serde_json::Value> = journal_bytes.lines()
-                .map(|line| serde_json::from_str(line).unwrap()).collect();
-            assert_eq!(records.len(), 2, "only the original intent and its terminal receipt remain");
+            let records: Vec<serde_json::Value> = journal_bytes
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                records.len(),
+                2,
+                "only the original intent and its terminal receipt remain"
+            );
             assert_eq!(records[1]["status"], journal::REPLAY_STATUS_REPLAYED);
             assert!(!records[1].to_string().contains("supervised-retry"));
         });

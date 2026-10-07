@@ -38,9 +38,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CATCH_UP_INTERVAL: Duration = Duration::from_secs(1);
 const SCAN_INTERVAL: Duration = Duration::from_millis(100);
 type ReplayWorkerSlots = [Option<ReplayWorker>; 2];
-static WORKERS: LazyLock<Mutex<Option<supervision::Service>>> =
-    LazyLock::new(|| Mutex::new(None));
-const REPLAY_KINDS: [journal_scan::Kind; 2] = [journal_scan::Kind::Ack, journal_scan::Kind::Release];
+static WORKERS: LazyLock<Mutex<Option<supervision::Service>>> = LazyLock::new(|| Mutex::new(None));
+const REPLAY_KINDS: [journal_scan::Kind; 2] =
+    [journal_scan::Kind::Ack, journal_scan::Kind::Release];
 
 type IntentKey = (i64, String);
 
@@ -417,7 +417,9 @@ pub(super) fn start(config: &Config) {
     let started = service.ensure_running();
     drop(workers);
     if retargeted {
-        tracing::warn!("durable replay retains its original mailbox until shutdown; restart required to retarget");
+        tracing::warn!(
+            "durable replay retains its original mailbox until shutdown; restart required to retarget"
+        );
     }
     if let Err(error) = started {
         tracing::warn!(%error, "could not start durable replay supervisor; startup retry required");
@@ -809,14 +811,20 @@ mod tests {
                 journal_scan::Kind::Ack => {
                     assert!(failed.acknowledgements.is_err());
                     assert!(failed.releases.unwrap().is_none());
-                    assert!(empty.acknowledgements.unwrap().unwrap().is_empty());
+                    assert_eq!(
+                        empty.acknowledgements.unwrap().unwrap(),
+                        [] as [QueuedAckIntent; 0]
+                    );
                     assert!(empty.releases.unwrap().is_none());
                 }
                 journal_scan::Kind::Release => {
                     assert!(failed.acknowledgements.unwrap().is_none());
                     assert!(failed.releases.is_err());
                     assert!(empty.acknowledgements.unwrap().is_none());
-                    assert!(empty.releases.unwrap().unwrap().is_empty());
+                    assert_eq!(
+                        empty.releases.unwrap().unwrap(),
+                        [] as [QueuedReleaseIntentView; 0]
+                    );
                 }
             }
         }
@@ -862,7 +870,14 @@ mod tests {
         });
         assert_eq!(errors.len(), 1);
         assert!(workers[0].is_none());
-        let peer = workers[1].as_ref().unwrap().handle.as_ref().unwrap().thread().id();
+        let peer = workers[1]
+            .as_ref()
+            .unwrap()
+            .handle
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
         let mut attempts = 0;
         let errors = ensure_replay_workers(&mut workers, |kind| {
             assert!(matches!(kind, journal_scan::Kind::Ack));
@@ -871,8 +886,20 @@ mod tests {
         });
         assert!(errors.is_empty());
         assert_eq!(attempts, 1);
-        assert_eq!(workers[1].as_ref().unwrap().handle.as_ref().unwrap().thread().id(), peer);
-        let stopped = workers.each_ref().map(|slot| Arc::clone(&slot.as_ref().unwrap().shutdown));
+        assert_eq!(
+            workers[1]
+                .as_ref()
+                .unwrap()
+                .handle
+                .as_ref()
+                .unwrap()
+                .thread()
+                .id(),
+            peer
+        );
+        let stopped = workers
+            .each_ref()
+            .map(|slot| Arc::clone(&slot.as_ref().unwrap().shutdown));
         stop_replay_workers(&mut workers);
         assert!(workers.iter().all(Option::is_none));
         assert!(stopped.iter().all(|stop| stop.load(Ordering::Acquire)));
@@ -887,14 +914,23 @@ mod tests {
             assert!(Instant::now() < deadline, "first worker did not exit");
             std::thread::yield_now();
         }
-        let mut workers = [Some(first), Some(sleeping_replay_worker(journal_scan::Kind::Release).unwrap())];
+        let mut workers = [
+            Some(first),
+            Some(sleeping_replay_worker(journal_scan::Kind::Release).unwrap()),
+        ];
         let peer_stop = Arc::clone(&workers[1].as_ref().unwrap().shutdown);
         let errors = ensure_replay_workers(&mut workers, sleeping_replay_worker);
         assert!(errors.is_empty());
         let new_stop = Arc::clone(&workers[0].as_ref().unwrap().shutdown);
-        assert!(old_stop.load(Ordering::Acquire), "old incarnation was joined");
+        assert!(
+            old_stop.load(Ordering::Acquire),
+            "old incarnation was joined"
+        );
         assert!(!Arc::ptr_eq(&old_stop, &new_stop));
-        assert!(Arc::ptr_eq(&peer_stop, &workers[1].as_ref().unwrap().shutdown));
+        assert!(Arc::ptr_eq(
+            &peer_stop,
+            &workers[1].as_ref().unwrap().shutdown
+        ));
         assert!(!new_stop.load(Ordering::Acquire));
         assert!(!peer_stop.load(Ordering::Acquire));
         stop_replay_workers(&mut workers);
@@ -908,12 +944,14 @@ mod tests {
             let cancelled = sleep_until_next_pass(Duration::from_secs(3600), stop);
             let peer_stopped = peer_stopped_rx.recv_timeout(Duration::from_secs(5)).is_ok();
             observed_tx.send(cancelled && peer_stopped).unwrap();
-        }).unwrap();
+        })
+        .unwrap();
         let release = ReplayWorker::spawn_with(journal_scan::Kind::Release, move |stop| {
             if sleep_until_next_pass(Duration::from_secs(3600), stop) {
                 let _ = peer_stopped_tx.send(());
             }
-        }).unwrap();
+        })
+        .unwrap();
         let mut workers = [Some(ack), Some(release)];
         stop_replay_workers(&mut workers);
         assert!(observed_rx.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -933,8 +971,11 @@ mod tests {
             .output()
             .expect("run isolated replay worker test");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success() && stdout.contains("1 passed; 0 failed"),
-            "isolated {name} failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         true
     }
 
@@ -960,7 +1001,9 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
                 storage_root: temp.path().join("archive"),
-                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("mail.sqlite3")),
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
                 ..Config::default()
             };
             std::fs::create_dir_all(&config.storage_root).unwrap();
@@ -970,27 +1013,52 @@ mod tests {
             selected.run_migrations = true;
             let pool = DbPool::new(&selected).unwrap();
             let cx = Cx::for_testing();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             let key = project_root.to_string_lossy().replace('\'', "''");
             conn.execute_raw(&format!("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'replay', '{key}', 1)")).unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
             drop(conn);
             let message = fastmcp_core::block_on(queries::create_message_with_recipients(
-                &cx, &pool, 71, 81, "ack during archive contention", "body", None,
-                "normal", true, "[]", &[(81, "to")],
-            )).into_result().unwrap();
+                &cx,
+                &pool,
+                71,
+                81,
+                "ack during archive contention",
+                "body",
+                None,
+                "normal",
+                true,
+                "[]",
+                &[(81, "to")],
+            ))
+            .into_result()
+            .unwrap();
             let message_id = message.id.unwrap();
             let lease = fastmcp_core::block_on(queries::create_file_reservations(
-                &cx, &pool, 71, 81, &["src/owned.rs"], 3600, true, "queued release",
-            )).into_result().unwrap();
+                &cx,
+                &pool,
+                71,
+                81,
+                &["src/owned.rs"],
+                3600,
+                true,
+                "queued release",
+            ))
+            .into_result()
+            .unwrap();
             let lease_id = lease[0].id.unwrap();
             let archive = mcp_agent_mail_storage::ensure_archive(&config, "replay").unwrap();
             mcp_agent_mail_storage::flush_async_commits();
             let generation = fastmcp_core::block_on(queries::db_generation_id(&cx, &pool))
-                .into_result().unwrap().expect("live generation");
+                .into_result()
+                .unwrap()
+                .expect("live generation");
             let stable = archive.root.join("file_reservations").join(
                 mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
-                    Some(&generation), lease_id,
+                    Some(&generation),
+                    lease_id,
                 ),
             );
             let mut record = json!({
@@ -1003,8 +1071,13 @@ mod tests {
             let hash = journal::hash_json_value(&record);
             record["intent_id"] = json!(&hash[..16]);
             record["content_sha256"] = json!(hash);
-            journal::append_jsonl(&config, journal::RELEASE_INTENT_LOG_FILE,
-                ".release_file_reservations.jsonl.lock", &record).unwrap();
+            journal::append_jsonl(
+                &config,
+                journal::RELEASE_INTENT_LOG_FILE,
+                ".release_file_reservations.jsonl.lock",
+                &record,
+            )
+            .unwrap();
 
             // Declare the replay slots first so unwinding drops/unlocks the
             // lock owner before joining a replay which may be waiting on it.
@@ -1018,53 +1091,81 @@ mod tests {
                     // lock to be explicitly released after ACK recovery.
                     if !sleep_until_next_pass(Duration::from_secs(45), stop) {
                         return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut, "archive blocker expired",
-                        ).into());
+                            std::io::ErrorKind::TimedOut,
+                            "archive blocker expired",
+                        )
+                        .into());
                     }
                     Ok(())
                 });
                 let _ = unlocked_tx.send(result);
-            }).unwrap();
+            })
+            .unwrap();
             locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             workers[1] = Some(ReplayWorker::spawn(&config, journal_scan::Kind::Release).unwrap());
             let release_applied = wait_for_replay_observation(|| {
                 fastmcp_core::block_on(queries::get_reservations_by_ids(&cx, &pool, &[lease_id]))
-                    .into_result().is_ok_and(|rows| rows.first().is_some_and(|row| row.released_ts.is_some()))
+                    .into_result()
+                    .is_ok_and(|rows| rows.first().is_some_and(|row| row.released_ts.is_some()))
             });
             // Queue this ACK only AFTER the release reached its database
             // mutation. It cannot pass merely by winning the first poll race.
-            journal::append_ack_intent(&config, "replay", "BlueLake", message_id, "test", "outage", None).unwrap();
-            let spawn_errors = ensure_replay_workers(&mut workers, |kind| ReplayWorker::spawn(&config, kind));
+            journal::append_ack_intent(
+                &config, "replay", "BlueLake", message_id, "test", "outage", None,
+            )
+            .unwrap();
+            let spawn_errors =
+                ensure_replay_workers(&mut workers, |kind| ReplayWorker::spawn(&config, kind));
             let ack_completed = wait_for_replay_observation(|| {
                 journal::read_queued_ack_intents(&config).is_ok_and(|intents| intents.is_empty())
             });
             // Project-lock waiting is now bounded: database closeout and its
             // receipt must finish even though the archive remains unavailable.
             let release_completed_while_locked = wait_for_replay_observation(|| {
-                journal::read_queued_release_intents(&config).is_ok_and(|intents| intents.is_empty())
+                journal::read_queued_release_intents(&config)
+                    .is_ok_and(|intents| intents.is_empty())
             });
             let archive_deferred_while_locked = !stable.exists();
             let release_still_running = !workers[1].as_ref().unwrap().is_finished();
             // An ACK completion marker alone is insufficient: verify the real
             // recipient receipt as well, while the archive lock is still held.
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
-            let rows = conn.query_sync("SELECT ack_ts FROM message_recipients WHERE message_id = ? AND agent_id = 81",
-                &[message_id.into()]).unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = ? AND agent_id = 81",
+                    &[message_id.into()],
+                )
+                .unwrap();
             let ack_ts = rows[0].get_named::<Option<i64>>("ack_ts").unwrap();
             drop(conn);
             drop(locker);
             let explicitly_unlocked = unlocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let release_completed = wait_for_replay_observation(|| {
-                journal::read_queued_release_intents(&config).is_ok_and(|intents| intents.is_empty())
+                journal::read_queued_release_intents(&config)
+                    .is_ok_and(|intents| intents.is_empty())
             });
             stop_replay_workers(&mut workers);
-            assert!(explicitly_unlocked.is_ok(), "archive lock expired before explicit release");
+            assert!(
+                explicitly_unlocked.is_ok(),
+                "archive lock expired before explicit release"
+            );
             assert!(spawn_errors.is_empty());
-            assert!(release_applied, "release never reached its database mutation");
+            assert!(
+                release_applied,
+                "release never reached its database mutation"
+            );
             assert!(release_completed_while_locked && release_still_running);
-            assert!(archive_deferred_while_locked, "repair wrote through a held project lock");
+            assert!(
+                archive_deferred_while_locked,
+                "repair wrote through a held project lock"
+            );
             assert!(ack_completed && ack_ts.is_some_and(|ts| ts > 0));
-            assert!(release_completed, "release did not finish after archive admission reopened");
+            assert!(
+                release_completed,
+                "release did not finish after archive admission reopened"
+            );
             assert!(workers.iter().all(Option::is_none));
             // Completion only certified the database. The existing ledger
             // must still drive authoritative archive repair after unlocking.
@@ -1074,7 +1175,8 @@ mod tests {
                 &AtomicBool::new(false),
             ).unwrap();
             assert!(repaired.repaired > 0);
-            let archived: serde_json::Value = serde_json::from_slice(&std::fs::read(&stable).unwrap()).unwrap();
+            let archived: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&stable).unwrap()).unwrap();
             assert_eq!(archived["id"], lease_id);
             assert_eq!(archived["db_generation"], generation);
             assert!(archived["released_ts"].is_string());
