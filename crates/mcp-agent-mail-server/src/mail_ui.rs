@@ -910,6 +910,69 @@ first body
     }
 
     #[test]
+    fn overseer_compose_offers_active_agents_and_not_itself() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("overseer-recipients");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-overseer-{}", unique_nonce()),
+        )));
+        let pid = project.id.unwrap_or(0);
+        outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            pid,
+            "CopperHawk",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let retired = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            pid,
+            "SilverFern",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            retired.id.unwrap_or(0),
+            Some(1),
+        )));
+        outcome_ok(block_on(queries::insert_system_agent(
+            &cx,
+            &pool,
+            pid,
+            OVERSEER_AGENT_NAME,
+            "WebUI",
+            "Human",
+            "operator",
+        )));
+
+        let html = render_overseer_compose(&cx, &pool, &project.slug)
+            .expect("overseer compose should render")
+            .expect("overseer compose returns html");
+        assert!(html.contains("CopperHawk"), "{html}");
+        assert!(
+            !html.contains("SilverFern"),
+            "retired agents are not recipients"
+        );
+        assert!(
+            !html.contains(OVERSEER_AGENT_NAME),
+            "the overseer does not write to itself"
+        );
+    }
+
+    #[test]
     fn parse_attachment_views_accepts_content_type_and_size_aliases() {
         let attachments = parse_attachment_views(
             r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#,
@@ -4718,12 +4781,21 @@ fn render_overseer_compose(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+    // Recipients are the agents still working here: not retired ones, and
+    // not HumanOverseer, which the first overseer send registers.
+    let agents = block_on_outcome(
+        cx,
+        queries::list_active_agents_bounded(cx, pool, pid, None, None),
+    )?;
     render(
         "overseer_compose.html",
         OverseerComposeCtx {
             project: project_view(&p),
-            agents: agents.iter().map(agent_view).collect(),
+            agents: agents
+                .iter()
+                .filter(|agent| agent.name != OVERSEER_AGENT_NAME)
+                .map(agent_view)
+                .collect(),
         },
     )
 }
@@ -5567,6 +5639,7 @@ const OVERSEER_PREAMBLE: &str = "---\n\n\
     ---\n\n";
 
 const OVERSEER_SEND_INTENT: &str = "human_overseer_send";
+const OVERSEER_AGENT_NAME: &str = "HumanOverseer";
 const OVERSEER_REASON_MAX_CHARS: usize = 500;
 const OVERSEER_MAX_RECIPIENTS: usize = 100;
 
@@ -5720,7 +5793,7 @@ fn handle_overseer_send(
             cx,
             pool,
             pid,
-            "HumanOverseer",
+            OVERSEER_AGENT_NAME,
             "WebUI",
             "Human",
             "Human operator providing guidance and oversight to agents",
@@ -5794,7 +5867,7 @@ fn handle_overseer_send(
         "recipient_count": valid_names.len(),
         "thread_id": thread_id,
         "audit": {
-            "actor": "HumanOverseer",
+            "actor": OVERSEER_AGENT_NAME,
             "human_overseer": true,
             "contact_policy_bypass": true,
             "reason": parsed.reason,

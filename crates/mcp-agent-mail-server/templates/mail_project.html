@@ -318,13 +318,12 @@
         <div class="w-1 h-10 bg-gradient-to-b from-success-600 to-success-800 rounded-full"></div>
         <div>
           <h2 class="text-2xl font-bold text-slate-900 dark:text-white">Registered Agents</h2>
-          <p class="text-sm text-slate-600 dark:text-slate-400">Active collaborators in this project</p>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Everyone registered in this project, retired agents included</p>
         </div>
       </div>
       {% if agents %}
         <span class="px-4 py-2 bg-success-100 dark:bg-success-900/30 text-success-700 dark:text-success-300 text-sm font-bold rounded-full flex items-center gap-2">
-          <span class="w-2 h-2 bg-success-500 rounded-full animate-pulse"></span>
-          {{ agents|length }} active
+          {{ agents|length }} registered
         </span>
       {% endif %}
     </div>
