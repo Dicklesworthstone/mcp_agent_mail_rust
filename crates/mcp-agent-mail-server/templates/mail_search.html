@@ -194,7 +194,7 @@
 
           <!-- Direction -->
           <div>
-            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Direction</label>
+            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Direction <span class="font-normal text-slate-400">(of the agent above)</span></label>
             <div class="flex items-center gap-2">
               <label class="inline-flex items-center gap-1.5 cursor-pointer">
                 <input type="radio" name="direction" value="" {% if not direction %}checked{% endif %} class="text-primary-600">
@@ -241,7 +241,7 @@
 
           <!-- Date Range -->
           <div>
-            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Date Range</label>
+            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Date Range <span class="font-normal text-slate-400">(UTC days)</span></label>
             <div class="flex items-center gap-2">
               <input type="date" name="from_date" value="{{ from_date }}"
                 class="flex-1 px-3 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-900 dark:text-white"

@@ -1947,6 +1947,17 @@ mod utility_tests {
     }
 
     #[test]
+    fn mail_search_direction_needs_an_agent() {
+        assert_eq!(parse_mail_search_direction("direction=inbox", ""), "");
+        assert_eq!(parse_mail_search_direction("direction=outbox", ""), "");
+        assert_eq!(
+            parse_mail_search_direction("direction=inbox", "BlueLake"),
+            "inbox"
+        );
+        assert_eq!(parse_mail_search_direction("q=x", "BlueLake"), "");
+    }
+
+    #[test]
     fn parse_mail_search_order_accepts_sort_aliases() {
         assert_eq!(parse_mail_search_order("order=time"), "time");
         assert_eq!(parse_mail_search_order("sort=relevance"), "relevance");
@@ -4007,6 +4018,15 @@ fn normalize_mail_search_order(value: &str) -> Option<&'static str> {
     }
 }
 
+/// Inbox/Outbox are relative to an agent. With "All agents" no search path
+/// applies them, so they are not kept as a filter: the form then shows
+/// "Any", which is what the results are.
+fn parse_mail_search_direction(query: &str, agent_filter: &str) -> String {
+    extract_query_str(query, "direction")
+        .filter(|_| !agent_filter.is_empty())
+        .unwrap_or_default()
+}
+
 fn parse_mail_search_order(query: &str) -> String {
     for key in ["order", "sort"] {
         if let Some(raw) = extract_query_str(query, key)
@@ -4217,7 +4237,7 @@ fn render_search(
     let agent_filter = extract_query_str(query_str, "agent").unwrap_or_default();
     let thread_filter = extract_query_str(query_str, "thread").unwrap_or_default();
     let ack_filter = extract_query_str(query_str, "ack").unwrap_or_else(|| "any".to_string());
-    let direction_filter = extract_query_str(query_str, "direction").unwrap_or_default();
+    let direction_filter = parse_mail_search_direction(query_str, &agent_filter);
     let from_date = extract_query_str(query_str, "from_date").unwrap_or_default();
     let to_date = extract_query_str(query_str, "to_date").unwrap_or_default();
 
@@ -5646,19 +5666,20 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     if subject.is_empty() {
         return Err(err("Subject is required"));
     }
-    if subject.len() > 200 {
+    // Limits count characters, as the form's counters do, not UTF-8 bytes.
+    if subject.chars().count() > 200 {
         return Err(err("Subject too long (maximum 200 characters)"));
     }
     if body_md.is_empty() {
         return Err(err("Message body is required"));
     }
-    if body_md.len() > 50_000 {
+    if body_md.chars().count() > 50_000 {
         return Err(err("Message body too long (maximum 50,000 characters)"));
     }
     if reason.is_empty() {
         return Err(err("Intervention reason is required"));
     }
-    if reason.len() > OVERSEER_REASON_MAX_CHARS {
+    if reason.chars().count() > OVERSEER_REASON_MAX_CHARS {
         return Err(err("Intervention reason too long (maximum 500 characters)"));
     }
 
@@ -6719,6 +6740,19 @@ mod overseer_form_validation_tests {
         body["subject"] = json!("x".repeat(201));
         let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Subject too long (maximum 200 characters)");
+    }
+
+    #[test]
+    fn parse_overseer_body_limits_count_characters_not_bytes() {
+        // 200 two-byte characters fit the 200-character subject the form allows.
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["subject"] = json!("é".repeat(200));
+        body["reason"] = json!("ü".repeat(500));
+        assert!(parse_overseer_body(&body.to_string()).is_ok());
+        body["subject"] = json!("é".repeat(201));
+        let (status, msg) = parse_err_message(&body.to_string());
         assert_eq!(status, 400);
         assert_eq!(msg, "Subject too long (maximum 200 characters)");
     }
