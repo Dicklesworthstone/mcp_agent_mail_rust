@@ -7,9 +7,9 @@ Options:
       --json               Output JSON (shorthand for --format json)
       --project <PROJECT>  Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
       --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
-      --urgent             Show only urgent messages
-      --ack-overdue        Show only ack-overdue messages
-      --unread             Show only unread messages
+      --urgent             Show only unread high/urgent messages
+      --ack-overdue        Show only ack-required messages unacknowledged for over 30 minutes
+      --unread             Show unread messages plus overdue acknowledgements (the default)
       --all                Show all messages (no filtering)
       --limit <LIMIT>      Maximum messages to return
       --include-bodies     Include message bodies in output

@@ -503,6 +503,40 @@ fn sc_file_reservations_db_parity() {
         .map(|r| r.get_named::<String>("path_pattern").unwrap())
         .collect();
     assert_eq!(paths, vec!["src/**", "tests/**"]);
+    // Exclusive by default, as the MCP tool is: a shared hold is invisible to
+    // the pre-commit guard.
+    let exclusive = query_count(
+        &conn,
+        "SELECT COUNT(*) AS cnt FROM file_reservations WHERE agent_id = 1 AND \"exclusive\" = 1",
+        &[],
+    );
+    assert_eq!(exclusive, 2, "reserve defaults to exclusive holds");
+    drop(conn);
+
+    let out = run_am(
+        &env.base_env(),
+        &[
+            "file_reservations",
+            "reserve",
+            "test-proj",
+            "BlueLake",
+            "docs/**",
+            "--shared",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "shared reserve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let conn = env.open_conn();
+    let shared = query_count(
+        &conn,
+        "SELECT COUNT(*) AS cnt FROM file_reservations \
+         WHERE path_pattern = 'docs/**' AND \"exclusive\" = 0",
+        &[],
+    );
+    assert_eq!(shared, 1, "--shared asks for a shared hold");
 }
 
 /// SC-6: CLI file_reservations release produces same effect as MCP release.

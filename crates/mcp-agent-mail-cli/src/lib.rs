@@ -181,7 +181,7 @@ macro_rules! define_mcp_tool_cli_corrections {
 define_mcp_tool_cli_corrections! {
     {
         attempted_names: ["reserve", "file-reserve", "file_reservation_paths"],
-        cli: "am file_reservations reserve <project> <agent> <path> [--exclusive]",
+        cli: "am file_reservations reserve <project> <agent> <path> [--shared]",
         mcp_tool: Some("file_reservation_paths"),
     },
     {
@@ -444,13 +444,13 @@ pub enum Commands {
         /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
         #[arg(long)]
         agent: Option<String>,
-        /// Show only urgent messages.
+        /// Show only unread high/urgent messages.
         #[arg(long)]
         urgent: bool,
-        /// Show only ack-overdue messages.
+        /// Show only ack-required messages unacknowledged for over 30 minutes.
         #[arg(long)]
         ack_overdue: bool,
-        /// Show only unread messages.
+        /// Show unread messages plus overdue acknowledgements (the default).
         #[arg(long)]
         unread: bool,
         /// Show all messages (no filtering).
@@ -481,7 +481,8 @@ pub enum Commands {
         /// Show reservations for all agents, not just the selected agent.
         #[arg(long)]
         all: bool,
-        /// Show only conflicting reservations.
+        /// Add the overlapping subset (`conflicting_active`) to the view;
+        /// `all_active`, conflicts and expiring reservations stay listed.
         #[arg(long)]
         conflicts: bool,
         /// Warn about reservations expiring within N minutes.
@@ -573,12 +574,14 @@ pub enum Commands {
         /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
-        /// Server host for HTTP mode (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Server port for HTTP mode (default: 8765).
-        #[arg(long, default_value_t = 8765)]
-        port: u16,
+        /// Server host for HTTP mode (default: the endpoint `am mail` uses —
+        /// HTTP_HOST from the environment or config.env, else 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Server port for HTTP mode (default: HTTP_PORT from the environment
+        /// or config.env, else the mailbox owner's listener, else 8765).
+        #[arg(long)]
+        port: Option<u16>,
         /// Project key to check (default: AGENT_MAIL_PROJECT env var or current directory).
         #[arg(long)]
         project: Option<String>,
@@ -616,12 +619,14 @@ pub enum Commands {
         /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
-        /// Server host for HTTP mode (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Server port for HTTP mode (default: 8765).
-        #[arg(long, default_value_t = 8765)]
-        port: u16,
+        /// Server host for HTTP mode (default: the endpoint `am mail` uses —
+        /// HTTP_HOST from the environment or config.env, else 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Server port for HTTP mode (default: HTTP_PORT from the environment
+        /// or config.env, else the mailbox owner's listener, else 8765).
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Read durable, restart-safe inbox delivery events for one recipient.
     #[command(name = "inbox-events")]
@@ -650,12 +655,14 @@ pub enum Commands {
         /// Output JSON (shorthand for --format json).
         #[arg(long)]
         json: bool,
-        /// Server host for HTTP mode (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Server port for HTTP mode (default: 8765).
-        #[arg(long, default_value_t = 8765)]
-        port: u16,
+        /// Server host for HTTP mode (default: the endpoint `am mail` uses —
+        /// HTTP_HOST from the environment or config.env, else 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Server port for HTTP mode (default: HTTP_PORT from the environment
+        /// or config.env, else the mailbox owner's listener, else 8765).
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Run the unified local pre-release quality gate.
     #[command(name = "check")]
@@ -769,7 +776,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: FileReservationsCommand,
     },
-    /// List and send reminders for pending or overdue message acknowledgements.
+    /// List pending, stale, or overdue message acknowledgements (nothing is sent).
     #[command(name = "acks")]
     Acks {
         #[command(subcommand)]
@@ -1848,10 +1855,11 @@ pub enum FileReservationsCommand {
         /// TTL in seconds, clamped to 60..=31536000 (default: 3600).
         #[arg(long, default_value_t = 3600)]
         ttl: i64,
-        /// Request exclusive lock.
+        /// Request an exclusive lock (the default, as with the MCP tool).
         #[arg(long, default_value_t = false)]
         exclusive: bool,
-        /// Request shared (non-exclusive) lock.
+        /// Request a shared (non-exclusive) lock instead. The pre-commit guard
+        /// and `file_reservations conflicts` only act on exclusive holds.
         #[arg(long, conflicts_with = "exclusive")]
         shared: bool,
         /// Reason for the reservation.
@@ -1900,6 +1908,9 @@ pub enum AcksCommand {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
+    /// List the acknowledgements this agent owes that are older than
+    /// --min-age-minutes: a reminder list for the agent itself. It sends no
+    /// message.
     Remind {
         project: String,
         agent: String,
@@ -2045,7 +2056,9 @@ pub enum ProjectsCommand {
     Adopt {
         source: PathBuf,
         target: PathBuf,
-        #[arg(long, default_value_t = false)]
+        // Planning is the default; --dry-run with --apply is a usage error
+        // rather than a silent mutation.
+        #[arg(long, default_value_t = false, conflicts_with = "apply")]
         dry_run: bool,
         #[arg(long, default_value_t = false)]
         apply: bool,
@@ -3739,9 +3752,9 @@ fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
 fn mail_command_is_read_only(action: &MailCommand) -> bool {
     matches!(
         action,
+        // `Read` is absent: it marks a message read, a write like `Ack`.
         MailCommand::Status { .. }
             | MailCommand::Inbox { .. }
-            | MailCommand::Read { .. }
             | MailCommand::Search { .. }
             | MailCommand::SummarizeThread { .. }
             // GH#306: `discard-queued` issues NO mailbox query at all — it
@@ -3754,11 +3767,11 @@ fn mail_command_is_read_only(action: &MailCommand) -> bool {
 }
 
 fn acks_command_is_read_only(action: &AcksCommand) -> bool {
-    // `Remind` issues a write (sends reminder messages); `Pending` and
-    // `Overdue` are SELECT-only listings of unacked messages.
+    // Every variant is a SELECT-only listing of unacked messages; `Remind`
+    // lists the stale ones and sends nothing.
     matches!(
         action,
-        AcksCommand::Pending { .. } | AcksCommand::Overdue { .. }
+        AcksCommand::Pending { .. } | AcksCommand::Remind { .. } | AcksCommand::Overdue { .. }
     )
 }
 
@@ -9529,8 +9542,8 @@ fn handle_check_inbox(
     direct: bool,
     format: Option<output::CliOutputFormat>,
     json: bool,
-    host: String,
-    port: u16,
+    host: Option<String>,
+    port: Option<u16>,
     project: Option<String>,
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
@@ -9578,19 +9591,21 @@ fn handle_check_inbox(
     // WAL with a running `serve-http` daemon's long-lived writer (GH#158). Prefer
     // the daemon over HTTP whenever it is reachable — even under `--direct` — and
     // fall back to a direct SQLite read only when no daemon is listening.
+    let app_config = Config::from_env();
+    let (host, port) = hook_server_host_port(&app_config, host, port);
     let daemon_reachable = direct && process_owner_port_reachable(&host, port);
     let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
 
     let result = if use_daemon {
         // Build HTTP config and fetch via JSON-RPC.
-        let config = Config::from_env();
         let config = resolve_check_inbox_rpc_config_reader(
             |key| std::env::var(key).ok(),
             &project_key,
             &agent_name,
             &host,
             port,
-            &config.http_path,
+            &app_config.http_path,
+            local_server_bearer_token(&app_config),
         );
         let server_urls = config.server_urls.clone();
 
@@ -9695,8 +9710,8 @@ fn handle_mark_all_read(
     direct: bool,
     format: Option<output::CliOutputFormat>,
     json: bool,
-    host: String,
-    port: u16,
+    host: Option<String>,
+    port: Option<u16>,
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
 
@@ -9727,11 +9742,12 @@ fn handle_mark_all_read(
     // Same routing decision as check-inbox (GH#158): prefer the daemon
     // whenever it is reachable; only touch SQLite directly when `--direct`
     // was requested AND no daemon is listening.
+    let config = Config::from_env();
+    let (host, port) = hook_server_host_port(&config, host, port);
     let daemon_reachable = direct && process_owner_port_reachable(&host, port);
     let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
 
     let payload = if use_daemon {
-        let config = Config::from_env();
         let rpc_config = resolve_check_inbox_rpc_config_reader(
             |key| std::env::var(key).ok(),
             &project_key,
@@ -9739,6 +9755,7 @@ fn handle_mark_all_read(
             &host,
             port,
             &config.http_path,
+            local_server_bearer_token(&config),
         );
         let server_urls = rpc_config.server_urls.clone();
 
@@ -9999,8 +10016,8 @@ fn handle_inbox_events(
     direct: bool,
     format: Option<output::CliOutputFormat>,
     json: bool,
-    host: String,
-    port: u16,
+    host: Option<String>,
+    port: Option<u16>,
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
     if position_now && after.is_some() {
@@ -10055,10 +10072,11 @@ fn handle_inbox_events(
         limit,
         position_now,
     };
+    let config = Config::from_env();
+    let (host, port) = hook_server_host_port(&config, host, port);
     let daemon_reachable = direct && process_owner_port_reachable(&host, port);
     let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
     let result = if use_daemon {
-        let config = Config::from_env();
         let rpc_config = resolve_check_inbox_rpc_config_reader(
             |key| std::env::var(key).ok(),
             &project_key,
@@ -10066,6 +10084,7 @@ fn handle_inbox_events(
             &host,
             port,
             &config.http_path,
+            local_server_bearer_token(&config),
         );
         let server_urls = rpc_config.server_urls.clone();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -10265,8 +10284,17 @@ pub(crate) fn local_server_url(config: &Config) -> String {
     if let Some(url) = env_value("AGENT_MAIL_URL").filter(|url| !url.trim().is_empty()) {
         return normalize_agent_mail_url(&url, &config.http_path);
     }
-    let configured =
-        || local_server_url_from_parts(&config.http_host, config.http_port, &config.http_path);
+    let (host, port) = local_server_host_port(config);
+    local_server_url_from_parts(&host, port, &config.http_path)
+}
+
+/// The daemon's host and port, ignoring `AGENT_MAIL_URL`: the configured
+/// `HTTP_HOST`/`HTTP_PORT` (process env or user config), or this mailbox's
+/// verified owner listener when neither is configured.
+pub(crate) fn local_server_host_port(config: &Config) -> (String, u16) {
+    use mcp_agent_mail_core::config::env_value;
+
+    let configured = || (config.http_host.clone(), config.http_port);
     if ["HTTP_HOST", "HTTP_PORT"]
         .iter()
         .any(|key| env_value(key).is_some())
@@ -10294,7 +10322,24 @@ pub(crate) fn local_server_url(config: &Config) -> String {
     if sole_proxy_mailbox_owner(&current) != Some(pid) {
         return configured();
     }
-    local_server_url_from_parts(&host, port, &config.http_path)
+    (host, port)
+}
+
+/// The host and port the inbox hook commands (`check-inbox`, `mark-all-read`,
+/// `inbox-events`) probe and call: explicit `--host`/`--port` win, otherwise
+/// the same endpoint `am mail` resolves.
+fn hook_server_host_port(
+    config: &Config,
+    host: Option<String>,
+    port: Option<u16>,
+) -> (String, u16) {
+    if host.is_none() && port.is_none() {
+        return local_server_host_port(config);
+    }
+    (
+        host.unwrap_or_else(|| config.http_host.clone()),
+        port.unwrap_or(config.http_port),
+    )
 }
 
 fn sole_proxy_mailbox_owner(
@@ -19825,7 +19870,7 @@ fn handle_file_reservations_mutation_locally(
                 agent,
                 paths,
                 ttl,
-                exclusive,
+                exclusive: _,
                 shared,
                 reason,
             } => (
@@ -19836,7 +19881,7 @@ fn handle_file_reservations_mutation_locally(
                     agent.clone(),
                     paths.clone(),
                     Some(*ttl),
-                    Some(!*shared && *exclusive),
+                    Some(!*shared),
                     Some(reason.clone()),
                     None,
                 )
@@ -19963,11 +20008,11 @@ fn file_reservations_proxy_request(
             agent,
             paths,
             ttl,
-            exclusive,
+            exclusive: _,
             shared,
             reason,
         } => {
-            let exclusive_val = if *shared { false } else { *exclusive };
+            let exclusive_val = !*shared;
             Some((
                 "file_reservation_paths",
                 "file_reservations reserve",
@@ -46556,6 +46601,7 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
             "127.0.0.1",
             9999,
             "/mcp/",
+            Some("from-config-env".to_string()),
         );
         assert_eq!(cfg.project_key, "/tmp/proj");
         assert_eq!(cfg.agent_name, "BlueLake");
@@ -46567,7 +46613,58 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
                 "http://10.0.0.5:8123/mcp/".to_string(),
             ]
         );
+        // A process variable outranks the configured token.
         assert_eq!(cfg.bearer_token.as_deref(), Some("token-xyz"));
+    }
+
+    #[test]
+    fn resolve_check_inbox_rpc_config_falls_back_to_the_configured_token() {
+        // After `am setup run` the token lives in config.env, not the process
+        // environment; the hook commands must still authenticate with it.
+        let cfg = resolve_check_inbox_rpc_config_reader(
+            |_| None,
+            "/tmp/proj",
+            "BlueLake",
+            "127.0.0.1",
+            9000,
+            "/mcp/",
+            Some("from-config-env".to_string()),
+        );
+        assert_eq!(cfg.server_url, "http://127.0.0.1:9000/mcp/");
+        assert_eq!(cfg.bearer_token.as_deref(), Some("from-config-env"));
+
+        let none = resolve_check_inbox_rpc_config_reader(
+            |_| None,
+            "/tmp/proj",
+            "BlueLake",
+            "127.0.0.1",
+            9000,
+            "/mcp/",
+            None,
+        );
+        assert_eq!(none.bearer_token, None);
+    }
+
+    #[test]
+    fn hook_server_host_port_prefers_flags_then_configuration() {
+        let config = Config {
+            http_host: "10.1.2.3".to_string(),
+            http_port: 9000,
+            ..Config::default()
+        };
+        assert_eq!(
+            hook_server_host_port(&config, Some("127.0.0.2".to_string()), None),
+            ("127.0.0.2".to_string(), 9000)
+        );
+        assert_eq!(
+            hook_server_host_port(&config, None, Some(9100)),
+            ("10.1.2.3".to_string(), 9100)
+        );
+        // No flags: a non-default configured endpoint is used as-is.
+        assert_eq!(
+            hook_server_host_port(&config, None, None),
+            ("10.1.2.3".to_string(), 9000)
+        );
     }
 
     #[test]
@@ -47354,8 +47451,9 @@ http_headers = { Authorization = "Bearer secret" }
                 assert_eq!(limit, 500);
                 assert!(!direct);
                 assert!(!json);
-                assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 8765);
+                // Unset: the configured endpoint is resolved at run time.
+                assert_eq!(host, None);
+                assert_eq!(port, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -47405,6 +47503,31 @@ http_headers = { Authorization = "Bearer secret" }
             !command_is_read_only(&command),
             "mark-all-read mutates read state and must not bypass the ownership guard"
         );
+    }
+
+    #[test]
+    fn mail_read_is_write_classified_and_acks_remind_is_read_only() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("parse")
+                .command
+                .expect("expected command")
+        };
+        assert!(
+            !command_is_read_only(&parse(&[
+                "am", "mail", "read", "-p", "proj", "-a", "BlueLake", "7"
+            ])),
+            "mail read marks a message read and must not bypass the ownership guard"
+        );
+        assert!(!command_is_read_only(&parse(&[
+            "am", "mail", "ack", "-p", "proj", "-a", "BlueLake", "7"
+        ])));
+        assert!(command_is_read_only(&parse(&[
+            "am", "acks", "remind", "proj", "BlueLake"
+        ])));
+        assert!(command_is_read_only(&parse(&[
+            "am", "mail", "inbox", "-p", "proj", "-a", "BlueLake"
+        ])));
     }
 
     /// GH#273: the JSON-RPC request the CLI sends to the daemon must name the
@@ -48972,8 +49095,9 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(!direct);
                 assert!(format.is_none());
                 assert!(!json);
-                assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 8765);
+                // Unset: the configured endpoint is resolved at run time.
+                assert_eq!(host, None);
+                assert_eq!(port, None);
                 assert!(project.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
@@ -49015,8 +49139,8 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(direct);
                 assert!(format.is_none());
                 assert!(json);
-                assert_eq!(host, "0.0.0.0");
-                assert_eq!(port, 9999);
+                assert_eq!(host.as_deref(), Some("0.0.0.0"));
+                assert_eq!(port, Some(9999));
                 assert_eq!(project.as_deref(), Some("/tmp/proj"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -66772,6 +66896,18 @@ startup_timeout_sec = 42
             } => assert!(apply),
             other => panic!("expected Projects Adopt, got {other:?}"),
         }
+
+        // --dry-run never rides along with --apply into a mutation.
+        let both = Cli::try_parse_from([
+            "am",
+            "projects",
+            "adopt",
+            "/tmp/src",
+            "/tmp/dst",
+            "--dry-run",
+            "--apply",
+        ]);
+        assert!(both.is_err(), "--dry-run --apply must be refused");
     }
 
     #[test]
@@ -87507,6 +87643,8 @@ where
     })
 }
 
+/// `configured_token` is the token `am mail` would send (user `config.env`,
+/// then the managed service unit); process variables still take precedence.
 fn resolve_check_inbox_rpc_config_reader<F>(
     read_env: F,
     project_key: &str,
@@ -87514,6 +87652,7 @@ fn resolve_check_inbox_rpc_config_reader<F>(
     host: &str,
     port: u16,
     http_path: &str,
+    configured_token: Option<String>,
 ) -> CheckInboxRpcConfig
 where
     F: Fn(&str) -> Option<String>,
@@ -87523,6 +87662,7 @@ where
         .filter(|v| !v.is_empty() && !value_looks_like_template(v));
     let bearer_token = read_env("AGENT_MAIL_TOKEN")
         .or_else(|| read_env("HTTP_BEARER_TOKEN"))
+        .or(configured_token)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && !value_looks_like_template(v));
 

@@ -3,7 +3,7 @@ MCP Agent Mail CLI (Rust)
 Usage: am [COMMAND]
 
 Commands:
-  acks                        List and send reminders for pending or overdue message acknowledgements
+  acks                        List pending, stale, or overdue message acknowledgements (nothing is sent)
   agent                       First-turn cockpit for agents: identity, project, runtime hints, and next actions
   agents                      Register, list, and inspect agent identities
   am-run                      Run a command while holding a build-slot file reservation
@@ -64,7 +64,7 @@ Options:
   -V, --version  Print version
 
 MCP tool-name corrections:
-  reserve/file-reserve/file_reservation_paths -> am file_reservations reserve <project> <agent> <path> [--exclusive]
+  reserve/file-reserve/file_reservation_paths -> am file_reservations reserve <project> <agent> <path> [--shared]
   release_file_reservations -> am file_reservations release <project> <agent> [--paths <path>...]
   macro_start_session -> am macros start-session --project <abs-path> --program <program> --model <model>
   send/send-message/send_message -> am mail send --project <project> --from <agent> --to <agent> --subject <subject> --body <markdown>
