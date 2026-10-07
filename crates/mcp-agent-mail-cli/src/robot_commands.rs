@@ -9756,10 +9756,11 @@ fn build_handoff(
             })
             .then_with(|| left.id.cmp(&right.id))
     });
-    records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
-
-    let summary =
+    // Count every classified bead; `--limit` only trims the listed records.
+    let mut summary =
         summarize_handoff_records(total_in_progress, scanned, truncated_by_budget, &records);
+    records.truncate(limit.unwrap_or(ROBOT_HANDOFF_DEFAULT_LIMIT));
+    summary.shown = records.len();
     let mut actions: Vec<String> = records
         .iter()
         .filter(|record| record.action != "keep")
@@ -16688,7 +16689,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     format!(
                         "Handoff stopped at the {max_seconds}s wall-clock budget after {scanned} of {total} in-progress beads; results are partial"
                     ),
-                    Some("Rerun with --max-seconds <n> (or --limit <n>) to cover the rest".to_string()),
+                    Some("Rerun with a larger --max-seconds <n> to cover the rest".to_string()),
                 );
             }
             for action in actions {
@@ -17764,6 +17765,69 @@ mod tests {
         assert_eq!(data.records[0].active_reservations.len(), 1);
         assert_eq!(data.records[0].active_reservations[0].agent, "OtherAgent");
         assert_eq!(data.summary.blocked_by_reservation, 1);
+    }
+
+    #[test]
+    fn build_handoff_summary_counts_beads_the_limit_leaves_out() {
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let beads_dir = project_dir.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let now_us = mcp_agent_mail_db::now_micros();
+        let stale_updated_at = mcp_agent_mail_db::micros_to_iso(now_us - 2 * MICROS_PER_HOUR);
+        let issues = ["br-one", "br-two", "br-three"]
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "title": "Stale",
+                    "status": "in_progress",
+                    "updated_at": stale_updated_at,
+                    "comments": []
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(beads_dir.join("issues.jsonl"), format!("{issues}\n"))
+            .expect("write issues jsonl");
+
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let conn = open_robot_test_db_with_real_schema(&db_dir.path().join("handoff.sqlite3"));
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'demo', ?, 0)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                project_dir.path().display().to_string(),
+            )],
+        )
+        .expect("insert project");
+        let scope = ResolvedRobotProjectScope {
+            db: RobotDbHandle::from_conn(conn),
+            project_id: 1,
+            project_slug: "demo".to_string(),
+        };
+
+        let (data, _actions) = build_handoff(
+            &scope,
+            30,
+            30,
+            30,
+            false,
+            Some(1),
+            ROBOT_HANDOFF_DEFAULT_MAX_SECONDS,
+            false,
+        )
+        .expect("build handoff");
+
+        assert_eq!(data.records.len(), 1);
+        assert_eq!(data.summary.shown, 1);
+        let s = &data.summary;
+        let classified = s.keep
+            + s.ask_owner
+            + s.takeover_candidates
+            + s.reopen_candidates
+            + s.blocked_by_reservation
+            + s.needs_human_review;
+        assert_eq!(classified, 3, "every stale bead is counted: {s:?}");
     }
 
     fn sample_atc_snapshot() -> AtcRobotSnapshot {
