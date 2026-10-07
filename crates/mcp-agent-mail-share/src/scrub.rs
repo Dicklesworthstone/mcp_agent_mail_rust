@@ -73,6 +73,16 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             .unwrap_or_else(|_| unreachable!()),
         // GitLab tokens
         Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap_or_else(|_| unreachable!()),
+        // Secret assignments: `HTTP_BEARER_TOKEN=...`, `sender_token: ...`,
+        // `"api_key": "..."` (a pasted .env line, an agent's own sender token).
+        // The name must end in a secret word, so `token_count=...` is not one;
+        // the value needs 16+ characters, so prose like "token: required"
+        // survives; and `[` is excluded so an earlier `[REDACTED]` is final.
+        // Kept last: specific patterns above redact first.
+        Regex::new(
+            r#"(?i)\b[a-z0-9_\-]*(?:secret|token|password|passwd|api[_\-]?key|private[_\-]?key|access[_\-]?key)["']?\s*[:=]\s*["']?[^\s"',;\[\]]{16,}"#,
+        )
+        .unwrap_or_else(|_| unreachable!()),
     ]
 });
 
@@ -1522,6 +1532,41 @@ mod tests {
         let (result, count) = scrub_text("Token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
         assert_eq!(result, "Token: [REDACTED]");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_finds_secret_assignments() {
+        for (input, expected) in [
+            (
+                "export HTTP_BEARER_TOKEN=Zm9vYmFyYmF6cXV4MTIzNDU2 now",
+                "export [REDACTED] now",
+            ),
+            (
+                "my sender_token: 'Rk9PQkFSQkFaUVVYMTIzNDU2Nzg5MEFCQ0RFRkdISUo'",
+                "my [REDACTED]'",
+            ),
+            (
+                r#"{"api_key": "abcdEFGH12345678ijkl"}"#,
+                r#"{"[REDACTED]"}"#,
+            ),
+        ] {
+            let (result, count) = scrub_text(input);
+            assert_eq!(result, expected, "input: {input}");
+            assert_eq!(count, 1, "input: {input}");
+        }
+        // Not secrets: the name does not end in a secret word, the value is a
+        // short word, or an earlier pattern already redacted it.
+        for input in [
+            "token_count = 12345678901234567890",
+            "the sender token: required",
+            "the KEY=VALUE pattern",
+        ] {
+            assert_eq!(scrub_text(input), (input.to_string(), 0), "input: {input}");
+        }
+        assert_eq!(
+            scrub_text("Token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"),
+            ("Token: [REDACTED]".to_string(), 1)
+        );
     }
 
     #[test]
