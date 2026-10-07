@@ -16683,6 +16683,9 @@ pub fn create_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
 /// retires the entry, so a replaced generation is never read through a
 /// pre-recovery handle, and an entry whose mailbox path now names a different
 /// file, or none, is rebuilt the way a per-call pool would have reopened it.
+///
+/// Only the engine connections are shared: every call returns a wrapper with
+/// its own read-cache generation (see [`with_fresh_cache_generation`]).
 pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let authority = DbPoolAuthority::resolve(config)?;
     if authority.sqlite_identity.is_none() {
@@ -16708,7 +16711,7 @@ pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbP
         if let Some(entry) = guard.get(&cache_key)
             && current(entry)
         {
-            return Ok(entry.pool.clone());
+            return Ok(with_fresh_cache_generation(entry.pool.clone()));
         }
     }
     // Construct outside the registry lock (GH#184): authority resolution and
@@ -16718,7 +16721,7 @@ pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbP
     if let Some(entry) = guard.get(&cache_key)
         && current(entry)
     {
-        return Ok(entry.pool.clone());
+        return Ok(with_fresh_cache_generation(entry.pool.clone()));
     }
     // Replace a stale entry for this key, forget closed entries, then evict
     // the oldest until there is room. Eviction drops only the registry's
@@ -16757,7 +16760,21 @@ pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbP
     );
     drop(guard);
     drop(evicted);
-    Ok(pool)
+    Ok(with_fresh_cache_generation(pool))
+}
+
+/// A wrapper of `pool` with a process-unique read-cache generation of its own.
+///
+/// Writes invalidate and refresh cached agent/project rows only in the cache
+/// scope of the pool that wrote them. A live read lane whose scope persisted
+/// across calls would therefore keep serving rows a later write changed: an
+/// agent's profile, contact policy or retirement would read stale for as long
+/// as the entry stayed hot. A fresh generation per call keeps the live lane
+/// cache-cold, as the per-call pool it replaced was, while the engine
+/// connections themselves stay shared (GH#333).
+fn with_fresh_cache_generation(mut pool: DbPool) -> DbPool {
+    pool.cache_generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    pool
 }
 
 // ============================================================================
