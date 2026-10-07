@@ -6575,6 +6575,29 @@ mod canonicalize_existing_prefix_tests {
     }
 }
 
+/// Whether `am share verify` passes. With `--public-key` the caller asked
+/// whether the publisher signed this bundle, so a missing signature fails:
+/// deleting `manifest.sig.json` after editing the manifest must not verify.
+fn share_verify_outcome(
+    result: &share::VerifyResult,
+    public_key_given: bool,
+) -> Result<(), String> {
+    if let Some(ref err) = result.error {
+        return Err(format!("Error: {err}"));
+    }
+    if result.signature_checked && !result.signature_verified {
+        return Err("Signature verification FAILED.".to_string());
+    }
+    if public_key_given && !result.signature_checked {
+        return Err(
+            "Signature verification FAILED: --public-key was given but the bundle has no \
+             manifest.sig.json."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn handle_share(action: ShareCommand) -> CliResult<()> {
     match action {
         ShareCommand::Export(args) => {
@@ -6700,14 +6723,20 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
             output::kv("SRI valid", &result.sri_valid.to_string());
             output::kv("Signature checked", &result.signature_checked.to_string());
             output::kv("Signature valid", &result.signature_verified.to_string());
+            if let Some(source) = result.key_source.as_deref() {
+                output::kv(
+                    "Signature key",
+                    if source == "embedded" {
+                        "embedded in the bundle (self-signed; pass --public-key to check the publisher)"
+                    } else {
+                        source
+                    },
+                );
+            }
             output::kv("Database checked", &result.database_checked.to_string());
             output::kv("Database valid", &result.database_verified.to_string());
-            if let Some(ref err) = result.error {
-                ftui_runtime::ftui_eprintln!("  Error: {err}");
-                return Err(CliError::ExitCode(1));
-            }
-            if result.signature_checked && !result.signature_verified {
-                ftui_runtime::ftui_eprintln!("  Signature verification FAILED.");
+            if let Err(failure) = share_verify_outcome(&result, args.public_key.is_some()) {
+                ftui_runtime::ftui_eprintln!("  {failure}");
                 return Err(CliError::ExitCode(1));
             }
             Ok(())
@@ -95479,6 +95508,39 @@ fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let err = ensure_share_zip_target_absent(&bundle, false)
         .expect_err("existing zip archive should fail preflight");
     assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
+}
+
+#[test]
+fn share_verify_requires_a_signature_when_a_public_key_is_given() {
+    let unsigned = share::VerifyResult {
+        bundle: "/tmp/b".to_string(),
+        sri_checked: true,
+        sri_valid: true,
+        signature_checked: false,
+        signature_verified: false,
+        key_source: None,
+        database_checked: true,
+        database_verified: true,
+        error: None,
+    };
+    // Without --public-key an unsigned bundle may still be checked for SRI.
+    assert!(share_verify_outcome(&unsigned, false).is_ok());
+    // With it, a deleted manifest.sig.json is a failure, not a pass.
+    let err = share_verify_outcome(&unsigned, true).expect_err("unsigned with a key");
+    assert!(err.contains("no manifest.sig.json"), "{err}");
+
+    let signed = share::VerifyResult {
+        signature_checked: true,
+        signature_verified: true,
+        key_source: Some("explicit".to_string()),
+        ..unsigned.clone()
+    };
+    assert!(share_verify_outcome(&signed, true).is_ok());
+    let forged = share::VerifyResult {
+        signature_verified: false,
+        ..signed
+    };
+    assert!(share_verify_outcome(&forged, false).is_err());
 }
 
 #[test]
