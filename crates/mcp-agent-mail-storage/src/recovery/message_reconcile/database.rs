@@ -7,6 +7,8 @@
 
 mod source;
 mod staged;
+#[cfg(test)]
+mod admission_tests;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +27,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use self::source::prepare_message;
-use super::{ReconcileResult, read_surviving_message, reconcile_message_bundle};
+use super::{ReconcileResult, RepairControl, read_surviving_message, reconcile_message_bundle};
 use crate::{MessageBundleBatchEntry, ProjectArchive};
 
 const IDS_PER_LANE: i64 = 16;
@@ -407,10 +409,26 @@ fn merge_surviving_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 fn reconcile_prepared(
     config: &Config,
     prepared: &PreparedMessage,
 ) -> Result<ReconcileResult, String> {
+    reconcile_prepared_inner(config, prepared, None)
+}
+
+fn reconcile_prepared_inner(
+    config: &Config,
+    prepared: &PreparedMessage,
+    control: Option<RepairControl<'_>>,
+) -> Result<ReconcileResult, String> {
+    // Admit before ensure_archive: even creating a missing archive must not
+    // wait behind an unrelated publisher while retaining the DB source lease.
+    // Nested bundle publication retains this same native mutation window.
+    let _mutation = control
+        .map(|control| control.begin_at(&config.storage_root))
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let archive =
         crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
@@ -423,6 +441,7 @@ fn reconcile_prepared(
     .0;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         if let Some((message, body)) =
             read_surviving_message(path).map_err(|error| error.to_string())?
         {
@@ -443,6 +462,7 @@ fn reconcile_prepared(
     };
     if let Some(committed) = &committed {
         for path in [&paths.canonical, &paths.outbox] {
+            super::checkpoint(control).map_err(|error| error.to_string())?;
             if let Some((message, body)) = committed.read(&archive, path)? {
                 validate_surviving_message(prepared, &message, &body)?;
                 merge_surviving_metadata(
@@ -458,6 +478,7 @@ fn reconcile_prepared(
     // extension fields; BCC comes exclusively from the authoritative DB row.
     if surviving.is_none() {
         for path in &paths.inbox {
+            super::checkpoint(control).map_err(|error| error.to_string())?;
             if let Some((message, body)) =
                 read_surviving_message(path).map_err(|error| error.to_string())?
             {
@@ -477,6 +498,7 @@ fn reconcile_prepared(
         && let Some(committed) = &committed
     {
         for path in &paths.inbox {
+            super::checkpoint(control).map_err(|error| error.to_string())?;
             if let Some((message, body)) = committed.read(&archive, path)? {
                 let message = restore_inbox_metadata(prepared, message, &body)?;
                 merge_surviving_metadata(
@@ -494,6 +516,7 @@ fn reconcile_prepared(
     if surviving.is_none()
         && let Some(committed) = &committed
     {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         surviving = staged::read_metadata(
             &committed.repo,
             &archive,
@@ -514,17 +537,20 @@ fn reconcile_prepared(
             return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string());
         }
     };
-    reconcile_message_bundle(
-        &archive,
-        config,
-        MessageBundleBatchEntry {
-            message: &message,
-            body_md: &prepared.body,
-            sender: &prepared.sender,
-            recipients: &prepared.recipients,
-            extra_paths: &[],
-        },
-    )
+    super::checkpoint(control).map_err(|error| error.to_string())?;
+    let entry = MessageBundleBatchEntry {
+        message: &message,
+        body_md: &prepared.body,
+        sender: &prepared.sender,
+        recipients: &prepared.recipients,
+        extra_paths: &[],
+    };
+    match control {
+        Some(control) => super::reconcile_message_bundle_cancellable(
+            control.cx, &archive, config, entry, control.stop,
+        ),
+        None => reconcile_message_bundle(&archive, config, entry),
+    }
     .map_err(|error| error.to_string())
 }
 
@@ -655,6 +681,11 @@ impl CommittedMessages {
 /// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace.
 /// No row, receipt, delivery, notification or thread digest is mutated. Failed
 /// messages are reported and revisited by backfill, not retried in a tight loop.
+/// Database-promotion contention defers before consuming a candidate. A busy
+/// global archive fence or project lock defers that message within the finite
+/// scan; other messages can progress and backfill revisits it. Shutdown reaches
+/// the archive admission path as well as the outer loop. Blocking I/O and Git
+/// operations still have no hard deadline.
 ///
 /// # Errors
 ///
@@ -677,11 +708,18 @@ pub fn reconcile_message_batch(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
-    validate_pool_binding(pool, config)?;
     let cutoff = mcp_agent_mail_db::now_micros()
         .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
         .max(cursor.settled_before_us);
-    let selected = select_ids(cx, pool, cursor, cutoff)?;
+    let selected = {
+        // The selection itself must not enter a pool while promotion owns
+        // admission. Refusal leaves both scan positions untouched.
+        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
+        validate_pool_binding(pool, config)?;
+        select_ids(cx, pool, cursor, cutoff)?
+    };
+    let selected_identity = cursor.source_identity.clone();
     let mut seen = HashSet::new();
     for (id, tail) in selected {
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
@@ -695,13 +733,19 @@ pub fn reconcile_message_batch(
             report.budget_exhausted = true;
             break;
         }
+        // Freeze recovery promotion through source observation and archive
+        // publication, but never wait for closed admission on this worker.
+        // A replacement between selection and this item invalidates the page;
+        // the next pass rebinds its cursors before reading new-generation IDs.
+        let write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
+        if pool.sqlite_identity_key() != selected_identity {
+            return Err("message reconciliation source changed after selection; rescan required".into());
+        }
         if !seen.insert(id) {
             cursor.advance(id, tail);
             continue;
         }
-        // Freeze recovery promotion through source observation and archive
-        // publication. Drop each SQL connection before filesystem/Git work.
-        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
         let result = match prepare_message(cx, pool, id) {
             Ok(prepared) => match payload_admission(report.payload_bytes, prepared.payload_bytes) {
                 PayloadAdmission::Oversized => {
@@ -725,11 +769,18 @@ pub fn reconcile_message_batch(
                         report.interrupted = true;
                         break;
                     }
-                    reconcile_prepared(config, &prepared)
+                    reconcile_prepared_inner(config, &prepared, Some(RepairControl { cx, stop }))
                 }
             },
             Err(error) => Err(error),
         };
+        // Archive guards and SQL connections have already been dropped. Slow
+        // logging must not prolong this message's database-promotion exclusion.
+        drop(write_activity);
+        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            report.interrupted = true;
+            break;
+        }
         report.scanned += 1;
         match result {
             Ok(result) if result.files_created > 0 || result.git_commit_needed => {
@@ -1585,6 +1636,9 @@ mod tests {
 
     #[test]
     fn oversized_projection_does_not_pin_later_mail_and_preserves_source() {
+        if admission_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join("mail.sqlite3");
@@ -1661,6 +1715,11 @@ mod tests {
     }
 
     fn retention_fixture(count: i64, test: impl FnOnce(&Cx, &DbPool, &Config)) {
+        // Recovery now refuses unrelated process-global lock contention.
+        // Keep the existing exact expectations isolated from parallel tests.
+        if admission_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let storage_root = temp.path().join("archive");
@@ -1994,6 +2053,9 @@ mod tests {
 
     #[test]
     fn real_file_backed_projection_repairs_without_modifying_mailbox_rows() {
+        if admission_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join("mail.sqlite3");
