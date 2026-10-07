@@ -15,6 +15,7 @@ use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::{AgentHealthGrade, AgentHealthScorecard};
 use mcp_agent_mail_db::DbConn;
 
+use crate::tui_action_menu::{ActionEntry, agents_actions};
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
@@ -1187,6 +1188,14 @@ impl MailScreen for AgentsScreen {
         Some(agent.name.clone())
     }
 
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let idx = self.table_state.selected?;
+        let agent = self.agents.get(idx)?;
+        // Anchor row is the selected row + header offset, as in Contacts.
+        let anchor_row = u16::try_from(idx).unwrap_or(u16::MAX).saturating_add(2);
+        Some((agents_actions(&agent.name), anchor_row, agent.name.clone()))
+    }
+
     fn title(&self) -> &'static str {
         "Agents"
     }
@@ -2072,6 +2081,41 @@ mod tests {
         let s = Event::Key(ftui::KeyEvent::new(KeyCode::Char('S')));
         screen.update(&s, &state);
         assert_ne!(screen.sort_asc, initial);
+    }
+
+    #[test]
+    fn action_menu_offers_the_selected_agents_links() {
+        use crate::tui_action_menu::ActionKind;
+        let mut screen = AgentsScreen::new();
+        assert!(screen.contextual_actions().is_none(), "no row, no menu");
+        for name in ["RedFox", "BlueLake"] {
+            screen
+                .agents
+                .push(test_agent_row(name, "", "claude-code", "opus-4.6", 100, 5));
+        }
+        screen.table_state.selected = Some(1);
+
+        let (actions, _, context) = screen.contextual_actions().expect("menu for a row");
+        assert_eq!(context, "BlueLake");
+        let action = |label: &str| {
+            actions
+                .iter()
+                .find(|a| a.label == label)
+                .map(|a| a.action.clone())
+                .unwrap_or_else(|| panic!("missing {label}"))
+        };
+        assert!(matches!(
+            action("View reservations"),
+            ActionKind::DeepLink(DeepLinkTarget::ReservationByAgent(name)) if name == "BlueLake"
+        ));
+        assert!(matches!(
+            action("View inbox"),
+            ActionKind::DeepLink(DeepLinkTarget::ExplorerForAgent(name)) if name == "BlueLake"
+        ));
+        assert!(matches!(
+            action("Send message"),
+            ActionKind::Execute(op) if op == "compose_to:BlueLake"
+        ));
     }
 
     #[test]
