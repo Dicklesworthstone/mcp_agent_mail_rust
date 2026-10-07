@@ -2010,6 +2010,19 @@ mod utility_tests {
     }
 
     #[test]
+    fn inbox_pages_reach_past_the_newest_ten_thousand() {
+        assert_eq!(inbox_fetch_window(1, 50), (0, 51));
+        assert_eq!(inbox_fetch_window(2, 50), (50, 101));
+        // The default page size: page 3 must read past row 20,000.
+        assert_eq!(inbox_fetch_window(3, 10_000), (20_000, 30_001));
+        assert_eq!(
+            inbox_fetch_window(0, 0),
+            (0, 2),
+            "page and limit floor at 1"
+        );
+    }
+
+    #[test]
     fn mail_search_direction_needs_an_agent() {
         assert_eq!(parse_mail_search_direction("direction=inbox", ""), "");
         assert_eq!(parse_mail_search_direction("direction=outbox", ""), "");
@@ -3605,6 +3618,16 @@ struct InboxMessage {
     read: bool,
 }
 
+/// `(offset, rows to fetch)` for inbox page `page` (1-based) of `limit` rows:
+/// offset-based like Python, fetching through the page plus one row so "Older
+/// Messages" shows exactly when there is more. Python fetched a fixed 10,000
+/// rows and paged inside them, so nothing older than those was reachable.
+fn inbox_fetch_window(page: usize, limit: usize) -> (usize, usize) {
+    let limit = limit.max(1);
+    let offset = page.max(1).saturating_sub(1).saturating_mul(limit);
+    (offset, offset.saturating_add(limit).saturating_add(1))
+}
+
 fn render_inbox(
     cx: &Cx,
     pool: &DbPool,
@@ -3619,14 +3642,15 @@ fn render_inbox(
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
     let aid = a.id.unwrap_or(0);
 
-    // Fetch a generous amount, then paginate client-side (Python parity).
-    let fetch_limit = 10_000;
+    let page = page.max(1);
+    let (offset, fetch_limit) = inbox_fetch_window(page, limit);
     let inbox = block_on_outcome(
         cx,
         queries::fetch_inbox(cx, pool, pid, aid, false, None, fetch_limit),
     )?;
     let total = inbox.len();
-    let candidate_root_ids: Vec<i64> = inbox
+    let page_rows: Vec<_> = inbox.iter().skip(offset).take(limit).collect();
+    let candidate_root_ids: Vec<i64> = page_rows
         .iter()
         .filter_map(|row| {
             if explicit_thread_ref(row.message.thread_id.as_deref()).is_none() {
@@ -3638,11 +3662,8 @@ fn render_inbox(
         .collect();
     let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
 
-    // Offset-based pagination (Python: offset = (page - 1) * limit).
-    let page = page.max(1);
-    let offset = (page - 1).saturating_mul(limit.max(1));
     let mut items = Vec::new();
-    for row in inbox.iter().skip(offset).take(limit) {
+    for row in page_rows {
         let m = &row.message;
         let thread_id = display_thread_ref_for_message(
             m.id.unwrap_or(0),
