@@ -2038,7 +2038,8 @@ mod utility_tests {
         assert_eq!(parse_mail_search_order("order=time"), "time");
         assert_eq!(parse_mail_search_order("sort=relevance"), "relevance");
         assert_eq!(parse_mail_search_order("sort=newest"), "time");
-        assert_eq!(parse_mail_search_order("sort=oldest"), "time");
+        // Saved searches carry sort=oldest; it is its own order, not newest.
+        assert_eq!(parse_mail_search_order("sort=oldest"), "oldest");
     }
 
     #[test]
@@ -4097,7 +4098,8 @@ fn mail_search_text_fields(field_scope: &str) -> TextFieldScope {
 fn normalize_mail_search_order(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "relevance" => Some("relevance"),
-        "time" | "newest" | "oldest" => Some("time"),
+        "time" | "newest" => Some("time"),
+        "oldest" => Some("oldest"),
         _ => None,
     }
 }
@@ -4341,10 +4343,10 @@ fn render_search(
             max_ts: parse_date_to_micros_end(&to_date),
         };
 
-        let ranking = if order == "time" {
-            RankingMode::Recency
-        } else {
-            RankingMode::Relevance
+        let ranking = match order.as_str() {
+            "time" => RankingMode::Recency,
+            "oldest" => RankingMode::Oldest,
+            _ => RankingMode::Relevance,
         };
 
         let direction = match direction_filter.as_str() {

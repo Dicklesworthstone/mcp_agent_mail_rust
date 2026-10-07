@@ -164,9 +164,9 @@ impl SearchRecipe {
         if self.ack_filter != "any" {
             params.push(("ack", url_encode_component(&self.ack_filter)));
         }
-        if self.sort_mode != "newest" {
-            params.push(("sort", url_encode_component(&self.sort_mode)));
-        }
+        // Always explicit: a page that opens the route defaults to its own
+        // order (the web search defaults to relevance), not the recipe's.
+        params.push(("sort", url_encode_component(&self.sort_mode)));
         if let Some(ref tid) = self.thread_filter {
             params.push(("thread", url_encode_component(tid)));
         }
@@ -1093,6 +1093,9 @@ mod tests {
         let route = recipe.route_string();
         assert!(route.contains("/search"));
         assert!(route.contains("scope=global"));
+        // The default newest order is spelled out, or the web search would
+        // open the recipe in its own default order (relevance).
+        assert!(route.contains("sort=newest"), "{route}");
     }
 
     #[test]

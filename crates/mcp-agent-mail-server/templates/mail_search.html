@@ -136,7 +136,11 @@
             <button type="button" data-search-quick-control @click="order = 'time'"
               :class="order === 'time' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1">
-              <i data-lucide="clock" class="w-3.5 h-3.5"></i> Time</button>
+              <i data-lucide="clock" class="w-3.5 h-3.5"></i> Newest</button>
+            <button type="button" data-search-quick-control @click="order = 'oldest'"
+              :class="order === 'oldest' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
+              class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1">
+              <i data-lucide="history" class="w-3.5 h-3.5"></i> Oldest</button>
           </div>
         </div>
 
@@ -550,8 +554,9 @@
       switch ((value || '').trim().toLowerCase()) {
         case 'time':
         case 'newest':
-        case 'oldest':
           return 'time';
+        case 'oldest':
+          return 'oldest';
         case 'relevance':
         default:
           return 'relevance';
@@ -708,6 +713,9 @@
       filtered.sort((left, right) => {
         if (order === 'time') {
           return right._createdMs - left._createdMs || right.id - left.id;
+        }
+        if (order === 'oldest') {
+          return left._createdMs - right._createdMs || left.id - right.id;
         }
         return right._score - left._score || right._createdMs - left._createdMs || right.id - left.id;
       });
