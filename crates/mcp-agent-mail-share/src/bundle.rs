@@ -88,6 +88,20 @@ impl Default for BundleExportConfig {
     }
 }
 
+/// An attachment path as a published bundle may record it: relative archive
+/// paths as they are, an absolute host path as its file name only.
+fn publishable_attachment_path(path: &str) -> String {
+    let as_path = Path::new(path);
+    if as_path.is_absolute() {
+        as_path.file_name().map_or_else(
+            || "attachment".to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    } else {
+        path.to_string()
+    }
+}
+
 fn rewrite_original_path(obj: &mut serde_json::Map<String, Value>, original_path: &Option<String>) {
     match original_path {
         Some(path) => {
@@ -217,6 +231,11 @@ pub fn bundle_attachments(
                 let Some(orig_path_str) = &original_path else {
                     continue;
                 };
+                // What the published bundle records: an absolute source path
+                // (allowed with ALLOW_ABSOLUTE_ATTACHMENT_PATHS) would publish
+                // the host's directory layout, so only its file name is kept.
+                // `orig_path_str` still locates the file.
+                let published_path = original_path.as_deref().map(publishable_attachment_path);
 
                 let media_type = obj
                     .get("media_type")
@@ -255,7 +274,7 @@ pub fn bundle_attachments(
                             base64::engine::general_purpose::STANDARD.encode(&content)
                         );
                         remove_attachment_keys(obj, &["path", "note"]);
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("inline".to_string()));
                         obj.insert("data_uri".to_string(), Value::String(data_uri));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
@@ -270,7 +289,7 @@ pub fn bundle_attachments(
                             sha256: Some(sha),
                             media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: None,
                         });
                         updated = true;
@@ -278,7 +297,7 @@ pub fn bundle_attachments(
                         // External — too large to bundle
                         let sha = sha256_file(source)?;
                         remove_attachment_keys(obj, &["path", "data_uri"]);
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("external".to_string()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
                         obj.insert(
@@ -298,7 +317,7 @@ pub fn bundle_attachments(
                             sha256: Some(sha),
                             media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: None,
                         });
                         updated = true;
@@ -319,7 +338,7 @@ pub fn bundle_attachments(
                         };
 
                         remove_attachment_keys(obj, &["data_uri", "note"]);
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("file".to_string()));
                         obj.insert("path".to_string(), Value::String(bundle_rel.clone()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
@@ -334,7 +353,7 @@ pub fn bundle_attachments(
                             sha256: Some(sha),
                             media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: Some(bundle_rel),
                         });
                         updated = true;
@@ -353,7 +372,7 @@ pub fn bundle_attachments(
                             obj,
                             &["path", "data_uri", "sha256", "bytes", "note"],
                         );
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("missing".to_string()));
                         stats.missing += 1;
                         items.push(AttachmentItem {
@@ -362,7 +381,7 @@ pub fn bundle_attachments(
                             sha256: None,
                             media_type: Some(media_type),
                             bytes: None,
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: None,
                         });
                         updated = true;
@@ -2253,6 +2272,58 @@ mod tests {
             .unwrap();
         let att: String = rows[0].get_named("attachments").unwrap();
         assert!(att.contains("data:text/plain;base64,"));
+    }
+
+    #[test]
+    fn bundled_absolute_attachment_paths_publish_only_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let outside = dir.path().join("home-alice-clients-acme");
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("merger-notes.txt");
+        std::fs::write(&source, b"Hello!").unwrap();
+
+        let att_json = serde_json::json!([{
+            "type": "file",
+            "path": source.display().to_string(),
+            "media_type": "text/plain",
+        }])
+        .to_string();
+        let db = create_bundle_test_db(dir.path(), &[att_json.as_str()]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let result = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            result.items[0].original_path.as_deref(),
+            Some("merger-notes.txt")
+        );
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            !att.contains("home-alice-clients-acme"),
+            "the host directory must not be published: {att}"
+        );
+        assert!(att.contains("merger-notes.txt"), "{att}");
+
+        // Relative archive paths are recorded as they are.
+        assert_eq!(
+            publishable_attachment_path("attachments/ab/x.webp"),
+            "attachments/ab/x.webp"
+        );
     }
 
     #[test]
