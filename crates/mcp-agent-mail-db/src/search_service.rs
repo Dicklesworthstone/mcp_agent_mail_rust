@@ -507,6 +507,12 @@ fn message_query_requires_sql_plan(query: &SearchQuery) -> bool {
         || query_needs_recipient_filter(query)
         || importance_filter_requires_sql_plan(query)
         || scoped_project_set_requires_sql_plan(query)
+        // A numeric thread id includes its root message, which the index's
+        // thread_id field does not carry.
+        || query
+            .thread_id
+            .as_deref()
+            .is_some_and(|thread| thread.parse::<i64>().is_ok())
 }
 
 fn lexical_candidate_limit(query: &SearchQuery) -> usize {

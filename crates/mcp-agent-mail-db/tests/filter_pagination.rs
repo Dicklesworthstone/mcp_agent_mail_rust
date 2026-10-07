@@ -574,6 +574,54 @@ fn filter_only_relevance_pages_newest_first() {
     assert_eq!(collected, ids, "newest first, every match once");
 }
 
+/// A numeric thread id names its root message, which has no `thread_id` of
+/// its own: the filter must return it with its replies, as the thread view does.
+#[test]
+fn numeric_thread_filter_includes_the_root_message() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "thread-root");
+    let aid = seed_agent(&pool, pid, "CoralFinch");
+    let root = create_msg(
+        &pool,
+        pid,
+        aid,
+        "rootthr plan",
+        "rootthr body",
+        "normal",
+        None,
+        false,
+    );
+    let root_thread = root.to_string();
+    let reply = create_msg(
+        &pool,
+        pid,
+        aid,
+        "rootthr reply",
+        "rootthr body",
+        "normal",
+        Some(&root_thread),
+        false,
+    );
+    let _other = create_msg(
+        &pool,
+        pid,
+        aid,
+        "rootthr other",
+        "rootthr body",
+        "normal",
+        None,
+        false,
+    );
+
+    for text in ["rootthr", ""] {
+        let mut query = SearchQuery::messages(text, pid);
+        query.thread_id = Some(root_thread.clone());
+        let mut ids = result_ids(&search(&pool, &query));
+        ids.sort_unstable();
+        assert_eq!(ids, vec![root, reply], "text={text:?}");
+    }
+}
+
 /// Test: project isolation — messages in other projects are not returned.
 #[test]
 fn project_isolation() {

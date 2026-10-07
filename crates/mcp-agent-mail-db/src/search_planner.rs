@@ -891,8 +891,16 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     }
 
     if let Some(thread) = &query.thread_id {
-        where_clauses.push("m.thread_id = ?".to_string());
-        params.push(PlanParam::Text(thread.clone()));
+        // A numeric thread id names its root message, which carries no
+        // thread_id of its own; the thread view includes it, so does this.
+        if let Ok(root_id) = thread.parse::<i64>() {
+            where_clauses.push("(m.thread_id = ? OR m.id = ?)".to_string());
+            params.push(PlanParam::Text(thread.clone()));
+            params.push(PlanParam::Int(root_id));
+        } else {
+            where_clauses.push("m.thread_id = ?".to_string());
+            params.push(PlanParam::Text(thread.clone()));
+        }
         facets_applied.push("thread_id".to_string());
     }
 
@@ -1522,7 +1530,25 @@ mod tests {
         q.thread_id = Some("my-thread".to_string());
         let plan = plan_search(&q);
         assert!(plan.sql.contains("m.thread_id = ?"));
+        assert!(!plan.sql.contains("m.id = ?"), "{}", plan.sql);
         assert!(plan.facets_applied.contains(&"thread_id".to_string()));
+    }
+
+    #[test]
+    fn plan_with_numeric_thread_includes_the_root_message() {
+        let mut q = SearchQuery::messages("test", 1);
+        q.thread_id = Some("42".to_string());
+        let plan = plan_search(&q);
+        assert!(
+            plan.sql.contains("(m.thread_id = ? OR m.id = ?)"),
+            "{}",
+            plan.sql
+        );
+        assert!(
+            plan.params
+                .iter()
+                .any(|param| matches!(param, PlanParam::Int(42)))
+        );
     }
 
     #[test]
