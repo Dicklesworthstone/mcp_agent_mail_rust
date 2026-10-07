@@ -1266,7 +1266,8 @@ pub enum SetupCommand {
         /// Preview changes without writing files.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Non-interactive (skip confirmations).
+        /// Accepted for scripts; `setup run` never prompts, so it writes with or
+        /// without this flag (use --dry-run to preview).
         #[arg(long, short = 'y', default_value_t = false)]
         yes: bool,
         /// Use a specific bearer token.
@@ -1293,7 +1294,8 @@ pub enum SetupCommand {
         /// Skip user-level config files (project-local only).
         #[arg(long, default_value_t = false)]
         no_user_config: bool,
-        /// Skip Claude Code hook installation.
+        /// Skip Claude Code hook installation. Hooks are also skipped (with a
+        /// warning) when AGENT_MAIL_AGENT is unset, since they need the name.
         #[arg(long, default_value_t = false)]
         no_hooks: bool,
     },
@@ -17049,6 +17051,12 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let agent_name_val = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
 
             // Auto-skip hooks if agent_name is empty (hooks generate malformed commands without it)
+            if !no_hooks && agent_name_val.is_empty() {
+                output::warn(
+                    "skipping Claude Code hook installation: AGENT_MAIL_AGENT is not set \
+                     (set it to the agent's name and rerun `am setup run` to install hooks)",
+                );
+            }
             let no_hooks = no_hooks || agent_name_val.is_empty();
             let project_slug = if no_hooks {
                 String::new()
