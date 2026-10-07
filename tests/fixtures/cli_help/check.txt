@@ -5,7 +5,7 @@ Usage: am check [OPTIONS]
 Options:
   -q, --quick            Quick mode: skip long-running perf and E2E gates
   -r, --report <REPORT>  Write JSON report to this path
-      --format <FORMAT>  Output format: table, json, or toon (default: auto-detect)
+      --format <FORMAT>  Output format: table, json, or toon (default: table, piped or not)
       --json             Output JSON (shorthand for --format json)
   -p, --parallel         Run independent gates in parallel (faster execution)
   -h, --help             Print help

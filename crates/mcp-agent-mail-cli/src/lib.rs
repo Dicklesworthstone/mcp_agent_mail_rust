@@ -568,7 +568,7 @@ pub enum Commands {
         /// daemon is listening.
         #[arg(long)]
         direct: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -613,7 +613,7 @@ pub enum Commands {
         /// directly when no daemon is listening.
         #[arg(long)]
         direct: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -649,7 +649,7 @@ pub enum Commands {
         /// Allow a direct SQLite read only when no daemon is reachable.
         #[arg(long)]
         direct: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -673,7 +673,7 @@ pub enum Commands {
         /// Write JSON report to this path.
         #[arg(long, short = 'r')]
         report: Option<std::path::PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -692,7 +692,7 @@ pub enum Commands {
         /// Write JSON report to this path.
         #[arg(long, short = 'r')]
         report: Option<std::path::PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -717,7 +717,7 @@ pub enum Commands {
         /// Quick mode: warmup=1, runs=3 unless overridden.
         #[arg(long, short = 'q')]
         quick: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -813,7 +813,7 @@ pub enum Commands {
     ListProjects {
         #[arg(long, default_value_t = false)]
         include_agents: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1026,7 +1026,7 @@ pub enum ReleaseCommand {
         /// Write JSON report to this path.
         #[arg(long, short = 'r')]
         report: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1097,7 +1097,7 @@ pub enum ContactsCommand {
         /// Agent name.
         #[arg(long = "agent", short = 'a')]
         agent_name: String,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1197,7 +1197,7 @@ pub enum BeadsCommand {
         /// Maximum number of issues to show.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1219,7 +1219,7 @@ pub enum BeadsCommand {
         /// Maximum number of issues to show.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1233,7 +1233,7 @@ pub enum BeadsCommand {
         /// Path to the project root containing .beads/.
         #[arg(long, short = 'p')]
         path: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1245,7 +1245,7 @@ pub enum BeadsCommand {
         /// Path to the project root containing .beads/.
         #[arg(long, short = 'p')]
         path: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1284,7 +1284,7 @@ pub enum SetupCommand {
         /// Project directory for project-local configs (default: cwd).
         #[arg(long)]
         project_dir: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1300,7 +1300,7 @@ pub enum SetupCommand {
     /// Show current setup status: detected agents, config state.
     #[command(name = "status")]
     Status {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1341,7 +1341,7 @@ pub enum FlakeTriageCommand {
         /// Directory to scan (default: tests/artifacts).
         #[arg(long, short = 'd')]
         dir: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1372,7 +1372,7 @@ pub enum FlakeTriageCommand {
         /// Timeout per seed in seconds (default: 60).
         #[arg(long, default_value_t = 60)]
         timeout: u64,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1391,7 +1391,7 @@ pub enum GoldenCommand {
         /// Optional filename glob filter (e.g. "am_*help*").
         #[arg(long)]
         filter: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1409,7 +1409,7 @@ pub enum GoldenCommand {
         /// Optional filename glob filter (e.g. "mcp_deny_*").
         #[arg(long)]
         filter: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1427,7 +1427,7 @@ pub enum GoldenCommand {
         /// Optional filename glob filter (e.g. "stub_*").
         #[arg(long)]
         filter: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1442,7 +1442,7 @@ pub enum E2eCommand {
     /// List available E2E test suites.
     #[command(name = "list")]
     List {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1479,7 +1479,7 @@ pub enum E2eCommand {
         /// missing, incomplete, or belongs to another invocation.
         #[arg(long)]
         release_scorecard: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -1543,7 +1543,7 @@ pub enum DeployCommand {
 pub struct DeployValidateArgs {
     /// Path to the bundle directory to validate.
     pub bundle: PathBuf,
-    /// Output format: table, json, or toon (default: auto-detect).
+    /// Output format: table, json, or toon (default: table, piped or not).
     #[arg(long, value_parser)]
     pub format: Option<output::CliOutputFormat>,
     /// Output JSON (shorthand for --format json).
@@ -1564,7 +1564,7 @@ pub struct DeployToolingArgs {
 pub struct DeployVerifyArgs {
     /// Deployed URL to verify (e.g., `https://example.github.io/agent-mail`).
     pub url: String,
-    /// Output format: table, json, or toon (default: auto-detect).
+    /// Output format: table, json, or toon (default: table, piped or not).
     #[arg(long, value_parser)]
     pub format: Option<output::CliOutputFormat>,
     /// Output JSON (shorthand for --format json).
@@ -1579,7 +1579,7 @@ pub struct DeployVerifyLiveArgs {
     /// Local bundle directory for content-match checks.
     #[arg(long)]
     pub bundle: Option<PathBuf>,
-    /// Output format: table, json, or toon (default: auto-detect).
+    /// Output format: table, json, or toon (default: table, piped or not).
     #[arg(long, value_parser)]
     pub format: Option<output::CliOutputFormat>,
     /// Output JSON report (shorthand for --format json).
@@ -1738,7 +1738,7 @@ pub struct ShareWizardArgs {
     /// Non-interactive mode (fail if prompts needed).
     #[arg(long)]
     pub non_interactive: bool,
-    /// Output format: table, json, or toon (default: auto-detect).
+    /// Output format: table, json, or toon (default: table, piped or not).
     #[arg(long, value_parser)]
     pub format: Option<output::CliOutputFormat>,
     /// Output JSON (shorthand for --format json).
@@ -1775,7 +1775,7 @@ pub enum ArchiveCommand {
     List {
         #[arg(long, short = 'n', default_value_t = 0)]
         limit: i64,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2121,7 +2121,7 @@ pub enum MailCommand {
         /// AGENT_MAIL_SENDER_TOKEN and any persisted identity token.
         #[arg(long = "sender-token-file", value_name = "PATH")]
         sender_token_file: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json, default true for detect).
@@ -2134,7 +2134,7 @@ pub enum MailCommand {
         /// Path printed by a failed `am mail send` queued-send error.
         #[arg(long, value_name = "PATH")]
         artifact: PathBuf,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2159,7 +2159,7 @@ pub enum MailCommand {
         /// Who is discarding (defaults to AGENT_MAIL_AGENT, else the OS user).
         #[arg(long, value_name = "NAME")]
         actor: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2196,7 +2196,7 @@ pub enum MailCommand {
         /// Read the sender token from this file (contents trimmed).
         #[arg(long = "sender-token-file", value_name = "PATH")]
         sender_token_file: Option<PathBuf>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2223,7 +2223,7 @@ pub enum MailCommand {
         /// Include message bodies.
         #[arg(long, default_value_t = false)]
         include_bodies: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2262,7 +2262,7 @@ pub enum MailCommand {
         /// Max results.
         #[arg(long, short = 'l', default_value_t = 20)]
         limit: i64,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2283,7 +2283,7 @@ pub enum MailCommand {
         /// Skip the LLM refinement; summarize from the message text alone.
         #[arg(long)]
         no_llm: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2399,7 +2399,7 @@ pub enum ProductsCommand {
         product_key: Option<String>,
         #[arg(long, short = 'n')]
         name: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2409,7 +2409,7 @@ pub enum ProductsCommand {
     Link {
         product_key: String,
         project: String,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2418,7 +2418,7 @@ pub enum ProductsCommand {
     },
     Status {
         product_key: String,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2430,7 +2430,7 @@ pub enum ProductsCommand {
         query: String,
         #[arg(long, short = 'l', default_value_t = 20)]
         limit: i64,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2452,7 +2452,7 @@ pub enum ProductsCommand {
         no_bodies: bool,
         #[arg(long)]
         since_ts: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2467,7 +2467,7 @@ pub enum ProductsCommand {
         per_thread_limit: i64,
         #[arg(long)]
         no_llm: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2540,7 +2540,7 @@ pub enum DoctorCommand {
         project: Option<String>,
         #[arg(long, short = 'v')]
         verbose: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2598,7 +2598,7 @@ pub enum DoctorCommand {
         take_ownership: bool,
     },
     Backups {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2664,7 +2664,7 @@ pub enum DoctorCommand {
     /// Audit archive hygiene without mutating the mailbox archive.
     #[command(name = "archive-scan")]
     ArchiveScan {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2674,7 +2674,7 @@ pub enum DoctorCommand {
     /// Cross-check archive artifacts against SQLite for tamper evidence.
     #[command(name = "archive-verify")]
     ArchiveVerify {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -2813,7 +2813,7 @@ pub enum DoctorCommand {
     /// Inventory test, perf, forensic, and e2e artifact roots without deleting anything.
     #[command(name = "artifacts")]
     Artifacts {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3106,7 +3106,7 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3133,7 +3133,7 @@ pub enum AgentsCommand {
         /// Attachments policy: auto, inline, file, none.
         #[arg(long, default_value = "auto")]
         attachments_policy: String,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3150,7 +3150,7 @@ pub enum AgentsCommand {
         /// Project key (slug or human_key / absolute path).
         #[arg(long = "project", short = 'p')]
         project_key: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3170,7 +3170,7 @@ pub enum AgentsCommand {
         /// current directory when omitted.
         #[arg(long = "project", short = 'p')]
         project_key: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3190,7 +3190,7 @@ pub enum AgentsCommand {
         /// `%N`). Resolved from the current tmux pane when omitted.
         #[arg(long)]
         pane: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3232,7 +3232,7 @@ pub enum AgentsCommand {
         /// anything.
         #[arg(long)]
         dry_run: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3273,7 +3273,7 @@ pub enum MacroCommand {
         /// Max inbox messages to fetch.
         #[arg(long, default_value_t = 10)]
         inbox_limit: i32,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3319,7 +3319,7 @@ pub enum MacroCommand {
         /// Max inbox messages to fetch.
         #[arg(long, default_value_t = 10)]
         inbox_limit: i32,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3353,7 +3353,7 @@ pub enum MacroCommand {
         /// Automatically release reservations after granting.
         #[arg(long, default_value_t = false)]
         auto_release: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3405,7 +3405,7 @@ pub enum MacroCommand {
         /// Task description for auto-registration.
         #[arg(long)]
         reg_task: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3418,7 +3418,7 @@ pub enum MacroCommand {
 pub enum ToolingCommand {
     /// List all available MCP tools with cluster and capability metadata.
     Directory {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3430,7 +3430,7 @@ pub enum ToolingCommand {
         /// Filter to a specific tool name.
         #[arg(long)]
         tool: Option<String>,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3439,7 +3439,7 @@ pub enum ToolingCommand {
     },
     /// Show tool call counts and error rates.
     Metrics {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3449,7 +3449,7 @@ pub enum ToolingCommand {
     /// Show core system metrics (HTTP/DB/Storage/Locks).
     #[command(name = "metrics-core")]
     MetricsCore {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3458,7 +3458,7 @@ pub enum ToolingCommand {
     },
     /// Show comprehensive diagnostic report with health metrics and recommendations.
     Diagnostics {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3467,7 +3467,7 @@ pub enum ToolingCommand {
     },
     /// Show active archive locks.
     Locks {
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -3480,7 +3480,7 @@ pub enum ToolingCommand {
         /// Proceed even if preflight checks fail.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Output format: table, json, or toon (default: auto-detect).
+        /// Output format: table, json, or toon (default: table, piped or not).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
