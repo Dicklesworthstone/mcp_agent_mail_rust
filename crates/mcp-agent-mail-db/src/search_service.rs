@@ -5179,6 +5179,41 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The SQL plan selects no recipients; fill to/cc/bcc for message results as
+/// the index path's canonicalization does, so a result does not lose its
+/// recipients just because the search was ordered by time or filtered.
+async fn hydrate_plan_recipients(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    mut results: Vec<SearchResult>,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) || results.is_empty() {
+        return Outcome::Ok(results);
+    }
+    let ids: Vec<i64> = results.iter().map(|r| r.id).collect();
+    let details =
+        match crate::queries::get_messages_details_by_ids(cx, pool, &ids, query.project_id).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+    let recipients_by_id: HashMap<i64, String> = details
+        .into_iter()
+        .map(|row| (row.id, row.recipients))
+        .collect();
+    for result in &mut results {
+        if let Some(raw) = recipients_by_id.get(&result.id) {
+            let recipients = parse_search_result_recipients(raw);
+            result.to = Some(recipients.to);
+            result.cc = Some(recipients.cc);
+            result.bcc = Some(recipients.bcc);
+        }
+    }
+    Outcome::Ok(results)
+}
+
 async fn execute_sql_plan_search(
     cx: &Cx,
     pool: &DbPool,
@@ -5215,6 +5250,12 @@ async fn execute_sql_plan_search(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
         map_planned_rows(rows, query.doc_kind)
+    };
+    let raw_results = match hydrate_plan_recipients(cx, pool, query, raw_results).await {
+        Outcome::Ok(results) => results,
+        Outcome::Err(err) => return Outcome::Err(err),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
     let explain = if query.explain {

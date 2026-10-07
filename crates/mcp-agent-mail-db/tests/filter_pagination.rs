@@ -672,6 +672,47 @@ fn query_hints_filter_like_their_facets() {
     assert_eq!(run("project:no-such-project hintq").1, Vec::<String>::new());
 }
 
+/// Time-ordered (SQL plan) results carry their recipients like relevance
+/// (index) results do.
+#[test]
+fn time_ordered_results_carry_recipients() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "plan-recipients");
+    let sender = seed_agent(&pool, pid, "AmberOx");
+    let to = seed_agent(&pool, pid, "TealOtter");
+    let cc = seed_agent(&pool, pid, "CoralFinch");
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                pid,
+                sender,
+                "hydrate me",
+                "hydrate body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(to, "to"), (cc, "cc")],
+            )
+            .await
+            {
+                Outcome::Ok(_) => {}
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            }
+        }
+    });
+
+    let mut query = SearchQuery::messages("hydrate", pid);
+    query.ranking = RankingMode::Recency;
+    let response = search(&pool, &query);
+    let result = response.results.first().expect("one result");
+    assert_eq!(result.to.as_deref(), Some(&["TealOtter".to_string()][..]));
+    assert_eq!(result.cc.as_deref(), Some(&["CoralFinch".to_string()][..]));
+}
+
 /// A numeric thread id names its root message, which has no `thread_id` of
 /// its own: the filter must return it with its replies, as the thread view does.
 #[test]

@@ -119,9 +119,9 @@ pub struct SearchResult {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    /// Omitted when empty, so it must default when read back.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub bcc: Vec<String>,
+    // No bcc: search has no viewer identity, so it cannot apply fetch_inbox's
+    // "only the sender sees BCC" rule, and must not hand BCC lists to anyone
+    // who can search the project (the Python search never returned them).
     /// Message body (Markdown). Populated only when the caller passes
     /// `include_body_md=true`; otherwise omitted from the JSON envelope so
     /// FTS5 result lists stay cheap by default.
@@ -993,7 +993,6 @@ pub async fn search_messages(
                 from: r.from_agent.unwrap_or_default(),
                 to: r.to.unwrap_or_default(),
                 cc: r.cc.unwrap_or_default(),
-                bcc: r.bcc.unwrap_or_default(),
                 body_md: if include_body_md { Some(r.body) } else { None },
                 reason_codes: r.reason_codes,
                 score_factors: r.score_factors,
@@ -2073,7 +2072,6 @@ mod tests {
             from: "Alice".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
@@ -2103,7 +2101,6 @@ mod tests {
             from: "Bob".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
@@ -2135,7 +2132,6 @@ mod tests {
             from: "Alice".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: None,
             reason_codes: vec!["LexicalBm25".to_string(), "FusionWeightedBlend".to_string()],
             score_factors: vec![ScoreFactorSummary {
@@ -2166,7 +2162,6 @@ mod tests {
             from: "Carol".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: Some("# Hello\n\nthis is the body".to_string()),
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
