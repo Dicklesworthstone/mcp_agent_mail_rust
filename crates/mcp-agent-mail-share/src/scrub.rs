@@ -192,6 +192,32 @@ impl DerivedExportArtifacts {
 ///
 /// Operates in-place on the provided snapshot file.
 ///
+/// Null every agent's registration token in a snapshot.
+///
+/// Share exports run this whatever the scrub preset: the tokens are sender
+/// credentials and a published bundle is public, while the `archive` preset
+/// otherwise keeps them so a private `archive save` restores losslessly.
+/// Returns the number of tokens removed.
+///
+/// # Errors
+///
+/// - [`ShareError::Sqlite`] on any SQLite error.
+pub fn clear_registration_tokens(snapshot_path: &Path) -> Result<i64, ShareError> {
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let path_str = snapshot_path.display().to_string();
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
+    })?;
+    if !column_exists(&conn, "agents", "registration_token")? {
+        return Ok(0);
+    }
+    exec_count(
+        &conn,
+        "UPDATE agents SET registration_token = NULL WHERE registration_token IS NOT NULL",
+        &[],
+    )
+}
+
 /// # Errors
 ///
 /// - [`ShareError::Sqlite`] on any SQLite error.
@@ -1387,7 +1413,14 @@ mod tests {
         let private = PRIVATE_ATTACHMENT.repeat(1024);
         set_attachment_text(&source, &private);
         let target = dir.path().join("shared.sqlite3");
-        crate::create_snapshot_context(&source, &target, &[], ScrubPreset::Strict).unwrap();
+        crate::create_snapshot_context(
+            &source,
+            &target,
+            &[],
+            ScrubPreset::Strict,
+            crate::SnapshotPurpose::Publish,
+        )
+        .unwrap();
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
         let rows = conn.query_sync("SELECT attachments, body_md FROM messages WHERE id = 1", &[]).unwrap();
         assert_eq!(rows[0].get_named::<String>("attachments").unwrap(), "[]");
@@ -1457,7 +1490,14 @@ mod tests {
         );
         set_attachment_text(&source, &raw);
         let target = dir.path().join("shared.sqlite3");
-        crate::create_snapshot_context(&source, &target, &[], ScrubPreset::Standard).unwrap();
+        crate::create_snapshot_context(
+            &source,
+            &target,
+            &[],
+            ScrubPreset::Standard,
+            crate::SnapshotPurpose::Publish,
+        )
+        .unwrap();
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
         let rows = conn.query_sync("SELECT attachments FROM messages WHERE id = 1", &[]).unwrap();
         let text = rows[0].get_named::<String>("attachments").unwrap();
@@ -1675,6 +1715,23 @@ mod tests {
                 .get_named::<Option<String>>("registration_token")
                 .unwrap();
             assert_eq!(token.as_deref(), expected_token, "preset={preset:?}");
+            drop(conn);
+
+            // A share export publishes the bundle, so the token goes even under
+            // the lossless archive preset.
+            let removed = clear_registration_tokens(&db).unwrap();
+            assert_eq!(removed, i64::from(expected_token.is_some()));
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let rows = conn
+                .query_sync("SELECT registration_token FROM agents WHERE id = 1", &[])
+                .unwrap();
+            assert_eq!(
+                rows[0]
+                    .get_named::<Option<String>>("registration_token")
+                    .unwrap(),
+                None,
+                "published bundles carry no tokens, preset={preset:?}"
+            );
         }
     }
 

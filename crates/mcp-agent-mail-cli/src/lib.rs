@@ -16131,6 +16131,7 @@ impl CanonicalSnapshotSource {
         snapshot_path: &Path,
         project_filters: &[String],
         scrub_preset: share::ScrubPreset,
+        purpose: share::SnapshotPurpose,
     ) -> Result<share::SnapshotContext, share::ShareError> {
         match self.kind {
             CanonicalSnapshotSourceKind::LiveSqlite => share::create_snapshot_context(
@@ -16138,6 +16139,7 @@ impl CanonicalSnapshotSource {
                 snapshot_path,
                 project_filters,
                 scrub_preset,
+                purpose,
             ),
             CanonicalSnapshotSourceKind::LiveSnapshot
             | CanonicalSnapshotSourceKind::ArchiveSnapshot
@@ -16147,6 +16149,7 @@ impl CanonicalSnapshotSource {
                     snapshot_path,
                     project_filters,
                     scrub_preset,
+                    purpose,
                 )
             }
         }
@@ -82379,6 +82382,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
             &snapshot_path,
             &params.projects,
             params.scrub_preset,
+            share::SnapshotPurpose::Publish,
         )?;
 
         ftui_runtime::ftui_println!("\nSummary:");
@@ -82439,6 +82443,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         &snapshot_path,
         &params.projects,
         params.scrub_preset,
+        share::SnapshotPurpose::Publish,
     )?;
 
     ftui_runtime::ftui_println!("  Projects: {} kept", snap_ctx.scope.projects.len());
@@ -82595,6 +82600,7 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         &snapshot_path,
         &params.projects,
         params.scrub_preset,
+        share::SnapshotPurpose::Publish,
     )?;
 
     ftui_runtime::ftui_println!("  Projects: {} kept", snap_ctx.scope.projects.len());
@@ -83645,7 +83651,14 @@ fn archive_save_state_internal(
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
 
     ftui_runtime::ftui_println!("Creating mailbox archive...");
-    let context = source.create_share_snapshot_context(&snapshot_path, &projects, preset)?;
+    // A private save: the preset alone decides (the lossless `archive`
+    // preset keeps registration tokens so a restore can still send).
+    let context = source.create_share_snapshot_context(
+        &snapshot_path,
+        &projects,
+        preset,
+        share::SnapshotPurpose::PrivateArchive,
+    )?;
 
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
     let destination_name = destination

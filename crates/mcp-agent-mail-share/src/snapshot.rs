@@ -988,9 +988,21 @@ pub fn create_snapshot_context(
     snapshot_path: &Path,
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
     create_sqlite_snapshot(source, snapshot_path, true)?;
-    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+    finish_snapshot_context(snapshot_path, project_filters, scrub_preset, purpose)
+}
+
+/// What a snapshot is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPurpose {
+    /// A share bundle that will be published: agents' registration tokens are
+    /// removed whatever the scrub preset.
+    Publish,
+    /// A private archive (`am archive save`): the preset alone decides, so the
+    /// lossless `archive` preset keeps tokens and a restore can still send.
+    PrivateArchive,
 }
 
 /// Full snapshot preparation pipeline for a private canonical SQLite source.
@@ -1008,18 +1020,25 @@ pub fn create_private_canonical_snapshot_context(
     snapshot_path: &Path,
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
     create_private_canonical_sqlite_snapshot(source, snapshot_path, true)?;
-    finish_snapshot_context(snapshot_path, project_filters, scrub_preset)
+    finish_snapshot_context(snapshot_path, project_filters, scrub_preset, purpose)
 }
 
 fn finish_snapshot_context(
     snapshot_path: &Path,
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
-    let scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
+    let mut scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
+    if purpose == SnapshotPurpose::Publish {
+        // Before finalize rebuilds the file, so no page keeps the old values.
+        let removed = crate::scrub::clear_registration_tokens(snapshot_path)?;
+        scrub_summary.secrets_replaced += removed;
+    }
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
         crate::scrub::redact_scope_project_human_keys(&mut scope);
     }
@@ -2148,8 +2167,14 @@ mod tests {
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
         let snapshot = dir.path().join("snapshot.sqlite3");
-        let context =
-            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
+        let context = create_snapshot_context(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Standard,
+            SnapshotPurpose::Publish,
+        )
+        .unwrap();
         assert!(context.snapshot_path.exists());
         assert!(!context.scope.projects.is_empty());
         assert_eq!(
@@ -2269,8 +2294,14 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let context =
-            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
+        let context = create_snapshot_context(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Standard,
+            SnapshotPurpose::Publish,
+        )
+        .unwrap();
         assert!(context.snapshot_path.exists());
 
         let copy_conn = SqliteConnection::open_file(snapshot.display().to_string()).unwrap();
@@ -2379,8 +2410,14 @@ mod tests {
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
         let snapshot = dir.path().join("snapshot.sqlite3");
-        let context =
-            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Archive).unwrap();
+        let context = create_snapshot_context(
+            &source,
+            &snapshot,
+            &[],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::Publish,
+        )
+        .unwrap();
         assert_eq!(context.scope.projects[0].human_key, "/test/proj");
 
         let output = dir.path().join("bundle");
