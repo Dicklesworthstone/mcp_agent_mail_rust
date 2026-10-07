@@ -279,10 +279,18 @@ fn repair_one(
     config: &Config,
     original: &Source,
     attempted: &mut bool,
+    stop: &AtomicBool,
 ) -> Result<bool, String> {
-    let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
+    // Keep the source lease out of an unbounded archive wait. Use the same
+    // native fence and project locks as terminal/message recovery, not a
+    // second publication protocol or a detached writer.
+    let _mutation = crate::ArchiveMutationGuard::try_begin_repair(&config.storage_root, || {
+        stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
+    })
+    .map_err(|error| error.to_string())?;
     let archive = crate::ensure_archive(config, &original.slug).map_err(source_error)?;
-    crate::with_project_lock(&archive, || {
+    let publish = || {
+        checkpoint(cx, stop)?;
         if read_source(cx, pool, original.id)
             .map_err(invalid)?
             .as_ref()
@@ -367,6 +375,7 @@ fn repair_one(
                 "active reservation source changed during verification",
             ));
         }
+        checkpoint(cx, stop)?;
         *attempted = true;
         if working.is_none() {
             publish_missing(&path, &bytes)?;
@@ -374,6 +383,7 @@ fn repair_one(
         // The commit helper reads the current file, not the captured ACTIVE
         // payload. A racing terminal writer can therefore only supersede it;
         // no stale active WriteOp is ever queued for a later overwrite.
+        checkpoint(cx, stop)?;
         crate::commit_paths_with_retry(
             repo_root,
             config,
@@ -396,31 +406,31 @@ fn repair_one(
             ));
         }
         Ok(true)
-    })
-    .map_err(|error| error.to_string())
+    };
+    archive
+        .with_repair_lock(|| stop.load(Ordering::Acquire) || cx.checkpoint().is_err(), publish)
+        .map_err(|error| error.to_string())
 }
 
-/// Repair missing generation-stamped stable artifacts for settled active leases.
-/// The pass never modifies database rows or overwrites an occupied destination.
-/// Thirty-second-old grants are eligible; expired, released, unversioned and
-/// ambiguous sources remain untouched. Row selection and writes are bounded,
-/// but this is not a hard deadline on SQLite, Git or filesystem operations.
-pub fn reconcile_active_reservations(
+fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
+    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "active reservation repair cancelled",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+// The caller owns database admission throughout source binding and selection.
+// Keep the existing finite ID window and all active/grace/release predicates.
+fn select_ids(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
     cursor: &mut ActiveReservationCursor,
-    stop: &AtomicBool,
-) -> Result<ActiveReservationReport, String> {
-    let mut report = ActiveReservationReport::default();
-    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-        report.interrupted = true;
-        return Ok(report);
-    }
-    let _activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-    if corruption_circuit_breaker().is_tripped() {
-        return Err("active reservation repair refused: corruption breaker open".into());
-    }
+) -> Result<Vec<i64>, String> {
     validate_source(cx, pool, config)?;
     let identity = pool.sqlite_identity_key();
     if cursor.identity != identity {
@@ -451,11 +461,42 @@ pub fn reconcile_active_reservations(
           mcp_agent_mail_db::now_micros().into(),
           mcp_agent_mail_db::now_micros().saturating_sub(GRANT_GRACE_US).into(), IDS_PER_PASS.into()],
     ).map_err(source_error)?;
-    let ids = rows
-        .iter()
+    rows.iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(conn);
+        .collect()
+}
+
+/// Repair missing generation-stamped stable artifacts for settled active leases.
+/// The pass never modifies database rows or overwrites an occupied destination.
+/// Thirty-second-old grants are eligible; expired, released, unversioned and
+/// ambiguous sources remain untouched. Row selection and writes are bounded,
+/// but this is not a hard deadline on SQLite, Git or filesystem operations.
+///
+/// Closed database admission defers before consuming a candidate. A busy global
+/// archive fence or project lock defers that lease within the finite round so
+/// other projects can progress. Worker shutdown reaches lock admission and the
+/// publication checkpoints; completed files remain evidence for a safe retry.
+pub fn reconcile_active_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ActiveReservationCursor,
+    stop: &AtomicBool,
+) -> Result<ActiveReservationReport, String> {
+    let mut report = ActiveReservationReport::default();
+    if checkpoint(cx, stop).is_err() {
+        report.interrupted = true;
+        return Ok(report);
+    }
+    if corruption_circuit_breaker().is_tripped() {
+        return Err("active reservation repair refused: corruption breaker open".into());
+    }
+    let ids = {
+        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("active reservation repair deferred: recovery promotion or admission contention")?;
+        select_ids(cx, pool, config, cursor)?
+    };
+    let selected_identity = cursor.identity.clone();
     report.more = ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound");
     for id in ids {
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
@@ -470,14 +511,28 @@ pub fn reconcile_active_reservations(
         if corruption_circuit_breaker().is_tripped() {
             return Err("active reservation repair stopped: source corruption observed".into());
         }
+        // A promotion may have run after selection. Never apply a retained ID
+        // page to an observed replacement source, and never wait while closed.
+        let activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("active reservation repair deferred: recovery promotion or admission contention")?;
+        if pool.sqlite_identity_key() != selected_identity {
+            return Err("active reservation source changed after selection; rescan required".into());
+        }
         let mut attempted = false;
         let result = read_source(cx, pool, id).and_then(|source| {
             source.map_or(Ok(false), |source| {
-                repair_one(cx, pool, config, &source, &mut attempted)
+                repair_one(cx, pool, config, &source, &mut attempted, stop)
             })
         });
-        report.scanned += 1;
+        // Do not retain source/promotion authority across outer diagnostics.
+        drop(activity);
         report.attempted += usize::from(attempted);
+        if checkpoint(cx, stop).is_err() {
+            report.interrupted = true;
+            report.more = true;
+            break;
+        }
+        report.scanned += 1;
         match result {
             Ok(true) => report.repaired += 1,
             Ok(false) => report.unchanged += 1,
@@ -498,8 +553,49 @@ pub fn reconcile_active_reservations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // These tests deliberately hold process-global admission locks. Isolate
+    // them from unrelated libtests, while bounding a regressed child's life.
+    fn isolated() -> bool {
+        const CHILD: &str = "AM_TEST_ACTIVE_RESERVATION_ADMISSION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn isolated active reservation test");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut expired = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                expired = true;
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !expired && output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "isolated {name} failed (timeout={expired}): {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
 
     fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
+        if isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
@@ -625,7 +721,7 @@ mod tests {
                 conn.execute_raw(change).unwrap();
                 drop(conn);
                 let mut attempted = false;
-                assert!(repair_one(cx, pool, config, &captured, &mut attempted).is_err());
+                assert!(repair_one(cx, pool, config, &captured, &mut attempted, &AtomicBool::new(false)).is_err());
                 assert!(!attempted);
                 assert!(!target(config).exists());
             });
@@ -791,6 +887,235 @@ mod tests {
             );
             assert!(!target(config).exists());
             assert_eq!(fs::read(other).unwrap(), b"not this mailbox");
+        });
+    }
+
+    fn assert_committed(cx: &Cx, pool: &DbPool, config: &Config, id: i64) {
+        let source = read_source(cx, pool, id).unwrap().unwrap();
+        let relative = format!(
+            "projects/{}/file_reservations/{}",
+            source.slug,
+            reservation_artifact_filename(Some(&source.generation), id),
+        );
+        let path = config.storage_root.join(&relative);
+        let artifact = read_artifact(&path).unwrap().unwrap();
+        assert_eq!(artifact.value, source.artifact);
+        let repo = Repository::open(&config.storage_root).unwrap();
+        let tree = head_tree(&repo).unwrap().unwrap();
+        assert_eq!(
+            committed_artifact(&repo, Some(&tree), &relative)
+                .unwrap().unwrap().bytes,
+            artifact.bytes,
+        );
+        assert_eq!(read_source(cx, pool, id).unwrap().unwrap(), source);
+    }
+
+    #[test]
+    fn promotion_defers_active_repair_without_consuming_the_round() {
+        use mcp_agent_mail_db::write_barrier::{
+            DrainOutcome, acquire_promotion_barrier_draining, active_writer_count,
+            begin_write_activity, try_acquire_promotion_barrier_if_idle,
+        };
+        for parent_writer in [false, true] {
+            fixture(|cx, pool, config| {
+                let source = read_source(cx, pool, 401).unwrap().unwrap();
+                assert_eq!(active_writer_count(), 0);
+                let parent = parent_writer.then(begin_write_activity);
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let owner = std::thread::spawn(move || {
+                    let gate = if parent_writer {
+                        let (gate, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+                        assert!(matches!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        gate
+                    } else {
+                        try_acquire_promotion_barrier_if_idle().expect("idle promotion")
+                    };
+                    ready_tx.send(()).unwrap();
+                    let released = release_rx.recv_timeout(Duration::from_secs(10));
+                    drop(gate);
+                    released
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let mut cursor = ActiveReservationCursor {
+                    identity: "retained source".into(), after: 17, ceiling: Some(401),
+                };
+                let refused = reconcile_active_reservations(
+                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                );
+                let writers = active_writer_count();
+                let initialized = config.storage_root.join("projects").exists();
+                drop(parent);
+                let _ = release_tx.send(());
+                assert!(owner.join().unwrap().is_ok(), "repair waited for promotion expiry");
+                assert!(refused.unwrap_err().contains("admission contention"));
+                assert_eq!(writers, usize::from(parent_writer));
+                assert!(!initialized);
+                assert_eq!((&*cursor.identity, cursor.after, cursor.ceiling),
+                           ("retained source", 17, Some(401)));
+                assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+                let resumed = reconcile_active_reservations(
+                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                ).unwrap();
+                assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
+                assert_committed(cx, pool, config, 401);
+                assert_eq!(active_writer_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn busy_global_fence_does_not_initialize_an_archive_or_hold_database_admission() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+        for existing_archive in [false, true] {
+            fixture(|cx, pool, config| {
+                if existing_archive {
+                    crate::ensure_archive(config, "project").unwrap();
+                }
+                crate::flush_async_commits();
+                let epoch_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+                let stamp = fs::read(&epoch_path).ok();
+                let epoch = crate::archive_mutation_epoch();
+                let source = read_source(cx, pool, 401).unwrap().unwrap();
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let owner = std::thread::spawn(move || {
+                    crate::with_archive_snapshot_publication_fence(|| {
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10))
+                    })
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let mut cursor = ActiveReservationCursor::default();
+                let first = reconcile_active_reservations(
+                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                );
+                let writers = active_writer_count();
+                let gate = try_acquire_promotion_barrier_if_idle();
+                let can_promote = gate.is_some();
+                drop(gate);
+                let observations = (
+                    target(config).exists(), config.storage_root.join(".git").exists(),
+                    fs::read(&epoch_path).ok(), crate::archive_mutation_epoch(),
+                    crate::archive_mutations_active(),
+                );
+                let _ = release_tx.send(());
+                assert!(owner.join().unwrap().is_ok(), "repair waited for fence-owner expiry");
+                let first = first.unwrap();
+                assert_eq!((first.scanned, first.deferred, first.repaired, first.attempted), (1, 1, 0, 0));
+                assert_eq!(observations, (false, existing_archive, stamp, epoch, 0));
+                assert_eq!(writers, 0);
+                assert!(can_promote);
+                assert!(cursor.ceiling.is_none(), "the finite round must revisit deferrals");
+                assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                conn.execute_raw("UPDATE file_reservations SET reason='renewed while deferred', expires_ts=expires_ts+1000000 WHERE id=401").unwrap();
+                drop(conn);
+                let resumed = reconcile_active_reservations(
+                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                ).unwrap();
+                assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
+                assert_committed(cx, pool, config, 401);
+                assert_eq!(read_artifact(&target(config)).unwrap().unwrap().value["reason"], "renewed while deferred");
+                assert_eq!(active_writer_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn busy_project_does_not_strand_other_leases_or_resurrect_a_later_release() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other', '/other', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'GreenStone', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT 501, 72, 82, 'other.rs', 1, 'other lease', created_ts, expires_ts, NULL FROM file_reservations WHERE id=401").unwrap();
+            drop(conn);
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            crate::ensure_archive(config, "other").unwrap();
+            crate::flush_async_commits();
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let _held = process.lock().unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10))
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut cursor = ActiveReservationCursor::default();
+            let first = reconcile_active_reservations(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            );
+            let missing = !target(config).exists();
+            let other = config.storage_root.join("projects/other/file_reservations/id-501-gaabb.json");
+            let other_present = other.exists();
+            let _ = release_tx.send(());
+            assert!(owner.join().unwrap().is_ok(), "repair waited for project-owner expiry");
+            let first = first.unwrap();
+            assert_eq!((first.scanned, first.deferred, first.repaired), (2, 1, 1));
+            assert!(missing && other_present);
+            assert_committed(cx, pool, config, 501);
+            // Release the previously active row while its repair is deferred.
+            // The next round must consult both release stores, never a payload
+            // captured before contention. Keep the same cursor, without reset.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)").unwrap();
+            drop(conn);
+            let resumed = reconcile_active_reservations(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!((resumed.repaired, resumed.unchanged, resumed.deferred), (0, 1, 0));
+            assert!(!target(config).exists());
+            assert!(read_source(cx, pool, 401).unwrap().is_none());
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn shutdown_during_project_contention_retains_the_candidate_for_resume() {
+        fixture(|cx, pool, config| {
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            crate::flush_async_commits();
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let cancel = std::sync::Arc::clone(&stop);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let _held = process.lock().unwrap();
+                ready_tx.send(()).unwrap();
+                // Observe the actual repair mutation window, not a timed guess
+                // about when the worker will reach the held project mutex.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while crate::archive_mutations_active() == 0 && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let observed = crate::archive_mutations_active() > 0;
+                cancel.store(true, Ordering::Release);
+                let released = release_rx.recv_timeout(Duration::from_secs(10));
+                (observed, released)
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut cursor = ActiveReservationCursor::default();
+            let interrupted = reconcile_active_reservations(cx, pool, config, &mut cursor, &stop);
+            let absent = !target(config).exists();
+            let _ = release_tx.send(());
+            let (observed, released) = owner.join().unwrap();
+            assert!(observed && released.is_ok());
+            let interrupted = interrupted.unwrap();
+            assert!(interrupted.interrupted && interrupted.more);
+            assert_eq!((interrupted.scanned, interrupted.attempted, cursor.after), (0, 0, 0));
+            assert!(absent);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+            let resumed = reconcile_active_reservations(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
+            assert_committed(cx, pool, config, 401);
         });
     }
 }
