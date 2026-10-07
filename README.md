@@ -732,7 +732,10 @@ am inbox-events --project /abs/path --agent BlueLake --after 42 --limit 100 --fo
 
 Each page includes `events`, `next_cursor`, `has_more`,
 `oldest_available_cursor`, and `tail_cursor`. A cursor below retained history
-returns `CURSOR_EXPIRED`; a cursor beyond the tail returns `CURSOR_AHEAD`.
+fails with code `cursor_expired` (the `fetch_inbox_events` tool reports
+`CURSOR_EXPIRED`); a cursor beyond the tail fails with `cursor_ahead`
+(`CURSOR_AHEAD`). Restart from the error's `oldest_available_cursor` or
+`tail_cursor`.
 
 ---
 

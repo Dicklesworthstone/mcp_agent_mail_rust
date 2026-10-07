@@ -949,7 +949,7 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 - `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
-- `CURSOR_EXPIRED` / `CURSOR_AHEAD`: Use `oldest_available_cursor` or `tail_cursor` from `inbox-events`; never replace a delivery cursor with a message ID
+- `CURSOR_EXPIRED` / `CURSOR_AHEAD` (tool) or `cursor_expired` / `cursor_ahead` (`am inbox-events`): Use `oldest_available_cursor` or `tail_cursor` from the error; never replace a delivery cursor with a message ID
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
 ### Shared Mailbox Lifecycle and Read Safety

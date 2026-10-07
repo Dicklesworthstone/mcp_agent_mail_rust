@@ -2180,6 +2180,19 @@ pub enum MailCommand {
         /// Override recipients (comma-separated; defaults to original sender).
         #[arg(long)]
         to: Option<String>,
+        /// Sender token proving ownership of --from, as for `mail send`
+        /// (prefer --sender-token-file or AGENT_MAIL_SENDER_TOKEN; a token
+        /// persisted by `am agents register` / `am macros start-session` is
+        /// reused automatically).
+        #[arg(
+            long = "sender-token",
+            value_name = "TOKEN",
+            allow_hyphen_values = true
+        )]
+        sender_token: Option<String>,
+        /// Read the sender token from this file (contents trimmed).
+        #[arg(long = "sender-token-file", value_name = "PATH")]
+        sender_token_file: Option<PathBuf>,
         /// Output format: table, json, or toon (default: auto-detect).
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
@@ -20300,6 +20313,15 @@ fn resolve_project_for_cli_best_effort(
     }
 }
 
+/// An unregistered project truly has no reservations, so the read commands
+/// still answer "none" — but say why on stderr, so a misspelled project name
+/// is not mistaken for a clear field before an edit.
+fn warn_unregistered_reservation_project(identifier: &str) {
+    output::warn(&format!(
+        "project `{identifier}` is not registered in this mailbox, so it has no reservations; check the project name"
+    ));
+}
+
 fn handle_file_reservations_with_conn(
     conn: &impl mcp_agent_mail_db::pool::SyncQuery,
     action: FileReservationsCommand,
@@ -20313,6 +20335,7 @@ fn handle_file_reservations_with_conn(
             all,
         } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                warn_unregistered_reservation_project(&project);
                 output::empty_result(false, "No file reservations found.");
                 return Ok(());
             };
@@ -20405,6 +20428,7 @@ fn handle_file_reservations_with_conn(
         }
         FileReservationsCommand::Active { project, limit } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                warn_unregistered_reservation_project(&project);
                 ftui_runtime::ftui_println!("No active reservations.");
                 return Ok(());
             };
@@ -20458,6 +20482,7 @@ fn handle_file_reservations_with_conn(
         }
         FileReservationsCommand::Soon { project, minutes } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                warn_unregistered_reservation_project(&project);
                 ftui_runtime::ftui_println!(
                     "No reservations expiring within {} minutes.",
                     minutes.unwrap_or(30)
@@ -20525,6 +20550,7 @@ fn handle_file_reservations_with_conn(
         )),
         FileReservationsCommand::Conflicts { project, paths } => {
             let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                warn_unregistered_reservation_project(&project);
                 output::success("No conflicts detected.");
                 return Ok(());
             };
@@ -20854,7 +20880,8 @@ fn handle_contacts_with_conn(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let ttl = ttl_seconds.max(60);
+            // Same bounds as the request_contact tool.
+            let ttl = ttl_seconds.clamp(60, 31_536_000);
             let expires_us = now_us.saturating_add(saturating_seconds_to_micros(ttl));
 
             // Resolve project and agents.
@@ -20862,55 +20889,92 @@ fn handle_contacts_with_conn(
 
             let from_id = crate::context::resolve_agent(conn, project_id, &from_agent)?.id;
             let to_id = crate::context::resolve_agent(conn, project_id, &to_agent)?.id;
+            let link_key = [
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(from_id),
+                sqlmodel_core::Value::BigInt(project_id),
+                sqlmodel_core::Value::BigInt(to_id),
+            ];
+            let read_link = || {
+                conn.query_sync(
+                    "SELECT status, expires_ts FROM agent_links \
+                     WHERE a_project_id = ? AND a_agent_id = ? \
+                       AND b_project_id = ? AND b_agent_id = ?",
+                    &link_key,
+                )
+                .map_err(|e| CliError::Other(format!("contact link read failed: {e}")))
+            };
 
-            // Upsert agent_links: set status to 'pending'.
-            // FrankenConnection does not support ON CONFLICT ... DO UPDATE;
-            // emulate with DELETE + INSERT.
-            conn.execute_sync(
-                "DELETE FROM agent_links \
-                 WHERE a_project_id = ? AND a_agent_id = ? \
-                   AND b_project_id = ? AND b_agent_id = ?",
-                &[
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(from_id),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(to_id),
-                ],
-            )
-            .map_err(|e| CliError::Other(format!("delete for upsert failed: {e}")))?;
-            conn.execute_sync(
-                "INSERT INTO agent_links \
-                 (a_project_id, a_agent_id, b_project_id, b_agent_id, \
-                  status, reason, created_ts, updated_ts, expires_ts) \
-                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
-                &[
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(from_id),
-                    sqlmodel_core::Value::BigInt(project_id),
-                    sqlmodel_core::Value::BigInt(to_id),
-                    sqlmodel_core::Value::Text(reason.clone()),
-                    sqlmodel_core::Value::BigInt(now_us),
-                    sqlmodel_core::Value::BigInt(now_us),
-                    sqlmodel_core::Value::BigInt(expires_us),
-                ],
-            )
-            .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
+            if read_link()?.is_empty() {
+                conn.execute_sync(
+                    "INSERT INTO agent_links \
+                     (a_project_id, a_agent_id, b_project_id, b_agent_id, \
+                      status, reason, created_ts, updated_ts, expires_ts) \
+                     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                    &[
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(from_id),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(to_id),
+                        sqlmodel_core::Value::Text(reason.clone()),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(expires_us),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("insert failed: {e}")))?;
+            } else {
+                // The tool's refresh rule: a block stands (the target's
+                // decision), and an unexpired approval is not downgraded back
+                // to pending. Pending links and lapsed approvals refresh.
+                conn.execute_sync(
+                    "UPDATE agent_links \
+                     SET status = 'pending', reason = ?, updated_ts = ?, expires_ts = ? \
+                     WHERE a_project_id = ? AND a_agent_id = ? \
+                       AND b_project_id = ? AND b_agent_id = ? \
+                       AND status != 'blocked' \
+                       AND (status != 'approved' OR (expires_ts IS NOT NULL AND expires_ts <= ?))",
+                    &[
+                        sqlmodel_core::Value::Text(reason.clone()),
+                        sqlmodel_core::Value::BigInt(now_us),
+                        sqlmodel_core::Value::BigInt(expires_us),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(from_id),
+                        sqlmodel_core::Value::BigInt(project_id),
+                        sqlmodel_core::Value::BigInt(to_id),
+                        sqlmodel_core::Value::BigInt(now_us),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("refresh failed: {e}")))?;
+            }
+            let link = read_link()?;
+            let status: String = link
+                .first()
+                .and_then(|row| row.get_named("status").ok())
+                .unwrap_or_else(|| "pending".to_string());
+            let expires_iso = link
+                .first()
+                .and_then(|row| row.get_named::<i64>("expires_ts").ok())
+                .map(mcp_agent_mail_db::timestamps::micros_to_iso);
 
             let result = serde_json::json!({
                 "from": from_agent.clone(),
                 "to": to_agent.clone(),
-                "status": "pending",
+                "status": &status,
                 "reason": reason.clone(),
-                "expires_ts": mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
+                "expires_ts": &expires_iso,
             });
             output::emit_output(&result, fmt, || {
-                output::success(&format!("Contact request sent: {from_agent} → {to_agent}"));
-                output::kv("Status", "pending");
+                if status == "pending" {
+                    output::success(&format!("Contact request sent: {from_agent} → {to_agent}"));
+                } else {
+                    output::warn(&format!(
+                        "Contact already {status}: {from_agent} → {to_agent} (unchanged)"
+                    ));
+                }
+                output::kv("Status", &status);
                 output::kv("Reason", &reason);
-                output::kv(
-                    "Expires",
-                    &mcp_agent_mail_db::timestamps::micros_to_iso(expires_us),
-                );
+                output::kv("Expires", expires_iso.as_deref().unwrap_or("never"));
             });
             Ok(())
         }
@@ -20935,8 +20999,8 @@ fn handle_contacts_with_conn(
             let from_id = crate::context::resolve_agent(conn, project_id, &from_agent)?.id;
             let to_id = crate::context::resolve_agent(conn, project_id, &agent_name)?.id;
 
-            let _updated = conn
-                .query_sync(
+            let updated = conn
+                .execute_sync(
                     "UPDATE agent_links SET status = ?, updated_ts = ?, expires_ts = ? \
                      WHERE a_project_id = ? AND a_agent_id = ? \
                        AND b_project_id = ? AND b_agent_id = ?",
@@ -20951,6 +21015,14 @@ fn handle_contacts_with_conn(
                     ],
                 )
                 .map_err(|e| CliError::Other(format!("update failed: {e}")))?;
+            if updated == 0 {
+                // As the respond_contact tool does (NOT_FOUND): there is no
+                // request to answer, so nothing was approved or blocked.
+                return Err(CliError::InvalidArgument(format!(
+                    "no contact request from `{from_agent}` to `{agent_name}` in project \
+                     `{project_key}`; nothing to respond to"
+                )));
+            }
 
             let result = serde_json::json!({
                 "from": from_agent.clone(),
@@ -38629,6 +38701,8 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             message_id,
             body,
             to,
+            sender_token,
+            sender_token_file,
             format,
             json,
         } => {
@@ -38641,6 +38715,15 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     .map(str::to_string)
                     .collect()
             });
+            // A reply is a send: under the fail-closed send profile it needs
+            // the same proof of sender ownership `mail send` resolves.
+            let resolved_sender_token = resolve_sender_token(
+                &server_config,
+                &project_key,
+                &sender,
+                sender_token.as_deref(),
+                sender_token_file.as_deref(),
+            )?;
             match try_call_server_tool(
                 &server_url,
                 bearer.as_deref(),
@@ -38651,6 +38734,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     &sender,
                     &body,
                     explicit_to.as_deref(),
+                    resolved_sender_token.as_deref(),
                 ),
             )
             .await
@@ -38700,6 +38784,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 &sender,
                 &body,
                 explicit_to.as_deref(),
+                resolved_sender_token.as_deref(),
             )
             .await?;
             let data = server_message_payload_to_cli_json(payload).ok_or_else(|| {
@@ -39494,6 +39579,7 @@ fn build_server_reply_message_arguments(
     sender: &str,
     body: &str,
     explicit_to: Option<&[String]>,
+    sender_token: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
         ("project_key".to_string(), serde_json::json!(project_key)),
@@ -39503,6 +39589,9 @@ fn build_server_reply_message_arguments(
     ]);
     if let Some(explicit_to) = explicit_to {
         arguments.insert("to".to_string(), serde_json::json!(explicit_to));
+    }
+    if let Some(sender_token) = sender_token {
+        arguments.insert("sender_token".to_string(), serde_json::json!(sender_token));
     }
     serde_json::Value::Object(arguments)
 }
@@ -42568,10 +42657,60 @@ mod mail_server_cli_bridge_tests {
             "PinkStone",
             "Reply body",
             None,
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
         assert!(!object.contains_key("to"));
+        assert!(!object.contains_key("sender_token"));
+
+        // A reply proves its sender the way `mail send` does.
+        let signed = build_server_reply_message_arguments(
+            "/tmp/project",
+            42,
+            "PinkStone",
+            "Reply body",
+            None,
+            Some("tok-123"),
+        );
+        assert_eq!(signed["sender_token"], "tok-123");
+    }
+
+    #[test]
+    fn clap_parses_mail_reply_sender_token_flags() {
+        use crate::{Cli, Commands, MailCommand};
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "reply",
+            "-p",
+            "/tmp/project",
+            "--from",
+            "PinkStone",
+            "--message-id",
+            "42",
+            "-b",
+            "ok",
+            "--sender-token-file",
+            "/tmp/tok.txt",
+        ])
+        .expect("parse mail reply");
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action:
+                    MailCommand::Reply {
+                        sender_token,
+                        sender_token_file,
+                        ..
+                    },
+            } => {
+                assert_eq!(sender_token, None);
+                assert_eq!(sender_token_file, Some(PathBuf::from("/tmp/tok.txt")));
+            }
+            other => panic!("expected Mail Reply, got {other:?}"),
+        }
     }
 
     #[test]
@@ -50268,6 +50407,62 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             lease.released_ts.is_some(),
             "expected released_ts to be set, got: {lease_json}"
+        );
+    }
+
+    #[test]
+    fn am_run_with_build_slots_disabled_leaves_no_lease_and_says_so() {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            worktrees_enabled: false,
+            storage_root: temp.path().join("storage_root"),
+            ..Config::default()
+        };
+        let args = AmRunArgs {
+            slot: "frontend-build".to_string(),
+            cmd: vec!["true".to_string()],
+            path: PathBuf::from("/tmp/am-run-fixture"),
+            agent: Some("TestAgent".to_string()),
+            ttl_seconds: 3600,
+            shared: false,
+            exclusive: false,
+            block_on_conflicts: true,
+            no_block_on_conflicts: false,
+            artifact_dir: None,
+        };
+
+        let capture = StdioCapture::install().unwrap();
+        handle_am_run_with(&config, None, None, args).expect("the command still runs");
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+        let output = String::from_utf8_lossy(&sink).to_string();
+        assert!(
+            output.contains("build slots are disabled"),
+            "expected the disabled-slots warning: {output}"
+        );
+
+        // No lease is written, so none lingers as an active exclusive hold.
+        let identity = resolve_project_identity("/tmp/am-run-fixture");
+        let lease_path = config
+            .storage_root
+            .join("projects")
+            .join(&identity.slug)
+            .join("build_slots")
+            .join("frontend-build");
+        assert!(
+            !lease_path.exists(),
+            "no slot directory or lease may be created: {}",
+            lease_path.display()
         );
     }
 
@@ -71327,6 +71522,10 @@ startup_timeout_sec = 42
             output.contains("No conflicts"),
             "expected no conflicts, got: {output}"
         );
+        assert!(
+            !output.contains("is not registered"),
+            "a registered project gets no warning, got: {output}"
+        );
     }
 
     #[test]
@@ -71351,6 +71550,11 @@ startup_timeout_sec = 42
         assert!(
             output.contains("No conflicts"),
             "expected empty conflicts result, got: {output}"
+        );
+        // A misspelled project must not read as a clear field.
+        assert!(
+            output.contains("project `missing-proj` is not registered"),
+            "expected an unregistered-project warning, got: {output}"
         );
     }
 
@@ -73448,6 +73652,110 @@ startup_timeout_sec = 42
             .unwrap();
         let status: String = rows[0].get_named("status").unwrap();
         assert_eq!(status, "blocked");
+
+        // Asking again does not lift the block, as with the tool.
+        drop(capture);
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let again = handle_contacts_with_conn(&conn, contact_request("RedFox", "BlueLake"));
+        let output = capture.drain_to_string();
+        assert!(again.is_ok(), "repeat request failed: {again:?}");
+        assert!(output.contains("blocked"), "{output}");
+        let rows = conn
+            .query_sync(
+                "SELECT status FROM agent_links WHERE a_agent_id = 2 AND b_agent_id = 1",
+                &[],
+            )
+            .unwrap();
+        let status: String = rows[0].get_named("status").unwrap();
+        assert_eq!(
+            status, "blocked",
+            "a block stands until the target lifts it"
+        );
+    }
+
+    fn contact_request(from: &str, to: &str) -> ContactsCommand {
+        ContactsCommand::Request {
+            project_key: "test-proj".to_string(),
+            from_agent: from.to_string(),
+            to_agent: to.to_string(),
+            reason: "again".to_string(),
+            ttl_seconds: i64::MAX,
+            format: None,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn integration_contacts_respond_without_a_request_is_an_error() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Respond {
+                project_key: "test-proj".to_string(),
+                agent_name: "RedFox".to_string(),
+                from_agent: "BlueLake".to_string(),
+                accept: true,
+                reject: false,
+                ttl_seconds: 86400,
+                format: None,
+                json: true,
+            },
+        );
+        let output = capture.drain_to_string();
+        let err = result.expect_err("no request means nothing was approved");
+        assert!(err.to_string().contains("no contact request"), "{err}");
+        assert!(!output.contains("\"updated\""), "{output}");
+
+        // An approved link stays approved when asked again, and an absurd TTL
+        // is clamped to a year rather than pinning the link forever.
+        drop(capture);
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_contacts_with_conn(&conn, contact_request("BlueLake", "RedFox")).expect("request");
+        let expires: i64 = conn
+            .query_sync(
+                "SELECT expires_ts FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+                &[],
+            )
+            .unwrap()[0]
+            .get_named("expires_ts")
+            .unwrap();
+        let year_and_a_day = 366 * 24 * 3600 * 1_000_000_i64;
+        assert!(
+            expires <= mcp_agent_mail_db::timestamps::now_micros() + year_and_a_day,
+            "TTL must be clamped to a year, got expires_ts={expires}"
+        );
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Respond {
+                project_key: "test-proj".to_string(),
+                agent_name: "RedFox".to_string(),
+                from_agent: "BlueLake".to_string(),
+                accept: true,
+                reject: false,
+                ttl_seconds: 86400,
+                format: None,
+                json: true,
+            },
+        )
+        .expect("approve");
+        handle_contacts_with_conn(&conn, contact_request("BlueLake", "RedFox"))
+            .expect("repeat request");
+        let _ = capture.drain_to_string();
+        let rows = conn
+            .query_sync(
+                "SELECT status FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+                &[],
+            )
+            .unwrap();
+        let status: String = rows[0].get_named("status").unwrap();
+        assert_eq!(status, "approved");
     }
 
     #[test]
@@ -79938,10 +80246,11 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
     }
 
     let server_url = local_server_url(&config);
+    let bearer = local_server_bearer_token(&config);
     handle_am_run_with(
         &config,
         Some(server_url.as_str()),
-        config.http_bearer_token.as_deref(),
+        bearer.as_deref(),
         AmRunArgs {
             slot,
             cmd,
@@ -79960,12 +80269,9 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
     let server_url = local_server_url(&config);
-    handle_am_run_with(
-        &config,
-        Some(server_url.as_str()),
-        config.http_bearer_token.as_deref(),
-        args,
-    )
+    // The same token `am mail` sends, including the managed-service fallback.
+    let bearer = local_server_bearer_token(&config);
+    handle_am_run_with(&config, Some(server_url.as_str()), bearer.as_deref(), args)
 }
 
 #[derive(Debug)]
@@ -80468,10 +80774,17 @@ fn handle_am_run_with(
 
     // Ensure local lease path exists upfront so tests can observe it even if server path is used.
     // This is best-effort (legacy behavior) because server-based build slot leases don't strictly
-    // require local filesystem writes.
+    // require local filesystem writes. With build slots disabled nothing below
+    // releases a lease, so none is written: an unreleased "active" exclusive
+    // lease would otherwise linger for the whole TTL.
     let mut slot_dir_opt: Option<PathBuf> = None;
     let mut lease_path_opt: Option<PathBuf> = None;
-    if let Ok(dir) = ensure_slot_dir(config, &identity.slug, &args.slot) {
+    if !config.worktrees_enabled {
+        output::warn(
+            "build slots are disabled (WORKTREES_ENABLED=false): running without a slot lease \
+             or conflict check",
+        );
+    } else if let Ok(dir) = ensure_slot_dir(config, &identity.slug, &args.slot) {
         let path = lease_path(&dir, &agent_name, &branch);
         let _ = write_lease(&path, &lease);
         slot_dir_opt = Some(dir);
@@ -89640,6 +89953,7 @@ async fn call_reply_message_tool_locally(
     sender: &str,
     body: &str,
     to_names: Option<&[String]>,
+    sender_token: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(
         mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE),
@@ -89659,7 +89973,7 @@ async fn call_reply_message_tool_locally(
         None,
         None,
         None,
-        None, // sender_token
+        sender_token.map(str::to_string),
         None, // idempotency_key
     )
     .await
@@ -90039,7 +90353,8 @@ fn handle_products(action: ProductsCommand) -> CliResult<()> {
 async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let config = Config::from_env();
     let server_url = local_server_url(&config);
-    let bearer = config.http_bearer_token.as_deref();
+    let bearer_token = local_server_bearer_token(&config);
+    let bearer = bearer_token.as_deref();
 
     let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
     let canonical_read_pool;
