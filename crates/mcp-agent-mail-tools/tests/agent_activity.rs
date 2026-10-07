@@ -358,7 +358,7 @@ fn operator_actions_on_an_agents_behalf_are_not_its_activity() {
 }
 
 /// Reading or acknowledging mail in a project that does not exist is
-/// NOT_FOUND; a typo'd absolute key must not leave a phantom project behind.
+/// `NOT_FOUND`; a typo'd absolute key must not leave a phantom project behind.
 #[test]
 fn read_tools_do_not_create_a_project_from_an_unknown_key() {
     run_with_storage(|cx| async move {

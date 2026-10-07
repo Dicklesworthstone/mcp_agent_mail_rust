@@ -1419,7 +1419,7 @@ fn handshake_reports_a_half_written_welcome() {
     });
 }
 
-/// A single-thread summary covers the whole thread; per_thread_limit (a
+/// A single-thread summary covers the whole thread; `per_thread_limit` (a
 /// multi-thread knob, default 50) cuts it only when given.
 #[test]
 fn single_thread_summary_counts_the_whole_thread() {
