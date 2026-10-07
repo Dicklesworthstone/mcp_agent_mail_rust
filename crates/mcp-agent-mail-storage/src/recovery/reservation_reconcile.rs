@@ -484,7 +484,10 @@ fn publish_release(
     targets: ReleaseTargets,
     attempted: &mut bool,
 ) -> Result<bool, String> {
-    let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
+    // Do not retain the source's database writer lease behind a stalled
+    // archive publisher. Contention is a deferral, not authority to bypass it.
+    let _mutation = repair_lock::try_begin_at(cx, &config.storage_root)
+        .map_err(|error| error.to_string())?;
     let archive =
         crate::ensure_archive(config, &original.project_slug).map_err(|error| error.to_string())?;
     repair_lock::with_repair_lock(cx, &archive, || {
@@ -633,6 +636,8 @@ fn publish_release(
 /// wait for a promotion that is itself trying to drain that caller.
 /// Project mutex/flock contention shares a short acquisition budget. A timeout
 /// leaves the database release authoritative for a later history repair pass.
+/// The global publication fence is tried without waiting before archive access;
+/// a busy fence leaves mutation epochs unchanged and retains no repair window.
 pub fn reconcile_released_reservation(
     cx: &Cx,
     pool: &DbPool,
@@ -716,6 +721,8 @@ pub fn reconcile_released_reservation(
 /// Closed or contended admission defers the pass without advancing either cursor.
 /// A contended project archive is deferred within the finite scan, allowing
 /// other projects to progress; it is revisited in a later round.
+/// Publication-fence contention likewise defers without retaining the source
+/// writer lease behind a blocked archive owner or initializing archive paths.
 pub fn reconcile_reservation_releases(
     cx: &Cx,
     pool: &DbPool,
@@ -882,6 +889,12 @@ mod tests {
     }
 
     fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
+        // These assertions require uncontended admission unless the test
+        // explicitly creates contention. The publication fence is global to
+        // the process, so unrelated parallel storage tests cannot share it.
+        if isolated_admission_test() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
@@ -1740,5 +1753,138 @@ mod tests {
             drop(conn);
             crate::flush_async_commits();
         });
+    }
+
+    fn exercise_busy_publication_fence(existing_artifact: bool) {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let captured = captured_row(cx, pool, 401);
+            let stable = config
+                .storage_root
+                .join("projects/project/file_reservations/id-401-gaabb.json");
+            let before = if existing_artifact {
+                let (path, bytes) = seed_artifact(config, &source, "aabb", false);
+                assert_eq!(path, stable);
+                Some(bytes)
+            } else {
+                assert!(!config.storage_root.join(".git").exists());
+                assert!(!config.storage_root.join("projects").exists());
+                None
+            };
+            crate::flush_async_commits();
+            let epoch_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+            let token_before = fs::read(&epoch_path).ok();
+            let epoch_before = crate::archive_mutation_epoch();
+            let active_before = crate::archive_mutations_active();
+            assert_eq!(active_writer_count(), 0);
+            let head = || {
+                existing_artifact.then(|| {
+                    Repository::open(&config.storage_root)
+                        .unwrap()
+                        .head()
+                        .unwrap()
+                        .target()
+                        .unwrap()
+                })
+            };
+            let head_before = head();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                crate::with_archive_snapshot_publication_fence(|| {
+                    ready_tx.send(()).unwrap();
+                    // Cleanup only: both repairs must return BEFORE this owner
+                    // is explicitly released, never by waiting for its expiry.
+                    release_rx.recv_timeout(Duration::from_secs(20))
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let targeted = reconcile_released_reservation(cx, pool, config, &captured, "aabb");
+            let mut cursor = ReservationReconcileCursor::default();
+            let historical = reconcile_reservation_releases(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            );
+            let held_writers = active_writer_count();
+            // The real DB promotion gate must be available even though an
+            // archive owner remains blocked. Repair cannot retain a DB lease.
+            let promotion = try_acquire_promotion_barrier_if_idle();
+            let promotion_available = promotion.is_some();
+            drop(promotion);
+            let owner_still_held = crate::archive_publication_fence_holder().is_some();
+            let during = fs::read(&stable).ok();
+            let token_during = fs::read(&epoch_path).ok();
+            let epoch_during = crate::archive_mutation_epoch();
+            let active_during = crate::archive_mutations_active();
+            let initialized_during = config.storage_root.join(".git").exists();
+            let projects_during = config.storage_root.join("projects").exists();
+            let head_during = head();
+            let source_during = read_source(cx, pool, 401).unwrap().unwrap();
+            let _ = release_tx.send(());
+            let explicitly_released = owner.join().unwrap();
+            assert!(explicitly_released.is_ok(), "repair waited for fence-owner expiry");
+            assert!(owner_still_held, "admission did not return while the fence was held");
+            assert!(targeted.unwrap_err().contains("publication fence busy"));
+            let report = historical.unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred, report.repaired, report.attempted),
+                (1, 1, 0, 0)
+            );
+            assert!(cursor.history.ceiling.is_none(), "deferred finite round advanced");
+            assert_eq!(held_writers, 0);
+            assert!(promotion_available, "archive contention retained a database writer");
+            assert_eq!(during, before);
+            assert_eq!(token_during, token_before);
+            assert_eq!(epoch_during, epoch_before);
+            assert_eq!(active_during, active_before);
+            assert_eq!(initialized_during, existing_artifact);
+            assert_eq!(projects_during, existing_artifact);
+            assert_eq!(head_during, head_before);
+            assert_eq!(source_during, source);
+
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason='after fence reopens' WHERE id=401").unwrap();
+            drop(conn);
+            let resumed = reconcile_reservation_releases(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
+            let artifact = read_artifact(&stable).unwrap().unwrap();
+            assert_eq!(artifact.value["reason"], "after fence reopens");
+            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(artifact.value["db_generation"], "aabb");
+            if existing_artifact {
+                assert_eq!(artifact.value["operator_note"], "preserve this note");
+            }
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), "projects/project/file_reservations/id-401-gaabb.json")
+                    .unwrap().unwrap().bytes,
+                artifact.bytes
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let hot = conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap();
+            let ledger = conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap();
+            assert_eq!(hot[0].get_as::<Option<i64>>(0).unwrap(), None);
+            assert_eq!(ledger[0].get_as::<i64>(0).unwrap(), 5_000_000);
+            drop(conn);
+            crate::flush_async_commits();
+        });
+    }
+
+    #[test]
+    fn busy_publication_fence_preserves_archive_evidence_and_releases_database_admission() {
+        exercise_busy_publication_fence(true);
+    }
+
+    #[test]
+    fn busy_publication_fence_cannot_initialize_a_missing_archive_before_admission() {
+        exercise_busy_publication_fence(false);
     }
 }

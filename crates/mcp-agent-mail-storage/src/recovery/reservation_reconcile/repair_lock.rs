@@ -4,8 +4,8 @@
 //! but spend one short budget across both waits. Contention defers repair; it
 //! never authorizes breaking a live lock or publishing without ownership.
 //! Filesystem operations, registry access, and the admitted closure are not
-//! subject to a hard deadline. The caller must acquire its archive mutation
-//! fence before entering, just as with `crate::with_project_lock`.
+//! subject to a hard deadline. Repair callers first try the archive mutation
+//! fence with `try_begin_at`; the acquired native guard spans this lock scope.
 
 use std::sync::TryLockError;
 use std::time::{Duration, Instant};
@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 
 use crate::{FileLock, ProjectArchive, Result, StorageError};
+
+mod fence;
+pub(super) use fence::try_begin_at;
 
 const REPAIR_LOCK_BUDGET: Duration = Duration::from_millis(250);
 const WAIT_SLICE: Duration = Duration::from_millis(10);
