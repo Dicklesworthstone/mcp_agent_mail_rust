@@ -697,10 +697,13 @@ fn pagination_exhausts_beyond_candidate_prefix_with_date_and_recency() {
         ids.push(id);
     }
 
+    // Oldest must start at the oldest match, not reverse the newest page.
     for (ranking, date_filtered) in [
         (RankingMode::Relevance, false),
         (RankingMode::Relevance, true),
         (RankingMode::Recency, true),
+        (RankingMode::Oldest, false),
+        (RankingMode::Oldest, true),
     ] {
         let mut query = SearchQuery::messages("deepcursor", pid);
         query.limit = Some(3);

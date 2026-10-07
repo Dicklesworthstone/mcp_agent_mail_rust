@@ -438,6 +438,16 @@ impl SortDirection {
             _ => Self::NewestFirst,
         }
     }
+
+    /// The search backend's ordering, so Oldest fetches the oldest matches
+    /// rather than reversing the newest page.
+    const fn ranking(self) -> RankingMode {
+        match self {
+            Self::NewestFirst => RankingMode::Recency,
+            Self::OldestFirst => RankingMode::Oldest,
+            Self::Relevance => RankingMode::Relevance,
+        }
+    }
 }
 
 /// Search V3 mode selector.
@@ -1995,10 +2005,7 @@ impl SearchCockpitScreen {
         };
 
         // Apply ranking mode
-        query.ranking = match self.sort_direction {
-            SortDirection::Relevance => RankingMode::Relevance,
-            SortDirection::NewestFirst | SortDirection::OldestFirst => RankingMode::Recency,
-        };
+        query.ranking = self.sort_direction.ranking();
 
         // Apply importance facet
         if let Some(imp) = self.importance_filter.importance() {
@@ -2321,11 +2328,8 @@ impl SearchCockpitScreen {
             doc_kind: DocKind::Message,
             limit: Some(MAX_RESULTS),
             explain: self.explain_toggle.is_on(),
+            ranking: self.sort_direction.ranking(),
             ..Default::default()
-        };
-        query.ranking = match self.sort_direction {
-            SortDirection::Relevance => RankingMode::Relevance,
-            SortDirection::NewestFirst | SortDirection::OldestFirst => RankingMode::Recency,
         };
 
         if let Some(imp) = self.importance_filter.importance() {
@@ -6728,6 +6732,19 @@ mod tests {
         assert_eq!(q.importance, vec![Importance::High]);
         assert_eq!(q.ack_required, Some(true));
         assert_eq!(q.thread_id.as_deref(), Some("t-1"));
+    }
+
+    #[test]
+    fn each_sort_asks_the_backend_for_its_own_order() {
+        let mut screen = SearchCockpitScreen::new();
+        for (sort, ranking) in [
+            (SortDirection::NewestFirst, RankingMode::Recency),
+            (SortDirection::OldestFirst, RankingMode::Oldest),
+            (SortDirection::Relevance, RankingMode::Relevance),
+        ] {
+            screen.sort_direction = sort;
+            assert_eq!(screen.build_query().ranking, ranking, "{sort:?}");
+        }
     }
 
     #[test]

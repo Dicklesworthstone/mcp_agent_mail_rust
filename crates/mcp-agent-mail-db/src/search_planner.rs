@@ -106,6 +106,8 @@ pub enum RankingMode {
     Relevance,
     /// Most recent first.
     Recency,
+    /// Oldest first: the oldest matches, not the newest page reversed.
+    Oldest,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -794,10 +796,10 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
 
     let mut params: Vec<PlanParam> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
-    let message_order_clause = if query.ranking == RankingMode::Recency {
-        "ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC"
-    } else {
-        "ORDER BY score ASC, m.id ASC"
+    let message_order_clause = match query.ranking {
+        RankingMode::Recency => "ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC",
+        RankingMode::Oldest => "ORDER BY COALESCE(m.created_ts, 0) ASC, m.id ASC",
+        RankingMode::Relevance => "ORDER BY score ASC, m.id ASC",
     };
 
     // ── SELECT + FROM + JOIN ───────────────────────────────────────
@@ -953,10 +955,14 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         // assigns every row score 0.0, so comparing the literal score can make
         // stale or cross-path cursors duplicate/suppress whole pages. In that
         // mode, the SQL order is effectively id-only.
-        if query.ranking == RankingMode::Recency {
-            // Recency cursor is encoded as negative created_ts so ASC score
-            // order corresponds to newest-first message ordering.
-            let cursor_score_expr = "-CAST(COALESCE(m.created_ts, 0) AS REAL)";
+        // Time-ordered cursors carry created_ts, negated for Recency, so
+        // ascending score order is the page order either way.
+        let time_cursor_expr = match query.ranking {
+            RankingMode::Recency => Some("-CAST(COALESCE(m.created_ts, 0) AS REAL)"),
+            RankingMode::Oldest => Some("CAST(COALESCE(m.created_ts, 0) AS REAL)"),
+            RankingMode::Relevance => None,
+        };
+        if let Some(cursor_score_expr) = time_cursor_expr {
             where_clauses.push(format!(
                 "({cursor_score_expr} > ? OR ({cursor_score_expr} = ? AND m.id > ?))"
             ));
@@ -1609,6 +1615,31 @@ mod tests {
                 .contains("-CAST(COALESCE(m.created_ts, 0) AS REAL) > ?")
         );
         assert!(plan.facets_applied.contains(&"cursor".to_string()));
+    }
+
+    #[test]
+    fn plan_with_cursor_oldest_orders_and_continues_ascending() {
+        let cursor = SearchCursor {
+            score: 1_700_000_000_000_000.0,
+            id: 123,
+        };
+        let mut q = SearchQuery::messages("test", 1);
+        q.ranking = RankingMode::Oldest;
+        q.cursor = Some(cursor.encode());
+        let plan = plan_search(&q);
+        assert!(
+            plan.sql
+                .contains("ORDER BY COALESCE(m.created_ts, 0) ASC, m.id ASC"),
+            "{}",
+            plan.sql
+        );
+        assert!(
+            plan.sql
+                .contains("(CAST(COALESCE(m.created_ts, 0) AS REAL) > ?"),
+            "{}",
+            plan.sql
+        );
+        assert!(!plan.sql.contains("-CAST"), "{}", plan.sql);
     }
 
     // ── plan_search: filter-only (no text) ─────────────────────────

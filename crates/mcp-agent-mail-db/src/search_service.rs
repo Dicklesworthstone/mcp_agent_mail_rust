@@ -501,7 +501,7 @@ fn message_query_requires_sql_plan(query: &SearchQuery) -> bool {
     }
 
     message_query_uses_sql_plan(query)
-        || query.ranking == RankingMode::Recency
+        || query.ranking != RankingMode::Relevance
         || query.product_id.is_some()
         || query.ack_required.is_some()
         || query_needs_recipient_filter(query)
@@ -545,13 +545,16 @@ fn cursor_sort_score(result: &SearchResult, ranking: RankingMode) -> f64 {
             || result.score.unwrap_or(0.0),
             |created_ts| -micros_to_f64_for_cursor(created_ts),
         ),
+        RankingMode::Oldest => result
+            .created_ts
+            .map_or_else(|| result.score.unwrap_or(0.0), micros_to_f64_for_cursor),
         RankingMode::Relevance => result.score.unwrap_or(0.0),
     }
 }
 
 fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> Vec<SearchResult> {
     match query.ranking {
-        RankingMode::Recency => {
+        RankingMode::Recency | RankingMode::Oldest => {
             results.sort_by(|a, b| {
                 let a_score = cursor_sort_score(a, query.ranking);
                 let b_score = cursor_sort_score(b, query.ranking);
@@ -589,7 +592,7 @@ fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> V
     results.retain(|result| {
         let score = cursor_sort_score(result, query.ranking);
         match query.ranking {
-            RankingMode::Recency => {
+            RankingMode::Recency | RankingMode::Oldest => {
                 score > cursor.score
                     || (score.to_bits() == cursor.score.to_bits() && result.id > cursor.id)
             }
@@ -4246,6 +4249,7 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
     match query.ranking {
         RankingMode::Relevance => "relevance".hash(&mut hasher),
         RankingMode::Recency => "recency".hash(&mut hasher),
+        RankingMode::Oldest => "oldest".hash(&mut hasher),
     }
 
     query.explain.hash(&mut hasher);
