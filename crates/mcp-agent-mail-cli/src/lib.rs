@@ -9205,6 +9205,21 @@ fn sender_identity_state_path(config: &Config, project_key: &str, agent_name: &s
         .join(format!("{key}.json"))
 }
 
+/// The `(project, agent)` a sender-token record is filed under. The project is
+/// named by slug, so `--project /abs/path` at registration and `--project
+/// <slug>` at send time find the same token: an absolute path maps through the
+/// identity resolution the server uses to name the project, and anything else
+/// already is a slug. Agent names compare case-insensitively, as everywhere.
+fn sender_identity_key(project_key: &str, agent_name: &str) -> (String, String) {
+    let project_key = project_key.trim();
+    let project = if Path::new(project_key).is_absolute() {
+        mcp_agent_mail_core::resolve_project_identity(project_key).slug
+    } else {
+        project_key.to_string()
+    };
+    (project, agent_name.trim().to_ascii_lowercase())
+}
+
 /// Persist a registered agent's sender token so `mail send` can reuse it without
 /// the operator re-supplying it. Best-effort: failures are logged, not fatal.
 fn persist_sender_identity_token(
@@ -9216,10 +9231,11 @@ fn persist_sender_identity_token(
     if sender_token.is_empty() || project_key.is_empty() || agent_name.is_empty() {
         return;
     }
-    let path = sender_identity_state_path(config, project_key, agent_name);
+    let (project, agent) = sender_identity_key(project_key, agent_name);
+    let path = sender_identity_state_path(config, &project, &agent);
     let record = SenderIdentityState {
-        project_key: project_key.to_string(),
-        agent_name: agent_name.to_string(),
+        project_key: project,
+        agent_name: agent,
         sender_token: sender_token.to_string(),
     };
     let Ok(content) = serde_json::to_string(&record) else {
@@ -9238,17 +9254,12 @@ fn load_sender_identity_token(
     project_key: &str,
     agent_name: &str,
 ) -> Option<String> {
-    let path = sender_identity_state_path(config, project_key, agent_name);
+    let (project, agent) = sender_identity_key(project_key, agent_name);
+    let path = sender_identity_state_path(config, &project, &agent);
     let content = read_cache_file_if_real(&path)?;
     let record: SenderIdentityState = serde_json::from_str(&content).ok()?;
-    if record.project_key == project_key
-        && record.agent_name == agent_name
-        && !record.sender_token.is_empty()
-    {
-        Some(record.sender_token)
-    } else {
-        None
-    }
+    (record.project_key == project && record.agent_name == agent && !record.sender_token.is_empty())
+        .then_some(record.sender_token)
 }
 
 /// Extract `name` + `registration_token` from a `register_agent` /
@@ -42108,6 +42119,33 @@ mod mail_server_cli_bridge_tests {
         persist_sender_identity_token(&config, "/proj-c", "Agent3", "");
         assert_eq!(
             load_sender_identity_token(&config, "/proj-c", "Agent3"),
+            None
+        );
+    }
+
+    #[test]
+    fn sender_identity_registered_by_path_is_found_by_slug_and_any_name_case() {
+        let td = tempfile::tempdir().unwrap();
+        let config = config_with_storage_root(td.path());
+        let project_dir = td.path().join("token-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path_key = project_dir.display().to_string();
+        let slug = mcp_agent_mail_core::resolve_project_identity(&path_key).slug;
+
+        // `am macros start-session --project /abs/...` persists the token...
+        persist_sender_identity_token(&config, &path_key, "BlueLake", "tok-path");
+        // ...and `am mail send --project <slug> --from bluelake` reuses it.
+        assert_eq!(
+            load_sender_identity_token(&config, &slug, "bluelake").as_deref(),
+            Some("tok-path")
+        );
+        assert_eq!(
+            load_sender_identity_token(&config, &path_key, "BLUELAKE").as_deref(),
+            Some("tok-path")
+        );
+        // Another project's slug does not see it.
+        assert_eq!(
+            load_sender_identity_token(&config, "other-project", "BlueLake"),
             None
         );
     }
