@@ -289,6 +289,18 @@ struct ParsedAttachment {
     size_text: String,
     size_bytes: usize,
     mime_type: String,
+    storage: String,
+}
+
+/// How an attachment record is stored: its `type` when that says `file` or
+/// `inline`, else inferred from a `data_uri` (inline) or `path` (file).
+fn parse_attachment_storage(value: &serde_json::Value) -> String {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some(kind @ ("file" | "inline")) => kind.to_string(),
+        _ if value.get("data_uri").is_some_and(|v| !v.is_null()) => "inline".to_string(),
+        _ if value.get("path").is_some_and(|v| !v.is_null()) => "file".to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
@@ -379,6 +391,7 @@ fn parse_attachments_json(attachments_json: &str) -> Vec<ParsedAttachment> {
                 size_text,
                 size_bytes,
                 mime_type: parse_attachment_mime_type(value),
+                storage: parse_attachment_storage(value),
             }
         })
         .collect()
@@ -2237,6 +2250,11 @@ pub struct ProjectRow {
 /// robot attachments — attachment entry.
 #[derive(Debug, Serialize)]
 pub struct AttachmentRow {
+    /// File name (from `name`, else the last segment of `path`).
+    pub name: String,
+    /// `file` (stored in the archive), `inline` (embedded in the message), or
+    /// `unknown` when the record says neither.
+    pub storage: String,
     pub r#type: String,
     pub size: usize,
     pub sender: String,
@@ -3119,7 +3137,8 @@ pub enum RobotSubcommand {
     /// Project summary with per-project agent/message/reservation counts.
     Projects,
 
-    /// Attachment inventory with type, size, provenance, storage mode.
+    /// Attachment inventory: name, storage mode, type, size and provenance
+    /// (sender, message), from the newest 100 messages that carry attachments.
     Attachments,
 
     // ── Track 5: Air Traffic Controller ─────────────────────────────────
@@ -16601,6 +16620,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
                 for attachment in parse_attachments_json(&att_json) {
                     attachments.push(AttachmentRow {
+                        name: attachment.name,
+                        storage: attachment.storage,
                         r#type: attachment.mime_type,
                         size: attachment.size_bytes,
                         sender: sender.clone(),
@@ -20424,6 +20445,8 @@ mod tests {
     #[test]
     fn test_attachment_row_serialization() {
         let att = AttachmentRow {
+            name: "shot.webp".into(),
+            storage: "file".into(),
             r#type: "image/webp".into(),
             size: 1024,
             sender: "RedFox".into(),
@@ -20432,10 +20455,35 @@ mod tests {
             project: "my-project".into(),
         };
         let v: Value = serde_json::to_value(&att).unwrap();
+        assert_eq!(v["name"], "shot.webp");
+        assert_eq!(v["storage"], "file");
         assert_eq!(v["type"], "image/webp");
         assert_eq!(v["size"], 1024);
         assert_eq!(v["sender"], "RedFox");
         assert_eq!(v["message_id"], 77);
+    }
+
+    #[test]
+    fn attachment_records_report_name_and_storage_mode() {
+        let parsed = parse_attachments_json(
+            r#"[{"type":"file","path":"attachments/ab/shot.webp","media_type":"image/webp","bytes":10},
+                {"type":"inline","data_uri":"data:image/png;base64,AA","name":"tiny.png"},
+                {"path":"attachments/cd/log.txt"},
+                {"media_type":"text/plain"}]"#,
+        );
+        let summary = parsed
+            .iter()
+            .map(|a| (a.name.as_str(), a.storage.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                ("shot.webp", "file"),
+                ("tiny.png", "inline"),
+                ("log.txt", "file"),
+                ("attachment", "unknown"),
+            ]
+        );
     }
 
     #[test]
