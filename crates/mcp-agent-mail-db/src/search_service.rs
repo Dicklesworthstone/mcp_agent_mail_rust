@@ -4488,6 +4488,25 @@ pub async fn execute_search(
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
         || message_query_requires_sql_plan(query)
     {
+        // A filter-only search (no text) has nothing to rank, and every SQL
+        // row scores 0.0, so Relevance there listed ascending ids: the oldest
+        // matches first. It runs newest first instead; the next page's cursor
+        // routes the same way, so paging stays consistent. Text searches on
+        // this path keep id order, which the Python reference fixtures pin
+        // (search_messages_product "Hello" → [2, 5]).
+        let newest_first;
+        let query = if query.ranking == RankingMode::Relevance
+            && matches!(query.doc_kind, DocKind::Message | DocKind::Thread)
+            && message_query_uses_sql_plan(query)
+        {
+            newest_first = SearchQuery {
+                ranking: RankingMode::Recency,
+                ..query.clone()
+            };
+            &newest_first
+        } else {
+            query
+        };
         return execute_sql_plan_search(
             cx,
             pool,

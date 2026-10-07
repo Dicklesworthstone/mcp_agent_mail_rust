@@ -532,6 +532,48 @@ fn ack_required_filter() {
     assert_eq!(resp.results[0].id, id_ack);
 }
 
+/// A filter-only search (here: ack required, no text) has nothing to rank by
+/// relevance; it must page newest first, not list the oldest matches first.
+#[test]
+fn filter_only_relevance_pages_newest_first() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "sql-relevance");
+    let aid = seed_agent(&pool, pid, "AmberOx");
+    let mut ids = Vec::new();
+    for day in 0..7 {
+        let id = create_msg(
+            &pool,
+            pid,
+            aid,
+            "sqlrel needs ack",
+            "sqlrel body",
+            "normal",
+            None,
+            true,
+        );
+        set_message_ts(&pool, id, BASE_TS + day * MICROS_PER_DAY);
+        ids.push(id);
+    }
+    let no_ack = create_msg(&pool, pid, aid, "sqlrel", "sqlrel", "normal", None, false);
+    set_message_ts(&pool, no_ack, BASE_TS + 9 * MICROS_PER_DAY);
+
+    let mut query = SearchQuery::messages("", pid);
+    query.ack_required = Some(true);
+    query.limit = Some(3);
+    assert_eq!(query.ranking, RankingMode::Relevance);
+    let mut collected = Vec::new();
+    for _ in 0..=7 {
+        let response = search(&pool, &query);
+        collected.extend(result_ids(&response));
+        query.cursor = response.next_cursor;
+        if query.cursor.is_none() {
+            break;
+        }
+    }
+    ids.reverse();
+    assert_eq!(collected, ids, "newest first, every match once");
+}
+
 /// Test: project isolation — messages in other projects are not returned.
 #[test]
 fn project_isolation() {
