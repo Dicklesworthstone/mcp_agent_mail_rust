@@ -5159,6 +5159,21 @@ static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<SqliteInitGateKey, Arc<
     OnceLock::new();
 static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn>>>>> =
     OnceLock::new();
+/// Strict query-only pools for the live mailbox read lane, held strongly.
+///
+/// Request-path reads used to build a fresh uncached pool per call, so every
+/// read opened one new engine connection and closed it again. While the live
+/// pool's connections hold their WAL-lifetime read locks, the engine cannot
+/// close such a redundant descriptor without dropping the process' POSIX
+/// locks, so it parks it until no lock claim survives — which on a busy
+/// server is never. Wherever the engine does not reuse retained descriptors
+/// (every non-Linux Unix, and Linux before FrankenSQLite 0.4.9), that leaked
+/// one `storage.sqlite3` descriptor per read call until `RLIMIT_NOFILE`
+/// (GH#333, br-8r6dl). Callers drop their wrapper after each call, so a weak
+/// registry entry would die immediately; recovery retires these entries in
+/// [`retire_cached_runtime_state_after_recovery`].
+static LIVE_QUERY_ONLY_POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, DbPool>>> =
+    OnceLock::new();
 
 /// Retire every in-process handle and identity cache for a replaced SQLite
 /// generation, regardless of which pool configuration created it.
@@ -5187,6 +5202,24 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
             {
                 pools.push(pool);
             }
+        }
+        drop(guard);
+        // Separate critical section: both registries share one lock rank, so
+        // they must never be held together.
+        if let Some(cache) = LIVE_QUERY_ONLY_POOL_CACHE.get() {
+            let mut guard = cache.write();
+            guard.retain(|key, read_pool| {
+                if key.sqlite_identity.as_deref() != Some(identity) {
+                    return true;
+                }
+                if !pools
+                    .iter()
+                    .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &read_pool.pool))
+                {
+                    pools.push(Arc::clone(&read_pool.pool));
+                }
+                false
+            });
         }
         pools
     };
@@ -16617,6 +16650,52 @@ pub fn create_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     DbPool::new_query_only(config)
 }
 
+/// Get (or create) the process-wide strict query-only pool for reading the
+/// live mailbox.
+///
+/// The pool has the [`create_query_only_pool`] shape (existing file only,
+/// read-only, query-only; no startup init, migrations, recovery, directory
+/// creation, or replacement) but is shared per mailbox identity and pool
+/// shape, so request-path reads reuse engine connections instead of opening
+/// and closing one per call (see [`LIVE_QUERY_ONLY_POOL_CACHE`]). Recovery
+/// retires the entry, so a replaced generation is never read through a
+/// pre-recovery handle.
+pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
+    let authority = DbPoolAuthority::resolve(config)?;
+    if authority.sqlite_identity.is_none() {
+        return DbPool::new_with_authority(config, true, true, authority);
+    }
+    let cache_key = pool_cache_key_from_authority(
+        &authority,
+        config.min_connections,
+        config.max_connections,
+        config.acquire_timeout_ms,
+        config.max_lifetime_ms,
+    );
+    let cache = LIVE_QUERY_ONLY_POOL_CACHE
+        .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+    {
+        let guard = cache.read();
+        if let Some(pool) = guard.get(&cache_key)
+            && !pool.pool.is_closed()
+        {
+            return Ok(pool.clone());
+        }
+    }
+    // Construct outside the registry lock (GH#184): authority resolution and
+    // pool setup touch the filesystem.
+    let pool = DbPool::new_with_authority(config, true, true, authority)?;
+    let mut guard = cache.write();
+    if let Some(existing) = guard.get(&cache_key)
+        && !existing.pool.is_closed()
+    {
+        return Ok(existing.clone());
+    }
+    guard.insert(cache_key, pool.clone());
+    drop(guard);
+    Ok(pool)
+}
+
 // ============================================================================
 // Synthetic canary namespace, metrics, and alert-isolation policy
 // (br-97gc6.5.2.6.5.4)
@@ -24645,6 +24724,80 @@ mod tests {
             "get_or_create_pool must not return a closed cached pool"
         );
         assert!(!pool2.pool.is_closed(), "replacement pool should be live");
+    }
+
+    /// GH#333 / br-8r6dl: request-path reads must share one strict query-only
+    /// pool per mailbox. A per-call pool opened and closed an engine connection
+    /// on every read, and wherever the engine cannot reuse the retained
+    /// descriptor that leaked one `storage.sqlite3` fd per call.
+    #[test]
+    fn live_query_only_pool_is_shared_reused_and_retired_by_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-read.sqlite3");
+        let seed = DbConn::open_file(db_path.to_string_lossy().into_owned()).expect("open seed db");
+        seed.execute_raw(&schema::init_schema_sql_base())
+            .expect("initialize seed schema");
+        drop(seed);
+        let config = DbPoolConfig {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+            storage_root: Some(dir.path().join("archive")),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+
+        // Two request-path reads, each dropping its wrapper afterwards.
+        let first = get_or_create_live_query_only_pool(&config).expect("first live read pool");
+        assert_eq!(first.open_mode, DbPoolOpenMode::QueryOnlyStrict);
+        let shared = Arc::clone(&first.pool);
+        let conn = runtime
+            .block_on(first.acquire(&cx))
+            .into_result()
+            .expect("first read checkout");
+        let query_only = conn.query_sync("PRAGMA query_only", &[]).expect("pragma")[0]
+            .get_named::<i64>("query_only")
+            .expect("query_only value");
+        assert_eq!(query_only, 1, "the live read lane must stay query-only");
+        drop(conn);
+        drop(first);
+
+        let second = get_or_create_live_query_only_pool(&config).expect("second live read pool");
+        assert!(
+            Arc::ptr_eq(&shared, &second.pool),
+            "dropping every caller wrapper must not drop the shared live read pool"
+        );
+        let conn = runtime
+            .block_on(second.acquire(&cx))
+            .into_result()
+            .expect("second read checkout");
+        drop(conn);
+        assert_eq!(
+            second.pool.stats().total_connections,
+            1,
+            "sequential reads must reuse one engine connection, not open one per call"
+        );
+
+        // Recovery retires the shared pool so a replaced generation is never
+        // read through a pre-recovery handle.
+        let identity = second
+            .sqlite_identity
+            .clone()
+            .expect("file-backed identity");
+        retire_cached_runtime_state_after_recovery(&identity, "live read pool retirement test");
+        assert!(
+            second.pool.is_closed(),
+            "recovery must close the retired live read pool"
+        );
+        let replacement =
+            get_or_create_live_query_only_pool(&config).expect("post-recovery live read pool");
+        assert!(!Arc::ptr_eq(&shared, &replacement.pool));
+        assert!(!replacement.pool.is_closed());
     }
 
     #[test]

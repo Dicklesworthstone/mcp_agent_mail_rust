@@ -943,7 +943,10 @@ pub mod tool_util {
         }
         cfg.run_migrations = false;
         cfg.warmup_connections = 0;
-        mcp_agent_mail_db::create_query_only_pool(&cfg)
+        // Shared, not per call: a per-call pool opened and closed one engine
+        // connection per read, leaking a descriptor wherever the engine
+        // cannot reuse it (GH#333, br-8r6dl).
+        mcp_agent_mail_db::get_or_create_live_query_only_pool(&cfg)
             .map_err(|error| McpError::internal_error(error.to_string()))
     }
 

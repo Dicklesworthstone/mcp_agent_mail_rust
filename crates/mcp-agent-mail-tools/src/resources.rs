@@ -362,7 +362,9 @@ fn open_live_resource_read_pool() -> McpResult<ResourceReadPool> {
     pool_config.run_migrations = false;
     pool_config.warmup_connections = 0;
 
-    mcp_agent_mail_db::create_query_only_pool(&pool_config)
+    // Shared across resource reads: a per-read pool leaked one live-mailbox
+    // descriptor per read wherever the engine cannot reuse it (GH#333).
+    mcp_agent_mail_db::get_or_create_live_query_only_pool(&pool_config)
         .map(ResourceReadPool::live)
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))
 }
