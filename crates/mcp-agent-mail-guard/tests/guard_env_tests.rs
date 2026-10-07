@@ -245,6 +245,36 @@ fn guard_check_full_missing_agent_name_returns_error() {
     );
 }
 
+/// Without an identity, paths no exclusive lease covers still check clean:
+/// no caller could conflict there, so `am guard check` must not exit 1.
+#[test]
+fn guard_check_full_missing_agent_name_passes_uncovered_paths() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = EnvGuard::save(&[
+        "WORKTREES_ENABLED",
+        "AGENT_NAME",
+        "AGENT_MAIL_BYPASS",
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+    ]);
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = make_archive_with_reservations(td.path());
+
+    unsafe {
+        std::env::set_var("WORKTREES_ENABLED", "1");
+        std::env::remove_var("AGENT_NAME");
+        std::env::remove_var("AGENT_MAIL_BYPASS");
+        std::env::remove_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED");
+    }
+
+    let result = guard_check_full(&archive, &archive, &["docs/notes.md".to_string()])
+        .expect("an uncovered path needs no identity");
+    assert!(!result.gated);
+    assert!(result.conflicts.is_empty());
+}
+
 #[test]
 fn guard_check_full_detects_conflict_when_enabled() {
     let _lock = ENV_LOCK

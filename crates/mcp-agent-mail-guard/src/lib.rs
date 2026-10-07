@@ -2100,12 +2100,11 @@ pub fn guard_check_full(
         });
     }
 
-    let agent_name = resolve_guard_agent_name(repo_root).ok_or(GuardError::MissingAgentName)?;
-
     // Read reservations from the archive
     let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
-
-    let conflicts = check_path_conflicts(paths, &reservations, &agent_name, ignorecase)?;
+    let agent_name = resolve_guard_agent_name(repo_root);
+    let conflicts =
+        conflicts_for_identity(paths, &reservations, agent_name.as_deref(), ignorecase)?;
 
     Ok(GuardCheckResult {
         conflicts,
@@ -2113,6 +2112,28 @@ pub fn guard_check_full(
         bypassed: false,
         gated: false,
     })
+}
+
+/// Conflicts for `agent`. An identity is needed only when some path is covered
+/// by an exclusive reservation (it may be the caller's own). With none covered
+/// there is no conflict whoever the caller is, so a missing `AGENT_NAME` is not
+/// an error. The installed hook stays stricter and fails closed whenever any
+/// reservation is active.
+fn conflicts_for_identity(
+    paths: &[String],
+    reservations: &[FileReservationRecord],
+    agent: Option<&str>,
+    ignorecase: bool,
+) -> GuardResult<Vec<GuardConflict>> {
+    if let Some(agent) = agent {
+        return check_path_conflicts(paths, reservations, agent, ignorecase);
+    }
+    // No holder is named "", so this lists every covered path.
+    if check_path_conflicts(paths, reservations, "", ignorecase)?.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Err(GuardError::MissingAgentName)
+    }
 }
 
 /// Check if given paths conflict with active file reservations.
@@ -2126,12 +2147,12 @@ pub fn guard_check(
     _advisory: bool,
 ) -> GuardResult<Vec<GuardConflict>> {
     let ignorecase = detect_core_ignorecase(repo_root);
-    let agent_name = resolve_guard_agent_name(repo_root).ok_or(GuardError::MissingAgentName)?;
 
     // Read reservations from archive JSON files
     let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
+    let agent_name = resolve_guard_agent_name(repo_root);
 
-    check_path_conflicts(paths, &reservations, &agent_name, ignorecase)
+    conflicts_for_identity(paths, &reservations, agent_name.as_deref(), ignorecase)
 }
 
 /// Core conflict detection: check paths against reservations using globset.
@@ -4162,6 +4183,38 @@ mod tests {
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert!(conflicts.is_empty());
+    }
+
+    /// `am guard check` without an identity: uncovered paths pass, a path under
+    /// any exclusive lease (even the caller's own) needs the identity to decide.
+    #[test]
+    fn missing_identity_is_an_error_only_for_covered_paths() {
+        let reservations = vec![
+            reservation("src/**", "OtherAgent", true),
+            reservation("docs/**", "OtherAgent", false),
+        ];
+        let uncovered = vec!["README.md".to_string(), "docs/guide.md".to_string()];
+        let covered = vec!["README.md".to_string(), "src/lib.rs".to_string()];
+
+        assert!(
+            conflicts_for_identity(&uncovered, &reservations, None, false)
+                .expect("uncovered paths need no identity")
+                .is_empty()
+        );
+        assert!(matches!(
+            conflicts_for_identity(&covered, &reservations, None, false),
+            Err(GuardError::MissingAgentName)
+        ));
+        // With an identity the usual rules apply: the holder passes, others conflict.
+        assert!(
+            conflicts_for_identity(&covered, &reservations, Some("OtherAgent"), false)
+                .expect("holder")
+                .is_empty()
+        );
+        let conflicts = conflicts_for_identity(&covered, &reservations, Some("Me"), false)
+            .expect("other agent");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "src/lib.rs");
     }
 
     #[test]
