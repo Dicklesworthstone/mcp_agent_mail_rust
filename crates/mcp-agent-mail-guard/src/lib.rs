@@ -1514,8 +1514,10 @@ def glob_to_regex(pattern):
     if regex.startswith("\0/"):
         regex = "(?:.+/|)" + regex[2:]
     regex = regex.replace("\0", ".*")
-    # Handle {a,b} bash-style brace expansion.
-    regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
+    # Handle {a,b} bash-style brace expansion. The alternatives are already
+    # escaped regex (commas are emitted bare), so keep their escapes: stripping
+    # backslashes here turned `{c++,cpp}` into a pattern that never matched.
+    regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace(",", "|") + ")", regex)
     return regex
 
 def compile_reservations(reservations, self_agent):
@@ -1570,6 +1572,14 @@ def check_conflicts(paths, reservations, self_agent):
             continue
 
         for pattern, holder, normalized_pattern, matcher, has_glob in compiled:
+            # 0. Literal match: a reserved path conflicts with that exact path
+            #    (and anything under it) even when it contains glob characters,
+            #    as the server treats it: Next.js `app/[slug]/page.tsx` is a
+            #    file name, and as a glob its `[slug]` class never matches it.
+            if normalized_f == normalized_pattern or normalized_f.startswith(normalized_pattern + "/"):
+                conflicts.append((f, pattern, holder))
+                break
+
             # 1. Glob matching: check if concrete path matches reserved glob
             #    (an uncompilable pattern matches everything, see above).
             if matcher is None or matcher.fullmatch(normalized_f) is not None:
@@ -2093,28 +2103,29 @@ fn check_path_conflicts(
                 break;
             }
 
-            // Also check the reverse: pattern's literal base is a prefix of the path.
-            // This is needed for literal directory reservations (e.g. reserving "src/subdir"
-            // blocks edits to "src/subdir/file.rs").
-            // We do NOT do this if the pattern has a glob, because globs like "src/*"
-            // should not recursively lock subdirectories (that's what "src/**" is for).
-            if !res.has_glob {
-                let literal_base = res_pattern;
-                if normalized.starts_with(literal_base)
+            // Also check the reverse: the pattern, read literally, is the path or
+            // a parent of it. Literal directory reservations need this (reserving
+            // "src/subdir" blocks "src/subdir/file.rs"), and so do file names that
+            // contain glob characters: Next.js `app/[slug]/page.tsx` never matches
+            // itself as a glob, yet the server counts the same string as a
+            // conflict. For a real glob this compares only its literal text, so
+            // "src/*" still does not lock subdirectories ("src/**" does that).
+            let literal_base = res_pattern;
+            if normalized == *literal_base
+                || (normalized.starts_with(literal_base.as_str())
                     && (literal_base.is_empty()
                         || normalized
                             .as_bytes()
                             .get(literal_base.len())
-                            .is_some_and(|&c| c == b'/'))
-                {
-                    conflicts.push(GuardConflict {
-                        path: path.clone(),
-                        pattern: res.path_pattern.clone(),
-                        holder: res.agent_name.clone(),
-                        expires_ts: res.expires_ts.clone(),
-                    });
-                    break;
-                }
+                            .is_some_and(|&c| c == b'/')))
+            {
+                conflicts.push(GuardConflict {
+                    path: path.clone(),
+                    pattern: res.path_pattern.clone(),
+                    holder: res.agent_name.clone(),
+                    expires_ts: res.expires_ts.clone(),
+                });
+                break;
             }
         }
     }
@@ -4050,6 +4061,28 @@ mod tests {
     }
 
     #[test]
+    fn check_path_conflicts_blocks_file_names_with_glob_characters() {
+        // Next.js / SvelteKit route files: `[slug]` is part of the name, and as
+        // a glob class it never matches the name itself.
+        let reservations = vec![
+            reservation("app/[slug]/page.tsx", "OtherAgent", true),
+            reservation("pages/[id]", "OtherAgent", true),
+        ];
+        let paths = vec![
+            "app/[slug]/page.tsx".to_string(),
+            "pages/[id]/index.tsx".to_string(),
+            "app/other/page.tsx".to_string(),
+        ];
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
+        let blocked = conflicts
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(blocked, vec!["app/[slug]/page.tsx", "pages/[id]/index.tsx"]);
+    }
+
+    #[test]
     fn check_path_conflicts_non_glob_directory_prefix_matches_contained_file() {
         let paths = vec!["src/utils/file.rs".to_string()];
         // Reservation is a literal directory without glob metacharacters
@@ -5948,6 +5981,66 @@ mod tests {
             assert!(
                 script.contains("treating as a conflict (fail-closed)"),
                 "guard {hook} must fail closed when a reservation pattern cannot be evaluated"
+            );
+        }
+    }
+
+    /// The installed hook's own matcher, imported under every interpreter: a
+    /// file name containing glob characters blocks itself and what is under it,
+    /// and brace alternatives keep their regex escapes (`{c++,cpp}`).
+    #[test]
+    fn guard_plugin_matcher_blocks_bracketed_names_and_escaped_brace_alternatives() {
+        let pythons = python_executables();
+        if pythons.is_empty() {
+            return;
+        }
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let script_path = td.path().join("guard_matcher.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script("/abs/project", "pre-commit"),
+        )
+        .expect("write guard script");
+        // A raw string: a `\` line continuation would strip the loop body's
+        // indentation and make the probe a Python syntax error.
+        let probe = r"import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('guard', sys.argv[1])
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+out = []
+for pattern, path in json.loads(sys.argv[2]):
+    res = [{'path_pattern': pattern, 'agent_name': 'OtherAgent'}]
+    out.append(bool(guard.check_conflicts([path], res, 'MyAgent')))
+print(json.dumps(out))
+";
+        let cases = serde_json::json!([
+            ["app/[slug]/page.tsx", "app/[slug]/page.tsx"],
+            ["app/[slug]", "app/[slug]/page.tsx"],
+            ["src/{c++,cpp}/**", "src/c++/main.cpp"],
+            ["src/{c++,cpp}/**", "src/cpp/main.cpp"],
+            ["docs/{a(1),b}/*.md", "docs/a(1)/x.md"],
+            // Negatives: an unrelated alternative, and `*` stays in one folder.
+            ["src/{c++,cpp}/**", "src/rust/main.rs"],
+            ["src/*", "src/sub/file.rs"],
+        ]);
+        for python in &pythons {
+            let output = Command::new(python)
+                .args(["-c", probe])
+                .arg(&script_path)
+                .arg(cases.to_string())
+                .output()
+                .expect("run matcher probe");
+            assert!(
+                output.status.success(),
+                "probe failed under {python}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let verdicts: Vec<bool> =
+                serde_json::from_slice(&output.stdout).expect("probe prints a JSON list");
+            assert_eq!(
+                verdicts,
+                vec![true, true, true, true, true, false, false],
+                "matcher verdicts under {python}"
             );
         }
     }
