@@ -117,6 +117,15 @@ accessible via `?`. Common patterns:
 - `Enter` — Inspect/open selected item (screen-dependent deep links)
 - `.` — Open contextual action menu on focused row
 
+Action-menu writes run the same tools agents call, on the agent's behalf, and
+toast what they did or why the tool refused. They never count as the agent's
+own activity, so clearing a dead agent's lock does not make it look alive.
+Reservations: Renew (+30 min) and Release act for the holder; Force-release
+acts as `HumanOverseer`, keeps the tool's staleness check (an active holder is
+refused), and tells the holder. Contacts: Approve, Deny and Block answer for
+the recipient (Deny leaves the requester blocked). Messages: Acknowledge and
+Mark read apply for every recipient.
+
 ### 3.1 Command Palette Usage
 
 Use the palette (`Ctrl+P` or `:`) for fast, low-friction control:

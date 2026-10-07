@@ -2535,6 +2535,22 @@ impl MailAppModel {
                 self.notify_reservation_create_result(arg, context);
                 Cmd::none()
             }
+            "operator_result" => {
+                let (status, operation) = arg.split_once(':').unwrap_or((arg, ""));
+                let operation = operation.to_string();
+                self.record_action_outcome(if status == "ok" {
+                    ActionOutcome::Success {
+                        operation,
+                        summary: context.to_string(),
+                    }
+                } else {
+                    ActionOutcome::Failure {
+                        operation,
+                        error: context.to_string(),
+                    }
+                });
+                Cmd::none()
+            }
             "rethread_message" => {
                 if let Some((message_id, target_thread_id)) = parse_rethread_operation_arg(arg) {
                     self.execute_rethread_message(message_id, &target_thread_id);
@@ -2549,11 +2565,12 @@ impl MailAppModel {
             }
 
             // ── Server-dispatched operations ──────────────────────
-            // These produce an in-flight toast; actual execution is
-            // delegated to the screen's update handler via ActionExecute.
+            // These produce an in-flight toast; the screen that owns the rows
+            // runs the tool in its `handle_action` and answers with an
+            // `operator_result`.
             "acknowledge" | "mark_read" | "renew" | "release" | "force_release" | "summarize"
             | "approve_contact" | "deny_contact" | "block_contact" | "batch_acknowledge"
-            | "batch_mark_read" | "batch_mark_unread" => {
+            | "batch_mark_read" => {
                 let op = operation.to_string();
                 let ctx = context.to_string();
                 self.action_outcomes.push_back(ActionOutcome::InFlight {
@@ -5064,7 +5081,6 @@ impl Model for MailAppModel {
                         | "block_contact"
                         | "batch_acknowledge"
                         | "batch_mark_read"
-                        | "batch_mark_unread"
                 ) {
                     self.notifications.notify(
                         Toast::new(format!("Action not supported on this screen: {cmd_name}"))
@@ -14455,6 +14471,41 @@ first body
     }
 
     // ── ActionOutcome tests ─────────────────────────────────────
+
+    #[test]
+    fn operator_result_settles_the_in_flight_action() {
+        let mut model = test_model();
+        let _ = model.dispatch_execute_operation("release:7", "key");
+        assert!(
+            model.action_outcomes.iter().any(
+                |o| matches!(o, ActionOutcome::InFlight { operation } if operation == "release")
+            )
+        );
+
+        let _ = model.dispatch_execute_operation("operator_result:ok:release", "released 1");
+        assert!(
+            !model
+                .action_outcomes
+                .iter()
+                .any(|o| matches!(o, ActionOutcome::InFlight { .. })),
+            "the result clears the in-flight marker"
+        );
+        assert!(matches!(
+            model.action_outcomes.back(),
+            Some(ActionOutcome::Success { operation, summary })
+                if operation == "release" && summary == "released 1"
+        ));
+
+        let _ = model.dispatch_execute_operation(
+            "operator_result:error:force_release",
+            "Reservation still shows recent activity",
+        );
+        assert!(matches!(
+            model.action_outcomes.back(),
+            Some(ActionOutcome::Failure { operation, error })
+                if operation == "force_release" && error.contains("recent activity")
+        ));
+    }
 
     #[test]
     fn action_outcome_success_shows_toast() {

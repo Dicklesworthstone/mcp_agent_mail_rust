@@ -892,8 +892,33 @@ pub mod tool_util {
         })
     }
 
+    /// Session-state key that marks a context made by [`operator_context`].
+    /// Only in-process callers can set session state; an MCP client cannot.
+    const OPERATOR_ON_BEHALF_STATE_KEY: &str = "mcp_agent_mail.operator_on_behalf";
+
+    /// A context for the operator console to run a tool on an agent's behalf,
+    /// such as releasing its reservation or acknowledging its mail.
+    ///
+    /// The tool behaves as usual except that the agent is not marked active.
+    /// GH#334's `last_active_ts` records what the agent itself did; an
+    /// operator clearing a dead agent's lock must not make it look alive,
+    /// which would also make `force_release_file_reservation` refuse its
+    /// other locks.
+    #[must_use]
+    pub fn operator_context(cx: Cx) -> McpContext {
+        let state = fastmcp_core::SessionState::new();
+        state.set(OPERATOR_ON_BEHALF_STATE_KEY, true);
+        McpContext::with_state(cx, 1, state)
+    }
+
+    fn acts_for_operator(ctx: &McpContext) -> bool {
+        ctx.get_state::<bool>(OPERATOR_ON_BEHALF_STATE_KEY)
+            .unwrap_or(false)
+    }
+
     /// GH#334: record that the acting agent (the caller, never a recipient)
-    /// was active, on the write `pool` the tool already holds.
+    /// was active, on the write `pool` the tool already holds. A call made
+    /// through [`operator_context`] is the operator's, not the agent's.
     ///
     /// Best-effort: `queries::touch_agent` writes at most once a minute per
     /// agent, and a failed touch is logged, never surfaced to the caller.
@@ -901,6 +926,9 @@ pub mod tool_util {
         let Some(agent_id) = agent_id.filter(|id| *id > 0) else {
             return;
         };
+        if acts_for_operator(ctx) {
+            return;
+        }
         match mcp_agent_mail_db::queries::touch_agent(ctx.cx(), pool, agent_id).await {
             asupersync::Outcome::Ok(_) => {}
             asupersync::Outcome::Err(error) => {
@@ -923,7 +951,9 @@ pub mod tool_util {
         let Some(agent_id) = agent_id.filter(|id| *id > 0) else {
             return;
         };
-        if !mcp_agent_mail_db::queries::agent_touch_due(read_pool, agent_id) {
+        if acts_for_operator(ctx)
+            || !mcp_agent_mail_db::queries::agent_touch_due(read_pool, agent_id)
+        {
             return;
         }
         match get_db_pool() {

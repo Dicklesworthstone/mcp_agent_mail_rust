@@ -45,7 +45,10 @@ use crate::tui_persist::{
     ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
+    operator_tool_context,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -1767,6 +1770,70 @@ impl MessageBrowserScreen {
                 ))
             }
         }
+    }
+
+    /// Acknowledge (or mark read) each listed message for every one of its
+    /// recipients, as the operator.
+    fn receipt_for_recipients(&mut self, ids: &[i64], acknowledge: bool) -> Result<String, String> {
+        if ids.is_empty() {
+            return Err("no message selected".to_string());
+        }
+        let ctx = operator_tool_context();
+        let mut receipts = 0_usize;
+        for &id in ids {
+            let entry = self
+                .results
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| format!("message #{id} is no longer listed"))?;
+            let project = entry.project_slug.clone();
+            let recipients: Vec<String> = entry
+                .to_agents
+                .split(", ")
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
+            if project.is_empty() || recipients.is_empty() {
+                return Err(format!(
+                    "message #{id} has no recorded project or recipients"
+                ));
+            }
+            for agent in recipients {
+                let result = if acknowledge {
+                    block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
+                        &ctx,
+                        project.clone(),
+                        agent.clone(),
+                        id,
+                        None,
+                    ))
+                } else {
+                    block_on(mcp_agent_mail_tools::messaging::mark_message_read(
+                        &ctx,
+                        project.clone(),
+                        agent.clone(),
+                        id,
+                    ))
+                };
+                result.map_err(|err| format!("#{id} for {agent}: {err}"))?;
+                receipts += 1;
+            }
+        }
+        // Re-query so the list shows the new read and ack state.
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+        let verb = if acknowledge {
+            "acknowledged"
+        } else {
+            "marked read"
+        };
+        Ok(match ids {
+            [id] => format!("#{id} {verb} for {receipts} recipient(s)"),
+            _ => format!(
+                "{} messages {verb} ({receipts} recipient receipts)",
+                ids.len()
+            ),
+        })
     }
 
     fn submit_quick_reply_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
@@ -3495,45 +3562,18 @@ impl MailScreen for MessageBrowserScreen {
     }
 
     fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
-        match operation {
-            "batch_acknowledge" => {
+        let (name, id) = operation.split_once(':').unwrap_or((operation, ""));
+        let ids = match name {
+            "acknowledge" | "mark_read" => id.parse::<i64>().ok().into_iter().collect(),
+            "batch_acknowledge" | "batch_mark_read" => {
                 let ids = self.selected_message_ids_sorted();
                 self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "acknowledge".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
+                ids
             }
-            "batch_mark_read" => {
-                let ids = self.selected_message_ids_sorted();
-                self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "mark_read".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
-            }
-            "batch_mark_unread" => {
-                let ids = self.selected_message_ids_sorted();
-                self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "mark_unread".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
-            }
-            _ => Cmd::None,
-        }
+            _ => return Cmd::None,
+        };
+        let result = self.receipt_for_recipients(&ids, name.ends_with("acknowledge"));
+        operator_result(name, result)
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
@@ -9376,90 +9416,141 @@ first body
 
     // ── Batch operation tests (br-2bbt.10) ──────────────────────────
 
-    #[test]
-    fn batch_acknowledge_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(10, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(20, "thread-b", "Two"));
-        screen
-            .results
-            .push(test_message_entry(30, "thread-c", "Three"));
-        screen.selected_message_ids.select(10);
-        screen.selected_message_ids.select(30);
+    /// GreenCastle → BlueLake, cc RedFox, ack required; returns the message id.
+    fn send_to_bluelake_cc_redfox(project_key: &str, subject: &str) -> i64 {
+        let sent: serde_json::Value = serde_json::from_str(
+            &block_on(mcp_agent_mail_tools::messaging::send_message(
+                &operator_tool_context(),
+                project_key.to_string(),
+                "GreenCastle".to_string(),
+                vec!["BlueLake".to_string()],
+                subject.to_string(),
+                "body".to_string(),
+                Some(vec!["RedFox".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .expect("send_message"),
+        )
+        .expect("send_message JSON");
+        sent["deliveries"][0]["payload"]["id"]
+            .as_i64()
+            .expect("message id")
+    }
 
-        let cmd = screen.handle_action("batch_acknowledge", "batch:10,30");
-        // Should clear selection
-        assert!(screen.selected_message_ids.is_empty());
-        // Should return a batch of individual acknowledge commands
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2, "should dispatch 2 acknowledge actions");
-            }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+    /// `(agent, read, acked)` for each recipient of one message, from the mailbox.
+    fn recipient_receipts(id: i64) -> Vec<(String, bool, bool)> {
+        crate::tui_screens::with_operator_test_conn(|conn| {
+            let rows = conn
+                .query_sync(
+                    "SELECT a.name AS name, r.read_ts IS NOT NULL AS read, \
+                     r.ack_ts IS NOT NULL AS acked \
+                     FROM message_recipients r JOIN agents a ON a.id = r.agent_id \
+                     WHERE r.message_id = ? ORDER BY a.name",
+                    &[Value::BigInt(id)],
+                )
+                .expect("receipts");
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get_named::<String>("name").expect("name"),
+                        row.get_named::<i64>("read").expect("read") == 1,
+                        row.get_named::<i64>("acked").expect("acked") == 1,
+                    )
+                })
+                .collect()
+        })
     }
 
     #[test]
-    fn batch_mark_read_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(5, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(6, "thread-b", "Two"));
-        screen.selected_message_ids.select(5);
-        screen.selected_message_ids.select(6);
-
-        let cmd = screen.handle_action("batch_mark_read", "batch:5,6");
-        assert!(screen.selected_message_ids.is_empty());
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2, "should dispatch 2 mark_read actions");
+    fn action_menu_message_receipts_reach_the_mailbox() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let send = |subject: &str| send_to_bluelake_cc_redfox(project_key, subject);
+            let receipts = recipient_receipts;
+            let first = send("first");
+            let second = send("second");
+            let untouched = send("untouched");
+            let mut screen = MessageBrowserScreen::new();
+            for (id, subject) in [
+                (first, "first"),
+                (second, "second"),
+                (untouched, "untouched"),
+            ] {
+                screen.results.push(MessageEntry {
+                    to_agents: "BlueLake, RedFox".to_string(),
+                    project_slug: slug.clone(),
+                    ..test_message_entry(id, "thread", subject)
+                });
             }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{first}"), ""));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "acknowledge"),
+                "{text}"
+            );
+            assert!(text.contains("2 recipient"), "{text}");
+            let acked: Vec<bool> = receipts(first).iter().map(|r| r.2).collect();
+            assert_eq!(acked, [true, true], "both recipients acknowledged");
+
+            screen.selected_message_ids.select(first);
+            screen.selected_message_ids.select(second);
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action("batch_mark_read", "batch:"));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "batch_mark_read"),
+                "{text}"
+            );
+            assert!(screen.selected_message_ids.is_empty());
+            for id in [first, second] {
+                let read: Vec<bool> = receipts(id).iter().map(|r| r.1).collect();
+                assert_eq!(read, [true, true], "#{id} read for both recipients");
+            }
+            assert_eq!(
+                receipts(second).iter().map(|r| r.2).collect::<Vec<_>>(),
+                [false, false],
+                "marking read does not acknowledge"
+            );
+            assert_eq!(
+                receipts(untouched),
+                [
+                    ("BlueLake".to_string(), false, false),
+                    ("RedFox".to_string(), false, false)
+                ],
+                "an unselected message is left alone"
+            );
+
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action("mark_read:999999", ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("no longer listed"), "{text}");
+        });
     }
 
     #[test]
-    fn batch_mark_unread_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(7, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(8, "thread-b", "Two"));
-        screen
-            .results
-            .push(test_message_entry(9, "thread-c", "Three"));
-        screen.selected_message_ids.select(7);
-        screen.selected_message_ids.select(8);
-        screen.selected_message_ids.select(9);
-
-        let cmd = screen.handle_action("batch_mark_unread", "batch:7,8,9");
-        assert!(screen.selected_message_ids.is_empty());
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 3, "should dispatch 3 mark_unread actions");
-            }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn batch_acknowledge_with_empty_selection_returns_noop() {
+    fn batch_acknowledge_with_empty_selection_reports_it() {
         let mut screen = MessageBrowserScreen::new();
         let cmd = screen.handle_action("batch_acknowledge", "batch:");
-        // Cmd::batch with empty vec collapses to Cmd::None
-        assert!(
-            matches!(cmd, Cmd::None | Cmd::Batch(_)),
-            "empty selection should produce noop or empty batch"
+        let (status, op, text) = crate::tui_screens::expect_operator_result(cmd);
+        assert_eq!(
+            (status.as_str(), op.as_str()),
+            ("error", "batch_acknowledge")
         );
+        assert_eq!(text, "no message selected");
     }
 
     #[test]

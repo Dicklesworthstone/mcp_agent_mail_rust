@@ -9,7 +9,9 @@ use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
 use mcp_agent_mail_tools::{
-    ensure_project, fetch_inbox, list_agents, register_agent, send_message,
+    acknowledge_message, ensure_project, fetch_inbox, file_reservation_paths, list_agents,
+    mark_message_read, register_agent, release_file_reservations, renew_file_reservations,
+    send_message,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -224,6 +226,133 @@ fn sending_and_reading_mail_mark_the_acting_agent_active() {
         assert_eq!(
             listed_names(&ctx, &project, None).await,
             vec!["BlueLake".to_string(), "GreenCastle".to_string()],
+        );
+    });
+}
+
+/// Send an ack-required message and return its id.
+async fn send_ack_required(ctx: &McpContext, project: &str, from: &str, to: &str) -> i64 {
+    let sent: Value = serde_json::from_str(
+        &send_message(
+            ctx,
+            project.to_string(),
+            from.to_string(),
+            vec![to.to_string()],
+            "review".to_string(),
+            "please ack".to_string(),
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            None, // importance
+            Some(true),
+            None, // thread_id
+            None, // topic
+            None, // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
+            None, // idempotency_key
+        )
+        .await
+        .expect("send_message"),
+    )
+    .expect("send_message JSON");
+    sent["deliveries"][0]["payload"]["id"]
+        .as_i64()
+        .expect("message id")
+}
+
+#[test]
+fn operator_actions_on_an_agents_behalf_are_not_its_activity() {
+    run_with_storage(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let operator = mcp_agent_mail_tools::tool_util::operator_context(cx.clone());
+        let project = format!("/tmp/agent-activity-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        register(&ctx, &project, "GreenCastle").await;
+        register(&ctx, &project, "BlueLake").await;
+        let message_id = send_ack_required(&ctx, &project, "GreenCastle", "BlueLake").await;
+
+        // BlueLake has done nothing itself, so its next touch is due: a
+        // regression that touched it here would write, not be throttled.
+        age_agent(&cx, "BlueLake", 7).await;
+        let granted: Value = serde_json::from_str(
+            &file_reservation_paths(
+                &operator,
+                project.clone(),
+                "BlueLake".to_string(),
+                vec!["src/lib.rs".to_string()],
+                Some(3600),
+                Some(true),
+                None,
+                None,
+            )
+            .await
+            .expect("file_reservation_paths"),
+        )
+        .expect("file_reservation_paths JSON");
+        let reservation_id = granted["granted"][0]["id"]
+            .as_i64()
+            .expect("reservation id");
+        renew_file_reservations(
+            &operator,
+            project.clone(),
+            "BlueLake".to_string(),
+            Some(600),
+            None,
+            Some(vec![reservation_id]),
+        )
+        .await
+        .expect("renew_file_reservations");
+        release_file_reservations(
+            &operator,
+            project.clone(),
+            "BlueLake".to_string(),
+            None,
+            Some(vec![reservation_id]),
+        )
+        .await
+        .expect("release_file_reservations");
+        mark_message_read(
+            &operator,
+            project.clone(),
+            "BlueLake".to_string(),
+            message_id,
+        )
+        .await
+        .expect("mark_message_read");
+        acknowledge_message(
+            &operator,
+            project.clone(),
+            "BlueLake".to_string(),
+            message_id,
+            None,
+        )
+        .await
+        .expect("acknowledge_message");
+
+        let (inception, active) = activity(&cx, "BlueLake").await;
+        assert_eq!(
+            active, inception,
+            "the operator acting for BlueLake is not BlueLake's activity"
+        );
+
+        // The same acknowledgement made by the agent itself is its activity.
+        acknowledge_message(
+            &ctx,
+            project.clone(),
+            "BlueLake".to_string(),
+            message_id,
+            None,
+        )
+        .await
+        .expect("acknowledge_message");
+        let (_, active) = activity(&cx, "BlueLake").await;
+        assert!(
+            active > inception + 6 * DAY_MICROS,
+            "BlueLake acknowledging its own mail must move its last_active_ts"
         );
     });
 }

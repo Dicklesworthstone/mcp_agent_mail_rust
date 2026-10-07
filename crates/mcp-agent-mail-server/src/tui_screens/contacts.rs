@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use fastmcp_core::block_on;
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
@@ -24,7 +25,9 @@ use ftui::PackedRgba;
 use crate::tui_action_menu::{ActionEntry, contacts_actions};
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::{ContactSummary, MailEvent};
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, operator_result, operator_tool_context,
+};
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::generate_contact_graph_mermaid;
 use crate::tui_widgets::{AgentHeatmap, MetricTile, MetricTrend};
@@ -544,6 +547,39 @@ impl ContactsScreen {
         }
         Cmd::None
     }
+
+    /// Answer the listed link `"From:To"` on the recipient's behalf: approve
+    /// it (`accept`) or block it. The selected row wins when two projects
+    /// list the same pair of names.
+    fn respond_to_contact(&mut self, pair: &str, accept: bool) -> Result<String, String> {
+        let (from, to) = pair
+            .split_once(':')
+            .ok_or_else(|| format!("not a contact pair: {pair:?}"))?;
+        let is_pair = |c: &&ContactSummary| c.from_agent == from && c.to_agent == to;
+        let link = self
+            .table_state
+            .selected
+            .and_then(|idx| self.contacts.get(idx))
+            .filter(is_pair)
+            .or_else(|| self.contacts.iter().find(is_pair))
+            .ok_or_else(|| format!("the link {from} → {to} is no longer listed"))?
+            .clone();
+        block_on(mcp_agent_mail_tools::respond_contact(
+            &operator_tool_context(),
+            link.to_project_slug.clone(),
+            link.to_agent.clone(),
+            link.from_agent.clone(),
+            (!link.from_project_slug.is_empty()).then(|| link.from_project_slug.clone()),
+            accept,
+            None,
+        ))
+        .map_err(|err| err.to_string())?;
+        let status = if accept { "approved" } else { "blocked" };
+        if let Some(row) = self.contacts.iter_mut().find(|row| **row == link) {
+            row.status = status.to_string();
+        }
+        Ok(format!("{from} → {to} {status}"))
+    }
 }
 
 impl Default for ContactsScreen {
@@ -816,6 +852,16 @@ impl MailScreen for ContactsScreen {
             }
             _ => false,
         }
+    }
+
+    fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
+        let (name, pair) = operation.split_once(':').unwrap_or((operation, ""));
+        let result = match name {
+            "approve_contact" => self.respond_to_contact(pair, true),
+            "deny_contact" | "block_contact" => self.respond_to_contact(pair, false),
+            _ => return Cmd::None,
+        };
+        operator_result(name, result)
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -1782,6 +1828,88 @@ mod tests {
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    #[test]
+    fn action_menu_contact_answers_reach_the_mailbox() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake", "GreenCastle"]);
+            block_on(mcp_agent_mail_tools::request_contact(
+                &operator_tool_context(),
+                project_key.to_string(),
+                "GreenCastle".to_string(),
+                "BlueLake".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .expect("request_contact");
+            let listed = |from: &str, to: &str| ContactSummary {
+                from_agent: from.to_string(),
+                to_agent: to.to_string(),
+                from_project_slug: slug.clone(),
+                to_project_slug: slug.clone(),
+                status: "pending".to_string(),
+                ..ContactSummary::default()
+            };
+            let link_status = || {
+                crate::tui_screens::with_operator_test_conn(|conn| {
+                    let rows = conn
+                        .query_sync("SELECT status FROM agent_links", &[])
+                        .expect("agent_links");
+                    rows.iter()
+                        .map(|row| row.get_named::<String>("status").expect("status"))
+                        .collect::<Vec<_>>()
+                })
+            };
+            let mut screen = ContactsScreen::new();
+            // The reverse link was never requested, so it exists only on screen.
+            screen.contacts = vec![
+                listed("GreenCastle", "BlueLake"),
+                listed("BlueLake", "GreenCastle"),
+            ];
+            screen.table_state.selected = Some(0);
+
+            let (status, op, text) = expect_operator_result(
+                screen.handle_action("approve_contact:GreenCastle:BlueLake", ""),
+            );
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "approve_contact"),
+                "{text}"
+            );
+            assert_eq!(link_status(), ["approved"]);
+            assert_eq!(screen.contacts[0].status, "approved");
+
+            let (status, op, text) = expect_operator_result(
+                screen.handle_action("block_contact:GreenCastle:BlueLake", ""),
+            );
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "block_contact"),
+                "{text}"
+            );
+            assert_eq!(link_status(), ["blocked"]);
+
+            let (status, _, _) = expect_operator_result(
+                screen.handle_action("approve_contact:BlueLake:GreenCastle", ""),
+            );
+            assert_eq!(
+                status, "error",
+                "no link exists for the operator to approve"
+            );
+            assert_eq!(link_status(), ["blocked"], "and none is invented");
+
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action("deny_contact:RedFox:BlueLake", ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("no longer listed"), "{text}");
+        });
     }
 
     #[test]
