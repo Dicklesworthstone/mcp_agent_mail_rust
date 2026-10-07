@@ -356,3 +356,52 @@ fn operator_actions_on_an_agents_behalf_are_not_its_activity() {
         );
     });
 }
+
+/// Reading or acknowledging mail in a project that does not exist is
+/// NOT_FOUND; a typo'd absolute key must not leave a phantom project behind.
+#[test]
+fn read_tools_do_not_create_a_project_from_an_unknown_key() {
+    run_with_storage(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let ghost = format!("/tmp/agent-activity-ghost-{}", unique_suffix());
+        let errors = [
+            mark_message_read(&ctx, ghost.clone(), "BlueLake".to_string(), 1)
+                .await
+                .expect_err("mark_message_read"),
+            acknowledge_message(&ctx, ghost.clone(), "BlueLake".to_string(), 1, None)
+                .await
+                .expect_err("acknowledge_message"),
+            mcp_agent_mail_tools::summarize_thread(
+                &ctx,
+                ghost.clone(),
+                "1".to_string(),
+                None,
+                Some(false),
+                None,
+                None,
+            )
+            .await
+            .expect_err("summarize_thread"),
+        ];
+        for err in &errors {
+            assert_eq!(
+                mcp_agent_mail_tools::tool_util::tool_error_code(err),
+                Some("NOT_FOUND"),
+                "{err:?}"
+            );
+        }
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+        let conn = pool.acquire(&cx).await.into_result().expect("DB checkout");
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM projects WHERE human_key = ?",
+                &[SqlValue::Text(ghost)],
+            )
+            .expect("count projects");
+        assert_eq!(
+            rows[0].get_named::<i64>("n").expect("n"),
+            0,
+            "no phantom project"
+        );
+    });
+}

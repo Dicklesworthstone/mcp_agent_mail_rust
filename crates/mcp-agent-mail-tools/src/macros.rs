@@ -25,7 +25,10 @@ use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_existing_project,
+    resolve_project,
+};
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -713,7 +716,13 @@ pub async fn macro_contact_handshake(
     let target_resolution =
         crate::contacts::resolve_contact_target(&target_agent, to_project.as_deref(), &project_key);
     let pool = get_db_pool()?;
-    let source_project = resolve_project(ctx, &pool, &project_key).await?;
+    // register_if_missing=false means nothing is created implicitly: a missing
+    // source project is NOT_FOUND here, before the contact flow's own check.
+    let source_project = if register_if_missing == Some(false) {
+        resolve_existing_project(ctx, &pool, &project_key).await?
+    } else {
+        resolve_project(ctx, &pool, &project_key).await?
+    };
     let source_project_key = source_project.human_key.clone();
     let target_project = resolve_project(ctx, &pool, &target_resolution.project_key).await?;
     let target_project_key = target_project.human_key.clone();

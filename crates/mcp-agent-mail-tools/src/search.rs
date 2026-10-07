@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use crate::llm;
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_existing_project, resolve_project,
+    legacy_tool_error, resolve_existing_project,
 };
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
@@ -1178,7 +1178,8 @@ pub async fn summarize_thread(
     let msg_limit = parse_summarize_thread_limit(per_thread_limit)?;
 
     let pool = get_read_db_pool(ctx.cx()).await?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Summarizing reads; an unknown project is NOT_FOUND, never created.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     // Check if multi-thread mode (comma-separated)

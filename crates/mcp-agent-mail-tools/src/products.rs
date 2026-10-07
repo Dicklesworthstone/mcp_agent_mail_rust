@@ -22,7 +22,8 @@ use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_project,
+    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists,
+    resolve_existing_project,
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -439,7 +440,8 @@ pub async fn products_link(
             )
         })?;
 
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Link an existing project; a typo'd key must not create and link a new one.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let product_id = product.id.unwrap_or(0);
     let project_id = project.id.unwrap_or(0);
 
@@ -652,7 +654,7 @@ pub async fn search_messages_product(
     // The project filter narrows within the product; it must not create a
     // project from a typo'd key.
     let scoped_project = if let Some(project_selector) = project_filter {
-        Some(crate::tool_util::resolve_existing_project(ctx, &pool, &project_selector).await?)
+        Some(resolve_existing_project(ctx, &pool, &project_selector).await?)
     } else {
         None
     };

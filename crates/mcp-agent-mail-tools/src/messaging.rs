@@ -5448,9 +5448,9 @@ pub async fn fetch_inbox_events(
     // Cursor delivery is a durable database contract. Do not use the
     // archive-reconstruction read pool here: an archive snapshot has no
     // independent event sequence and would turn a degraded source into a
-    // dishonest empty monitor page.
+    // dishonest empty monitor page. Reading events never creates a project.
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = resolve_agent(
         ctx,
@@ -5562,7 +5562,7 @@ pub async fn get_message_delivery_receipt(
     message_id: i64,
 ) -> McpResult<String> {
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let receipt = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_message_delivery_receipt(
@@ -5680,7 +5680,7 @@ pub async fn mark_message_read(
     let agent_name = normalize_agent_name_or_original(agent_name);
 
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_agent(
@@ -6117,7 +6117,7 @@ pub async fn acknowledge_message(
             );
         }
     };
-    let project = match resolve_project(ctx, &pool, &project_key).await {
+    let project = match resolve_existing_project(ctx, &pool, &project_key).await {
         Ok(project) => project,
         Err(error) if mcp_error_supports_ack_intent(&error) => {
             return queued_ack_intent_response(
