@@ -166,6 +166,17 @@ const fn group_label(g: GroupMode) -> &'static str {
     }
 }
 
+/// SQL predicates over `messages m` joined to `message_recipients r` for an
+/// ack filter. Shared by the inbound and outbound queries.
+const fn recipient_state_predicates(filter: AckFilter) -> &'static [&'static str] {
+    match filter {
+        AckFilter::PendingAck => &["m.ack_required = 1", "r.ack_ts IS NULL"],
+        AckFilter::Acknowledged => &["m.ack_required = 1", "r.ack_ts IS NOT NULL"],
+        AckFilter::Unread => &["r.read_ts IS NULL"],
+        AckFilter::All => &[],
+    }
+}
+
 const fn ack_label(a: AckFilter) -> &'static str {
     match a {
         AckFilter::All => "All",
@@ -644,6 +655,7 @@ impl MailExplorerScreen {
 
         // Truncate
         all_entries.truncate(MAX_ENTRIES);
+        group_entries(&mut all_entries, self.group_mode);
         self.entries = all_entries;
 
         let rendered_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
@@ -938,20 +950,11 @@ impl MailExplorerScreen {
         }
 
         // Ack filter
-        match self.ack_filter {
-            AckFilter::PendingAck => {
-                conditions.push("m.ack_required = 1".to_string());
-                conditions.push("r.ack_ts IS NULL".to_string());
-            }
-            AckFilter::Acknowledged => {
-                conditions.push("m.ack_required = 1".to_string());
-                conditions.push("r.ack_ts IS NOT NULL".to_string());
-            }
-            AckFilter::Unread => {
-                conditions.push("r.read_ts IS NULL".to_string());
-            }
-            AckFilter::All => {}
-        }
+        conditions.extend(
+            recipient_state_predicates(self.ack_filter)
+                .iter()
+                .map(ToString::to_string),
+        );
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -1021,6 +1024,20 @@ impl MailExplorerScreen {
             return Ok(Vec::new());
         }
 
+        // Ack and read state belong to recipients: a sent message matches
+        // when any of its recipients is in that state (e.g. still owes an
+        // ack). Joined rather than a correlated EXISTS, like the inbound query.
+        let recipient_state = recipient_state_predicates(self.ack_filter);
+        let (recipient_join, distinct) = if recipient_state.is_empty() {
+            ("", "")
+        } else {
+            conditions.extend(recipient_state.iter().map(ToString::to_string));
+            (
+                " JOIN message_recipients r ON r.message_id = m.id",
+                "DISTINCT ",
+            )
+        };
+
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
@@ -1028,10 +1045,10 @@ impl MailExplorerScreen {
         };
 
         let sql = format!(
-            "SELECT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, m.sender_id AS raw_sender_id, m.project_id AS raw_project_id, \
-             s.name AS sender_name, p.slug AS project_slug \
-             FROM messages m \
+            "SELECT {distinct}m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, \
+             m.created_ts, m.thread_id, m.sender_id AS raw_sender_id, \
+             m.project_id AS raw_project_id, s.name AS sender_name, p.slug AS project_slug \
+             FROM messages m{recipient_join} \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
              WHERE 1=1{where_clause} \
@@ -1634,6 +1651,7 @@ impl MailScreen for MailExplorerScreen {
                 frame,
                 results_area,
                 &self.entries,
+                self.group_mode,
                 &mut self.list_state.borrow_mut(),
                 results_focused,
             );
@@ -1752,8 +1770,11 @@ impl MailScreen for MailExplorerScreen {
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         match target {
+            // Every producer ("View inbox", "Fetch inbox for X") asks for the
+            // agent's inbox, not everything the agent also sent.
             DeepLinkTarget::ExplorerForAgent(name) => {
                 self.agent_filter.clone_from(name);
+                self.direction = Direction::Inbound;
                 self.search_dirty = true;
                 self.debounce_remaining = 0;
                 true
@@ -1839,6 +1860,25 @@ fn stable_hash<T: Hash>(value: T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Keep each group's rows together: groups in key order, rows in their sort
+/// order within a group. Keys match the `mail_explorer` API's grouping.
+fn group_entries(entries: &mut [DisplayEntry], mode: GroupMode) {
+    let key = |entry: &DisplayEntry| match mode {
+        GroupMode::None => String::new(),
+        GroupMode::Project => entry.project_slug.clone(),
+        GroupMode::Thread => entry
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| "(no thread)".to_string()),
+        GroupMode::Agent if entry.direction == Direction::Inbound => entry.sender_name.clone(),
+        GroupMode::Agent => entry.to_agents.clone(),
+    };
+    if mode != GroupMode::None {
+        // Stable, so the sort order survives within each group.
+        entries.sort_by_cached_key(key);
+    }
 }
 
 fn sort_entries(entries: &mut [DisplayEntry], mode: SortMode) {
@@ -2124,12 +2164,17 @@ fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
     entries: &[DisplayEntry],
+    group_mode: GroupMode,
     list_state: &mut VirtualizedListState,
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = match group_mode {
+        GroupMode::None => "Messages".to_string(),
+        grouped => format!("Messages · grouped by {}", group_label(grouped)),
+    };
     let block = Block::default()
-        .title("Messages")
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
@@ -2942,7 +2987,53 @@ mod tests {
             screen.receive_deep_link(&DeepLinkTarget::ExplorerForAgent("Fox".to_string()));
         assert!(handled);
         assert_eq!(screen.agent_filter, "Fox");
+        assert_eq!(
+            screen.direction,
+            Direction::Inbound,
+            "an inbox, not sent mail"
+        );
         assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn fetch_outbound_honours_the_ack_filter_through_recipient_state() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha');
+             INSERT INTO agents (id, name) VALUES (1, 'Sender'), (2, 'BlueLake'), (3, 'RedFox');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, topic, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'owes an ack', NULL, 'b', 'normal', 1, 1000, 't'),
+                (11, 1, 1, 'fully acked', NULL, 'b', 'normal', 1, 1100, 't'),
+                (12, 1, 1, 'no ack asked', NULL, 'b', 'normal', 0, 1200, 't');
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, 1200, 1300),
+                (10, 3, NULL, NULL),
+                (11, 2, 1150, 1160),
+                (12, 2, 1250, NULL),
+                (12, 3, 1260, NULL);",
+        )
+        .expect("seed outbound rows");
+
+        let ids = |filter: AckFilter| {
+            let mut screen = MailExplorerScreen::new();
+            screen.ack_filter = filter;
+            let mut ids: Vec<i64> = screen
+                .fetch_outbound(&conn, None)
+                .expect("fetch outbound")
+                .iter()
+                .map(|entry| entry.message_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(AckFilter::All), [10, 11, 12]);
+        // Before the fix every sent message passed every ack filter.
+        assert_eq!(ids(AckFilter::PendingAck), [10], "RedFox still owes 10");
+        assert_eq!(ids(AckFilter::Acknowledged), [10, 11]);
+        assert_eq!(ids(AckFilter::Unread), [10], "only 10 has an unread copy");
     }
 
     #[test]
@@ -2962,6 +3053,42 @@ mod tests {
         assert_eq!(entries[0].message_id, 2);
         assert_eq!(entries[1].message_id, 3);
         assert_eq!(entries[2].message_id, 1);
+    }
+
+    #[test]
+    fn group_mode_keeps_each_group_contiguous_in_sort_order() {
+        let entry = |id, ts, project: &str| {
+            let mut entry = test_entry(id, ts, Direction::Inbound);
+            entry.project_slug = project.to_string();
+            entry
+        };
+        let mut entries = vec![
+            entry(1, 400, "beta"),
+            entry(2, 300, "alpha"),
+            entry(3, 200, "beta"),
+            entry(4, 100, "alpha"),
+        ];
+        sort_entries(&mut entries, SortMode::DateDesc);
+
+        let mut flat = entries.clone();
+        group_entries(&mut flat, GroupMode::None);
+        let ids = |rows: &[DisplayEntry]| rows.iter().map(|e| e.message_id).collect::<Vec<_>>();
+        assert_eq!(ids(&flat), [1, 2, 3, 4], "Flat keeps the sort order");
+
+        group_entries(&mut entries, GroupMode::Project);
+        // Before the fix every group mode rendered this interleaved list.
+        assert_eq!(
+            ids(&entries),
+            [2, 4, 1, 3],
+            "alpha's rows, then beta's, newest first"
+        );
+
+        // Agent groups inbound rows by sender and sent rows by recipients.
+        let mut sent = test_entry(5, 50, Direction::Outbound);
+        sent.to_agents = "AAA".to_string();
+        let mut rows = vec![test_entry(6, 60, Direction::Inbound), sent];
+        group_entries(&mut rows, GroupMode::Agent);
+        assert_eq!(ids(&rows), [5, 6]);
     }
 
     #[test]

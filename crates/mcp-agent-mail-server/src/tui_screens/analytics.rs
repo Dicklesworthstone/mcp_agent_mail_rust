@@ -371,12 +371,10 @@ impl AnalyticsScreen {
             .filter_map(|(idx, card)| self.severity_filter.includes(card.severity).then_some(idx))
             .collect();
 
+        // No match stays empty: the view then says so and how to relax the
+        // filter, instead of showing a card the filter excludes under a
+        // "filter:crit" title.
         self.sort_card_indices(&mut indices);
-        if indices.is_empty() && !self.feed.cards.is_empty() {
-            indices = (0..self.feed.cards.len()).collect();
-            self.sort_card_indices(&mut indices);
-            indices.truncate(1);
-        }
 
         *self.cached_active_indices.borrow_mut() = (key.0, key.1, key.2, indices);
     }
@@ -1957,7 +1955,6 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
     out
 }
 
-#[allow(dead_code)]
 fn render_filtered_empty_state(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1998,7 +1995,6 @@ fn render_filtered_empty_state(
     Paragraph::new(Text::from_lines(lines)).render(inner, frame);
 }
 
-#[allow(dead_code)]
 fn render_empty_state(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3594,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn severity_filter_falls_back_to_top_card_when_filtered_empty() {
+    fn severity_filter_with_no_match_shows_the_empty_state_not_another_card() {
         let mut screen = AnalyticsScreen::new();
         screen.feed = InsightFeed {
             cards: vec![
@@ -3608,9 +3604,21 @@ mod tests {
         screen.sort_mode = AnalyticsSortMode::Confidence;
         screen.clamp_selected_to_active_cards();
 
-        let active = screen.active_cards();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].id, "low");
+        // A Low card under a "critical only" filter read as a critical anomaly.
+        assert!(screen.active_cards().is_empty());
+        assert!(screen.selected_card().is_none());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 30, &mut pool);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = crate::tui_bridge::TuiSharedState::new(&config);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 30), &state);
+        let text = frame_text(&frame);
+        assert!(text.contains("No cards match the current filter"), "{text}");
+        assert!(!text.contains("[1/1]"), "{text}");
+
+        // Relaxing the filter brings the cards back.
+        screen.severity_filter = AnalyticsSeverityFilter::All;
+        assert_eq!(screen.active_cards().len(), 2);
     }
 
     #[test]

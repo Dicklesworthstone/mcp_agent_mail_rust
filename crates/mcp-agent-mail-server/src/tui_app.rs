@@ -3954,12 +3954,14 @@ impl MailAppModel {
         }
 
         // ── Dynamic sources ───────────────────────────────────────
-        if id.starts_with(palette_action_ids::AGENT_PREFIX) {
-            self.activate_screen(MailScreenId::Agents);
+        if let Some(name) = id.strip_prefix(palette_action_ids::AGENT_PREFIX) {
+            let target = DeepLinkTarget::AgentByName(name.to_string());
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
-        if id.starts_with(palette_action_ids::THREAD_PREFIX) {
-            self.activate_screen(MailScreenId::Threads);
+        if let Some(thread_id) = id.strip_prefix(palette_action_ids::THREAD_PREFIX) {
+            let target = DeepLinkTarget::ThreadById(thread_id.to_string());
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
         if let Some(id_str) = id.strip_prefix(palette_action_ids::MESSAGE_PREFIX) {
@@ -4055,16 +4057,6 @@ impl MailAppModel {
     /// Dispatch a macro action by its suffix (after `macro:` prefix).
     fn dispatch_macro_action(&mut self, rest: &str) -> Cmd<MailMsg> {
         // Thread macros
-        if let Some(thread_id) = rest.strip_prefix("summarize_thread:") {
-            self.notifications.notify(
-                Toast::new(format!("Summarizing thread {thread_id}..."))
-                    .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(4)),
-            );
-            let target = DeepLinkTarget::ThreadById(thread_id.to_string());
-            self.apply_deep_link_with_transition(&target);
-            return Cmd::none();
-        }
         if let Some(thread_id) = rest.strip_prefix("view_thread:") {
             let target = DeepLinkTarget::ThreadById(thread_id.to_string());
             self.apply_deep_link_with_transition(&target);
@@ -11274,13 +11266,6 @@ first body
     // ── Macro dispatch tests ─────────────────────────────────────
 
     #[test]
-    fn dispatch_macro_summarize_thread_goes_to_threads() {
-        let mut model = test_model();
-        model.dispatch_palette_action("macro:summarize_thread:br-3vwi");
-        assert_eq!(model.active_screen(), MailScreenId::Threads);
-    }
-
-    #[test]
     fn dispatch_macro_view_thread_goes_to_threads() {
         let mut model = test_model();
         model.dispatch_palette_action("macro:view_thread:br-3vwi");
@@ -13069,6 +13054,55 @@ first body
         fn title(&self) -> &'static str {
             "ResizeCounting"
         }
+    }
+
+    struct DeepLinkRecordingScreen {
+        received: Rc<RefCell<Vec<DeepLinkTarget>>>,
+    }
+
+    impl MailScreen for DeepLinkRecordingScreen {
+        fn update(&mut self, _event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+            Cmd::none()
+        }
+
+        fn view(&self, _frame: &mut ftui::Frame<'_>, _area: Rect, _state: &TuiSharedState) {}
+
+        fn tick(&mut self, _tick_count: u64, _state: &TuiSharedState) {}
+
+        fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
+            self.received.borrow_mut().push(target.clone());
+            true
+        }
+
+        fn title(&self) -> &'static str {
+            "DeepLinkRecording"
+        }
+    }
+
+    #[test]
+    fn palette_agent_and_thread_entries_open_the_named_target() {
+        let mut model = test_model();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        for id in [MailScreenId::Agents, MailScreenId::Threads] {
+            let screen = DeepLinkRecordingScreen {
+                received: Rc::clone(&received),
+            };
+            model.set_screen(id, Box::new(screen));
+        }
+
+        model.dispatch_palette_action("agent:GoldFox");
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+        model.dispatch_palette_action("thread:br-10wc");
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+
+        // Switching screens alone would leave the user hunting for the row.
+        assert_eq!(
+            *received.borrow(),
+            [
+                DeepLinkTarget::AgentByName("GoldFox".to_string()),
+                DeepLinkTarget::ThreadById("br-10wc".to_string()),
+            ]
+        );
     }
 
     #[test]

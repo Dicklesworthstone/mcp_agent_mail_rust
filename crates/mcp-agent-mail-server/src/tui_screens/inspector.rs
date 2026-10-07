@@ -177,7 +177,7 @@ pub struct QuickAction {
 /// Build quick actions from a focused event's correlation links.
 ///
 /// Returns actions suitable for injection into the command palette.
-/// Includes both navigation ("Go to X") and macro ("Summarize thread",
+/// Includes both navigation ("Go to X") and macro ("View messages in",
 /// "Fetch inbox") actions derived from the focused entity.
 #[must_use]
 pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
@@ -216,17 +216,11 @@ pub fn build_quick_actions(event: &MailEvent) -> Vec<QuickAction> {
     actions
 }
 
-/// Append macro-style quick actions (summarize, fetch inbox, etc.).
+/// Append macro-style quick actions (view thread, fetch inbox, etc.).
 fn build_macro_actions(event: &MailEvent, links: &[CorrelationLink], out: &mut Vec<QuickAction>) {
-    // Thread macros: summarize thread, view all messages in thread.
+    // Thread macro: view all messages in thread.
     for link in links {
         if let DeepLinkTarget::ThreadById(thread_id) = &link.target {
-            out.push(QuickAction {
-                id: format!("macro:summarize_thread:{thread_id}"),
-                label: format!("Summarize thread {thread_id}"),
-                description: "Request LLM thread summary via command palette".to_string(),
-                target: DeepLinkTarget::ThreadById(thread_id.clone()),
-            });
             out.push(QuickAction {
                 id: format!("macro:view_thread:{thread_id}"),
                 label: format!("View messages in {thread_id}"),
@@ -1465,9 +1459,11 @@ mod tests {
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
 
         // Should have macro actions for thread, agents
+        // It only opened the thread while claiming an LLM summary was requested.
         assert!(
-            ids.contains(&"macro:summarize_thread:thread-1"),
-            "missing summarize thread macro: {ids:?}"
+            !ids.iter()
+                .any(|id| id.starts_with("macro:summarize_thread:")),
+            "no fake summarize macro: {ids:?}"
         );
         assert!(
             ids.contains(&"macro:view_thread:thread-1"),

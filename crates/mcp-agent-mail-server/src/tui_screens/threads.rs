@@ -2440,6 +2440,7 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
     let sender_name_map = agent_names_by_id(conn, &agent_ids);
     let project_slug_map = project_slugs_by_id(conn, &project_ids);
     let participant_names_map = participant_names_by_thread(conn, &thread_ids, &sender_name_map);
+    let unread_map = unread_counts_by_thread(conn, &thread_ids);
 
     rows.into_iter()
         .map(|row| {
@@ -2497,10 +2498,39 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                 velocity_msg_per_hr: velocity,
                 participant_names,
                 first_timestamp_iso: micros_to_iso(row.first_timestamp_micros),
-                unread_count: 0,
+                unread_count: unread_map.get(&row.thread_id).copied().unwrap_or(0),
             }
         })
         .collect()
+}
+
+/// Messages in each thread that at least one recipient has not read yet.
+fn unread_counts_by_thread(conn: &DbConn, thread_ids: &[String]) -> HashMap<String, usize> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; thread_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT m.thread_id AS thread_id, COUNT(DISTINCT m.id) AS unread \
+         FROM messages m \
+         JOIN message_recipients r ON r.message_id = m.id \
+         WHERE m.thread_id IN ({placeholders}) AND r.read_ts IS NULL \
+         GROUP BY m.thread_id"
+    );
+    let params: Vec<Value> = thread_ids.iter().cloned().map(Value::Text).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let thread_id = row.get_named::<String>("thread_id").ok()?;
+                    let unread = row.get_named::<i64>("unread").ok()?;
+                    Some((thread_id, usize::try_from(unread).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn latest_thread_meta_by_thread(
@@ -5892,6 +5922,37 @@ mod tests {
         }
 
         conn
+    }
+
+    #[test]
+    fn unread_counts_count_messages_some_recipient_has_not_read() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL)")
+            .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+               message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, read_ts INTEGER\
+             )",
+        )
+        .expect("create recipients");
+        // t1: message 1 unread by two of three recipients, message 2 read by
+        // all; t2: everything read; t3 is not asked for.
+        conn.execute_raw(
+            "INSERT INTO messages (id, thread_id) VALUES (1, 't1'), (2, 't1'), (3, 't2'), (4, 't3');
+             INSERT INTO message_recipients (message_id, agent_id, read_ts) VALUES
+                (1, 2, NULL), (1, 3, 100), (1, 4, NULL), (2, 2, 100), (3, 2, 100), (4, 2, NULL);",
+        )
+        .expect("seed rows");
+
+        let counts = unread_counts_by_thread(&conn, &["t1".to_string(), "t2".to_string()]);
+        assert_eq!(
+            counts.get("t1"),
+            Some(&1),
+            "two unread copies of one message count once"
+        );
+        assert_eq!(counts.get("t2"), None);
+        assert_eq!(counts.get("t3"), None, "only the requested threads");
+        assert!(unread_counts_by_thread(&conn, &[]).is_empty());
     }
 
     #[test]
