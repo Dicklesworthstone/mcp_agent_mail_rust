@@ -2101,6 +2101,65 @@ fn set_contact_policy_contacts_only() {
     );
 }
 
+/// GH#333 follow-up: request-path reads share one live query-only pool, but a
+/// write refreshes cached agent rows only in the writing pool's cache scope.
+/// An agent read through the live lane, then updated, must read back updated
+/// through the live lane (by name and by id), not from the earlier cached row.
+#[test]
+fn live_read_lane_sees_agent_updates_after_a_cached_read() {
+    let (pool, dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+    let live_config = DbPoolConfig {
+        database_url: format!("sqlite:///{}", pool.sqlite_path()),
+        storage_root: Some(dir.path().join("storage")),
+        min_connections: 0,
+        max_connections: 2,
+        run_migrations: false,
+        warmup_connections: 0,
+        ..Default::default()
+    };
+    let read_through_live_lane = |config: DbPoolConfig| {
+        block_on(|cx| async move {
+            let live = mcp_agent_mail_db::get_or_create_live_query_only_pool(&config)
+                .expect("live read pool");
+            let by_name = match queries::get_agent(&cx, &live, pid, "GoldFox").await {
+                Outcome::Ok(agent) => agent.contact_policy,
+                other => panic!("live get_agent failed: {other:?}"),
+            };
+            let by_id = match queries::get_agent_by_id(&cx, &live, agent_id).await {
+                Outcome::Ok(agent) => agent.contact_policy,
+                other => panic!("live get_agent_by_id failed: {other:?}"),
+            };
+            (by_name, by_id)
+        })
+    };
+
+    let (before, before_by_id) = read_through_live_lane(live_config.clone());
+    assert_eq!(before, before_by_id);
+    let updated_policy = if before == "block_all" {
+        "contacts_only"
+    } else {
+        "block_all"
+    };
+
+    let writer = pool.clone();
+    let written = block_on(|cx| async move {
+        queries::set_agent_contact_policy(&cx, &writer, agent_id, updated_policy).await
+    });
+    match written {
+        Outcome::Ok(agent) => assert_eq!(agent.contact_policy, updated_policy),
+        other => panic!("set_agent_contact_policy failed: {other:?}"),
+    }
+
+    let (after, after_by_id) = read_through_live_lane(live_config);
+    assert_eq!(
+        after, updated_policy,
+        "the live read lane served the contact policy cached before the update"
+    );
+    assert_eq!(after_by_id, updated_policy);
+}
+
 // =============================================================================
 // Search V3 scope enforcement integration tests (br-2tnl.6.4)
 //
