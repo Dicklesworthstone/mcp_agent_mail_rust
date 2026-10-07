@@ -171,7 +171,7 @@ fn run(config: &Config, stop: &AtomicBool) {
                 Ok(report) => {
                     delay = next_delay(&report);
                     if report.repaired > 0 || report.deferred > 0 || report.interrupted {
-                        tracing::info!(target: "maintenance", event: "active_reservation_reconcile",
+                        tracing::info!(target: "maintenance", event = "active_reservation_reconcile",
                             scanned = report.scanned, unchanged = report.unchanged,
                             attempted = report.attempted, repaired = report.repaired,
                             deferred = report.deferred, more = report.more,
