@@ -2110,15 +2110,7 @@ fn live_read_lane_sees_agent_updates_after_a_cached_read() {
     let (pool, dir) = make_pool();
     let pid = setup_project(&pool);
     let agent_id = setup_agent(&pool, pid, "GoldFox");
-    let live_config = DbPoolConfig {
-        database_url: format!("sqlite:///{}", pool.sqlite_path()),
-        storage_root: Some(dir.path().join("storage")),
-        min_connections: 0,
-        max_connections: 2,
-        run_migrations: false,
-        warmup_connections: 0,
-        ..Default::default()
-    };
+    let live_config = live_read_lane_config(&pool, &dir);
     let read_through_live_lane = |config: DbPoolConfig| {
         block_on(|cx| async move {
             let live = mcp_agent_mail_db::get_or_create_live_query_only_pool(&config)
@@ -2158,6 +2150,44 @@ fn live_read_lane_sees_agent_updates_after_a_cached_read() {
         "the live read lane served the contact policy cached before the update"
     );
     assert_eq!(after_by_id, updated_policy);
+}
+
+/// GH#333: each live read-lane wrapper has its own read-cache scope, but all of
+/// them name the one shared engine pool, so memos of facts about the database
+/// file (the search generation probe) are computed once per engine pool, not
+/// by opening a fresh connection on every read.
+#[test]
+fn live_read_lane_wrappers_share_engine_identity_not_cache_scope() {
+    let (pool, dir) = make_pool();
+    let live_config = live_read_lane_config(&pool, &dir);
+    let first = mcp_agent_mail_db::get_or_create_live_query_only_pool(&live_config)
+        .expect("first live read pool");
+    let second = mcp_agent_mail_db::get_or_create_live_query_only_pool(&live_config)
+        .expect("second live read pool");
+    assert_ne!(
+        first.sqlite_identity_key(),
+        second.sqlite_identity_key(),
+        "live read-lane wrappers must not share a read-cache scope"
+    );
+    assert_eq!(
+        first.engine_identity_key(),
+        second.engine_identity_key(),
+        "live read-lane wrappers share one engine pool identity"
+    );
+    assert_eq!(pool.engine_identity_key(), pool.sqlite_identity_key());
+}
+
+/// Live read-lane configuration for the mailbox behind a `make_pool` pool.
+fn live_read_lane_config(pool: &DbPool, dir: &tempfile::TempDir) -> DbPoolConfig {
+    DbPoolConfig {
+        database_url: format!("sqlite:///{}", pool.sqlite_path()),
+        storage_root: Some(dir.path().join("storage")),
+        min_connections: 0,
+        max_connections: 2,
+        run_migrations: false,
+        warmup_connections: 0,
+        ..Default::default()
+    }
 }
 
 // =============================================================================

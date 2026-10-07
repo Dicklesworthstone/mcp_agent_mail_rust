@@ -2970,7 +2970,13 @@ pub struct DbPool {
     /// Unlike a raw `Arc` address, this value cannot be reused after a pool is
     /// dropped. Read/search cache scopes include it so a replacement pool for
     /// the same on-disk path cannot inherit pre-recovery numeric identities.
+    /// Live read-lane wrappers replace it per call (see
+    /// [`with_fresh_cache_generation`]).
     cache_generation: u64,
+    /// The generation `pool` was created with. Unlike `cache_generation`, it
+    /// is never replaced, so every wrapper of one engine pool shares it (see
+    /// [`DbPool::engine_identity_key`]).
+    engine_generation: u64,
     /// Frozen, lossless identity of the file-backed SQLite authority.
     ///
     /// This is resolved exactly once when the pool wrapper is constructed and
@@ -3314,6 +3320,7 @@ impl DbPool {
         Ok(Self {
             pool,
             cache_generation,
+            engine_generation: cache_generation,
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
@@ -3372,6 +3379,7 @@ impl DbPool {
         Ok(Self {
             pool,
             cache_generation,
+            engine_generation: cache_generation,
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
@@ -3566,12 +3574,30 @@ impl DbPool {
         // just by path, so a newly initialized pool can never observe rows
         // cached before the replacement. Clones and separately constructed
         // wrappers of the same underlying pool intentionally share one
-        // generation.
-        let identity = self.sqlite_identity.as_ref().map_or_else(
+        // generation; live read-lane wrappers deliberately do not.
+        let identity = self.cache_identity_namespace();
+        format!("{identity}@{}", self.cache_generation)
+    }
+
+    /// Identity of the engine pool behind this wrapper: `path@generation` with
+    /// the generation the engine pool was created with.
+    ///
+    /// Equal to [`Self::sqlite_identity_key`] except for live read-lane
+    /// wrappers, which each carry a fresh read-cache generation but share one
+    /// engine pool. Memos of facts about the database file itself (not about
+    /// rows a write may change) use this key, so they are computed once per
+    /// engine pool instead of once per live read.
+    #[must_use]
+    pub fn engine_identity_key(&self) -> String {
+        let identity = self.cache_identity_namespace();
+        format!("{identity}@{}", self.engine_generation)
+    }
+
+    fn cache_identity_namespace(&self) -> String {
+        self.sqlite_identity.as_ref().map_or_else(
             || ":memory:".to_string(),
             |path| sqlite_identity_cache_namespace(path),
-        );
-        format!("{identity}@{}", self.cache_generation)
+        )
     }
 
     pub fn sample_pool_stats_now(&self) {

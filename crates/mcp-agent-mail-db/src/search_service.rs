@@ -1484,8 +1484,11 @@ fn lexical_backfill_database_url(pool: &DbPool) -> String {
 /// Process-wide memo of each pool generation's mailbox generation token.
 ///
 /// Lets the per-search health probe avoid re-opening the database: keyed by
-/// `pool.sqlite_identity_key()` (`path@pool-generation`), which a recovery
-/// that replaces the file also replaces.
+/// `pool.engine_identity_key()` (`path@pool-generation`), which a recovery
+/// that replaces the file also replaces. Not `sqlite_identity_key()`: live
+/// read-lane wrappers carry a fresh read-cache generation per call, and a
+/// per-call key would open a fresh connection on the live file for every
+/// search (GH#333).
 fn lexical_generation_cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1500,7 +1503,7 @@ fn cached_db_generation_for_pool(pool: &DbPool) -> Option<String> {
     if pool.sqlite_path() == ":memory:" {
         return None;
     }
-    let cache_key = pool.sqlite_identity_key();
+    let cache_key = pool.engine_identity_key();
     if let Some(generation) = lexical_generation_cache()
         .lock()
         .ok()
