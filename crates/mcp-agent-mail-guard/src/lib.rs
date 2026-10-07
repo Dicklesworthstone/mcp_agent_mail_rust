@@ -1765,6 +1765,26 @@ if __name__ == "__main__":
         .replace("__STORAGE_ROOT_JSON__", &storage_root_json)
 }
 
+fn render_cmd_shim(hook_name: &str) -> String {
+    format!(
+        "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%{hook_name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+    )
+}
+
+fn render_ps1_shim(hook_name: &str) -> String {
+    format!(
+        "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot '{hook_name}'\npython $hook @args\nexit $LASTEXITCODE\n"
+    )
+}
+
+/// Remove `path` only when it holds exactly the shim install wrote: install
+/// leaves a user's own `.cmd`/`.ps1` alone, so uninstall must too.
+fn remove_own_shim(path: &Path, shim: &str) {
+    if std::fs::read_to_string(path).is_ok_and(|content| content == shim) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// `base`, or `base-2`, `base-3`, ... : the first that does not exist yet.
 fn unused_path(base: &Path) -> PathBuf {
     if std::fs::symlink_metadata(base).is_err() {
@@ -1824,17 +1844,11 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
         // Windows shims
         let cmd_path = hooks_dir.join(format!("{name}.cmd"));
         if !cmd_path.exists() {
-            let body = format!(
-                "@echo off\r\nsetlocal\r\nset \"DIR=%~dp0\"\r\npython \"%DIR%{name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
-            );
-            write_guard_file_atomic(&cmd_path, &body, false)?;
+            write_guard_file_atomic(&cmd_path, &render_cmd_shim(name), false)?;
         }
         let ps1_path = hooks_dir.join(format!("{name}.ps1"));
         if !ps1_path.exists() {
-            let body = format!(
-                "$ErrorActionPreference = 'Stop'\n$hook = Join-Path $PSScriptRoot '{name}'\npython $hook @args\nexit $LASTEXITCODE\n"
-            );
-            write_guard_file_atomic(&ps1_path, &body, false)?;
+            write_guard_file_atomic(&ps1_path, &render_ps1_shim(name), false)?;
         }
 
         // Write guard plugin
@@ -1914,12 +1928,24 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
             if orig_path.exists() {
                 std::fs::rename(&orig_path, &hook_path)?;
             }
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.cmd")),
+                &render_cmd_shim(hook_name),
+            );
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.ps1")),
+                &render_ps1_shim(hook_name),
+            );
         } else if is_legacy_hook {
             let _ = std::fs::remove_file(&hook_path);
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.cmd")));
-            let _ = std::fs::remove_file(hooks_dir.join(format!("{hook_name}.ps1")));
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.cmd")),
+                &render_cmd_shim(hook_name),
+            );
+            remove_own_shim(
+                &hooks_dir.join(format!("{hook_name}.ps1")),
+                &render_ps1_shim(hook_name),
+            );
         }
     }
 
@@ -3593,8 +3619,15 @@ mod tests {
         let pre_commit = hooks_dir.join("pre-commit");
         let orig_body = "#!/bin/sh\necho original\n";
         std::fs::write(&pre_commit, orig_body).expect("write pre-commit");
+        // The user's own Windows wrapper: install leaves it, uninstall must too.
+        let user_cmd = "@echo off\r\nrem my own wrapper\r\n";
+        std::fs::write(hooks_dir.join("pre-commit.cmd"), user_cmd).expect("write user cmd");
 
         install_guard("/abs/path/backend", &repo_dir, false).expect("install_guard");
+        assert!(
+            hooks_dir.join("pre-commit.ps1").exists(),
+            "install writes its own .ps1 shim"
+        );
 
         let chain_body = std::fs::read_to_string(&pre_commit).expect("read chain");
         assert!(
@@ -3617,6 +3650,15 @@ mod tests {
         assert!(!plugin_path.exists(), "expected plugin file to be removed");
         let restored = std::fs::read_to_string(&pre_commit).expect("read restored pre-commit");
         assert_eq!(restored, orig_body);
+        assert!(
+            !hooks_dir.join("pre-commit.ps1").exists(),
+            "uninstall removes the shim it wrote"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-commit.cmd")).expect("user cmd kept"),
+            user_cmd,
+            "uninstall must not delete the user's own .cmd"
+        );
     }
 
     #[test]
