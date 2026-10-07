@@ -8,6 +8,8 @@
 //! may already name a newer lease. Completion receipts certify the DB operation,
 //! not the entire archive. Bulk intents advance one bounded page per pass and
 //! remain queued until their complete, finite scope has been examined.
+//! All database pages and completion receipts in a pass precede archive work.
+//! A failed or blocked archive follow-up cannot strand that pass's closeouts.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +31,62 @@ pub(super) use paging::Cursor;
 const RELEASE_LOCK: &str = ".release_file_reservations.jsonl.lock";
 const MAX_ARCHIVE_REPAIRS_PER_BATCH: usize = 4;
 
+struct AppliedPage {
+    released: Vec<FileReservationRow>,
+    generation: Option<String>,
+    complete: bool,
+}
+
+/// Disposable identity hints for this pass, never a persistent payload queue.
+/// At most four rows survive the mutation phase. The release ledger remains
+/// authoritative if the worker exits before, or during, archive follow-up.
+#[derive(Default)]
+struct ArchiveFollowups {
+    groups: Vec<(Vec<FileReservationRow>, String)>,
+    retained: usize,
+    unversioned: usize,
+}
+
+impl ArchiveFollowups {
+    fn remember(&mut self, page: AppliedPage) {
+        let Some(generation) = page.generation.filter(|value| !value.is_empty()) else {
+            self.unversioned += page.released.len();
+            return;
+        };
+        let remaining = MAX_ARCHIVE_REPAIRS_PER_BATCH.saturating_sub(self.retained);
+        let rows: Vec<_> = page.released.into_iter().take(remaining).collect();
+        if !rows.is_empty() {
+            self.retained += rows.len();
+            self.groups.push((rows, generation));
+        }
+    }
+
+    fn run(self, cx: &Cx, pool: &DbPool, config: &Config, shutdown: &AtomicBool) {
+        if self.unversioned > 0 {
+            tracing::warn!(released = self.unversioned,
+                "release applied; missing generation defers archive repair without a legacy write");
+        }
+        let mut budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
+        for (rows, generation) in self.groups {
+            if shutdown.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                break;
+            }
+            // Admission is reacquired by storage and the original generation
+            // is checked there. Dropping replay's lease is not authority to
+            // publish a release into a replacement mailbox generation.
+            reconcile_release_archive(cx, pool, config, &rows, &Ok(Some(generation)), &mut budget);
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    // Fault injection at the real receipt/archive boundary, after the source
+    // lease drops. Database mutations and journal publication remain real.
+    static BEFORE_ARCHIVE_FOLLOWUPS: std::cell::RefCell<Option<Box<dyn FnOnce(usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(super) async fn replay_batch(
     cx: &Cx,
     pool: &DbPool,
@@ -38,14 +96,19 @@ pub(super) async fn replay_batch(
     intents: &[QueuedReleaseIntentView],
 ) -> Result<ReplayReport, String> {
     let mut report = ReplayReport::default();
-    if shutdown.load(Ordering::Acquire) {
+    if shutdown.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
         return Ok(report);
     }
     // This path deliberately bypasses public tool handlers and their WriteDbPool
     // lease. Retain the same promotion exclusion through identity resolution,
-    // page mutation, archive verification and completion receipt publication.
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    // page mutation and completion receipt publication. Archive repair has
+    // its own admission and must not precede any closeout in this pass.
+    // A retryable closeout must not wait for promotion, including a failed
+    // drain whose owner still excludes writers. Refuse before source access
+    // or any round/page changes; the supervisor can retry the durable journal.
+    let write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or("durable release replay deferred: recovery promotion or admission contention")?;
     validate_live_pool(cx, pool, config).await?;
     let keys: Vec<_> = intents
         .iter()
@@ -55,7 +118,7 @@ pub(super) async fn replay_batch(
     let candidates = cursor.round.candidates(&keys);
     report.more = candidates.len() > MAX_ATTEMPTS;
     let ctx = McpContext::new(cx.clone(), 0);
-    let mut archive_budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
+    let mut followups = ArchiveFollowups::default();
     for index in candidates.into_iter().take(MAX_ATTEMPTS) {
         if shutdown.load(Ordering::Acquire) || ctx.checkpoint().is_err() {
             report.interrupted = true;
@@ -67,28 +130,29 @@ pub(super) async fn replay_batch(
         cursor.round.after = Some(key.clone());
         report.attempted += 1;
         let position = cursor.pages.entry(key.clone()).or_default();
-        match apply_release(&ctx, pool, config, intent, position, &mut archive_budget).await {
-            Ok((released, complete)) => {
+        match apply_release(&ctx, pool, intent, position).await {
+            Ok(page) => {
                 // Applied counts successful pages, including a sparse page
                 // that advanced without finding a matching path. It does not
                 // imply that the whole intent has completed.
                 report.applied += 1;
-                report.rows_released += released;
-                if !complete {
+                report.rows_released += page.released.len();
+                if !page.complete {
                     report.more = true;
-                    continue;
-                }
-                match append_completion(config, intent, position.released) {
-                    Ok(()) => {
-                        report.completed += 1;
-                        cursor.pages.remove(key);
+                } else {
+                    match append_completion(config, intent, position.released) {
+                        Ok(()) => {
+                            report.completed += 1;
+                            cursor.pages.remove(key);
+                        }
+                        Err(error) => {
+                            report.deferred += 1;
+                            tracing::warn!(intent_id = %intent.intent_id, %error,
+                                "release applied but completion receipt unavailable; replay retained");
+                        }
                     }
-                    Err(error) => {
-                        report.deferred += 1;
-                        tracing::warn!(intent_id = %intent.intent_id, %error,
-                            "release applied but completion receipt unavailable; replay retained");
-                    }
                 }
+                followups.remember(page);
             }
             Err(error) => {
                 report.deferred += 1;
@@ -98,6 +162,19 @@ pub(super) async fn replay_batch(
         }
     }
     report.more |= !cursor.pages.is_empty();
+    drop(write_activity);
+    // Finish the bounded batch's database work and terminal receipts before
+    // waiting for any archive I/O. An interrupted follow-up is repaired from
+    // the release ledger, even if the intent has already left the journal.
+    #[cfg(test)]
+    BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook(followups.retained);
+        }
+    });
+    followups.run(cx, pool, config, shutdown);
+    report.interrupted |= shutdown.load(Ordering::Acquire) || cx.checkpoint().is_err();
     Ok(report)
 }
 
@@ -214,11 +291,9 @@ fn matches_scope(
 async fn apply_release(
     ctx: &McpContext,
     pool: &DbPool,
-    config: &Config,
     intent: &QueuedReleaseIntentView,
     position: &mut paging::Position,
-    archive_budget: &mut usize,
-) -> Result<(usize, bool), String> {
+) -> Result<AppliedPage, String> {
     if intent.created_ts <= 0 {
         return Err("queued release has no positive creation cutoff".to_string());
     }
@@ -251,7 +326,11 @@ async fn apply_release(
             .as_ref()
             .is_some_and(Vec::is_empty)
     {
-        return Ok((0, true));
+        return Ok(AppliedPage {
+            released: Vec::new(),
+            generation: None,
+            complete: true,
+        });
     }
     // A failed authority query cannot advance a multi-pass scan. A legitimately
     // unseeded generation is allowed, but any later identity/generation change
@@ -300,15 +379,11 @@ async fn apply_release(
         )?
     };
     position.applied(&page, released.len());
-    reconcile_release_archive(
-        ctx.cx(),
-        pool,
-        config,
-        &released,
-        &Ok(generation),
-        archive_budget,
-    );
-    Ok((released.len(), page.complete))
+    Ok(AppliedPage {
+        released,
+        generation,
+        complete: page.complete,
+    })
 }
 
 /// Repair at most the remaining per-pass budget; failures consume it too.
@@ -492,6 +567,9 @@ mod tests {
 
     #[test]
     fn replay_releases_old_scope_not_future_or_foreign_leases_and_materializes_archive() {
+        if isolated_completion_test() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             storage_root: temp.path().to_path_buf(),
@@ -726,6 +804,9 @@ mod tests {
     }
 
     fn with_replay_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config, &str, &str)) {
+        if isolated_completion_test() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
@@ -1298,6 +1379,360 @@ mod tests {
                 journal::read_queued_release_intents(config).unwrap(),
                 [] as [QueuedReleaseIntentView; 0]
             );
+        });
+    }
+
+    // These boundary tests inspect real process-global admission. Run in a
+    // private child; file-backed output cannot fill a pipe while we wait.
+    fn isolated_completion_test() -> bool {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "AM_TEST_RELEASE_COMPLETION_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let mut log = tempfile::tempfile().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log.try_clone().unwrap())
+            .spawn()
+            .expect("spawn isolated release completion test");
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut expired = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                expired = true;
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.wait().unwrap();
+        log.seek(SeekFrom::Start(0)).unwrap();
+        let mut output = String::new();
+        log.read_to_string(&mut output).unwrap();
+        assert!(
+            !expired && status.success() && output.contains("1 passed; 0 failed"),
+            "isolated {name} failed (timeout={expired}): {output}"
+        );
+        true
+    }
+
+    #[test]
+    fn all_batch_receipts_survive_an_exit_before_the_first_archive_followup() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::sync::Arc;
+
+        if isolated_completion_test() {
+            return;
+        }
+        with_replay_mailbox(|cx, pool, config, generation, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            let ids: Vec<_> = (401..407).collect();
+            for &id in &ids {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+                queue_fixture_release(config, cutoff, id);
+            }
+            let reached = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&reached);
+            let selected = config.clone();
+            BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |retained| {
+                    assert_eq!(retained, MAX_ARCHIVE_REPAIRS_PER_BATCH);
+                    assert!(journal::read_queued_release_intents(&selected).unwrap().is_empty());
+                    assert_eq!(active_writer_count(), 0);
+                    let promotion = try_acquire_promotion_barrier_if_idle()
+                        .expect("completed batch must release database admission");
+                    drop(promotion);
+                    assert!(!selected.storage_root.join("projects/replay/file_reservations").exists());
+                    // Mark only after every boundary assertion succeeded, so
+                    // catch_unwind cannot mistake an assertion for the fault.
+                    observed.store(true, Ordering::Release);
+                    panic!("injected exit after all receipts, before archive I/O");
+                }));
+            });
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                page_pass(cx, pool, config, &mut Cursor::default())
+            }));
+            assert!(failed.is_err());
+            assert!(reached.load(Ordering::Acquire));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            let released = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
+                .into_result().unwrap();
+            assert_eq!(released.len(), ids.len());
+            assert!(released.iter().all(|row| row.released_ts.is_some()));
+            assert_eq!(active_writer_count(), 0);
+
+            // No intent or in-memory follow-up survives. The real history
+            // reconciler must use the ledger and the latest database metadata.
+            let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason='after replay exit'").unwrap();
+            drop(conn);
+            let mut history = mcp_agent_mail_storage::recovery::reservation_reconcile::ReservationReconcileCursor::default();
+            for _ in 0..3 {
+                mcp_agent_mail_storage::recovery::reservation_reconcile::reconcile_reservation_releases(
+                    cx, pool, config, &mut history, &AtomicBool::new(false),
+                ).unwrap();
+            }
+            for row in released {
+                let file = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    Some(generation), row.id.unwrap(),
+                );
+                let bytes = std::fs::read(config.storage_root.join("projects/replay/file_reservations").join(file)).unwrap();
+                let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(artifact["reason"], "after replay exit");
+                assert_eq!(artifact["db_generation"], generation);
+                assert_eq!(artifact["released_ts"], micros_to_iso(row.released_ts.unwrap()));
+            }
+        });
+    }
+
+    #[test]
+    fn shutdown_after_receipts_preserves_partial_pages_and_completed_closeouts() {
+        use std::sync::Arc;
+
+        if isolated_completion_test() {
+            return;
+        }
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=65 {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+            }
+            seed_replay_lease(cx, pool, 501, "small.rs", cutoff - 1);
+            queue_scope(config, cutoff, "BlueLake", None, None);
+            queue_fixture_release(config, cutoff, 501);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_at_boundary = Arc::clone(&stop);
+            let selected = config.clone();
+            BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |retained| {
+                    assert_eq!(retained, MAX_ARCHIVE_REPAIRS_PER_BATCH);
+                    let pending = journal::read_queued_release_intents(&selected).unwrap();
+                    assert_eq!(pending.len(), 1);
+                    assert!(pending[0].file_reservation_ids.is_none(), "bulk scope is incomplete");
+                    assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                    stop_at_boundary.store(true, Ordering::Release);
+                }));
+            });
+            let mut cursor = Cursor::default();
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            let report = fastmcp_core::block_on(replay_batch(
+                cx, pool, config, &mut cursor, &stop, &intents,
+            )).unwrap();
+            assert!(report.interrupted);
+            assert_eq!((report.applied, report.completed, report.rows_released), (2, 1, 65));
+            assert!(!config.storage_root.join("projects/replay/file_reservations").exists());
+            let before = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
+                .into_result().unwrap();
+            assert!(before.iter().all(|row| row.released_ts.is_some()));
+            let resumed = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            let after = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
+                .into_result().unwrap();
+            assert_eq!(
+                before.iter().map(|row| (row.id, row.released_ts)).collect::<Vec<_>>(),
+                after.iter().map(|row| (row.id, row.released_ts)).collect::<Vec<_>>(),
+            );
+        });
+    }
+
+    #[test]
+    fn failed_receipt_publication_keeps_applied_release_pending_for_idempotent_retry() {
+        if isolated_completion_test() {
+            return;
+        }
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/receipt.rs", cutoff - 1);
+            queue_fixture_release(config, cutoff, 401);
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let before = std::fs::read(&log).unwrap();
+            let lock_path = config.storage_root.join(journal::DEGRADED_INTENTS_DIR).join(RELEASE_LOCK);
+            let held = std::fs::OpenOptions::new().read(true).write(true).open(lock_path).unwrap();
+            fs2::FileExt::try_lock_exclusive(&held).unwrap();
+            let mut cursor = Cursor::default();
+            let report = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 0, 1));
+            assert_eq!(std::fs::read(&log).unwrap(), before);
+            assert_eq!(journal::read_queued_release_intents(config).unwrap().len(), 1);
+            let original = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
+                .into_result().unwrap()[0].released_ts;
+            assert!(original.is_some());
+            fs2::FileExt::unlock(&held).unwrap();
+            let retry = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((retry.rows_released, retry.completed, retry.deferred), (0, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            let after = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
+                .into_result().unwrap()[0].released_ts;
+            assert_eq!(after, original);
+        });
+    }
+
+    #[test]
+    fn a_changed_generation_after_completion_cannot_authorize_old_archive_followups() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+
+        if isolated_completion_test() {
+            return;
+        }
+        with_replay_mailbox(|cx, pool, config, generation, _| {
+            assert_ne!(generation, "ccdd");
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/generation.rs", cutoff - 1);
+            queue_fixture_release(config, cutoff, 401);
+            let selected = config.clone();
+            let database = pool.sqlite_path().to_string();
+            BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |retained| {
+                    assert_eq!(retained, 1);
+                    assert!(journal::read_queued_release_intents(&selected).unwrap().is_empty());
+                    assert_eq!(active_writer_count(), 0);
+                    let promotion = try_acquire_promotion_barrier_if_idle().unwrap();
+                    let conn = mcp_agent_mail_db::DbConn::open_file(&database).unwrap();
+                    conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0").unwrap();
+                    drop(conn);
+                    drop(promotion);
+                }));
+            });
+            let report = page_pass(cx, pool, config, &mut Cursor::default());
+            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert!(!config.storage_root.join("projects/replay/file_reservations").exists());
+            let current = fastmcp_core::block_on(queries::db_generation_id(cx, pool))
+                .into_result().unwrap();
+            assert_eq!(current.as_deref(), Some("ccdd"));
+        });
+    }
+
+    #[test]
+    fn promotion_refusal_preserves_an_applied_bulk_page_and_its_durable_intent() {
+        use mcp_agent_mail_db::write_barrier::{
+            DrainOutcome, acquire_promotion_barrier_draining, active_writer_count,
+            begin_write_activity, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=65 {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+            }
+            queue_scope(config, cutoff, "BlueLake", None, None);
+            let mut cursor = Cursor::default();
+            assert_eq!(page_pass(cx, pool, config, &mut cursor).rows_released, 64);
+            let round_before = cursor.round.after.clone();
+            let progress_before: Vec<_> = cursor.pages.iter()
+                .map(|(key, position)| (key.clone(), position.released)).collect();
+            assert_eq!(progress_before.len(), 1);
+            assert_eq!(progress_before[0].1, 64);
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let bytes_before = std::fs::read(&log).unwrap();
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            for parent_writer in [false, true] {
+                let parent = parent_writer.then(begin_write_activity);
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let owner = std::thread::spawn(move || {
+                    let gate = if parent_writer {
+                        let (gate, result) = acquire_promotion_barrier_draining(Duration::ZERO);
+                        assert!(matches!(result, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        gate
+                    } else {
+                        try_acquire_promotion_barrier_if_idle().expect("idle promotion")
+                    };
+                    ready_tx.send(()).unwrap();
+                    // Cleanup only: the test requires replay to return before
+                    // explicit release, not by waiting for this timeout.
+                    let released = release_rx.recv_timeout(Duration::from_secs(10));
+                    drop(gate);
+                    released
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let refused = fastmcp_core::block_on(replay_batch(
+                    cx, pool, config, &mut cursor, &AtomicBool::new(false), &intents,
+                ));
+                let writers = active_writer_count();
+                let bytes_during = std::fs::read(&log).unwrap();
+                drop(parent);
+                let _ = release_tx.send(());
+                assert!(owner.join().unwrap().is_ok(), "replay waited for promotion expiry");
+                assert!(refused.unwrap_err().contains("admission contention"));
+                assert_eq!(writers, usize::from(parent_writer));
+                assert_eq!(active_writer_count(), 0);
+                assert_eq!(bytes_during, bytes_before);
+                assert_eq!(cursor.round.after, round_before);
+                let progress: Vec<_> = cursor.pages.iter()
+                    .map(|(key, position)| (key.clone(), position.released)).collect();
+                assert_eq!(progress, progress_before);
+                let remaining = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[65]))
+                    .into_result().unwrap();
+                assert!(remaining[0].released_ts.is_none());
+            }
+            // No cursor reset: completion must resume after the committed
+            // 64-ID page, not rescan it or abandon the last lease.
+            let resumed = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn release_replay_cannot_use_a_promotion_owners_blocking_writer_exemption() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/owner.rs", cutoff - 1);
+            queue_fixture_release(config, cutoff, 401);
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let before = std::fs::read(&log).unwrap();
+            let mut cursor = Cursor::default();
+            let gate = try_acquire_promotion_barrier_if_idle().unwrap();
+            let refused = fastmcp_core::block_on(replay_batch(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false), &intents,
+            ));
+            let writers = active_writer_count();
+            drop(gate);
+            assert!(refused.unwrap_err().contains("admission contention"));
+            assert_eq!(writers, 0);
+            assert!(cursor.round.after.is_none());
+            assert!(cursor.pages.is_empty());
+            assert_eq!(std::fs::read(log).unwrap(), before);
+            let resumed = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((resumed.rows_released, resumed.completed), (1, 1));
+        });
+    }
+
+    #[test]
+    fn other_counted_writers_do_not_disable_release_replay() {
+        use mcp_agent_mail_db::write_barrier::{active_writer_count, begin_write_activity};
+
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/parallel.rs", cutoff - 1);
+            queue_fixture_release(config, cutoff, 401);
+            let writer = begin_write_activity();
+            let report = page_pass(cx, pool, config, &mut Cursor::default());
+            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(active_writer_count(), 1);
+            drop(writer);
+            assert_eq!(active_writer_count(), 0);
         });
     }
 }

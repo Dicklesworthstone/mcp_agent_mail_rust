@@ -5172,8 +5172,30 @@ static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn
 /// (GH#333, br-8r6dl). Callers drop their wrapper after each call, so a weak
 /// registry entry would die immediately; recovery retires these entries in
 /// [`retire_cached_runtime_state_after_recovery`].
-static LIVE_QUERY_ONLY_POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, DbPool>>> =
-    OnceLock::new();
+static LIVE_QUERY_ONLY_POOL_CACHE: OnceLock<
+    OrderedRwLock<HashMap<PoolCacheKey, LiveQueryOnlyPoolEntry>>,
+> = OnceLock::new();
+static LIVE_QUERY_ONLY_POOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct LiveQueryOnlyPoolEntry {
+    /// Insertion order, for [`LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY`] eviction.
+    sequence: u64,
+    /// Device and inode (volume and file index on Windows) of the mailbox
+    /// file when the pool was created. A per-call pool always opened the
+    /// file the path names now; a cached pool must not keep reading a
+    /// generation that another process replaced or removed.
+    file_id: Option<(u64, u64)>,
+    pool: DbPool,
+}
+
+fn live_query_only_file_id(sqlite_identity: &Path) -> Option<(u64, u64)> {
+    health_probe_file_stamp(sqlite_identity).map(|(device, file, _, _)| (device, file))
+}
+/// Upper bound on [`LIVE_QUERY_ONLY_POOL_CACHE`] entries. A server reads one
+/// mailbox, so this only binds processes that touch many mailboxes (a test
+/// binary creates one per test), where an unbounded strong registry would pin
+/// every pool's idle connections, worker threads and descriptors.
+const LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY: usize = 4;
 
 /// Retire every in-process handle and identity cache for a replaced SQLite
 /// generation, regardless of which pool configuration created it.
@@ -5208,15 +5230,15 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
         // they must never be held together.
         if let Some(cache) = LIVE_QUERY_ONLY_POOL_CACHE.get() {
             let mut guard = cache.write();
-            guard.retain(|key, read_pool| {
+            guard.retain(|key, entry| {
                 if key.sqlite_identity.as_deref() != Some(identity) {
                     return true;
                 }
                 if !pools
                     .iter()
-                    .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &read_pool.pool))
+                    .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &entry.pool.pool))
                 {
-                    pools.push(Arc::clone(&read_pool.pool));
+                    pools.push(Arc::clone(&entry.pool.pool));
                 }
                 false
             });
@@ -16659,7 +16681,8 @@ pub fn create_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
 /// shape, so request-path reads reuse engine connections instead of opening
 /// and closing one per call (see [`LIVE_QUERY_ONLY_POOL_CACHE`]). Recovery
 /// retires the entry, so a replaced generation is never read through a
-/// pre-recovery handle.
+/// pre-recovery handle, and an entry whose mailbox path now names a different
+/// file, or none, is rebuilt the way a per-call pool would have reopened it.
 pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let authority = DbPoolAuthority::resolve(config)?;
     if authority.sqlite_identity.is_none() {
@@ -16672,27 +16695,68 @@ pub fn get_or_create_live_query_only_pool(config: &DbPoolConfig) -> DbResult<DbP
         config.acquire_timeout_ms,
         config.max_lifetime_ms,
     );
+    let file_id = cache_key
+        .sqlite_identity
+        .as_deref()
+        .and_then(live_query_only_file_id);
+    let current =
+        |entry: &LiveQueryOnlyPoolEntry| !entry.pool.pool.is_closed() && entry.file_id == file_id;
     let cache = LIVE_QUERY_ONLY_POOL_CACHE
         .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
     {
         let guard = cache.read();
-        if let Some(pool) = guard.get(&cache_key)
-            && !pool.pool.is_closed()
+        if let Some(entry) = guard.get(&cache_key)
+            && current(entry)
         {
-            return Ok(pool.clone());
+            return Ok(entry.pool.clone());
         }
     }
     // Construct outside the registry lock (GH#184): authority resolution and
     // pool setup touch the filesystem.
     let pool = DbPool::new_with_authority(config, true, true, authority)?;
     let mut guard = cache.write();
-    if let Some(existing) = guard.get(&cache_key)
-        && !existing.pool.is_closed()
+    if let Some(entry) = guard.get(&cache_key)
+        && current(entry)
     {
-        return Ok(existing.clone());
+        return Ok(entry.pool.clone());
     }
-    guard.insert(cache_key, pool.clone());
+    // Replace a stale entry for this key, forget closed entries, then evict
+    // the oldest until there is room. Eviction drops only the registry's
+    // reference: an in-flight caller keeps its clone and the pool's
+    // connections close when the last one drops, so a concurrent read is
+    // never failed by a close. Dropping happens after the lock is released,
+    // because the last drop closes engine connections.
+    let mut evicted = Vec::new();
+    evicted.extend(guard.remove(&cache_key));
+    let closed_keys = guard
+        .iter()
+        .filter(|(_, entry)| entry.pool.pool.is_closed())
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in &closed_keys {
+        evicted.extend(guard.remove(key));
+    }
+    while guard.len() >= LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY {
+        let Some(oldest) = guard
+            .iter()
+            .min_by_key(|(_, entry)| entry.sequence)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        evicted.extend(guard.remove(&oldest));
+    }
+    let sequence = LIVE_QUERY_ONLY_POOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    guard.insert(
+        cache_key,
+        LiveQueryOnlyPoolEntry {
+            sequence,
+            file_id,
+            pool: pool.clone(),
+        },
+    );
     drop(guard);
+    drop(evicted);
     Ok(pool)
 }
 
@@ -24798,6 +24862,85 @@ mod tests {
             get_or_create_live_query_only_pool(&config).expect("post-recovery live read pool");
         assert!(!Arc::ptr_eq(&shared, &replacement.pool));
         assert!(!replacement.pool.is_closed());
+
+        // The registry is bounded: reading enough other mailboxes evicts the
+        // oldest entry without closing it under a caller that still holds it.
+        // This stays in the same test as the sharing checks above, because a
+        // parallel test filling the registry could evict their entry.
+        let latest = get_or_create_live_query_only_pool(&config).expect("latest live read pool");
+        assert!(Arc::ptr_eq(&replacement.pool, &latest.pool));
+        for index in 0..LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY {
+            let other_path = dir.path().join(format!("other-mailbox-{index}.sqlite3"));
+            let other_seed = DbConn::open_file(other_path.to_string_lossy().into_owned())
+                .expect("open other seed db");
+            other_seed
+                .execute_raw(&schema::init_schema_sql_base())
+                .expect("initialize other seed schema");
+            drop(other_seed);
+            let other = get_or_create_live_query_only_pool(&DbPoolConfig {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&other_path),
+                ..config.clone()
+            })
+            .expect("other mailbox live read pool");
+            assert!(!other.pool.is_closed());
+        }
+        let after_eviction =
+            get_or_create_live_query_only_pool(&config).expect("live read pool after eviction");
+        assert!(
+            !Arc::ptr_eq(&latest.pool, &after_eviction.pool),
+            "the oldest live read pool must be evicted once the registry is full"
+        );
+        assert!(
+            !latest.pool.is_closed(),
+            "eviction must not close a pool an in-flight caller still holds"
+        );
+        let conn = runtime
+            .block_on(latest.acquire(&cx))
+            .into_result()
+            .expect("an evicted pool still serves its holder");
+        drop(conn);
+        let cached = LIVE_QUERY_ONLY_POOL_CACHE
+            .get()
+            .expect("registry initialized")
+            .read()
+            .len();
+        assert!(cached <= LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY);
+
+        // Another process replacing the mailbox file outside this process'
+        // recovery path: the next read must get a pool for the file the path
+        // names now. No connection is opened on either generation, so the
+        // swap leaves no engine sidecars behind for the new file.
+        let seed_mailbox = |path: &Path| {
+            let seed =
+                DbConn::open_file(path.to_string_lossy().into_owned()).expect("open swap seed");
+            seed.execute_raw(&schema::init_schema_sql_base())
+                .expect("initialize swap seed schema");
+            drop(seed);
+        };
+        let swap_path = dir.path().join("swap-mailbox.sqlite3");
+        let staged_path = dir.path().join("swap-mailbox-staged.sqlite3");
+        seed_mailbox(&swap_path);
+        let swap_config = DbPoolConfig {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&swap_path),
+            ..config.clone()
+        };
+        let before_swap =
+            get_or_create_live_query_only_pool(&swap_config).expect("pre-swap live read pool");
+        seed_mailbox(&staged_path);
+        std::fs::rename(&staged_path, &swap_path).expect("replace mailbox file");
+        let after_swap =
+            get_or_create_live_query_only_pool(&swap_config).expect("post-swap live read pool");
+        assert!(
+            !Arc::ptr_eq(&before_swap.pool, &after_swap.pool),
+            "a mailbox file replaced out of process must not be read through the old pool"
+        );
+        assert!(
+            !before_swap.pool.is_closed(),
+            "rebuilding a stale entry must not close the old pool under its holders"
+        );
+        let again =
+            get_or_create_live_query_only_pool(&swap_config).expect("stable live read pool");
+        assert!(Arc::ptr_eq(&after_swap.pool, &again.pool));
     }
 
     #[test]
