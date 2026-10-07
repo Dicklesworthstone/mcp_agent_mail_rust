@@ -984,6 +984,7 @@ impl ContactsScreen {
     fn render_graph(&self, frame: &mut Frame<'_>, area: Rect, metrics: &GraphFlowMetrics) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
+            .borders(Borders::ALL)
             .title("Network Graph")
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
@@ -1100,6 +1101,7 @@ impl ContactsScreen {
     fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect, events: &[MailEvent]) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let block = Block::default()
+            .borders(Borders::ALL)
             .title("Mermaid Contact Graph [g]")
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
@@ -1437,6 +1439,7 @@ impl ContactsScreen {
             .collect();
 
         let block = Block::default()
+            .borders(Borders::ALL)
             .title("Contacts")
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(tp.panel_border));
@@ -2768,6 +2771,38 @@ mod tests {
         // Gamma -> Alpha (1 message) is warmer than the empty diagonal.
         assert_ne!(bg(2, "Alpha"), bg(0, "Alpha"));
         assert_eq!(bg(1, "Alpha"), bg(0, "Alpha"), "zero cells share one color");
+    }
+
+    #[test]
+    fn table_graph_and_mermaid_panels_draw_their_titles() {
+        let state = test_state();
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "Alpha",
+            vec!["Beta".to_string()],
+            "s",
+            "t",
+            "p",
+            "",
+        ));
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        // A title draws on its panel's top border, so its row carries `─`;
+        // the "Contacts" metric tile's label row does not.
+        let title_on_border = |screen: &ContactsScreen, title: &str| {
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(120, 32, &mut pool);
+            screen.view(&mut frame, Rect::new(0, 0, 120, 32), &state);
+            (0..32)
+                .map(|y| row_text(&frame, y))
+                .any(|row| row.contains(title) && row.contains('─'))
+        };
+
+        assert!(title_on_border(&screen, "Contacts"));
+        screen.view_mode = ViewMode::Graph;
+        assert!(title_on_border(&screen, "Network Graph"));
+        screen.show_mermaid_panel = true;
+        assert!(title_on_border(&screen, "Mermaid Contact Graph [g]"));
     }
 
     #[test]

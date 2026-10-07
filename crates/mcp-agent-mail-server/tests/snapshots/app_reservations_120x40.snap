@@ -20,7 +20,7 @@
 │                             │                                                          │                             │
 │                             │ ??  No Active Reservations                               │                             │
 │                             │                                                          │                             │
-│                             │ Use `file_reservation_paths` to reserve files. Press 'r' │                             │
+│                             │ Press n to reserve (agents use file_reservation_paths).  │                             │
 │                             │                                                          │                             │
 │                             ╰──────────────────────────────────────────────────────────╯                             │
 │                                                                                                                      │

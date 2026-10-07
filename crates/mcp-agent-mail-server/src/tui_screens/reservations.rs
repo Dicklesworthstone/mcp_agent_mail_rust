@@ -2217,7 +2217,8 @@ impl MailScreen for ReservationsScreen {
                 } else if self.show_released {
                     "No reservations match current filters. Press 'x' to toggle released."
                 } else {
-                    "Use `file_reservation_paths` to reserve files. Press 'r' to refresh."
+                    // The table refreshes itself; `r` does nothing here.
+                    "Press n to reserve (agents use file_reservation_paths)."
                 };
                 let title = self.agent_filter.as_ref().map_or_else(
                     || "No Active Reservations".to_string(),
