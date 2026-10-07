@@ -81729,6 +81729,37 @@ fn ensure_share_zip_target_absent(
     Ok(Some(zip_path))
 }
 
+/// ZIP `bundle_dir` to `zip_path`, or, with age recipients, to `zip_path` +
+/// `.age` only. The plaintext ZIP is then just an intermediate: it is built
+/// and encrypted in a private staging directory beside the target (same
+/// filesystem, so the final rename is atomic) and only the encrypted file is
+/// moved into place; dropping the staging directory removes the plaintext.
+/// Leaving `OUT.zip` next to `OUT.zip.age` defeated the encryption.
+fn package_share_archive(
+    bundle_dir: &Path,
+    zip_path: &Path,
+    age_recipients: &[String],
+) -> CliResult<PathBuf> {
+    if age_recipients.is_empty() {
+        share::package_directory_as_zip(bundle_dir, zip_path)?;
+        return Ok(zip_path.to_path_buf());
+    }
+    let parent = zip_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::Builder::new()
+        .prefix(".share-archive.")
+        .tempdir_in(parent)?;
+    let staged_zip = staging.path().join(
+        zip_path
+            .file_name()
+            .unwrap_or_else(|| "bundle.zip".as_ref()),
+    );
+    share::package_directory_as_zip(bundle_dir, &staged_zip)?;
+    let staged_age = share::encrypt_with_age(&staged_zip, age_recipients)?;
+    let final_age = age_archive_path_for_input(zip_path);
+    std::fs::rename(&staged_age, &final_age)?;
+    Ok(final_age)
+}
+
 fn share_update_require_real_directory(path: &Path, label: &str) -> CliResult<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
@@ -82518,28 +82549,20 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         None
     };
 
-    // 12. ZIP
-    let mut archive_path: Option<PathBuf> = None;
-    let mut final_path = if params.zip {
-        ftui_runtime::ftui_println!("Packaging as ZIP...");
+    // 12. ZIP (and 13. encrypt: only the encrypted archive is left)
+    let final_path = if params.zip {
         let zip_path = zip_path.expect("zip path preflighted");
-        share::package_directory_as_zip(output, &zip_path)?;
-        ftui_runtime::ftui_println!("  ZIP: {}", zip_path.display());
-        archive_path = Some(zip_path.clone());
-        zip_path
+        if params.age_recipients.is_empty() {
+            ftui_runtime::ftui_println!("Packaging as ZIP...");
+        } else {
+            ftui_runtime::ftui_println!("Packaging as ZIP and encrypting with age...");
+        }
+        let archive = package_share_archive(output, &zip_path, &params.age_recipients)?;
+        ftui_runtime::ftui_println!("  Archive: {}", archive.display());
+        archive
     } else {
         output.clone()
     };
-
-    // 13. Encrypt
-    if !params.age_recipients.is_empty()
-        && let Some(ref archive) = archive_path
-    {
-        ftui_runtime::ftui_println!("Encrypting with age...");
-        let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
-        ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
-        final_path = encrypted;
-    }
 
     ftui_runtime::ftui_println!("Export complete: {}", final_path.display());
     Ok(())
@@ -82687,23 +82710,12 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         );
     }
 
-    // Package ZIP (optional).
-    let mut archive_path: Option<PathBuf> = None;
+    // Package ZIP (optional; encrypted, only the `.age` archive is left).
     if params.zip {
-        ftui_runtime::ftui_println!("Packaging as ZIP...");
         let zip_path = zip_path.expect("zip path preflighted");
-        share::package_directory_as_zip(&params.bundle, &zip_path)?;
-        ftui_runtime::ftui_println!("  ZIP: {}", zip_path.display());
-        archive_path = Some(zip_path);
-    }
-
-    // Encrypt (optional).
-    if !params.age_recipients.is_empty()
-        && let Some(ref archive) = archive_path
-    {
-        ftui_runtime::ftui_println!("Encrypting with age...");
-        let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
-        ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
+        ftui_runtime::ftui_println!("Packaging as ZIP...");
+        let archive = package_share_archive(&params.bundle, &zip_path, &params.age_recipients)?;
+        ftui_runtime::ftui_println!("  Archive: {}", archive.display());
     }
 
     ftui_runtime::ftui_println!("Update complete: {}", params.bundle.display());
@@ -95467,6 +95479,34 @@ fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let err = ensure_share_zip_target_absent(&bundle, false)
         .expect_err("existing zip archive should fail preflight");
     assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
+}
+
+#[test]
+fn encrypted_share_archives_leave_no_plaintext_zip_behind() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = temp.path().join("bundle");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    std::fs::write(bundle.join("index.html"), b"<html>secret</html>").expect("seed bundle");
+    let zip_path = zip_archive_path_for_dir(&bundle);
+
+    // Without recipients the ZIP is the product.
+    let plain = package_share_archive(&bundle, &zip_path, &[]).expect("plain zip");
+    assert_eq!(plain, zip_path);
+    assert!(zip_path.is_file());
+    std::fs::remove_file(&zip_path).expect("reset");
+
+    // With recipients the ZIP is only staged. Whether `age` is missing here or
+    // rejects the bogus recipient, the encryption fails, and neither the
+    // plaintext ZIP nor the staging directory may remain.
+    let result = package_share_archive(&bundle, &zip_path, &["not-an-age-recipient".to_string()]);
+    assert!(result.is_err(), "a bogus recipient cannot encrypt");
+    let leftovers = std::fs::read_dir(temp.path())
+        .expect("list parent")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "bundle")
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "plaintext left behind: {leftovers:?}");
 }
 
 #[test]
