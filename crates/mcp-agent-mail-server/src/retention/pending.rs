@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_worker_recovers_while_release_worker_is_blocked_on_the_real_archive_lock() {
+    fn closeout_workers_complete_while_archive_repair_defers_on_the_real_project_lock() {
         if isolate_replay_worker_test() {
             return;
         }
@@ -976,7 +976,7 @@ mod tests {
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
             drop(conn);
             let message = fastmcp_core::block_on(queries::create_message_with_recipients(
-                &cx, &pool, 71, 81, "ack after release stalls", "body", None,
+                &cx, &pool, 71, 81, "ack during archive contention", "body", None,
                 "normal", true, "[]", &[(81, "to")],
             )).into_result().unwrap();
             let message_id = message.id.unwrap();
@@ -986,6 +986,13 @@ mod tests {
             let lease_id = lease[0].id.unwrap();
             let archive = mcp_agent_mail_storage::ensure_archive(&config, "replay").unwrap();
             mcp_agent_mail_storage::flush_async_commits();
+            let generation = fastmcp_core::block_on(queries::db_generation_id(&cx, &pool))
+                .into_result().unwrap().expect("live generation");
+            let stable = archive.root.join("file_reservations").join(
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    Some(&generation), lease_id,
+                ),
+            );
             let mut record = json!({
                 "schema_version": 1, "kind": journal::RELEASE_INTENT_KIND,
                 "created_ts": mcp_agent_mail_db::now_micros(),
@@ -1031,8 +1038,12 @@ mod tests {
             let ack_completed = wait_for_replay_observation(|| {
                 journal::read_queued_ack_intents(&config).is_ok_and(|intents| intents.is_empty())
             });
-            let release_still_pending = journal::read_queued_release_intents(&config)
-                .is_ok_and(|intents| intents.len() == 1);
+            // Project-lock waiting is now bounded: database closeout and its
+            // receipt must finish even though the archive remains unavailable.
+            let release_completed_while_locked = wait_for_replay_observation(|| {
+                journal::read_queued_release_intents(&config).is_ok_and(|intents| intents.is_empty())
+            });
+            let archive_deferred_while_locked = !stable.exists();
             let release_still_running = !workers[1].as_ref().unwrap().is_finished();
             // An ACK completion marker alone is insufficient: verify the real
             // recipient receipt as well, while the archive lock is still held.
@@ -1050,10 +1061,23 @@ mod tests {
             assert!(explicitly_unlocked.is_ok(), "archive lock expired before explicit release");
             assert!(spawn_errors.is_empty());
             assert!(release_applied, "release never reached its database mutation");
-            assert!(release_still_pending && release_still_running, "release was not blocked during ACK recovery");
+            assert!(release_completed_while_locked && release_still_running);
+            assert!(archive_deferred_while_locked, "repair wrote through a held project lock");
             assert!(ack_completed && ack_ts.is_some_and(|ts| ts > 0));
             assert!(release_completed, "release did not finish after archive admission reopened");
             assert!(workers.iter().all(Option::is_none));
+            // Completion only certified the database. The existing ledger
+            // must still drive authoritative archive repair after unlocking.
+            let repaired = mcp_agent_mail_storage::recovery::reservation_reconcile::reconcile_reservation_releases(
+                &cx, &pool, &config,
+                &mut mcp_agent_mail_storage::recovery::reservation_reconcile::ReservationReconcileCursor::default(),
+                &AtomicBool::new(false),
+            ).unwrap();
+            assert!(repaired.repaired > 0);
+            let archived: serde_json::Value = serde_json::from_slice(&std::fs::read(&stable).unwrap()).unwrap();
+            assert_eq!(archived["id"], lease_id);
+            assert_eq!(archived["db_generation"], generation);
+            assert!(archived["released_ts"].is_string());
             mcp_agent_mail_storage::flush_async_commits();
         });
     }

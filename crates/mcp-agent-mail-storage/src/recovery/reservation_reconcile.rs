@@ -21,6 +21,8 @@ use sha1::{Digest as _, Sha1};
 use super::agent_reconcile::{Artifact, committed_artifact, head_tree, read_artifact};
 use crate::{ProjectArchive, StorageError};
 
+mod repair_lock;
+
 const IDS_PER_BATCH: i64 = 32;
 const MAX_REPAIRS_PER_BATCH: usize = 4;
 const PRIORITY_IDS_PER_BATCH: i64 = 16;
@@ -485,7 +487,7 @@ fn publish_release(
     let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
     let archive =
         crate::ensure_archive(config, &original.project_slug).map_err(|error| error.to_string())?;
-    crate::with_project_lock(&archive, || {
+    repair_lock::with_repair_lock(cx, &archive, || {
         let source = read_source(cx, pool, original.id).map_err(invalid)?;
         if source.as_ref() != Some(original) {
             return Err(invalid(
@@ -629,6 +631,8 @@ fn publish_release(
 /// Recovery promotion or admission contention defers repair before DB/archive
 /// access. In particular, a replay caller's existing writer lease must never
 /// wait for a promotion that is itself trying to drain that caller.
+/// Project mutex/flock contention shares a short acquisition budget. A timeout
+/// leaves the database release authoritative for a later history repair pass.
 pub fn reconcile_released_reservation(
     cx: &Cx,
     pool: &DbPool,
@@ -710,6 +714,8 @@ pub fn reconcile_released_reservation(
 /// connections are released before Git I/O; a write-activity lease prevents
 /// recovery promotion from replacing the source generation during the pass.
 /// Closed or contended admission defers the pass without advancing either cursor.
+/// A contended project archive is deferred within the finite scan, allowing
+/// other projects to progress; it is revisited in a later round.
 pub fn reconcile_reservation_releases(
     cx: &Cx,
     pool: &DbPool,
@@ -1657,5 +1663,82 @@ mod tests {
             return;
         }
         exercise_closed_admission(true);
+    }
+
+    #[test]
+    fn a_busy_project_defers_without_stranding_other_releases_and_is_revisited() {
+        if isolated_admission_test() {
+            return;
+        }
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other', '/other', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'GreenStone', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(501, 72, 82, 'other.rs', 1, 'other release', 1000000, 9000000, NULL)").unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(501, 5000000)").unwrap();
+            drop(conn);
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let other_source = read_source(cx, pool, 501).unwrap().unwrap();
+            let captured = captured_row(cx, pool, 401);
+            let (stable, before) = seed_artifact(config, &source, "aabb", false);
+            let (other, _) = seed_artifact(config, &other_source, "aabb", false);
+            crate::flush_async_commits();
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            // This is the actual mutex used by ordinary project writers, not
+            // an injected error. Hold it until both repair APIs have returned.
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let held = process.lock().unwrap();
+            let targeted = reconcile_released_reservation(cx, pool, config, &captured, "aabb");
+            assert!(targeted.unwrap_err().contains("lock budget exhausted"));
+            assert_eq!(fs::read(&stable).unwrap(), before);
+
+            let mut cursor = ReservationReconcileCursor::default();
+            let first = reconcile_reservation_releases(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!((first.scanned, first.deferred, first.repaired), (2, 1, 1));
+            assert!(cursor.history.ceiling.is_none());
+            assert_eq!(fs::read(&stable).unwrap(), before);
+            assert!(matches!(process.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+            let other_artifact = read_artifact(&other).unwrap().unwrap();
+            assert_eq!(other_artifact.value["released_ts"], other_source.artifact["released_ts"]);
+            assert_eq!(other_artifact.value["operator_note"], "preserve this note");
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), "projects/other/file_reservations/id-501-gaabb.json")
+                    .unwrap().unwrap().bytes,
+                other_artifact.bytes
+            );
+
+            // A deferred repair must re-read its live source, not publish a
+            // payload captured before the lock wait or freeze the scan there.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason='latest reason' WHERE id=401").unwrap();
+            drop(conn);
+            drop(held);
+            let resumed = reconcile_reservation_releases(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+            ).unwrap();
+            assert_eq!((resumed.repaired, resumed.unchanged, resumed.deferred), (1, 1, 0));
+            let artifact = read_artifact(&stable).unwrap().unwrap();
+            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(artifact.value["reason"], "latest reason");
+            assert_eq!(artifact.value["operator_note"], "preserve this note");
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), "projects/project/file_reservations/id-401-gaabb.json")
+                    .unwrap().unwrap().bytes,
+                artifact.bytes
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let rows = conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap();
+            assert_eq!(rows[0].get_as::<Option<i64>>(0).unwrap(), None);
+            let ledger = conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap();
+            assert_eq!(ledger[0].get_as::<i64>(0).unwrap(), 5_000_000);
+            drop(conn);
+            crate::flush_async_commits();
+        });
     }
 }
