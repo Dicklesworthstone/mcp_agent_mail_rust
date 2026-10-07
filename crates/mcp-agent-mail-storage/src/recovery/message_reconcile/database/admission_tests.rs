@@ -1,14 +1,14 @@
 //! End-to-end live-mailbox recovery under actual promotion/archive contention.
 
 use super::*;
+use mcp_agent_mail_db::write_barrier::{
+    DrainOutcome, acquire_promotion_barrier_draining, active_writer_count, begin_write_activity,
+    try_acquire_promotion_barrier_if_idle,
+};
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
-use mcp_agent_mail_db::write_barrier::{
-    DrainOutcome, acquire_promotion_barrier_draining, active_writer_count,
-    begin_write_activity, try_acquire_promotion_barrier_if_idle,
-};
 
 /// Other storage libtests use the same process-wide fence and admission gate.
 /// Keep their activity out of tests that deliberately control those owners.
@@ -54,7 +54,8 @@ fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
             min_connections: 1,
             max_connections: 1,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         let cx = Cx::for_testing();
         let conn = outcome(block_on(pool.acquire(&cx))).unwrap();
         for (project, slug, sender, recipient, bcc, id) in [
@@ -79,7 +80,8 @@ fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
             conn.execute_raw(&format!(
                 "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
                  VALUES({id}, {recipient}, 'to', 7, 11), ({id}, {bcc}, 'bcc', NULL, NULL)"
-            )).unwrap();
+            ))
+            .unwrap();
         }
         drop(conn);
         test(&cx, &pool, &config);
@@ -113,24 +115,36 @@ fn database_evidence(cx: &Cx, pool: &DbPool) -> Value {
         "SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id",
         &[],
     ).unwrap();
-    let receipts = receipts.iter().map(|row| json!({
-        "message_id": row.get_named::<i64>("message_id").unwrap(),
-        "agent_id": row.get_named::<i64>("agent_id").unwrap(),
-        "kind": row.get_named::<String>("kind").unwrap(),
-        "read_ts": row.get_named::<Option<i64>>("read_ts").unwrap(),
-        "ack_ts": row.get_named::<Option<i64>>("ack_ts").unwrap(),
-    })).collect::<Vec<_>>();
+    let receipts = receipts
+        .iter()
+        .map(|row| {
+            json!({
+                "message_id": row.get_named::<i64>("message_id").unwrap(),
+                "agent_id": row.get_named::<i64>("agent_id").unwrap(),
+                "kind": row.get_named::<String>("kind").unwrap(),
+                "read_ts": row.get_named::<Option<i64>>("read_ts").unwrap(),
+                "ack_ts": row.get_named::<Option<i64>>("ack_ts").unwrap(),
+            })
+        })
+        .collect::<Vec<_>>();
     json!({"messages": messages, "receipts": receipts})
 }
 
 fn seed_outbox(config: &Config, prepared: &PreparedMessage) -> (std::path::PathBuf, Vec<u8>) {
     let archive = crate::ensure_archive(config, &prepared.project_slug).unwrap();
     let paths = crate::message_paths_for_bundle(
-        &archive, &prepared.message, &prepared.sender, &prepared.recipients,
-    ).unwrap().0;
+        &archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )
+    .unwrap()
+    .0;
     let mut message = prepared.message.clone();
     message["operator_note"] = json!("surviving evidence");
-    let bytes = crate::render_message_bundle_content(&message, &prepared.body).unwrap().into_bytes();
+    let bytes = crate::render_message_bundle_content(&message, &prepared.body)
+        .unwrap()
+        .into_bytes();
     crate::ensure_parent_dir(&paths.outbox).unwrap();
     fs::write(&paths.outbox, &bytes).unwrap();
     (paths.outbox, bytes)
@@ -138,10 +152,17 @@ fn seed_outbox(config: &Config, prepared: &PreparedMessage) -> (std::path::PathB
 
 fn assert_recovered(cx: &Cx, pool: &DbPool, config: &Config, id: i64, note: bool) {
     let prepared = prepare_message(cx, pool, id).unwrap();
-    let archive = crate::open_archive(config, &prepared.project_slug).unwrap().unwrap();
+    let archive = crate::open_archive(config, &prepared.project_slug)
+        .unwrap()
+        .unwrap();
     let paths = crate::message_paths_for_bundle(
-        &archive, &prepared.message, &prepared.sender, &prepared.recipients,
-    ).unwrap().0;
+        &archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )
+    .unwrap()
+    .0;
     let mut full = prepared.message.clone();
     if note {
         full["operator_note"] = json!("surviving evidence");
@@ -149,7 +170,8 @@ fn assert_recovered(cx: &Cx, pool: &DbPool, config: &Config, id: i64, note: bool
     let inbox = crate::redact_message_bcc_for_inbox(&full);
     let repo = git2::Repository::open(&archive.repo_root).unwrap();
     let tree = repo.head().unwrap().peel_to_tree().unwrap();
-    for (path, expected) in [&paths.canonical, &paths.outbox].into_iter()
+    for (path, expected) in [&paths.canonical, &paths.outbox]
+        .into_iter()
         .map(|path| (path, &full))
         .chain(paths.inbox.iter().map(|path| (path, &inbox)))
     {
@@ -160,7 +182,10 @@ fn assert_recovered(cx: &Cx, pool: &DbPool, config: &Config, id: i64, note: bool
         let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
         let entry = tree.get_path(Path::new(&relative)).unwrap();
         assert_eq!(entry.kind(), Some(git2::ObjectType::Blob));
-        assert_eq!(repo.find_blob(entry.id()).unwrap().content(), fs::read(path).unwrap().as_slice());
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            fs::read(path).unwrap().as_slice()
+        );
     }
     assert_eq!(full["bcc"], json!(["RedFox"]));
     assert_eq!(inbox["bcc"], json!([]));
@@ -171,7 +196,8 @@ fn catch_up(cx: &Cx, pool: &DbPool, config: &Config, cursor: &mut ReconcileCurso
     // not reset the cursor to make the test conceal a failed finite revisit.
     let mut repaired = 0;
     for _ in 0..3 {
-        let report = reconcile_message_batch(cx, pool, config, cursor, &AtomicBool::new(false)).unwrap();
+        let report =
+            reconcile_message_batch(cx, pool, config, cursor, &AtomicBool::new(false)).unwrap();
         assert_eq!(report.deferred, 0, "{report:?}");
         assert!(!report.interrupted);
         repaired += report.repaired;
@@ -185,10 +211,16 @@ fn exercise_busy_fence(existing: bool) {
         let survivor = existing.then(|| seed_outbox(config, &original));
         crate::flush_async_commits();
         let before_db = database_evidence(cx, pool);
-        let head = || git2::Repository::open(&config.storage_root).ok()
-            .and_then(|repo| repo.head().ok().and_then(|head| head.target()));
+        let head = || {
+            git2::Repository::open(&config.storage_root)
+                .ok()
+                .and_then(|repo| repo.head().ok().and_then(|head| head.target()))
+        };
         let before_head = head();
-        let token_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+        let token_path = config
+            .storage_root
+            .join(".git")
+            .join(crate::ARCHIVE_EPOCH_FILE_NAME);
         let before_token = fs::read(&token_path).ok();
         let before_epoch = crate::archive_mutation_epoch();
         let before_active = crate::archive_mutations_active();
@@ -202,7 +234,8 @@ fn exercise_busy_fence(existing: bool) {
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut cursor = ReconcileCursor::default();
-        let result = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+        let result =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
         let observed_db = database_evidence(cx, pool);
         let observed_head = head();
         let observed_token = fs::read(&token_path).ok();
@@ -215,9 +248,20 @@ fn exercise_busy_fence(existing: bool) {
         let other_created = config.storage_root.join("projects/other").exists();
         let survivor_during = survivor.as_ref().map(|(path, _)| fs::read(path).unwrap());
         let _ = release_tx.send(());
-        assert!(owner.join().unwrap().is_ok(), "replay waited for the fence owner's timeout");
+        assert!(
+            owner.join().unwrap().is_ok(),
+            "replay waited for the fence owner's timeout"
+        );
         let report = result.unwrap();
-        assert_eq!((report.scanned, report.deferred, report.repaired, report.files_created), (2, 2, 0, 0));
+        assert_eq!(
+            (
+                report.scanned,
+                report.deferred,
+                report.repaired,
+                report.files_created
+            ),
+            (2, 2, 0, 0)
+        );
         assert_eq!(observed_db, before_db);
         assert_eq!(observed_head, before_head);
         assert_eq!(observed_token, before_token);
@@ -226,8 +270,14 @@ fn exercise_busy_fence(existing: bool) {
         assert_eq!(held_writers, 0);
         assert!(promotion_available && owner_still_held);
         assert_eq!(initialized, existing);
-        assert!(!other_created, "a busy fence cannot initialize an unrelated project");
-        assert_eq!(survivor_during, survivor.as_ref().map(|(_, bytes)| bytes.clone()));
+        assert!(
+            !other_created,
+            "a busy fence cannot initialize an unrelated project"
+        );
+        assert_eq!(
+            survivor_during,
+            survivor.as_ref().map(|(_, bytes)| bytes.clone())
+        );
         assert_eq!(cursor.tail_after, Some(902));
 
         // Deferred work must be reread, not retained as a stale publication
@@ -266,9 +316,22 @@ fn busy_project_is_skipped_while_another_mailbox_project_repairs_then_is_revisit
         let process = crate::archive_process_lock(&archive).unwrap();
         let owner = process.lock().unwrap();
         let mut cursor = ReconcileCursor::default();
-        let report = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
-        assert_eq!((report.scanned, report.deferred, report.repaired, report.files_created), (2, 1, 1, 4));
-        assert!(matches!(process.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.deferred,
+                report.repaired,
+                report.files_created
+            ),
+            (2, 1, 1, 4)
+        );
+        assert!(matches!(
+            process.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
         assert_eq!(fs::read(&survivor).unwrap(), bytes);
         assert!(!archive.root.join("messages").exists());
         assert_recovered(cx, pool, config, 902, false);
@@ -309,7 +372,12 @@ fn exercise_promotion(parent_writer: bool) {
         let promotion = std::thread::spawn(move || {
             let owner = if parent_writer {
                 let (owner, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
-                assert!(matches!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                assert!(matches!(
+                    outcome,
+                    DrainOutcome::TimedOut {
+                        remaining_writers: 1
+                    }
+                ));
                 owner
             } else {
                 try_acquire_promotion_barrier_if_idle().expect("idle promotion owner")
@@ -321,14 +389,22 @@ fn exercise_promotion(parent_writer: bool) {
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut cursor = retained_cursor();
-        let result = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+        let result =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
         let writers = active_writer_count();
         let no_archive = !config.storage_root.join(".git").exists()
             && !config.storage_root.join("projects").exists();
         drop(parent);
         let _ = release_tx.send(());
-        assert!(promotion.join().unwrap().is_ok(), "batch waited for promotion-owner expiry");
-        assert!(result.unwrap_err().contains("recovery promotion or admission contention"));
+        assert!(
+            promotion.join().unwrap().is_ok(),
+            "batch waited for promotion-owner expiry"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("recovery promotion or admission contention")
+        );
         assert_cursor_retained(&cursor);
         assert_eq!(writers, usize::from(parent_writer));
         assert_eq!(active_writer_count(), 0);
@@ -359,7 +435,10 @@ fn worker_stop_preserves_source_and_cursors_until_a_later_uncancelled_pass() {
         let stop = AtomicBool::new(true);
         let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
         assert!(report.interrupted);
-        assert_eq!((report.scanned, report.repaired, report.files_created), (0, 0, 0));
+        assert_eq!(
+            (report.scanned, report.repaired, report.files_created),
+            (0, 0, 0)
+        );
         assert_cursor_retained(&cursor);
         assert!(!config.storage_root.join(".git").exists());
         assert_eq!(active_writer_count(), 0);

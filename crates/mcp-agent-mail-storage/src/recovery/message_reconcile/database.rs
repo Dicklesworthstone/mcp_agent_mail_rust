@@ -5,10 +5,10 @@
 //! verifying their complete archive and rechecking the live source. Both paths
 //! require the server's writable pool for the same configured mailbox/root.
 
-mod source;
-mod staged;
 #[cfg(test)]
 mod admission_tests;
+mod source;
+mod staged;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -547,7 +547,11 @@ fn reconcile_prepared_inner(
     };
     match control {
         Some(control) => super::reconcile_message_bundle_cancellable(
-            control.cx, &archive, config, entry, control.stop,
+            control.cx,
+            &archive,
+            config,
+            entry,
+            control.stop,
         ),
         None => reconcile_message_bundle(&archive, config, entry),
     }
@@ -740,7 +744,9 @@ pub fn reconcile_message_batch(
         let write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
         if pool.sqlite_identity_key() != selected_identity {
-            return Err("message reconciliation source changed after selection; rescan required".into());
+            return Err(
+                "message reconciliation source changed after selection; rescan required".into(),
+            );
         }
         if !seen.insert(id) {
             cursor.advance(id, tail);
