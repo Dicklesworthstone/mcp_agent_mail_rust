@@ -627,12 +627,15 @@ jq '{verdict, summary, remote_checks: [.stages.remote.checks[] | {id, severity, 
 Cloudflare Pages deployment path (native artifacts + verification):
 
 ```bash
-# Generate deployment tooling files, including Cloudflare workflow + wrangler template
-am share deploy tooling /tmp/agent-mail-bundle
+# Generate deployment tooling files, including Cloudflare workflow + wrangler template.
+# They land at the root of the git repo that contains the bundle (else the
+# nearest project-marker root, else the bundle's parent directory), so keep
+# the bundle inside the site repository you deploy from.
+am share deploy tooling ~/site-repo/agent-mail-bundle
 
-# Expected Cloudflare artifacts
-ls /tmp/agent-mail-bundle/.github/workflows/deploy-cf-pages.yml
-ls /tmp/agent-mail-bundle/wrangler.toml.template
+# Expected Cloudflare artifacts (repo root, beside the bundle)
+ls ~/site-repo/.github/workflows/deploy-cf-pages.yml
+ls ~/site-repo/wrangler.toml.template
 
 # Verify a Cloudflare Pages host against the same bundle
 am share deploy verify-live https://<project>.pages.dev \

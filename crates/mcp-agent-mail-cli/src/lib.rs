@@ -1553,7 +1553,10 @@ pub struct DeployValidateArgs {
 
 #[derive(Args, Debug)]
 pub struct DeployToolingArgs {
-    /// Path to the bundle directory; repo-root CI/tooling files are written in the current directory.
+    /// Path to the bundle directory. Repo-root CI/tooling files (.github/,
+    /// wrangler.toml.template) are written at the root of the git repository
+    /// that contains the bundle, else the nearest project-marker root, else
+    /// the bundle's parent directory — never the current directory.
     pub bundle: PathBuf,
 }
 

@@ -295,7 +295,7 @@ archive.
 
 ```bash
 PROJECT=/abs/path/project
-OUT=~/mailbox-share.zip
+OUT=~/mailbox-share
 AGE_RECIPIENT=age1example...
 
 am share export --output "$OUT" --project "$PROJECT" --dry-run
@@ -303,9 +303,12 @@ am share export --output "$OUT" --project "$PROJECT" --zip --age-recipient "$AGE
 am share verify "$OUT"
 ```
 
-**Expected output:** The dry run summarizes what would be exported, the real
-export writes the bundle to `OUT`, and verify confirms the resulting archive is
-well-formed.
+**Expected output:** The dry run summarizes what would be exported. The real
+export writes the bundle directory to `OUT` and the encrypted archive beside it
+(`$OUT.zip.age`; `$OUT.zip` without `--age-recipient`). `am share verify` checks
+a bundle directory, not an archive: to check what you will ship, run
+`am share decrypt "$OUT.zip.age"` (it writes `$OUT.zip`), unzip that, and verify
+the unpacked directory.
 
 **Troubleshooting:** If you need a different scrub profile or chunking behavior,
 add the relevant `am share export` flags explicitly. Use a real Age recipient
