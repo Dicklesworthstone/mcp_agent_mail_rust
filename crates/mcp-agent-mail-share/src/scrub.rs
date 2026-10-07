@@ -274,6 +274,12 @@ pub fn scrub_snapshot(
             }
             removed
         } else if cfg.clear_recipient_state {
+            if table_exists(&conn, "inbox_stats")? {
+                // Per-agent unread and ack-pending counts are that same
+                // read/ack state in aggregate (and project scoping rebuilt
+                // them from the unscrubbed rows), so they go with it.
+                exec_count(&conn, "DELETE FROM inbox_stats", &[])?;
+            }
             exec_count(
                 &conn,
                 "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL",
@@ -1897,36 +1903,42 @@ mod tests {
     }
 
     #[test]
-    fn strict_scrub_removes_recipient_derived_inbox_stats() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = create_fixture_db(dir.path());
-        let conn = Conn::open_file(db.display().to_string()).unwrap();
-        conn.execute_raw(
-            "CREATE TABLE inbox_stats (
-                agent_id INTEGER PRIMARY KEY,
-                total_count INTEGER NOT NULL DEFAULT 0,
-                unread_count INTEGER NOT NULL DEFAULT 0,
-                ack_pending_count INTEGER NOT NULL DEFAULT 0,
-                last_message_ts INTEGER
-            )",
-        )
-        .unwrap();
-        conn.execute_raw(
-            "INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
-             VALUES (1, 4, 2, 1, 12345)",
-        )
-        .unwrap();
-
-        scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
-
-        let rows = conn
-            .query_sync("SELECT COUNT(*) AS cnt FROM inbox_stats", &[])
+    fn scrubbed_read_state_takes_its_inbox_stats_aggregates_with_it() {
+        // Standard clears read/ack state and strict drops recipients; both must
+        // drop the per-agent unread/ack-pending counts derived from them. The
+        // lossless archive preset keeps them.
+        for (preset, expected_rows) in [
+            (ScrubPreset::Standard, 0),
+            (ScrubPreset::Strict, 0),
+            (ScrubPreset::Archive, 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "CREATE TABLE inbox_stats (
+                    agent_id INTEGER PRIMARY KEY,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                    last_message_ts INTEGER
+                )",
+            )
             .unwrap();
-        let remaining: i64 = rows[0].get_named("cnt").unwrap_or(0);
-        assert_eq!(
-            remaining, 0,
-            "strict export must not leak recipient-derived inbox aggregates"
-        );
+            conn.execute_raw(
+                "INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+                 VALUES (1, 4, 2, 1, 12345)",
+            )
+            .unwrap();
+
+            scrub_snapshot(&db, preset).unwrap();
+
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS cnt FROM inbox_stats", &[])
+                .unwrap();
+            let remaining: i64 = rows[0].get_named("cnt").unwrap_or(0);
+            assert_eq!(remaining, expected_rows, "preset={preset:?}");
+        }
     }
 
     #[test]
