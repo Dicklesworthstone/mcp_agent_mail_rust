@@ -408,7 +408,10 @@ fn repair_one(
         Ok(true)
     };
     archive
-        .with_repair_lock(|| stop.load(Ordering::Acquire) || cx.checkpoint().is_err(), publish)
+        .with_repair_lock(
+            || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
+            publish,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -492,8 +495,9 @@ pub fn reconcile_active_reservations(
         return Err("active reservation repair refused: corruption breaker open".into());
     }
     let ids = {
-        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
-            .ok_or("active reservation repair deferred: recovery promotion or admission contention")?;
+        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(
+            "active reservation repair deferred: recovery promotion or admission contention",
+        )?;
         select_ids(cx, pool, config, cursor)?
     };
     let selected_identity = cursor.identity.clone();
@@ -513,10 +517,13 @@ pub fn reconcile_active_reservations(
         }
         // A promotion may have run after selection. Never apply a retained ID
         // page to an observed replacement source, and never wait while closed.
-        let activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
-            .ok_or("active reservation repair deferred: recovery promotion or admission contention")?;
+        let activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(
+            "active reservation repair deferred: recovery promotion or admission contention",
+        )?;
         if pool.sqlite_identity_key() != selected_identity {
-            return Err("active reservation source changed after selection; rescan required".into());
+            return Err(
+                "active reservation source changed after selection; rescan required".into(),
+            );
         }
         let mut attempted = false;
         let result = read_source(cx, pool, id).and_then(|source| {
@@ -721,7 +728,17 @@ mod tests {
                 conn.execute_raw(change).unwrap();
                 drop(conn);
                 let mut attempted = false;
-                assert!(repair_one(cx, pool, config, &captured, &mut attempted, &AtomicBool::new(false)).is_err());
+                assert!(
+                    repair_one(
+                        cx,
+                        pool,
+                        config,
+                        &captured,
+                        &mut attempted,
+                        &AtomicBool::new(false)
+                    )
+                    .is_err()
+                );
                 assert!(!attempted);
                 assert!(!target(config).exists());
             });
@@ -904,7 +921,9 @@ mod tests {
         let tree = head_tree(&repo).unwrap().unwrap();
         assert_eq!(
             committed_artifact(&repo, Some(&tree), &relative)
-                .unwrap().unwrap().bytes,
+                .unwrap()
+                .unwrap()
+                .bytes,
             artifact.bytes,
         );
         assert_eq!(read_source(cx, pool, id).unwrap().unwrap(), source);
@@ -926,7 +945,12 @@ mod tests {
                 let owner = std::thread::spawn(move || {
                     let gate = if parent_writer {
                         let (gate, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
-                        assert!(matches!(outcome, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        assert!(matches!(
+                            outcome,
+                            DrainOutcome::TimedOut {
+                                remaining_writers: 1
+                            }
+                        ));
                         gate
                     } else {
                         try_acquire_promotion_barrier_if_idle().expect("idle promotion")
@@ -938,25 +962,41 @@ mod tests {
                 });
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let mut cursor = ActiveReservationCursor {
-                    identity: "retained source".into(), after: 17, ceiling: Some(401),
+                    identity: "retained source".into(),
+                    after: 17,
+                    ceiling: Some(401),
                 };
                 let refused = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
                 );
                 let writers = active_writer_count();
                 let initialized = config.storage_root.join("projects").exists();
                 drop(parent);
                 let _ = release_tx.send(());
-                assert!(owner.join().unwrap().is_ok(), "repair waited for promotion expiry");
+                assert!(
+                    owner.join().unwrap().is_ok(),
+                    "repair waited for promotion expiry"
+                );
                 assert!(refused.unwrap_err().contains("admission contention"));
                 assert_eq!(writers, usize::from(parent_writer));
                 assert!(!initialized);
-                assert_eq!((&*cursor.identity, cursor.after, cursor.ceiling),
-                           ("retained source", 17, Some(401)));
+                assert_eq!(
+                    (&*cursor.identity, cursor.after, cursor.ceiling),
+                    ("retained source", 17, Some(401))
+                );
                 assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
                 let resumed = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
-                ).unwrap();
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
                 assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
                 assert_committed(cx, pool, config, 401);
                 assert_eq!(active_writer_count(), 0);
@@ -975,7 +1015,10 @@ mod tests {
                     crate::ensure_archive(config, "project").unwrap();
                 }
                 crate::flush_async_commits();
-                let epoch_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+                let epoch_path = config
+                    .storage_root
+                    .join(".git")
+                    .join(crate::ARCHIVE_EPOCH_FILE_NAME);
                 let stamp = fs::read(&epoch_path).ok();
                 let epoch = crate::archive_mutation_epoch();
                 let source = read_source(cx, pool, 401).unwrap().unwrap();
@@ -990,35 +1033,63 @@ mod tests {
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let mut cursor = ActiveReservationCursor::default();
                 let first = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
                 );
                 let writers = active_writer_count();
                 let gate = try_acquire_promotion_barrier_if_idle();
                 let can_promote = gate.is_some();
                 drop(gate);
                 let observations = (
-                    target(config).exists(), config.storage_root.join(".git").exists(),
-                    fs::read(&epoch_path).ok(), crate::archive_mutation_epoch(),
+                    target(config).exists(),
+                    config.storage_root.join(".git").exists(),
+                    fs::read(&epoch_path).ok(),
+                    crate::archive_mutation_epoch(),
                     crate::archive_mutations_active(),
                 );
                 let _ = release_tx.send(());
-                assert!(owner.join().unwrap().is_ok(), "repair waited for fence-owner expiry");
+                assert!(
+                    owner.join().unwrap().is_ok(),
+                    "repair waited for fence-owner expiry"
+                );
                 let first = first.unwrap();
-                assert_eq!((first.scanned, first.deferred, first.repaired, first.attempted), (1, 1, 0, 0));
+                assert_eq!(
+                    (
+                        first.scanned,
+                        first.deferred,
+                        first.repaired,
+                        first.attempted
+                    ),
+                    (1, 1, 0, 0)
+                );
                 assert_eq!(observations, (false, existing_archive, stamp, epoch, 0));
                 assert_eq!(writers, 0);
                 assert!(can_promote);
-                assert!(cursor.ceiling.is_none(), "the finite round must revisit deferrals");
+                assert!(
+                    cursor.ceiling.is_none(),
+                    "the finite round must revisit deferrals"
+                );
                 assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
                 conn.execute_raw("UPDATE file_reservations SET reason='renewed while deferred', expires_ts=expires_ts+1000000 WHERE id=401").unwrap();
                 drop(conn);
                 let resumed = reconcile_active_reservations(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false),
-                ).unwrap();
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
                 assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
                 assert_committed(cx, pool, config, 401);
-                assert_eq!(read_artifact(&target(config)).unwrap().unwrap().value["reason"], "renewed while deferred");
+                assert_eq!(
+                    read_artifact(&target(config)).unwrap().unwrap().value["reason"],
+                    "renewed while deferred"
+                );
                 assert_eq!(active_writer_count(), 0);
             });
         }
@@ -1046,13 +1117,22 @@ mod tests {
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let mut cursor = ActiveReservationCursor::default();
             let first = reconcile_active_reservations(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
             );
             let missing = !target(config).exists();
-            let other = config.storage_root.join("projects/other/file_reservations/id-501-gaabb.json");
+            let other = config
+                .storage_root
+                .join("projects/other/file_reservations/id-501-gaabb.json");
             let other_present = other.exists();
             let _ = release_tx.send(());
-            assert!(owner.join().unwrap().is_ok(), "repair waited for project-owner expiry");
+            assert!(
+                owner.join().unwrap().is_ok(),
+                "repair waited for project-owner expiry"
+            );
             let first = first.unwrap();
             assert_eq!((first.scanned, first.deferred, first.repaired), (2, 1, 1));
             assert!(missing && other_present);
@@ -1064,9 +1144,17 @@ mod tests {
             conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)").unwrap();
             drop(conn);
             let resumed = reconcile_active_reservations(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
-            assert_eq!((resumed.repaired, resumed.unchanged, resumed.deferred), (0, 1, 0));
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                (resumed.repaired, resumed.unchanged, resumed.deferred),
+                (0, 1, 0)
+            );
             assert!(!target(config).exists());
             assert!(read_source(cx, pool, 401).unwrap().is_none());
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
@@ -1107,13 +1195,21 @@ mod tests {
             assert!(observed && released.is_ok());
             let interrupted = interrupted.unwrap();
             assert!(interrupted.interrupted && interrupted.more);
-            assert_eq!((interrupted.scanned, interrupted.attempted, cursor.after), (0, 0, 0));
+            assert_eq!(
+                (interrupted.scanned, interrupted.attempted, cursor.after),
+                (0, 0, 0)
+            );
             assert!(absent);
             assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
             let resumed = reconcile_active_reservations(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
             assert_committed(cx, pool, config, 401);
         });

@@ -651,7 +651,9 @@ pub fn reconcile_agent_batch(
         let activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("agent reconciliation deferred: recovery promotion or admission contention")?;
         if pool.sqlite_identity_key() != selected_identity {
-            return Err("agent reconciliation source changed after selection; rescan required".into());
+            return Err(
+                "agent reconciliation source changed after selection; rescan required".into(),
+            );
         }
         let result = read_source(cx, pool, id)
             .and_then(|source| reconcile_agent(cx, pool, config, &source, stop));
@@ -1215,7 +1217,12 @@ mod tests {
                 let owner = std::thread::spawn(move || {
                     let gate = if parent_writer {
                         let (gate, result) = acquire_promotion_barrier_draining(Duration::ZERO);
-                        assert!(matches!(result, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        assert!(matches!(
+                            result,
+                            DrainOutcome::TimedOut {
+                                remaining_writers: 1
+                            }
+                        ));
                         gate
                     } else {
                         try_acquire_promotion_barrier_if_idle().expect("idle promotion")
@@ -1227,14 +1234,20 @@ mod tests {
                 });
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let mut cursor = AgentReconcileCursor {
-                    source_identity: "previous round".into(), after: 17, ceiling: Some(101),
+                    source_identity: "previous round".into(),
+                    after: 17,
+                    ceiling: Some(101),
                 };
-                let result = reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+                let result =
+                    reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
                 let writers = active_writer_count();
                 let initialized = config.storage_root.join(".git").exists();
                 drop(parent);
                 let _ = release_tx.send(());
-                assert!(owner.join().unwrap().is_ok(), "repair waited for promotion expiry");
+                assert!(
+                    owner.join().unwrap().is_ok(),
+                    "repair waited for promotion expiry"
+                );
                 assert!(result.unwrap_err().contains("admission contention"));
                 assert_eq!(writers, usize::from(parent_writer));
                 assert_eq!(active_writer_count(), 0);
@@ -1266,12 +1279,21 @@ mod tests {
             crate::flush_async_commits();
             let source = read_source(cx, pool, 101).unwrap();
             let before = fs::read(profile_path(config)).ok();
-            let token_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+            let token_path = config
+                .storage_root
+                .join(".git")
+                .join(crate::ARCHIVE_EPOCH_FILE_NAME);
             let token = fs::read(&token_path).ok();
             let epoch = crate::archive_mutation_epoch();
             let active = crate::archive_mutations_active();
             let head = || {
-                existing.then(|| Repository::open(&config.storage_root).unwrap().head().unwrap().target())
+                existing.then(|| {
+                    Repository::open(&config.storage_root)
+                        .unwrap()
+                        .head()
+                        .unwrap()
+                        .target()
+                })
             };
             let head_before = head();
             let (ready_tx, ready_rx) = mpsc::channel();
@@ -1284,7 +1306,8 @@ mod tests {
             });
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let mut cursor = AgentReconcileCursor::default();
-            let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+            let report =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
             let held = crate::archive_publication_fence_holder().is_some();
             let writers = active_writer_count();
             let promotion = try_acquire_promotion_barrier_if_idle();
@@ -1298,18 +1321,35 @@ mod tests {
             let initialized = config.storage_root.join(".git").exists();
             let projects = config.storage_root.join("projects").exists();
             let _ = release_tx.send(());
-            assert!(owner.join().unwrap().is_ok(), "repair waited for fence expiry");
+            assert!(
+                owner.join().unwrap().is_ok(),
+                "repair waited for fence expiry"
+            );
             let report = report.unwrap();
-            assert_eq!((report.scanned, report.deferred, report.repaired), (1, 1, 0));
+            assert_eq!(
+                (report.scanned, report.deferred, report.repaired),
+                (1, 1, 0)
+            );
             assert!(held && unchanged && promotion_available);
             assert_eq!(writers, 0);
             assert_eq!((initialized, projects), (existing, existing));
             assert_eq!(read_source(cx, pool, 101).unwrap(), source);
-            assert!(cursor.ceiling.is_none(), "the deferred finite round completed");
+            assert!(
+                cursor.ceiling.is_none(),
+                "the deferred finite round completed"
+            );
 
-            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(cx, pool, 101, 234_567_891))).unwrap();
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                101,
+                234_567_891,
+            )))
+            .unwrap();
             let latest = read_source(cx, pool, 101).unwrap();
-            let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            let resumed =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
             assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
             let profile = assert_profile_committed(config);
             assert_eq!(profile["deregistered_at"], timestamp(234_567_891).unwrap());
@@ -1345,8 +1385,20 @@ mod tests {
             conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(102, 'other', '/other', 1)").unwrap();
             conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(102, 102, 'GreenStone', 'test', 'test', 1000000, 2000000)").unwrap();
             drop(conn);
-            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(cx, pool, 101, Some(123_456_789)))).unwrap();
-            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(cx, pool, 102, 234_567_890))).unwrap();
+            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
+                cx,
+                pool,
+                101,
+                Some(123_456_789),
+            )))
+            .unwrap();
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                102,
+                234_567_890,
+            )))
+            .unwrap();
             let original = read_source(cx, pool, 101).unwrap();
             let other = read_source(cx, pool, 102).unwrap();
             let archive = crate::open_archive(config, "project").unwrap().unwrap();
@@ -1354,42 +1406,80 @@ mod tests {
             let process = crate::archive_process_lock(&archive).unwrap();
             let held = process.lock().unwrap();
             let mut cursor = AgentReconcileCursor::default();
-            let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
-            assert_eq!((report.scanned, report.deferred, report.repaired), (2, 1, 1));
+            let report =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred, report.repaired),
+                (2, 1, 1)
+            );
             assert_eq!(fs::read(profile_path(config)).unwrap(), before);
             assert_eq!(read_source(cx, pool, 101).unwrap(), original);
             assert_eq!(read_source(cx, pool, 102).unwrap(), other);
             assert!(cursor.ceiling.is_none());
-            assert!(matches!(process.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            assert!(matches!(
+                process.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
             let relative = "projects/other/agents/GreenStone/profile.json";
             let repo = Repository::open(&config.storage_root).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
-            let committed = committed_artifact(&repo, Some(&tree), relative).unwrap().unwrap();
-            assert_eq!(committed.value["deregistered_at"], timestamp(234_567_890).unwrap());
-            assert_eq!(committed.bytes, fs::read(config.storage_root.join(relative)).unwrap());
+            let committed = committed_artifact(&repo, Some(&tree), relative)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                committed.value["deregistered_at"],
+                timestamp(234_567_890).unwrap()
+            );
+            assert_eq!(
+                committed.bytes,
+                fs::read(config.storage_root.join(relative)).unwrap()
+            );
             drop(tree);
             drop(repo);
 
             // The deferred retirement has since become permanent deregistration.
             // Resuming the original cursor must observe that newer live ledger.
-            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(cx, pool, 101, 345_678_901))).unwrap();
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                101,
+                345_678_901,
+            )))
+            .unwrap();
             let latest = read_source(cx, pool, 101).unwrap();
             drop(held);
-            let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
-            assert_eq!((resumed.repaired, resumed.unchanged, resumed.deferred), (1, 1, 0));
+            let resumed =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                (resumed.repaired, resumed.unchanged, resumed.deferred),
+                (1, 1, 0)
+            );
             let profile = assert_profile_committed(config);
             assert_eq!(profile["deregistered_at"], timestamp(345_678_901).unwrap());
             assert_eq!(profile["extension"], json!({"keep": true}));
             assert_eq!(read_source(cx, pool, 101).unwrap(), latest);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
             let restored_path = scratch.join("both-tombstones.sqlite3");
-            mcp_agent_mail_db::reconstruct::reconstruct_from_archive(&restored_path, &config.storage_root).unwrap();
-            let restored = mcp_agent_mail_db::DbConn::open_file(restored_path.to_string_lossy()).unwrap();
+            mcp_agent_mail_db::reconstruct::reconstruct_from_archive(
+                &restored_path,
+                &config.storage_root,
+            )
+            .unwrap();
+            let restored =
+                mcp_agent_mail_db::DbConn::open_file(restored_path.to_string_lossy()).unwrap();
             let rows = restored.query_sync("SELECT a.name, d.deregistered_at FROM agents a JOIN agent_deregistrations d ON d.agent_id=a.id ORDER BY a.name", &[]).unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].get_named::<String>("name").unwrap(), "BlueLake");
-            assert_eq!(rows[0].get_named::<i64>("deregistered_at").unwrap(), 345_678_901);
-            assert_eq!(rows[1].get_named::<i64>("deregistered_at").unwrap(), 234_567_890);
+            assert_eq!(
+                rows[0].get_named::<i64>("deregistered_at").unwrap(),
+                345_678_901
+            );
+            assert_eq!(
+                rows[1].get_named::<i64>("deregistered_at").unwrap(),
+                234_567_890
+            );
         });
     }
 
@@ -1397,7 +1487,13 @@ mod tests {
     fn cancelled_profile_publication_keeps_evidence_and_the_unconsumed_cursor() {
         with_mailbox(|cx, pool, config, _| {
             assert_eq!(reconcile(cx, pool, config).repaired, 1);
-            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(cx, pool, 101, Some(123_456_789)))).unwrap();
+            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
+                cx,
+                pool,
+                101,
+                Some(123_456_789),
+            )))
+            .unwrap();
             let source = read_source(cx, pool, 101).unwrap();
             let archive = crate::open_archive(config, "project").unwrap().unwrap();
             crate::flush_async_commits();
@@ -1405,10 +1501,14 @@ mod tests {
             let repo = Repository::open(&config.storage_root).unwrap();
             let head = repo.head().unwrap().target();
             let stop = AtomicBool::new(true);
-            assert!(matches!(publish_profile(cx, &archive, config, &source, &stop),
-                Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted));
+            assert!(
+                matches!(publish_profile(cx, &archive, config, &source, &stop),
+                Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+            );
             let mut cursor = AgentReconcileCursor {
-                source_identity: pool.sqlite_identity_key(), after: 100, ceiling: Some(101),
+                source_identity: pool.sqlite_identity_key(),
+                after: 100,
+                ceiling: Some(101),
             };
             let result = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
             assert!(result.interrupted);
@@ -1419,8 +1519,16 @@ mod tests {
             assert_eq!(read_source(cx, pool, 101).unwrap(), source);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
             stop.store(false, Ordering::Release);
-            assert_eq!(reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap().repaired, 1);
-            assert_eq!(assert_profile_committed(config)["retired_at"], timestamp(123_456_789).unwrap());
+            assert_eq!(
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &stop)
+                    .unwrap()
+                    .repaired,
+                1
+            );
+            assert_eq!(
+                assert_profile_committed(config)["retired_at"],
+                timestamp(123_456_789).unwrap()
+            );
         });
     }
 
@@ -1431,21 +1539,45 @@ mod tests {
             let mut profile = assert_profile_committed(config);
             profile["extension"] = json!("survives failed publication");
             crate::write_json(&profile_path(config), &profile, true).unwrap();
-            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(cx, pool, 101, Some(123_456_789)))).unwrap();
+            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
+                cx,
+                pool,
+                101,
+                Some(123_456_789),
+            )))
+            .unwrap();
             let source = read_source(cx, pool, 101).unwrap();
             let repo = Repository::open(&config.storage_root).unwrap();
             let head = repo.head().unwrap().target();
             let mut invalid_author = config.clone();
             invalid_author.git_author_name = "invalid\0author".into();
             let mut cursor = AgentReconcileCursor::default();
-            let failed = reconcile_agent_batch(cx, pool, &invalid_author, &mut cursor, &AtomicBool::new(false)).unwrap();
+            let failed = reconcile_agent_batch(
+                cx,
+                pool,
+                &invalid_author,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!((failed.repaired, failed.deferred), (0, 1));
             assert_eq!(repo.head().unwrap().target(), head);
             assert_eq!(read_source(cx, pool, 101).unwrap(), source);
-            assert_eq!(read_artifact(&profile_path(config)).unwrap().unwrap().value["retired_at"], timestamp(123_456_789).unwrap());
-            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(cx, pool, 101, 345_678_901))).unwrap();
+            assert_eq!(
+                read_artifact(&profile_path(config)).unwrap().unwrap().value["retired_at"],
+                timestamp(123_456_789).unwrap()
+            );
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx,
+                pool,
+                101,
+                345_678_901,
+            )))
+            .unwrap();
             let latest = read_source(cx, pool, 101).unwrap();
-            let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            let resumed =
+                reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
             assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
             let profile = assert_profile_committed(config);
             assert_eq!(profile["deregistered_at"], timestamp(345_678_901).unwrap());
