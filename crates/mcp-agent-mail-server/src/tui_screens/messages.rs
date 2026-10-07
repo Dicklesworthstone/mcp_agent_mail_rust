@@ -150,6 +150,51 @@ fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, act
 // Query presets — reusable filter shortcuts
 // ──────────────────────────────────────────────────────────────────────
 
+/// Structured filter a preset applies on top of the typed query.
+///
+/// Importance and acknowledgement are message columns, not words: a text
+/// search for "urgent" finds messages that mention the word, not urgent ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MessageFilter {
+    /// Only messages of exactly this importance.
+    importance: Option<&'static str>,
+    /// Only messages that require acknowledgement.
+    ack_required: bool,
+}
+
+impl MessageFilter {
+    const NONE: Self = Self {
+        importance: None,
+        ack_required: false,
+    };
+
+    const fn is_active(self) -> bool {
+        self.importance.is_some() || self.ack_required
+    }
+
+    /// Live-event entries carry no importance or ack flag (they read as
+    /// normal / not required), so an active filter never admits them.
+    fn matches(self, entry: &MessageEntry) -> bool {
+        self.importance
+            .is_none_or(|level| entry.importance.eq_ignore_ascii_case(level))
+            && (!self.ack_required || entry.ack_required)
+    }
+
+    /// SQL predicates over the `messages` table, ANDed by the caller.
+    fn sql_predicates(self) -> (Vec<&'static str>, Vec<Value>) {
+        let mut predicates = Vec::new();
+        let mut params = Vec::new();
+        if let Some(level) = self.importance {
+            predicates.push("importance = ?");
+            params.push(Value::Text(level.to_string()));
+        }
+        if self.ack_required {
+            predicates.push("ack_required = 1");
+        }
+        (predicates, params)
+    }
+}
+
 /// A named query preset for quick search access.
 #[derive(Debug, Clone)]
 struct QueryPreset {
@@ -157,6 +202,8 @@ struct QueryPreset {
     label: &'static str,
     /// The query string to inject into the search bar.
     query: &'static str,
+    /// Structured filter applied with whatever the search bar holds.
+    filter: MessageFilter,
     /// Short description for help overlay (shown in preset picker).
     #[allow(dead_code)]
     description: &'static str,
@@ -167,31 +214,46 @@ const QUERY_PRESETS: &[QueryPreset] = &[
     QueryPreset {
         label: "All",
         query: "",
+        filter: MessageFilter::NONE,
         description: "Show all recent messages",
     },
     QueryPreset {
         label: "Urgent",
-        query: "urgent",
+        query: "",
+        filter: MessageFilter {
+            importance: Some("urgent"),
+            ack_required: false,
+        },
         description: "Urgent importance messages",
     },
     QueryPreset {
         label: "High",
-        query: "high",
+        query: "",
+        filter: MessageFilter {
+            importance: Some("high"),
+            ack_required: false,
+        },
         description: "High importance messages",
     },
     QueryPreset {
         label: "Ack",
-        query: "ack",
+        query: "",
+        filter: MessageFilter {
+            importance: None,
+            ack_required: true,
+        },
         description: "Messages requiring acknowledgement",
     },
     QueryPreset {
         label: "Error",
         query: "error",
+        filter: MessageFilter::NONE,
         description: "Messages containing error",
     },
     QueryPreset {
         label: "Plan",
         query: "plan",
+        filter: MessageFilter::NONE,
         description: "Planning and coordination messages",
     },
 ];
@@ -1077,6 +1139,8 @@ pub struct MessageBrowserScreen {
     selected_message_ids: SelectionState<i64>,
     /// Last search term that was actually executed.
     last_search: String,
+    /// Preset filter the current `results` were fetched under.
+    last_filter: MessageFilter,
     /// Ticks remaining before executing a search after input changes.
     debounce_remaining: u8,
     /// Whether we need to re-query.
@@ -1179,6 +1243,7 @@ impl MessageBrowserScreen {
             list_state: RefCell::new(VirtualizedListState::default()),
             selected_message_ids: SelectionState::new(),
             last_search: String::new(),
+            last_filter: MessageFilter::NONE,
             debounce_remaining: 0,
             search_dirty: true, // Initial load
             db_conn: None,
@@ -2775,6 +2840,7 @@ impl MessageBrowserScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let query = self.search_input.value().trim().to_string();
+        let filter = self.active_preset().filter;
         self.last_refresh = Some(Instant::now());
 
         // Determine if we should show project column (Global mode)
@@ -2789,11 +2855,12 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             let previous_results = self.results.clone();
             let previous_total = self.total_results;
-            let preserve_previous = self.can_preserve_previous_results_for_live_fallback(
-                &query,
-                show_project,
-                project_filter,
-            );
+            let preserve_previous = self.last_filter == filter
+                && self.can_preserve_previous_results_for_live_fallback(
+                    &query,
+                    show_project,
+                    project_filter,
+                );
             let mut results = Self::search_live_events(state, &query, show_project);
             if let Some(slug) = project_filter {
                 results.retain(|entry| entry.project_slug == slug);
@@ -2804,6 +2871,8 @@ impl MessageBrowserScreen {
             } else {
                 results.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
             }
+            results.retain(|entry| filter.matches(entry));
+            self.last_filter = filter;
 
             // Apply system-message filter on the live-only fallback path too.
             let mut hidden = 0usize;
@@ -2851,24 +2920,35 @@ impl MessageBrowserScreen {
 
         let (mut results, total, method) = if query.is_empty() {
             self.last_search.clear();
-            let (r, t) = fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project);
+            let (r, t) =
+                fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project, filter);
             (r, t, SearchMethod::Recent)
         } else {
             self.last_search.clone_from(&query);
-            let (r, t, m) =
-                search_messages_unified(conn, &query, MAX_RESULTS, project_filter, show_project);
+            let (r, t, m) = search_messages_unified(
+                conn,
+                &query,
+                MAX_RESULTS,
+                project_filter,
+                show_project,
+                filter,
+            );
             (r, t, m)
         };
         self.search_method = method;
+        self.last_filter = filter;
 
         // Self-heal: if the DB query returned nothing but the poller knows
         // messages exist, the connection is likely stale or broken.  Drop it
         // so the next tick re-opens a fresh one (with schema guarantee).
         // Setting search_method=Live activates the tick handler's 5-second
         // retry loop which resets db_conn_attempted and search_dirty.
+        // A preset filter may legitimately match nothing, so it never
+        // counts as evidence of a broken connection.
         if results.is_empty()
             && total == 0
             && query.is_empty()
+            && !filter.is_active()
             && state
                 .db_stats_snapshot()
                 .is_some_and(|stats| stats.messages > 0)
@@ -2895,6 +2975,9 @@ impl MessageBrowserScreen {
                 if let Some(slug) = project_filter
                     && entry.project_slug != slug
                 {
+                    continue;
+                }
+                if !filter.matches(&entry) {
                     continue;
                 }
                 results.push(entry);
@@ -3947,42 +4030,48 @@ impl MailScreen for MessageBrowserScreen {
 ///
 /// If `project_filter` is Some, only fetch messages from that project (Local mode).
 /// Otherwise, fetch from all projects (Global mode).
+/// `WHERE` clause (empty when unfiltered) and parameters for a project scope
+/// plus a preset filter. `None` when the project slug does not resolve.
+fn message_scope_where(
+    conn: &DbConn,
+    project_filter: Option<&str>,
+    filter: MessageFilter,
+) -> Option<(String, Vec<Value>)> {
+    let (mut predicates, mut params) = (Vec::new(), Vec::new());
+    if let Some(slug) = project_filter {
+        predicates.push("project_id = ?");
+        params.push(Value::BigInt(project_id_for_slug(conn, slug)?));
+    }
+    let (filter_predicates, filter_params) = filter.sql_predicates();
+    predicates.extend(filter_predicates);
+    params.extend(filter_params);
+    let clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", predicates.join(" AND "))
+    };
+    Some((clause, params))
+}
+
 fn fetch_recent_messages(
     conn: &DbConn,
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
+    filter: MessageFilter,
 ) -> (Vec<MessageEntry>, usize) {
-    let (sql, params, total) = match project_filter {
-        Some(slug) => {
-            let Some(project_id) = project_id_for_slug(conn, slug) else {
-                return (Vec::new(), 0);
-            };
-            (
-                format!(
-                    "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
-                     created_ts, sender_id, project_id, recipients_json \
-                     FROM messages \
-                     WHERE project_id = ? \
-                     ORDER BY created_ts DESC \
-                     LIMIT {limit}"
-                ),
-                vec![Value::BigInt(project_id)],
-                count_messages(conn, project_filter),
-            )
-        }
-        None => (
-            format!(
-                "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
-                 created_ts, sender_id, project_id, recipients_json \
-                 FROM messages \
-                 ORDER BY created_ts DESC \
-                 LIMIT {limit}"
-            ),
-            Vec::new(),
-            count_messages(conn, None),
-        ),
+    let Some((where_clause, params)) = message_scope_where(conn, project_filter, filter) else {
+        return (Vec::new(), 0);
     };
+    let sql = format!(
+        "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
+         created_ts, sender_id, project_id, recipients_json \
+         FROM messages \
+         {where_clause}\
+         ORDER BY created_ts DESC \
+         LIMIT {limit}"
+    );
+    let total = count_messages(conn, project_filter, filter);
 
     let rows = query_raw_message_rows(conn, &sql, &params);
     let results = message_entries_from_rows(conn, rows, show_project);
@@ -3999,6 +4088,7 @@ fn search_messages_unified(
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
+    filter: MessageFilter,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
     let project_id = project_filter.and_then(|slug| project_id_for_slug(conn, slug));
     let mut search_query = mcp_agent_mail_db::search_planner::SearchQuery {
@@ -4006,6 +4096,12 @@ fn search_messages_unified(
         doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
         project_id,
         limit: Some(limit),
+        importance: filter
+            .importance
+            .and_then(mcp_agent_mail_db::search_planner::Importance::parse)
+            .into_iter()
+            .collect(),
+        ack_required: filter.ack_required.then_some(true),
         ..Default::default()
     };
     // Messages screen expects newest-first ordering when scanning inbox content.
@@ -4382,21 +4478,13 @@ fn recipient_names_from_json(raw: &str) -> String {
 }
 
 /// Count total messages, optionally filtered by project.
-fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let (sql, params) = match project_filter {
-        Some(slug) => {
-            let Some(project_id) = project_id_for_slug(conn, slug) else {
-                return 0;
-            };
-            (
-                "SELECT COUNT(*) AS c FROM messages WHERE project_id = ?",
-                vec![Value::BigInt(project_id)],
-            )
-        }
-        None => ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
+fn count_messages(conn: &DbConn, project_filter: Option<&str>, filter: MessageFilter) -> usize {
+    let Some((where_clause, params)) = message_scope_where(conn, project_filter, filter) else {
+        return 0;
     };
+    let sql = format!("SELECT COUNT(*) AS c FROM messages {where_clause}");
 
-    match conn.query_sync(sql, &params) {
+    match conn.query_sync(&sql, &params) {
         Ok(rows) => rows
             .into_iter()
             .next()
@@ -8116,8 +8204,13 @@ first body
         )
         .expect("seed message");
 
-        let (entries, total) =
-            fetch_recent_messages(&conn, PAGE_SIZE, Some("[unknown-project-77]"), true);
+        let (entries, total) = fetch_recent_messages(
+            &conn,
+            PAGE_SIZE,
+            Some("[unknown-project-77]"),
+            true,
+            MessageFilter::NONE,
+        );
 
         assert_eq!(total, 1);
         assert_eq!(entries.len(), 1);
@@ -8265,11 +8358,88 @@ first body
     #[test]
     fn apply_preset_sets_query() {
         let mut screen = MessageBrowserScreen::new();
-        screen.apply_preset(1); // "Urgent"
-        assert_eq!(screen.preset_index, 1);
-        assert_eq!(screen.search_input.value(), "urgent");
+        screen.apply_preset(4); // "Error" is a text preset
+        assert_eq!(screen.preset_index, 4);
+        assert_eq!(screen.search_input.value(), "error");
         assert!(screen.search_dirty);
         assert_eq!(screen.debounce_remaining, 0);
+    }
+
+    #[test]
+    fn importance_and_ack_presets_filter_columns_not_words() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.apply_preset(1); // "Urgent"
+        assert_eq!(screen.search_input.value(), "", "no word is injected");
+        let urgent = screen.active_preset().filter;
+        assert_eq!(urgent.importance, Some("urgent"));
+
+        let mut flagged = test_message_entry(1, "t", "deploy");
+        flagged.importance = "urgent".to_string();
+        // The old text preset matched this one and missed the one above.
+        let mentions_word = test_message_entry(2, "t", "urgent: please read");
+        let mut live = test_message_entry(-1, "t", "urgent");
+        live.importance = "normal".to_string();
+        assert!(urgent.matches(&flagged));
+        assert!(!urgent.matches(&mentions_word));
+        assert!(!urgent.matches(&live), "live entries carry no importance");
+
+        screen.apply_preset(3); // "Ack"
+        let ack = screen.active_preset().filter;
+        let mut needs_ack = test_message_entry(3, "t", "s");
+        needs_ack.ack_required = true;
+        assert!(ack.matches(&needs_ack));
+        assert!(!ack.matches(&flagged));
+
+        assert!(!MessageFilter::NONE.is_active());
+        assert!(MessageFilter::NONE.matches(&mentions_word));
+    }
+
+    #[test]
+    fn fetch_recent_messages_applies_the_preset_filter_to_rows_and_total() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
+        conn.execute_raw("INSERT INTO projects (id, slug) VALUES (7, 'proj')")
+            .expect("seed project");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY, subject TEXT, topic TEXT, body_md TEXT,
+                thread_id TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER,
+                sender_id INTEGER, project_id INTEGER, recipients_json TEXT
+            )",
+        )
+        .expect("create messages");
+        // Message 2 only mentions the word; message 4 is in another project.
+        for (id, subject, importance, ack, project) in [
+            (1, "deploy", "urgent", 0, 7),
+            (2, "urgent: please read", "normal", 0, 7),
+            (3, "review", "high", 1, 7),
+            (4, "elsewhere", "urgent", 1, 8),
+        ] {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, subject, body_md, thread_id, importance, \
+                 ack_required, created_ts, sender_id, project_id, recipients_json) \
+                 VALUES ({id}, '{subject}', 'b', 't', '{importance}', {ack}, {id}, 1, \
+                 {project}, '{{\"to\":[],\"cc\":[],\"bcc\":[]}}')"
+            ))
+            .expect("seed message");
+        }
+        let ids = |project: Option<&str>, filter: MessageFilter| {
+            let (entries, total) = fetch_recent_messages(&conn, PAGE_SIZE, project, true, filter);
+            let mut ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+            ids.sort_unstable();
+            (ids, total)
+        };
+        let urgent = QUERY_PRESETS[1].filter;
+        let ack = QUERY_PRESETS[3].filter;
+
+        assert_eq!(ids(None, MessageFilter::NONE), (vec![1, 2, 3, 4], 4));
+        assert_eq!(ids(None, urgent), (vec![1, 4], 2));
+        assert_eq!(ids(Some("proj"), urgent), (vec![1], 1));
+        assert_eq!(ids(None, ack), (vec![3, 4], 2));
+        assert_eq!(ids(Some("proj"), ack), (vec![3], 1));
     }
 
     #[test]
@@ -8289,7 +8459,8 @@ first body
         let p = Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')));
         screen.update(&p, &state);
         assert_eq!(screen.preset_index, 1);
-        assert_eq!(screen.search_input.value(), "urgent");
+        assert_eq!(screen.active_preset().label, "Urgent");
+        assert_eq!(screen.active_preset().filter.importance, Some("urgent"));
     }
 
     #[test]
