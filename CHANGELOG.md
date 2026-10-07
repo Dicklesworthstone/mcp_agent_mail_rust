@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-Scope window: [v0.3.36 → v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...v0.3.37)
-and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.37...main). Entries use git diffs, tag targets,
+Scope window: [v0.3.37 → v0.3.38](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.37...v0.3.38)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.38...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -17,6 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.38](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.38) | 2026-10-07 | **Release** | Server descriptor-leak fix (GH #333): one shared, bounded live read pool; FrankenSQLite 0.4.10 data-integrity update; background closeout replay and archive repair; CLI/TUI/search correctness fixes |
 | [v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.37) | 2026-10-05 | **Release** | Safe mailbox upgrades after the v30 short-record incident (br-2hpuk); FrankenSQLite 0.4.9; Linux descriptor bound and descriptor-exhaustion reporting; stalled write-behind drain detection |
 | [v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.36) | 2026-09-16 | **Release** | Windows/WAL recovery, contention and search fixes; six signed platform archives and matching GHCR images |
 | [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers; six-platform binary assets |
@@ -27,7 +28,176 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-No changes since v0.3.37.
+No changes since v0.3.38.
+
+## v0.3.38 — 2026-10-07 [Release]
+
+Changes after the [v0.3.37 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.37).
+
+### Upgrade notes
+
+- **No schema change.** v0.3.38 uses the v0.3.37 mailbox schema (v31) unchanged, so
+  upgrading needs no migration. The usual rule still applies: stop every running `am`
+  process (server, TUI, CLI) before you start the new binary on the same mailbox.
+- **FrankenSQLite 0.4.10 is a data-integrity update.** The mailbox engine moves from
+  0.4.9 to 0.4.10. That release fixes:
+  - inserts inside a transaction that could silently corrupt a table b-tree;
+  - a retried fsync after a failed WAL sync that could vouch for unwritten frames;
+  - `UPDATE ... FROM` losing or repeating updates;
+  - malformed index entries for non-integer rowid / `INTEGER PRIMARY KEY` values.
+
+### Descriptor leak fix (GH #333, br-8r6dl)
+
+**This is the release that carries the fix for the server descriptor leak.** On v0.3.36,
+and on macOS also v0.3.37, a long-running server accumulated descriptors on
+`storage.sqlite3` until it reached `RLIMIT_NOFILE`. Every tool call then failed with
+`RESOURCE_BUSY ... unable to open database file`. Upgrade any server that has hit this.
+
+- **Request-path reads share one live read pool** (1d994f1e).
+  - Before: `fetch_inbox`, project resolution, the live read tools and MCP resource reads
+    each built a fresh query-only pool, so every call opened one FrankenSQLite connection
+    on `storage.sqlite3` and closed it again. On macOS and other non-Linux Unix, the engine
+    cannot release that connection's descriptor while the pool holds read locks, so a
+    busy server leaked descriptors on every read.
+  - Measured on Linux with the engine's descriptor reuse disabled: 13 → 185 descriptors
+    over 120 calls before the fix, 13 → 56 after.
+  - Now one strict query-only pool per mailbox is shared, and recovery retires it.
+- **The shared pool registry is bounded** (f523f04b).
+  - It holds four entries. Eviction never closes a pool that a caller is still using.
+  - An entry whose mailbox path now names a different file, or no file, is rebuilt.
+    This covers a mailbox replaced by another process.
+- **Live reads stay fresh.** Every caller of the shared lane gets its own read-cache
+  generation, as the per-call pool did. Writes refresh cached agent rows only in the
+  writing pool's scope. With one shared generation, `whois`, `fetch_inbox` sender
+  resolution, `list_contacts` and agent resources would have kept serving an agent's old
+  profile, contact policy or retirement after an update. Found in release review, fixed
+  before release, and covered by a regression test (053335a0).
+- **Search probes the database once per pool.** The lexical search health probe keys its
+  memo by the shared engine pool, not by the per-call read scope. Searches therefore don't
+  open a fresh connection on the live file each time, and the memo stays bounded
+  (06b0a25c).
+- **Residual on macOS: about 2 descriptors per write.** These come from the deliberate
+  fresh-handle durability probe. Closing them needs the engine's descriptor reuse on
+  Darwin, which is tracked in FrankenSQLite as bd-l0rbc and is not an Agent Mail change.
+  Until then, the startup soft-limit raise from v0.3.37 (toward 65,536, or 10,240 on
+  macOS) keeps a server far from the limit.
+
+### Background recovery and maintenance
+
+The server now finishes interrupted mailbox work by itself instead of waiting for the next
+client call that touches it:
+
+- **Closeout replay.** Durable acknowledgements and queued reservation releases are replayed
+  by dedicated join-on-shutdown workers (br-bvq1x.8.3). The workers run in two independent
+  lanes, so a stalled release archive cannot hold up acknowledgements. A supervisor
+  restarts a failed lane with 1–60 s backoff (ae05cc37, c5594606). Bulk releases replay in
+  resumable keyset pages.
+  - A replayed release repair no longer panics the replay worker (97e5ae76).
+  - A release batch writes its database closeouts and journal receipts before any archive
+    follow-up, so blocked Git or filesystem work cannot strand them (1d1d0644).
+  - Release replay defers, instead of blocking, while recovery promotion owns write
+    admission (574c66d7).
+- **Active lease artifacts** missing from the archive are rebuilt create-only from the
+  database, without overwriting newer state (br-kp1in.19).
+- **Accepted messages and attachments.**
+  - Message bundles missing from the archive after an interrupted write are repaired by a
+    cancellable path with bounded lock admission (dfaf839a, d331d749).
+  - Staged-only attachments are recovered.
+  - A missing committed attachment object is rebuilt only when the surviving bytes reproduce
+    its exact Git object id (br-8j6cb).
+- **Repair under contention.** Reservation, active-lease, message and agent-profile repair
+  try database and archive admission without blocking. A contended project is deferred
+  while other projects keep progressing, and recovery promotion takes priority over nested
+  repair.
+- **Unfinished lock waits are reported automatically.** The server reports their holder and
+  waiter sites with bounded incident tracking, without waiting for an operator to ask for
+  diagnostics (br-kp1in.29).
+- **Archive index sync.** The shared archive `.git/index` is kept current off the commit
+  path (br-0i0g4). This used to cost about 1 MB written per message on a 90k-file archive,
+  and above 64 MB the index stayed permanently behind HEAD. The background sync never fails
+  a read, never strands `index.lock`, and never overwrites staged changes.
+- **First send after a start.** The message-id archive seed rescans after a concurrent
+  append instead of failing that send (br-zh5wa).
+- **Broken archive repositories.** An archive repo whose `.git` cannot be opened is
+  refused, not treated as healthy, and failed archive writes are surfaced.
+
+### CLI, doctor and guard
+
+- **`am mail inbox` no longer marks messages read.** The server path now peeks, like
+  `am inbox` and `check-inbox`.
+- **`am macros start-session` / `prepare-thread` without `--agent-name`** let the server
+  choose a name instead of inventing one client-side, which could collide with an existing
+  agent.
+- **`am mail summarize-thread`** prints the key points and action items, not just counts.
+- **`am guard check`** honors `AGENT_MAIL_BYPASS=1`, `AGENT_MAIL_GUARD_MODE=warn` and
+  `FILE_RESERVATIONS_ENFORCEMENT_ENABLED=false`, as the installed hook does.
+- **Every command that doctor, hints, the README and the runbooks tell you to run now
+  parses.** About 60 recipes used pre-verb `am doctor` flags that the CLI rejected.
+- **Health reporting.** A release reconciliation that is converging is reported as
+  reconciling, not as a stuck reconciler, and timestamps in the future are not counted as
+  recent progress.
+- **HTTP `--setup` timing.** HTTP startup preparation runs once, and `--setup` runs only
+  after the listener is serving.
+
+### Search
+
+- **Subject Only / Body Only scope every term** on both the SQL and the lexical paths.
+  A one-word Body Only search used to become an empty query that listed the project's
+  oldest messages.
+- **Per-tool engine settings are honored.** `AM_SEARCH_ENGINE_FOR_<TOOL>` overrides and
+  `AM_SEARCH_SEMANTIC_ENABLED=false` are now consulted. The kill switch also keeps an
+  explicit hybrid/auto request on the lexical tier.
+- **No write lock for an empty prune.** A search-history prune with nothing to delete no
+  longer opens a write transaction.
+
+### Terminal UI
+
+- **Controls do what their labels say.** Timeline filters and details, command-palette
+  deep links, Messages presets (Urgent/High/Ack filter by importance and ack state), and
+  "View reservations" for an agent.
+- **Unreachable features are reachable.**
+  - Keyboard move uses Ctrl+X / Ctrl+V, because Ctrl+M was indistinguishable from Enter.
+  - Clear actions moved to `X`, off Ctrl+C.
+  - Drill-down keys work.
+  - Saved searches are shared.
+  - Message toasts coalesce.
+- **Key routing.** Every documented sub-pane key reaches its screen, and modal dialogs
+  stop firing global shortcuts.
+- **New:** a sender × recipient heatmap of recent message flow in Contacts (`n` cycles
+  Table → Graph → Matrix).
+
+### Dependencies
+
+- FrankenSQLite 0.4.9 → 0.4.10 (mailbox engine; see the upgrade notes).
+- franken-agent-detection 0.2.2 → 0.3.7. The detection API is unchanged, and the new
+  optional session connectors are not enabled.
+- comrak 0.55 → 0.56. Rendered Markdown still passes through Ammonia.
+- A semver-compatible refresh of 83 registry packages.
+  - The wasm-bindgen family is held at 0.2.127 / 0.4.77, because wasm-bindgen-futures
+    0.4.79 would add tokio to `Cargo.lock`.
+  - FrankenTUI stays at 0.7.0 and embedded Beads at 0.6.0.
+
+### Release verification
+
+The release commit was gated on remote RCH workers with the pinned `nightly-2026-08-31`. It
+was checked against v0.3.37 in four ways:
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo check --workspace --lib --bins`, and portable-feature clippy for the two shipped
+  packages.
+- The full test suite, run one package at a time. Every failure was classified against
+  v0.3.37.
+- Two independent review rounds over `v0.3.37..v0.3.38`. They found the live-lane cache
+  staleness and the per-search probe described above, and both were fixed before the tag.
+- Real-service installer and upgrade checks against the published archives.
+
+Per-package counts and the e2e transcripts are in the
+[v0.3.38 GitHub Release notes](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.38).
+
+Archives are built with DSR native lanes, never GitHub Actions. Linux GNU targets need
+glibc 2.28 or newer; the musl archive is static; macOS binaries need macOS 13 or newer.
+`SHA256SUMS` is signed with minisign key
+`RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70`.
 
 ## v0.3.37 — 2026-10-05 [Release]
 

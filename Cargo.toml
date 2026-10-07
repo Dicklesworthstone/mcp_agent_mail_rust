@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.37"
+version = "0.3.38"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -208,7 +208,7 @@ fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", re
 fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
 # Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
-# The mailbox uses registry FrankenSQLite 0.4.9 (no patch).
+# The mailbox uses registry FrankenSQLite 0.4.10 (no patch).
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
@@ -230,10 +230,12 @@ fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 # The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# registry FrankenSQLite 0.4.9 and pinned FastMCP 0.10.0.
+# registry FrankenSQLite 0.4.10 and pinned FastMCP 0.10.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
 # the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).
+# 0.4.10 adds the b-tree insert-in-transaction (bd-obwsy) and retried-fsync
+# (bd-alyrn) integrity fixes and max-rowid parity (br-9pnpe).
 # No mutable sibling checkout is required.
 #
 # beads_rust =0.6.0 is published and resolves from crates.io. Do not patch it
