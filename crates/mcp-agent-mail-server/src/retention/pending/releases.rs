@@ -63,8 +63,10 @@ impl ArchiveFollowups {
 
     fn run(self, cx: &Cx, pool: &DbPool, config: &Config, shutdown: &AtomicBool) {
         if self.unversioned > 0 {
-            tracing::warn!(released = self.unversioned,
-                "release applied; missing generation defers archive repair without a legacy write");
+            tracing::warn!(
+                released = self.unversioned,
+                "release applied; missing generation defers archive repair without a legacy write"
+            );
         }
         let mut budget = MAX_ARCHIVE_REPAIRS_PER_BATCH;
         for (rows, generation) in self.groups {
@@ -1446,12 +1448,21 @@ mod tests {
             BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move |retained| {
                     assert_eq!(retained, MAX_ARCHIVE_REPAIRS_PER_BATCH);
-                    assert!(journal::read_queued_release_intents(&selected).unwrap().is_empty());
+                    assert!(
+                        journal::read_queued_release_intents(&selected)
+                            .unwrap()
+                            .is_empty()
+                    );
                     assert_eq!(active_writer_count(), 0);
                     let promotion = try_acquire_promotion_barrier_if_idle()
                         .expect("completed batch must release database admission");
                     drop(promotion);
-                    assert!(!selected.storage_root.join("projects/replay/file_reservations").exists());
+                    assert!(
+                        !selected
+                            .storage_root
+                            .join("projects/replay/file_reservations")
+                            .exists()
+                    );
                     // Mark only after every boundary assertion succeeded, so
                     // catch_unwind cannot mistake an assertion for the fault.
                     observed.store(true, Ordering::Release);
@@ -1463,17 +1474,25 @@ mod tests {
             }));
             assert!(failed.is_err());
             assert!(reached.load(Ordering::Acquire));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
             let released = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
-                .into_result().unwrap();
+                .into_result()
+                .unwrap();
             assert_eq!(released.len(), ids.len());
             assert!(released.iter().all(|row| row.released_ts.is_some()));
             assert_eq!(active_writer_count(), 0);
 
             // No intent or in-memory follow-up survives. The real history
             // reconciler must use the ledger and the latest database metadata.
-            let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='after replay exit'").unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(cx))
+                .into_result()
+                .unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason='after replay exit'")
+                .unwrap();
             drop(conn);
             let mut history = mcp_agent_mail_storage::recovery::reservation_reconcile::ReservationReconcileCursor::default();
             for _ in 0..3 {
@@ -1483,13 +1502,23 @@ mod tests {
             }
             for row in released {
                 let file = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
-                    Some(generation), row.id.unwrap(),
+                    Some(generation),
+                    row.id.unwrap(),
                 );
-                let bytes = std::fs::read(config.storage_root.join("projects/replay/file_reservations").join(file)).unwrap();
+                let bytes = std::fs::read(
+                    config
+                        .storage_root
+                        .join("projects/replay/file_reservations")
+                        .join(file),
+                )
+                .unwrap();
                 let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(artifact["reason"], "after replay exit");
                 assert_eq!(artifact["db_generation"], generation);
-                assert_eq!(artifact["released_ts"], micros_to_iso(row.released_ts.unwrap()));
+                assert_eq!(
+                    artifact["released_ts"],
+                    micros_to_iso(row.released_ts.unwrap())
+                );
             }
         });
     }
@@ -1517,7 +1546,10 @@ mod tests {
                     assert_eq!(retained, MAX_ARCHIVE_REPAIRS_PER_BATCH);
                     let pending = journal::read_queued_release_intents(&selected).unwrap();
                     assert_eq!(pending.len(), 1);
-                    assert!(pending[0].file_reservation_ids.is_none(), "bulk scope is incomplete");
+                    assert!(
+                        pending[0].file_reservation_ids.is_none(),
+                        "bulk scope is incomplete"
+                    );
                     assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
                     stop_at_boundary.store(true, Ordering::Release);
                 }));
@@ -1525,22 +1557,53 @@ mod tests {
             let mut cursor = Cursor::default();
             let intents = journal::read_queued_release_intents(config).unwrap();
             let report = fastmcp_core::block_on(replay_batch(
-                cx, pool, config, &mut cursor, &stop, &intents,
-            )).unwrap();
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &stop,
+                &intents,
+            ))
+            .unwrap();
             assert!(report.interrupted);
-            assert_eq!((report.applied, report.completed, report.rows_released), (2, 1, 65));
-            assert!(!config.storage_root.join("projects/replay/file_reservations").exists());
-            let before = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
-                .into_result().unwrap();
+            assert_eq!(
+                (report.applied, report.completed, report.rows_released),
+                (2, 1, 65)
+            );
+            assert!(
+                !config
+                    .storage_root
+                    .join("projects/replay/file_reservations")
+                    .exists()
+            );
+            let before =
+                fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
+                    .into_result()
+                    .unwrap();
             assert!(before.iter().all(|row| row.released_ts.is_some()));
             let resumed = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
-            let after = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
-                .into_result().unwrap();
             assert_eq!(
-                before.iter().map(|row| (row.id, row.released_ts)).collect::<Vec<_>>(),
-                after.iter().map(|row| (row.id, row.released_ts)).collect::<Vec<_>>(),
+                (resumed.rows_released, resumed.completed, resumed.deferred),
+                (1, 1, 0)
+            );
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
+            let after =
+                fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
+                    .into_result()
+                    .unwrap();
+            assert_eq!(
+                before
+                    .iter()
+                    .map(|row| (row.id, row.released_ts))
+                    .collect::<Vec<_>>(),
+                after
+                    .iter()
+                    .map(|row| (row.id, row.released_ts))
+                    .collect::<Vec<_>>(),
             );
         });
     }
@@ -1556,23 +1619,48 @@ mod tests {
             queue_fixture_release(config, cutoff, 401);
             let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
             let before = std::fs::read(&log).unwrap();
-            let lock_path = config.storage_root.join(journal::DEGRADED_INTENTS_DIR).join(RELEASE_LOCK);
-            let held = std::fs::OpenOptions::new().read(true).write(true).open(lock_path).unwrap();
+            let lock_path = config
+                .storage_root
+                .join(journal::DEGRADED_INTENTS_DIR)
+                .join(RELEASE_LOCK);
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
             fs2::FileExt::try_lock_exclusive(&held).unwrap();
             let mut cursor = Cursor::default();
             let report = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 0, 1));
+            assert_eq!(
+                (report.rows_released, report.completed, report.deferred),
+                (1, 0, 1)
+            );
             assert_eq!(std::fs::read(&log).unwrap(), before);
-            assert_eq!(journal::read_queued_release_intents(config).unwrap().len(), 1);
-            let original = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
-                .into_result().unwrap()[0].released_ts;
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap().len(),
+                1
+            );
+            let original =
+                fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
+                    .into_result()
+                    .unwrap()[0]
+                    .released_ts;
             assert!(original.is_some());
             fs2::FileExt::unlock(&held).unwrap();
             let retry = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((retry.rows_released, retry.completed, retry.deferred), (0, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(
+                (retry.rows_released, retry.completed, retry.deferred),
+                (0, 1, 0)
+            );
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
             let after = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
-                .into_result().unwrap()[0].released_ts;
+                .into_result()
+                .unwrap()[0]
+                .released_ts;
             assert_eq!(after, original);
         });
     }
@@ -1596,21 +1684,41 @@ mod tests {
             BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move |retained| {
                     assert_eq!(retained, 1);
-                    assert!(journal::read_queued_release_intents(&selected).unwrap().is_empty());
+                    assert!(
+                        journal::read_queued_release_intents(&selected)
+                            .unwrap()
+                            .is_empty()
+                    );
                     assert_eq!(active_writer_count(), 0);
                     let promotion = try_acquire_promotion_barrier_if_idle().unwrap();
                     let conn = mcp_agent_mail_db::DbConn::open_file(&database).unwrap();
-                    conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0").unwrap();
+                    conn.execute_raw(
+                        "UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0",
+                    )
+                    .unwrap();
                     drop(conn);
                     drop(promotion);
                 }));
             });
             let report = page_pass(cx, pool, config, &mut Cursor::default());
-            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
-            assert!(!config.storage_root.join("projects/replay/file_reservations").exists());
+            assert_eq!(
+                (report.rows_released, report.completed, report.deferred),
+                (1, 1, 0)
+            );
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                !config
+                    .storage_root
+                    .join("projects/replay/file_reservations")
+                    .exists()
+            );
             let current = fastmcp_core::block_on(queries::db_generation_id(cx, pool))
-                .into_result().unwrap();
+                .into_result()
+                .unwrap();
             assert_eq!(current.as_deref(), Some("ccdd"));
         });
     }
@@ -1633,8 +1741,11 @@ mod tests {
             let mut cursor = Cursor::default();
             assert_eq!(page_pass(cx, pool, config, &mut cursor).rows_released, 64);
             let round_before = cursor.round.after.clone();
-            let progress_before: Vec<_> = cursor.pages.iter()
-                .map(|(key, position)| (key.clone(), position.released)).collect();
+            let progress_before: Vec<_> = cursor
+                .pages
+                .iter()
+                .map(|(key, position)| (key.clone(), position.released))
+                .collect();
             assert_eq!(progress_before.len(), 1);
             assert_eq!(progress_before[0].1, 64);
             let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
@@ -1647,7 +1758,12 @@ mod tests {
                 let owner = std::thread::spawn(move || {
                     let gate = if parent_writer {
                         let (gate, result) = acquire_promotion_barrier_draining(Duration::ZERO);
-                        assert!(matches!(result, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        assert!(matches!(
+                            result,
+                            DrainOutcome::TimedOut {
+                                remaining_writers: 1
+                            }
+                        ));
                         gate
                     } else {
                         try_acquire_promotion_barrier_if_idle().expect("idle promotion")
@@ -1661,30 +1777,50 @@ mod tests {
                 });
                 ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let refused = fastmcp_core::block_on(replay_batch(
-                    cx, pool, config, &mut cursor, &AtomicBool::new(false), &intents,
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                    &intents,
                 ));
                 let writers = active_writer_count();
                 let bytes_during = std::fs::read(&log).unwrap();
                 drop(parent);
                 let _ = release_tx.send(());
-                assert!(owner.join().unwrap().is_ok(), "replay waited for promotion expiry");
+                assert!(
+                    owner.join().unwrap().is_ok(),
+                    "replay waited for promotion expiry"
+                );
                 assert!(refused.unwrap_err().contains("admission contention"));
                 assert_eq!(writers, usize::from(parent_writer));
                 assert_eq!(active_writer_count(), 0);
                 assert_eq!(bytes_during, bytes_before);
                 assert_eq!(cursor.round.after, round_before);
-                let progress: Vec<_> = cursor.pages.iter()
-                    .map(|(key, position)| (key.clone(), position.released)).collect();
+                let progress: Vec<_> = cursor
+                    .pages
+                    .iter()
+                    .map(|(key, position)| (key.clone(), position.released))
+                    .collect();
                 assert_eq!(progress, progress_before);
-                let remaining = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[65]))
-                    .into_result().unwrap();
+                let remaining =
+                    fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[65]))
+                        .into_result()
+                        .unwrap();
                 assert!(remaining[0].released_ts.is_none());
             }
             // No cursor reset: completion must resume after the committed
             // 64-ID page, not rescan it or abandon the last lease.
             let resumed = page_pass(cx, pool, config, &mut cursor);
-            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(
+                (resumed.rows_released, resumed.completed, resumed.deferred),
+                (1, 1, 0)
+            );
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -1704,7 +1840,12 @@ mod tests {
             let mut cursor = Cursor::default();
             let gate = try_acquire_promotion_barrier_if_idle().unwrap();
             let refused = fastmcp_core::block_on(replay_batch(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false), &intents,
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+                &intents,
             ));
             let writers = active_writer_count();
             drop(gate);
@@ -1728,8 +1869,15 @@ mod tests {
             queue_fixture_release(config, cutoff, 401);
             let writer = begin_write_activity();
             let report = page_pass(cx, pool, config, &mut Cursor::default());
-            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 1, 0));
-            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(
+                (report.rows_released, report.completed, report.deferred),
+                (1, 1, 0)
+            );
+            assert!(
+                journal::read_queued_release_intents(config)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(active_writer_count(), 1);
             drop(writer);
             assert_eq!(active_writer_count(), 0);
