@@ -434,7 +434,7 @@
         </div>
         <div class="divide-y divide-slate-100 dark:divide-slate-700 max-h-96 overflow-y-auto">
           {% for recipe in recipes %}
-          <a href="/mail/{{ project.slug }}{{ recipe.route }}"
+          <a href="{{ recipe.href }}"
              class="block px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-900 transition-colors group">
             <div class="flex items-center gap-2 mb-1">
               {% if recipe.pinned %}

@@ -833,14 +833,58 @@ first body
             },
         )
         .expect("insert recipe");
+        live_conn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (77, 'pinned-proj', '/pinned-proj', 0)",
+                &[],
+            )
+            .expect("insert pinned project");
+        let pinned_id = mcp_agent_mail_db::search_recipes::insert_recipe(
+            &live_conn,
+            &mcp_agent_mail_db::search_recipes::SearchRecipe {
+                name: "Pinned project recipe".to_string(),
+                scope_mode: mcp_agent_mail_db::search_recipes::ScopeMode::Project,
+                scope_id: Some(77),
+                ..Default::default()
+            },
+        )
+        .expect("insert pinned recipe");
         drop(live_conn);
 
-        let recipes = with_mail_ui_env(&storage_root, &db_path, load_recipes);
+        let recipes = with_mail_ui_env(&storage_root, &db_path, || {
+            load_recipes("ahead-project", None)
+        });
+        let live = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Live saved recipe")
+            .expect("live recipe listed");
         assert!(
-            recipes
-                .iter()
-                .any(|recipe| recipe.name == "Live saved recipe")
+            live.href.starts_with("/mail/ahead-project/search?"),
+            "{}",
+            live.href
         );
+        let pinned = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Pinned project recipe")
+            .expect("pinned recipe listed");
+        // A project-scoped saved search opens in its own project.
+        assert!(
+            pinned.href.starts_with("/mail/pinned-proj/search?"),
+            "{}",
+            pinned.href
+        );
+        assert!(pinned.href.ends_with(&format!("recipe={pinned_id}")));
+        assert_eq!(pinned.use_count, 0);
+
+        // Following its link counts a use.
+        let recipes = with_mail_ui_env(&storage_root, &db_path, || {
+            load_recipes("ahead-project", Some(pinned_id))
+        });
+        let pinned = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Pinned project recipe")
+            .expect("pinned recipe listed");
+        assert_eq!(pinned.use_count, 1);
     }
 
     #[test]
@@ -4047,7 +4091,10 @@ struct RecipeView {
     id: i64,
     name: String,
     description: String,
-    route: String,
+    /// Where the saved search opens: its pinned project's search page for a
+    /// Project/Product scope, else this project's, tagged with the recipe id
+    /// so opening it counts a use.
+    href: String,
     pinned: bool,
     use_count: i64,
 }
@@ -4427,7 +4474,8 @@ fn render_search(
     let agents: Vec<AgentView> = agents_rows.iter().map(agent_view).collect();
 
     // ── Load saved recipes ──────────────────────────────────────────
-    let recipes = load_recipes();
+    let opened_recipe = extract_query_str(query_str, "recipe").and_then(|id| id.parse().ok());
+    let recipes = load_recipes(&p.slug, opened_recipe);
 
     let result_count = results.len();
     let deep_link = build_search_deep_link(project_slug, query_str);
@@ -4468,7 +4516,9 @@ fn render_search(
 /// Recipes are operator-local metadata, not archive-backed state, so they must
 /// come from the configured live sqlite file even when the rest of the page is
 /// rendered from an archive-backed observability snapshot.
-fn load_recipes() -> Vec<RecipeView> {
+/// Saved searches for the sidebar of `project_slug`'s search page. `opened`
+/// is the recipe whose link was just followed; its use count goes up first.
+fn load_recipes(project_slug: &str, opened: Option<i64>) -> Vec<RecipeView> {
     let config = Config::from_env();
     // `list_recipes` self-heals its schema with idempotent DDL, so this
     // apparently read-only route must hold the promotion lease from before the
@@ -4479,16 +4529,39 @@ fn load_recipes() -> Vec<RecipeView> {
     };
     // Wrap in DbConnGuard so the live metadata connection closes at scope exit.
     let conn = mcp_agent_mail_db::guard_db_conn(conn, "mail_ui::load_recipes");
+    if let Some(recipe_id) = opened {
+        let _ = mcp_agent_mail_db::search_recipes::touch_recipe(&conn, recipe_id);
+    }
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
+    let pinned_project_slug = |project_id: i64| {
+        conn.query_sync(
+            "SELECT slug FROM projects WHERE id = ?",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project_id)],
+        )
+        .ok()?
+        .first()?
+        .get_named::<String>("slug")
+        .ok()
+    };
     recipes
         .iter()
-        .map(|r| RecipeView {
-            id: r.id.unwrap_or(0),
-            name: r.name.clone(),
-            description: r.description.clone(),
-            route: r.route_string(),
-            pinned: r.pinned,
-            use_count: r.use_count,
+        .map(|r| {
+            let id = r.id.unwrap_or(0);
+            let slug = r
+                .scope_id
+                .filter(|_| r.scope_mode != mcp_agent_mail_db::search_recipes::ScopeMode::Global)
+                .and_then(pinned_project_slug)
+                .unwrap_or_else(|| project_slug.to_string());
+            let route = r.route_string();
+            let separator = if route.contains('?') { '&' } else { '?' };
+            RecipeView {
+                id,
+                name: r.name.clone(),
+                description: r.description.clone(),
+                href: format!("/mail/{slug}{route}{separator}recipe={id}"),
+                pinned: r.pinned,
+                use_count: r.use_count,
+            }
         })
         .collect()
 }
