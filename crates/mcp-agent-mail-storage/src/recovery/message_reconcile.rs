@@ -9,11 +9,15 @@
 mod attachments;
 pub mod database;
 mod identity;
+#[cfg(test)]
+mod cancellable_tests;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use asupersync::Cx;
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 use mcp_agent_mail_core::Config;
 use serde::{Deserialize, Serialize};
@@ -42,6 +46,38 @@ fn invalid(message: impl Into<String>) -> StorageError {
     StorageError::InvalidPath(message.into())
 }
 
+#[derive(Clone, Copy)]
+struct RepairControl<'a> {
+    cx: &'a Cx,
+    stop: &'a AtomicBool,
+}
+
+impl RepairControl<'_> {
+    fn cancelled(self) -> bool {
+        self.stop.load(Ordering::Acquire) || self.cx.checkpoint().is_err()
+    }
+
+    fn checkpoint(self) -> crate::Result<()> {
+        if self.cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "message archive repair cancelled",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[track_caller]
+    fn begin_at(self, path: &Path) -> crate::Result<crate::ArchiveMutationGuard> {
+        crate::ArchiveMutationGuard::try_begin_repair(path, || self.cancelled())
+    }
+}
+
+fn checkpoint(control: Option<RepairControl<'_>>) -> crate::Result<()> {
+    control.map_or(Ok(()), RepairControl::checkpoint)
+}
+
 /// Restore missing canonical/outbox/inbox copies without replacing any file.
 ///
 /// The caller must supply authoritative frontmatter, including optional fields
@@ -64,6 +100,40 @@ pub fn reconcile_message_bundle(
     config: &Config,
     entry: MessageBundleBatchEntry<'_>,
 ) -> crate::Result<ReconcileResult> {
+    reconcile_message_bundle_inner(archive, config, entry, None)
+}
+
+/// Restore a message bundle with cooperative cancellation and bounded lock admission.
+///
+/// Uses the same validation, no-clobber publication and exact Git verification
+/// as [`reconcile_message_bundle`]. A busy global publication fence defers
+/// immediately; project mutex/flock waits share a 250 ms acquisition budget.
+/// The worker stop flag and Cx are checked before admission, while waiting for
+/// project locks, between file publications, and before committing. Completed
+/// files survive cancellation and are revalidated on retry, never redelivered.
+///
+/// # Errors
+///
+/// Returns the original validation/I/O errors, lock contention/timeouts, or an
+/// interrupted I/O error on cancellation. Filesystem calls, verification scans,
+/// libgit2 operations and native guard cleanup do not have hard deadlines.
+pub fn reconcile_message_bundle_cancellable(
+    cx: &Cx,
+    archive: &ProjectArchive,
+    config: &Config,
+    entry: MessageBundleBatchEntry<'_>,
+    stop: &AtomicBool,
+) -> crate::Result<ReconcileResult> {
+    reconcile_message_bundle_inner(archive, config, entry, Some(RepairControl { cx, stop }))
+}
+
+fn reconcile_message_bundle_inner(
+    archive: &ProjectArchive,
+    config: &Config,
+    entry: MessageBundleBatchEntry<'_>,
+    control: Option<RepairControl<'_>>,
+) -> crate::Result<ReconcileResult> {
+    checkpoint(control)?;
     let id = crate::positive_message_id(entry.message)
         .ok_or_else(|| invalid("archive reconciliation requires a positive message ID"))?;
     let created = entry
@@ -170,7 +240,10 @@ pub fn reconcile_message_bundle(
     // Missing-file publication creates parent directories inside the project
     // lock. Enter their mutation fence first, matching ordinary bundle writes
     // and archive-verified retention, so repair cannot invert that lock order.
-    let _mutation = crate::ArchiveMutationGuard::begin_at(repo_root);
+    let _mutation = match control {
+        Some(control) => control.begin_at(repo_root)?,
+        None => crate::ArchiveMutationGuard::begin_at(repo_root),
+    };
     let repo = Repository::open(repo_root)?;
     let attachment_files =
         attachments::prepare(&repo, archive, entry.message, MAX_BUNDLE_BYTES - bytes)?;
@@ -188,7 +261,8 @@ pub fn reconcile_message_bundle(
         .map(|(_, bytes)| Oid::hash_object(ObjectType::Blob, bytes))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let files_created = crate::with_project_lock(archive, || {
+    let publish = || {
+        checkpoint(control)?;
         // Missing working-tree copies do not erase the Git ledger's authority.
         // Check every committed copy before publishing even the first repair;
         // otherwise a different reply parent or extension field could silently
@@ -228,16 +302,23 @@ pub fn reconcile_message_bundle(
         }
         let mut created = 0;
         for ((path, expected), missing) in targets.iter().zip(missing) {
+            checkpoint(control)?;
             if missing {
                 publish_missing_file(path, expected)?;
                 created += 1;
             }
         }
         Ok(created)
-    })?;
+    };
+    let files_created = match control {
+        Some(control) => archive.with_repair_lock(|| control.cancelled(), publish),
+        None => crate::with_project_lock(archive, publish),
+    }?;
 
+    checkpoint(control)?;
     let git_commit_needed = !head_contains(&repo, &rel_paths, &expected_oids)?;
     if git_commit_needed {
+        checkpoint(control)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
         crate::commit_paths_with_retry(
             repo_root,

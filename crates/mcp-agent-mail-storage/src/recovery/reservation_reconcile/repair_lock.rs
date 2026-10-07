@@ -28,6 +28,19 @@ pub(super) fn with_repair_lock<T>(
     with_budget(archive, REPAIR_LOCK_BUDGET, || cx.checkpoint().is_err(), repair)
 }
 
+impl ProjectArchive {
+    /// Recovery-only admission shared with message repair. Callers retain the
+    /// native publication fence before entering; both project lock layers use
+    /// the same budget and ownership protocol as terminal reservation repair.
+    pub(in crate::recovery) fn with_repair_lock<T>(
+        &self,
+        cancelled: impl FnMut() -> bool,
+        repair: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        with_budget(self, REPAIR_LOCK_BUDGET, cancelled, repair)
+    }
+}
+
 fn deferred() -> StorageError {
     StorageError::LockTimeout("archive repair lock budget exhausted; repair deferred".to_string())
 }

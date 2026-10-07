@@ -23,6 +23,19 @@ pub(in crate::recovery::reservation_reconcile) fn try_begin_at(
     try_begin_checked(path, || cx.checkpoint().is_err())
 }
 
+impl ArchiveMutationGuard {
+    /// Share the existing repair admission protocol with other recovery paths.
+    /// The predicate can include a worker stop flag as well as its Cx budget.
+    /// This is still the native guard, not a parallel fence or epoch protocol.
+    #[track_caller]
+    pub(in crate::recovery) fn try_begin_repair(
+        path: &Path,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Self> {
+        try_begin_checked(path, cancelled)
+    }
+}
+
 fn unavailable(reason: &str) -> StorageError {
     StorageError::LockContention {
         message: format!("archive repair publication admission deferred: {reason}"),
