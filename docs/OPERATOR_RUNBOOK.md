@@ -144,7 +144,7 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 - Threads: `e/c` expands/collapses all message cards; `Left/Right` collapses/expands selected branch.
 - Timeline: `V` cycles Events/Commits/Combined/Log; lowercase `v` toggles visual selection mode.
 - Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
-- Contacts: `n` toggles Table/Graph; `g` toggles Mermaid panel.
+- Contacts: `n` cycles Table/Graph/Matrix (sender × recipient heatmap of recent message flow); `g` toggles Mermaid panel.
 - Reservations: `n` opens create-reservation form.
 - ATC: `d` opens decision detail; `r` opens the retention report.
 

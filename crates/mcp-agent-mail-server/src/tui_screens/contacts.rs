@@ -6,10 +6,11 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
+use ftui::text::display_width;
 use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::BorderType;
+use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Style};
@@ -26,7 +27,7 @@ use crate::tui_events::{ContactSummary, MailEvent};
 use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::generate_contact_graph_mermaid;
-use crate::tui_widgets::{MetricTile, MetricTrend};
+use crate::tui_widgets::{AgentHeatmap, MetricTile, MetricTrend};
 
 /// Column indices for sorting.
 const COL_FROM: usize = 0;
@@ -47,6 +48,8 @@ fn sanitize_diagnostic_value(value: &str) -> String {
         .join(" ")
 }
 const GRAPH_MIN_WIDTH: u16 = 60;
+/// Narrowest Matrix column; the heatmap truncates names to the cell width.
+const MATRIX_MIN_CELL_WIDTH: u32 = 3;
 const GRAPH_MIN_HEIGHT: u16 = 10;
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,9 @@ struct GraphFlowMetrics {
     edge_volume: HashMap<(String, String), u32>,
     node_sent: HashMap<String, u32>,
     node_received: HashMap<String, u32>,
+    /// False when no message flowed in the event window and the volumes are
+    /// the one-per-contact fallback rather than message counts.
+    from_messages: bool,
 }
 
 impl GraphFlowMetrics {
@@ -95,6 +101,8 @@ impl GraphFlowMetrics {
 enum ViewMode {
     Table,
     Graph,
+    /// Sender x recipient heatmap of the same flow the graph draws.
+    Matrix,
 }
 
 /// Status filter modes.
@@ -501,7 +509,8 @@ impl ContactsScreen {
             KeyCode::Char('n') => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Table => ViewMode::Graph,
-                    ViewMode::Graph => ViewMode::Table,
+                    ViewMode::Graph => ViewMode::Matrix,
+                    ViewMode::Matrix => ViewMode::Table,
                 };
                 self.graph_selected_idx = 0;
             }
@@ -681,9 +690,10 @@ impl MailScreen for ContactsScreen {
         // ── Main content area ──────────────────────────────────────────
         let content_area = Rect::new(main_area.x, y, main_area.width, table_h);
         y += table_h;
-        let main_graph_visible = self.view_mode == ViewMode::Graph
-            && content_area.width >= GRAPH_MIN_WIDTH
-            && content_area.height >= GRAPH_MIN_HEIGHT;
+        let canvas_fits =
+            content_area.width >= GRAPH_MIN_WIDTH && content_area.height >= GRAPH_MIN_HEIGHT;
+        let main_graph_visible = self.view_mode == ViewMode::Graph && canvas_fits;
+        let main_matrix_visible = self.view_mode == ViewMode::Matrix && canvas_fits;
         let side_graph_visible = split.rects.len() >= 2
             && is_table_mode
             && self.detail_visible
@@ -696,6 +706,8 @@ impl MailScreen for ContactsScreen {
             self.render_mermaid_panel(frame, content_area, &recent_events);
         } else if main_graph_visible {
             self.render_graph(frame, content_area, &self.graph_metrics);
+        } else if main_matrix_visible {
+            Self::render_matrix(frame, content_area, &self.graph_metrics);
         } else {
             self.render_table(frame, content_area);
         }
@@ -747,7 +759,7 @@ impl MailScreen for ContactsScreen {
             },
             HelpEntry {
                 key: "n",
-                action: "Toggle Table/Graph",
+                action: "Cycle Table/Graph/Matrix",
             },
             HelpEntry {
                 key: "s",
@@ -840,6 +852,84 @@ impl MailScreen for ContactsScreen {
 
 // Helper methods for ContactsScreen (not part of MailScreen trait)
 impl ContactsScreen {
+    /// Sender x recipient heatmap of the graph's flow: busiest agents first,
+    /// trimmed so every row fits and each column keeps a readable width.
+    fn render_matrix(frame: &mut Frame<'_>, area: Rect, metrics: &GraphFlowMetrics) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let mut agents: Vec<&str> = metrics
+            .node_sent
+            .keys()
+            .chain(metrics.node_received.keys())
+            .map(String::as_str)
+            .collect();
+        agents.sort_unstable();
+        agents.dedup();
+        agents.sort_by(|a, b| {
+            metrics
+                .node_total(b)
+                .cmp(&metrics.node_total(a))
+                .then_with(|| a.cmp(b))
+        });
+        let total = agents.len();
+
+        // Bordered (Block::default() draws no border, and with no top
+        // border the title, which carries the axis legend, never shows).
+        let frame_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let inner = frame_block.inner(area);
+        // Mirror HeatmapGrid's layout: labels take their widest name plus
+        // one, unless that exceeds 40% of the width; one header row.
+        let label_w = agents
+            .iter()
+            .map(|agent| display_width(agent))
+            .max()
+            .map_or(0, |w| {
+                u32::try_from(w).unwrap_or(u32::MAX).saturating_add(1)
+            });
+        let width = u32::from(inner.width);
+        let data_w = if label_w.saturating_mul(10) > width * 4 {
+            width
+        } else {
+            width - label_w
+        };
+        let fit = usize::from(inner.height.saturating_sub(1))
+            .min(usize::try_from(data_w / MATRIX_MIN_CELL_WIDTH).unwrap_or(usize::MAX));
+        agents.truncate(fit);
+
+        let kind = if metrics.from_messages {
+            "Message Matrix: row sends to column, recent events"
+        } else {
+            "Contact Matrix: no messages in recent events"
+        };
+        let title = if agents.len() < total {
+            format!("{kind} (top {} of {total})", agents.len())
+        } else {
+            kind.to_string()
+        };
+        let block = frame_block.title(&title);
+
+        if agents.is_empty() {
+            block.render(area, frame);
+            Paragraph::new("No contacts or recent messages").render(inner, frame);
+            return;
+        }
+        let max = f64::from(metrics.max_edge_weight().max(1));
+        let matrix: Vec<Vec<f64>> = agents
+            .iter()
+            .map(|from| {
+                agents
+                    .iter()
+                    .map(|to| f64::from(metrics.edge_weight(from, to)) / max)
+                    .collect()
+            })
+            .collect();
+        AgentHeatmap::new(&agents, &matrix)
+            .block(block)
+            .render(area, frame);
+    }
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -1341,7 +1431,8 @@ fn build_graph_flow_metrics(contacts: &[ContactSummary], events: &[MailEvent]) -
         }
     }
 
-    if metrics.max_edge_weight() == 0 {
+    metrics.from_messages = metrics.max_edge_weight() > 0;
+    if !metrics.from_messages {
         for contact in contacts {
             *metrics
                 .edge_volume
@@ -2460,6 +2551,135 @@ mod tests {
     fn view_mode_is_table_by_default() {
         let screen = ContactsScreen::new();
         assert_eq!(screen.view_mode, ViewMode::Table);
+    }
+
+    #[test]
+    fn n_cycles_table_graph_matrix_and_back_to_table() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let n = Event::Key(ftui::KeyEvent::new(KeyCode::Char('n')));
+        let seen: Vec<ViewMode> = (0..3)
+            .map(|_| {
+                let _ = screen.update(&n, &state);
+                screen.view_mode
+            })
+            .collect();
+        assert_eq!(seen, [ViewMode::Graph, ViewMode::Matrix, ViewMode::Table]);
+    }
+
+    fn row_text(frame: &Frame<'_>, y: u16) -> String {
+        (0..frame.buffer.width())
+            .filter_map(|x| frame.buffer.get(x, y))
+            .filter(|cell| !cell.is_continuation())
+            .map(|cell| cell.content.as_char().unwrap_or(' '))
+            .collect()
+    }
+
+    /// Column (cell index) where `needle` starts in `row`.
+    fn column_of(row: &str, needle: &str) -> u16 {
+        let byte = row.find(needle).expect("needle in row");
+        u16::try_from(row[..byte].chars().count()).unwrap()
+    }
+
+    #[test]
+    fn matrix_view_puts_senders_on_rows_and_recipients_on_columns() {
+        let state = test_state();
+        for id in 1..=3 {
+            let _ = state.push_event(MailEvent::message_sent(
+                id,
+                "Alpha",
+                vec!["Beta".to_string()],
+                "s",
+                "t",
+                "p",
+                "",
+            ));
+        }
+        let _ = state.push_event(MailEvent::message_sent(
+            4,
+            "Gamma",
+            vec!["Alpha".to_string()],
+            "s",
+            "t",
+            "p",
+            "",
+        ));
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        screen.view_mode = ViewMode::Matrix;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+        let rows: Vec<String> = (0..24).map(|y| row_text(&frame, y)).collect();
+
+        assert!(
+            rows.iter().any(|r| r.contains("Message Matrix")),
+            "{rows:#?}"
+        );
+        let header = rows
+            .iter()
+            .position(|r| r.contains("Alpha") && r.contains("Beta") && r.contains("Gamma"))
+            .expect("column header names every agent");
+        // Busiest first: Alpha sent 3 and received 1, Beta received 3,
+        // Gamma sent 1.
+        for (offset, name) in ["Alpha", "Beta", "Gamma"].into_iter().enumerate() {
+            let label =
+                rows[header + 1 + offset].trim_start_matches(|c: char| !c.is_alphanumeric());
+            assert!(
+                label.starts_with(name),
+                "row {offset} should be {name}: {rows:#?}"
+            );
+        }
+
+        let y_of = |offset: usize| u16::try_from(header + 1 + offset).unwrap();
+        let x_of = |name: &str| column_of(&rows[header], name);
+        let bg = |row: usize, col: &str| frame.buffer.get(x_of(col), y_of(row)).unwrap().bg;
+        // Direction: Alpha -> Beta carries 3 messages, Beta -> Alpha none.
+        assert_ne!(bg(0, "Beta"), bg(1, "Alpha"));
+        // Gamma -> Alpha (1 message) is warmer than the empty diagonal.
+        assert_ne!(bg(2, "Alpha"), bg(0, "Alpha"));
+        assert_eq!(bg(1, "Alpha"), bg(0, "Alpha"), "zero cells share one color");
+    }
+
+    #[test]
+    fn matrix_view_labels_contact_fallback_and_trims_to_fit() {
+        let contacts: Vec<ContactSummary> = ["B", "C", "D", "E", "F", "G"]
+            .into_iter()
+            .map(|to| ContactSummary {
+                from_agent: "A".to_string(),
+                to_agent: to.to_string(),
+                status: "approved".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        // No messages in the window: volumes are the one-per-contact
+        // fallback, so the panel must not claim message flow.
+        let metrics = build_graph_flow_metrics(&contacts, &[]);
+        assert!(!metrics.from_messages);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 8, &mut pool);
+        ContactsScreen::render_matrix(&mut frame, Rect::new(0, 0, 80, 8), &metrics);
+        let top = row_text(&frame, 0);
+        assert!(top.contains("Contact Matrix"), "{top}");
+        assert!(!top.contains("Message Matrix"), "{top}");
+        // 7 agents, 6 inner rows, one taken by the column header.
+        assert!(top.contains("(top 5 of 7)"), "{top}");
+
+        let flowing = build_graph_flow_metrics(
+            &contacts,
+            &[MailEvent::message_sent(
+                1,
+                "A",
+                vec!["B".to_string()],
+                "s",
+                "t",
+                "p",
+                "",
+            )],
+        );
+        assert!(flowing.from_messages);
     }
 
     #[test]
