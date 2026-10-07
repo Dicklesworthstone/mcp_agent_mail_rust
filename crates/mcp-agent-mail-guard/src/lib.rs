@@ -1339,7 +1339,11 @@ def artifact_stamp(name, record, mtime):
     return (int(id_text), generation, mtime)
 
 def get_active_reservations():
-    """Read active file reservations directly from the archive."""
+    """Read active file reservations directly from the archive.
+
+    Returns (reservations, archive_root); archive_root is None when no
+    archive was found.
+    """
     archive_root, suspicious, errors = resolve_archive_root()
     if not archive_root:
         if errors:
@@ -1365,7 +1369,7 @@ def get_active_reservations():
                 "different project -- slug collision); allowing",
                 file=sys.stderr,
             )
-            return []
+            return [], None
         # This repo matches no agent-mail project archive, so there are no
         # reservations that can be evaluated. A guard must not turn missing
         # mailbox state into a universal commit gate.
@@ -1374,11 +1378,11 @@ def get_active_reservations():
             "nothing to guard, allowing",
             file=sys.stderr,
         )
-        return []
+        return [], None
 
     reservations_dir = os.path.join(archive_root, "file_reservations")
     if not is_real_directory(reservations_dir):
-        return []
+        return [], archive_root
 
     now = datetime.datetime.now(datetime.timezone.utc)
     active = []
@@ -1444,7 +1448,53 @@ def get_active_reservations():
             }
         )
 
-    return active
+    return active, archive_root
+
+def project_root_for(archive_root, repo_root):
+    """The directory reservation paths are relative to: the project's human_key."""
+    values = []
+    metadata_path = os.path.join(archive_root, "project.json") if archive_root else ""
+    if metadata_path and is_real_file(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            if isinstance(metadata, dict):
+                values.append(str(metadata.get("human_key", "")).strip())
+        except Exception:
+            pass
+    values.append(PROJECT.strip())
+    for value in values:
+        if value and os.path.isabs(value):
+            return value
+    return repo_root
+
+def project_relative_paths(paths, project_root, repo_root, ignorecase):
+    """Re-anchor git's repo-relative paths to the project root reservations use.
+
+    They differ when the project is a folder inside the repository (a
+    monorepo; paths outside that folder are not this project's to guard) or
+    the repository a folder inside the project. Unrelated roots (a worktree
+    beside the project's checkout) leave the paths unchanged.
+    """
+    if not project_root or not repo_root:
+        return paths
+    project = canonical_text(project_root)
+    repo = canonical_text(repo_root)
+    try:
+        inner = os.path.relpath(project, repo).replace(os.sep, "/")
+        outer = os.path.relpath(repo, project).replace(os.sep, "/")
+    except ValueError:
+        return paths
+    if inner == ".":
+        return paths
+    if inner != ".." and not inner.startswith("../"):
+        prefix = inner + "/"
+        if ignorecase:
+            return [p[len(prefix):] for p in paths if p.lower().startswith(prefix.lower())]
+        return [p[len(prefix):] for p in paths if p.startswith(prefix)]
+    if outer != ".." and not outer.startswith("../"):
+        return [outer + "/" + p for p in paths]
+    return paths
 
 def core_ignorecase_enabled():
     """Detect git core.ignorecase for path comparison parity with Rust guard."""
@@ -1699,8 +1749,20 @@ def main():
     if not files_to_check and not unchecked:
         sys.exit(0)
 
-    reservations = get_active_reservations()
+    reservations, archive_root = get_active_reservations()
     if not reservations:
+        sys.exit(0)
+
+    # Reservation patterns are relative to the project root; git's paths are
+    # relative to the repository top level.
+    repo_root = get_repo_root()
+    files_to_check = project_relative_paths(
+        files_to_check,
+        project_root_for(archive_root, repo_root),
+        repo_root,
+        core_ignorecase_enabled(),
+    )
+    if not files_to_check and not unchecked:
         sys.exit(0)
 
     # Prefer the explicit environment override, then recover the caller's
@@ -2124,9 +2186,10 @@ pub fn guard_check_full(
 
     // Read reservations from the archive
     let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
+    let paths = project_relative_paths(archive_root, repo_root, paths, ignorecase);
     let agent_name = resolve_guard_agent_name(repo_root);
     let conflicts =
-        conflicts_for_identity(paths, &reservations, agent_name.as_deref(), ignorecase)?;
+        conflicts_for_identity(&paths, &reservations, agent_name.as_deref(), ignorecase)?;
 
     Ok(GuardCheckResult {
         conflicts,
@@ -2172,9 +2235,64 @@ pub fn guard_check(
 
     // Read reservations from archive JSON files
     let reservations = read_active_reservations_from_archive(archive_root, ignorecase)?;
+    let paths = project_relative_paths(archive_root, repo_root, paths, ignorecase);
     let agent_name = resolve_guard_agent_name(repo_root);
 
-    conflicts_for_identity(paths, &reservations, agent_name.as_deref(), ignorecase)
+    conflicts_for_identity(&paths, &reservations, agent_name.as_deref(), ignorecase)
+}
+
+/// Re-anchor git's repo-relative `paths` to the project root reservation
+/// patterns are relative to: the archive's `project.json` `human_key`.
+///
+/// They differ when the project is a folder inside the repository (a monorepo;
+/// paths outside that folder are not this project's to guard) or the
+/// repository a folder inside the project. Without readable metadata, or with
+/// unrelated roots (a worktree beside the project's checkout), `paths` are
+/// returned unchanged.
+fn project_relative_paths(
+    archive_root: &Path,
+    repo_root: &Path,
+    paths: &[String],
+    ignorecase: bool,
+) -> Vec<String> {
+    let Some(project_root) = archive_project_root(archive_root) else {
+        return paths.to_vec();
+    };
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let (project, repo) = (canonical(&project_root), canonical(repo_root));
+    let as_slashes = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    if let Ok(inner) = project.strip_prefix(&repo) {
+        let inner = as_slashes(inner);
+        if inner.is_empty() {
+            return paths.to_vec();
+        }
+        let prefix = format!("{inner}/");
+        return paths
+            .iter()
+            .filter_map(|path| {
+                let head = path.get(..prefix.len())?;
+                let inside = if ignorecase {
+                    head.eq_ignore_ascii_case(&prefix)
+                } else {
+                    head == prefix
+                };
+                inside.then(|| path[prefix.len()..].to_string())
+            })
+            .collect();
+    }
+    if let Ok(outer) = repo.strip_prefix(&project) {
+        let outer = as_slashes(outer);
+        return paths.iter().map(|path| format!("{outer}/{path}")).collect();
+    }
+    paths.to_vec()
+}
+
+/// The absolute `human_key` recorded in the archive's `project.json`.
+fn archive_project_root(archive_root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(archive_root.join("project.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let root = PathBuf::from(metadata.get("human_key")?.as_str()?.trim());
+    root.is_absolute().then_some(root)
 }
 
 /// Core conflict detection: check paths against reservations using globset.
@@ -4239,6 +4357,68 @@ mod tests {
         assert_eq!(conflicts[0].path, "src/lib.rs");
     }
 
+    /// Reservations are relative to the project root (`human_key`); git
+    /// reports repo-relative paths. A project in a monorepo folder sees its own
+    /// paths re-anchored and the rest of the repository dropped.
+    #[test]
+    fn project_relative_paths_reanchor_to_the_project_root() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo = td.path().join("repo");
+        let project = repo.join("services").join("api");
+        let archive = td.path().join("archive");
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let set_human_key = |key: &Path| {
+            let metadata = serde_json::json!({ "human_key": key.to_string_lossy() });
+            std::fs::write(archive.join("project.json"), metadata.to_string()).expect("write");
+        };
+        let paths = vec![
+            "services/api/src/lib.rs".to_string(),
+            "web/app.ts".to_string(),
+            "Services/Api/x.rs".to_string(),
+        ];
+        let own = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // No metadata: unchanged.
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            paths
+        );
+
+        set_human_key(&project);
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            own(&["src/lib.rs"])
+        );
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, true),
+            own(&["src/lib.rs", "x.rs"])
+        );
+
+        // The project is the repository: unchanged.
+        set_human_key(&repo);
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            paths
+        );
+
+        // The repository is a folder inside the project: prefixed.
+        set_human_key(td.path());
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths[..1], false),
+            own(&["repo/services/api/src/lib.rs"])
+        );
+
+        // Unrelated roots (a worktree beside the checkout): unchanged.
+        let worktree = td.path().join("repo-worktree");
+        std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+        set_human_key(&worktree);
+        assert_eq!(
+            project_relative_paths(&archive, &repo, &paths, false),
+            paths
+        );
+    }
+
     #[test]
     fn check_path_conflicts_root_reservation_blocks_everything() {
         let reservations = vec![FileReservationRecord {
@@ -6076,6 +6256,81 @@ mod tests {
             "expected archive lookup warning, got stdout={}, stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A project in a monorepo folder: its reservations are relative to that
+    /// folder, git's staged paths to the repository top level. The hook must
+    /// block the reserved file under the folder and allow the same relative
+    /// path elsewhere in the repository.
+    #[test]
+    fn guard_plugin_reanchors_staged_paths_for_a_project_inside_the_repo() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let project_dir = repo_dir.join("services").join("api");
+        let storage_root = td.path().join("storage");
+        for dir in [project_dir.join("src"), repo_dir.join("src")] {
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write");
+        }
+        run_git(&repo_dir, &["init", "-q"]);
+
+        let project_key = project_dir.to_string_lossy().into_owned();
+        let identity = mcp_agent_mail_core::resolve_project_identity(&project_key);
+        let archive_root = storage_root.join("projects").join(&identity.slug);
+        let reservations_dir = archive_root.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        let metadata = serde_json::json!({ "slug": identity.slug, "human_key": project_key });
+        std::fs::write(archive_root.join("project.json"), metadata.to_string())
+            .expect("write metadata");
+        let reservation = serde_json::json!({
+            "path_pattern": "src/main.rs",
+            "agent_name": "OtherAgent",
+            "exclusive": true,
+            "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            "released_ts": serde_json::Value::Null,
+        });
+        std::fs::write(reservations_dir.join("lease.json"), reservation.to_string())
+            .expect("write reservation");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&project_key, "pre-commit"),
+        )
+        .expect("write guard script");
+        let commit_check = |staged: &str| {
+            run_git(&repo_dir, &["read-tree", "--empty"]);
+            run_git(&repo_dir, &["add", staged]);
+            Command::new(&python)
+                .current_dir(&repo_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .env("STORAGE_ROOT", &storage_root)
+                .env_remove("AGENT_MAIL_GUARD_MODE")
+                .env_remove("AGENT_MAIL_BYPASS")
+                .arg(&script_path)
+                .output()
+                .expect("run guard script")
+        };
+
+        let inside = commit_check("services/api/src/main.rs");
+        assert_eq!(
+            inside.status.code(),
+            Some(1),
+            "the reserved file under the project folder must block: stderr={}",
+            String::from_utf8_lossy(&inside.stderr),
+        );
+        assert!(String::from_utf8_lossy(&inside.stderr).contains("held by OtherAgent"));
+
+        let outside = commit_check("src/main.rs");
+        assert_eq!(
+            outside.status.code(),
+            Some(0),
+            "the same relative path outside the project is not reserved: stderr={}",
+            String::from_utf8_lossy(&outside.stderr),
         );
     }
 
