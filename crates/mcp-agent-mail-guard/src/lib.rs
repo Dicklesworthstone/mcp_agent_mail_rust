@@ -1315,6 +1315,27 @@ def is_expired(value, now):
             return False
     return False
 
+def artifact_stamp(name, record, mtime):
+    """(reservation id, database generation, mtime) of an artifact named
+    `id-<id>[-g<generation>].json`; the generation falls back to the record's
+    `db_generation`. None for any other name. Mirrors the Rust reader."""
+    stem = name[:-5] if name.endswith(".json") else name
+    if not stem.startswith("id-"):
+        return None
+    rest = stem[3:]
+    id_text, generation = rest, None
+    if "-g" in rest:
+        head, tail = rest.split("-g", 1)
+        if tail:
+            id_text, generation = head, tail
+    if not id_text.isdigit():
+        return None
+    if generation is None:
+        stored = record.get("db_generation")
+        if isinstance(stored, str) and stored.strip():
+            generation = stored.strip()
+    return (int(id_text), generation, mtime)
+
 def get_active_reservations():
     """Read active file reservations directly from the archive."""
     archive_root, suspicious, errors = resolve_archive_root()
@@ -1366,6 +1387,7 @@ def get_active_reservations():
         # but through the GH#224 path that honors warn mode + names bypass.
         fail_closed("mcp-agent-mail: guard failed to read reservations: " + str(exc))
 
+    loaded = []
     for entry in entries:
         try:
             if not entry.is_file(follow_symlinks=False):
@@ -1379,11 +1401,31 @@ def get_active_reservations():
         try:
             with open(entry.path, "r", encoding="utf-8") as handle:
                 record = json.load(handle)
+            mtime = entry.stat(follow_symlinks=False).st_mtime
         except Exception:
             continue
+        if isinstance(record, dict):
+            loaded.append((entry.name, record, mtime))
 
+    # GH#299, as the Rust reader does: after a mailbox rebuild one reservation
+    # id can have an unreleased artifact from the previous database generation
+    # and a released one from the current generation. The newest released
+    # artifact per id supersedes an unreleased twin of another generation.
+    released_by_id = {}
+    for name, record, mtime in loaded:
+        if released_ts_marks_released(record.get("released_ts")):
+            stamp = artifact_stamp(name, record, mtime)
+            if stamp and (stamp[0] not in released_by_id or mtime > released_by_id[stamp[0]][2]):
+                released_by_id[stamp[0]] = stamp
+
+    for name, record, mtime in loaded:
         if released_ts_marks_released(record.get("released_ts")):
             continue
+        stamp = artifact_stamp(name, record, mtime)
+        if stamp and stamp[0] in released_by_id:
+            released = released_by_id[stamp[0]]
+            if released[1] != stamp[1] and released[2] >= stamp[2]:
+                continue
         if is_expired(record.get("expires_ts"), now):
             continue
 
@@ -5639,6 +5681,71 @@ mod tests {
         assert!(script.contains("\"/\" not in name"));
         assert!(script.contains("AGENT_NAME is unset and no current-pane identity"));
         assert!(script.contains("sys.exit(2)"));
+    }
+
+    /// GH#299 in the installed hook, as in the Rust reader: an unreleased
+    /// artifact from the previous database generation is superseded by a
+    /// released twin of the same id, and alone it still blocks.
+    #[test]
+    fn guard_plugin_skips_a_previous_generation_twin_of_a_released_reservation() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("main.rs"), "fn main() {}\n").expect("write staged");
+        run_git(&repo_dir, &["add", "main.rs"]);
+        let reservations_dir = repo_dir.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        let active = serde_json::json!({
+            "path_pattern": "main.rs",
+            "agent_name": "OtherAgent",
+            "exclusive": true,
+            "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            "released_ts": serde_json::Value::Null,
+        });
+        std::fs::write(
+            reservations_dir.join("id-123-goldgen00.json"),
+            active.to_string(),
+        )
+        .expect("write previous-generation artifact");
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+        let run = || {
+            Command::new(&python)
+                .current_dir(&repo_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .arg(&script_path)
+                .output()
+                .expect("run guard script")
+        };
+
+        assert_eq!(
+            run().status.code(),
+            Some(1),
+            "alone, the stale artifact blocks"
+        );
+
+        let mut released = active;
+        released["released_ts"] = serde_json::json!("2026-10-07T00:00:00Z");
+        std::fs::write(
+            reservations_dir.join("id-123-gcurgen11.json"),
+            released.to_string(),
+        )
+        .expect("write current-generation release");
+        let output = run();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "a released current-generation twin supersedes it: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// A `STORAGE_ROOT` configured at install time (the installer writes it to
