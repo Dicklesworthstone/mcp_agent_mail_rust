@@ -396,12 +396,15 @@ fn render_chain_runner_script(hook_name: &str) -> String {
         "    return items".to_string(),
         String::new(),
         "def _run_child(path: Path, * , stdin_bytes=None):".to_string(),
+        "    # Children get git's own arguments (pre-push: remote name and URL);".to_string(),
+        "    # `git lfs pre-push \"$@\"` exits 1 without them, blocking every push.".to_string(),
+        "    args = sys.argv[1:]".to_string(),
         "    # On Windows, prefer 'python' for .py plugins to avoid PATHEXT reliance.".to_string(),
         "    try:".to_string(),
         "        if os.name != 'posix' and path.suffix.lower() == '.py':".to_string(),
-        "            return subprocess.run([sys.executable, str(path)], input=stdin_bytes, check=False).returncode"
+        "            return subprocess.run([sys.executable, str(path), *args], input=stdin_bytes, check=False).returncode"
             .to_string(),
-        "        return subprocess.run([str(path)], input=stdin_bytes, check=False).returncode"
+        "        return subprocess.run([str(path), *args], input=stdin_bytes, check=False).returncode"
             .to_string(),
         "    except OSError as exc:".to_string(),
         "        print(f'mcp-agent-mail chain-runner: could not execute {path.name}: {exc}', file=sys.stderr)"
@@ -415,6 +418,11 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             .to_string(),
         "    return first_failure or rc".to_string(),
         String::new(),
+        "def _orig_runnable() -> bool:".to_string(),
+        "    # Git skips a hook that is not executable; the user's original hook".to_string(),
+        "    # keeps that behaviour rather than failing every commit with 126.".to_string(),
+        "    return ORIG.exists() and (os.name != 'posix' or _is_exec(ORIG))".to_string(),
+        String::new(),
     ];
 
     if hook_name == "pre-push" {
@@ -426,7 +434,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             "    rc = _run_child(exe, stdin_bytes=stdin_bytes)".to_string(),
             "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
             String::new(),
-            "if ORIG.exists():".to_string(),
+            "if _orig_runnable():".to_string(),
             "    rc = _run_child(ORIG, stdin_bytes=stdin_bytes)".to_string(),
             "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
             "sys.exit(first_failure)".to_string(),
@@ -438,7 +446,7 @@ fn render_chain_runner_script(hook_name: &str) -> String {
             "    rc = _run_child(exe)".to_string(),
             "    first_failure = _remember_failure(exe, rc, first_failure)".to_string(),
             String::new(),
-            "if ORIG.exists():".to_string(),
+            "if _orig_runnable():".to_string(),
             "    rc = _run_child(ORIG)".to_string(),
             "    first_failure = _remember_failure(ORIG, rc, first_failure)".to_string(),
             "sys.exit(first_failure)".to_string(),
@@ -6695,6 +6703,78 @@ print(json.dumps(out))
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("file reservation conflict"),
             "expected the guard conflict in stderr"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chain_runner_passes_git_arguments_and_skips_a_non_executable_original() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let hooks_dir = td.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).expect("mkdir hooks");
+        let marker = td.path().join("marker.txt");
+
+        // pre-push: the user's original hook (say `git lfs pre-push "$@"`)
+        // needs git's remote name and URL, and the ref lines on stdin.
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-push"),
+            &render_chain_runner_script("pre-push"),
+            true,
+        )
+        .expect("write chain runner");
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-push.orig"),
+            "#!/bin/sh\nprintf '%s|' \"$@\" >> \"$CHAIN_MARKER\"\ncat >> \"$CHAIN_MARKER\"\n",
+            true,
+        )
+        .expect("write original pre-push");
+        let mut child = Command::new(&python)
+            .env("CHAIN_MARKER", &marker)
+            .arg(hooks_dir.join("pre-push"))
+            .args(["origin", "https://example.test/repo.git"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("run pre-push chain");
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin
+                .write_all(b"refs/heads/main abc refs/heads/main def\n")
+                .expect("write refs");
+        }
+        let status = child.wait().expect("wait pre-push chain");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read marker"),
+            "origin|https://example.test/repo.git|refs/heads/main abc refs/heads/main def\n"
+        );
+
+        // pre-commit: git never ran a non-executable hook, so after install the
+        // moved original must not start failing every commit with 126.
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-commit"),
+            &render_chain_runner_script("pre-commit"),
+            true,
+        )
+        .expect("write chain runner");
+        write_guard_file_atomic(
+            &hooks_dir.join("pre-commit.orig"),
+            "#!/bin/sh\nexit 1\n",
+            false,
+        )
+        .expect("write non-executable original");
+        let output = Command::new(&python)
+            .arg(hooks_dir.join("pre-commit"))
+            .output()
+            .expect("run pre-commit chain");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
