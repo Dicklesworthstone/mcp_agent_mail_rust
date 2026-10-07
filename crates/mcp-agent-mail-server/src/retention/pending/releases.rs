@@ -82,10 +82,13 @@ impl ArchiveFollowups {
 }
 
 #[cfg(test)]
+type ArchiveFollowupHook = Box<dyn FnOnce(usize)>;
+
+#[cfg(test)]
 std::thread_local! {
     // Fault injection at the real receipt/archive boundary, after the source
     // lease drops. Database mutations and journal publication remain real.
-    static BEFORE_ARCHIVE_FOLLOWUPS: std::cell::RefCell<Option<Box<dyn FnOnce(usize)>>> =
+    static BEFORE_ARCHIVE_FOLLOWUPS: std::cell::RefCell<Option<ArchiveFollowupHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -139,9 +142,7 @@ pub(super) async fn replay_batch(
                 // imply that the whole intent has completed.
                 report.applied += 1;
                 report.rows_released += page.released.len();
-                if !page.complete {
-                    report.more = true;
-                } else {
+                if page.complete {
                     match append_completion(config, intent, position.released) {
                         Ok(()) => {
                             report.completed += 1;
@@ -153,6 +154,8 @@ pub(super) async fn replay_batch(
                                 "release applied but completion receipt unavailable; replay retained");
                         }
                     }
+                } else {
+                    report.more = true;
                 }
                 followups.remember(page);
             }
@@ -1448,10 +1451,9 @@ mod tests {
             BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move |retained| {
                     assert_eq!(retained, MAX_ARCHIVE_REPAIRS_PER_BATCH);
-                    assert!(
-                        journal::read_queued_release_intents(&selected)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        journal::read_queued_release_intents(&selected).unwrap(),
+                        [] as [QueuedReleaseIntentView; 0]
                     );
                     assert_eq!(active_writer_count(), 0);
                     let promotion = try_acquire_promotion_barrier_if_idle()
@@ -1474,10 +1476,9 @@ mod tests {
             }));
             assert!(failed.is_err());
             assert!(reached.load(Ordering::Acquire));
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             let released = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &ids))
                 .into_result()
@@ -1586,10 +1587,9 @@ mod tests {
                 (resumed.rows_released, resumed.completed, resumed.deferred),
                 (1, 1, 0)
             );
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             let after =
                 fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[1, 501]))
@@ -1652,10 +1652,9 @@ mod tests {
                 (retry.rows_released, retry.completed, retry.deferred),
                 (0, 1, 0)
             );
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             let after = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[401]))
                 .into_result()
@@ -1684,10 +1683,9 @@ mod tests {
             BEFORE_ARCHIVE_FOLLOWUPS.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move |retained| {
                     assert_eq!(retained, 1);
-                    assert!(
-                        journal::read_queued_release_intents(&selected)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        journal::read_queued_release_intents(&selected).unwrap(),
+                        [] as [QueuedReleaseIntentView; 0]
                     );
                     assert_eq!(active_writer_count(), 0);
                     let promotion = try_acquire_promotion_barrier_if_idle().unwrap();
@@ -1705,10 +1703,9 @@ mod tests {
                 (report.rows_released, report.completed, report.deferred),
                 (1, 1, 0)
             );
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             assert!(
                 !config
@@ -1816,10 +1813,9 @@ mod tests {
                 (resumed.rows_released, resumed.completed, resumed.deferred),
                 (1, 1, 0)
             );
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
         });
     }
@@ -1873,10 +1869,9 @@ mod tests {
                 (report.rows_released, report.completed, report.deferred),
                 (1, 1, 0)
             );
-            assert!(
-                journal::read_queued_release_intents(config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_release_intents(config).unwrap(),
+                [] as [QueuedReleaseIntentView; 0]
             );
             assert_eq!(active_writer_count(), 1);
             drop(writer);
