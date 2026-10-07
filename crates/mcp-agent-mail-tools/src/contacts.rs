@@ -541,6 +541,8 @@ async fn send_contact_notice(
         &all_recipient_names,
         &[],
     );
+    // No .signal file: send_message's auto-handshake sends these notices to
+    // BCC recipients too, and a BCC recipient is never signalled by a send.
     Ok(())
 }
 

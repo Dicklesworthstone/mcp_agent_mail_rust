@@ -3653,14 +3653,26 @@ pub async fn resolve_pane_identity(
 #[tool(
     description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
 )]
-pub fn cleanup_pane_identities(
-    _ctx: &McpContext,
+pub async fn cleanup_pane_identities(
+    ctx: &McpContext,
     project_key: Option<String>,
 ) -> McpResult<String> {
-    let removed = project_key
-        .map_or_else(mcp_agent_mail_core::cleanup_all_stale_identities, |key| {
+    let removed = match project_key {
+        None => mcp_agent_mail_core::cleanup_all_stale_identities(),
+        Some(key) => {
+            // Identity files are keyed by the project's path: resolve a slug to
+            // it, as resolve_pane_identity does, or a slug cleans nothing.
+            let key = if !Path::new(&key).is_absolute()
+                && let Ok(pool) = get_read_db_pool(ctx.cx()).await
+                && let Ok(project) = resolve_existing_project(ctx, &pool, &key).await
+            {
+                project.human_key
+            } else {
+                key
+            };
             mcp_agent_mail_core::cleanup_stale_identities(&key)
-        });
+        }
+    };
 
     let paths: Vec<String> = removed
         .iter()

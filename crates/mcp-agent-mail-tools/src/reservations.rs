@@ -2768,7 +2768,9 @@ pub async fn force_release_file_reservation(
     }
 
     // If already released, return early
-    if let Some(released_ts) = reservation.released_ts {
+    // Only a positive released_ts means released (ACTIVE_RESERVATION_PREDICATE
+    // treats a legacy 0 as active, and the release below would act on it).
+    if let Some(released_ts) = reservation.released_ts.filter(|ts| *ts > 0) {
         let response = serde_json::json!({
             "released": 0,
             "released_at": micros_to_iso(released_ts),
@@ -3089,6 +3091,13 @@ pub async fn force_release_file_reservation(
                     &agent_name,
                     &all_recipient_names,
                     &[],
+                );
+                crate::messaging::signal_direct_recipient(
+                    &Config::get(),
+                    &project.slug,
+                    &holder_agent_name,
+                    &agent_name,
+                    &message,
                 );
                 true
             }
@@ -7293,6 +7302,65 @@ mod tests {
                 );
                 assert_eq!(parsed["reservation"]["notified"].as_bool(), Some(false));
                 assert!(parsed["reservation"]["last_agent_activity_ts"].is_null());
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_treats_a_legacy_zero_released_ts_as_active() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/force-release-zero-ts-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let actor = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.unwrap_or(0),
+                    &["src/legacy-zero.rs"],
+                    3600,
+                    true,
+                    "legacy zero released_ts",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+                // An expired lease whose released_ts is the legacy 0: still active.
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = 1, released_ts = 0 WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id)],
+                )
+                .expect("legacy row");
+                drop(conn);
+
+                let payload = force_release_file_reservation(
+                    &McpContext::new(cx.clone(), 1),
+                    project.human_key.clone(),
+                    actor.name.clone(),
+                    reservation_id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("force release succeeds");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(parsed["released"].as_i64(), Some(1), "{parsed}");
+                assert!(parsed.get("already_released").is_none(), "{parsed}");
             });
         });
     }

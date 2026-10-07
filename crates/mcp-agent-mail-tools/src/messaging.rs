@@ -86,6 +86,32 @@ pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, co
     }
 }
 
+/// Write the `.signal` file `send_message` writes for each to/cc recipient,
+/// for a message a tool inserts directly (force-release notes), so signal
+/// watchers hear about it as well as inbox pollers. Best-effort, like the
+/// send path's.
+pub(crate) fn signal_direct_recipient(
+    config: &Config,
+    project_slug: &str,
+    recipient: &str,
+    from: &str,
+    message: &mcp_agent_mail_db::MessageRow,
+) {
+    let meta = mcp_agent_mail_storage::NotificationMessage {
+        id: message.id,
+        from: Some(from.to_string()),
+        subject: Some(message.subject.clone()),
+        importance: Some(message.importance.clone()),
+    };
+    let outcome = mcp_agent_mail_storage::emit_notification_signal(
+        config,
+        project_slug,
+        recipient,
+        Some(&meta),
+    );
+    tracing::debug!(recipient, ?outcome, "direct message notification signal");
+}
+
 /// Write a message bundle to the git archive (best-effort).
 /// Failures are logged but never fail the tool call.
 ///
@@ -10148,6 +10174,41 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn direct_messages_signal_their_recipient_like_send_message() {
+        let dir = tempfile::tempdir().expect("signals dir");
+        let config = Config {
+            notifications_enabled: true,
+            notifications_signals_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let message = mcp_agent_mail_db::MessageRow {
+            id: Some(41),
+            project_id: 1,
+            sender_id: 2,
+            thread_id: None,
+            topic: None,
+            subject: "[file-reservations] Released stale lock on src/a.rs".to_string(),
+            body_md: String::new(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: 0,
+            recipients_json: String::new(),
+            attachments: "[]".to_string(),
+        };
+        let slug = "direct-signal-test";
+        signal_direct_recipient(&config, slug, "AmberRiver", "BlueLake", &message);
+        let agents = dir.path().join("projects").join(slug).join("agents");
+        let body = std::fs::read_to_string(agents.join("AmberRiver.signal"))
+            .expect("the recipient's signal file");
+        let signal: Value = serde_json::from_str(&body).expect("signal JSON");
+        assert_eq!(signal["message_id"].as_i64(), Some(41), "{body}");
+        assert!(
+            !agents.join("BlueLake.signal").exists(),
+            "only the recipient is signalled"
+        );
     }
 
     #[test]
