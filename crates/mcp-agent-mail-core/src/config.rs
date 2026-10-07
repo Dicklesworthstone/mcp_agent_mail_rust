@@ -6088,6 +6088,11 @@ mod tests {
             "Python-DB discovery needs the raw URL; Config substitutes the Rust default when unset",
         ),
         (
+            "STORAGE_ROOT",
+            "mcp-agent-mail-guard/src/lib.rs",
+            "explicit-vs-default provenance: the installed hook bakes in only an explicitly configured root and computes the default itself at commit time",
+        ),
+        (
             "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
             "mcp-agent-mail-guard/src/lib.rs",
             "git hook contract: the guard gates on the committing process env, like the hook script",

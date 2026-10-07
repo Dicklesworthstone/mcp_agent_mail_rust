@@ -478,6 +478,9 @@ import sys
 
 PROJECT = __PROJECT_JSON__
 HOOK_NAME = __HOOK_NAME_JSON__
+# STORAGE_ROOT configured when the guard was installed (environment or the
+# user config.env); a commit shell's own STORAGE_ROOT still takes precedence.
+INSTALLED_STORAGE_ROOT = __STORAGE_ROOT_JSON__
 AGENT_NAME = os.environ.get("AGENT_NAME", "").strip()
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
 
@@ -959,7 +962,12 @@ def default_storage_root():
         value = os.environ.get(key, "").strip()
         if value:
             return os.path.expanduser(value)
-    
+    # The installer writes STORAGE_ROOT to config.env, which a commit shell
+    # does not export: without the installed value the hook looked in the
+    # default location, found no archive and allowed every commit.
+    if INSTALLED_STORAGE_ROOT.strip():
+        return os.path.expanduser(INSTALLED_STORAGE_ROOT.strip())
+
     # Match Rust core's default_storage_root_path logic.
     # Only honor the legacy path if it actually *contains* an archive —
     # an empty-directory stub at ~/.mcp_agent_mail_git_mailbox_repo (left
@@ -1232,8 +1240,11 @@ def resolve_archive_root():
 
         metadata_path = os.path.join(candidate, "project.json")
         if not is_real_file(metadata_path):
-            if suspicious is None and entry.name in slug_candidates:
-                suspicious = entry.name
+            # This project's slug with no metadata saying otherwise: only a
+            # parsed project.json naming another project proves a collision,
+            # so enforce these reservations rather than allow (fail closed).
+            if entry.name in slug_candidates:
+                return candidate, None, errors
             continue
         try:
             with open(metadata_path, "r", encoding="utf-8") as handle:
@@ -1244,8 +1255,9 @@ def resolve_archive_root():
             errors.append("%s: %s" % (metadata_path, exc))
             continue
         except Exception:
-            if suspicious is None and entry.name in slug_candidates:
-                suspicious = entry.name
+            # Truncated or corrupt metadata proves nothing either (see above).
+            if entry.name in slug_candidates:
+                return candidate, None, errors
             continue
         if project_metadata_matches(
             metadata,
@@ -1629,8 +1641,9 @@ def main():
     if is_truthy(os.environ.get("AGENT_MAIL_BYPASS")):
         sys.exit(0)
 
+    # Only an explicit false value disables enforcement, as the server reads it.
     enforcement_enabled = os.environ.get("FILE_RESERVATIONS_ENFORCEMENT_ENABLED")
-    if enforcement_enabled is not None and not is_truthy(enforcement_enabled):
+    if enforcement_enabled is not None and enforcement_enabled.strip().lower() in ("0", "false", "f", "no", "n"):
         sys.exit(0)
 
     unchecked = []
@@ -1690,11 +1703,22 @@ if __name__ == "__main__":
     main()
 "##;
 
+    // An explicitly configured STORAGE_ROOT (process environment or the user
+    // config.env the installer writes) is baked in; with none, the hook keeps
+    // computing the default root at commit time. Read as Config reads it: a
+    // project's own .env must not redirect the archive the guard checks.
+    let installed_storage_root = mcp_agent_mail_core::config::infra_env_value("STORAGE_ROOT")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let storage_root_json =
+        serde_json::to_string(&installed_storage_root).unwrap_or_else(|_| "\"\"".to_string());
+
     template
         .replace("__HOOK_NAME_TEXT__", hook_name)
         .replace("__PROJECT_TEXT__", &project.replace(['\n', '\r'], " "))
         .replace("__PROJECT_JSON__", &project_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
+        .replace("__STORAGE_ROOT_JSON__", &storage_root_json)
 }
 
 pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> GuardResult<()> {
@@ -1890,8 +1914,14 @@ fn is_guard_gated_from_values(
     _worktrees_enabled: Option<&str>,
     _git_identity_enabled: Option<&str>,
 ) -> bool {
+    // Only an explicit false value disables the guard, as the server reads the
+    // same variable (`parse_bool` with default true): `on`, a typo or an empty
+    // value must not silently switch commit enforcement off.
     if let Some(val) = enforcement_enabled {
-        return is_truthy_value(Some(val));
+        return !matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "f" | "no" | "n"
+        );
     }
     // Default to true: the file reservation guard is active unless explicitly
     // disabled via FILE_RESERVATIONS_ENFORCEMENT_ENABLED=false.
@@ -3389,6 +3419,13 @@ mod tests {
             Some("0")
         ));
         assert!(!is_guard_gated_from_values(Some("0"), Some("1"), Some("1")));
+        assert!(!is_guard_gated_from_values(Some(" False "), None, None));
+        assert!(!is_guard_gated_from_values(Some("no"), None, None));
+        // As the server reads it: anything but an explicit false keeps the
+        // guard on, so a typo or an empty value cannot switch it off.
+        assert!(is_guard_gated_from_values(Some("on"), None, None));
+        assert!(is_guard_gated_from_values(Some(""), None, None));
+        assert!(is_guard_gated_from_values(Some("enabled"), None, None));
     }
 
     #[test]
@@ -5537,6 +5574,86 @@ mod tests {
         assert!(script.contains("\"/\" not in name"));
         assert!(script.contains("AGENT_NAME is unset and no current-pane identity"));
         assert!(script.contains("sys.exit(2)"));
+    }
+
+    /// A `STORAGE_ROOT` configured at install time (the installer writes it to
+    /// `config.env`, which commit shells do not export) is where the hook looks,
+    /// and a slug-matching archive whose `project.json` is missing is enforced,
+    /// not waved through as a "collision".
+    #[test]
+    fn guard_plugin_finds_the_installed_storage_root_and_enforces_unlabelled_archives() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let storage_root = td.path().join("custom-storage");
+        let home_dir = td.path().join("home");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        std::fs::create_dir_all(&home_dir).expect("mkdir home");
+        run_git(&repo_dir, &["init", "-q"]);
+        let staged = repo_dir.join("src").join("main.rs");
+        std::fs::create_dir_all(staged.parent().expect("src dir")).expect("mkdir src");
+        std::fs::write(&staged, "fn main() {}\n").expect("write staged file");
+        run_git(&repo_dir, &["add", "src/main.rs"]);
+
+        let slug = mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy()).slug;
+        let reservations_dir = storage_root
+            .join("projects")
+            .join(&slug)
+            .join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        // Deliberately no project.json beside it.
+        std::fs::write(
+            reservations_dir.join("conflict.json"),
+            serde_json::json!({
+                "path_pattern": "src/main.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let run_hook = |configured_root: &str| {
+            let script = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("STORAGE_ROOT", configured_root)],
+                || render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+            );
+            let script_path = td.path().join("guard.py");
+            std::fs::write(&script_path, script).expect("write guard script");
+            Command::new(&python)
+                .current_dir(&repo_dir)
+                .env_remove("STORAGE_ROOT")
+                .env_remove("AGENT_MAIL_STORAGE_ROOT")
+                .env_remove("XDG_DATA_HOME")
+                .env("HOME", &home_dir)
+                .env("AGENT_NAME", "PinkStone")
+                .arg(&script_path)
+                .output()
+                .expect("run guard script")
+        };
+
+        let blocked = run_hook(&storage_root.to_string_lossy());
+        assert_eq!(
+            blocked.status.code(),
+            Some(1),
+            "the installed root's reservation must block: stderr={}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("src/main.rs"));
+
+        // Negative control: with no configured root the hook looks under HOME,
+        // finds nothing and allows, which is what every config.env install got.
+        let allowed = run_hook("");
+        assert_eq!(
+            allowed.status.code(),
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&allowed.stderr)
+        );
     }
 
     #[test]
