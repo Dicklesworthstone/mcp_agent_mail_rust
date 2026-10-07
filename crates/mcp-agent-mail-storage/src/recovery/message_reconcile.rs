@@ -7,10 +7,10 @@
 //! an enqueue into the best-effort commit queue.
 
 mod attachments;
-pub mod database;
-mod identity;
 #[cfg(test)]
 mod cancellable_tests;
+pub mod database;
+mod identity;
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};

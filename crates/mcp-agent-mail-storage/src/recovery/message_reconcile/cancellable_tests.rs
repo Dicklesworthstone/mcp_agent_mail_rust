@@ -1,7 +1,7 @@
 //! Exercise the production bounded entrypoint with real archive ownership.
 
-use super::*;
 use super::tests::{entry, fixture};
+use super::*;
 use std::fs;
 use std::sync::{TryLockError, mpsc};
 use std::time::Duration;
@@ -61,9 +61,13 @@ fn bounded_repair_preserves_exact_bundle_metadata_privacy_and_idempotence() {
     let (_temp, config, archive, mut message, recipients) = fixture();
     message["future_metadata"] = serde_json::json!({"keep": [true, "λ"]});
     let first = reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
         &AtomicBool::new(false),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(first.files_created, 4);
     assert!(first.git_commit_needed);
     let paths = bundle_paths(&archive, &message, &recipients);
@@ -86,9 +90,13 @@ fn bounded_repair_preserves_exact_bundle_metadata_privacy_and_idempotence() {
     );
     assert_eq!(
         reconcile_message_bundle_cancellable(
-            &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
             &AtomicBool::new(false),
-        ).unwrap(),
+        )
+        .unwrap(),
         ReconcileResult::default(),
     );
     assert_eq!(repo.head().unwrap().target(), head);
@@ -117,27 +125,46 @@ fn busy_global_fence_defers_before_changing_any_archive_evidence() {
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let result = reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
         &AtomicBool::new(false),
     );
     let held_during_return = crate::archive_publication_fence_holder().is_some();
-    let observed = (crate::archive_mutation_epoch(), crate::archive_mutations_active());
+    let observed = (
+        crate::archive_mutation_epoch(),
+        crate::archive_mutations_active(),
+    );
     let observed_token = fs::read(&token_path).unwrap();
     let observed_head = repo.head().unwrap().target();
     let untouched = paths.iter().all(|path| !path.exists());
     let _ = release_tx.send(());
-    assert!(owner.join().unwrap().is_ok(), "waited for the fence owner's timeout");
+    assert!(
+        owner.join().unwrap().is_ok(),
+        "waited for the fence owner's timeout"
+    );
     assert!(held_during_return);
-    assert!(result.unwrap_err().to_string().contains("publication fence busy"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("publication fence busy")
+    );
     assert_eq!(observed, (epoch, active));
     assert_eq!(observed_token, token);
     assert_eq!(observed_head, head);
     assert!(untouched);
     assert_eq!(
         reconcile_message_bundle_cancellable(
-            &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
             &AtomicBool::new(false),
-        ).unwrap().files_created,
+        )
+        .unwrap()
+        .files_created,
         4,
     );
     assert_committed(&archive, &paths);
@@ -157,15 +184,27 @@ fn a_busy_project_does_not_prevent_another_message_bundle_from_recovering() {
     let process = crate::archive_process_lock(&archive).unwrap();
     let owner = process.lock().unwrap();
     let refused = reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
         &AtomicBool::new(false),
     );
-    assert!(refused.unwrap_err().to_string().contains("lock budget exhausted"));
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("lock budget exhausted")
+    );
     assert!(paths.iter().all(|path| !path.exists()));
     let progressed = reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &other, &config, entry(&other_message, &recipients),
+        &Cx::for_testing(),
+        &other,
+        &config,
+        entry(&other_message, &recipients),
         &AtomicBool::new(false),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(progressed.files_created, 4);
     assert_committed(&other, &bundle_paths(&other, &other_message, &recipients));
     assert!(matches!(process.try_lock(), Err(TryLockError::WouldBlock)));
@@ -173,9 +212,14 @@ fn a_busy_project_does_not_prevent_another_message_bundle_from_recovering() {
     drop(owner);
     assert_eq!(
         reconcile_message_bundle_cancellable(
-            &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
             &AtomicBool::new(false),
-        ).unwrap().files_created,
+        )
+        .unwrap()
+        .files_created,
         4,
     );
     assert_committed(&archive, &paths);
@@ -196,10 +240,18 @@ fn a_held_flock_keeps_its_owner_evidence_and_all_message_destinations() {
     let owner = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
     owner.try_lock_exclusive().unwrap();
     let result = reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
         &AtomicBool::new(false),
     );
-    assert!(result.unwrap_err().to_string().contains("lock budget exhausted"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("lock budget exhausted")
+    );
     assert_eq!(fs::read(&lock_path).unwrap(), b"foreign lock evidence");
     assert_eq!(fs::read(&owner_path).unwrap(), b"foreign owner evidence");
     assert!(paths.iter().all(|path| !path.exists()));
@@ -210,9 +262,14 @@ fn a_held_flock_keeps_its_owner_evidence_and_all_message_destinations() {
     drop(owner);
     assert_eq!(
         reconcile_message_bundle_cancellable(
-            &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
             &AtomicBool::new(false),
-        ).unwrap().files_created,
+        )
+        .unwrap()
+        .files_created,
         4,
     );
     assert_committed(&archive, &paths);
@@ -228,24 +285,41 @@ fn stop_refuses_publication_and_nested_admission_retains_its_native_owner() {
     let stop = AtomicBool::new(true);
     let epoch = crate::archive_mutation_epoch();
     let result = reconcile_message_bundle_cancellable(
-        &cx, &archive, &config, entry(&message, &recipients), &stop,
+        &cx,
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &stop,
     );
     assert!(matches!(result, Err(StorageError::Io(ref error))
         if error.kind() == std::io::ErrorKind::Interrupted));
     assert_eq!(crate::archive_mutation_epoch(), epoch);
-    assert!(bundle_paths(&archive, &message, &recipients).iter().all(|path| !path.exists()));
+    assert!(
+        bundle_paths(&archive, &message, &recipients)
+            .iter()
+            .all(|path| !path.exists())
+    );
     stop.store(false, Ordering::Release);
     let outer = crate::ArchiveMutationGuard::begin_at(&archive.repo_root);
     let holder = crate::archive_publication_fence_holder().unwrap();
     assert_eq!(
         reconcile_message_bundle_cancellable(
-            &cx, &archive, &config, entry(&message, &recipients), &stop,
-        ).unwrap().files_created,
+            &cx,
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &stop,
+        )
+        .unwrap()
+        .files_created,
         4,
     );
     assert_eq!(crate::ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 1);
     assert_eq!(crate::archive_mutations_active(), 1);
-    assert_eq!(crate::archive_publication_fence_holder().unwrap().site, holder.site);
+    assert_eq!(
+        crate::archive_publication_fence_holder().unwrap().site,
+        holder.site
+    );
     drop(outer);
     assert_eq!(crate::ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
     assert_eq!(crate::archive_mutations_active(), 0);
@@ -260,10 +334,15 @@ fn bounded_admission_does_not_relax_committed_identity_checks() {
     let (_temp, config, archive, mut message, recipients) = fixture();
     reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
     let paths = bundle_paths(&archive, &message, &recipients);
-    let original = paths.iter().map(|path| fs::read(path).unwrap()).collect::<Vec<_>>();
+    let original = paths
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
     let mut evidence = Vec::new();
     for (index, path) in paths.iter().enumerate() {
-        let saved = config.storage_root.join(format!("identity-evidence-{index}.md"));
+        let saved = config
+            .storage_root
+            .join(format!("identity-evidence-{index}.md"));
         fs::rename(path, &saved).unwrap();
         evidence.push(saved);
     }
@@ -271,10 +350,18 @@ fn bounded_admission_does_not_relax_committed_identity_checks() {
     let head = repo.head().unwrap().target();
     message["reply_to"] = serde_json::json!(9);
     let result = reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
         &AtomicBool::new(false),
     );
-    assert!(result.unwrap_err().to_string().contains("committed archive artifact"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("committed archive artifact")
+    );
     assert_eq!(repo.head().unwrap().target(), head);
     assert!(paths.iter().all(|path| !path.exists()));
     for (path, bytes) in evidence.iter().zip(original) {
@@ -296,19 +383,30 @@ fn attachment_authority_is_required_before_any_cancellable_message_publication()
         "sha1": hex::encode(Sha1::digest(bytes)),
     }]);
     let paths = bundle_paths(&archive, &message, &recipients);
-    assert!(reconcile_message_bundle_cancellable(
-        &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
-        &AtomicBool::new(false),
-    ).is_err());
+    assert!(
+        reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &AtomicBool::new(false),
+        )
+        .is_err()
+    );
     assert!(paths.iter().all(|path| !path.exists()));
     let attachment = archive.repo_root.join(relative);
     crate::ensure_parent_dir(&attachment).unwrap();
     fs::write(&attachment, bytes).unwrap();
     assert_eq!(
         reconcile_message_bundle_cancellable(
-            &Cx::for_testing(), &archive, &config, entry(&message, &recipients),
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
             &AtomicBool::new(false),
-        ).unwrap().files_created,
+        )
+        .unwrap()
+        .files_created,
         4,
     );
     assert_committed(&archive, &paths);
