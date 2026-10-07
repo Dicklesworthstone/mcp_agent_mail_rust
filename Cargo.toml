@@ -36,8 +36,8 @@ fastmcp-protocol = "0.10.0"
 # br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
 # The embedded Beads library retains its older private runtime graph.
 asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
-fsqlite = "=0.4.9"
-fsqlite-types = "=0.4.9"
+fsqlite = "=0.4.10"
+fsqlite-types = "=0.4.10"
 
 sqlmodel = "=0.5.0"
 sqlmodel-core = "=0.5.0"
