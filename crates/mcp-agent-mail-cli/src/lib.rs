@@ -11445,7 +11445,10 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             advisory,
             repo,
         } => {
-            let repo_path = repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let repo_path = repo.unwrap_or_else(|| {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                guard_check_repo_root(&cwd).unwrap_or(cwd)
+            });
             // Read paths from stdin (null-separated or line-separated)
             let input = {
                 use std::io::Read;
@@ -11470,7 +11473,17 @@ fn handle_guard(action: GuardCommand) -> CliResult<()> {
             };
 
             let config = mcp_agent_mail_core::Config::from_env();
-            let archive_root = resolve_guard_archive_root_for_check(&repo_path, &config);
+            let Some(archive_root) = resolve_guard_archive_root_for_check(&repo_path, &config)
+            else {
+                // As the hook does: warn and allow, but never claim "no
+                // conflicts" for paths nothing was checked against.
+                ftui_runtime::ftui_eprintln!(
+                    "No reservation archive found for {} under {}; nothing was checked.",
+                    repo_path.display(),
+                    config.storage_root.join("projects").display()
+                );
+                return Ok(());
+            };
 
             // Honor the same escape hatches as the installed hook: bypass,
             // disabled enforcement, and warn mode.
@@ -11553,20 +11566,28 @@ fn project_identity_matches_requested_path(
         || stored_identity.canonical_path == requested_identity.canonical_path
 }
 
-fn archive_project_matches_repo_path(
+/// Whose project an archive's `project.json` names.
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveOwner {
+    ThisProject,
+    OtherProject,
+    /// Missing, unreadable or without a `human_key`: proves nothing.
+    Unknown,
+}
+
+fn archive_owner(
     candidate: &Path,
     repo_identity: &mcp_agent_mail_core::ProjectIdentity,
-) -> bool {
+) -> ArchiveOwner {
     let metadata_path = candidate.join("project.json");
     if !path_is_real_file(&metadata_path) {
-        return false;
+        return ArchiveOwner::Unknown;
     }
-
     let Ok(content) = std::fs::read_to_string(&metadata_path) else {
-        return false;
+        return ArchiveOwner::Unknown;
     };
     let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
+        return ArchiveOwner::Unknown;
     };
     let Some(human_key) = metadata
         .get("human_key")
@@ -11574,45 +11595,64 @@ fn archive_project_matches_repo_path(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return false;
+        return ArchiveOwner::Unknown;
     };
-
-    project_identity_matches_requested_path(human_key, repo_identity)
+    if project_identity_matches_requested_path(human_key, repo_identity) {
+        ArchiveOwner::ThisProject
+    } else {
+        ArchiveOwner::OtherProject
+    }
 }
 
-fn resolve_guard_archive_root_for_check(repo_path: &Path, config: &Config) -> PathBuf {
+/// The reservation archive `am guard check` reads for `repo_path`, or `None`
+/// when no archive belongs to it (then nothing can be checked). As in the
+/// installed hook, the archive under this project's slug counts unless its
+/// metadata names another project; elsewhere only matching metadata counts.
+fn resolve_guard_archive_root_for_check(repo_path: &Path, config: &Config) -> Option<PathBuf> {
     if path_is_real_directory(&repo_path.join("file_reservations")) {
-        return repo_path.to_path_buf();
+        return Some(repo_path.to_path_buf());
     }
 
     let projects_dir = config.storage_root.join("projects");
     if !path_is_real_directory(&projects_dir) {
-        return repo_path.to_path_buf();
+        return None;
     }
 
     let human_key = repo_path.to_string_lossy().to_string();
     let identity = resolve_project_identity(&human_key);
     let candidate = projects_dir.join(&identity.slug);
     if path_is_real_directory(&candidate.join("file_reservations"))
-        && archive_project_matches_repo_path(&candidate, &identity)
+        && archive_owner(&candidate, &identity) != ArchiveOwner::OtherProject
     {
-        return candidate;
+        return Some(candidate);
     }
 
-    let Ok(entries) = std::fs::read_dir(&projects_dir) else {
-        return repo_path.to_path_buf();
-    };
+    let entries = std::fs::read_dir(&projects_dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path == candidate || !path_is_real_directory(&path.join("file_reservations")) {
             continue;
         }
-        if archive_project_matches_repo_path(&path, &identity) {
-            return path;
+        if archive_owner(&path, &identity) == ArchiveOwner::ThisProject {
+            return Some(path);
         }
     }
 
-    repo_path.to_path_buf()
+    None
+}
+
+/// The git work tree containing `dir` (what the hook checks against), so
+/// `am guard check` run from a subdirectory still finds the project.
+fn guard_check_repo_root(dir: &Path) -> Option<PathBuf> {
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .run()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!top.is_empty()).then(|| PathBuf::from(top))
 }
 
 fn handle_list_projects(
@@ -66521,7 +66561,34 @@ startup_timeout_sec = 42
         .expect("write project metadata");
 
         let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
-        assert_eq!(resolved, candidate);
+        assert_eq!(resolved, Some(candidate));
+    }
+
+    #[test]
+    fn resolve_guard_archive_root_uses_an_unlabelled_slug_archive_and_reports_none() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_path = td.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+        let config = Config {
+            storage_root: td.path().join("storage"),
+            ..Config::default()
+        };
+
+        // No archive at all: nothing to check, not "no conflicts".
+        assert_eq!(
+            resolve_guard_archive_root_for_check(&repo_path, &config),
+            None
+        );
+
+        // This project's slug with no project.json proves no collision, so its
+        // reservations are read (as the installed hook does).
+        let identity = resolve_project_identity(&repo_path.to_string_lossy());
+        let candidate = config.storage_root.join("projects").join(&identity.slug);
+        std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+        assert_eq!(
+            resolve_guard_archive_root_for_check(&repo_path, &config),
+            Some(candidate)
+        );
     }
 
     #[cfg(unix)]
@@ -66559,7 +66626,7 @@ startup_timeout_sec = 42
         .expect("write project metadata");
 
         let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
-        assert_eq!(resolved, candidate);
+        assert_eq!(resolved, Some(candidate));
     }
 
     #[test]
@@ -66595,7 +66662,10 @@ startup_timeout_sec = 42
         .expect("write colliding metadata");
 
         let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
-        assert_eq!(resolved, repo_path);
+        assert_eq!(
+            resolved, None,
+            "an archive naming another project is not ours"
+        );
     }
 
     #[test]
