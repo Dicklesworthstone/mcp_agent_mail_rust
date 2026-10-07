@@ -297,6 +297,13 @@ pub fn apply_project_scope(
             rebuild_scope_inbox_stats(&conn)?;
         }
 
+        // Global tool telemetry is not keyed by project, so it cannot be scoped:
+        // it covers every project's calls and goes whenever scoping applies,
+        // whatever the scrub preset (the archive preset otherwise keeps it).
+        if table_exists(&conn, "tool_metrics_snapshots")? {
+            exec(&conn, "DELETE FROM tool_metrics_snapshots", &[])?;
+        }
+
         // 12. Delete projects
         exec(
             &conn,
@@ -842,6 +849,38 @@ mod tests {
             .expect_err("symlinked snapshots must fail validation");
         assert!(matches!(err, ShareError::Validation { .. }));
         assert!(err.to_string().contains("real file"));
+    }
+
+    #[test]
+    fn scoping_drops_global_tool_telemetry() {
+        let seed = |db: &std::path::Path| {
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "CREATE TABLE tool_metrics_snapshots (id INTEGER PRIMARY KEY, payload TEXT)",
+            )
+            .unwrap();
+            conn.execute_raw("INSERT INTO tool_metrics_snapshots VALUES (1, 'every project')")
+                .unwrap();
+        };
+        let telemetry_rows = |db: &std::path::Path| -> i64 {
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.query_sync("SELECT COUNT(*) AS n FROM tool_metrics_snapshots", &[])
+                .unwrap()[0]
+                .get_named("n")
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let scoped = create_test_db(dir.path());
+        seed(&scoped);
+        apply_project_scope(&scoped, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(telemetry_rows(&scoped), 0, "covers other projects' calls");
+
+        let other = tempfile::tempdir().unwrap();
+        let unscoped = create_test_db(other.path());
+        seed(&unscoped);
+        apply_project_scope(&unscoped, &[]).unwrap();
+        assert_eq!(telemetry_rows(&unscoped), 1, "no scope, nothing to hide");
     }
 
     #[test]
