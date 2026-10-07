@@ -1370,3 +1370,131 @@ fn qualified_send_consent_cannot_be_forged_by_the_sender() {
         assert_eq!(delivery_counts(&cx).await, before, "nothing may be written");
     });
 }
+
+/// Send from `from` to `to` in thread th-plan, optionally verified.
+async fn send_in_plan_thread(
+    ctx: &McpContext,
+    project: &str,
+    from: &str,
+    to: &str,
+    token: Option<String>,
+) -> Result<String, fastmcp::McpError> {
+    send_message(
+        ctx,
+        project.to_string(),
+        from.to_string(),
+        vec![to.to_string()],
+        "plan".to_string(),
+        "body".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("th-plan".to_string()),
+        None,
+        None,
+        None,
+        token,
+        None,
+    )
+    .await
+}
+
+/// Register `name` in `project`; returns its registration token.
+async fn register_for_token(ctx: &McpContext, project: &str, name: &str) -> String {
+    let raw = register_agent(
+        ctx,
+        project.to_string(),
+        "codex-cli".to_string(),
+        "gpt-5".to_string(),
+        Some(name.to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register_agent");
+    let agent: Value = serde_json::from_str(&raw).expect("agent JSON");
+    agent["registration_token"]
+        .as_str()
+        .expect("token")
+        .to_string()
+}
+
+/// `macro_prepare_thread` registers only as a convenience: it must not rotate a
+/// running agent's token (its verified sends would start failing).
+/// `register_agent` itself still rotates.
+#[test]
+fn macro_prepare_thread_keeps_the_running_agents_token() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-prepare-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        let token = register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        send_in_plan_thread(&ctx, &project, "GreenCastle", "BlueLake", None)
+            .await
+            .expect("send to BlueLake");
+
+        let prepared: Value = serde_json::from_str(
+            &mcp_agent_mail_tools::macro_prepare_thread(
+                &ctx,
+                project.clone(),
+                "th-plan".to_string(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some("BlueLake".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("macro_prepare_thread"),
+        )
+        .expect("prepare JSON");
+        // Present (the Python response always carried it) but null: the kept
+        // token is never echoed.
+        assert_eq!(
+            prepared["agent"].get("registration_token"),
+            Some(&serde_json::Value::Null),
+            "{prepared}"
+        );
+        assert!(
+            prepared["inbox"]
+                .as_array()
+                .is_some_and(|inbox| inbox.iter().any(|msg| msg["thread_id"] == "th-plan")),
+            "{prepared}"
+        );
+
+        send_in_plan_thread(
+            &ctx,
+            &project,
+            "BlueLake",
+            "GreenCastle",
+            Some(token.clone()),
+        )
+        .await
+        .expect("BlueLake's original token still verifies");
+
+        register_for_token(&ctx, &project, "BlueLake").await;
+        let err = send_in_plan_thread(&ctx, &project, "BlueLake", "GreenCastle", Some(token))
+            .await
+            .expect_err("register_agent rotated the token");
+        assert_eq!(
+            mcp_agent_mail_tools::tool_util::tool_error_code(&err),
+            Some("SENDER_TOKEN_MISMATCH")
+        );
+    });
+}

@@ -375,7 +375,10 @@ pub async fn macro_prepare_thread(
 
     let should_register = register_if_missing.unwrap_or(true);
     let agent = if should_register {
-        let agent_json = crate::identity::register_agent(
+        // Refresh (or create) the profile as register_agent does, but leave a
+        // running agent's registration token alone: rotating it here would
+        // make that agent's next verified send fail with a token mismatch.
+        let agent_json = crate::identity::register_agent_with_token_policy(
             ctx,
             project.human_key.clone(),
             program,
@@ -387,6 +390,7 @@ pub async fn macro_prepare_thread(
             None,
             None,
             registration_proof,
+            crate::identity::TokenPolicy::KeepExisting,
         )
         .await?;
         parse_json(agent_json, "agent")?
@@ -501,7 +505,15 @@ pub async fn macro_prepare_thread(
     }
     tracing::debug!("Inbox limit: {}", inbox_limit);
 
-    serde_json::to_string(&response)
+    let mut value = serde_json::to_value(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))?;
+    // The agent object always carries `registration_token`, as the Python
+    // response did; a token this call kept (or did not mint) is null, never
+    // the running agent's credential.
+    if let Some(agent) = value.get_mut("agent").and_then(Value::as_object_mut) {
+        agent.entry("registration_token").or_insert(Value::Null);
+    }
+    serde_json::to_string(&value)
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 

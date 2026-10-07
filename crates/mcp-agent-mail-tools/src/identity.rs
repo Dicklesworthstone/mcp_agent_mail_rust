@@ -2461,6 +2461,52 @@ pub async fn register_agent(
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
+    register_agent_with_token_policy(
+        ctx,
+        project_key,
+        program,
+        model,
+        name,
+        task_description,
+        attachments_policy,
+        reaper_exempt,
+        pane_id,
+        tmux_socket_path,
+        registration_proof,
+        TokenPolicy::Rotate,
+    )
+    .await
+}
+
+/// What a registration does to an existing agent's registration token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenPolicy {
+    /// Issue a fresh token, as `register_agent` always does: the most recent
+    /// registrant is the one that can prove it owns the name.
+    Rotate,
+    /// Leave an existing agent's token alone and do not return it; an agent
+    /// registered for the first time still gets one. For tools that register
+    /// only as a convenience (`macro_prepare_thread`), where rotating would
+    /// silently invalidate the running agent's `sender_token`.
+    KeepExisting,
+}
+
+/// `register_agent` with an explicit [`TokenPolicy`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn register_agent_with_token_policy(
+    ctx: &McpContext,
+    project_key: String,
+    program: String,
+    model: String,
+    name: Option<String>,
+    task_description: Option<String>,
+    attachments_policy: Option<String>,
+    reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
+    registration_proof: Option<String>,
+    token_policy: TokenPolicy,
+) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -2663,16 +2709,27 @@ Check that all parameters have valid values."
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
-    // Every registration (new or update) rotates the token so that only the
-    // most recent registrant can prove ownership.
-    let mut registration_token = match mcp_agent_mail_core::setup::generate_registration_token() {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(
-                "failed to generate registration_token for agent {}: {error}",
-                row.name
-            );
-            String::new()
+    // Under TokenPolicy::Rotate every registration (new or update) rotates the
+    // token so that only the most recent registrant can prove ownership; under
+    // KeepExisting an agent that already has one keeps it (and it is not
+    // returned).
+    let keep_existing_token = token_policy == TokenPolicy::KeepExisting
+        && row
+            .registration_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+    let mut registration_token = if keep_existing_token {
+        String::new()
+    } else {
+        match mcp_agent_mail_core::setup::generate_registration_token() {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to generate registration_token for agent {}: {error}",
+                    row.name
+                );
+                String::new()
+            }
         }
     };
     if !registration_token.is_empty()
