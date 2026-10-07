@@ -802,15 +802,12 @@ pub fn agents_actions(agent_name: &str) -> Vec<ActionEntry> {
 #[must_use]
 pub fn threads_actions(thread_id: &str) -> Vec<ActionEntry> {
     vec![
-        ActionEntry::new("View messages", ActionKind::Execute("view_messages".into()))
-            .with_keybinding("v")
-            .with_description("Show all messages in thread"),
         ActionEntry::new(
             "Summarize",
             ActionKind::Execute(format!("summarize:{thread_id}")),
         )
         .with_keybinding("s")
-        .with_description("Generate thread summary"),
+        .with_description("Key points and action items above the conversation"),
         ActionEntry::new(
             "Search in thread",
             ActionKind::Execute(format!("search_in:{thread_id}")),
@@ -1124,8 +1121,8 @@ mod tests {
         assert!(agents.iter().any(|a| a.label == "Send message"));
 
         let threads = threads_actions("th-1");
-        assert!(threads.iter().any(|a| a.label == "View messages"));
         assert!(threads.iter().any(|a| a.label == "Summarize"));
+        assert!(threads.iter().any(|a| a.label == "Search in thread"));
 
         let timeline = timeline_actions("tool_call_end", "http");
         assert!(timeline.iter().any(|a| a.label == "View details"));
