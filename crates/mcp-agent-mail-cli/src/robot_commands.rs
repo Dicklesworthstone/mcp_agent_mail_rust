@@ -2931,7 +2931,8 @@ fn classify_handoff(input: &HandoffClassificationInput) -> HandoffClassification
 /// Shared arguments for all `am robot` subcommands.
 #[derive(Debug, Args)]
 pub struct RobotArgs {
-    /// Output format: toon (default at TTY), json (default when piped), md (for thread/message).
+    /// Output format: toon (default at TTY), json (default when piped), md (thread and
+    /// message only, where it is the default whether or not stdout is a TTY).
     #[arg(long, global = true, value_parser = parse_output_format)]
     pub format: Option<OutputFormat>,
 
@@ -2973,18 +2974,18 @@ pub enum RobotSubcommand {
 
     /// Actionable inbox with priority ordering, urgency/ack synthesis.
     ///
-    /// Defaults to UNREAD messages only (as if --unread were passed) unless
-    /// --urgent, --ack-overdue, or --all is given. Listing never marks
-    /// messages read: read state changes only via explicit `am mail read`
-    /// or acknowledgement (GH#229).
+    /// Defaults to unread messages plus any whose acknowledgement is overdue
+    /// (as if --unread were passed) unless --urgent, --ack-overdue, or --all
+    /// is given. Listing never marks messages read: read state changes only
+    /// via explicit `am mail read` or acknowledgement (GH#229).
     Inbox {
-        /// Show only urgent messages.
+        /// Show only unread high/urgent messages.
         #[arg(long)]
         urgent: bool,
-        /// Show only ack-overdue messages.
+        /// Show only ack-required messages unacknowledged for over 30 minutes.
         #[arg(long)]
         ack_overdue: bool,
-        /// Show only unread messages.
+        /// Show unread messages plus overdue acknowledgements (the default).
         #[arg(long)]
         unread: bool,
         /// Show all messages (no filtering).
@@ -3006,7 +3007,8 @@ pub enum RobotSubcommand {
         /// Filter by event kind (message, reservation, agent).
         #[arg(long)]
         kind: Option<String>,
-        /// Filter by event source.
+        /// Filter by event source (an agent name, case-insensitive). The timeline
+        /// covers the whole project; `--agent` does not narrow it.
         #[arg(long)]
         source: Option<String>,
     },
@@ -3069,7 +3071,8 @@ pub enum RobotSubcommand {
         /// Show reservations for all agents, not just the selected agent.
         #[arg(long)]
         all: bool,
-        /// Show only conflicting reservations.
+        /// Add the overlapping subset (`conflicting_active`) to the view;
+        /// `all_active`, conflicts and expiring reservations stay listed.
         #[arg(long)]
         conflicts: bool,
         /// Warn about reservations expiring within N minutes.
@@ -3128,7 +3131,7 @@ pub enum RobotSubcommand {
         /// Filter open-stratum counters to a matching canonical stratum key.
         #[arg(long)]
         stratum: Option<String>,
-        /// Only render the summary block.
+        /// Only render the summary block (and the latest canary verdict).
         #[arg(long)]
         summary_only: bool,
         /// Maximum items to show.
@@ -5916,6 +5919,7 @@ struct RobotInboxServerRequest {
 struct ServerInboxEntry {
     entry: InboxEntry,
     bucket: i64,
+    ack_overdue: bool,
     created_ts: i64,
 }
 
@@ -5993,32 +5997,71 @@ fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> 
     )
 }
 
-fn robot_inbox_server_arguments(request: &RobotInboxServerRequest) -> serde_json::Value {
-    let ack_overdue_only = !request.urgent && request.ack_overdue;
-    let unread_only = if request.urgent {
-        true
-    } else if ack_overdue_only || request.all {
-        false
-    } else {
-        request.unread
+/// `fetch_inbox` caps `limit` at this many rows.
+const ROBOT_INBOX_SERVER_WINDOW: usize = 1000;
+
+/// The `fetch_inbox` calls whose union holds every row the robot view could
+/// show. The server returns the newest rows of each call, so a view ordered
+/// by priority asks for the whole window of each candidate class and trims to
+/// `--limit` only after sorting; otherwise an old urgent message would fall
+/// behind the newest `--limit` rows and never be ranked.
+fn robot_inbox_server_windows(request: &RobotInboxServerRequest) -> Vec<serde_json::Value> {
+    let window = |urgent_only: bool, unread_only: bool, ack_overdue_only: bool, limit: usize| {
+        serde_json::json!({
+            "project_key": request.project_key,
+            "agent_name": request.agent_name,
+            "urgent_only": urgent_only,
+            "limit": i32::try_from(limit.max(1)).unwrap_or(i32::MAX),
+            "include_bodies": request.include_bodies,
+            "unread_only": unread_only,
+            "ack_overdue_only": ack_overdue_only,
+            // `am inbox` is a listing, not a consumption: without this the
+            // fetch_inbox tool auto-marks every returned row read, and the
+            // client-side bucket filter then hides those same rows from the very
+            // response that consumed them — messages nobody ever saw become
+            // permanently invisible to the default unread-only view (GH#229).
+            // Read-state changes are left to explicit `am mail read` / ack, the
+            // same non-consuming-peek contract check-inbox adopted in GH#207.
+            "mark_read": false,
+        })
     };
-    serde_json::json!({
-        "project_key": request.project_key,
-        "agent_name": request.agent_name,
-        "urgent_only": request.urgent,
-        "limit": i32::try_from(request.limit).unwrap_or(i32::MAX),
-        "include_bodies": request.include_bodies,
-        "unread_only": unread_only,
-        "ack_overdue_only": ack_overdue_only,
-        // `am inbox` is a listing, not a consumption: without this the
-        // fetch_inbox tool auto-marks every returned row read, and the
-        // client-side bucket filter then hides those same rows from the very
-        // response that consumed them — messages nobody ever saw become
-        // permanently invisible to the default unread-only view (GH#229).
-        // Read-state changes are left to explicit `am mail read` / ack, the
-        // same non-consuming-peek contract check-inbox adopted in GH#207.
-        "mark_read": false,
-    })
+    if request.urgent {
+        // Every row is unread high/urgent, which the server already returns
+        // newest first: the same order the priority sort gives them.
+        return vec![window(true, true, false, request.limit)];
+    }
+    if request.ack_overdue {
+        return vec![window(false, false, true, ROBOT_INBOX_SERVER_WINDOW)];
+    }
+    let mut windows = vec![
+        window(false, true, false, ROBOT_INBOX_SERVER_WINDOW),
+        window(false, false, true, ROBOT_INBOX_SERVER_WINDOW),
+    ];
+    if request.all || !request.unread {
+        // Read rows rank after every unread or overdue one, newest first, so
+        // the newest `--limit` rows hold every read row the view can reach.
+        windows.push(window(false, false, false, request.limit));
+    }
+    windows
+}
+
+/// Merges the window payloads into one row list, keeping each message once.
+fn merge_server_inbox_windows(
+    payloads: &[serde_json::Value],
+) -> Result<serde_json::Value, CliError> {
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for payload in payloads {
+        let window_rows = server_inbox_rows(payload)
+            .ok_or_else(|| CliError::Other("unexpected fetch_inbox response shape".to_string()))?;
+        for row in window_rows {
+            let id = row.get("id").and_then(serde_json::Value::as_i64);
+            if id.is_none_or(|id| seen.insert(id)) {
+                rows.push(row.clone());
+            }
+        }
+    }
+    Ok(serde_json::Value::Array(rows))
 }
 
 fn server_inbox_rows(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
@@ -6062,9 +6105,10 @@ fn server_inbox_row_to_entry(
         .get("ack_required")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let ack_overdue = ack_required && ack_ts.is_none() && created_ts < ack_threshold;
     let bucket = if matches!(importance.as_str(), "urgent" | "high") && read_ts.is_none() {
         1
-    } else if ack_required && ack_ts.is_none() && created_ts < ack_threshold {
+    } else if ack_overdue {
         2
     } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
         3
@@ -6088,7 +6132,7 @@ fn server_inbox_row_to_entry(
         "none".to_string()
     } else if ack_ts.is_some() {
         "acked".to_string()
-    } else if bucket == 2 {
+    } else if ack_overdue {
         "overdue".to_string()
     } else if read_ts.is_some() {
         "pending".to_string()
@@ -6131,6 +6175,7 @@ fn server_inbox_row_to_entry(
             },
         },
         bucket,
+        ack_overdue,
         created_ts,
     }
 }
@@ -6150,7 +6195,7 @@ fn build_inbox_from_server_payload(
             if request.urgent {
                 row.bucket == 1
             } else if request.ack_overdue {
-                row.bucket == 2
+                row.ack_overdue
             } else if request.all {
                 true
             } else if request.unread {
@@ -6172,7 +6217,7 @@ fn build_inbox_from_server_payload(
     let entries = projected
         .into_iter()
         .map(|row| {
-            if row.bucket == 2 {
+            if row.ack_overdue {
                 overdue_ids.push(row.entry.id);
             }
             row.entry
@@ -6233,38 +6278,45 @@ fn try_build_inbox_via_server(
     let bearer = crate::local_server_bearer_token(config);
     let mut last_unavailable: Option<(String, String)> = None;
 
-    for server_url in urls {
-        let arguments = robot_inbox_server_arguments(request);
-        let call = crate::context::run_async(async {
-            Ok(crate::try_call_server_tool(
-                &server_url,
-                bearer.as_deref(),
-                "fetch_inbox",
-                arguments,
-            )
-            .await)
-        })?;
-        match call {
-            crate::ServerToolCall::Success(result) => {
-                let payload = crate::coerce_tool_result_json_or_error("fetch_inbox", result)?;
-                return build_inbox_from_server_payload(&payload, request).map(Some);
-            }
-            crate::ServerToolCall::Unavailable(message) => {
-                last_unavailable = Some((server_url, message));
-            }
-            crate::ServerToolCall::Rejected(message) => {
-                if crate::mail_server_rejection_allows_local_fallback(&message) {
-                    tracing::debug!(
-                        message = %message,
-                        "robot inbox fell back to local scope after server scope mismatch"
-                    );
-                    return Ok(None);
+    'urls: for server_url in urls {
+        let mut payloads = Vec::new();
+        for arguments in robot_inbox_server_windows(request) {
+            let call = crate::context::run_async(async {
+                Ok(crate::try_call_server_tool(
+                    &server_url,
+                    bearer.as_deref(),
+                    "fetch_inbox",
+                    arguments,
+                )
+                .await)
+            })?;
+            match call {
+                crate::ServerToolCall::Success(result) => {
+                    payloads.push(crate::coerce_tool_result_json_or_error(
+                        "fetch_inbox",
+                        result,
+                    )?);
                 }
-                return Err(CliError::Other(format!(
-                    "fetch_inbox via server failed: {message}"
-                )));
+                crate::ServerToolCall::Unavailable(message) => {
+                    last_unavailable = Some((server_url, message));
+                    continue 'urls;
+                }
+                crate::ServerToolCall::Rejected(message) => {
+                    if crate::mail_server_rejection_allows_local_fallback(&message) {
+                        tracing::debug!(
+                            message = %message,
+                            "robot inbox fell back to local scope after server scope mismatch"
+                        );
+                        return Ok(None);
+                    }
+                    return Err(CliError::Other(format!(
+                        "fetch_inbox via server failed: {message}"
+                    )));
+                }
             }
         }
+        let payload = merge_server_inbox_windows(&payloads)?;
+        return build_inbox_from_server_payload(&payload, request).map(Some);
     }
 
     if let Some((server_url, message)) = last_unavailable {
@@ -6379,11 +6431,14 @@ fn build_inbox_with_phase(
     let bucket_filter = if urgent_only {
         "AND priority_bucket = 1"
     } else if ack_overdue_only {
-        "AND priority_bucket = 2"
+        // Urgent unread mail ranks in bucket 1 even once its ack is overdue;
+        // `robot status` counts it as overdue and points here, so match on
+        // the overdue condition rather than the bucket.
+        "AND sub.ack_overdue = 1"
     } else if show_all {
         "" // no filter
     } else if unread_only {
-        "AND priority_bucket <= 4" // unread only (read_ts IS NULL)
+        "AND priority_bucket <= 4" // unread, plus read mail whose ack is overdue
     } else {
         "AND priority_bucket <= 5" // include read but un-acked messages
     };
@@ -6396,7 +6451,7 @@ fn build_inbox_with_phase(
     let sql = format!(
         "SELECT sub.id, sub.subject, sub.topic, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
-                sub.priority_bucket,
+                sub.priority_bucket, sub.ack_overdue,
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
          FROM (
              SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required,
@@ -6408,7 +6463,11 @@ fn build_inbox_with_phase(
                         WHEN mr.read_ts IS NULL THEN 4
                         WHEN m.ack_required = 1 AND mr.ack_ts IS NULL THEN 5
                         ELSE 6
-                    END AS priority_bucket
+                    END AS priority_bucket,
+                    CASE
+                        WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 1
+                        ELSE 0
+                    END AS ack_overdue
              FROM message_recipients mr
              JOIN messages m ON m.id = mr.message_id
              WHERE mr.agent_id = ? AND m.project_id = ?
@@ -6424,6 +6483,7 @@ fn build_inbox_with_phase(
             &sql,
             &[
                 Value::BigInt(ack_threshold),
+                Value::BigInt(ack_threshold),
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
                 Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
@@ -6438,6 +6498,7 @@ fn build_inbox_with_phase(
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
         let bucket: i64 = row.get_named("priority_bucket").unwrap_or(7);
+        let ack_overdue = row.get_named::<i64>("ack_overdue").unwrap_or(0) == 1;
         let sender: String = row.get_named("sender_name").unwrap_or_default();
         let subject: String = row.get_named("subject").unwrap_or_default();
         let topic: Option<String> = row.get_named("topic").ok();
@@ -6462,7 +6523,7 @@ fn build_inbox_with_phase(
             "none".to_string()
         } else if ack_ts.is_some() {
             "acked".to_string()
-        } else if bucket == 2 {
+        } else if ack_overdue {
             "overdue".to_string()
         } else if read_ts.is_some() {
             "pending".to_string()
@@ -6472,7 +6533,7 @@ fn build_inbox_with_phase(
 
         let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
-        if bucket == 2 {
+        if ack_overdue {
             overdue_ids.push(id);
         }
 
@@ -7660,14 +7721,16 @@ fn build_search(
         mcp_agent_mail_db::search_planner::SearchQuery::messages(raw_query.to_string(), project_id);
     search_query.explain = true;
 
-    if let Some(imp) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
-        let parsed = mcp_agent_mail_db::search_planner::Importance::parse(imp);
-        let Some(parsed) = parsed else {
-            return Err(CliError::InvalidArgument(format!(
-                "invalid importance filter: {imp}"
-            )));
-        };
-        search_query.importance = vec![parsed];
+    // A comma-separated list, as the server-routed search accepts.
+    if let Some(list) = importance_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        for imp in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(parsed) = mcp_agent_mail_db::search_planner::Importance::parse(imp) else {
+                return Err(CliError::InvalidArgument(format!(
+                    "invalid importance filter: {imp}"
+                )));
+            };
+            search_query.importance.push(parsed);
+        }
     }
 
     if let Some(since_str) = since.map(str::trim).filter(|s| !s.is_empty()) {
@@ -8796,19 +8859,18 @@ fn build_reservations_at(
             .filter(|e| conflict_paths.contains(&e.path))
             .cloned()
             .collect();
+        // The expiring set stays too: the documented pre-edit safety check is
+        // `--conflicts --expiring N`, and the renew actions above are built
+        // from it, so dropping it here left actions with nothing behind them.
         return Ok((
             ReservationsData {
                 my_reservations: vec![],
                 all_active: scoped_all_active,
                 conflicting_active,
                 conflicts: scoped_conflicts,
-                expiring_soon: vec![],
+                expiring_soon: scoped_expiring_soon,
                 playbooks: scoped_playbooks,
-                forecast: ReservationForecast {
-                    expiry_herds: vec![],
-                    conflict_hotspots: scoped_forecast.conflict_hotspots,
-                }
-                .into_option(),
+                forecast: scoped_forecast.into_option(),
             },
             actions,
         ));
@@ -9708,6 +9770,11 @@ fn build_handoff(
 
 // ── Timeline command implementation ─────────────────────────────────────────
 
+/// Agent names are case-insensitive everywhere else, so the source filter is too.
+fn timeline_source_matches(filter: Option<&str>, source: &str) -> bool {
+    filter.is_none_or(|filter| filter.eq_ignore_ascii_case(source))
+}
+
 fn build_timeline(
     conn: &DbConn,
     project_id: i64,
@@ -9756,7 +9823,7 @@ fn build_timeline(
             let importance: String = row.get_named("importance").unwrap_or_default();
             let sender: String = row.get_named("sender").unwrap_or_default();
 
-            if source_filter.is_some() && source_filter != Some(sender.as_str()) {
+            if !timeline_source_matches(source_filter, &sender) {
                 continue;
             }
 
@@ -9809,7 +9876,7 @@ fn build_timeline(
                 continue;
             }
 
-            if source_filter.is_some() && source_filter != Some(agent.as_str()) {
+            if !timeline_source_matches(source_filter, &agent) {
                 continue;
             }
 
@@ -9853,7 +9920,7 @@ fn build_timeline(
             let inception_ts: i64 = row.get_named("inception_ts").unwrap_or(0);
             let program: String = row.get_named("program").unwrap_or_default();
 
-            if source_filter.is_some() && source_filter != Some(name.as_str()) {
+            if !timeline_source_matches(source_filter, &name) {
                 continue;
             }
 
@@ -12459,6 +12526,12 @@ fn build_navigate_file_reservations(
     let active_only = query
         .get("active_only")
         .is_none_or(|value| parse_resource_bool(Some(value)));
+    let limit = parse_resource_limit(query.get("limit"), 50);
+    let offset = query
+        .get("offset")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let now = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
     let release_ledger = release_ledger_index(conn, has_release_ledger)?;
@@ -12491,23 +12564,37 @@ fn build_navigate_file_reservations(
                  FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ?
-                 ORDER BY fr.created_ts DESC LIMIT 50"
+                 ORDER BY fr.created_ts DESC LIMIT ? OFFSET ?"
             ),
-            vec![Value::BigInt(project_id)],
+            vec![
+                Value::BigInt(project_id),
+                Value::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)),
+                Value::BigInt(i64::try_from(offset).unwrap_or(i64::MAX)),
+            ],
         )
     };
     let rows = conn
         .query_sync(&sql, &params)
         .map_err(|e| CliError::Other(format!("navigate reservations query failed: {e}")))?;
 
+    // An active page excludes ledger-released and expired leases, as the
+    // resource does, and is paged after that filter.
+    let (skip, take) = if active_only {
+        (offset, limit)
+    } else {
+        (0, usize::MAX)
+    };
     let reservations: Vec<serde_json::Value> = rows
         .iter()
         .filter(|r| {
             !(active_only
-                && r.get_as::<i64>(6)
-                    .is_ok_and(|id| release_ledger.contains(id)))
+                && (r
+                    .get_as::<i64>(6)
+                    .is_ok_and(|id| release_ledger.contains(id))
+                    || r.get_as::<i64>(3).is_ok_and(|expires_ts| expires_ts <= now)))
         })
-        .take(50)
+        .skip(skip)
+        .take(take)
         .map(|r| {
             let legacy_released_ts = r
                 .get_as::<sqlmodel_core::Value>(4)
@@ -14130,7 +14217,9 @@ fn build_atc_data(
                 limit,
             )
         }),
-        privacy,
+        // The privacy report is an audit, not part of the compact view; the
+        // one-line canary verdict stays because it is a health signal.
+        privacy: privacy.filter(|_| !summary_only),
     }
 }
 
@@ -16491,7 +16580,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Navigate { uri } => {
             let (result, resolved_project) = if navigate_should_use_canonical_resource(&uri) {
-                build_navigate_from_canonical_resource(&uri, args.project.as_deref())?
+                // Same fallback as every other robot verb: --project, then
+                // AGENT_MAIL_PROJECT, then the working directory.
+                let default_project = robot_server_project_key(args.project.as_deref()).ok();
+                build_navigate_from_canonical_resource(&uri, default_project.as_deref())?
             } else if let Some(result) = build_navigate_without_db(&uri)? {
                 result
             } else {
@@ -16589,8 +16681,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let maybe_scope =
                 maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
             // ATC experiences live in the sidecar (br-bvq1x.11.7); the privacy
-            // report reads them from there. No sidecar => no report.
-            let privacy_report = maybe_scope.as_ref().and_then(|_scope| {
+            // report reads them from there. No sidecar => no report, and the
+            // summary-only view never shows it.
+            let privacy_scope = maybe_scope.as_ref().filter(|_| !summary_only);
+            let privacy_report = privacy_scope.and_then(|_scope| {
                 let atc_conn = open_local_atc_sidecar_conn()?;
                 match atc_privacy_report_from_conn(&atc_conn) {
                     Ok(report) => Some(report),
@@ -18274,12 +18368,31 @@ mod tests {
             Some("1970-01-01T00:00:02Z"),
             Some("liveness:probe:0"),
             None,
-            None,
+            Some(atc_privacy_report_unavailable()),
             true,
             5,
         );
 
         assert!(data.summary.is_some(), "summary-only should keep summary");
+        assert!(
+            data.privacy.is_none(),
+            "summary-only should drop the privacy report"
+        );
+        let full = build_atc_data(
+            sample_atc_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            Some(atc_privacy_report_unavailable()),
+            false,
+            5,
+        );
+        assert!(
+            full.privacy.is_some(),
+            "the full view keeps the privacy report"
+        );
         assert!(
             data.decisions.is_none(),
             "summary-only should suppress decisions"
@@ -18885,8 +18998,19 @@ mod tests {
         assert_eq!(v["_actions"][0], "am mail ack 1");
     }
 
+    fn window_flags(window: &serde_json::Value) -> (bool, bool, bool, i64) {
+        (
+            window["urgent_only"].as_bool().expect("urgent_only"),
+            window["unread_only"].as_bool().expect("unread_only"),
+            window["ack_overdue_only"]
+                .as_bool()
+                .expect("ack_overdue_only"),
+            window["limit"].as_i64().expect("limit"),
+        )
+    }
+
     #[test]
-    fn robot_inbox_server_arguments_preserve_robot_filter_precedence() {
+    fn robot_inbox_server_windows_preserve_robot_filter_precedence() {
         let default_request = RobotInboxServerRequest {
             project_key: "/tmp/demo".into(),
             agent_name: "BlueLake".into(),
@@ -18897,11 +19021,20 @@ mod tests {
             limit: 20,
             include_bodies: false,
         };
-        let default_args = robot_inbox_server_arguments(&default_request);
-        assert_eq!(default_args["unread_only"], true);
-        assert_eq!(default_args["ack_overdue_only"], false);
+        let window = i64::try_from(ROBOT_INBOX_SERVER_WINDOW).expect("window fits");
+        let default_windows = robot_inbox_server_windows(&default_request);
+        // Unread plus overdue acknowledgements, each whole, so the priority
+        // sort runs over every candidate before `--limit` trims.
+        assert_eq!(
+            default_windows.iter().map(window_flags).collect::<Vec<_>>(),
+            vec![(false, true, false, window), (false, false, true, window)]
+        );
         // Listing must never consume unread state (GH#229).
-        assert_eq!(default_args["mark_read"], false);
+        assert!(
+            default_windows
+                .iter()
+                .all(|args| args["mark_read"] == false)
+        );
 
         let urgent_request = RobotInboxServerRequest {
             urgent: true,
@@ -18909,10 +19042,13 @@ mod tests {
             unread: false,
             ..default_request.clone()
         };
-        let urgent_args = robot_inbox_server_arguments(&urgent_request);
-        assert_eq!(urgent_args["urgent_only"], true);
-        assert_eq!(urgent_args["unread_only"], true);
-        assert_eq!(urgent_args["ack_overdue_only"], false);
+        assert_eq!(
+            robot_inbox_server_windows(&urgent_request)
+                .iter()
+                .map(window_flags)
+                .collect::<Vec<_>>(),
+            vec![(true, true, false, 20)]
+        );
 
         let overdue_request = RobotInboxServerRequest {
             urgent: false,
@@ -18920,19 +19056,86 @@ mod tests {
             unread: false,
             ..default_request.clone()
         };
-        let overdue_args = robot_inbox_server_arguments(&overdue_request);
-        assert_eq!(overdue_args["unread_only"], false);
-        assert_eq!(overdue_args["ack_overdue_only"], true);
+        assert_eq!(
+            robot_inbox_server_windows(&overdue_request)
+                .iter()
+                .map(window_flags)
+                .collect::<Vec<_>>(),
+            vec![(false, false, true, window)]
+        );
 
         let all_request = RobotInboxServerRequest {
             unread: false,
             all: true,
+            limit: 0,
             ..default_request
         };
-        let all_args = robot_inbox_server_arguments(&all_request);
-        assert_eq!(all_args["unread_only"], false);
-        assert_eq!(all_args["ack_overdue_only"], false);
-        assert_eq!(all_args["mark_read"], false);
+        let all_windows = robot_inbox_server_windows(&all_request);
+        assert_eq!(
+            all_windows.iter().map(window_flags).collect::<Vec<_>>(),
+            vec![
+                (false, true, false, window),
+                (false, false, true, window),
+                // The server refuses limit 0; the view trims to 0 afterwards.
+                (false, false, false, 1),
+            ]
+        );
+        assert!(all_windows.iter().all(|args| args["mark_read"] == false));
+    }
+
+    #[test]
+    fn robot_inbox_server_ranks_an_old_urgent_message_past_newer_unread_mail() {
+        let now = mcp_agent_mail_db::now_micros();
+        let row = |id: i64, importance: &str, age_minutes: i64| {
+            serde_json::json!({
+                "id": id,
+                "subject": format!("message {id}"),
+                "from": "GreenCastle",
+                "importance": importance,
+                "ack_required": false,
+                "created_ts": mcp_agent_mail_db::micros_to_iso(now - age_minutes * 60_000_000),
+                "thread_id": "t",
+                "kind": "to"
+            })
+        };
+        // The unread window holds three newer normal messages and the old
+        // urgent one; the overdue window repeats one of them.
+        let unread_window = serde_json::json!([
+            row(4, "normal", 1),
+            row(3, "normal", 2),
+            row(2, "normal", 3),
+            row(1, "urgent", 120),
+        ]);
+        let overdue_window = serde_json::json!({ "messages": [row(3, "normal", 2)] });
+        let merged =
+            merge_server_inbox_windows(&[unread_window, overdue_window]).expect("merge windows");
+        assert_eq!(merged.as_array().map(Vec::len), Some(4));
+
+        let request = RobotInboxServerRequest {
+            project_key: "/tmp/demo".into(),
+            agent_name: "BlueLake".into(),
+            urgent: false,
+            ack_overdue: false,
+            unread: true,
+            all: false,
+            limit: 2,
+            include_bodies: false,
+        };
+        let result = build_inbox_from_server_payload(&merged, &request).expect("server inbox");
+        let ids = result
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 4]);
+
+        let error = merge_server_inbox_windows(&[serde_json::json!({ "unexpected": true })])
+            .expect_err("a window without rows is not an empty inbox");
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected fetch_inbox response shape")
+        );
     }
 
     #[test]
@@ -19005,10 +19208,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![1, 3, 2]);
         assert_eq!(result.entries[0].priority, "urgent");
+        // Urgent unread mail keeps its rank but still reports the overdue ack.
+        assert_eq!(result.entries[0].ack_status, "overdue");
         assert_eq!(result.entries[1].priority, "ack-overdue");
         assert_eq!(result.entries[1].ack_status, "overdue");
         assert_eq!(result.alerts.len(), 1);
+        assert!(result.alerts[0].1.contains("#1, #3"));
 
+        // `--ack-overdue` lists every overdue acknowledgement, the urgent one
+        // included, matching the count `robot status` reports; the acked
+        // message stays out.
         let overdue_request = RobotInboxServerRequest {
             ack_overdue: true,
             unread: false,
@@ -19016,8 +19225,12 @@ mod tests {
         };
         let overdue =
             build_inbox_from_server_payload(&payload, &overdue_request).expect("overdue inbox");
-        assert_eq!(overdue.entries.len(), 1);
-        assert_eq!(overdue.entries[0].id, 3);
+        let overdue_ids = overdue
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(overdue_ids, vec![1, 3]);
     }
 
     #[test]
@@ -22041,12 +22254,13 @@ mod tests {
             &empty,
         )
         .expect("insert agent");
+        // A live lease (expires in 2100): navigate lists only unexpired ones.
         conn.query_sync(
             "INSERT INTO file_reservations (
                 id, project_id, agent_id, path_pattern, \"exclusive\",
                 reason, created_ts, expires_ts, released_ts
              ) VALUES (
-                1, 1, 1, 'src/**', 1, 'test', 1000, 2000, NULL
+                1, 1, 1, 'src/**', 1, 'test', 1000, 4102444800000000, NULL
              )",
             &empty,
         )
@@ -22517,6 +22731,52 @@ mod tests {
             other => panic!("unexpected active-only reservations result: {other:?}"),
         }
         assert_eq!(active_scope.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn test_build_navigate_active_reservations_skip_expired_leases_and_page() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now = mcp_agent_mail_db::now_micros();
+        let live = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now + 3_600_000_000);
+        let lapsed = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now - 3_600_000_000);
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'lapsed/**', 1, 'a', 10, ?, NULL),
+                (2, 1, 1, 'one/**', 1, 'b', 20, ?, NULL),
+                (3, 1, 2, 'two/**', 1, 'c', 30, ?, NULL),
+                (4, 1, 3, 'three/**', 1, 'd', 40, ?, NULL)",
+            &[lapsed, live.clone(), live.clone(), live],
+        )
+        .expect("insert reservations");
+        let paths = |uri: &str| {
+            let (result, _) =
+                build_navigate(&conn, uri, 1, "proj", None).expect("navigate reservations");
+            let NavigateResult::Generic { data, .. } = result else {
+                panic!("unexpected reservations result: {result:?}");
+            };
+            data["reservations"]
+                .as_array()
+                .expect("reservations array")
+                .iter()
+                .map(|row| row["path"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Newest first; the lease that expired an hour ago is not active.
+        assert_eq!(
+            paths("resource://file_reservations/proj"),
+            vec!["three/**", "two/**", "one/**"]
+        );
+        assert_eq!(
+            paths("resource://file_reservations/proj?limit=1&offset=1"),
+            vec!["two/**"]
+        );
+        assert_eq!(
+            paths("resource://file_reservations/proj?active_only=false&limit=2&offset=2"),
+            vec!["one/**", "lapsed/**"]
+        );
     }
 
     #[test]
@@ -24233,6 +24493,106 @@ mod tests {
         )
         .expect("build full inbox");
         assert_eq!(full.entries[0].body_md.as_deref(), Some("inbox body"));
+    }
+
+    #[test]
+    fn test_build_timeline_source_filter_ignores_case() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let recent = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+            mcp_agent_mail_db::now_micros() - 60_000_000,
+        );
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (140, 1, 1, 'From Alice', 'T', 'normal', 0, ?, 'b', '[]'),
+                    (141, 1, 2, 'From Bob', 'T', 'normal', 0, ?, 'b', '[]')",
+            &[recent.clone(), recent],
+        )
+        .expect("insert timeline messages");
+
+        let bob =
+            build_timeline(&conn, 1, None, Some("message"), Some("bob")).expect("bob timeline");
+        assert_eq!(
+            bob.iter()
+                .map(|event| event.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Bob"]
+        );
+        let everyone =
+            build_timeline(&conn, 1, None, Some("message"), None).expect("project timeline");
+        assert_eq!(everyone.len(), 2);
+        assert!(
+            build_timeline(&conn, 1, None, Some("message"), Some("Dave"))
+                .expect("unknown source")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_build_inbox_ack_overdue_includes_urgent_unread_mail() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        // All three are hours old. 130: urgent, unread, ack overdue.
+        // 131: read, ack overdue. 132: read and acknowledged.
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (130, 1, 1, 'Urgent overdue', 'OVERDUE', 'urgent', 1, 10, 'b', '[]'),
+                    (131, 1, 1, 'Read overdue', 'OVERDUE', 'normal', 1, 20, 'b', '[]'),
+                    (132, 1, 1, 'Acked', 'OVERDUE', 'normal', 1, 30, 'b', '[]')",
+            &[],
+        )
+        .expect("insert inbox messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (130, 2, 'to', NULL, NULL),
+                    (131, 2, 'to', 40, NULL),
+                    (132, 2, 'to', 40, 50)",
+            &[],
+        )
+        .expect("insert inbox recipients");
+
+        let overdue = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, true, false, false, 20, false,
+        )
+        .expect("build overdue inbox");
+        let ids = overdue
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![130, 131]);
+        assert_eq!(overdue.entries[0].priority, "urgent");
+        assert_eq!(overdue.entries[0].ack_status, "overdue");
+        assert_eq!(overdue.entries[1].ack_status, "overdue");
+        assert_eq!(overdue.alerts.len(), 1);
+        assert!(overdue.alerts[0].1.contains("#130, #131"));
+
+        // `--urgent` still lists only the unread urgent message, and the
+        // default view keeps the read-but-overdue message.
+        let default_view = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build default inbox");
+        assert_eq!(
+            default_view
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![130, 131]
+        );
+        let urgent = build_inbox(
+            &conn, 1, "proj", 2, "Bob", true, false, false, false, 20, false,
+        )
+        .expect("build urgent inbox");
+        assert_eq!(
+            urgent
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![130]
+        );
     }
 
     #[test]
@@ -26232,6 +26592,65 @@ mod tests {
     }
 
     #[test]
+    fn build_reservations_conflicts_view_keeps_the_expiring_set() {
+        // The documented pre-edit check is `--conflicts --expiring 30`.
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let soon = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 20 * 60_000_000);
+        let later = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000);
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 2, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 1, 'docs/**', 1, 'b', 0, ?, NULL)",
+            &[soon, later],
+        )
+        .expect("insert reservations");
+
+        let (data, actions) = build_reservations(
+            &conn,
+            1,
+            "proj",
+            Some((2, "Bob".to_string())),
+            false,
+            true,
+            Some(30),
+        )
+        .expect("build reservations");
+        assert_eq!(
+            data.expiring_soon
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/auth/**"]
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("renew") && action.contains("src/auth/**")),
+            "{actions:?}"
+        );
+
+        // A shorter window leaves the 20-minute lease out.
+        let (narrow, _actions) = build_reservations(
+            &conn,
+            1,
+            "proj",
+            Some((2, "Bob".to_string())),
+            false,
+            true,
+            Some(10),
+        )
+        .expect("build reservations");
+        assert!(
+            narrow.expiring_soon.is_empty(),
+            "{:?}",
+            narrow.expiring_soon
+        );
+    }
+
+    #[test]
     fn build_reservations_omits_playbooks_when_conflict_free() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
@@ -26664,6 +27083,22 @@ mod tests {
         assert!(
             matches!(err, CliError::InvalidArgument(msg) if msg.contains("invalid importance filter"))
         );
+
+        // A list is accepted, as on the server route, and each entry is checked.
+        build_search(
+            &conn,
+            &pool,
+            1,
+            "auth",
+            None,
+            Some("high, urgent"),
+            None,
+            20,
+        )
+        .expect("an importance list searches");
+        let err = build_search(&conn, &pool, 1, "auth", None, Some("high,bogus"), None, 20)
+            .expect_err("one bad entry fails the list");
+        assert!(matches!(err, CliError::InvalidArgument(msg) if msg.ends_with(": bogus")));
     }
 
     #[test]

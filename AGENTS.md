@@ -770,7 +770,7 @@ Use it when you need structured snapshots quickly (especially in automated loops
 |---------|---------|----------|
 | `am robot status` | Dashboard synthesis across health, inbox, activity, reservations, top threads | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
-| `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
+| `am robot timeline` | Project event stream (last 24h unless `--since`) | `--since`, `--kind`, `--source` |
 | `am robot overview` | Cross-project summary of actionable state | `--format`, `--project`, `--agent`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
@@ -791,29 +791,43 @@ Use it when you need structured snapshots quickly (especially in automated loops
 #### Output Formats
 
 - `toon` (default at TTY): token-efficient, compact, optimized for agent parsing.
-- `json` (default when piped): strict machine-readable envelope with `_meta`, `_alerts`, `_actions`.
-- `md` (thread/message-focused): human-readable narrative output for deep context.
+- `json` (default when piped): strict machine-readable envelope with `_meta`, `_alerts`, `_actions`; the command's fields sit beside them at the top level.
+- `md` (`thread` and `message` only, and their default even when piped): human-readable narrative output for deep context. Pass `--format json` to pipe them into `jq`.
 
-Example (`toon`, truncated):
+Example (`am robot status`, `toon`, truncated; from `tests/golden/cli/robot/status/`):
 ```text
-_meta{command,format}: status,toon
-health{status,db}: ok,connected
-inbox_summary{total,urgent,ack_overdue}: 12,2,1
+_meta:
+  command: robot status
+  format: toon
+  project: /workspace/project-alpha
+  agent: RedFox
+_actions[1]: am robot inbox --urgent
+health: ok
+unread: 2
+urgent: 1
+ack_required: 1
+ack_overdue: 0
+active_reservations: 1
 ```
 
-Example (`json`, truncated):
+Example (same, `json`, truncated):
 ```json
 {
-  "_meta": { "command": "status", "format": "json" },
-  "health": { "status": "ok" },
-  "inbox_summary": { "total": 12, "urgent": 2, "ack_overdue": 1 }
+  "_meta": { "command": "robot status", "format": "json", "agent": "RedFox" },
+  "_actions": ["am robot inbox --urgent"],
+  "health": "ok",
+  "unread": 2,
+  "urgent": 1,
+  "ack_overdue": 0
 }
 ```
 
-Example (`md`, thread):
+Example (`am robot thread`, `md`):
 ```markdown
-# Thread: br-123 — Reservation conflict triage
-**Messages**: 4 | **Participants**: 3 | **Last activity**: 2026-02-16T16:33:00Z
+# Thread: robot thread br-robot-golden
+
+## [1] BlueLake → RedFox (3m)
+**Start robot golden thread**
 ```
 
 #### Agent Workflow Recipes

@@ -165,7 +165,7 @@ print((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec='sec
 PY
 )"
 
-am robot timeline --project "$PROJECT" --agent "$AGENT" --since "$SINCE" --format toon
+am robot timeline --project "$PROJECT" --source "$AGENT" --since "$SINCE" --format toon
 am robot analytics --project "$PROJECT" --agent "$AGENT" --format toon
 ```
 

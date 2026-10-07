@@ -847,7 +847,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 |---------|---------|-----------|
 | `am robot status` | Dashboard synthesis | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
-| `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
+| `am robot timeline` | Project event stream (last 24h unless `--since`) | `--since`, `--kind`, `--source` |
 | `am robot overview` | Cross-project summary | `--format`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
