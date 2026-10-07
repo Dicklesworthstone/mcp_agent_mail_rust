@@ -11963,7 +11963,14 @@ fn median_micros(values: &mut [u64]) -> u64 {
 
 // ── Contacts command implementation ─────────────────────────────────────────
 
-fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, CliError> {
+/// Contact links touching the project: requests its agents made and requests
+/// made to them from other projects (stored under the requester's project).
+/// `agent` narrows to links where that agent is either side.
+fn build_contacts(
+    conn: &DbConn,
+    project_id: i64,
+    agent: Option<&str>,
+) -> Result<Vec<ContactRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
 
     let rows = conn
@@ -11975,9 +11982,9 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
              FROM agent_links al
              LEFT JOIN agents a1 ON a1.id = al.a_agent_id
              LEFT JOIN agents a2 ON a2.id = al.b_agent_id
-             WHERE al.a_project_id = ?
+             WHERE al.a_project_id = ? OR al.b_project_id = ?
              ORDER BY al.updated_ts DESC",
-            &[Value::BigInt(project_id)],
+            &[Value::BigInt(project_id), Value::BigInt(project_id)],
         )
         .map_err(|e| CliError::Other(format!("contacts query: {e}")))?;
 
@@ -11985,6 +11992,11 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
     for row in &rows {
         let from: String = row.get_named("from_agent").unwrap_or_default();
         let to: String = row.get_named("to_agent").unwrap_or_default();
+        if agent.is_some_and(|agent| {
+            !agent.eq_ignore_ascii_case(&from) && !agent.eq_ignore_ascii_case(&to)
+        }) {
+            continue;
+        }
         let status: String = row.get_named("status").unwrap_or_default();
         let from_policy: String = row.get_named("from_policy").unwrap_or_default();
         let reason: String = row.get_named("reason").unwrap_or_default();
@@ -16524,7 +16536,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Contacts => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;
-            let contacts = build_contacts(scope.conn(), scope.project_id)?;
+            // Only an explicit --agent narrows the graph; an AGENT_NAME in the
+            // environment does not hide the rest of the project's links.
+            let agent = args
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|a| !a.is_empty());
+            let contacts = build_contacts(scope.conn(), scope.project_id, agent)?;
 
             #[derive(Serialize)]
             struct ContactsData {
@@ -16535,6 +16554,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let count = contacts.len();
             let mut env = RobotEnvelope::new(cmd_name, format, ContactsData { count, contacts });
             env._meta.project = Some(scope.project_slug);
+            env._meta.agent = agent.map(str::to_string);
             format_output(&env, format)?
         }
         RobotSubcommand::Projects => {
@@ -20122,12 +20142,65 @@ mod tests {
         conn.query_sync("DELETE FROM agents WHERE id = 2", &[])
             .expect("delete counterparty agent row");
 
-        let contacts = build_contacts(&conn, 1).expect("build contacts");
+        let contacts = build_contacts(&conn, 1, None).expect("build contacts");
 
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].from, "Alice");
         assert_eq!(contacts[0].to, "[unknown-agent-2]");
         assert_eq!(contacts[0].policy, "unknown");
+    }
+
+    #[test]
+    fn build_contacts_lists_incoming_cross_project_requests_and_narrows_by_agent() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let ts = mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us);
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0)",
+            &[],
+        )
+        .expect("insert other project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (9, 2, 'Zed', 'codex-cli', 'gpt-5', 0, 0)",
+            &[],
+        )
+        .expect("insert other-project agent");
+        // Zed (project 2) asked Bob (project 1); the link lives under project 2.
+        // Alice asked Carol inside project 1.
+        conn.query_sync(
+            "INSERT INTO agent_links
+             (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)
+             VALUES (1, 2, 9, 1, 2, 'pending', 'cross', ?1, ?1, ?1),
+                    (2, 1, 1, 1, 3, 'approved', 'local', ?1, ?1, ?1)",
+            &[ts],
+        )
+        .expect("insert links");
+
+        let pairs = |agent: Option<&str>| {
+            build_contacts(&conn, 1, agent)
+                .expect("build contacts")
+                .into_iter()
+                .map(|row| format!("{}->{}", row.from, row.to))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            pairs(None),
+            ["Alice->Carol", "Zed->Bob"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            pairs(Some("bob")),
+            std::iter::once("Zed->Bob".to_string()).collect()
+        );
+        // Project 2's own view still sees the request it made.
+        assert_eq!(
+            build_contacts(&conn, 2, None).expect("other project").len(),
+            1
+        );
     }
 
     #[test]

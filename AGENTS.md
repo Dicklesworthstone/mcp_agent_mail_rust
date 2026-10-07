@@ -771,19 +771,19 @@ Use it when you need structured snapshots quickly (especially in automated loops
 | `am robot status` | Dashboard synthesis across health, inbox, activity, reservations, top threads | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
 | `am robot timeline` | Project event stream (last 24h unless `--since`) | `--since`, `--kind`, `--source` |
-| `am robot overview` | Cross-project summary of actionable state | `--format`, `--project`, `--agent`, `--counts` |
+| `am robot overview` | Cross-project summary of actionable state (every project; `--project`/`--agent` do not scope it) | `--format`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
-| `am robot message <id>` | Single-message deep view with context | `--format`, `--project`, `--agent` |
+| `am robot message <id>` | Single-message deep view with context | `--format`, `--project` |
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness | `--all`, `--conflicts`, `--expiring`, `--agent` |
-| `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics synthesis | `--format`, `--project`, `--agent`, `--include-host` |
+| `am robot metrics` | Tool call rates, failures, latency percentiles (server-wide) | `--format` |
+| `am robot health` | Runtime/system diagnostics synthesis (server-wide) | `--format`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
-| `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
-| `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
-| `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
+| `am robot contacts` | Contact graph (incoming cross-project requests included) and policy surface | `--format`, `--project`, `--agent` (links on either side) |
+| `am robot projects` | Per-project aggregate stats (every project) | `--format` |
+| `am robot attachments` | Attachment inventory | `--format`, `--project` |
 | `am robot atc` | Live ATC snapshot over `/mail/ws-state` with local SQLite fallback | `--since`, `--stratum`, `--summary-only`, `--limit` |
 | `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
 | `am robot tui-dump` (alias of `am tui-dump`) | TUI freeze escape hatch: the live situational snapshot the TUI renders, never interactive | `--format` |

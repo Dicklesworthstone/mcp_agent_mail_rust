@@ -854,16 +854,16 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot overview` | Cross-project summary | `--format`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
-| `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |
+| `am robot message <id>` | Single-message deep view | `--format`, `--project` |
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness; JSON entries carry absolute `granted_ts`/`expires_ts` (RFC 3339 UTC) and integer `remaining_seconds`/`granted_age_seconds` next to the humanized `remaining` | `--all`, `--conflicts`, `--expiring`, `--agent` |
-| `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent`, `--include-host` |
+| `am robot metrics` | Tool call rates, failures, latency percentiles (server-wide) | `--format` |
+| `am robot health` | Runtime/system diagnostics (server-wide) | `--format`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
-| `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
-| `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
-| `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
+| `am robot contacts` | Contact graph (incoming cross-project requests included) and policy surface | `--format`, `--project`, `--agent` (links on either side) |
+| `am robot projects` | Per-project aggregate stats (every project) | `--format` |
+| `am robot attachments` | Attachment inventory | `--format`, `--project` |
 | `am robot atc` | Live ATC snapshot with local DB fallback when the server is unavailable | `--since`, `--stratum`, `--summary-only`, `--limit` |
 | `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
 | `am robot tui-dump` | TUI freeze escape hatch (alias of `am tui-dump`): the situational snapshot the TUI renders, fetched live or from local SQLite | `--format` |
