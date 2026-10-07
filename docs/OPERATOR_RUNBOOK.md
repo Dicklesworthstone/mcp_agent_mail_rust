@@ -145,7 +145,7 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 - Timeline: `V` cycles Events/Commits/Combined/Log; lowercase `v` toggles visual selection mode.
 - Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
 - Contacts: `n` cycles Table/Graph/Matrix (sender × recipient heatmap of recent message flow); `g` toggles Mermaid panel.
-- Reservations: `n` opens create-reservation form.
+- Reservations: `n` opens create-reservation form. "View reservations" on an agent narrows the table to that agent; `X` shows every agent again.
 - ATC: `d` opens decision detail; `r` opens the retention report.
 
 ## 4. Screens Reference

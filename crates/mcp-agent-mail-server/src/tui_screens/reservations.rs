@@ -320,6 +320,9 @@ pub struct ReservationsScreen {
     sort_col: usize,
     sort_asc: bool,
     show_released: bool,
+    /// Agent the table is narrowed to ("View reservations" on an agent);
+    /// `X` clears it.
+    agent_filter: Option<String>,
     last_seq: u64,
     /// Timestamp of the last DB snapshot consumed by this screen.
     last_snapshot_micros: i64,
@@ -378,6 +381,7 @@ impl ReservationsScreen {
             sort_col: COL_TTL,
             sort_asc: true,
             show_released: false,
+            agent_filter: None,
             last_seq: 0,
             last_snapshot_micros: 0,
             empty_snapshot_streak: 0,
@@ -673,6 +677,7 @@ impl ReservationsScreen {
             .reservations
             .iter()
             .filter(|(_, r)| show_released || !r.released)
+            .filter(|(_, r)| self.agent_filter.as_ref().is_none_or(|a| r.agent == *a))
             .collect();
 
         entries.sort_by(|(ka, a), (kb, b)| {
@@ -1105,6 +1110,9 @@ impl ReservationsScreen {
         values.insert("sort_col".to_string(), self.sort_col.to_string());
         values.insert("sort_asc".to_string(), self.sort_asc.to_string());
         values.insert("show_released".to_string(), self.show_released.to_string());
+        if let Some(agent) = &self.agent_filter {
+            values.insert("agent".to_string(), agent.clone());
+        }
         values
     }
 
@@ -1150,6 +1158,9 @@ impl ReservationsScreen {
                 "1" | "true" | "yes" | "on"
             );
         }
+        // A preset is the whole filter state: one saved without an agent
+        // shows every agent.
+        self.agent_filter = values.get("agent").cloned();
         self.rebuild_sorted();
     }
 
@@ -1596,6 +1607,10 @@ impl MailScreen for ReservationsScreen {
                     self.show_released = !self.show_released;
                     self.rebuild_sorted();
                 }
+                KeyCode::Char('X') if self.agent_filter.is_some() => {
+                    self.agent_filter = None;
+                    self.rebuild_sorted();
+                }
                 KeyCode::Char('n') => self.open_create_form(),
                 KeyCode::Char('i') => {
                     self.detail_visible = !self.detail_visible;
@@ -1680,8 +1695,11 @@ impl MailScreen for ReservationsScreen {
                 screen: "reservations".to_string(),
                 scope: "file_reservations.list".to_string(),
                 query_params: format!(
-                    "show_released={};sort_col={};sort_asc={};active={};exclusive={};shared={};expired={}",
-                    self.show_released, self.sort_col, self.sort_asc,
+                    "show_released={};agent={};sort_col={};sort_asc={};active={};exclusive={};shared={};expired={}",
+                    self.show_released,
+                    self.agent_filter.as_deref().unwrap_or("all"),
+                    self.sort_col,
+                    self.sort_asc,
                     a, e, s, x,
                 ),
                 raw_count,
@@ -1828,8 +1846,14 @@ impl MailScreen for ReservationsScreen {
         } else {
             format!("  selected:{}", self.selected_reservation_keys.len())
         };
+        // The filter leads the line: with the detail panel open the table
+        // column is too narrow for the tail of it.
+        let agent_label = self
+            .agent_filter
+            .as_ref()
+            .map_or_else(String::new, |agent| format!(" Agent: {agent} (X clears) ·"));
         let summary_base = format!(
-            " {active} active  {exclusive} exclusive  {shared} shared{selected_label}   Sort: {sort_label}{sort_indicator} {released_label}",
+            "{agent_label} {active} active  {exclusive} exclusive  {shared} shared{selected_label}   Sort: {sort_label}{sort_indicator} {released_label}",
         );
         let critical_alert = if expired > 0 {
             format!("  CRITICAL: {expired} expired")
@@ -1981,7 +2005,9 @@ impl MailScreen for ReservationsScreen {
             .border_style(Style::default().fg(tp.panel_border));
         let inner = block.inner(table_area);
         let rows_empty = rows.is_empty();
-        let row_mismatch = rows_empty && !self.show_released && db_active_total > 0;
+        // Only an unfiltered view can contradict the DB total.
+        let row_mismatch =
+            rows_empty && !self.show_released && self.agent_filter.is_none() && db_active_total > 0;
 
         let table = Table::new(rows, col_widths)
             .header(header)
@@ -2027,11 +2053,17 @@ impl MailScreen for ReservationsScreen {
                         frame,
                     );
             } else {
-                let hint = if self.show_released {
+                let hint = if self.agent_filter.is_some() {
+                    "Press 'X' to show every agent's reservations."
+                } else if self.show_released {
                     "No reservations match current filters. Press 'x' to toggle released."
                 } else {
                     "Use `file_reservation_paths` to reserve files. Press 'r' to refresh."
                 };
+                let title = self.agent_filter.as_ref().map_or_else(
+                    || "No Active Reservations".to_string(),
+                    |agent| format!("No Reservations Held by {agent}"),
+                );
                 crate::tui_panel_helpers::render_empty_state(
                     frame,
                     Rect::new(
@@ -2041,7 +2073,7 @@ impl MailScreen for ReservationsScreen {
                         inner.height.saturating_sub(1),
                     ),
                     "\u{1f512}",
-                    "No Active Reservations",
+                    &title,
                     hint,
                 );
             }
@@ -2105,6 +2137,10 @@ impl MailScreen for ReservationsScreen {
                 action: "Toggle show released",
             },
             HelpEntry {
+                key: "X",
+                action: "Clear agent filter",
+            },
+            HelpEntry {
                 key: "n",
                 action: "Open create reservation form",
             },
@@ -2150,18 +2186,16 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::ReservationByAgent(agent) = target {
-            // Find the first reservation for this agent and select it
-            if let Some(pos) = self.sorted_keys.iter().position(|key| {
-                self.reservations
-                    .get(key)
-                    .is_some_and(|r| r.agent == *agent)
-            }) {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
-        }
-        false
+        let DeepLinkTarget::ReservationByAgent(agent) = target else {
+            return false;
+        };
+        // Narrow the table to this agent. An agent holding nothing gets an
+        // empty table that says so, not everyone else's reservations.
+        self.agent_filter = Some(agent.clone());
+        self.rebuild_sorted();
+        self.table_state.selected = (!self.sorted_keys.is_empty()).then_some(0);
+        self.detail_scroll = 0;
+        true
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -3830,42 +3864,102 @@ mod tests {
     }
 
     #[test]
-    fn deep_link_reservation_by_agent() {
+    fn deep_link_by_agent_filters_the_table_to_that_agent() {
         use crate::tui_screens::DeepLinkTarget;
 
         let state = test_state();
         let mut screen = ReservationsScreen::new();
+        for (agent, path) in [
+            ("BlueLake", "src/**/*.rs"),
+            ("RedStone", "tests/*.rs"),
+            ("BlueLake", "docs/**"),
+        ] {
+            let _ = state.push_event(MailEvent::reservation_granted(
+                agent,
+                vec![path.to_string()],
+                true,
+                3600,
+                "proj",
+            ));
+        }
+        assert!(screen.ingest_events(&state));
+        screen.rebuild_sorted();
+        let visible_agents = |screen: &ReservationsScreen| -> Vec<String> {
+            screen
+                .sorted_keys
+                .iter()
+                .map(|key| screen.reservations[key].agent.clone())
+                .collect()
+        };
+        assert_eq!(visible_agents(&screen).len(), 3);
 
-        // Add some reservations
+        assert!(screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("RedStone".into())));
+        // Only RedStone's row remains, not everyone's with the cursor moved.
+        assert_eq!(visible_agents(&screen), ["RedStone"]);
+        assert_eq!(screen.table_state.selected, Some(0));
+
+        // The filter survives later rebuilds (new events, sort changes).
         let _ = state.push_event(MailEvent::reservation_granted(
             "BlueLake",
-            vec!["src/**/*.rs".to_string()],
-            true,
-            3600,
-            "proj",
-        ));
-        let _ = state.push_event(MailEvent::reservation_granted(
-            "RedStone",
-            vec!["tests/*.rs".to_string()],
+            vec!["bench/**".to_string()],
             false,
-            1800,
+            600,
             "proj",
         ));
+        assert!(screen.ingest_events(&state));
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('s'))), &state);
+        assert_eq!(visible_agents(&screen), ["RedStone"]);
 
-        let changed = screen.ingest_events(&state);
-        assert!(changed);
-        screen.rebuild_sorted();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Agent: RedStone (X clears) · 4 active"),
+            "{text}"
+        );
 
-        // Deep-link to RedStone's reservation
-        let handled =
-            screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("RedStone".into()));
-        assert!(handled);
-        assert!(screen.table_state.selected.is_some());
+        // An agent holding nothing gets an empty table that says so, and no
+        // stale-poller warning even though the DB holds other agents' rows.
+        state.update_db_stats(DbStatSnapshot {
+            file_reservations: 4,
+            timestamp_micros: 1,
+            ..Default::default()
+        });
+        assert!(screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("Unknown".into())));
+        assert_eq!(screen.sorted_keys, [] as [String; 0]);
+        assert_eq!(screen.table_state.selected, None);
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("No Reservations Held by Unknown"), "{text}");
+        assert!(!text.contains("detail rows are unavailable"), "{text}");
 
-        // Deep-link to unknown agent
-        let handled =
-            screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("Unknown".into()));
-        assert!(!handled);
+        // X clears the filter and every agent's rows come back.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.agent_filter, None);
+        assert_eq!(visible_agents(&screen).len(), 4);
+    }
+
+    #[test]
+    fn filter_presets_carry_the_agent_filter() {
+        let mut screen = ReservationsScreen::new();
+        screen.agent_filter = Some("RedStone".to_string());
+        let with_agent = screen.snapshot_filter_values();
+        assert_eq!(
+            with_agent.get("agent").map(String::as_str),
+            Some("RedStone")
+        );
+
+        screen.agent_filter = None;
+        let without_agent = screen.snapshot_filter_values();
+        assert!(!without_agent.contains_key("agent"));
+
+        screen.apply_preset_values(&with_agent);
+        assert_eq!(screen.agent_filter.as_deref(), Some("RedStone"));
+        // Loading a preset saved without an agent shows every agent again.
+        screen.apply_preset_values(&without_agent);
+        assert_eq!(screen.agent_filter, None);
     }
 
     #[test]
