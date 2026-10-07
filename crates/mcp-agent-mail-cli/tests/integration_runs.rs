@@ -3487,6 +3487,55 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
 }
 
 #[test]
+fn agents_create_offline_validates_policy_and_mints_a_sender_token() {
+    let env = TestEnv::new();
+    let project_dir = env.tmp.path().join("create-proj");
+    std::fs::create_dir_all(&project_dir).expect("project dir");
+    let project_key = project_dir.display().to_string();
+    let create = |extra: &[&str]| {
+        let mut args = vec![
+            "agents",
+            "create",
+            "-p",
+            project_key.as_str(),
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        run_am(&env.base_env(), Some(env.tmp.path()), &args, None)
+    };
+
+    // No daemon answers (HTTP_PORT=1), so this is the local path; it must
+    // apply the tool's validation rather than write the row directly.
+    let bad = create(&["--attachments-policy", "bogus"]);
+    assert!(
+        !bad.status.success(),
+        "an invalid attachments policy must be refused offline too\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let out = create(&["-n", "BlueLake"]);
+    assert!(
+        out.status.success(),
+        "expected success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["name"], "BlueLake", "{value}");
+    assert!(
+        value["registration_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "an offline-created agent gets a sender token: {value}"
+    );
+}
+
+#[test]
 fn projects_adopt_dry_run_accepts_slug_identifiers() {
     let env = TestEnv::new();
     let (source_slug, target_slug, _source_key, _target_key) = seed_projects_for_adopt(&env, true);

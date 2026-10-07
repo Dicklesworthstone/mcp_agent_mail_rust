@@ -39966,6 +39966,11 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 ServerToolCall::Success(result) => {
                     let payload =
                         coerce_tool_result_json_or_error("create_agent_identity", result)?;
+                    persist_sender_identity_token_from_agent_payload(
+                        &server_config,
+                        &project_key,
+                        &payload,
+                    );
                     render_agent_payload(&payload, fmt);
                     return Ok(());
                 }
@@ -39986,51 +39991,47 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             }
 
             reject_local_registration_if_proof_gate_enabled("agents create")?;
+            let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(
+                &database_url,
+                Some(&server_config.storage_root),
+            )?;
             let ctx = context::AsyncCliContext::open()?;
-            let cx = mcp_agent_mail_server::runtime_request_cx(asupersync::Budget::INFINITE);
+            let cx = asupersync::Cx::current().ok_or_else(|| {
+                CliError::Other("agents create requires an active async context".into())
+            })?;
 
+            // As for `agents register`: keep the CLI's project resolution, then
+            // let the native tool validate the request, mint the registration
+            // token and archive the identity. Writing the row directly skipped
+            // the attachments-policy check and left an agent with no token, which
+            // can never send under the fail-closed send profile.
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-
-            let agent_name = name_hint
-                .map(|value| value.trim().to_string())
-                .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
-
-            let row = match mcp_agent_mail_db::queries::create_agent(
-                &cx,
-                &ctx.pool,
-                proj.id.unwrap_or(0),
-                &agent_name,
-                &program,
-                &model,
-                task.as_deref(),
-                Some(attachments_policy.as_str()),
+            let mcp_ctx = McpContext::new(cx, 1);
+            mcp_agent_mail_tools::identity::ensure_project(&mcp_ctx, proj.human_key.clone(), None)
+                .await
+                .map_err(mcp_error_to_cli_error)?;
+            let result = mcp_agent_mail_tools::identity::create_agent_identity(
+                &mcp_ctx,
+                proj.human_key,
+                program,
+                model,
+                name_hint,
+                task,
+                Some(attachments_policy),
+                None,
+                None,
+                None,
+                None,
             )
             .await
-            {
-                asupersync::Outcome::Ok(r) => r,
-                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
-                    return Err(CliError::InvalidArgument(format!(
-                        "agent name already exists in this project: {agent_name}"
-                    )));
-                }
-                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
-                    message,
-                    ..
-                }) => {
-                    return Err(CliError::InvalidArgument(message));
-                }
-                asupersync::Outcome::Err(e) => {
-                    return Err(CliError::Other(format!("create_agent failed: {e}")));
-                }
-                asupersync::Outcome::Cancelled(_) => {
-                    return Err(CliError::Other("request cancelled".into()));
-                }
-                asupersync::Outcome::Panicked(p) => {
-                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                }
-            };
-
-            render_agent_row(&row, fmt);
+            .map_err(mcp_error_to_cli_error)?;
+            let payload = parse_tool_json_payload("create_agent_identity", &result)?;
+            persist_sender_identity_token_from_agent_payload(
+                &server_config,
+                &project_key,
+                &payload,
+            );
+            render_agent_payload(&payload, fmt);
             Ok(())
         }
 
@@ -40592,11 +40593,6 @@ fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
         "contact_policy": a.contact_policy,
         "retired_at": a.retired_at.map(mcp_agent_mail_db::micros_to_iso),
     })
-}
-
-fn render_agent_row(row: &mcp_agent_mail_db::AgentRow, format: output::CliOutputFormat) {
-    let payload = agent_row_to_json(row);
-    render_agent_payload(&payload, format);
 }
 
 fn agent_payload_string(payload: &serde_json::Value, key: &str) -> String {
