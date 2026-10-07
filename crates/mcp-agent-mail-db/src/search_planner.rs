@@ -698,6 +698,107 @@ impl PlanMethod {
 
 use crate::queries::extract_like_terms;
 
+const SUBJECT_COLUMN: &[&str] = &["m.subject"];
+const BODY_COLUMN: &[&str] = &["m.body_md"];
+const SUBJECT_AND_BODY_COLUMNS: &[&str] = &["m.subject", "m.body_md"];
+
+/// One condition of a LIKE-planned text query: `needle` must appear (or,
+/// when `negated`, must not appear) in at least one of `columns`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LikeCondition {
+    needle: String,
+    columns: &'static [&'static str],
+    negated: bool,
+}
+
+/// The Query Help syntax the index honours, for the LIKE plan: `subject:` and
+/// `body:` prefixes, `"quoted phrases"`, `NOT x` / `-x`, `AND` (implicit) and
+/// a trailing `*` (a substring match already covers a prefix). Other words
+/// split on punctuation, as before, each its own condition. `OR` is not
+/// supported here and is dropped, as before.
+fn like_conditions(
+    text: &str,
+    default_columns: &'static [&'static str],
+    max_terms: usize,
+) -> Vec<LikeCondition> {
+    let mut conditions: Vec<LikeCondition> = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut negate_next = false;
+    while conditions.len() < max_terms {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        if chars.peek() == Some(&'-') {
+            chars.next();
+            negate_next = true;
+            continue;
+        }
+        let mut raw = String::new();
+        let mut in_quotes = false;
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() && !in_quotes {
+                break;
+            }
+            if c == '"' {
+                in_quotes = !in_quotes;
+            }
+            raw.push(c);
+            chars.next();
+        }
+        match raw.as_str() {
+            "NOT" => {
+                negate_next = true;
+                continue;
+            }
+            "AND" | "OR" | "NEAR" | "&&" | "||" => continue,
+            _ => {}
+        }
+        let negated = std::mem::take(&mut negate_next);
+        let (columns, value) = match raw.split_once(':') {
+            Some((field, value)) if field.eq_ignore_ascii_case("subject") => {
+                (SUBJECT_COLUMN, value)
+            }
+            Some((field, value))
+                if field.eq_ignore_ascii_case("body") || field.eq_ignore_ascii_case("body_md") =>
+            {
+                (BODY_COLUMN, value)
+            }
+            _ => (default_columns, raw.as_str()),
+        };
+        let needles: Vec<String> = if value.starts_with('"') {
+            let phrase = value
+                .trim_matches('"')
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![phrase]
+        } else {
+            extract_like_terms(value.trim_end_matches('*'), max_terms)
+        };
+        for needle in needles {
+            if needle.chars().count() < 2 || conditions.len() >= max_terms {
+                continue;
+            }
+            let condition = LikeCondition {
+                needle,
+                columns,
+                negated,
+            };
+            if !conditions.iter().any(|seen| {
+                seen.needle.eq_ignore_ascii_case(&condition.needle)
+                    && seen.columns == condition.columns
+                    && seen.negated == condition.negated
+            }) {
+                conditions.push(condition);
+            }
+        }
+    }
+    conditions
+}
+
 /// Plan a search query into SQL + params.
 ///
 /// This function does NOT execute the query — it produces a [`SearchPlan`]
@@ -807,28 +908,34 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     // The planner now only generates LIKE-based SQL for fallback.
     let (select_cols, mut from_clause, order_clause) = match method {
         PlanMethod::Like => {
-            let terms = extract_like_terms(&query.text, 5);
-            let columns: &[&str] = match query.text_fields {
-                TextFieldScope::SubjectAndBody => &["m.subject", "m.body_md"],
-                TextFieldScope::Subject => &["m.subject"],
-                TextFieldScope::Body => &["m.body_md"],
+            let default_columns = match query.text_fields {
+                TextFieldScope::SubjectAndBody => SUBJECT_AND_BODY_COLUMNS,
+                TextFieldScope::Subject => SUBJECT_COLUMN,
+                TextFieldScope::Body => BODY_COLUMN,
             };
             let mut like_parts = Vec::new();
-            for term in &terms {
-                let escaped = term
+            for condition in like_conditions(&query.text, default_columns, 5) {
+                let escaped = condition
+                    .needle
                     .replace('\\', "\\\\")
                     .replace('%', "\\%")
                     .replace('_', "\\_");
                 let pattern = format!("%{escaped}%");
-                let mut alternatives = Vec::with_capacity(columns.len());
-                for column in columns {
+                let mut alternatives = Vec::with_capacity(condition.columns.len());
+                for column in condition.columns {
                     alternatives.push(format!("{column} LIKE ? ESCAPE '\\'"));
                     params.push(PlanParam::Text(pattern.clone()));
                 }
-                like_parts.push(format!("({})", alternatives.join(" OR ")));
+                let any_column = format!("({})", alternatives.join(" OR "));
+                like_parts.push(if condition.negated {
+                    format!("NOT {any_column}")
+                } else {
+                    any_column
+                });
             }
-            let like_filter = like_parts.join(" AND ");
-            where_clauses.push(like_filter);
+            if !like_parts.is_empty() {
+                where_clauses.push(like_parts.join(" AND "));
+            }
 
             (
                 format!(
@@ -1532,6 +1639,62 @@ mod tests {
         assert!(plan.sql.contains("m.thread_id = ?"));
         assert!(!plan.sql.contains("m.id = ?"), "{}", plan.sql);
         assert!(plan.facets_applied.contains(&"thread_id".to_string()));
+    }
+
+    #[test]
+    fn like_conditions_honour_the_query_help_syntax() {
+        let both = SUBJECT_AND_BODY_COLUMNS;
+        let cond = |needle: &str, columns: &'static [&'static str], negated: bool| LikeCondition {
+            needle: needle.to_string(),
+            columns,
+            negated,
+        };
+        let parse = |text: &str| like_conditions(text, both, 5);
+
+        assert_eq!(
+            parse("error NOT timeout"),
+            [cond("error", both, false), cond("timeout", both, true)]
+        );
+        assert_eq!(parse("-timeout"), [cond("timeout", both, true)]);
+        assert_eq!(
+            parse("login AND security"),
+            [cond("login", both, false), cond("security", both, false)]
+        );
+        assert_eq!(
+            parse("subject:authentication"),
+            [cond("authentication", SUBJECT_COLUMN, false)]
+        );
+        assert_eq!(
+            parse("body:\"API  key\""),
+            [cond("API key", BODY_COLUMN, false)]
+        );
+        assert_eq!(
+            parse("\"exact phrase\" deploy*"),
+            [
+                cond("exact phrase", both, false),
+                cond("deploy", both, false)
+            ]
+        );
+        // The old flattening required the literal word "subject".
+        assert!(parse("subject:auth").iter().all(|c| c.needle != "subject"));
+        // The facet's columns are the default for unprefixed words.
+        assert_eq!(
+            like_conditions("auth", BODY_COLUMN, 5),
+            [cond("auth", BODY_COLUMN, false)]
+        );
+    }
+
+    #[test]
+    fn like_plan_negates_not_terms() {
+        let plan = plan_search(&SearchQuery::messages("error NOT timeout", 1));
+        assert!(
+            plan.sql.contains(
+                "(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\') AND \
+                 NOT (m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')"
+            ),
+            "{}",
+            plan.sql
+        );
     }
 
     #[test]

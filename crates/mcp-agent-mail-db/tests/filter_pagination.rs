@@ -574,6 +574,37 @@ fn filter_only_relevance_pages_newest_first() {
     assert_eq!(collected, ids, "newest first, every match once");
 }
 
+/// Newest/Oldest order runs on the SQL plan; its text match must honour the
+/// Query Help syntax rather than flatten it into required words.
+#[test]
+fn time_ordered_search_honours_query_syntax() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "like-syntax");
+    let aid = seed_agent(&pool, pid, "TealOtter");
+    let msg = |subject: &str, body: &str| {
+        create_msg(&pool, pid, aid, subject, body, "normal", None, false)
+    };
+    let error_only = msg("deploy error", "rollback started");
+    let _error_timeout = msg("deploy error", "the job hit a timeout");
+    let auth_subject = msg("authentication rework", "notes");
+    let _auth_body = msg("weekly notes", "authentication came up");
+    let phrase = msg("keys", "rotate the API key today");
+    let _split = msg("keys", "the API rotated; one key left");
+
+    let ids = |text: &str| {
+        let mut query = SearchQuery::messages(text, pid);
+        query.ranking = RankingMode::Recency;
+        let mut ids = result_ids(&search(&pool, &query));
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(ids("error NOT timeout"), vec![error_only]);
+    assert_eq!(ids("error -timeout"), vec![error_only]);
+    assert_eq!(ids("subject:authentication"), vec![auth_subject]);
+    assert_eq!(ids("body:\"API key\""), vec![phrase]);
+    assert_eq!(ids("\"API key\""), vec![phrase]);
+}
+
 /// A numeric thread id names its root message, which has no `thread_id` of
 /// its own: the filter must return it with its replies, as the thread view does.
 #[test]
