@@ -200,7 +200,12 @@ mod tests {
             explicitly_released.is_ok(),
             "repair waited for the owner's cleanup timeout"
         );
-        assert!(refused.unwrap().to_string().contains("publication fence busy"));
+        assert!(
+            refused
+                .unwrap()
+                .to_string()
+                .contains("publication fence busy")
+        );
         assert_eq!(after, before);
         assert_eq!(after_stamp, stamp);
         assert_eq!(still_held.thread, held.thread);
@@ -326,7 +331,12 @@ mod tests {
         let refused = try_begin_at(&Cx::for_testing(), root.path()).err();
         let observed = tracking();
         crate::ARCHIVE_MUTATION_DEPTH.with(|depth| depth.set(before.0));
-        assert!(refused.unwrap().to_string().contains("mutation nesting exhausted"));
+        assert!(
+            refused
+                .unwrap()
+                .to_string()
+                .contains("mutation nesting exhausted")
+        );
         assert_eq!(observed, (u32::MAX, before.1, before.2));
         assert_eq!(token(root.path()), stamp);
         assert!(crate::archive_publication_fence_holder().is_none());

@@ -486,8 +486,8 @@ fn publish_release(
 ) -> Result<bool, String> {
     // Do not retain the source's database writer lease behind a stalled
     // archive publisher. Contention is a deferral, not authority to bypass it.
-    let _mutation = repair_lock::try_begin_at(cx, &config.storage_root)
-        .map_err(|error| error.to_string())?;
+    let _mutation =
+        repair_lock::try_begin_at(cx, &config.storage_root).map_err(|error| error.to_string())?;
     let archive =
         crate::ensure_archive(config, &original.project_slug).map_err(|error| error.to_string())?;
     repair_lock::with_repair_lock(cx, &archive, || {
@@ -1823,7 +1823,10 @@ mod tests {
                 None
             };
             crate::flush_async_commits();
-            let epoch_path = config.storage_root.join(".git").join(crate::ARCHIVE_EPOCH_FILE_NAME);
+            let epoch_path = config
+                .storage_root
+                .join(".git")
+                .join(crate::ARCHIVE_EPOCH_FILE_NAME);
             let token_before = fs::read(&epoch_path).ok();
             let epoch_before = crate::archive_mutation_epoch();
             let active_before = crate::archive_mutations_active();
@@ -1853,7 +1856,11 @@ mod tests {
             let targeted = reconcile_released_reservation(cx, pool, config, &captured, "aabb");
             let mut cursor = ReservationReconcileCursor::default();
             let historical = reconcile_reservation_releases(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
             );
             let held_writers = active_writer_count();
             // The real DB promotion gate must be available even though an
@@ -1872,17 +1879,34 @@ mod tests {
             let source_during = read_source(cx, pool, 401).unwrap().unwrap();
             let _ = release_tx.send(());
             let explicitly_released = owner.join().unwrap();
-            assert!(explicitly_released.is_ok(), "repair waited for fence-owner expiry");
-            assert!(owner_still_held, "admission did not return while the fence was held");
+            assert!(
+                explicitly_released.is_ok(),
+                "repair waited for fence-owner expiry"
+            );
+            assert!(
+                owner_still_held,
+                "admission did not return while the fence was held"
+            );
             assert!(targeted.unwrap_err().contains("publication fence busy"));
             let report = historical.unwrap();
             assert_eq!(
-                (report.scanned, report.deferred, report.repaired, report.attempted),
+                (
+                    report.scanned,
+                    report.deferred,
+                    report.repaired,
+                    report.attempted
+                ),
                 (1, 1, 0, 0)
             );
-            assert!(cursor.history.ceiling.is_none(), "deferred finite round advanced");
+            assert!(
+                cursor.history.ceiling.is_none(),
+                "deferred finite round advanced"
+            );
             assert_eq!(held_writers, 0);
-            assert!(promotion_available, "archive contention retained a database writer");
+            assert!(
+                promotion_available,
+                "archive contention retained a database writer"
+            );
             assert_eq!(during, before);
             assert_eq!(token_during, token_before);
             assert_eq!(epoch_during, epoch_before);
@@ -1893,15 +1917,26 @@ mod tests {
             assert_eq!(source_during, source);
 
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='after fence reopens' WHERE id=401").unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET reason='after fence reopens' WHERE id=401",
+            )
+            .unwrap();
             drop(conn);
             let resumed = reconcile_reservation_releases(
-                cx, pool, config, &mut cursor, &AtomicBool::new(false),
-            ).unwrap();
+                cx,
+                pool,
+                config,
+                &mut cursor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert_eq!((resumed.repaired, resumed.deferred), (1, 0));
             let artifact = read_artifact(&stable).unwrap().unwrap();
             assert_eq!(artifact.value["reason"], "after fence reopens");
-            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(
+                artifact.value["released_ts"],
+                source.artifact["released_ts"]
+            );
             assert_eq!(artifact.value["db_generation"], "aabb");
             if existing_artifact {
                 assert_eq!(artifact.value["operator_note"], "preserve this note");
@@ -1909,13 +1944,29 @@ mod tests {
             let repo = Repository::open(&config.storage_root).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
             assert_eq!(
-                committed_artifact(&repo, Some(&tree), "projects/project/file_reservations/id-401-gaabb.json")
-                    .unwrap().unwrap().bytes,
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-401-gaabb.json"
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
                 artifact.bytes
             );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            let hot = conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap();
-            let ledger = conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap();
+            let hot = conn
+                .query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=401",
+                    &[],
+                )
+                .unwrap();
+            let ledger = conn
+                .query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(hot[0].get_as::<Option<i64>>(0).unwrap(), None);
             assert_eq!(ledger[0].get_as::<i64>(0).unwrap(), 5_000_000);
             drop(conn);
