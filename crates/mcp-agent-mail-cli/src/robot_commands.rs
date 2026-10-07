@@ -6998,7 +6998,11 @@ fn build_outbox_entries(
 struct ThreadData {
     thread_id: String,
     subject: String,
+    /// Every message in the thread (after `--since`), shown or not.
     message_count: usize,
+    /// Older messages left out by `--limit`; absent when none were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_older: Option<usize>,
     participants: Vec<String>,
     last_activity: String,
     messages: Vec<ThreadMessage>,
@@ -7019,6 +7023,11 @@ impl MarkdownRenderable for ThreadData {
             self.participants.join(", "),
             self.last_activity,
         );
+        if let Some(omitted) = self.omitted_older {
+            md.push_str(&format!(
+                "*{omitted} older message(s) not shown; raise --limit to include them.*\n\n---\n\n"
+            ));
+        }
         for msg in &self.messages {
             let topic_line = msg
                 .topic
@@ -7065,6 +7074,18 @@ fn build_thread(
     }
 
     let where_clause = conditions.join(" AND ");
+    // The newest `--limit` messages are shown; count the rest so a long
+    // thread is not mistaken for a complete one.
+    let total: usize = conn
+        .query_sync(
+            &format!("SELECT COUNT(*) AS n FROM messages m WHERE {where_clause}"),
+            &params,
+        )
+        .map_err(|e| CliError::Other(format!("thread count query failed: {e}")))?
+        .first()
+        .and_then(|row| row.get_named::<i64>("n").ok())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
     let effective_limit = limit.unwrap_or(200);
     params.push(Value::BigInt(
         effective_limit.try_into().unwrap_or(i64::MAX),
@@ -7093,6 +7114,7 @@ fn build_thread(
         .query_sync(&sql, &params)
         .map_err(|e| CliError::Other(format!("thread query failed: {e}")))?;
     rows.reverse();
+    let omitted = total.saturating_sub(rows.len());
 
     let mut messages = Vec::new();
     let mut last_ts: i64 = 0;
@@ -7132,7 +7154,8 @@ fn build_thread(
         let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
         messages.push(ThreadMessage {
-            position: idx + 1,
+            // Position in the whole thread, not in the shown window.
+            position: omitted + idx + 1,
             from: sender,
             to: to_names.join(", "),
             age: format_age(age_seconds),
@@ -7153,7 +7176,8 @@ fn build_thread(
     Ok(ThreadData {
         thread_id: thread_id.to_string(),
         subject: thread_subject,
-        message_count: messages.len(),
+        message_count: total.max(messages.len()),
+        omitted_older: (omitted > 0).then_some(omitted),
         participants,
         last_activity,
         messages,
@@ -21546,6 +21570,7 @@ mod tests {
             thread_id: "FEAT-123".into(),
             subject: "Add authentication".into(),
             message_count: 5,
+            omitted_older: None,
             participants: vec!["BlueLake".into(), "RedFox".into()],
             last_activity: "10m".into(),
             messages: vec![],
@@ -21561,6 +21586,7 @@ mod tests {
             thread_id: "BUG-42".into(),
             subject: "Fix login issue".into(),
             message_count: 2,
+            omitted_older: None,
             participants: vec!["Alice".into(), "Bob".into()],
             last_activity: "5m".into(),
             messages: vec![ThreadMessage {
@@ -24298,6 +24324,45 @@ mod tests {
 
         let full = build_thread(&conn, 1, "BODY-FLAG", Some(10), None, true).expect("full thread");
         assert_eq!(full.messages[0].body.as_deref(), Some("thread body"));
+    }
+
+    #[test]
+    fn test_build_thread_reports_messages_left_out_by_the_limit() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (150, 1, 1, 'one', 'LONG', 'normal', 0, 10, 'b', '[]'),
+                    (151, 1, 1, 'two', 'LONG', 'normal', 0, 20, 'b', '[]'),
+                    (152, 1, 1, 'three', 'LONG', 'normal', 0, 30, 'b', '[]')",
+            &[],
+        )
+        .expect("insert messages");
+
+        let window = build_thread(&conn, 1, "LONG", Some(2), None, false).expect("thread");
+        assert_eq!(window.message_count, 3, "the whole thread is counted");
+        assert_eq!(window.omitted_older, Some(1));
+        assert_eq!(
+            window
+                .messages
+                .iter()
+                .map(|msg| (msg.position, msg.subject.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "two"), (3, "three")],
+            "the newest messages keep their place in the thread"
+        );
+        let json = serde_json::to_value(&window).expect("serialize thread");
+        assert_eq!(json["omitted_older"], 1);
+
+        let whole = build_thread(&conn, 1, "LONG", Some(10), None, false).expect("thread");
+        assert_eq!(whole.message_count, 3);
+        assert_eq!(whole.omitted_older, None);
+        assert!(
+            serde_json::to_value(&whole)
+                .expect("serialize thread")
+                .get("omitted_older")
+                .is_none()
+        );
     }
 
     #[test]
@@ -27627,7 +27692,9 @@ mod tests {
 
         let latest_two =
             build_thread(&conn, 1, "200", Some(2), None, false).expect("build limited thread");
-        assert_eq!(latest_two.message_count, 2);
+        // message_count is the whole thread; the root is the one left out.
+        assert_eq!(latest_two.message_count, 3);
+        assert_eq!(latest_two.omitted_older, Some(1));
         assert_eq!(latest_two.subject, "Root");
         assert_eq!(latest_two.participants, vec!["Alice", "Bob"]);
         assert_eq!(latest_two.messages[0].subject, "Reply one");
@@ -27669,7 +27736,10 @@ mod tests {
 
         let latest_window =
             build_thread(&conn, 1, "LONG-THREAD", None, None, false).expect("build thread");
-        assert_eq!(latest_window.message_count, 200);
+        // The default window shows the newest 200 of 205 and says so.
+        assert_eq!(latest_window.messages.len(), 200);
+        assert_eq!(latest_window.message_count, 205);
+        assert_eq!(latest_window.omitted_older, Some(5));
         assert_eq!(
             latest_window
                 .messages
