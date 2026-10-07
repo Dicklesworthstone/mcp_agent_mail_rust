@@ -1953,6 +1953,34 @@ pub fn uninstall_guard(repo: &Path) -> GuardResult<()> {
 }
 
 /// Check the guard installation status for a repository.
+/// Whether `hook_name` would run the guard. Our chain runner enforces nothing
+/// itself: it runs `hooks.d/<hook>/*`, skipping (on POSIX) files without an
+/// exec bit, so the guard is present only while its plugin is there and runnable.
+fn guard_hook_present(hooks_dir: &Path, hook_name: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(hooks_dir.join(hook_name)) else {
+        return false;
+    };
+    if !contents.contains(&format!("mcp-agent-mail chain-runner ({hook_name})")) {
+        return contents.contains("mcp-agent-mail");
+    }
+    let plugin = hooks_dir
+        .join("hooks.d")
+        .join(hook_name)
+        .join(PLUGIN_FILE_NAME);
+    let Ok(metadata) = std::fs::metadata(&plugin) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
 pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
@@ -1963,14 +1991,8 @@ pub fn guard_status(repo: &Path) -> GuardResult<GuardStatus> {
     let hooks_dir = resolve_hooks_dir(repo)?;
     let mode = GuardMode::from_env();
 
-    let pre_commit_path = hooks_dir.join("pre-commit");
-    let pre_push_path = hooks_dir.join("pre-push");
-
-    let pre_commit_present = pre_commit_path.exists()
-        && std::fs::read_to_string(&pre_commit_path).is_ok_and(|c| c.contains("mcp-agent-mail"));
-
-    let pre_push_present = pre_push_path.exists()
-        && std::fs::read_to_string(&pre_push_path).is_ok_and(|c| c.contains("mcp-agent-mail"));
+    let pre_commit_present = guard_hook_present(&hooks_dir, "pre-commit");
+    let pre_push_present = guard_hook_present(&hooks_dir, "pre-push");
 
     // Check if worktrees are enabled (core.hooksPath set)
     let worktrees_enabled = {
@@ -5388,6 +5410,44 @@ mod tests {
             status.hooks_dir.contains("hooks"),
             "hooks_dir should point to hooks directory"
         );
+    }
+
+    /// The chain runner alone enforces nothing: once its plugin is gone (or,
+    /// on POSIX, loses its exec bit and is skipped) status must say so.
+    #[test]
+    fn guard_status_requires_the_runnable_plugin_behind_the_chain_runner() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        install_guard("/test/project", &repo_dir, true).expect("install");
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(status.pre_commit_present && status.pre_push_present);
+
+        let hooks_dir = PathBuf::from(&status.hooks_dir);
+        let plugin = hooks_dir
+            .join("hooks.d")
+            .join("pre-commit")
+            .join(PLUGIN_FILE_NAME);
+        let parked = plugin.with_extension("parked");
+        std::fs::rename(&plugin, &parked).expect("park plugin");
+        let status = guard_status(&repo_dir).expect("guard_status");
+        assert!(!status.pre_commit_present, "chain runner without plugin");
+        assert!(status.pre_push_present, "pre-push plugin untouched");
+
+        std::fs::rename(&parked, &plugin).expect("restore plugin");
+        assert!(guard_status(&repo_dir).expect("status").pre_commit_present);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert!(
+                !guard_status(&repo_dir).expect("status").pre_commit_present,
+                "the chain runner skips a plugin without an exec bit"
+            );
+        }
     }
 
     #[test]
