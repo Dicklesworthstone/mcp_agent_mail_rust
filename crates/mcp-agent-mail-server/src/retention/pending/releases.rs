@@ -96,7 +96,7 @@ pub(super) async fn replay_batch(
     intents: &[QueuedReleaseIntentView],
 ) -> Result<ReplayReport, String> {
     let mut report = ReplayReport::default();
-    if shutdown.load(Ordering::Acquire) {
+    if shutdown.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
         return Ok(report);
     }
@@ -104,7 +104,11 @@ pub(super) async fn replay_batch(
     // lease. Retain the same promotion exclusion through identity resolution,
     // page mutation and completion receipt publication. Archive repair has
     // its own admission and must not precede any closeout in this pass.
-    let write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    // A retryable closeout must not wait for promotion, including a failed
+    // drain whose owner still excludes writers. Refuse before source access
+    // or any round/page changes; the supervisor can retry the durable journal.
+    let write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or("durable release replay deferred: recovery promotion or admission contention")?;
     validate_live_pool(cx, pool, config).await?;
     let keys: Vec<_> = intents
         .iter()
@@ -563,6 +567,9 @@ mod tests {
 
     #[test]
     fn replay_releases_old_scope_not_future_or_foreign_leases_and_materializes_archive() {
+        if isolated_completion_test() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             storage_root: temp.path().to_path_buf(),
@@ -797,6 +804,9 @@ mod tests {
     }
 
     fn with_replay_mailbox(test: impl FnOnce(&Cx, &DbPool, &Config, &str, &str)) {
+        if isolated_completion_test() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
@@ -1602,6 +1612,127 @@ mod tests {
             let current = fastmcp_core::block_on(queries::db_generation_id(cx, pool))
                 .into_result().unwrap();
             assert_eq!(current.as_deref(), Some("ccdd"));
+        });
+    }
+
+    #[test]
+    fn promotion_refusal_preserves_an_applied_bulk_page_and_its_durable_intent() {
+        use mcp_agent_mail_db::write_barrier::{
+            DrainOutcome, acquire_promotion_barrier_draining, active_writer_count,
+            begin_write_activity, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            for id in 1..=65 {
+                seed_replay_lease(cx, pool, id, &format!("src/{id}.rs"), cutoff - 1);
+            }
+            queue_scope(config, cutoff, "BlueLake", None, None);
+            let mut cursor = Cursor::default();
+            assert_eq!(page_pass(cx, pool, config, &mut cursor).rows_released, 64);
+            let round_before = cursor.round.after.clone();
+            let progress_before: Vec<_> = cursor.pages.iter()
+                .map(|(key, position)| (key.clone(), position.released)).collect();
+            assert_eq!(progress_before.len(), 1);
+            assert_eq!(progress_before[0].1, 64);
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let bytes_before = std::fs::read(&log).unwrap();
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            for parent_writer in [false, true] {
+                let parent = parent_writer.then(begin_write_activity);
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let owner = std::thread::spawn(move || {
+                    let gate = if parent_writer {
+                        let (gate, result) = acquire_promotion_barrier_draining(Duration::ZERO);
+                        assert!(matches!(result, DrainOutcome::TimedOut { remaining_writers: 1 }));
+                        gate
+                    } else {
+                        try_acquire_promotion_barrier_if_idle().expect("idle promotion")
+                    };
+                    ready_tx.send(()).unwrap();
+                    // Cleanup only: the test requires replay to return before
+                    // explicit release, not by waiting for this timeout.
+                    let released = release_rx.recv_timeout(Duration::from_secs(10));
+                    drop(gate);
+                    released
+                });
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let refused = fastmcp_core::block_on(replay_batch(
+                    cx, pool, config, &mut cursor, &AtomicBool::new(false), &intents,
+                ));
+                let writers = active_writer_count();
+                let bytes_during = std::fs::read(&log).unwrap();
+                drop(parent);
+                let _ = release_tx.send(());
+                assert!(owner.join().unwrap().is_ok(), "replay waited for promotion expiry");
+                assert!(refused.unwrap_err().contains("admission contention"));
+                assert_eq!(writers, usize::from(parent_writer));
+                assert_eq!(active_writer_count(), 0);
+                assert_eq!(bytes_during, bytes_before);
+                assert_eq!(cursor.round.after, round_before);
+                let progress: Vec<_> = cursor.pages.iter()
+                    .map(|(key, position)| (key.clone(), position.released)).collect();
+                assert_eq!(progress, progress_before);
+                let remaining = fastmcp_core::block_on(queries::get_reservations_by_ids(cx, pool, &[65]))
+                    .into_result().unwrap();
+                assert!(remaining[0].released_ts.is_none());
+            }
+            // No cursor reset: completion must resume after the committed
+            // 64-ID page, not rescan it or abandon the last lease.
+            let resumed = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((resumed.rows_released, resumed.completed, resumed.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn release_replay_cannot_use_a_promotion_owners_blocking_writer_exemption() {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/owner.rs", cutoff - 1);
+            queue_fixture_release(config, cutoff, 401);
+            let intents = journal::read_queued_release_intents(config).unwrap();
+            let log = journal::log_path(config, journal::RELEASE_INTENT_LOG_FILE);
+            let before = std::fs::read(&log).unwrap();
+            let mut cursor = Cursor::default();
+            let gate = try_acquire_promotion_barrier_if_idle().unwrap();
+            let refused = fastmcp_core::block_on(replay_batch(
+                cx, pool, config, &mut cursor, &AtomicBool::new(false), &intents,
+            ));
+            let writers = active_writer_count();
+            drop(gate);
+            assert!(refused.unwrap_err().contains("admission contention"));
+            assert_eq!(writers, 0);
+            assert!(cursor.round.after.is_none());
+            assert!(cursor.pages.is_empty());
+            assert_eq!(std::fs::read(log).unwrap(), before);
+            let resumed = page_pass(cx, pool, config, &mut cursor);
+            assert_eq!((resumed.rows_released, resumed.completed), (1, 1));
+        });
+    }
+
+    #[test]
+    fn other_counted_writers_do_not_disable_release_replay() {
+        use mcp_agent_mail_db::write_barrier::{active_writer_count, begin_write_activity};
+
+        with_replay_mailbox(|cx, pool, config, _, _| {
+            let cutoff = mcp_agent_mail_db::now_micros();
+            seed_replay_lease(cx, pool, 401, "src/parallel.rs", cutoff - 1);
+            queue_fixture_release(config, cutoff, 401);
+            let writer = begin_write_activity();
+            let report = page_pass(cx, pool, config, &mut Cursor::default());
+            assert_eq!((report.rows_released, report.completed, report.deferred), (1, 1, 0));
+            assert!(journal::read_queued_release_intents(config).unwrap().is_empty());
+            assert_eq!(active_writer_count(), 1);
+            drop(writer);
+            assert_eq!(active_writer_count(), 0);
         });
     }
 }
