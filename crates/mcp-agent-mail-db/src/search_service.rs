@@ -321,6 +321,75 @@ fn query_assistance_payload(query: &SearchQuery) -> Option<QueryAssistance> {
     }
 }
 
+/// Apply the `field:value` hints `parse_query_assistance` recognises as the
+/// filters they name, with the hints taken out of the text: `from:` (sender),
+/// `thread:`, `importance:`, `after:`, `before:`, and `project:` (by slug, on
+/// an unscoped search only). An explicit facet wins over a hint. Only hints
+/// that took effect are reported in the assistance payload.
+///
+/// Returns the hinted query (`None` when the text has no hints) and the
+/// assistance payload.
+async fn apply_query_hints(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+) -> (Option<SearchQuery>, Option<QueryAssistance>) {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) {
+        return (None, query_assistance_payload(query));
+    }
+    let mut assistance = parse_query_assistance(&query.text);
+    if assistance.applied_filter_hints.is_empty() {
+        let payload = (!assistance.did_you_mean.is_empty()).then_some(assistance);
+        return (None, payload);
+    }
+    let hint_micros = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|dt| dt.timestamp_micros())
+    };
+    let mut hinted = query.clone();
+    hinted.text.clone_from(&assistance.query_text);
+    for hint in std::mem::take(&mut assistance.applied_filter_hints) {
+        let applied = match hint.field.as_str() {
+            "from" if hinted.agent_name.is_none() && hinted.direction.is_none() => {
+                hinted.agent_name = Some(hint.value.clone());
+                hinted.direction = Some(Direction::Outbox);
+                true
+            }
+            "thread" if hinted.thread_id.is_none() => {
+                hinted.thread_id = Some(hint.value.clone());
+                true
+            }
+            "importance" if hinted.importance.is_empty() => Importance::parse(&hint.value)
+                .map(|importance| hinted.importance = vec![importance])
+                .is_some(),
+            "after" if hinted.time_range.min_ts.is_none() => hint_micros(&hint.value)
+                .map(|ts| hinted.time_range.min_ts = Some(ts))
+                .is_some(),
+            "before" if hinted.time_range.max_ts.is_none() => hint_micros(&hint.value)
+                .map(|ts| hinted.time_range.max_ts = Some(ts))
+                .is_some(),
+            "project" if hinted.project_id.is_none() && hinted.product_id.is_none() => {
+                match crate::queries::get_project_by_slug(cx, pool, &hint.value).await {
+                    Outcome::Ok(project) => {
+                        hinted.project_id = project.id;
+                        project.id.is_some()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if applied {
+            assistance.applied_filter_hints.push(hint);
+        }
+    }
+    let payload = (!assistance.applied_filter_hints.is_empty()
+        || !assistance.did_you_mean.is_empty())
+    .then_some(assistance);
+    (Some(hinted), payload)
+}
+
 /// Generate zero-result recovery guidance based on query facets and result count.
 ///
 /// Only produces guidance when `result_count` is 0. Suggestions are deterministic
@@ -4459,6 +4528,9 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    // Hints become filters before routing, caching and planning see the query.
+    let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
+    let query = hinted.as_ref().unwrap_or(query);
     let product_sql_budget = product_sql_budget_state(cx, query);
     let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
     let engine = engine_for_text_fields(resolve_search_engine(options), query);
@@ -4488,8 +4560,6 @@ pub async fn execute_search(
         );
         return Outcome::Ok(cached);
     }
-
-    let assistance = query_assistance_payload(query);
 
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
         || message_query_requires_sql_plan(query)

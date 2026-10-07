@@ -605,6 +605,73 @@ fn time_ordered_search_honours_query_syntax() {
     assert_eq!(ids("\"API key\""), vec![phrase]);
 }
 
+/// `from:`, `thread:`, `importance:` and `after:`/`before:` hints in the text
+/// filter like the facets they name, and only applied hints are reported.
+#[test]
+fn query_hints_filter_like_their_facets() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "query-hints");
+    let amber = seed_agent(&pool, pid, "AmberOx");
+    let coral = seed_agent(&pool, pid, "CoralFinch");
+    let amber_plan = create_msg(
+        &pool,
+        pid,
+        amber,
+        "hintq plan",
+        "b",
+        "high",
+        Some("br-9"),
+        false,
+    );
+    set_message_ts(&pool, amber_plan, BASE_TS + 2 * MICROS_PER_DAY);
+    let coral_plan = create_msg(
+        &pool,
+        pid,
+        coral,
+        "hintq plan",
+        "b",
+        "normal",
+        Some("br-7"),
+        false,
+    );
+    set_message_ts(&pool, coral_plan, BASE_TS);
+
+    let run = |text: &str| {
+        let response = search(&pool, &SearchQuery::messages(text, pid));
+        let mut ids = result_ids(&response);
+        ids.sort_unstable();
+        let applied: Vec<String> = response
+            .assistance
+            .map(|a| {
+                a.applied_filter_hints
+                    .into_iter()
+                    .map(|h| h.field)
+                    .collect()
+            })
+            .unwrap_or_default();
+        (ids, applied)
+    };
+    assert_eq!(run("hintq"), (vec![amber_plan, coral_plan], vec![]));
+    assert_eq!(
+        run("from:AmberOx hintq"),
+        (vec![amber_plan], vec!["from".to_string()])
+    );
+    assert_eq!(
+        run("thread:br-7 hintq"),
+        (vec![coral_plan], vec!["thread".to_string()])
+    );
+    assert_eq!(
+        run("importance:high hintq"),
+        (vec![amber_plan], vec!["importance".to_string()])
+    );
+    assert_eq!(
+        run("after:2026-01-16 hintq"),
+        (vec![amber_plan], vec!["after".to_string()])
+    );
+    // An unknown project is not applied, and not reported as applied.
+    assert_eq!(run("project:no-such-project hintq").1, Vec::<String>::new());
+}
+
 /// A numeric thread id names its root message, which has no `thread_id` of
 /// its own: the filter must return it with its replies, as the thread view does.
 #[test]
