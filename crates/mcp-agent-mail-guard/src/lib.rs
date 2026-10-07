@@ -1721,6 +1721,20 @@ if __name__ == "__main__":
         .replace("__STORAGE_ROOT_JSON__", &storage_root_json)
 }
 
+/// `base`, or `base-2`, `base-3`, ... : the first that does not exist yet.
+fn unused_path(base: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(base).is_err() {
+        return base.to_path_buf();
+    }
+    let name = base
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    (2..=u32::MAX)
+        .map(|n| base.with_file_name(format!("{name}-{n}")))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
+        .unwrap_or_else(|| base.to_path_buf())
+}
+
 pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> GuardResult<()> {
     if !repo.exists() {
         return Err(GuardError::InvalidRepo {
@@ -1746,7 +1760,14 @@ pub fn install_guard(project: &str, repo: &Path, install_prepush: bool) -> Guard
             // Idempotent: backup if not ours
             if !content.contains(&format!("mcp-agent-mail chain-runner ({name})")) {
                 let orig = hooks_dir.join(format!("{name}.orig"));
-                if !orig.exists() {
+                if orig.exists() {
+                    // The first install already chained `.orig`; this is a
+                    // newer hook written since (husky, the pre-commit
+                    // framework). Chain it too instead of overwriting it, so
+                    // its checks keep running.
+                    let preserved = unused_path(&run_dir.join(format!("50-preserved-{name}")));
+                    std::fs::rename(&chain_path, &preserved)?;
+                } else {
                     std::fs::rename(&chain_path, &orig)?;
                 }
             }
@@ -3552,6 +3573,50 @@ mod tests {
         assert!(!plugin_path.exists(), "expected plugin file to be removed");
         let restored = std::fs::read_to_string(&pre_commit).expect("read restored pre-commit");
         assert_eq!(restored, orig_body);
+    }
+
+    #[test]
+    fn reinstalling_over_a_newer_user_hook_chains_it_instead_of_overwriting_it() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        let hooks_dir = repo_dir.join(".git").join("hooks");
+        let pre_commit = hooks_dir.join("pre-commit");
+
+        std::fs::write(&pre_commit, "#!/bin/sh\necho first\n").expect("write first hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("first install");
+        // A tool (husky, pre-commit) rewrites the hook after the first install.
+        let newer = "#!/bin/sh\necho newer\n";
+        std::fs::write(&pre_commit, newer).expect("write newer hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("reinstall");
+
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("pre-commit.orig")).expect("orig"),
+            "#!/bin/sh\necho first\n",
+            "the first original stays where uninstall restores it"
+        );
+        let chained = hooks_dir
+            .join("hooks.d")
+            .join("pre-commit")
+            .join("50-preserved-pre-commit");
+        assert_eq!(
+            std::fs::read_to_string(&chained).expect("newer hook is chained, not lost"),
+            newer
+        );
+
+        // A third rewrite and reinstall keeps both newer hooks.
+        std::fs::write(&pre_commit, "#!/bin/sh\necho third\n").expect("write third hook");
+        install_guard("/abs/path/backend", &repo_dir, false).expect("third install");
+        assert_eq!(
+            std::fs::read_to_string(chained.with_file_name("50-preserved-pre-commit-2"))
+                .expect("third hook chained"),
+            "#!/bin/sh\necho third\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&chained).expect("still there"),
+            newer
+        );
     }
 
     #[test]
