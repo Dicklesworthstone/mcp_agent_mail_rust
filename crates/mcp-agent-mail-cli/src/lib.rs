@@ -1272,15 +1272,15 @@ pub enum SetupCommand {
         /// Use a specific bearer token.
         #[arg(long)]
         token: Option<String>,
-        /// Override port (default: 8765).
-        #[arg(long, default_value_t = 8765)]
-        port: u16,
-        /// Override host (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Override MCP base path (default: /mcp/).
-        #[arg(long, default_value = "/mcp/")]
-        path: String,
+        /// Override port (default: the configured HTTP_PORT, else 8765).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override host (default: the configured HTTP_HOST, else 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Override MCP base path (default: the configured HTTP_PATH, else /mcp/).
+        #[arg(long)]
+        path: Option<String>,
         /// Project directory for project-local configs (default: cwd).
         #[arg(long)]
         project_dir: Option<PathBuf>,
@@ -1313,15 +1313,15 @@ pub enum SetupCommand {
         /// Expected bearer token for header drift checks.
         #[arg(long)]
         token: Option<String>,
-        /// Override port for status check (default: 8765).
-        #[arg(long, default_value_t = 8765)]
-        port: u16,
-        /// Override host for status check (default: 127.0.0.1).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Override MCP base path (default: /mcp/).
-        #[arg(long, default_value = "/mcp/")]
-        path: String,
+        /// Override port for status check (default: the configured HTTP_PORT, else 8765).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override host for status check (default: the configured HTTP_HOST, else 127.0.0.1).
+        #[arg(long)]
+        host: Option<String>,
+        /// Override MCP base path (default: the configured HTTP_PATH, else /mcp/).
+        #[arg(long)]
+        path: Option<String>,
         /// Project directory for project-local configs (default: cwd).
         #[arg(long)]
         project_dir: Option<PathBuf>,
@@ -3550,10 +3550,12 @@ pub enum ServiceCommand {
     ///
     /// Idempotent: safe to run multiple times.
     Install {
-        /// Override the host the server listens on (default: 127.0.0.1).
+        /// Override the host the server listens on (default: the configured
+        /// HTTP_HOST, else 127.0.0.1).
         #[arg(long)]
         host: Option<String>,
-        /// Override the port the server listens on (default: 8765).
+        /// Override the port the server listens on (default: the configured
+        /// HTTP_PORT, e.g. from `am config set-port`, else 8765).
         #[arg(long)]
         port: Option<u16>,
         /// Disable bearer token authentication for the managed server.
@@ -9481,9 +9483,9 @@ fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
         dry_run: false,
         yes: true,
         token: None,
-        port: config.http_port,
-        host: config.http_host.clone(),
-        path: config.http_path.clone(),
+        port: Some(config.http_port),
+        host: Some(config.http_host.clone()),
+        path: Some(config.http_path.clone()),
         project_dir: Some(project_dir),
         format: None,
         json: false,
@@ -17005,6 +17007,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let (host, port, path) = setup_endpoint(host, port, path);
 
             let config_env_file = canonical_setup_config_env_path()?;
 
@@ -17183,6 +17186,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let (host, port, path) = setup_endpoint(host, port, path);
 
             let config_env_file = canonical_setup_config_env_path()?;
             let resolved_token = setup::resolve_existing_token(token.as_deref(), &config_env_file)
@@ -43738,6 +43742,43 @@ WantedBy=default.target
     )
 }
 
+/// Where a managed service listens: --host/--port, else the configured
+/// HTTP_HOST/HTTP_PORT (environment or config.env, e.g. after
+/// `am config set-port`) — the endpoint the CLI itself will call. Defaulting
+/// to 127.0.0.1:8765 instead left a set-port user with a service the CLI
+/// never reached and an ownership refusal for its local fallback.
+fn service_listen_addr(config: &Config, host: Option<&str>, port: Option<u16>) -> (String, u16) {
+    (
+        host.unwrap_or(&config.http_host).to_string(),
+        port.unwrap_or(config.http_port),
+    )
+}
+
+/// The endpoint `am setup run` writes into client configs and `setup status`
+/// checks them against: the flags, else the configured
+/// HTTP_HOST/HTTP_PORT/HTTP_PATH — where `am service install` listens and the
+/// CLI calls.
+fn setup_endpoint(
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+) -> (String, u16, String) {
+    setup_endpoint_from(&Config::from_env(), host, port, path)
+}
+
+fn setup_endpoint_from(
+    config: &Config,
+    host: Option<String>,
+    port: Option<u16>,
+    path: Option<String>,
+) -> (String, u16, String) {
+    (
+        host.unwrap_or_else(|| config.http_host.clone()),
+        port.unwrap_or(config.http_port),
+        path.unwrap_or_else(|| config.http_path.clone()),
+    )
+}
+
 fn service_install_systemd(
     am_bin: &Path,
     host: Option<String>,
@@ -43750,12 +43791,12 @@ fn service_install_systemd(
 
     let unit_path = unit_dir.join(SYSTEMD_UNIT_NAME);
 
-    let listen_host = host.as_deref().unwrap_or("127.0.0.1");
-    let listen_port = port.unwrap_or(8765);
+    let config = mcp_agent_mail_core::Config::from_env();
+    let (listen_host, listen_port) = service_listen_addr(&config, host.as_deref(), port);
+    let listen_host = listen_host.as_str();
     validate_service_bind_addr(listen_host, listen_port)?;
     let exec_args = build_systemd_exec_start(am_bin, listen_host, listen_port, no_auth);
 
-    let config = mcp_agent_mail_core::Config::from_env();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(&home));
     let abs_db_url = resolve_absolute_database_url(&config.database_url, &cwd);
     let abs_storage_root = if config.storage_root.is_absolute() {
@@ -43908,8 +43949,9 @@ fn service_install_launchd(
 
     let plist_path = agents_dir.join(format!("{LAUNCHD_LABEL}.plist"));
 
-    let listen_host = host.as_deref().unwrap_or("127.0.0.1");
-    let listen_port = port.unwrap_or(8765);
+    let config = mcp_agent_mail_core::Config::from_env();
+    let (listen_host, listen_port) = service_listen_addr(&config, host.as_deref(), port);
+    let listen_host = listen_host.as_str();
     validate_service_bind_addr(listen_host, listen_port)?;
 
     let log_dir = PathBuf::from(&home).join("Library/Logs/agent-mail");
@@ -43917,7 +43959,6 @@ fn service_install_launchd(
     let uid = current_uid()?;
     let args_xml = build_launchd_args_xml(am_bin, listen_host, listen_port, no_auth);
 
-    let config = mcp_agent_mail_core::Config::from_env();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(&home));
     let abs_db_url = resolve_absolute_database_url(&config.database_url, &cwd);
     let abs_storage_root = if config.storage_root.is_absolute() {
@@ -44631,9 +44672,9 @@ mod tests {
                 dry_run: false,
                 yes: true,
                 token: Some("operator-token".to_string()),
-                port: 8765,
-                host: "127.0.0.1".to_string(),
-                path: "/mcp/".to_string(),
+                port: Some(8765),
+                host: Some("127.0.0.1".to_string()),
+                path: Some("/mcp/".to_string()),
                 project_dir: None,
                 format: None,
                 json: false,
@@ -44647,9 +44688,9 @@ mod tests {
                 json: false,
                 agent: None,
                 token: None,
-                port: 8765,
-                host: "127.0.0.1".to_string(),
-                path: "/mcp/".to_string(),
+                port: Some(8765),
+                host: Some("127.0.0.1".to_string()),
+                path: Some("/mcp/".to_string()),
                 project_dir: None,
                 no_user_config: false,
                 no_hooks: false,
@@ -46785,6 +46826,49 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
     }
 
     #[test]
+    fn service_listens_on_the_configured_port_unless_overridden() {
+        // After `am config set-port 9000` the CLI calls :9000, so the managed
+        // service must listen there too.
+        let config = Config {
+            http_port: 9000,
+            ..Config::default()
+        };
+        assert_eq!(
+            service_listen_addr(&config, None, None),
+            (Config::default().http_host, 9000)
+        );
+        assert_eq!(
+            service_listen_addr(&config, Some("0.0.0.0"), Some(9100)),
+            ("0.0.0.0".to_string(), 9100)
+        );
+        let defaults = Config::default();
+        assert_eq!(
+            service_listen_addr(&defaults, None, None),
+            (defaults.http_host.clone(), defaults.http_port)
+        );
+
+        // `am setup run` writes the same configured endpoint into clients.
+        let api = Config {
+            http_port: 9000,
+            http_path: "/api/".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(
+            setup_endpoint_from(&api, None, None, None),
+            (Config::default().http_host, 9000, "/api/".to_string())
+        );
+        assert_eq!(
+            setup_endpoint_from(
+                &api,
+                Some("10.0.0.2".into()),
+                Some(8765),
+                Some("/mcp/".into())
+            ),
+            ("10.0.0.2".to_string(), 8765, "/mcp/".to_string())
+        );
+    }
+
+    #[test]
     fn hook_server_host_port_prefers_flags_then_configuration() {
         let config = Config {
             http_host: "10.1.2.3".to_string(),
@@ -48455,9 +48539,9 @@ http_headers = { Authorization = "Bearer secret" }
                 no_hooks,
                 ..
             } => {
-                assert_eq!(host, "0.0.0.0");
-                assert_eq!(port, 9001);
-                assert_eq!(path, "/api/v2/");
+                assert_eq!(host.as_deref(), Some("0.0.0.0"));
+                assert_eq!(port, Some(9001));
+                assert_eq!(path.as_deref(), Some("/api/v2/"));
                 assert!(yes);
                 assert!(!dry_run);
                 assert!(!no_user_config);
@@ -48479,7 +48563,7 @@ http_headers = { Authorization = "Bearer secret" }
         );
 
         match build_setup_run_command_for_http_server(&config) {
-            SetupCommand::Run { path, .. } => assert_eq!(path, "/mcp/"),
+            SetupCommand::Run { path, .. } => assert_eq!(path.as_deref(), Some("/mcp/")),
             other => panic!("unexpected command: {other:?}"),
         }
     }
