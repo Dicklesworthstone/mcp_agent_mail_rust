@@ -9361,7 +9361,9 @@ pub async fn get_messages_details_by_ids(
 ///
 /// Thread semantics:
 /// - If `thread_id` is a numeric string, it is treated as a root message id.
-///   The thread includes the root message (`id = root`) and any replies (`thread_id = "{root}"`).
+///   The thread includes the root message (`id = root`), any replies
+///   (`thread_id = "{root}"`), and, when the root itself belongs to a named
+///   thread (`thread_id = "TKT-123"`), that whole thread.
 /// - Otherwise, the thread includes messages where `thread_id = thread_id`.
 /// - If `limit` is set, the most recent `limit` messages are selected and returned in
 ///   chronological order (oldest-to-newest within that limited window).
@@ -9373,6 +9375,8 @@ pub async fn list_thread_messages(
     thread_id: &str,
     limit: Option<usize>,
 ) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    const SEED_THREAD_SQL: &str =
+        "SELECT s.thread_id FROM messages s WHERE s.id = ? AND s.project_id = ?";
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9389,6 +9393,10 @@ pub async fn list_thread_messages(
         params.push(Value::BigInt(root_id));
     }
     params.push(Value::Text(thread_id.to_string()));
+    if let Ok(root_id) = thread_id.parse::<i64>() {
+        params.push(Value::BigInt(root_id));
+        params.push(Value::BigInt(project_id));
+    }
 
     let (sql, reverse_to_chronological) = match (is_root, limit) {
         (true, Some(lim)) => {
@@ -9406,7 +9414,7 @@ pub async fn list_thread_messages(
                             COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                      FROM messages m \
                      LEFT JOIN agents a ON a.id = m.sender_id \
-                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ? OR m.thread_id = ({SEED_THREAD_SQL})) \
                      ORDER BY created_ts DESC, id DESC \
                      LIMIT ?"
                 ),
@@ -9423,7 +9431,7 @@ pub async fn list_thread_messages(
                         COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                  FROM messages m \
                  LEFT JOIN agents a ON a.id = m.sender_id \
-                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ? OR m.thread_id = ({SEED_THREAD_SQL})) \
                  ORDER BY created_ts ASC, id ASC"
             ),
             false,
@@ -26979,6 +26987,85 @@ mod tests {
                     .into_result()
                     .expect("release exact id set");
             assert_eq!(released_ids, vec![second_id]);
+        });
+    }
+
+    #[test]
+    fn numeric_thread_seed_includes_the_seeds_named_thread() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", dir.path().join("seed.db").display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-seed-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let post_in = |thread: Option<&'static str>| {
+                let pool = pool.clone();
+                let cx = cx.clone();
+                async move {
+                    create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender_id,
+                        "s",
+                        "b",
+                        thread,
+                        "normal",
+                        false,
+                        "[]",
+                        &[(sender_id, "to")],
+                    )
+                    .await
+                    .into_result()
+                    .expect("message")
+                    .id
+                    .expect("id")
+                }
+            };
+            let seed = post_in(Some("TKT-1")).await;
+            let sibling = post_in(Some("TKT-1")).await;
+            let _unrelated = post_in(Some("TKT-2")).await;
+
+            let thread = list_thread_messages(&cx, &pool, project_id, &seed.to_string(), None)
+                .await
+                .into_result()
+                .expect("thread");
+            let mut ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![seed, sibling], "the seed's thread, nothing else");
         });
     }
 
