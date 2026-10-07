@@ -1224,6 +1224,11 @@ pub struct SearchCockpitScreen {
 
     // Facet state
     scope_mode: ScopeMode,
+    /// The project a Project or Product scope is pinned to: the selected
+    /// result's project when the Scope facet last changed.
+    scope_project: Option<i64>,
+    /// Project slug or product name the last search scoped to, for labels.
+    scope_label: Option<String>,
     doc_kind_filter: DocKindFilter,
     importance_filter: ImportanceFilter,
     ack_filter: AckFilter,
@@ -1351,6 +1356,8 @@ impl SearchCockpitScreen {
                 .with_placeholder("Search across messages, agents, projects... (/ to focus)")
                 .with_focused(false),
             scope_mode: ScopeMode::Global,
+            scope_project: None,
+            scope_label: None,
             doc_kind_filter: DocKindFilter::Messages,
             importance_filter: ImportanceFilter::Any,
             ack_filter: AckFilter::Any,
@@ -1591,6 +1598,9 @@ impl SearchCockpitScreen {
             "scope_mode".to_string(),
             self.scope_mode.as_str().to_string(),
         );
+        if let Some(project) = self.pinned_scope_project() {
+            values.insert("scope_project".to_string(), project.to_string());
+        }
         values.insert(
             "doc_kind_filter".to_string(),
             self.doc_kind_filter.route_value().to_string(),
@@ -1670,6 +1680,10 @@ impl SearchCockpitScreen {
         if let Some(scope) = values.get("scope_mode") {
             self.scope_mode = ScopeMode::from_str_lossy(scope);
         }
+        if let Some(project) = values.get("scope_project").and_then(|p| p.parse().ok()) {
+            self.scope_project = Some(project);
+        }
+        self.scope_label = None;
         if let Some(doc) = values.get("doc_kind_filter") {
             self.doc_kind_filter = DocKindFilter::from_route_value(doc);
         }
@@ -2318,14 +2332,17 @@ impl SearchCockpitScreen {
         raw: &str,
         cfg: &crate::tui_bridge::ConfigSnapshot,
     ) -> Result<Vec<ResultEntry>, String> {
+        let (project_id, product_id) = self.resolve_scope(conn)?;
         if raw.is_empty() {
-            return self.search_messages_recent(conn);
+            return self.search_messages_recent(conn, project_id, product_id);
         }
 
         let mut query = SearchQuery {
             text: raw.to_string(),
             text_fields: self.field_scope.text_fields(),
             doc_kind: DocKind::Message,
+            project_id,
+            product_id,
             limit: Some(MAX_RESULTS),
             explain: self.explain_toggle.is_on(),
             ranking: self.sort_direction.ranking(),
@@ -2358,10 +2375,26 @@ impl SearchCockpitScreen {
     }
 
     /// Recent messages view (empty query).
-    fn search_messages_recent(&mut self, conn: &DbConn) -> Result<Vec<ResultEntry>, String> {
+    fn search_messages_recent(
+        &mut self,
+        conn: &DbConn,
+        project_id: Option<i64>,
+        product_id: Option<i64>,
+    ) -> Result<Vec<ResultEntry>, String> {
         self.last_diagnostics = derive_tui_degraded_diagnostics(None, self.search_mode);
         let mut where_clauses: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
+
+        if let Some(project) = project_id {
+            where_clauses.push("m.project_id = ?");
+            params.push(Value::BigInt(project));
+        }
+        if let Some(product) = product_id {
+            where_clauses.push(
+                "m.project_id IN (SELECT project_id FROM product_project_links WHERE product_id = ?)",
+            );
+            params.push(Value::BigInt(product));
+        }
 
         if let Some(ref imp) = self.importance_filter.filter_string() {
             where_clauses.push("m.importance = ?");
@@ -2466,7 +2499,7 @@ impl SearchCockpitScreen {
     #[allow(clippy::missing_const_for_fn)] // mutates self through .next() chains
     fn toggle_active_facet(&mut self) {
         match self.active_facet {
-            FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
+            FacetSlot::Scope => self.cycle_scope(),
             FacetSlot::DocKind => self.doc_kind_filter = self.doc_kind_filter.next(),
             FacetSlot::Importance => self.importance_filter = self.importance_filter.next(),
             FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
@@ -2479,9 +2512,83 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
     }
 
+    /// Global → Project → Product → Global. The scope pins to the selected
+    /// result's project, and keeps its pin when nothing is selected.
+    fn cycle_scope(&mut self) {
+        if let Some(project) = self.results.get(self.cursor).and_then(|r| r.project_id) {
+            self.scope_project = Some(project);
+        }
+        self.scope_mode = self.scope_mode.next();
+        self.scope_label = None;
+    }
+
+    /// Project/Product scope as `(project_id, product_id)` for a message
+    /// search, resolved from the pinned project; refreshes the facet label.
+    fn resolve_scope(&mut self, conn: &DbConn) -> Result<(Option<i64>, Option<i64>), String> {
+        self.scope_label = None;
+        if self.scope_mode == ScopeMode::Global {
+            return Ok((None, None));
+        }
+        let project = self.scope_project.ok_or_else(|| {
+            format!(
+                "{} scope needs a project: select a result, then set Scope again",
+                self.scope_mode.label()
+            )
+        })?;
+        let slug = conn
+            .query_sync(
+                "SELECT slug FROM projects WHERE id = ?",
+                &[Value::BigInt(project)],
+            )
+            .map_err(|e| format!("Scope lookup failed: {e}"))?
+            .first()
+            .and_then(|row| row.get_named::<String>("slug").ok())
+            .ok_or_else(|| format!("Scope project #{project} no longer exists"))?;
+        if self.scope_mode == ScopeMode::Project {
+            self.scope_label = Some(slug);
+            return Ok((Some(project), None));
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT p.id AS id, p.name AS name FROM product_project_links l \
+                 JOIN products p ON p.id = l.product_id \
+                 WHERE l.project_id = ? ORDER BY p.id LIMIT 1",
+                &[Value::BigInt(project)],
+            )
+            .map_err(|e| format!("Scope lookup failed: {e}"))?;
+        let product = rows
+            .first()
+            .and_then(|row| {
+                Some((
+                    row.get_named::<i64>("id").ok()?,
+                    row.get_named::<String>("name").ok()?,
+                ))
+            })
+            .ok_or_else(|| format!("Project {slug} belongs to no product"))?;
+        self.scope_label = Some(product.1);
+        Ok((None, Some(product.0)))
+    }
+
+    /// The pinned project while a Project or Product scope is on.
+    fn pinned_scope_project(&self) -> Option<i64> {
+        self.scope_project
+            .filter(|_| self.scope_mode != ScopeMode::Global)
+    }
+
+    /// The Scope facet's value, naming what it narrows to once resolved.
+    fn scope_value_label(&self) -> String {
+        match &self.scope_label {
+            Some(target) if self.scope_mode != ScopeMode::Global => {
+                format!("{}: {target}", self.scope_mode.label())
+            }
+            _ => self.scope_mode.label().to_string(),
+        }
+    }
+
     /// Clear all facets to defaults.
     fn reset_facets(&mut self) {
         self.scope_mode = ScopeMode::Global;
+        self.scope_label = None;
         self.doc_kind_filter = DocKindFilter::Messages;
         self.importance_filter = ImportanceFilter::Any;
         self.ack_filter = AckFilter::Any;
@@ -2709,7 +2816,7 @@ impl SearchCockpitScreen {
             query_text: text,
             doc_kind: self.doc_kind_filter.route_value().to_string(),
             scope_mode: self.scope_mode,
-            scope_id: None,
+            scope_id: self.pinned_scope_project(),
             result_count: i64::try_from(self.results.len()).unwrap_or(0),
             executed_ts: now_micros(),
             ..Default::default()
@@ -2738,6 +2845,7 @@ impl SearchCockpitScreen {
             query_text: self.query_input.value().trim().to_string(),
             doc_kind: self.doc_kind_filter.route_value().to_string(),
             scope_mode: self.scope_mode,
+            scope_id: self.pinned_scope_project(),
             importance_filter: self.importance_filter.filter_string().unwrap_or_default(),
             ack_filter: match self.ack_filter {
                 AckFilter::Any => "any".to_string(),
@@ -2798,6 +2906,10 @@ impl SearchCockpitScreen {
     fn load_recipe(&mut self, recipe: &SearchRecipe) {
         self.query_input.set_value(&recipe.query_text);
         self.scope_mode = recipe.scope_mode;
+        if recipe.scope_id.is_some() {
+            self.scope_project = recipe.scope_id;
+        }
+        self.scope_label = None;
         self.importance_filter = ImportanceFilter::from_persist(&recipe.importance_filter);
         self.doc_kind_filter = match recipe.doc_kind.as_str() {
             "agents" => DocKindFilter::Agents,
@@ -2862,8 +2974,10 @@ impl SearchCockpitScreen {
             "off"
         };
         format!(
-            "scope={};type={};imp={};ack={};sort={};field={};mode={};explain={};thread={thread}",
+            "scope={}{};type={};imp={};ack={};sort={};field={};mode={};explain={};thread={thread}",
             self.scope_mode.as_str(),
+            self.pinned_scope_project()
+                .map_or_else(String::new, |project| format!("@{project}")),
             self.doc_kind_filter.route_value(),
             importance,
             ack,
@@ -2947,6 +3061,9 @@ impl SearchCockpitScreen {
         }
         if self.scope_mode != ScopeMode::Global {
             params.push(("scope", self.scope_mode.as_str().to_string()));
+            if let Some(project) = self.pinned_scope_project() {
+                params.push(("scope_id", project.to_string()));
+            }
         }
         if self.doc_kind_filter != DocKindFilter::Messages {
             params.push(("type", self.doc_kind_filter.route_value().to_string()));
@@ -3326,7 +3443,7 @@ impl MailScreen for SearchCockpitScreen {
                     }
                     KeyCode::Left => {
                         match self.active_facet {
-                            FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
+                            FacetSlot::Scope => self.cycle_scope(),
                             FacetSlot::DocKind => {
                                 self.doc_kind_filter = self.doc_kind_filter.prev();
                             }
@@ -4791,7 +4908,7 @@ fn render_query_bar(
             "{}  state:{}  scope:{}  type:{}  sort:{}  terms:{}  sql:{}  latency:{}",
             meter,
             state_label,
-            screen.scope_mode.label(),
+            screen.scope_value_label(),
             screen.doc_kind_filter.label(),
             screen.sort_direction.label(),
             screen.highlight_terms.len(),
@@ -4907,9 +5024,10 @@ fn render_facet_rail(
     let in_rail = screen.focus == Focus::FacetRail;
     let w = inner.width as usize;
     let search_mode = screen.search_mode.shown_label(screen.semantic_enabled);
+    let scope = screen.scope_value_label();
 
     let facets: &[(FacetSlot, &str, &str)] = &[
-        (FacetSlot::Scope, "Scope", screen.scope_mode.label()),
+        (FacetSlot::Scope, "Scope", &*scope),
         (
             FacetSlot::DocKind,
             "Doc Type",
@@ -8499,13 +8617,82 @@ mod tests {
 
         let mut screen = SearchCockpitScreen::new();
         let results = screen
-            .search_messages_recent(&conn)
+            .search_messages_recent(&conn, None, None)
             .expect("recent search succeeds");
 
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].from_agent.as_deref(),
             Some(UNKNOWN_SENDER_DISPLAY)
+        );
+    }
+
+    #[test]
+    fn scope_facet_narrows_messages_to_the_pinned_project_or_its_product() {
+        let conn = DbConn::open_memory().expect("open in-memory sqlite");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE product_project_links (product_id INTEGER, project_id INTEGER);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL,
+                 subject TEXT NOT NULL, importance TEXT NOT NULL,
+                 ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL,
+                 thread_id TEXT, body_md TEXT NOT NULL, project_id INTEGER NOT NULL
+             );
+             INSERT INTO projects VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+             INSERT INTO products VALUES (10, 'suite');
+             INSERT INTO product_project_links VALUES (10, 1), (10, 2);
+             INSERT INTO messages VALUES
+                 (1, 0, 'a', 'normal', 0, 1, 't', 'b', 1),
+                 (2, 0, 'b', 'normal', 0, 2, 't', 'b', 2),
+                 (3, 0, 'c', 'normal', 0, 3, 't', 'b', 3);",
+        )
+        .expect("seed scope schema");
+        let mut screen = SearchCockpitScreen::new();
+        let search = |screen: &mut SearchCockpitScreen| -> Result<Vec<i64>, String> {
+            let (project, product) = screen.resolve_scope(&conn)?;
+            let mut ids: Vec<i64> = screen
+                .search_messages_recent(&conn, project, product)?
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        };
+
+        // Nothing selected yet: Project scope cannot guess a project.
+        screen.cycle_scope();
+        assert_eq!(screen.scope_mode, ScopeMode::Project);
+        assert!(search(&mut screen).unwrap_err().contains("needs a project"));
+        screen.cycle_scope();
+        screen.cycle_scope();
+        assert_eq!(screen.scope_mode, ScopeMode::Global);
+        assert_eq!(search(&mut screen), Ok(vec![1, 2, 3]));
+
+        // Select alpha's message: Project pins alpha, Product its product.
+        screen.results = screen
+            .search_messages_recent(&conn, None, None)
+            .expect("global results");
+        screen.cursor = screen.results.iter().position(|r| r.id == 1).unwrap();
+        screen.cycle_scope();
+        assert_eq!(search(&mut screen), Ok(vec![1]));
+        assert_eq!(screen.scope_value_label(), "Project: alpha");
+        screen.cycle_scope();
+        assert_eq!(search(&mut screen), Ok(vec![1, 2]));
+        assert_eq!(screen.scope_value_label(), "Product: suite");
+
+        // gamma is in no product, and the scope says so instead of widening.
+        screen.cycle_scope();
+        screen.cursor = screen.results.iter().position(|r| r.id == 3).unwrap();
+        screen.cycle_scope();
+        assert_eq!(search(&mut screen), Ok(vec![3]));
+        screen.cycle_scope();
+        assert!(
+            search(&mut screen)
+                .unwrap_err()
+                .contains("gamma belongs to no product")
         );
     }
 

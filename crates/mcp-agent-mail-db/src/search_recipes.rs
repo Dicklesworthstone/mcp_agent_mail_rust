@@ -98,7 +98,8 @@ pub struct SearchRecipe {
     pub doc_kind: String,
     /// Scope: "project", "product", "global".
     pub scope_mode: ScopeMode,
-    /// When scope is `Project` or `Product`, the corresponding ID.
+    /// When scope is `Project` or `Product`, the project it is pinned to;
+    /// `Product` covers every project linked to that project's product.
     pub scope_id: Option<i64>,
     /// Importance filter: empty = any, or comma-separated values.
     pub importance_filter: String,
@@ -220,7 +221,7 @@ pub struct QueryHistoryEntry {
     pub doc_kind: String,
     /// Scope mode at execution time.
     pub scope_mode: ScopeMode,
-    /// Scope ID if project/product scoped.
+    /// Pinned project if project/product scoped (see `SearchRecipe::scope_id`).
     pub scope_id: Option<i64>,
     /// Number of results returned.
     pub result_count: i64,
