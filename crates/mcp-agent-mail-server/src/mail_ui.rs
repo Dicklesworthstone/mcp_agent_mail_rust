@@ -1490,6 +1490,22 @@ first body
             html.contains("window.agentMailNavigate = function"),
             "base.html must DEFINE window.agentMailNavigate, not just reference it: {html}"
         );
+        // "Copy link" buttons call agentMailAbsoluteUrl; it was never defined,
+        // so every click threw before copying.
+        assert!(
+            html.contains("window.agentMailAbsoluteUrl = function"),
+            "base.html must DEFINE window.agentMailAbsoluteUrl: {html}"
+        );
+        // Server-rendered links, GET forms and fetch() calls carry the token
+        // through these hooks; without them every plain href 401s.
+        for hook in [
+            "window.agentMailWithToken = function",
+            "document.addEventListener('click', carryOnLink, true)",
+            "document.addEventListener('submit', function (event)",
+            "window.fetch = function (input, init)",
+        ] {
+            assert!(html.contains(hook), "base.html must install {hook}: {html}");
+        }
     }
 }
 

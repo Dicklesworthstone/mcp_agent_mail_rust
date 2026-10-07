@@ -199,6 +199,62 @@
       window.agentMailNavigate = function (path) {
         window.location.href = window.agentMailAppendAuth(path);
       };
+
+      // Absolute, token-carrying URL for "Copy link" buttons.
+      window.agentMailAbsoluteUrl = function (path) {
+        return new URL(window.agentMailAppendAuth(path), window.location.origin).href;
+      };
+
+      // Server-rendered `href="/mail/…"` links, GET forms and plain fetch() calls
+      // are written without the token, so carry the page's `?token=` onto every
+      // same-origin one as it is followed, submitted or fetched. Auth itself is
+      // unchanged: the token travels in the URL exactly as on the first page.
+      window.agentMailWithToken = function (raw) {
+        const token = new URLSearchParams(window.location.search).get('token');
+        if (!token || raw === null || raw === undefined) return raw;
+        let url;
+        try {
+          url = new URL(String(raw), window.location.href);
+        } catch (_) {
+          return raw;
+        }
+        if (url.origin !== window.location.origin || url.searchParams.has('token')) return raw;
+        url.searchParams.set('token', token);
+        return url.href;
+      };
+      (function () {
+        const carryOnLink = function (event) {
+          const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null;
+          if (!anchor || /^(#|javascript:|mailto:)/i.test(anchor.getAttribute('href') || '')) return;
+          const next = window.agentMailWithToken(anchor.href);
+          if (next !== anchor.href) anchor.href = next;
+        };
+        document.addEventListener('click', carryOnLink, true);
+        document.addEventListener('auxclick', carryOnLink, true);
+        document.addEventListener('submit', function (event) {
+          const form = event.target;
+          const token = new URLSearchParams(window.location.search).get('token');
+          if (!(form instanceof HTMLFormElement) || !token) return;
+          const action = new URL(form.getAttribute('action') || window.location.href, window.location.href);
+          if (action.origin !== window.location.origin) return;
+          if ((form.getAttribute('method') || 'get').toLowerCase() === 'get') {
+            if (!form.querySelector('input[name="token"]')) {
+              const input = document.createElement('input');
+              input.type = 'hidden';
+              input.name = 'token';
+              input.value = token;
+              form.appendChild(input);
+            }
+          } else {
+            form.action = window.agentMailWithToken(action.href);
+          }
+        }, true);
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+          const target = typeof input === 'string' || input instanceof URL ? window.agentMailWithToken(String(input)) : input;
+          return nativeFetch(target, init);
+        };
+      })();
     </script>
 
     <!-- Tippy.js for beautiful tooltips -->
@@ -1955,7 +2011,7 @@
 
     <!-- Keyboard Shortcuts Help Panel -->
     <div x-data="{ showShortcuts: false }"
-         @keydown.window.prevent.shift.question="showShortcuts = !showShortcuts"
+         @toggle-shortcuts.window="showShortcuts = !showShortcuts"
          @keydown.escape.window="showShortcuts = false"
          x-show="showShortcuts"
          x-cloak
@@ -2036,19 +2092,15 @@
               </h3>
               <div class="space-y-3">
                 <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Next item</span>
+                  <span class="text-sm text-slate-700 dark:text-slate-300">Next message (Unified Inbox)</span>
                   <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">J</kbd>
                 </div>
                 <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Previous item</span>
+                  <span class="text-sm text-slate-700 dark:text-slate-300">Previous message (Unified Inbox)</span>
                   <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">K</kbd>
                 </div>
                 <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Open item</span>
-                  <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">Enter</kbd>
-                </div>
-                <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Go back</span>
+                  <span class="text-sm text-slate-700 dark:text-slate-300">Close panel</span>
                   <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">Esc</kbd>
                 </div>
               </div>
@@ -2076,27 +2128,6 @@
               </div>
             </div>
 
-            <!-- Message Actions -->
-            <div>
-              <h3 class="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wide mb-4 flex items-center gap-2">
-                <i data-lucide="mail" class="w-4 h-4 text-danger-600"></i>
-                Messages
-              </h3>
-              <div class="space-y-3">
-                <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Reply</span>
-                  <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">Shift+R</kbd>
-                </div>
-                <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Forward</span>
-                  <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">Shift+F</kbd>
-                </div>
-                <div class="flex items-center justify-between p-3 bg-slate-50 dark:bg-slate-800 rounded-lg">
-                  <span class="text-sm text-slate-700 dark:text-slate-300">Mark as read</span>
-                  <kbd class="px-2 py-1 bg-white dark:bg-slate-700 rounded border border-slate-300 dark:border-slate-600 text-xs">E</kbd>
-                </div>
-              </div>
-            </div>
           </div>
         </div>
       </div>
@@ -2628,7 +2659,7 @@
               iconBg: 'rgba(99, 102, 241, 0.1)',
               iconColor: 'text-primary-600',
               shortcut: 'G+P',
-              action: () => window.agentMailNavigate('/mail'),
+              action: () => window.agentMailNavigate('/mail/projects'),
               keywords: 'projects home list'
             },
             {
@@ -2686,8 +2717,7 @@
               shortcut: '?',
               action: () => {
                 this.close();
-                // Trigger the shortcuts panel
-                window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', shiftKey: true }));
+                window.dispatchEvent(new CustomEvent('toggle-shortcuts'));
               },
               keywords: 'help shortcuts keyboard keys commands'
             },
@@ -3143,9 +3173,10 @@
           return;
         }
 
-        // Shift + ? for keyboard shortcuts help
-        if (e.shiftKey && e.key === '?') {
+        // ? for keyboard shortcuts help (typed as-is into fields)
+        if (e.key === '?' && !isTyping) {
           e.preventDefault();
+          window.dispatchEvent(new CustomEvent('toggle-shortcuts'));
           return;
         }
 
@@ -3200,7 +3231,7 @@
 
         if ((e.key === 'p' || e.key === 'P') && window._lastKeyG) {
           e.preventDefault();
-          window.agentMailNavigate('/mail');
+          window.agentMailNavigate('/mail/projects');
           window._lastKeyG = false;
         }
 

@@ -314,7 +314,7 @@
                 <i data-lucide="list" class="w-5 h-5 text-primary-600 dark:text-primary-400"></i>
                 <h3 class="text-lg font-semibold text-slate-900 dark:text-white">Results</h3>
                 <span class="px-2 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-medium rounded-full">
-                  {{ result_count }} found
+                  {{ result_count }} shown
                 </span>
               </div>
               {% if deep_link %}
@@ -332,11 +332,13 @@
 
           <div class="divide-y divide-slate-200 dark:divide-slate-700">
             {% for r in results %}
-              <a href="/mail/{{ project.slug }}/message/{{ r.id }}"
-                 class="block p-6 hover:bg-slate-50 dark:hover:bg-slate-900 transition-all duration-200 group">
+              {# Sibling links, not one outer link: an <a> inside an <a> makes the
+                 HTML parser close the outer one, which left the snippet and
+                 "View message" unclickable on threaded results. #}
+              <div class="block p-6 hover:bg-slate-50 dark:hover:bg-slate-900 transition-all duration-200 group">
                 <div class="flex items-start justify-between mb-2">
                   <h4 class="text-base font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors flex-1 mr-3">
-                    {{ r.subject }}
+                    <a href="/mail/{{ project.slug }}/message/{{ r.id }}">{{ r.subject }}</a>
                   </h4>
                   <div class="flex items-center gap-2 flex-shrink-0">
                     {% if r.ack_required %}
@@ -363,7 +365,7 @@
                     <span>{{ r.created_relative }}</span>
                   </div>
                   {% if r.thread_id %}
-                    <a href="{{ r.thread_url }}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()">
+                    <a href="{{ r.thread_url }}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
                       <i data-lucide="message-circle" class="w-3.5 h-3.5"></i>
                       <span class="font-mono text-xs">{{ r.thread_id }}</span>
                     </a>
@@ -371,16 +373,16 @@
                 </div>
 
                 {% if r.snippet %}
-                  <div class="text-sm text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-3 line-clamp-3">
+                  <a href="/mail/{{ project.slug }}/message/{{ r.id }}" class="block text-sm text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-3 line-clamp-3">
                     {{ r.snippet | safe }}
-                  </div>
+                  </a>
                 {% endif %}
 
-                <div class="flex items-center gap-2 mt-2 text-primary-600 dark:text-primary-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                <a href="/mail/{{ project.slug }}/message/{{ r.id }}" class="flex items-center gap-2 mt-2 text-primary-600 dark:text-primary-400 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity">
                   <span class="text-sm font-medium">View message</span>
                   <i data-lucide="arrow-right" class="w-4 h-4 group-hover:translate-x-1 transition-transform"></i>
-                </div>
-              </a>
+                </a>
+              </div>
             {% endfor %}
           </div>
 

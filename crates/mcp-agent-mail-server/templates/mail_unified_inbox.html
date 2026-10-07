@@ -44,7 +44,7 @@
         @input="filterMessages()"
         @keydown.escape="searchQuery = ''; filterMessages()"
         type="search"
-        placeholder="Search all messages across all projects and agents..."
+        placeholder="Filter the newest messages across projects and agents..."
         class="w-full pl-12 pr-4 py-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:border-primary-500 dark:focus:border-primary-500 rounded-xl text-slate-900 dark:text-white placeholder-slate-500 dark:placeholder-slate-400 transition-all duration-200 focus:ring-2 focus:ring-primary-500/20"
         autocomplete="off"
         id="unified-search"
@@ -56,8 +56,8 @@
             <i data-lucide="x" class="w-4 h-4 text-slate-500"></i>
           </button>
         </template>
-        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400 text-xs font-mono rounded border border-slate-300 dark:border-slate-600">
-          <span class="shortcut-key">⌘</span><span>K</span>
+        <kbd class="hidden sm:inline-flex items-center gap-1 px-2 py-1 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-400 text-xs font-mono rounded border border-slate-300 dark:border-slate-600" title="Press / to search (⌘K opens the command palette)">
+          <span>/</span>
         </kbd>
       </div>
     </div>
@@ -580,7 +580,7 @@
     <div class="flex items-center justify-between mb-6">
       <div>
         <h2 class="text-2xl font-semibold text-slate-900 dark:text-white mb-2">Your Projects</h2>
-        <p class="text-slate-600 dark:text-slate-400">{{ projects|length }} project{{ 's' if projects|length != 1 else '' }} in total</p>
+        <p class="text-slate-600 dark:text-slate-400">{{ projects|length }} project{{ 's' if projects|length != 1 else '' }} with agents · <a href="/mail/projects" class="underline hover:text-primary-600 dark:hover:text-primary-400">all projects and related-project links</a></p>
       </div>
 
       {% if projects|length > 0 %}
@@ -890,13 +890,13 @@ function unifiedInboxManager() {
           const subject = (msg.subject ?? '').toString().toLowerCase();
           const sender = (msg.sender ?? '').toString().toLowerCase();
           const recipients = (msg.recipients ?? '').toString().toLowerCase();
-          const excerpt = (msg.excerpt ?? '').toString().toLowerCase();
+          const body = (msg.body_md ?? msg.excerpt ?? '').toString().toLowerCase();
           const projectName = (msg.project_name ?? '').toString().toLowerCase();
           return (
             subject.includes(query) ||
             sender.includes(query) ||
             recipients.includes(query) ||
-            excerpt.includes(query) ||
+            body.includes(query) ||
             projectName.includes(query)
           );
         });
