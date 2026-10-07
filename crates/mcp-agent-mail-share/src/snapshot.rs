@@ -1032,8 +1032,16 @@ fn finish_snapshot_context(
     scrub_preset: crate::ScrubPreset,
     purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
+    // Scoping deletes the other projects first; keep their paths so the scrub
+    // still redacts them where kept rows mention them.
+    let all_project_paths = if project_filters.is_empty() {
+        Vec::new()
+    } else {
+        crate::scope::project_paths_before_scope(snapshot_path)?
+    };
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
-    let mut scrub_summary = crate::scrub_snapshot(snapshot_path, scrub_preset)?;
+    let mut scrub_summary =
+        crate::scrub::scrub_snapshot_redacting(snapshot_path, scrub_preset, &all_project_paths)?;
     if purpose == SnapshotPurpose::Publish {
         // Before finalize rebuilds the file, so no page keeps the old values.
         let removed = crate::scrub::clear_registration_tokens(snapshot_path)?;

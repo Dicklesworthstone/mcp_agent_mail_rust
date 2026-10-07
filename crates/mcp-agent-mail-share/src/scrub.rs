@@ -235,6 +235,22 @@ pub fn scrub_snapshot(
     snapshot_path: &Path,
     preset: ScrubPreset,
 ) -> Result<ScrubSummary, ShareError> {
+    scrub_snapshot_redacting(snapshot_path, preset, &[])
+}
+
+/// [`scrub_snapshot`], also redacting the paths of `scoped_out_projects`
+/// (`(slug, human_key)` pairs). Project scoping deletes the other projects
+/// before the scrub runs, so their paths would otherwise drop off the
+/// redaction list while kept messages can still mention them.
+///
+/// # Errors
+///
+/// - [`ShareError::Sqlite`] on any SQLite error.
+pub fn scrub_snapshot_redacting(
+    snapshot_path: &Path,
+    preset: ScrubPreset,
+    scoped_out_projects: &[(String, String)],
+) -> Result<ScrubSummary, ShareError> {
     let cfg = preset_config(preset);
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let path_str = snapshot_path.display().to_string();
@@ -329,7 +345,16 @@ pub fn scrub_snapshot(
         }
 
         let project_path_redactions = if cfg.redact_project_paths {
-            redact_project_paths(&conn)?
+            let mut redactions = redact_project_paths(&conn)?;
+            for (slug, human_key) in scoped_out_projects {
+                if let Some(redaction) = project_path_redaction_for(slug, human_key)
+                    && !redactions.iter().any(|r| r.original == redaction.original)
+                {
+                    redactions.push(redaction);
+                }
+            }
+            redactions.sort_by_key(|redaction| std::cmp::Reverse(redaction.original.len()));
+            redactions
         } else {
             Vec::new()
         };
@@ -2297,6 +2322,41 @@ mod tests {
             "both non-message-field secrets should be counted, got {}",
             summary.secrets_replaced
         );
+    }
+
+    #[test]
+    fn scoped_out_project_paths_are_redacted_in_kept_messages() {
+        // `--project test` deleted the other project before the scrub ran;
+        // a kept message that mentions its path must not ship it.
+        let body_after = |scoped_out: &[(String, String)]| {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET body_md = 'Compare with /home/alice/clients/acme-merger/plan.md' \
+                 WHERE id = 1",
+            )
+            .unwrap();
+            scrub_snapshot_redacting(&db, ScrubPreset::Standard, scoped_out).unwrap();
+            let rows = conn
+                .query_sync("SELECT body_md FROM messages WHERE id = 1", &[])
+                .unwrap();
+            rows[0].get_named::<String>("body_md").unwrap()
+        };
+
+        let redacted = body_after(&[(
+            "acme-merger".to_string(),
+            "/home/alice/clients/acme-merger".to_string(),
+        )]);
+        assert!(
+            !redacted.contains("/home/alice/clients/acme-merger"),
+            "{redacted}"
+        );
+        assert!(redacted.contains("plan.md"), "{redacted}");
+
+        // Without the scoped-out list the path survives (the old behaviour).
+        let kept = body_after(&[]);
+        assert!(kept.contains("/home/alice/clients/acme-merger"), "{kept}");
     }
 
     #[test]

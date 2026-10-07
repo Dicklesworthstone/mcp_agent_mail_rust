@@ -340,6 +340,30 @@ pub fn apply_project_scope(
     }
 }
 
+/// Every project's `(slug, human_key)` in the snapshot, read before scoping
+/// deletes the unselected ones, so their paths can still be redacted from
+/// the rows that remain.
+///
+/// # Errors
+///
+/// - [`ShareError::Sqlite`] on any SQLite error.
+pub fn project_paths_before_scope(
+    snapshot_path: &Path,
+) -> Result<Vec<(String, String)>, ShareError> {
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let path_str = snapshot_path.display().to_string();
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
+    })?;
+    if !table_exists(&conn, "projects")? {
+        return Ok(Vec::new());
+    }
+    Ok(load_scope_projects(&conn)?
+        .into_iter()
+        .map(|project| (project.slug, project.human_key))
+        .collect())
+}
+
 fn load_scope_projects(conn: &Conn) -> Result<Vec<ProjectRecord>, ShareError> {
     let project_rows = conn
         .query_sync(
