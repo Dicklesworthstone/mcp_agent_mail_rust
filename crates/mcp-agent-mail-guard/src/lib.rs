@@ -482,7 +482,9 @@ HOOK_NAME = __HOOK_NAME_JSON__
 # user config.env); a commit shell's own STORAGE_ROOT still takes precedence.
 INSTALLED_STORAGE_ROOT = __STORAGE_ROOT_JSON__
 AGENT_NAME = os.environ.get("AGENT_NAME", "").strip()
-GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
+# Trimmed and case-insensitive, as `am guard check`/status read it: `Warn`
+# must not report warn mode while the hook blocks.
+GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block").strip().lower()
 
 def fail_closed(message):
     """Fail-closed exit for guard infrastructure failures (GH#224).
@@ -5731,6 +5733,16 @@ mod tests {
             Some(1),
             "alone, the stale artifact blocks"
         );
+        // Warn mode is read like `am guard check` reads it: trimmed, any case.
+        let warned = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("AGENT_MAIL_GUARD_MODE", " Warn ")
+            .arg(&script_path)
+            .output()
+            .expect("run guard script in warn mode");
+        assert_eq!(warned.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&warned.stderr).contains("WARNING"));
 
         let mut released = active;
         released["released_ts"] = serde_json::json!("2026-10-07T00:00:00Z");
