@@ -3147,7 +3147,8 @@ pub enum RobotSubcommand {
         /// Show only decisions/executions at or after this ISO-8601 timestamp.
         #[arg(long)]
         since: Option<String>,
-        /// Filter open-stratum counters to a matching canonical stratum key.
+        /// Filter open-stratum counters to stratum keys containing this text
+        /// (case-insensitive), e.g. `liveness` or a full key like `liveness:probe:0`.
         #[arg(long)]
         stratum: Option<String>,
         /// Only render the summary block (and the latest canary verdict).
@@ -14017,9 +14018,10 @@ fn atc_timestamp_matches_since(timestamp_micros: i64, since_micros: Option<i64>)
 }
 
 fn atc_stratum_matches(candidate: &str, filter: Option<&str>) -> bool {
+    // A blank `--stratum ""` filters nothing out rather than everything.
     filter.is_none_or(|needle| {
         let needle = needle.trim().to_ascii_lowercase();
-        !needle.is_empty() && candidate.to_ascii_lowercase().contains(&needle)
+        needle.is_empty() || candidate.to_ascii_lowercase().contains(&needle)
     })
 }
 
@@ -18486,6 +18488,15 @@ mod tests {
         assert_eq!(surfaced.verdict, "hold_live");
         assert_eq!(surfaced.artifact_path, "/tmp/atc/canary_report.json");
         assert_eq!(surfaced.atc_rows, Some(0));
+    }
+
+    #[test]
+    fn atc_stratum_filter_is_a_case_insensitive_substring() {
+        assert!(atc_stratum_matches("liveness:probe:0", Some("LIVENESS")));
+        assert!(atc_stratum_matches("liveness:probe:0", Some("probe:0")));
+        assert!(!atc_stratum_matches("liveness:probe:0", Some("conflict")));
+        assert!(atc_stratum_matches("liveness:probe:0", None));
+        assert!(atc_stratum_matches("liveness:probe:0", Some("  ")));
     }
 
     #[test]
