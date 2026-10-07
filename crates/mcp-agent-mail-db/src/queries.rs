@@ -14277,7 +14277,10 @@ async fn create_file_reservations_impl(
                             "active reservation for project_id={project_id} agent_id={agent_id} path={path} has no id"
                         )));
                     };
-                    row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
+                    // Re-reserving asks for the lease to run at least `ttl`
+                    // from now: keep a later expiry, never stack the TTL on
+                    // what is left (repeat calls would extend without bound).
+                    row.expires_ts = row.expires_ts.max(now.saturating_add(lease_extension));
                     // Re-acquisition applies the new request's intent as well
                     // as its TTL. In particular, shared -> exclusive must not
                     // report a successful acquisition that still lets peers
@@ -26976,6 +26979,83 @@ mod tests {
                     .into_result()
                     .expect("release exact id set");
             assert_eq!(released_ids, vec![second_id]);
+        });
+    }
+
+    #[test]
+    fn re_reserving_a_held_path_runs_ttl_from_now_without_stacking() {
+        use asupersync::runtime::RuntimeBuilder;
+        const HOUR: i64 = 3_600_000_000;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", dir.path().join("rereserve.db").display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-rereserve-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+            let reserve = |ttl: i64| {
+                let pool = pool.clone();
+                let cx = cx.clone();
+                async move {
+                    create_file_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        holder_id,
+                        &["src/a.rs"],
+                        ttl,
+                        true,
+                        "r",
+                    )
+                    .await
+                    .into_result()
+                    .expect("reserve")[0]
+                        .expires_ts
+                }
+            };
+            let first = reserve(3600).await;
+            // A shorter TTL does not cut the lease short, and does not add to it.
+            let short = reserve(60).await;
+            assert_eq!(short, first, "60 s on top of an hour left must not stack");
+            // A longer TTL runs from now (about first + 1 h), not from the
+            // current expiry (first + 2 h).
+            let long = reserve(7200).await;
+            assert!(long >= base + 2 * HOUR, "{long}");
+            assert!(
+                long < first + HOUR * 3 / 2,
+                "7200 s stacked on {first}: {long}"
+            );
         });
     }
 
