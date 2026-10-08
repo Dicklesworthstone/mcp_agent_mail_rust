@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+mod worker;
+
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
@@ -27,11 +29,11 @@ use mcp_agent_mail_db::ack_scan::{
     AckEscalationOutcome, AckEscalationRequest, AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE,
     grant_ack_escalation, overdue_ack_page,
 };
-use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros, queries};
+use mcp_agent_mail_db::{DbPool, micros_to_iso, now_micros, queries};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{info, warn};
 
 const ACK_SCAN_SLICE_BUDGET: Duration = Duration::from_millis(25);
@@ -70,7 +72,7 @@ pub fn start(config: &Config) {
             .name("ack-ttl-scan".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
-                ack_ttl_loop(&config);
+                worker::run(&config);
             }) {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -97,97 +99,6 @@ pub fn shutdown() {
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
-}
-
-fn ack_ttl_loop(config: &Config) {
-    let interval = Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));
-    let startup_delay = interval.min(Duration::from_secs(8));
-
-    let mut pool_config = DbPoolConfig::from_env();
-    pool_config.database_url.clone_from(&config.database_url);
-    pool_config.min_connections = 1;
-    pool_config.max_connections = 1;
-    pool_config.warmup_connections = 0;
-    // HTTP/TUI startup already runs readiness_check with migrations before
-    // this worker starts, so keep the worker path lean.
-    pool_config.run_migrations = false;
-    let pool = match create_pool(&pool_config) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "ack TTL worker: failed to create DB pool, exiting");
-            return;
-        }
-    };
-
-    info!(
-        interval_secs = interval.as_secs(),
-        ttl_seconds = config.ack_ttl_seconds,
-        escalation_enabled = config.ack_escalation_enabled,
-        escalation_mode = %config.ack_escalation_mode,
-        "ACK TTL scan worker started"
-    );
-
-    if startup_delay > Duration::ZERO {
-        info!(
-            startup_delay_secs = startup_delay.as_secs(),
-            "ACK TTL worker startup delay engaged"
-        );
-        if sleep_with_shutdown(startup_delay) {
-            return;
-        }
-    }
-
-    let mut state = AckScanState::default();
-    loop {
-        if SHUTDOWN.load(Ordering::Acquire) {
-            info!("ACK TTL scan worker shutting down");
-            return;
-        }
-        let started = Instant::now();
-        let result = run_ack_ttl_slice(
-            config,
-            &pool,
-            &mut state,
-            || SHUTDOWN.load(Ordering::Acquire),
-            || started.elapsed() < ACK_SCAN_SLICE_BUDGET,
-        );
-        let failed = result.is_err();
-        match result {
-            Ok((scanned, overdue)) => {
-                if overdue > 0 {
-                    info!(
-                        event = "ack_ttl_scan",
-                        scanned,
-                        overdue,
-                        lap_incomplete = state.cursor.is_some(),
-                        "ACK TTL scan slice completed"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(error = %error, "ACK TTL scan slice failed; retaining continuation");
-            }
-        }
-        // No database/write lease survives the slice call. A failed read must
-        // not inherit the fast continuation cadence and create a retry storm.
-        let delay = next_ack_scan_delay(interval, state.cursor.is_some(), failed);
-        if sleep_with_shutdown(delay) {
-            return;
-        }
-    }
-}
-
-fn sleep_with_shutdown(duration: Duration) -> bool {
-    let mut remaining = duration;
-    while !remaining.is_zero() {
-        if SHUTDOWN.load(Ordering::Acquire) {
-            return true;
-        }
-        let chunk = remaining.min(Duration::from_secs(1));
-        std::thread::sleep(chunk);
-        remaining = remaining.saturating_sub(chunk);
-    }
-    false
 }
 
 /// Run one bounded page without wall-clock scheduling noise in legacy fixtures.
