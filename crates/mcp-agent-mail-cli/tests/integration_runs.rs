@@ -6841,6 +6841,31 @@ fn check_serve_http_client_config_setup(setup: bool) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    // Liveness answers as soon as the listener serves, but `--setup` repairs
+    // client configs only after the server's own readiness self-probe, so
+    // stopping on the first 200 raced the repair. With setup, wait (bounded)
+    // for every client config to name this server; without it, give a wrong
+    // startup rewrite the same chance to land before asserting it did not.
+    if healthy {
+        if setup {
+            let expected = format!("http://127.0.0.1:{port}/mcp/");
+            let clients: Vec<_> = config_paths
+                .iter()
+                .filter(|path| **path != env.user_config_env_path())
+                .collect();
+            let settle_deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < settle_deadline
+                && matches!(child.try_wait(), Ok(None))
+                && !clients.iter().all(|path| {
+                    std::fs::read_to_string(path).is_ok_and(|content| content.contains(&expected))
+                })
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+        } else {
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
     // Reap this test's own server before assertions, including startup failures.
     let _ = child.kill();
     let _ = child.wait();
