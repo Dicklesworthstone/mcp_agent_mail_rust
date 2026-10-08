@@ -360,7 +360,9 @@ jobs:
         shell: bash
         env:
           AM_E2E_KEEP_TMP: "1"
-        run: bash tests/installer/test_install_artifact_fallback.sh
+        run: |
+          bash tests/installer/test_install_artifact_fallback.sh
+          bash tests/installer/test_install_transaction_history_prune.sh
 
       - name: Run PowerShell installer transaction suite
         if: runner.os == 'Windows'

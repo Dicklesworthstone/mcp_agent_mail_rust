@@ -3543,6 +3543,87 @@ archive_binary_transaction() {
   BINARY_TRANSACTION_LAST_ARCHIVE_PATH="$history"
 }
 
+# Whether a live process runs a binary from inside a transaction history entry.
+# A long-lived `am` can run for weeks from an archived `old-cli` (br-gq0gx),
+# so such an entry is never pruned. When liveness cannot be established
+# (no /proc and no lsof), the entry counts as in use.
+binary_transaction_history_in_use() {
+  local entry="$1"
+  local exe="" target="" resolved=""
+  if [ -d /proc/self ] && [ -e /proc/self/exe ]; then
+    # /proc/<pid>/exe names the resolved path, so compare against it.
+    resolved=$(cd "$entry" 2>/dev/null && pwd -P) || return 0
+    for exe in /proc/[0-9]*/exe; do
+      target=$(readlink "$exe" 2>/dev/null) || continue
+      target="${target% (deleted)}"
+      case "$target" in
+        "$resolved"/*) return 0 ;;
+      esac
+    done
+    return 1
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    # lsof exits 1 when nothing under the directory is open.
+    if lsof -t +D "$entry" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# Committed and rolled-back transactions keep the previous binary pair
+# (~200 MB each) and used to accumulate forever: 46 entries / 9.2 GB on one
+# host (br-gq0gx). Keep the newest AM_INSTALL_TRANSACTION_HISTORY_KEEP (default
+# 2, minimum 1) plus the entry this run archived; prune older entries that no
+# running process uses.
+prune_binary_transaction_history() {
+  local install_dir="$1"
+  local keep="${AM_INSTALL_TRANSACTION_HISTORY_KEEP:-2}"
+  local entries="" entry="" name="" kept=0 pruned=0
+  case "$keep" in
+    ''|*[!0-9]*) keep=2 ;;
+  esac
+  if [ "$keep" -lt 1 ]; then
+    keep=1
+  fi
+  # Newest first. The entry names are installer-generated and carry no
+  # whitespace; anything else is skipped by the exact-prefix check below.
+  entries=$(ls -1dt -- \
+    "$install_dir"/.mcp-agent-mail-install-transaction.committed.* \
+    "$install_dir"/.mcp-agent-mail-install-transaction.rolled-back.* 2>/dev/null) || true
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="${entry##*/}"
+    case "$name" in
+      .mcp-agent-mail-install-transaction.committed.*|.mcp-agent-mail-install-transaction.rolled-back.*) ;;
+      *) continue ;;
+    esac
+    if [ -L "$entry" ] || [ ! -d "$entry" ]; then
+      continue
+    fi
+    if [ "$entry" = "${BINARY_TRANSACTION_LAST_ARCHIVE_PATH:-}" ] || [ "$kept" -lt "$keep" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    if binary_transaction_history_in_use "$entry"; then
+      info "Keeping install history $name: a running process uses a binary inside it"
+      continue
+    fi
+    if rm -rf -- "$entry"; then
+      pruned=$((pruned + 1))
+    else
+      warn "Could not prune install history $entry"
+    fi
+  done <<EOF
+$entries
+EOF
+  if [ "$pruned" -gt 0 ]; then
+    info "Pruned $pruned old install transaction(s) under $install_dir (kept the newest $keep)"
+  fi
+  return 0
+}
+
 recover_binary_pair_transaction_impl() {
   local install_dir="$1"
   local inject_after_phase_for_test="${2:-}"
@@ -9168,6 +9249,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   fi
   ok "  Source receipt: $source_receipt_path"
 fi
+prune_binary_transaction_history "$DEST"
 maybe_add_path
 install_local_bin_links
 
