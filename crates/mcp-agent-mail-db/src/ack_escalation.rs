@@ -5,6 +5,11 @@
 //! conflicts in the same immediate transaction as the grant. An ACK committed
 //! before admission makes the proposal a no-op. A later ACK does not
 //! retroactively revoke a valid grant.
+//!
+//! Direct deliveries take precedence over project-mailbox visibility, including
+//! a direct delivery already acknowledged by this viewer. Shared obligations
+//! use the inbox's visibility predicate and the viewer's own lazy receipt; a
+//! grant never materializes per-agent deliveries or marks a message read.
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
@@ -45,20 +50,28 @@ pub enum AckEscalationOutcome {
     NoLongerOverdue,
 }
 
-const AUTHORIZED_SQL: &str = "\
+const AUTHORIZED_SQL: &str = concat!(
+    "\
 SELECT 1 AS authorized \
-FROM messages m JOIN message_recipients mr ON mr.message_id = m.id \
-JOIN agents recipient ON recipient.id = mr.agent_id \
+FROM messages m JOIN agents viewer ON viewer.id = ?4 \
 JOIN projects p ON p.id = m.project_id \
 JOIN agents holder ON holder.id = ?5 \
 WHERE m.id = ?1 AND m.project_id = ?2 AND m.created_ts = ?3 \
   AND m.created_ts <= ?11 \
-  AND m.ack_required = 1 AND mr.agent_id = ?4 AND mr.ack_ts IS NULL \
-  AND recipient.project_id = ?2 AND recipient.name = ?6 COLLATE BINARY \
+  AND m.ack_required = 1 \
+  AND viewer.project_id = ?2 AND viewer.name = ?6 COLLATE BINARY \
   AND holder.project_id = ?2 AND holder.name = ?7 COLLATE BINARY \
   AND p.slug = ?8 COLLATE BINARY AND p.human_key = ?9 COLLATE BINARY \
   AND (SELECT generation_id FROM db_identity WHERE singleton = 0) IS ?10 \
-LIMIT 1";
+  AND (EXISTS (SELECT 1 FROM message_recipients mr \
+               WHERE mr.message_id = m.id AND mr.agent_id = viewer.id AND mr.ack_ts IS NULL) \
+       OR EXISTS (SELECT 1 FROM project_mailbox_deliveries d \
+                  LEFT JOIN project_mailbox_receipts pr \
+                    ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+                  WHERE d.message_id = m.id AND pr.ack_ts IS NULL AND ",
+    crate::project_mailbox::visible_to_viewer_sql!(),
+    ")) LIMIT 1"
+);
 
 const INSERT_SQL: &str = "\
 INSERT INTO file_reservations \
@@ -372,6 +385,237 @@ pub async fn grant_ack_escalation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn use_shared_delivery(pool: &DbPool, cx: &Cx) {
+        execute(
+            pool,
+            cx,
+            "DELETE FROM message_recipients WHERE message_id = 901",
+        );
+        execute(
+            pool,
+            cx,
+            "INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) VALUES(901, 101, 'to', 1000000)",
+        );
+    }
+
+    #[test]
+    fn shared_grant_preserves_lazy_receipts_and_does_not_renew_coverage() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            let request = request(generation, observed);
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(first.path_pattern, "agents/BlueBear/inbox/1970/01/*.md");
+            assert_eq!(first.agent_id, observed.agent_id);
+            assert_eq!(first.project_id, observed.project_id);
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::AlreadyCovered)
+            ));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"), 0);
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
+
+            // Reading alone is not an ACK. A subsequent real ACK is terminal
+            // for this proposal even though its earlier reservation still exists.
+            execute(
+                pool,
+                cx,
+                "INSERT INTO project_mailbox_receipts VALUES(901, 102, 77, NULL)",
+            );
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::AlreadyCovered)
+            ));
+            run(crate::queries::acknowledge_message(cx, pool, 102, 901))
+                .into_result()
+                .unwrap();
+            let ack = scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts");
+            assert!(ack > 0);
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT read_ts FROM project_mailbox_receipts"), 77);
+            assert_eq!(scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"), ack);
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"), 0);
+        });
+    }
+
+    #[test]
+    fn shared_visibility_and_identity_changes_refuse_the_observed_grant() {
+        for sql in [
+            "UPDATE agents SET retired_at = 2 WHERE id = 102",
+            "UPDATE agents SET contact_policy = 'BLOCK_ALL' WHERE id = 102",
+            "UPDATE agents SET inception_ts = 1000001 WHERE id = 102",
+            "UPDATE agents SET project_id = 201 WHERE id = 102",
+            "UPDATE agents SET name = 'bluebear' WHERE id = 102",
+            "UPDATE messages SET sender_id = 102 WHERE id = 901",
+            "UPDATE messages SET created_ts = 999999 WHERE id = 901",
+            "UPDATE messages SET project_id = 201 WHERE id = 901",
+            "UPDATE messages SET ack_required = 0 WHERE id = 901",
+            "UPDATE project_mailbox_deliveries SET project_id = 201 WHERE message_id = 901",
+            "DELETE FROM project_mailbox_deliveries WHERE message_id = 901",
+            "UPDATE db_identity SET generation_id = 'replacement' WHERE singleton = 0",
+            "UPDATE projects SET human_key = '/changed' WHERE id = 101",
+        ] {
+            fixture(|pool, cx, generation, observed| {
+                use_shared_delivery(pool, cx);
+                execute(pool, cx, sql);
+                stale(run(grant_ack_escalation(
+                    cx,
+                    pool,
+                    &request(generation, observed),
+                )));
+                assert_eq!(
+                    scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                    0,
+                    "{sql}"
+                );
+                assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn shared_ack_before_admission_prevents_a_first_grant() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            run(crate::queries::acknowledge_message(cx, pool, 102, 901))
+                .into_result()
+                .unwrap();
+            let ack = scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts");
+            assert!(ack > 0);
+            stale(run(grant_ack_escalation(
+                cx,
+                pool,
+                &request(generation, observed),
+            )));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 0);
+            assert_eq!(scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"), ack);
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"), 0);
+        });
+    }
+
+    #[test]
+    fn direct_ack_state_wins_over_the_shared_receipt_in_both_directions() {
+        fixture(|pool, cx, generation, observed| {
+            execute(
+                pool,
+                cx,
+                "INSERT INTO project_mailbox_deliveries VALUES(901, 101, 'to', 1000000)",
+            );
+            execute(
+                pool,
+                cx,
+                "INSERT INTO project_mailbox_receipts VALUES(901, 102, 41, 42)",
+            );
+            // Existing direct mail is not made ineligible by a shared opt-out
+            // or a stale shared receipt. Only its own ACK settles it.
+            execute(
+                pool,
+                cx,
+                "UPDATE agents SET contact_policy = 'block_all' WHERE id = 102",
+            );
+            let request = request(generation, observed);
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            execute(pool, cx, "UPDATE agents SET contact_policy = 'auto' WHERE id = 102");
+            execute(
+                pool,
+                cx,
+                "UPDATE message_recipients SET ack_ts = 43 WHERE message_id = 901",
+            );
+            execute(
+                pool,
+                cx,
+                "UPDATE project_mailbox_receipts SET ack_ts = NULL WHERE message_id = 901",
+            );
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(scalar(pool, cx, "SELECT ack_ts FROM message_recipients"), 43);
+        });
+    }
+
+    #[test]
+    fn shared_cutoff_holder_and_conflicts_remain_transactional() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            let mut request = request(generation, observed);
+            request.overdue_before_ts = observed.created_ts - 1;
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            request.overdue_before_ts = observed.created_ts;
+            request.holder_id = 101;
+            request.holder_name = "WrongName";
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            request.holder_id = 102;
+            request.holder_name = "BlueBear";
+            let competing = run(crate::queries::create_file_reservations(
+                cx,
+                pool,
+                101,
+                101,
+                &["agents/BlueBear/inbox/**"],
+                3600,
+                true,
+                "other work",
+            ))
+            .into_result()
+            .unwrap();
+            assert_eq!(competing.len(), 1);
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Err(DbError::ResourceBusy(_))
+            ));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                competing[0].expires_ts
+            );
+            run(crate::queries::release_reservations(
+                cx,
+                pool,
+                101,
+                101,
+                None,
+                Some(&[competing[0].id.unwrap()]),
+            ))
+            .into_result()
+            .unwrap();
+            granted(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 2);
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+        });
+    }
+
+    #[test]
+    fn unavailable_shared_receipts_fail_instead_of_certifying_no_obligation() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            execute(
+                pool,
+                cx,
+                "ALTER TABLE project_mailbox_receipts RENAME TO unavailable_receipts",
+            );
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request(generation, observed))),
+                Outcome::Err(_)
+            ));
+            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 0);
+            let conn = run(pool.acquire(cx)).expect("checkout after failed admission");
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("ROLLBACK").unwrap();
+        });
+    }
 
     fn run<T>(future: impl std::future::Future<Output = T>) -> T {
         asupersync::runtime::RuntimeBuilder::current_thread()
