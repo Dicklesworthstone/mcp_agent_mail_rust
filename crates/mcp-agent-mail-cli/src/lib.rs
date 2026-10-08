@@ -821,12 +821,17 @@ pub enum Commands {
         json: bool,
     },
     /// Destructively wipe all Agent Mail state (optionally archiving first).
+    ///
+    /// Agent Mail processes holding the mailbox are stopped for the wipe: a
+    /// service-manager unit (systemd user service, LaunchAgent) is stopped
+    /// through its manager and started again afterwards; any other Agent Mail
+    /// process holding the mailbox is terminated.
     #[command(name = "clear-and-reset-everything")]
     ClearAndResetEverything {
         #[arg(
             long,
             short = 'f',
-            help = "Skip the final destructive confirmation prompt (still asks about creating an archive)."
+            help = "Skip every prompt (archives first unless --no-archive is given)."
         )]
         force: bool,
         #[arg(
@@ -24681,6 +24686,7 @@ fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliRe
 
     let config = Config::from_env();
     let _outcome = clear_and_reset_everything(
+        &LiveMailboxQuiesceHost,
         force,
         archive_choice,
         source_db_for_archive,
@@ -24691,12 +24697,16 @@ fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliRe
 }
 
 fn clear_and_reset_everything(
+    host: &dyn MailboxQuiesceHost,
     force: bool,
     archive_choice: Option<bool>,
     source_db_for_archive: Option<&Path>,
     database_files: &[PathBuf],
     storage_root: &Path,
 ) -> CliResult<ClearAndResetOutcome> {
+    let source_db_for_archive = source_db_for_archive
+        .map(|path| PathBuf::from(resolve_sqlite_runtime_path(&path.to_string_lossy())));
+
     if !force {
         if !crate::output::is_stdin_tty() {
             return Err(CliError::Other(
@@ -24717,6 +24727,12 @@ fn clear_and_reset_everything(
             "  - All contents inside {} (including .git)",
             storage_root.display()
         );
+        print_mailbox_holders_to_stop(
+            host,
+            storage_root,
+            source_db_for_archive.as_deref(),
+            "the reset",
+        );
         ftui_runtime::ftui_println!("");
     }
 
@@ -24733,15 +24749,21 @@ fn clear_and_reset_everything(
         }
     }
 
-    let source_db_for_archive = source_db_for_archive
-        .map(|path| PathBuf::from(resolve_sqlite_runtime_path(&path.to_string_lossy())));
-    let _storage_root_lock =
-        acquire_doctor_mailbox_activity_lock_for_storage_root(storage_root, false)?;
-    let _sqlite_lock = if let Some(path) = source_db_for_archive.as_deref() {
-        acquire_doctor_mailbox_activity_lock_for_sqlite_path(path, false)?
-    } else {
-        None
-    };
+    // Every decision is taken before anything running is disturbed: stopping
+    // a service and then abandoning the reset at a prompt would only bounce it.
+    if !force && !confirm("Proceed with destructive reset?", false)? {
+        return Err(CliError::ExitCode(1));
+    }
+
+    // Holds both activity locks for the rest of the reset. Services stopped to
+    // free them are started again when this drops, after the locks release.
+    let _mailbox = acquire_mailbox_locks_quiescing_owners(
+        host,
+        storage_root,
+        source_db_for_archive.as_deref(),
+        "the reset",
+        MailboxQuiesceTiming::default(),
+    )?;
 
     let mut archive_path: Option<PathBuf> = None;
     if should_archive == Some(true) {
@@ -24783,10 +24805,6 @@ fn clear_and_reset_everything(
                 }
             }
         }
-    }
-
-    if !force && !confirm("Proceed with destructive reset?", false)? {
-        return Err(CliError::ExitCode(1));
     }
 
     let mut deleted_db_files: Vec<PathBuf> = Vec::new();
@@ -24867,6 +24885,638 @@ fn remove_storage_root_entry_for_reset(path: &Path) -> CliResult<()> {
     Err(CliError::Other(format!(
         "unsupported storage-root entry type during reset: {}",
         path.display()
+    )))
+}
+
+// ── Quiescing the running mailbox owners (reset, archive restore) ────────
+//
+// Replacing the whole mailbox (`clear-and-reset-everything`, `archive
+// restore`) needs the mailbox activity locks exclusively, and a running Agent
+// Mail server holds them for as long as it lives. Refusing with "resource is
+// temporarily busy" left the operator to find and stop the owner by hand and
+// to remember to start it again, so these commands do that themselves: a
+// process a service manager supervises is stopped through that manager
+// (signalling it would only trip its `Restart=` policy) and started again once
+// the command has released the locks; any other Agent Mail process holding
+// the mailbox is sent SIGTERM, then SIGKILL if it has not let go after a grace
+// period.
+
+/// A service manager unit supervising an Agent Mail process that holds the
+/// mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MailboxSupervisor {
+    /// A systemd unit; `user` selects the per-user manager (`systemctl --user`).
+    Systemd { unit: String, user: bool },
+    /// The LaunchAgent that `am service install` registers on macOS.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Launchd,
+}
+
+impl MailboxSupervisor {
+    fn display_name(&self) -> String {
+        match self {
+            Self::Systemd { unit, user: true } => format!("{unit} (systemd user service)"),
+            Self::Systemd { unit, user: false } => format!("{unit} (systemd system service)"),
+            Self::Launchd => format!("{LAUNCHD_LABEL} (launchd agent)"),
+        }
+    }
+
+    /// The command an operator runs to start the unit by hand.
+    fn manual_start_command(&self) -> String {
+        match self {
+            Self::Systemd { unit, user: true } => format!("systemctl --user start {unit}"),
+            Self::Systemd { unit, user: false } => format!("sudo systemctl start {unit}"),
+            Self::Launchd => "am service restart".to_string(),
+        }
+    }
+}
+
+/// An Agent Mail process holding one of the mailbox activity locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailboxHolder {
+    pid: u32,
+    command: Option<String>,
+    supervisor: Option<MailboxSupervisor>,
+}
+
+/// One quiesce round: the supervisors to stop and the unsupervised holders
+/// to terminate.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MailboxQuiescePlan {
+    supervisors: Vec<(MailboxSupervisor, Vec<MailboxHolder>)>,
+    unmanaged: Vec<MailboxHolder>,
+}
+
+impl MailboxQuiescePlan {
+    fn is_empty(&self) -> bool {
+        self.supervisors.is_empty() && self.unmanaged.is_empty()
+    }
+}
+
+/// How long a quiesce round waits for terminated holders to release the
+/// mailbox before escalating, and how often it re-tries the locks.
+#[derive(Debug, Clone, Copy)]
+struct MailboxQuiesceTiming {
+    term_grace: std::time::Duration,
+    kill_grace: std::time::Duration,
+    poll: std::time::Duration,
+}
+
+impl Default for MailboxQuiesceTiming {
+    fn default() -> Self {
+        Self {
+            term_grace: std::time::Duration::from_secs(10),
+            kill_grace: std::time::Duration::from_secs(5),
+            poll: std::time::Duration::from_millis(100),
+        }
+    }
+}
+
+/// A holder that would outlive a round (a supervisor that respawns it, an MCP
+/// client relaunching its stdio server) gets this many rounds before the
+/// reset gives up and reports what still holds the mailbox.
+const MAILBOX_QUIESCE_MAX_ROUNDS: usize = 3;
+
+/// The host operations the reset uses to find and stop mailbox owners. The
+/// live implementation drives `/proc`, systemd and launchd; tests substitute
+/// a scripted host.
+trait MailboxQuiesceHost {
+    /// Agent Mail processes holding the storage-root or SQLite activity lock.
+    fn mailbox_holders(
+        &self,
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+    ) -> Vec<MailboxHolder>;
+    fn stop_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()>;
+    fn start_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()>;
+    fn terminate(&self, pid: u32);
+    fn force_kill(&self, pid: u32);
+}
+
+struct LiveMailboxQuiesceHost;
+
+impl MailboxQuiesceHost for LiveMailboxQuiesceHost {
+    fn mailbox_holders(
+        &self,
+        storage_root: &Path,
+        sqlite_path: Option<&Path>,
+    ) -> Vec<MailboxHolder> {
+        // Without a SQLite path the probe still needs one; the canonical
+        // location inside the storage root keeps the storage-root lock scan
+        // meaningful.
+        let fallback_sqlite = storage_root.join("storage.sqlite3");
+        let sqlite_path = sqlite_path.unwrap_or(&fallback_sqlite);
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(sqlite_path, storage_root)
+            .processes
+            .into_iter()
+            .filter(|process| process.holds_storage_root_lock || process.holds_sqlite_lock)
+            .map(|process| MailboxHolder {
+                pid: process.pid,
+                supervisor: mailbox_supervisor_for_pid(process.pid),
+                command: process.command,
+            })
+            .collect()
+    }
+
+    fn stop_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
+        match supervisor {
+            MailboxSupervisor::Systemd { unit, user: true } => {
+                run_systemctl_user(&["stop", unit.as_str()])
+            }
+            MailboxSupervisor::Systemd { unit, user: false } => {
+                run_cmd("systemctl", &["stop", unit.as_str()])
+            }
+            MailboxSupervisor::Launchd => stop_launchd_service(),
+        }
+    }
+
+    fn start_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
+        match supervisor {
+            MailboxSupervisor::Systemd { unit, user: true } => {
+                run_systemctl_user(&["start", unit.as_str()])
+            }
+            MailboxSupervisor::Systemd { unit, user: false } => {
+                run_cmd("systemctl", &["start", unit.as_str()])
+            }
+            MailboxSupervisor::Launchd => start_launchd_service(),
+        }
+    }
+
+    fn terminate(&self, pid: u32) {
+        send_sigterm(pid);
+    }
+
+    fn force_kill(&self, pid: u32) {
+        send_sigkill(pid);
+    }
+}
+
+/// Never signal ourselves, init, or the process-group sentinels.
+const fn mailbox_holder_is_signalable(pid: u32, self_pid: u32) -> bool {
+    pid > 1 && pid != self_pid
+}
+
+/// Split the current holders into supervisors to stop and processes to
+/// terminate. A holder whose supervisor was already stopped in an earlier
+/// round (a stray child that outlived its unit) is terminated directly.
+fn plan_mailbox_quiesce(
+    holders: &[MailboxHolder],
+    self_pid: u32,
+    already_stopped: &[MailboxSupervisor],
+) -> MailboxQuiescePlan {
+    let mut plan = MailboxQuiescePlan::default();
+    for holder in holders
+        .iter()
+        .filter(|holder| mailbox_holder_is_signalable(holder.pid, self_pid))
+    {
+        match &holder.supervisor {
+            Some(supervisor) if !already_stopped.contains(supervisor) => {
+                if let Some((_, members)) = plan
+                    .supervisors
+                    .iter_mut()
+                    .find(|(planned, _)| planned == supervisor)
+                {
+                    members.push(holder.clone());
+                } else {
+                    plan.supervisors
+                        .push((supervisor.clone(), vec![holder.clone()]));
+                }
+            }
+            _ => {
+                if !plan.unmanaged.iter().any(|known| known.pid == holder.pid) {
+                    plan.unmanaged.push(holder.clone());
+                }
+            }
+        }
+    }
+    plan
+}
+
+fn describe_mailbox_holder_command(holder: &MailboxHolder) -> String {
+    const MAX_CHARS: usize = 120;
+    let command = holder
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .unwrap_or("<unknown command>");
+    if command.chars().count() > MAX_CHARS {
+        let truncated: String = command.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        command.to_string()
+    }
+}
+
+/// Tell an operator about to confirm which running processes `operation`
+/// will stop, before anything is disturbed.
+fn print_mailbox_holders_to_stop(
+    host: &dyn MailboxQuiesceHost,
+    storage_root: &Path,
+    sqlite_path: Option<&Path>,
+    operation: &str,
+) {
+    let self_pid = std::process::id();
+    let running: Vec<MailboxHolder> = host
+        .mailbox_holders(storage_root, sqlite_path)
+        .into_iter()
+        .filter(|holder| mailbox_holder_is_signalable(holder.pid, self_pid))
+        .collect();
+    if running.is_empty() {
+        return;
+    }
+    ftui_runtime::ftui_println!("");
+    ftui_runtime::ftui_println!(
+        "Running Agent Mail processes holding this mailbox will be stopped for {operation}:"
+    );
+    for holder in &running {
+        ftui_runtime::ftui_println!("  - {}", describe_mailbox_holder_plan(holder));
+    }
+}
+
+fn describe_mailbox_holder_plan(holder: &MailboxHolder) -> String {
+    match &holder.supervisor {
+        Some(supervisor) => format!(
+            "{} (pid {}): stopped through its service manager and started again afterwards",
+            supervisor.display_name(),
+            holder.pid
+        ),
+        None => format!(
+            "pid {} (`{}`): terminated; not restarted automatically",
+            holder.pid,
+            describe_mailbox_holder_command(holder)
+        ),
+    }
+}
+
+/// The systemd unit a process runs in, from its `/proc/<pid>/cgroup` text:
+/// the innermost `.service` component of the unified (`0::`) hierarchy, or of
+/// the legacy `name=systemd` one. `user` is set when the unit belongs to a
+/// per-user manager (`user@<uid>.service`). Scopes (terminal sessions, tmux,
+/// SSH logins) are not services and yield `None`.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_systemd_unit_from_cgroup(content: &str) -> Option<(String, bool)> {
+    fn is_user_manager(component: &str) -> bool {
+        component
+            .strip_prefix("user@")
+            .and_then(|rest| rest.strip_suffix(".service"))
+            .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+
+    let path = content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .or_else(|| {
+            content.lines().find_map(|line| {
+                let mut fields = line.splitn(3, ':');
+                let _hierarchy = fields.next()?;
+                let controllers = fields.next()?;
+                let path = fields.next()?;
+                (controllers == "name=systemd").then_some(path)
+            })
+        })?;
+    let components: Vec<&str> = path
+        .trim()
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let manager_index = components
+        .iter()
+        .position(|component| is_user_manager(component));
+    let unit_scope = manager_index.map_or(&components[..], |index| &components[index + 1..]);
+    let unit = unit_scope
+        .iter()
+        .rev()
+        .find(|component| component.ends_with(".service") && !is_user_manager(component))?;
+    Some(((*unit).to_string(), manager_index.is_some()))
+}
+
+/// Decide whether a holder running in `unit` is that unit's supervised
+/// server. Our own `am service install` unit always is (its ExecStart may be
+/// a wrapper); any other unit only when the holder is its main process, so a
+/// stdio server spawned by some unrelated service (an agent harness running
+/// as a unit) never takes that whole service down with it.
+#[cfg(any(test, target_os = "linux"))]
+fn mailbox_supervisor_for_systemd_unit(
+    unit: &str,
+    user: bool,
+    holder_pid: u32,
+    main_pid: Option<u32>,
+) -> Option<MailboxSupervisor> {
+    let ours = user && unit == SYSTEMD_UNIT_NAME;
+    (ours || main_pid == Some(holder_pid)).then(|| MailboxSupervisor::Systemd {
+        unit: unit.to_string(),
+        user,
+    })
+}
+
+/// `MainPID` of a systemd unit, `None` when it has no main process.
+#[cfg(target_os = "linux")]
+fn systemd_unit_main_pid(unit: &str, user: bool) -> Option<u32> {
+    let mut cmd = std::process::Command::new("systemctl");
+    if user {
+        cmd.arg("--user");
+        for (key, value) in systemd_user_env_best_effort() {
+            cmd.env(key, value);
+        }
+    }
+    cmd.args(["show", unit, "--property=MainPID", "--value"]);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+}
+
+/// The `pid = N` line of `launchctl print` output.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_launchctl_print_pid(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("pid = ")
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn mailbox_supervisor_for_pid(pid: u32) -> Option<MailboxSupervisor> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let (unit, user) = parse_systemd_unit_from_cgroup(&cgroup)?;
+    let main_pid = systemd_unit_main_pid(&unit, user);
+    mailbox_supervisor_for_systemd_unit(&unit, user, pid, main_pid)
+}
+
+#[cfg(target_os = "macos")]
+fn mailbox_supervisor_for_pid(pid: u32) -> Option<MailboxSupervisor> {
+    let uid = current_uid().ok()?;
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    (parse_launchctl_print_pid(&String::from_utf8_lossy(&output.stdout)) == Some(pid))
+        .then_some(MailboxSupervisor::Launchd)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn mailbox_supervisor_for_pid(_pid: u32) -> Option<MailboxSupervisor> {
+    None
+}
+
+/// Starts the services a quiesce stopped, once the command is done with the
+/// mailbox, on every exit path (success, error, or a prompt declined midway).
+/// It also reports the unsupervised processes it terminated, which nothing
+/// here can bring back: an MCP client relaunches its stdio server on reconnect.
+struct MailboxSupervisorRestore<'h> {
+    host: &'h dyn MailboxQuiesceHost,
+    stopped: Vec<MailboxSupervisor>,
+    terminated: Vec<MailboxHolder>,
+    /// Supervisors that could not be stopped through their manager, whose
+    /// processes were terminated directly instead.
+    unstoppable: Vec<MailboxSupervisor>,
+}
+
+impl Drop for MailboxSupervisorRestore<'_> {
+    fn drop(&mut self) {
+        for supervisor in self.stopped.drain(..).rev() {
+            let name = supervisor.display_name();
+            ftui_runtime::ftui_println!("Starting {name} again...");
+            match self.host.start_supervisor(&supervisor) {
+                Ok(()) => ftui_runtime::ftui_println!("Started {name}."),
+                Err(err) => ftui_runtime::ftui_eprintln!(
+                    "Warning: failed to start {name} again: {err}. Start it with: {}",
+                    supervisor.manual_start_command()
+                ),
+            }
+        }
+        for supervisor in self.unstoppable.drain(..) {
+            ftui_runtime::ftui_eprintln!(
+                "Warning: {} was not stopped through its service manager; if it does not come back on its own, start it with: {}",
+                supervisor.display_name(),
+                supervisor.manual_start_command()
+            );
+        }
+        for holder in self.terminated.drain(..) {
+            ftui_runtime::ftui_println!(
+                "Terminated pid {} (`{}`) was not started by a service manager and is not restarted; relaunch it if you still need it (MCP clients relaunch stdio servers on reconnect).",
+                holder.pid,
+                describe_mailbox_holder_command(&holder)
+            );
+        }
+    }
+}
+
+/// Both mailbox activity locks, held exclusively. Fields drop
+/// in declaration order, so the locks are released before `_restore` starts
+/// any stopped service again — a restarted server must be able to take them.
+struct QuiescedMailboxLocks<'h> {
+    _storage_root_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    _sqlite_lock: Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    _restore: MailboxSupervisorRestore<'h>,
+}
+
+type MailboxLockPair = (
+    Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+    Option<mcp_agent_mail_server::MailboxActivityLockGuard>,
+);
+
+impl<'h> QuiescedMailboxLocks<'h> {
+    fn held(
+        (storage_root_lock, sqlite_lock): MailboxLockPair,
+        restore: MailboxSupervisorRestore<'h>,
+    ) -> Self {
+        Self {
+            _storage_root_lock: storage_root_lock,
+            _sqlite_lock: sqlite_lock,
+            _restore: restore,
+        }
+    }
+}
+
+fn try_acquire_exclusive_mailbox_locks(
+    storage_root: &Path,
+    sqlite_path: Option<&Path>,
+) -> CliResult<MailboxLockPair> {
+    let storage_root_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(storage_root, false)?;
+    let sqlite_lock = match sqlite_path {
+        Some(path) => acquire_doctor_mailbox_activity_lock_for_sqlite_path(path, false)?,
+        None => None,
+    };
+    Ok((storage_root_lock, sqlite_lock))
+}
+
+/// Retry the locks until the holders signalled this round let go. A holder
+/// still present after `term_grace` is sent SIGKILL; `Ok(None)` means the
+/// mailbox is still held after the round, for the caller to re-plan.
+fn wait_for_exclusive_mailbox_locks(
+    host: &dyn MailboxQuiesceHost,
+    storage_root: &Path,
+    sqlite_path: Option<&Path>,
+    signalled: &[u32],
+    timing: MailboxQuiesceTiming,
+) -> CliResult<Option<MailboxLockPair>> {
+    let started = std::time::Instant::now();
+    let first_deadline = if signalled.is_empty() {
+        timing.kill_grace
+    } else {
+        timing.term_grace
+    };
+    let mut kill_deadline: Option<std::time::Duration> = None;
+    loop {
+        match try_acquire_exclusive_mailbox_locks(storage_root, sqlite_path) {
+            Ok(locks) => return Ok(Some(locks)),
+            Err(err) if is_resource_busy_cli_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+        let elapsed = started.elapsed();
+        match kill_deadline {
+            None if elapsed >= first_deadline => {
+                let lingering: Vec<MailboxHolder> = host
+                    .mailbox_holders(storage_root, sqlite_path)
+                    .into_iter()
+                    .filter(|holder| signalled.contains(&holder.pid))
+                    .collect();
+                if lingering.is_empty() {
+                    return Ok(None);
+                }
+                for holder in &lingering {
+                    ftui_runtime::ftui_eprintln!(
+                        "pid {} still holds the mailbox {}s after SIGTERM; sending SIGKILL",
+                        holder.pid,
+                        timing.term_grace.as_secs()
+                    );
+                    host.force_kill(holder.pid);
+                }
+                kill_deadline = Some(elapsed + timing.kill_grace);
+            }
+            Some(deadline) if elapsed >= deadline => return Ok(None),
+            _ => {}
+        }
+        std::thread::sleep(timing.poll);
+    }
+}
+
+/// Take both mailbox activity locks exclusively for `operation` (e.g. "the
+/// reset"), stopping whatever Agent Mail processes hold them first. Services
+/// stopped here are started again when the returned value drops.
+fn acquire_mailbox_locks_quiescing_owners<'h>(
+    host: &'h dyn MailboxQuiesceHost,
+    storage_root: &Path,
+    sqlite_path: Option<&Path>,
+    operation: &str,
+    timing: MailboxQuiesceTiming,
+) -> CliResult<QuiescedMailboxLocks<'h>> {
+    let mut restore = MailboxSupervisorRestore {
+        host,
+        stopped: Vec::new(),
+        terminated: Vec::new(),
+        unstoppable: Vec::new(),
+    };
+    let self_pid = std::process::id();
+    let mut remaining: Vec<MailboxHolder> = Vec::new();
+    let mut round = 0;
+    let busy = loop {
+        let busy = match try_acquire_exclusive_mailbox_locks(storage_root, sqlite_path) {
+            Ok(locks) => return Ok(QuiescedMailboxLocks::held(locks, restore)),
+            Err(err) if is_resource_busy_cli_error(&err) => err,
+            Err(err) => return Err(err),
+        };
+        if round == MAILBOX_QUIESCE_MAX_ROUNDS {
+            break busy;
+        }
+        round += 1;
+
+        let holders = host.mailbox_holders(storage_root, sqlite_path);
+        let plan = plan_mailbox_quiesce(&holders, self_pid, &restore.stopped);
+        remaining = holders
+            .into_iter()
+            .filter(|holder| mailbox_holder_is_signalable(holder.pid, self_pid))
+            .collect();
+        if plan.is_empty() {
+            // Nothing we may stop holds the mailbox: the holder is this
+            // process, not an Agent Mail process, or already gone (then the
+            // final attempt below succeeds).
+            match try_acquire_exclusive_mailbox_locks(storage_root, sqlite_path) {
+                Ok(locks) => return Ok(QuiescedMailboxLocks::held(locks, restore)),
+                Err(err) if is_resource_busy_cli_error(&err) => break err,
+                Err(err) => return Err(err),
+            }
+        }
+
+        let mut to_terminate = plan.unmanaged;
+        for (supervisor, members) in plan.supervisors {
+            let name = supervisor.display_name();
+            let pids = members
+                .iter()
+                .map(|holder| holder.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ftui_runtime::ftui_println!(
+                "Stopping {name} (pid {pids}) for {operation}; it will be started again afterwards."
+            );
+            match host.stop_supervisor(&supervisor) {
+                Ok(()) => restore.stopped.push(supervisor),
+                Err(err) => {
+                    ftui_runtime::ftui_eprintln!(
+                        "Warning: could not stop {name} through its service manager ({err}); terminating pid {pids} directly."
+                    );
+                    if !restore.unstoppable.contains(&supervisor) {
+                        restore.unstoppable.push(supervisor);
+                    }
+                    to_terminate.extend(members);
+                }
+            }
+        }
+
+        let signalled: Vec<u32> = to_terminate.iter().map(|holder| holder.pid).collect();
+        for holder in to_terminate {
+            ftui_runtime::ftui_println!(
+                "Stopping Agent Mail process pid {} (`{}`) for {operation}.",
+                holder.pid,
+                describe_mailbox_holder_command(&holder)
+            );
+            host.terminate(holder.pid);
+            if holder.supervisor.is_none()
+                && !restore
+                    .terminated
+                    .iter()
+                    .any(|known| known.pid == holder.pid)
+            {
+                restore.terminated.push(holder);
+            }
+        }
+
+        if let Some(locks) =
+            wait_for_exclusive_mailbox_locks(host, storage_root, sqlite_path, &signalled, timing)?
+        {
+            return Ok(QuiescedMailboxLocks::held(locks, restore));
+        }
+    };
+
+    // `restore` drops on this return and starts again anything stopped above.
+    if remaining.is_empty() {
+        return Err(busy);
+    }
+    let holders = remaining
+        .iter()
+        .map(|holder| {
+            format!(
+                "pid {} (`{}`)",
+                holder.pid,
+                describe_mailbox_holder_command(holder)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CliError::Other(format!(
+        "{busy}\nCould not stop the mailbox owner for {operation}: {holders} still holds the mailbox after {MAILBOX_QUIESCE_MAX_ROUNDS} attempts. Something outside Agent Mail keeps restarting it; stop it there and re-run."
     )))
 }
 
@@ -53974,6 +54624,7 @@ http_headers = { Authorization = "Bearer secret" }
             &restore_storage,
             false,
             false,
+            || Ok(()),
         )
         .unwrap_err();
         let msg = match err {
@@ -53999,6 +54650,7 @@ http_headers = { Authorization = "Bearer secret" }
                 &restore_storage,
                 false,
                 true,
+                || -> CliResult<()> { panic!("a dry run must not take the mailbox") },
             )
             .unwrap();
             let mut sink = Vec::new();
@@ -54018,7 +54670,15 @@ http_headers = { Authorization = "Bearer secret" }
 
         // Actual restore with --force should preserve the prior state and
         // restore the snapshot + storage.
-        archive_restore_state(archive_arg, &restore_db, &restore_storage, true, false).unwrap();
+        archive_restore_state(
+            archive_arg,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
 
         let db_quarantine = find_backup_entry(&restore_dir, "mailbox.sqlite3.corrupt-")
             .expect("prior database generation preserved");
@@ -54096,6 +54756,7 @@ http_headers = { Authorization = "Bearer secret" }
             &restore_storage,
             true,
             false,
+            || Ok(()),
         )
         .expect("archive restore should back up broken sidecar symlink");
 
@@ -54171,8 +54832,15 @@ http_headers = { Authorization = "Bearer secret" }
             zip.finish().unwrap();
         }
 
-        let err = archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-            .expect_err("invalid archive snapshot should fail before mutating live state");
+        let err = archive_restore_state(
+            archive_path,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || Ok(()),
+        )
+        .expect_err("invalid archive snapshot should fail before mutating live state");
 
         assert!(
             format!("{err}").contains("did not pass health check"),
@@ -54230,8 +54898,15 @@ http_headers = { Authorization = "Bearer secret" }
         std::fs::create_dir_all(restore_storage.join(".git")).unwrap();
         std::fs::write(restore_storage.join(".git/HEAD"), b"old-head\n").unwrap();
 
-        archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-            .expect("restore into embedded sqlite layout");
+        archive_restore_state(
+            archive_path,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || Ok(()),
+        )
+        .expect("restore into embedded sqlite layout");
 
         assert!(
             find_backup_entry(root.path(), "storage.sqlite3.backup-").is_none(),
@@ -54271,6 +54946,127 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn archive_restore_state_stops_the_running_service_and_starts_it_after_restoring() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let source_storage = root.path().join("source-storage");
+        let source_db = root.path().join("source.sqlite3");
+        seed_storage_root(&source_storage);
+        seed_mailbox_db(&source_db);
+        let archive_path = archive_save_state(
+            &source_db,
+            &source_storage,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("restore-under-service".to_string()),
+        )
+        .expect("archive save");
+
+        let restore_storage = root.path().join("restore-root");
+        let restore_db = root.path().join("restore.sqlite3");
+        std::fs::create_dir_all(&restore_storage).unwrap();
+        std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+
+        // A running service holds the live mailbox; taking it stops the
+        // service, and the service comes back only after the restore.
+        let unit = user_unit(SYSTEMD_UNIT_NAME);
+        let host = ScriptedQuiesceHost::new(
+            &restore_storage,
+            scripted_holder(4242, Some(unit.clone())),
+            ScriptedRelease::Stop,
+        );
+        archive_restore_state(
+            archive_path,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || {
+                let locks = acquire_mailbox_locks_quiescing_owners(
+                    &host,
+                    &restore_storage,
+                    Some(&restore_db),
+                    "the restore",
+                    fast_quiesce_timing(),
+                )?;
+                host.events.borrow_mut().push("mailbox taken".to_string());
+                Ok(locks)
+            },
+        )
+        .expect("restore stops the running service instead of failing busy");
+
+        assert_eq!(
+            std::fs::read(restore_storage.join("nested/dir/file.txt")).unwrap(),
+            b"hello\n"
+        );
+        assert_eq!(
+            host.events(),
+            vec![
+                format!("stop {}", unit.display_name()),
+                "mailbox taken".to_string(),
+                format!("start {} lock_free=true", unit.display_name()),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_restore_state_leaves_live_state_when_the_mailbox_cannot_be_taken() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let source_storage = root.path().join("source-storage");
+        let source_db = root.path().join("source.sqlite3");
+        seed_storage_root(&source_storage);
+        seed_mailbox_db(&source_db);
+        let archive_path = archive_save_state(
+            &source_db,
+            &source_storage,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("restore-busy".to_string()),
+        )
+        .expect("archive save");
+
+        let restore_storage = root.path().join("restore-root");
+        let restore_db = root.path().join("restore.sqlite3");
+        std::fs::create_dir_all(&restore_storage).unwrap();
+        std::fs::write(&restore_db, b"old-db").unwrap();
+        std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+
+        let error = archive_restore_state(
+            archive_path,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || {
+                Err::<(), _>(CliError::Other(
+                    "Resource is temporarily busy. mailbox activity lock is busy".to_string(),
+                ))
+            },
+        )
+        .expect_err("a mailbox that cannot be taken fails the restore");
+        assert!(is_resource_busy_cli_error(&error), "{error}");
+        assert_eq!(std::fs::read(&restore_db).unwrap(), b"old-db");
+        assert_eq!(
+            std::fs::read(restore_storage.join("old.txt")).unwrap(),
+            b"old-storage"
+        );
+        assert!(!restore_storage.join("nested").exists());
+    }
+
+    #[test]
     fn archive_restore_state_embedded_layout_missing_target_creates_no_backup() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -54301,8 +55097,15 @@ http_headers = { Authorization = "Bearer secret" }
             "test requires a missing restore root"
         );
 
-        archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-            .expect("restore into previously missing embedded sqlite layout");
+        archive_restore_state(
+            archive_path,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || Ok(()),
+        )
+        .expect("restore into previously missing embedded sqlite layout");
 
         assert!(
             find_backup_entry(root.path(), "missing-restore-root.backup-").is_none(),
@@ -54402,8 +55205,15 @@ http_headers = { Authorization = "Bearer secret" }
 
         let restore_storage = root.path().join("restore-root");
         let restore_db = restore_storage.join("storage.sqlite3");
-        archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
-            .expect("restore should ignore embedded sqlite artifacts from storage payload");
+        archive_restore_state(
+            archive_path,
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+            || Ok(()),
+        )
+        .expect("restore should ignore embedded sqlite artifacts from storage payload");
 
         let restored_conn =
             mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
@@ -54828,6 +55638,7 @@ http_headers = { Authorization = "Bearer secret" }
         let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
 
         let outcome = clear_and_reset_everything(
+            &LiveMailboxQuiesceHost,
             true,
             Some(true),
             Some(&db_path),
@@ -54895,6 +55706,7 @@ http_headers = { Authorization = "Bearer secret" }
         let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
 
         clear_and_reset_everything(
+            &LiveMailboxQuiesceHost,
             true,
             Some(false),
             Some(&db_path),
@@ -54936,9 +55748,15 @@ http_headers = { Authorization = "Bearer secret" }
         std::fs::write(&shm_path, b"shm").unwrap();
         let database_files = vec![db_path.clone(), wal_path.clone(), shm_path.clone()];
 
-        let err =
-            clear_and_reset_everything(false, None, Some(&db_path), &database_files, &storage_root)
-                .unwrap_err();
+        let err = clear_and_reset_everything(
+            &LiveMailboxQuiesceHost,
+            false,
+            None,
+            Some(&db_path),
+            &database_files,
+            &storage_root,
+        )
+        .unwrap_err();
         let msg = match err {
             CliError::Other(m) => m,
             other => format!("{other}"),
@@ -54983,7 +55801,10 @@ http_headers = { Authorization = "Bearer secret" }
         )
         .expect("acquire shared storage-root lock");
 
+        // The holder is this very process, which the reset never stops, so the
+        // live host finds nothing it may quiesce and reports the busy mailbox.
         let error = clear_and_reset_everything(
+            &LiveMailboxQuiesceHost,
             true,
             Some(false),
             Some(&db_path),
@@ -55035,6 +55856,7 @@ http_headers = { Authorization = "Bearer secret" }
         let database_files = vec![db_path.clone()];
 
         clear_and_reset_everything(
+            &LiveMailboxQuiesceHost,
             true,
             Some(false),
             Some(&db_path),
@@ -55065,6 +55887,416 @@ http_headers = { Authorization = "Bearer secret" }
             std::fs::read(outside_dir.join("keep.txt")).unwrap(),
             b"keep",
             "outside target contents must remain untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // clear-and-reset-everything: quiescing the running mailbox owner
+    // -----------------------------------------------------------------------
+
+    /// What a scripted holder lets go of the mailbox in response to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ScriptedRelease {
+        Stop,
+        Terminate,
+        Kill,
+        Never,
+    }
+
+    /// A reset host whose single "holder" is an in-process activity lock that
+    /// is released when the reset applies the scripted action to it.
+    struct ScriptedQuiesceHost {
+        holder: MailboxHolder,
+        release_on: ScriptedRelease,
+        storage_root: PathBuf,
+        held: std::cell::RefCell<Option<mcp_agent_mail_server::MailboxActivityLockGuard>>,
+        events: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ScriptedQuiesceHost {
+        fn new(storage_root: &Path, holder: MailboxHolder, release_on: ScriptedRelease) -> Self {
+            let held = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+                storage_root,
+                mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+            )
+            .expect("scripted holder takes the storage-root lock");
+            Self {
+                holder,
+                release_on,
+                storage_root: storage_root.to_path_buf(),
+                held: std::cell::RefCell::new(held),
+                events: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn apply(&self, action: ScriptedRelease, event: String) {
+            self.events.borrow_mut().push(event);
+            if action == self.release_on {
+                self.held.borrow_mut().take();
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl MailboxQuiesceHost for ScriptedQuiesceHost {
+        fn mailbox_holders(
+            &self,
+            _storage_root: &Path,
+            _sqlite_path: Option<&Path>,
+        ) -> Vec<MailboxHolder> {
+            if self.held.borrow().is_some() {
+                vec![self.holder.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn stop_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
+            self.apply(
+                ScriptedRelease::Stop,
+                format!("stop {}", supervisor.display_name()),
+            );
+            Ok(())
+        }
+
+        fn start_supervisor(&self, supervisor: &MailboxSupervisor) -> CliResult<()> {
+            // A restarted server must find the mailbox free: the reset has to
+            // release both locks before it starts anything again.
+            let free = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+                &self.storage_root,
+                mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+            )
+            .is_ok();
+            self.events.borrow_mut().push(format!(
+                "start {} lock_free={free}",
+                supervisor.display_name()
+            ));
+            Ok(())
+        }
+
+        fn terminate(&self, pid: u32) {
+            self.apply(ScriptedRelease::Terminate, format!("terminate {pid}"));
+        }
+
+        fn force_kill(&self, pid: u32) {
+            self.apply(ScriptedRelease::Kill, format!("kill {pid}"));
+        }
+    }
+
+    fn fast_quiesce_timing() -> MailboxQuiesceTiming {
+        MailboxQuiesceTiming {
+            term_grace: std::time::Duration::from_millis(50),
+            kill_grace: std::time::Duration::from_millis(50),
+            poll: std::time::Duration::from_millis(5),
+        }
+    }
+
+    fn user_unit(unit: &str) -> MailboxSupervisor {
+        MailboxSupervisor::Systemd {
+            unit: unit.to_string(),
+            user: true,
+        }
+    }
+
+    fn scripted_holder(pid: u32, supervisor: Option<MailboxSupervisor>) -> MailboxHolder {
+        MailboxHolder {
+            pid,
+            command: Some(format!("/opt/am/mcp-agent-mail serve-http --pid-{pid}")),
+            supervisor,
+        }
+    }
+
+    #[test]
+    fn systemd_unit_from_cgroup_finds_user_and_system_services() {
+        assert_eq!(
+            parse_systemd_unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/agent-mail.service\n"
+            ),
+            Some(("agent-mail.service".to_string(), true))
+        );
+        assert_eq!(
+            parse_systemd_unit_from_cgroup("0::/system.slice/mcp-agent-mail.service\n"),
+            Some(("mcp-agent-mail.service".to_string(), false))
+        );
+        // A delegated sub-cgroup still belongs to its unit.
+        assert_eq!(
+            parse_systemd_unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/agent-mail.service/payload\n"
+            ),
+            Some(("agent-mail.service".to_string(), true))
+        );
+        // cgroup v1 exposes the systemd hierarchy as `name=systemd`.
+        assert_eq!(
+            parse_systemd_unit_from_cgroup(
+                "12:cpu,cpuacct:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/user@1000.service/agent-mail.service\n"
+            ),
+            Some(("agent-mail.service".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn systemd_unit_from_cgroup_ignores_scopes_and_the_user_manager() {
+        for content in [
+            "0::/user.slice/user-1000.slice/session-3.scope\n",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-1f2e.scope\n",
+            "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n",
+            "0::/\n",
+            "",
+        ] {
+            assert_eq!(
+                parse_systemd_unit_from_cgroup(content),
+                None,
+                "no supervising service in {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_supervisor_requires_our_unit_or_the_units_main_pid() {
+        assert_eq!(
+            mailbox_supervisor_for_systemd_unit(SYSTEMD_UNIT_NAME, true, 4242, Some(17)),
+            Some(user_unit(SYSTEMD_UNIT_NAME)),
+            "our own unit owns its holder even behind a wrapper ExecStart"
+        );
+        assert_eq!(
+            mailbox_supervisor_for_systemd_unit("custom-mail.service", true, 4242, Some(4242)),
+            Some(user_unit("custom-mail.service")),
+            "any unit whose main process is the holder supervises it"
+        );
+        assert_eq!(
+            mailbox_supervisor_for_systemd_unit("agent-harness.service", true, 4242, Some(17)),
+            None,
+            "a stdio server spawned by an unrelated service must not stop that service"
+        );
+        assert_eq!(
+            mailbox_supervisor_for_systemd_unit(SYSTEMD_UNIT_NAME, false, 4242, None),
+            None,
+            "a system unit that merely shares our name needs the main-pid proof"
+        );
+    }
+
+    #[test]
+    fn launchctl_print_pid_is_parsed() {
+        let text = "gui/501/com.agent-mail = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/com.agent-mail.plist\n\tstate = running\n\n\tpid = 8123\n\timmediate reason = speculative\n}\n";
+        assert_eq!(parse_launchctl_print_pid(text), Some(8123));
+        assert_eq!(parse_launchctl_print_pid("\tstate = not running\n"), None);
+    }
+
+    #[test]
+    fn reset_quiesce_plan_groups_supervisors_and_never_targets_self_or_init() {
+        let unit = user_unit(SYSTEMD_UNIT_NAME);
+        let holders = vec![
+            scripted_holder(100, Some(unit.clone())),
+            scripted_holder(101, Some(unit.clone())),
+            scripted_holder(200, None),
+            scripted_holder(200, None),
+            scripted_holder(777, None),
+            scripted_holder(1, None),
+            scripted_holder(0, None),
+        ];
+        let plan = plan_mailbox_quiesce(&holders, 777, &[]);
+        assert_eq!(plan.supervisors.len(), 1);
+        assert_eq!(plan.supervisors[0].0, unit);
+        assert_eq!(
+            plan.supervisors[0]
+                .1
+                .iter()
+                .map(|holder| holder.pid)
+                .collect::<Vec<_>>(),
+            vec![100, 101]
+        );
+        assert_eq!(
+            plan.unmanaged
+                .iter()
+                .map(|holder| holder.pid)
+                .collect::<Vec<_>>(),
+            vec![200]
+        );
+
+        // A holder that outlived its already-stopped unit is terminated directly.
+        let plan = plan_mailbox_quiesce(&holders[..1], 777, std::slice::from_ref(&unit));
+        assert!(plan.supervisors.is_empty());
+        assert_eq!(plan.unmanaged.len(), 1);
+        assert_eq!(plan.unmanaged[0].pid, 100);
+
+        assert!(plan_mailbox_quiesce(&[scripted_holder(777, None)], 777, &[]).is_empty());
+    }
+
+    #[test]
+    fn reset_lock_quiesce_stops_the_service_and_restarts_it_after_releasing_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let storage_root = root.path().join("storage_repo");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let unit = user_unit(SYSTEMD_UNIT_NAME);
+        let host = ScriptedQuiesceHost::new(
+            &storage_root,
+            scripted_holder(4242, Some(unit.clone())),
+            ScriptedRelease::Stop,
+        );
+
+        let locks = acquire_mailbox_locks_quiescing_owners(
+            &host,
+            &storage_root,
+            None,
+            "the reset",
+            fast_quiesce_timing(),
+        )
+        .expect("the reset takes the mailbox once the service is stopped");
+        assert_eq!(host.events(), vec![format!("stop {}", unit.display_name())]);
+        drop(locks);
+        assert_eq!(
+            host.events(),
+            vec![
+                format!("stop {}", unit.display_name()),
+                format!("start {} lock_free=true", unit.display_name()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_lock_quiesce_escalates_to_sigkill_for_a_holder_ignoring_sigterm() {
+        let root = tempfile::tempdir().unwrap();
+        let storage_root = root.path().join("storage_repo");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let host = ScriptedQuiesceHost::new(
+            &storage_root,
+            scripted_holder(5150, None),
+            ScriptedRelease::Kill,
+        );
+
+        let locks = acquire_mailbox_locks_quiescing_owners(
+            &host,
+            &storage_root,
+            None,
+            "the reset",
+            fast_quiesce_timing(),
+        )
+        .expect("SIGKILL frees the mailbox");
+        drop(locks);
+        assert_eq!(
+            host.events(),
+            vec!["terminate 5150".to_string(), "kill 5150".to_string()],
+            "an unsupervised holder is never restarted"
+        );
+    }
+
+    #[test]
+    fn reset_lock_quiesce_reports_a_holder_it_cannot_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let storage_root = root.path().join("storage_repo");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let host = ScriptedQuiesceHost::new(
+            &storage_root,
+            scripted_holder(6060, None),
+            ScriptedRelease::Never,
+        );
+
+        let Err(error) = acquire_mailbox_locks_quiescing_owners(
+            &host,
+            &storage_root,
+            None,
+            "the reset",
+            fast_quiesce_timing(),
+        ) else {
+            panic!("a holder that survives SIGKILL keeps the mailbox busy");
+        };
+        assert!(is_resource_busy_cli_error(&error), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("pid 6060"), "{message}");
+        assert!(
+            message.contains("Could not stop the mailbox owner"),
+            "{message}"
+        );
+        let terminations = host
+            .events()
+            .iter()
+            .filter(|event| event.as_str() == "terminate 6060")
+            .count();
+        assert_eq!(terminations, MAILBOX_QUIESCE_MAX_ROUNDS);
+    }
+
+    #[test]
+    fn clear_and_reset_restarts_the_stopped_service_and_wipes() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+        let db_path = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&db_path);
+        let database_files = vec![db_path.clone()];
+
+        let unit = user_unit(SYSTEMD_UNIT_NAME);
+        let host = ScriptedQuiesceHost::new(
+            &storage_root,
+            scripted_holder(4242, Some(unit.clone())),
+            ScriptedRelease::Stop,
+        );
+        clear_and_reset_everything(
+            &host,
+            true,
+            Some(false),
+            Some(&db_path),
+            &database_files,
+            &storage_root,
+        )
+        .expect("the reset stops the running service instead of failing busy");
+
+        assert!(!db_path.exists(), "database file should be removed");
+        // The restarted service may already have re-created its lock file, so
+        // check the seeded content rather than an empty directory.
+        assert!(!storage_root.join("nested").exists());
+        assert!(!storage_root.join(".git").exists());
+        assert_eq!(
+            host.events(),
+            vec![
+                format!("stop {}", unit.display_name()),
+                format!("start {} lock_free=true", unit.display_name()),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_and_reset_restarts_the_stopped_service_when_the_reset_fails() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let unit = user_unit(SYSTEMD_UNIT_NAME);
+        let host = ScriptedQuiesceHost::new(
+            &storage_root,
+            scripted_holder(4242, Some(unit.clone())),
+            ScriptedRelease::Stop,
+        );
+        // A mandatory archive with no SQLite source fails after the service
+        // was stopped; the service must still come back and nothing is wiped.
+        let error = clear_and_reset_everything(&host, true, Some(true), None, &[], &storage_root)
+            .expect_err("a mandatory archive without a database fails the reset");
+        assert!(matches!(error, CliError::ExitCode(1)), "{error}");
+
+        assert!(storage_root.join("nested/dir/file.txt").exists());
+        assert!(storage_root.join(".git/HEAD").exists());
+        assert_eq!(
+            host.events(),
+            vec![
+                format!("stop {}", unit.display_name()),
+                format!("start {} lock_free=true", unit.display_name()),
+            ]
         );
     }
 
@@ -83950,15 +85182,19 @@ fn archive_save_state_internal(
 }
 
 #[allow(dead_code)]
-fn archive_restore_state(
+/// Restore an archive over the live mailbox. `take_mailbox` must return a
+/// guard holding the mailbox activity locks for both the SQLite target and
+/// the storage root; it runs after the plan is confirmed and before anything
+/// is mutated, and the guard is held until the restore finishes. A dry run
+/// never calls it.
+fn archive_restore_state<G>(
     archive_file: PathBuf,
     database_path: &Path,
     storage_root: &Path,
     force: bool,
     dry_run: bool,
+    take_mailbox: impl FnOnce() -> CliResult<G>,
 ) -> CliResult<()> {
-    // Caller must hold the mailbox activity locks for both the SQLite target
-    // and storage root before invoking this mutating restore.
     let archive_path = resolve_archive_path(&archive_file)?;
     let (meta, meta_error) = load_archive_metadata(&archive_path);
     if let Some(err) = meta_error {
@@ -84059,6 +85295,7 @@ fn archive_restore_state(
             return Err(CliError::ExitCode(1));
         }
     }
+    let _mailbox = take_mailbox()?;
 
     // Open archive for restore.
     let file = std::fs::File::open(&archive_path)?;
@@ -84449,11 +85686,31 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
 
             let config = Config::from_env();
             let storage_root = config.storage_root;
-            let _mailbox_storage_root_lock =
-                acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
-            let _mailbox_sqlite_lock =
-                acquire_doctor_mailbox_activity_lock_for_sqlite_path(&database_path, dry_run)?;
-            archive_restore_state(archive_file, &database_path, &storage_root, force, dry_run)
+            let host = LiveMailboxQuiesceHost;
+            if !dry_run && !force && crate::output::is_stdin_tty() {
+                print_mailbox_holders_to_stop(
+                    &host,
+                    &storage_root,
+                    Some(&database_path),
+                    "the restore",
+                );
+            }
+            archive_restore_state(
+                archive_file,
+                &database_path,
+                &storage_root,
+                force,
+                dry_run,
+                || {
+                    acquire_mailbox_locks_quiescing_owners(
+                        &host,
+                        &storage_root,
+                        Some(&database_path),
+                        "the restore",
+                        MailboxQuiesceTiming::default(),
+                    )
+                },
+            )
         }
     }
 }

@@ -74,6 +74,24 @@ Recent releases; the earlier version history continues below.
   that agent's own `sender_token` is still accepted. Sessions without an
   identity keep the trusted-local behavior; the setting is off by default.
 
+### Reset and restore stop the running server instead of failing busy
+
+- `am clear-and-reset-everything` and `am archive restore` no longer fail with
+  `Resource is temporarily busy` while an Agent Mail server holds the mailbox.
+  They find the Agent Mail processes holding the mailbox activity locks and
+  stop them: a systemd unit (the `agent-mail.service` user unit, or any unit
+  whose main process is the holder) or the `com.agent-mail` LaunchAgent is
+  stopped through its manager and started again once the command has released
+  the locks, on success and on failure alike. Any other holder (a terminal
+  `am`, a stdio MCP server) gets SIGTERM, then SIGKILL after 10 seconds, and
+  is reported as not restarted.
+- Interactive runs list the processes that will be stopped and ask every
+  question before stopping anything; `clear-and-reset-everything` now asks
+  "Proceed with destructive reset?" before the archive is written.
+- A stdio server spawned by some other service is terminated on its own; that
+  service is never stopped. If a holder keeps coming back after three rounds,
+  the command stops and names it.
+
 ## v0.3.38 — 2026-10-08 [Release]
 
 Changes after the [v0.3.37 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.37).

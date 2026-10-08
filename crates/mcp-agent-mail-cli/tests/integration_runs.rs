@@ -5827,6 +5827,95 @@ fn clear_and_reset_with_force_and_no_archive_succeeds() {
     );
 }
 
+/// A running server holds the mailbox activity locks for its whole life. The
+/// reset must stop it rather than fail "Resource is temporarily busy", then
+/// wipe the mailbox it served.
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_and_reset_stops_a_running_server_holding_the_mailbox() {
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("serve-http.log");
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let mut server = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["serve-http", "--no-tui", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone server log"))
+        .stderr(log)
+        .spawn()
+        .expect("start HTTP server");
+
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut serving = false;
+    while Instant::now() < deadline && matches!(server.try_wait(), Ok(None)) {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+            && env.db_path.exists()
+        {
+            serving = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !serving {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!(
+            "server never started serving:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+    }
+
+    let out = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["clear-and-reset-everything", "--force", "--no-archive"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clear-and-reset-everything");
+
+    // Reap the server whatever the outcome, so a failure cannot leak it.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    let mut server_exited = false;
+    while Instant::now() < exit_deadline {
+        if matches!(server.try_wait(), Ok(Some(_))) {
+            server_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !server_exited {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reset must stop the running server instead of failing busy\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Stopping Agent Mail process pid {}", server.id())),
+        "reset should name the server it stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        server_exited,
+        "the server holding the mailbox should have been stopped"
+    );
+    assert!(
+        !env.db_path.exists(),
+        "database should be removed after the reset\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ---- Archive commands ----
 
 #[test]
