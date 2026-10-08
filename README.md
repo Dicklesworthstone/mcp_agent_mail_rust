@@ -1016,6 +1016,7 @@ sequenceDiagram
    - It can be combined with named recipients in `to`/`cc`, cannot be `bcc`, and can only name the sender's own project. Replies may address it too.
    - Retention treats a project message as settled only after every agent that can see it has read it (and acknowledged it when required). Archive reconstruction restores the delivery from the canonical message's `to`/`cc` envelope, and salvage restores the per-agent receipts.
    - Restart-safe monitors see it too: a project delivery appends one event to the durable `fetch_inbox_events` / `am inbox-events` cursor ledger, and each visible agent's page includes it (`"kind": "project"`) under the same single cursor.
+   - `am robot overview` and `am robot overview --counts` include each visible agent's unread, urgent-unread, and overdue acknowledgement obligations. One shared message can therefore count for several agents, while a named recipient is counted only once; generating the overview never creates receipts or marks mail read.
 
 ### Across Different Repos
 

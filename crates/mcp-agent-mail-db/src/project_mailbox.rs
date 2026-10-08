@@ -282,6 +282,51 @@ pub fn visible_events_sql() -> String {
     )
 }
 
+/// Pending shared-mailbox obligations, grouped by delivery for a bounded
+/// overview page. Counts represent eligible agents, not stored message copies.
+///
+/// Uses the inbox visibility predicate so direct recipients take precedence,
+/// late joiners and retired agents are excluded, and each agent's own receipt
+/// settles only that agent's obligation. The caller pages delivery ids within
+/// one read snapshot before this lookup, bounding the joined input even when
+/// most historical messages are already settled.
+pub fn overview_counts_query(
+    message_ids: &[i64],
+    overdue_before: i64,
+) -> Result<(String, Vec<Value>), DbError> {
+    if message_ids.is_empty() || message_ids.len() > MAX_IN_CLAUSE_ITEMS {
+        return Err(DbError::invalid(
+            "message_ids",
+            "overview requires between 1 and 500 delivery ids",
+        ));
+    }
+    let placeholders = std::iter::repeat_n("?", message_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT d.message_id AS id, d.project_id AS project_id, \
+                SUM(CASE WHEN pr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread, \
+                SUM(CASE WHEN pr.read_ts IS NULL AND m.importance IN ('urgent', 'high') \
+                         THEN 1 ELSE 0 END) AS urgent, \
+                SUM(CASE WHEN pr.ack_ts IS NULL AND m.ack_required = 1 AND m.created_ts < ? \
+                         THEN 1 ELSE 0 END) AS ack_overdue \
+         FROM project_mailbox_deliveries d \
+         JOIN messages m ON m.id = d.message_id \
+         JOIN agents viewer ON viewer.project_id = d.project_id \
+         LEFT JOIN project_mailbox_receipts pr \
+                ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+         WHERE d.message_id IN ({placeholders}) AND {VISIBLE_TO_VIEWER_SQL} \
+           AND (pr.read_ts IS NULL OR \
+                (pr.ack_ts IS NULL AND m.ack_required = 1 AND m.created_ts < ?)) \
+         GROUP BY d.message_id, d.project_id ORDER BY d.message_id ASC"
+    );
+    let mut params = Vec::with_capacity(message_ids.len() + 2);
+    params.push(Value::BigInt(overdue_before));
+    params.extend(message_ids.iter().copied().map(Value::BigInt));
+    params.push(Value::BigInt(overdue_before));
+    Ok((sql, params))
+}
+
 /// Merge direct and shared-mailbox inbox rows into one newest-first window of
 /// at most `limit` rows.
 #[must_use]

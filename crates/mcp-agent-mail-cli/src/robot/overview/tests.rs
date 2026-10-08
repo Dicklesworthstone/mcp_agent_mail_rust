@@ -51,6 +51,188 @@ fn json(projects: &[OverviewProject]) -> serde_json::Value {
     serde_json::to_value(projects).expect("serialize overview")
 }
 
+fn shared_mailbox_fixture() -> (tempfile::TempDir, DbConn) {
+    let (dir, conn) = fixture(false, false);
+    for sql in [
+        "ALTER TABLE agents ADD COLUMN inception_ts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agents ADD COLUMN retired_at INTEGER",
+        "ALTER TABLE agents ADD COLUMN contact_policy TEXT",
+        "ALTER TABLE messages ADD COLUMN sender_id INTEGER NOT NULL DEFAULT 1",
+        "CREATE TABLE project_mailbox_deliveries (
+            message_id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL)",
+        "CREATE TABLE project_mailbox_receipts (
+            message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL,
+            read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY (message_id, agent_id))",
+    ] {
+        execute(&conn, sql);
+    }
+    (dir, conn)
+}
+
+#[test]
+fn shared_mailbox_overview_counts_visible_agent_obligations_without_writes() {
+    let (_dir, conn) = shared_mailbox_fixture();
+    let now = 10 * ACK_OVERDUE_THRESHOLD_US;
+    let threshold = now - ACK_OVERDUE_THRESHOLD_US;
+    let old = threshold - 1;
+    execute(
+        &conn,
+        "INSERT INTO projects VALUES (1, 'alpha'), (2, 'beta'), (3, 'empty')",
+    );
+    execute(
+        &conn,
+        &format!(
+            "INSERT INTO agents (id, project_id, inception_ts, retired_at, contact_policy) VALUES
+             (1, 1, 0, NULL, 'auto'), (2, 1, 0, NULL, 'auto'),
+             (3, 1, 0, NULL, 'auto'), (4, 1, {now}, NULL, 'auto'),
+             (5, 1, 0, 1, 'auto'), (6, 1, 0, NULL, 'BLOCK_ALL'),
+             (7, 2, 0, NULL, 'auto'), (8, 2, 0, NULL, 'auto'),
+             (9, 1, {old}, NULL, NULL)"
+        ),
+    );
+    execute(
+        &conn,
+        &format!(
+            "INSERT INTO messages (id, project_id, importance, ack_required, created_ts, sender_id)
+             VALUES (1, 1, 'urgent', 1, {old}, 1), (2, 1, 'high', 1, {threshold}, 1),
+                    (3, 1, 'normal', 1, {old}, 1), (4, 2, 'high', 0, {old}, 7)"
+        ),
+    );
+    execute(
+        &conn,
+        "INSERT INTO project_mailbox_deliveries VALUES (1, 1), (2, 1), (3, 1), (4, 2)",
+    );
+    // Agent 3 has a direct delivery of message 1. Its direct obligation wins
+    // over its shared-mailbox receipt, even when that receipt says settled.
+    execute(
+        &conn,
+        "INSERT INTO message_recipients VALUES (1, 3, NULL, NULL)",
+    );
+    execute(
+        &conn,
+        "INSERT INTO project_mailbox_receipts VALUES
+         (1, 2, 0, NULL), (1, 3, 0, 0), (3, 2, 0, 0), (3, 3, 0, NULL), (3, 9, NULL, 0)",
+    );
+    execute(&conn, "PRAGMA query_only = ON");
+    let (full, _) = build_at(&conn, now).expect("read-only overview with shared mail");
+    let (counts, _) = build_at_mode(&conn, now, true).expect("read-only counts with shared mail");
+    assert_eq!(json(&full), json(&counts));
+    assert_eq!(
+        json(&full),
+        serde_json::json!([
+            {"slug": "alpha", "unread": 6, "urgent": 5, "ack_overdue": 4, "reservations": 0},
+            {"slug": "beta", "unread": 1, "urgent": 1, "ack_overdue": 0, "reservations": 0},
+            {"slug": "empty", "unread": 0, "urgent": 0, "ack_overdue": 0, "reservations": 0}
+        ])
+    );
+    let output: serde_json::Value =
+        serde_json::from_str(&render(&counts, true, OutputFormat::Json).expect("counts envelope"))
+            .expect("counts JSON");
+    assert_eq!(output["unread"], 7);
+    assert_eq!(output["urgent"], 6);
+    assert_eq!(output["ack_overdue"], 4);
+    assert_eq!(
+        integer(
+            &conn
+                .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+                .expect("read receipts")[0],
+            "n"
+        )
+        .expect("receipt count"),
+        5,
+        "overview must not materialize per-agent receipts"
+    );
+}
+
+#[test]
+fn shared_mailbox_overview_pages_past_settled_and_invisible_deliveries() {
+    let (_dir, conn) = shared_mailbox_fixture();
+    let now = 10 * ACK_OVERDUE_THRESHOLD_US;
+    let old = now - ACK_OVERDUE_THRESHOLD_US - 1;
+    execute(&conn, "INSERT INTO projects VALUES (1, 'alpha')");
+    execute(
+        &conn,
+        "INSERT INTO agents (id, project_id) VALUES (1, 1), (2, 1)",
+    );
+    execute(&conn, "BEGIN");
+    for id in 1..=2 * OVERVIEW_PAGE_ROWS {
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO messages (id, project_id, importance, ack_required, created_ts)
+                 VALUES ({id}, 1, 'urgent', 1, {old})"
+            ),
+        );
+        execute(
+            &conn,
+            &format!("INSERT INTO project_mailbox_deliveries VALUES ({id}, 1)"),
+        );
+        if id <= OVERVIEW_PAGE_ROWS {
+            execute(
+                &conn,
+                &format!("INSERT INTO project_mailbox_receipts VALUES ({id}, 2, 0, 0)"),
+            );
+        } else {
+            // A delivery with mismatched project authority is invisible to
+            // every viewer, and cannot terminate pagination either.
+            execute(
+                &conn,
+                &format!(
+                    "UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = {id}"
+                ),
+            );
+        }
+    }
+    execute(
+        &conn,
+        &format!(
+            "INSERT INTO messages (id, project_id, importance, ack_required, created_ts)
+             VALUES ({}, 1, 'urgent', 1, {old})",
+            i64::MAX
+        ),
+    );
+    execute(
+        &conn,
+        &format!(
+            "INSERT INTO project_mailbox_deliveries VALUES ({}, 1)",
+            i64::MAX
+        ),
+    );
+    execute(&conn, "COMMIT");
+    let (rows, work) = build_at(&conn, now).expect("paged shared mailbox overview");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].unread, rows[0].urgent, rows[0].ack_overdue),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        work.project_mailbox_message_rows,
+        2 * OVERVIEW_PAGE_ROWS + 1
+    );
+    assert!(work.peak_query_rows <= OVERVIEW_PAGE_ROWS);
+}
+
+#[test]
+fn shared_mailbox_overview_refuses_a_broken_receipt_schema() {
+    let (_dir, conn) = fixture(false, false);
+    execute(
+        &conn,
+        "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER)",
+    );
+    execute(
+        &conn,
+        "INSERT INTO project_mailbox_deliveries VALUES (1, 1)",
+    );
+    assert!(
+        build(&conn).is_err(),
+        "broken shared mail must not report zero unread"
+    );
+    assert!(
+        build_counts_output(&conn, OutputFormat::Json).is_err(),
+        "counts must report the same schema failure"
+    );
+}
+
 #[test]
 fn linear_overview_matches_current_main_across_release_schemas() {
     for legacy in [false, true] {
