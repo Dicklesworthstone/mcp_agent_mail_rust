@@ -15,6 +15,8 @@ use crate::ShareError;
 
 type Conn = DbConn;
 
+mod prune;
+
 /// A project record from the `projects` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
@@ -157,135 +159,16 @@ pub fn apply_project_scope(
 
     let derived_artifacts = crate::scrub::detect_derived_export_artifacts(&conn)?;
 
-    // Build SQL placeholders for allowed IDs
-    let placeholders = build_placeholders(matched_ids.len());
-    let id_values: Vec<Value> = matched_ids.iter().map(|&id| Value::BigInt(id)).collect();
-
     conn.execute_sync("BEGIN IMMEDIATE", &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("BEGIN transaction failed: {e}"),
         })?;
 
     let result = (|| {
-        // Delete order — use NOT IN (allowed_ids) for safety
-        // 1. agent_links (cross-project)
-        if table_exists(&conn, "agent_links")? {
-            let sql = format!(
-                "DELETE FROM agent_links WHERE a_project_id NOT IN ({placeholders}) OR b_project_id NOT IN ({placeholders})"
-            );
-            let mut params = id_values.clone();
-            params.extend(id_values.iter().cloned());
-            exec(&conn, &sql, &params)?;
-        }
+        // One transaction owns every phase and project chunk. Never collect
+        // all excluded message IDs into a single parameter list.
+        prune::apply(&conn, &disallowed)?;
 
-        // 2. project_sibling_suggestions
-        if table_exists(&conn, "project_sibling_suggestions")? {
-            let sql = format!(
-                "DELETE FROM project_sibling_suggestions WHERE project_a_id NOT IN ({placeholders}) OR project_b_id NOT IN ({placeholders})"
-            );
-            let mut params = id_values.clone();
-            params.extend(id_values.iter().cloned());
-            exec(&conn, &sql, &params)?;
-        }
-
-        // 3. Collect message IDs for non-allowed projects
-        let msg_sql = format!(
-            "SELECT id FROM messages WHERE project_id NOT IN ({placeholders}) ORDER BY id ASC"
-        );
-        let msg_rows = conn
-            .query_sync(&msg_sql, &id_values)
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("SELECT messages failed: {e}"),
-            })?;
-        let msg_ids: Vec<i64> = msg_rows
-            .iter()
-            .filter_map(|r| r.get_named::<i64>("id").ok())
-            .collect();
-
-        // 4. Delete message_recipients for collected message IDs
-        if !msg_ids.is_empty() {
-            let msg_placeholders = build_placeholders(msg_ids.len());
-            let msg_values: Vec<Value> = msg_ids.iter().map(|&id| Value::BigInt(id)).collect();
-            exec(
-                &conn,
-                &format!("DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"),
-                &msg_values,
-            )?;
-        }
-
-        // 5. Delete messages
-        exec(
-            &conn,
-            &format!("DELETE FROM messages WHERE project_id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
-
-        // 6. Delete file_reservations
-        exec(
-            &conn,
-            &format!("DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
-        if table_exists(&conn, "file_reservation_releases")? {
-            exec(
-                &conn,
-                "DELETE FROM file_reservation_releases \
-                 WHERE reservation_id NOT IN (SELECT id FROM file_reservations)",
-                &[],
-            )?;
-        }
-
-        // 7. Delete product links scoped to filtered-out projects and then
-        // remove any products that are no longer referenced by the kept scope.
-        if table_exists(&conn, "product_project_links")? {
-            exec(
-                &conn,
-                &format!(
-                    "DELETE FROM product_project_links WHERE project_id NOT IN ({placeholders})"
-                ),
-                &id_values,
-            )?;
-            if table_exists(&conn, "products")? {
-                exec(
-                    &conn,
-                    "DELETE FROM products \
-                     WHERE id NOT IN (SELECT DISTINCT product_id FROM product_project_links)",
-                    &[],
-                )?;
-            }
-        }
-
-        // 8. Remove lifecycle ledger rows for agents outside the selected
-        // project scope before removing their parent rows. Older snapshots do
-        // not have this table, so keep the operation schema-tolerant.
-        if table_exists(&conn, "agent_deregistrations")? {
-            exec(
-                &conn,
-                &format!(
-                    "DELETE FROM agent_deregistrations \
-                     WHERE agent_id IN (\
-                         SELECT id FROM agents WHERE project_id NOT IN ({placeholders})\
-                     )"
-                ),
-                &id_values,
-            )?;
-        }
-
-        // 9. Delete agents
-        exec(
-            &conn,
-            &format!("DELETE FROM agents WHERE project_id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
-
-        // 10. Delete recipient links that now point at filtered-out agents, then
-        // repair the denormalized recipients envelope for kept messages.
-        exec(
-            &conn,
-            "DELETE FROM message_recipients \
-             WHERE agent_id NOT IN (SELECT id FROM agents)",
-            &[],
-        )?;
         if column_exists(&conn, "messages", "recipients_json")? {
             sync_scope_recipients_json(&conn)?;
         }
@@ -303,13 +186,6 @@ pub fn apply_project_scope(
         if table_exists(&conn, "tool_metrics_snapshots")? {
             exec(&conn, "DELETE FROM tool_metrics_snapshots", &[])?;
         }
-
-        // 12. Delete projects
-        exec(
-            &conn,
-            &format!("DELETE FROM projects WHERE id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
 
         let remaining = count_remaining(&conn)?;
 
