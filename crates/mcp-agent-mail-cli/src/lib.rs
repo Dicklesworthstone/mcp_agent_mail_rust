@@ -8747,11 +8747,44 @@ pub fn prepare_runtime_server_startup_with_takeover(
 ) -> CliResult<()> {
     config.validate_user_env_authority()?;
     raise_server_fd_soft_limit();
+    ensure_startup_staging_root(config)?;
     run_runtime_server_startup_prep_with(
         config,
         |cfg| auto_clear_db_blockers_with_takeover(cfg, takeover),
         run_startup_database_self_heal,
     )
+}
+
+/// Startup probes stage private copies of the mailbox under `$TMPDIR`. Prove
+/// that works before they run, and move staging under the storage root's
+/// gitignored `diagnostics/` when it does not (br-txx8u): a full or
+/// over-quota temp directory must neither stop the server nor be read as
+/// mailbox damage.
+fn ensure_startup_staging_root(config: &Config) -> CliResult<()> {
+    use mcp_agent_mail_db::pool::SnapshotTempRootChoice;
+
+    let fallback = config.storage_root.join("diagnostics").join("staging");
+    match mcp_agent_mail_db::pool::ensure_usable_snapshot_temp_root(&fallback) {
+        Ok(SnapshotTempRootChoice::Preferred(_)) => Ok(()),
+        Ok(SnapshotTempRootChoice::Fallback {
+            preferred,
+            preferred_error,
+            fallback,
+        }) => {
+            output::warn(&format!(
+                "Temp directory {} cannot hold mailbox probe copies ({preferred_error}); \
+                 staging them under {} instead. Free space there or point TMPDIR at a \
+                 writable filesystem.",
+                preferred.display(),
+                fallback.display()
+            ));
+            Ok(())
+        }
+        Err(error) => Err(CliError::Other(format!(
+            "Startup cannot stage mailbox health probes: {error}. This is a host storage \
+             problem, not mailbox damage; no repair or archive reconstruction was attempted."
+        ))),
+    }
 }
 
 /// br-kp1in.17: servers raise their soft `RLIMIT_NOFILE` toward the hard limit
@@ -16085,7 +16118,13 @@ impl std::fmt::Debug for CanonicalSnapshotSource {
 }
 
 fn canonical_snapshot_tempdir(prefix: &str, context: &str) -> CliResult<tempfile::TempDir> {
-    canonical_snapshot_tempdir_in(&std::env::temp_dir(), prefix, context)
+    // The shared staging root honors a fallback chosen when $TMPDIR cannot
+    // hold a probe copy (br-txx8u).
+    canonical_snapshot_tempdir_in(
+        &mcp_agent_mail_db::pool::snapshot_temp_root(),
+        prefix,
+        context,
+    )
 }
 
 fn canonical_snapshot_tempdir_in(
@@ -33430,6 +33469,25 @@ fn doctor_enforce_corruption_verdict_authority(
     }
 }
 
+/// Refuse to turn a probe failure caused by the host's storage into a verdict
+/// about the mailbox. Staging a private probe copy into a full or over-quota
+/// `$TMPDIR` used to read as database damage, start archive reconstruction,
+/// and trip the recovery breaker on a healthy mailbox (br-txx8u).
+fn doctor_refuse_host_storage_fault(probe: &str, error: &dyn std::fmt::Display) -> CliResult<()> {
+    let text = error.to_string();
+    if !mcp_agent_mail_core::disk::is_host_storage_exhaustion_message(&text) {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "{probe} could not run because the host is out of disk space, quota, or writable \
+         storage: {}. This is not mailbox damage, so no repair or archive reconstruction was \
+         attempted. Free space in the staging directory {} (or point TMPDIR at a writable \
+         filesystem) and retry.",
+        truncate_doctor_open_probe_detail(&text),
+        mcp_agent_mail_db::pool::snapshot_temp_root().display()
+    )))
+}
+
 fn doctor_database_inventory_failure_strategy(
     error: &CliError,
     archive_reconstruct_available: bool,
@@ -33616,6 +33674,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     let opened = match open_db_for_doctor_check_read_only_with_context(database_url) {
         Ok(opened) => opened,
         Err(error) => {
+            doctor_refuse_host_storage_fault("Database open probe", &error)?;
             // The open error is a composite of every canonical-source branch
             // (`guarded live snapshot failed: ...; staged family copy failed:
             // ...; guarded offline canonical open failed: ...`); keep all of
@@ -33638,6 +33697,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     let missing_tables = match doctor_required_tables_canonical(&opened.conn) {
         Ok(missing_tables) => missing_tables,
         Err(error) => {
+            doctor_refuse_host_storage_fault("Required-table probe", &error)?;
             return Ok(doctor_database_probe_failure_strategy(
                 "Required-table probe",
                 &error,
@@ -33667,6 +33727,7 @@ fn doctor_database_fix_strategy_read_only_probes(
         let db = match collect_doctor_db_inventory_canonical(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
+                doctor_refuse_host_storage_fault("Database inventory probe", &error)?;
                 return Ok(doctor_database_inventory_failure_strategy(
                     &error,
                     archive_reconstruct_available,
@@ -33695,6 +33756,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     ) {
         Ok(ok) => ok,
         Err(error) => {
+            doctor_refuse_host_storage_fault("PRAGMA integrity_check", &error)?;
             let detail = format!(
                 "PRAGMA integrity_check failed for {}: {error}",
                 opened.opened_path
@@ -33731,6 +33793,7 @@ fn doctor_database_fix_strategy_read_only_probes(
         match doctor_relational_integrity_diagnostics_canonical(&opened.conn) {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
+                doctor_refuse_host_storage_fault("Relational consistency probe", &error)?;
                 return Ok(doctor_database_probe_failure_strategy(
                     "Relational consistency probe",
                     &error,
@@ -33934,6 +33997,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             return Ok(verdict);
         }
         Err(error) => {
+            doctor_refuse_host_storage_fault("Database sanity probe", &error)?;
             let verdict = if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database sanity probe failed for {}: {}; archive recovery is available under {}",
@@ -33971,6 +34035,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let opened = match open_db_for_doctor_check_with_context(database_url) {
         Ok(opened) => opened,
         Err(error) => {
+            doctor_refuse_host_storage_fault("Database open probe", &error)?;
             return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database open probe failed: {}; archive recovery is available under {}",
@@ -33989,6 +34054,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let missing_tables = match doctor_required_tables(&opened.conn) {
         Ok(missing_tables) => missing_tables,
         Err(error) => {
+            doctor_refuse_host_storage_fault("Required-table probe", &error)?;
             return Ok(doctor_database_probe_failure_strategy(
                 "Required-table probe",
                 &error,
@@ -34018,6 +34084,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         let db = match collect_doctor_db_inventory(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
+                doctor_refuse_host_storage_fault("Database inventory probe", &error)?;
                 return Ok(doctor_database_inventory_failure_strategy(
                     &error,
                     archive_reconstruct_available,
@@ -34054,6 +34121,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let integrity_ok = match integrity_probe {
         Ok(ok) => ok,
         Err(error) => {
+            doctor_refuse_host_storage_fault("PRAGMA integrity_check", &error)?;
             let detail = format!(
                 "PRAGMA integrity_check failed for {}: {error}",
                 opened.opened_path
@@ -34091,6 +34159,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
+                doctor_refuse_host_storage_fault("Relational consistency probe", &error)?;
                 return Ok(doctor_database_probe_failure_strategy(
                     "Relational consistency probe",
                     &error,
@@ -60850,6 +60919,42 @@ startup_timeout_sec = 42
             1,
             "doctor strategy should preserve the healthy main database"
         );
+    }
+
+    /// br-txx8u: the exact staging failures from the yto incident become a
+    /// clear host-storage error, never a repair or reconstruct verdict;
+    /// real database failures still reach the verdict logic.
+    #[test]
+    fn doctor_probe_failures_from_host_storage_are_not_mailbox_damage() {
+        for detail in [
+            "database health probe failed for /m/storage.sqlite3: failed to stage source-byte-neutral SQLite health probe for /m/storage.sqlite3: Quota exceeded (os error 122)",
+            "canonical double-probe snapshot tempdir failed: No space left on device (os error 28)",
+            "staged family copy of /m/storage.sqlite3 failed: Read-only file system (os error 30)",
+        ] {
+            let error = doctor_refuse_host_storage_fault(
+                "Database sanity probe",
+                &CliError::Other(detail.to_string()),
+            )
+            .expect_err("host storage failure must be refused as a verdict");
+            let text = error.to_string();
+            assert!(
+                text.contains("not mailbox damage")
+                    && text.contains("no repair or archive reconstruction was attempted")
+                    && text.contains("TMPDIR"),
+                "{text}"
+            );
+        }
+        for detail in [
+            "database disk image is malformed",
+            "PRAGMA integrity_check failed: wrong # of entries in index",
+            "Permission denied (os error 13)",
+        ] {
+            doctor_refuse_host_storage_fault(
+                "Database sanity probe",
+                &CliError::Other(detail.to_string()),
+            )
+            .expect("database failures keep flowing to the repair/reconstruct verdict");
+        }
     }
 
     #[test]

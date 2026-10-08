@@ -3324,6 +3324,11 @@ fn trusted_platform_snapshot_temp_alias(_candidate: &Path) -> std::io::Result<Op
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
+    // Startup moves staging here when $TMPDIR cannot hold a probe copy
+    // (br-txx8u); every snapshot must follow it.
+    if let Some(fallback) = mcp_agent_mail_db::pool::snapshot_temp_root_fallback() {
+        return validate_snapshot_temp_dir(&fallback, "staging fallback");
+    }
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
             continue;

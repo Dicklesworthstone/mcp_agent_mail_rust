@@ -1607,6 +1607,36 @@ where
             if let Some(prior) = &mut lineage_prior {
                 prior.db_fingerprint.clone_from(&terminal_fingerprint);
             }
+            let error_text = error.to_string();
+            if !breaker_bypass
+                && mcp_agent_mail_core::disk::is_host_storage_exhaustion_message(&error_text)
+            {
+                // A full disk, exhausted quota or read-only mount is a fault of
+                // the host, not evidence about this database: counting it let
+                // three restarts against a full $TMPDIR trip the breaker on a
+                // healthy mailbox (br-txx8u). Put back the history the attempt
+                // started from (retargeted like any other lineage) instead.
+                let restored = lineage_prior.map_or_else(
+                    || crate::recovery_breaker::cleared_state(&terminal_fingerprint),
+                    |mut prior| {
+                        prior.attempt_in_progress = false;
+                        prior
+                    },
+                );
+                if let Err(store_error) = crate::recovery_breaker::store(primary_path, &restored) {
+                    tracing::warn!(
+                        path = %primary_path.display(),
+                        error = %store_error,
+                        "could not restore recovery-breaker history after a host storage failure"
+                    );
+                }
+                tracing::warn!(
+                    path = %primary_path.display(),
+                    error = %error_text,
+                    "{action} failed because the host is out of disk space, quota, or writable storage; not counted against the recovery breaker"
+                );
+                return Err(AutomaticRecoveryRunError::Operation(error));
+            }
             let failed = crate::recovery_breaker::record_failure(
                 lineage_prior.as_ref(),
                 &terminal_fingerprint,
@@ -6993,14 +7023,155 @@ pub struct CanonicalSnapshotTempDir {
     canonical_path: PathBuf,
 }
 
+/// The staging directory chosen by [`ensure_usable_snapshot_temp_root`] when
+/// the environment's temp directory cannot hold a probe copy. Set at most once
+/// per process; every later staging area is created there.
+static SNAPSHOT_TEMP_ROOT_FALLBACK: OnceLock<PathBuf> = OnceLock::new();
+
+/// Bytes written by the staging probe: enough to fail on a quota or a
+/// filesystem that is already full, without itself filling one.
+const SNAPSHOT_TEMP_ROOT_PROBE_BYTES: usize = 1024 * 1024;
+
+/// Where [`ensure_usable_snapshot_temp_root`] decided staging goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotTempRootChoice {
+    /// The environment's temp directory accepted the probe.
+    Preferred(PathBuf),
+    /// The environment's temp directory refused the probe; staging moved to
+    /// the fallback for the rest of the process.
+    Fallback {
+        preferred: PathBuf,
+        preferred_error: String,
+        fallback: PathBuf,
+    },
+}
+
 /// The directory temporary staging areas are created in.
 ///
-/// The first non-empty `TMPDIR` / `TEMP` / `TMP` wins, falling back to the
+/// A fallback chosen by [`ensure_usable_snapshot_temp_root`] wins. Otherwise
+/// the first non-empty `TMPDIR` / `TEMP` / `TMP` wins, falling back to the
 /// platform temp directory. Nothing here is ever hardcoded to `/tmp`: that is
 /// simply what `std::env::temp_dir()` answers on Unix when none of those
 /// variables is set.
 #[must_use]
 pub fn snapshot_temp_root() -> PathBuf {
+    if let Some(fallback) = SNAPSHOT_TEMP_ROOT_FALLBACK.get() {
+        return fallback.clone();
+    }
+    environment_snapshot_temp_root()
+}
+
+/// The staging fallback in force for this process, if one was chosen.
+#[must_use]
+pub fn snapshot_temp_root_fallback() -> Option<PathBuf> {
+    SNAPSHOT_TEMP_ROOT_FALLBACK.get().cloned()
+}
+
+/// Prove that staging copies can be written before anything relies on them.
+///
+/// Startup health probes stage private copies of the mailbox family under the
+/// temp directory. A full or over-quota `$TMPDIR` used to make those copies
+/// fail, which startup read as database damage and answered with archive
+/// reconstruction until the recovery breaker tripped on a healthy mailbox
+/// (br-txx8u). This writes a small probe file under the environment's temp
+/// directory; when that fails, staging moves to `fallback` (created private)
+/// for the rest of the process. Errors only when neither location accepts
+/// the probe, naming both.
+pub fn ensure_usable_snapshot_temp_root(
+    fallback: &Path,
+) -> std::io::Result<SnapshotTempRootChoice> {
+    let preferred = environment_snapshot_temp_root();
+    if let Some(chosen) = SNAPSHOT_TEMP_ROOT_FALLBACK.get() {
+        return Ok(SnapshotTempRootChoice::Fallback {
+            preferred,
+            preferred_error: "an earlier probe in this process refused it".to_string(),
+            fallback: chosen.clone(),
+        });
+    }
+    let choice = choose_snapshot_temp_root(&preferred, fallback)?;
+    if let SnapshotTempRootChoice::Fallback { fallback, .. } = &choice {
+        SNAPSHOT_TEMP_ROOT_FALLBACK.get_or_init(|| fallback.clone());
+    }
+    Ok(choice)
+}
+
+/// The decision behind [`ensure_usable_snapshot_temp_root`], without
+/// recording it for the process.
+fn choose_snapshot_temp_root(
+    preferred: &Path,
+    fallback: &Path,
+) -> std::io::Result<SnapshotTempRootChoice> {
+    let preferred_error = match probe_snapshot_temp_root(preferred) {
+        Ok(()) => return Ok(SnapshotTempRootChoice::Preferred(preferred.to_path_buf())),
+        Err(error) => error,
+    };
+    let fallback_result =
+        create_private_dir_all(fallback).and_then(|()| probe_snapshot_temp_root(fallback));
+    if let Err(fallback_error) = fallback_result {
+        return Err(std::io::Error::new(
+            preferred_error.kind(),
+            format!(
+                "no usable staging directory: temp directory {} refused a {} KiB probe ({preferred_error}); fallback {} refused it too ({fallback_error}). Free space or quota there, or point TMPDIR at a writable filesystem",
+                preferred.display(),
+                SNAPSHOT_TEMP_ROOT_PROBE_BYTES / 1024,
+                fallback.display()
+            ),
+        ));
+    }
+    Ok(SnapshotTempRootChoice::Fallback {
+        preferred: preferred.to_path_buf(),
+        preferred_error: preferred_error.to_string(),
+        fallback: fallback.to_path_buf(),
+    })
+}
+
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    // The fallback and its parent belong to the mailbox owner; a symlink at
+    // either would send private mailbox copies somewhere else. Check before
+    // creating anything through them, and again after.
+    let owned_components = || std::iter::once(path).chain(path.parent());
+    let refuse_non_directory = |candidate: &Path, missing_ok: bool| -> std::io::Result<()> {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "staging fallback component {} is not a real directory",
+                    candidate.display()
+                ),
+            )),
+            Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    };
+    for candidate in owned_components() {
+        refuse_non_directory(candidate, true)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    for candidate in owned_components() {
+        refuse_non_directory(candidate, false)?;
+    }
+    Ok(())
+}
+
+/// Write and sync a probe file in a private directory under `root`; the
+/// directory is removed when the probe ends.
+fn probe_snapshot_temp_root(root: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let probe = CanonicalSnapshotTempDir::new_in("am-staging-probe-", root)?;
+    let mut file = std::fs::File::create_new(probe.path().join("probe.bin"))?;
+    file.write_all(&vec![0_u8; SNAPSHOT_TEMP_ROOT_PROBE_BYTES])?;
+    file.sync_all()
+}
+
+fn environment_snapshot_temp_root() -> PathBuf {
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = env_value(key) else {
             continue;
@@ -28879,6 +29050,128 @@ mod tests {
             .expect("cleared sidecar persists");
         assert!(!cleared.tripped);
         assert_eq!(cleared.consecutive_failures, 0);
+    }
+
+    /// br-txx8u: recovery that fails because the host ran out of space, quota
+    /// or writable storage says nothing about the database, so repeated such
+    /// failures never trip the breaker, and they leave earlier history as it
+    /// was rather than wiping it.
+    #[test]
+    fn host_storage_failures_never_trip_the_recovery_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"healthy-content-behind-a-full-tmpdir").unwrap();
+        let quota_op = || {
+            Err::<(), _>(SqlError::Custom(
+                "failed to stage source-byte-neutral SQLite health probe: Quota exceeded (os error 122)"
+                    .to_string(),
+            ))
+        };
+
+        for _ in 0..5 {
+            recovery_admission().reset();
+            let error = with_recovery_admission(&db, "test recovery", quota_op)
+                .expect_err("host storage failure is still reported");
+            assert!(error.to_string().contains("Quota exceeded"), "{error}");
+        }
+        let state = crate::recovery_breaker::load(&db)
+            .expect("load breaker sidecar")
+            .expect("restored history is persisted");
+        assert!(!state.tripped, "host storage failures must not trip");
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(!state.attempt_in_progress, "the armed attempt is retired");
+
+        // One real failure, then a host storage failure: the count keeps the
+        // real failure and does not add the storage one.
+        recovery_admission().reset();
+        with_recovery_admission(&db, "test recovery", || {
+            Err::<(), _>(SqlError::Custom("synthetic recovery failure".to_string()))
+        })
+        .expect_err("synthetic recovery must fail");
+        recovery_admission().reset();
+        with_recovery_admission(&db, "test recovery", quota_op).expect_err("still fails");
+        let state = crate::recovery_breaker::load(&db)
+            .expect("load sidecar")
+            .expect("sidecar");
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(
+            state
+                .last_failure_reason
+                .contains("synthetic recovery failure")
+        );
+    }
+
+    #[test]
+    fn staging_root_falls_back_when_the_temp_directory_refuses_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the temp directory should be refuses every
+        // staging attempt, even for root.
+        let unusable = dir.path().join("tmp-is-a-file");
+        std::fs::write(&unusable, b"not a directory").unwrap();
+        let fallback = dir
+            .path()
+            .join("storage")
+            .join("diagnostics")
+            .join("staging");
+
+        let choice = choose_snapshot_temp_root(&unusable, &fallback).expect("fallback accepted");
+        let SnapshotTempRootChoice::Fallback {
+            preferred,
+            fallback: chosen,
+            ..
+        } = choice
+        else {
+            panic!("an unusable temp directory must fall back: {choice:?}");
+        };
+        assert_eq!(preferred, unusable);
+        assert_eq!(chosen, fallback);
+        assert!(fallback.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&fallback).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "staging copies of the mailbox stay private");
+        }
+        assert_eq!(
+            std::fs::read_dir(&fallback).unwrap().count(),
+            0,
+            "the probe leaves nothing behind"
+        );
+
+        let usable = dir.path().join("usable-tmp");
+        std::fs::create_dir(&usable).unwrap();
+        assert_eq!(
+            choose_snapshot_temp_root(&usable, &fallback).expect("usable temp dir"),
+            SnapshotTempRootChoice::Preferred(usable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_root_refuses_a_symlinked_fallback_and_names_both_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let unusable = dir.path().join("tmp-is-a-file");
+        std::fs::write(&unusable, b"not a directory").unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir(&storage).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, storage.join("diagnostics")).unwrap();
+        let fallback = storage.join("diagnostics").join("staging");
+
+        let error = choose_snapshot_temp_root(&unusable, &fallback)
+            .expect_err("a symlinked fallback parent must be refused");
+        assert!(
+            !elsewhere.join("staging").exists(),
+            "nothing may be created through the symlink"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("no usable staging directory")
+                && text.contains(&unusable.display().to_string())
+                && text.contains("not a real directory"),
+            "{text}"
+        );
     }
 
     /// br-acusl: the production automatic archive-recovery entry refuses

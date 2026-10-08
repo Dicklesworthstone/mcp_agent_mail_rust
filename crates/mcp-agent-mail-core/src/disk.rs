@@ -752,6 +752,40 @@ fn normalize_probe_path(path: &Path) -> PathBuf {
     PathBuf::from(".")
 }
 
+/// Whether an I/O failure was caused by the host's storage, not the data.
+///
+/// That covers a full filesystem, an exhausted quota, or a read-only mount
+/// (ENOSPC/EDQUOT/EROFS and their Windows equivalents). Such a failure while
+/// staging a private probe copy says nothing about the mailbox, so it must
+/// never be read as database damage (br-txx8u).
+#[must_use]
+pub fn is_host_storage_exhaustion(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull
+            | io::ErrorKind::QuotaExceeded
+            | io::ErrorKind::ReadOnlyFilesystem
+    ) || is_host_storage_exhaustion_message(&error.to_string())
+}
+
+/// [`is_host_storage_exhaustion`] for an error that has already been
+/// flattened to text (`SqlError`, `CliError` and recovery reasons carry only
+/// the rendered `io::Error`).
+#[must_use]
+pub fn is_host_storage_exhaustion_message(text: &str) -> bool {
+    const SIGNATURES: &[&str] = &[
+        "no space left on device",
+        "quota exceeded",
+        "read-only file system",
+        "not enough space on the disk",
+        "(os error 28)",
+        "(os error 30)",
+        "(os error 122)",
+    ];
+    let lower = text.to_ascii_lowercase();
+    SIGNATURES.iter().any(|signature| lower.contains(signature))
+}
+
 /// Return available bytes for the filesystem containing `path`.
 ///
 /// Uses `fs2::available_space` (cross-platform) and never requires unsafe code.
@@ -1226,6 +1260,45 @@ pub fn is_platform_temp_firmlink(link: &Path, resolved: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn host_storage_exhaustion_recognizes_full_quota_and_read_only_storage() {
+        for error in [
+            io::Error::from(io::ErrorKind::StorageFull),
+            io::Error::from(io::ErrorKind::QuotaExceeded),
+            io::Error::from(io::ErrorKind::ReadOnlyFilesystem),
+            io::Error::other("write to disk: Quota exceeded (os error 122)"),
+        ] {
+            assert!(is_host_storage_exhaustion(&error), "{error}");
+        }
+        for text in [
+            "failed to stage source-byte-neutral SQLite health probe for /m/storage.sqlite3: No space left on device (os error 28)",
+            "canonical snapshot tempdir failed: Disk quota exceeded (os error 122)",
+            "macOS: Disc quota exceeded (os error 69)",
+            "Read-only file system (os error 30)",
+        ] {
+            assert!(is_host_storage_exhaustion_message(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn host_storage_exhaustion_ignores_database_and_permission_failures() {
+        for error in [
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::other("database disk image is malformed"),
+        ] {
+            assert!(!is_host_storage_exhaustion(&error), "{error}");
+        }
+        for text in [
+            "PRAGMA integrity_check failed: database disk image is malformed",
+            "file is not a database",
+            "os error 2",
+            "(os error 280)",
+        ] {
+            assert!(!is_host_storage_exhaustion_message(text), "{text}");
+        }
+    }
 
     #[cfg(windows)]
     #[test]
