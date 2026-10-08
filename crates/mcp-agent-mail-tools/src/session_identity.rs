@@ -53,6 +53,13 @@ const SESSION_IDENTITY_STATE_KEY: &str = "mcp_agent_mail.session_identity.v1";
 /// Most identities one session may hold; the oldest binding is dropped first.
 const MAX_SESSION_BINDINGS: usize = 32;
 
+// FastMCP locks individual get/set operations, but exposes no atomic update.
+// Serialize this key's two writers across their bounded read/modify/write;
+// otherwise parallel requests can lose a project's last binding or restore a
+// retired identity. A single lock avoids a second session-lifetime registry.
+// Authorization reads, database work, awaits, and logging never hold this lock.
+static BINDINGS_UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One agent identity held by the session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionBinding {
@@ -73,6 +80,29 @@ fn bindings(ctx: &McpContext) -> Vec<SessionBinding> {
         .unwrap_or_default()
 }
 
+fn update_bindings(
+    ctx: &McpContext,
+    update: impl FnOnce(&mut Vec<SessionBinding>) -> bool,
+) -> bool {
+    #[cfg(test)]
+    if matches!(
+        BINDINGS_UPDATE_LOCK.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ) {
+        tests::update_checkpoint(tests::UpdateCheckpoint::Contended);
+    }
+    let _guard = BINDINGS_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = bindings(ctx);
+    if !update(&mut held) {
+        return true;
+    }
+    #[cfg(test)]
+    tests::update_checkpoint(tests::UpdateCheckpoint::BeforeWrite);
+    ctx.set_state(SESSION_IDENTITY_STATE_KEY, held)
+}
+
 /// The identities this session holds, or none when the feature is off.
 #[must_use]
 pub fn session_bindings(ctx: &McpContext) -> Vec<SessionBinding> {
@@ -85,19 +115,21 @@ pub fn bind(ctx: &McpContext, project_id: i64, agent_id: i64, agent_name: &str) 
     if !enabled() || !ctx.has_session_state() || agent_id <= 0 {
         return;
     }
-    let mut held = bindings(ctx);
-    held.retain(|binding| binding.agent_id != agent_id);
-    held.push(SessionBinding {
-        project_id,
-        agent_id,
-        agent_name: agent_name.to_string(),
-        bound_at_us: mcp_agent_mail_db::now_micros(),
+    let stored = update_bindings(ctx, |held| {
+        held.retain(|binding| binding.agent_id != agent_id);
+        held.push(SessionBinding {
+            project_id,
+            agent_id,
+            agent_name: agent_name.to_string(),
+            bound_at_us: mcp_agent_mail_db::now_micros(),
+        });
+        if held.len() > MAX_SESSION_BINDINGS {
+            let excess = held.len() - MAX_SESSION_BINDINGS;
+            held.drain(..excess);
+        }
+        true
     });
-    if held.len() > MAX_SESSION_BINDINGS {
-        let excess = held.len() - MAX_SESSION_BINDINGS;
-        held.drain(..excess);
-    }
-    if !ctx.set_state(SESSION_IDENTITY_STATE_KEY, held) {
+    if !stored {
         tracing::warn!(agent_id, "could not record the session identity binding");
     }
 }
@@ -107,12 +139,11 @@ pub fn unbind(ctx: &McpContext, agent_id: i64) {
     if !enabled() || !ctx.has_session_state() {
         return;
     }
-    let mut held = bindings(ctx);
-    let before = held.len();
-    held.retain(|binding| binding.agent_id != agent_id);
-    if held.len() != before {
-        ctx.set_state(SESSION_IDENTITY_STATE_KEY, held);
-    }
+    update_bindings(ctx, |held| {
+        let before = held.len();
+        held.retain(|binding| binding.agent_id != agent_id);
+        held.len() != before
+    });
 }
 
 /// Whether this session holds `agent_id`.
@@ -175,7 +206,85 @@ pub fn authorize_actor(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UpdateCheckpoint {
+        Contended,
+        BeforeWrite,
+    }
+
+    type UpdateHook = Box<dyn FnMut(UpdateCheckpoint)>;
+
+    thread_local! {
+        static UPDATE_HOOK: RefCell<Option<UpdateHook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn update_checkpoint(checkpoint: UpdateCheckpoint) {
+        UPDATE_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(checkpoint);
+            }
+        });
+    }
+
+    // Stop one actual writer immediately before publication, then require a
+    // second actual writer to contend before releasing the first. Channels
+    // select the interleaving; timeouts only bound a broken test's deadlock.
+    fn interleave_updates(
+        state: fastmcp_core::SessionState,
+        first: impl FnOnce(&McpContext) + Send,
+        second: impl FnOnce(&McpContext) + Send,
+    ) {
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let first_state = state.clone();
+            let first_writer = scope.spawn(move || {
+                UPDATE_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |checkpoint| {
+                        if checkpoint == UpdateCheckpoint::BeforeWrite {
+                            ready_tx.send(()).expect("announce first writer");
+                            let _ = resume_rx.recv();
+                        }
+                    }));
+                });
+                let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 1, first_state);
+                first(&ctx);
+            });
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first writer reached publication");
+
+            let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+            let second_writer = scope.spawn(move || {
+                UPDATE_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |checkpoint| {
+                        checkpoint_tx
+                            .send(checkpoint)
+                            .expect("announce second writer");
+                    }));
+                });
+                let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 2, state);
+                second(&ctx);
+            });
+            let checkpoint = checkpoint_rx.recv_timeout(Duration::from_secs(5));
+            // Release even on a missing or incorrect checkpoint, so a failing
+            // assertion cannot strand either scoped writer.
+            drop(resume_tx);
+            first_writer.join().expect("first writer completed");
+            second_writer.join().expect("second writer completed");
+            assert_eq!(
+                checkpoint.expect("second writer reached the update"),
+                UpdateCheckpoint::Contended,
+                "the second writer must not read a stale binding vector"
+            );
+        });
+    }
 
     fn agent(id: i64, project_id: i64, name: &str) -> mcp_agent_mail_db::AgentRow {
         mcp_agent_mail_db::AgentRow {
@@ -264,6 +373,83 @@ mod tests {
             let held = session_bindings(&ctx);
             assert_eq!(held.len(), MAX_SESSION_BINDINGS);
             assert!(!holds(&ctx, Some(1)), "oldest binding dropped");
+        });
+    }
+
+    #[test]
+    fn concurrent_bindings_preserve_each_projects_identity_restriction() {
+        with_feature(true, || {
+            let state = fastmcp_core::SessionState::new();
+            let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 3, state.clone());
+            interleave_updates(
+                state,
+                |ctx| bind(ctx, 10, 1, "BlueLake"),
+                |ctx| bind(ctx, 20, 2, "RedStone"),
+            );
+            assert_eq!(session_bindings(&ctx).len(), 2);
+            assert!(holds(&ctx, Some(1)));
+            assert!(holds(&ctx, Some(2)));
+            for project_id in [10, 20] {
+                let error = authorize_actor(
+                    &ctx,
+                    &agent(3, project_id, "GreenCastle"),
+                    false,
+                    "send messages",
+                )
+                .expect_err("neither project may revert to trusted-local behavior");
+                assert_eq!(
+                    crate::tool_util::tool_error_code(&error),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_bind_and_unbind_preserve_the_new_identity_without_resurrection() {
+        with_feature(true, || {
+            for unbind_first in [false, true] {
+                let state = fastmcp_core::SessionState::new();
+                let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 3, state.clone());
+                bind(&ctx, 10, 1, "BlueLake");
+                interleave_updates(
+                    state,
+                    move |ctx| {
+                        if unbind_first {
+                            unbind(ctx, 1);
+                        } else {
+                            bind(ctx, 20, 2, "RedStone");
+                        }
+                    },
+                    move |ctx| {
+                        if unbind_first {
+                            bind(ctx, 20, 2, "RedStone");
+                        } else {
+                            unbind(ctx, 1);
+                        }
+                    },
+                );
+                let held = session_bindings(&ctx);
+                assert_eq!(held.len(), 1, "unbind_first={unbind_first}");
+                assert_eq!((held[0].project_id, held[0].agent_id), (20, 2));
+                assert!(!holds(&ctx, Some(1)), "retired identity must stay unbound");
+                assert!(
+                    authorize_actor(&ctx, &agent(3, 20, "GreenCastle"), false, "send").is_err(),
+                    "the newly bound project must keep its identity restriction"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_unbinds_do_not_restore_either_identity() {
+        with_feature(true, || {
+            let state = fastmcp_core::SessionState::new();
+            let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 3, state.clone());
+            bind(&ctx, 10, 1, "BlueLake");
+            bind(&ctx, 20, 2, "RedStone");
+            interleave_updates(state, |ctx| unbind(ctx, 1), |ctx| unbind(ctx, 2));
+            assert!(session_bindings(&ctx).is_empty());
         });
     }
 }

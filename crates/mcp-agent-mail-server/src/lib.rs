@@ -13150,8 +13150,17 @@ to skip auth for local requests.</p>
         // fastmcp's router handlers now take a request-scoped `McpContext`
         // instead of a bare `Cx`; the budget travels inside the context
         // (handlers enforce it via `budget_error`) rather than as an
-        // explicit argument.
-        let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
+        // explicit argument. The router derives tool/resource/prompt contexts
+        // from this context, so attach the same session bag used for catalog
+        // filtering; the separate router argument does not install it. Keep
+        // stateless contexts without a bag so macros cannot bind identities
+        // to a session that does not exist.
+        let request_ctx = match &session_state {
+            Some(state) => McpContext::with_state(cx.clone(), request_id, state.clone()),
+            None => McpContext::new(cx.clone(), request_id),
+        }
+        .with_budget_ceiling(budget);
+        let session_state = session_state.unwrap_or_default();
 
         match request.method.as_str() {
             "initialize" => {
@@ -13169,7 +13178,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_tools_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_tools_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -13278,7 +13287,7 @@ to skip auth for local requests.</p>
                 let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
-                    session_state.unwrap_or_default(),
+                    session_state,
                     None,
                     None,
                 ));
@@ -13420,7 +13429,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resources_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13430,7 +13439,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resource_templates_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13442,7 +13451,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
-                    session_state.unwrap_or_default(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -13462,7 +13471,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_prompts_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
@@ -13470,7 +13479,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
-                    session_state.unwrap_or_default(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -18768,6 +18777,24 @@ mod tests {
         }
     }
 
+    struct SessionStateProbeTool;
+
+    impl fastmcp::ToolHandler for SessionStateProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "session_state_probe".to_string(),
+                description: Some("test-only session-state presence probe".to_string()),
+                ..fastmcp::ToolHandler::definition(&NoopTool)
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: serde_json::json!({"has_session_state": ctx.has_session_state()}).to_string(),
+            }])
+        }
+    }
+
     /// Test tool that always fails with a legacy-coded tool error (br-315wc).
     struct FailingTool {
         code: &'static str,
@@ -21737,7 +21764,7 @@ first body
         }
     }
 
-    fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
+    fn with_serialized_tool_dispatch_env<F, T>(overrides: &[(&str, &str)], f: F) -> T
     where
         F: FnOnce(String) -> T,
     {
@@ -21761,13 +21788,14 @@ first body
             .expect("tool dispatch project root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            || f(project_key),
-        )
+        let mut env_overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        env_overrides.extend_from_slice(overrides);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env_overrides, || {
+            f(project_key)
+        })
     }
 
     fn with_serialized_dispatch_permits<F, T>(f: F) -> T
@@ -24554,7 +24582,7 @@ first body
 
     #[test]
     fn dispatch_request_contact_preserves_contact_parameter_names() {
-        with_serialized_tool_dispatch_env(|project_key| {
+        with_serialized_tool_dispatch_env(&[], |project_key| {
             let config = mcp_agent_mail_core::Config::from_env();
             let state = build_state(config);
 
@@ -24662,23 +24690,24 @@ first body
 
     /// GH#279: with `MESSAGING_SESSION_IDENTITY` on, `initialize` mints an
     /// `Mcp-Session-Id`; requests that send it back share the session's agent
-    /// identity (verified without a token, even fail-closed), stateless
-    /// requests do not, and `DELETE` ends the session.
+    /// identity (verified without a token, even fail-closed), cannot change
+    /// another agent's contact policy, and keep the policy intact on refusal.
+    /// Stateless requests do not share bindings, and `DELETE` ends the session.
     #[test]
     fn opt_in_http_sessions_carry_identity_across_requests() {
-        with_serialized_tool_dispatch_env(|project_key| {
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[
-                    ("MESSAGING_SESSION_IDENTITY", "true"),
-                    ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
-                ],
-                || {
-                    mcp_agent_mail_core::Config::reset_cached();
-                    let state = build_state(mcp_agent_mail_core::Config::from_env());
-                    let post = |method: &str,
-                                params: serde_json::Value,
-                                id: i64,
-                                session: Option<&str>| {
+        with_serialized_tool_dispatch_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+            ],
+            |project_key| {
+                let mut state = build_state(mcp_agent_mail_core::Config::from_env());
+                Arc::get_mut(&mut state.router)
+                    .expect("test owns the router")
+                    .add_tool(SessionStateProbeTool)
+                    .expect("admit the state probe");
+                let post =
+                    |method: &str, params: serde_json::Value, id: i64, session: Option<&str>| {
                         let headers: Vec<(&str, &str)> = session
                             .map(|session| vec![("Mcp-Session-Id", session)])
                             .unwrap_or_default();
@@ -24688,10 +24717,8 @@ first body
                                 .expect("serialize json-rpc");
                         block_on(state.handle(req))
                     };
-                    let tool = |name: &str,
-                                arguments: serde_json::Value,
-                                id: i64,
-                                session: Option<&str>| {
+                let tool =
+                    |name: &str, arguments: serde_json::Value, id: i64, session: Option<&str>| {
                         let resp = post(
                             "tools/call",
                             serde_json::json!({"name": name, "arguments": arguments}),
@@ -24711,78 +24738,109 @@ first body
                         )
                     };
 
-                    let init = post(
-                        "initialize",
-                        serde_json::json!({
-                            "protocolVersion": "2025-06-18",
-                            "capabilities": {},
-                            "clientInfo": {"name": "session-test", "version": "1"},
-                        }),
-                        1,
-                        None,
-                    );
-                    assert_eq!(init.status, 200);
-                    let session = response_header(&init, "mcp-session-id")
-                        .expect("initialize mints a session id")
-                        .to_string();
+                let init = post(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "session-test", "version": "1"},
+                    }),
+                    1,
+                    None,
+                );
+                assert_eq!(init.status, 200);
+                let session = response_header(&init, "mcp-session-id")
+                    .expect("initialize mints a session id")
+                    .to_string();
 
-                    let (failed, _) = tool(
-                        "ensure_project",
-                        serde_json::json!({"human_key": project_key}),
-                        2,
-                        Some(&session),
-                    );
-                    assert!(!failed);
-                    let identity = serde_json::json!({
-                        "project_key": project_key,
-                        "program": "codex-cli",
-                        "model": "gpt-5",
-                        "return_registration_token": false,
-                    });
-                    let (failed, alice) =
-                        tool("create_agent_identity", identity.clone(), 3, Some(&session));
-                    assert!(!failed, "{alice}");
-                    let alice = alice["name"].as_str().expect("alice").to_string();
-                    let (failed, bob) = tool("create_agent_identity", identity, 4, None);
-                    assert!(!failed, "{bob}");
-                    let bob = bob["name"].as_str().expect("bob").to_string();
-                    let (failed, _) = tool(
-                        "set_contact_policy",
-                        serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
-                        5,
-                        None,
-                    );
-                    assert!(!failed);
+                for (header, expected) in [
+                    (Some(session.as_str()), true),
+                    (None, false),
+                    (Some("unknown-session"), false),
+                ] {
+                    let (failed, presence) =
+                        tool("session_state_probe", serde_json::json!({}), 10, header);
+                    assert!(!failed, "{presence}");
+                    assert_eq!(presence["has_session_state"], expected);
+                }
 
-                    let send_args = serde_json::json!({
-                        "project_key": project_key,
-                        "sender_name": alice,
-                        "to": [bob],
-                        "subject": "hello",
-                        "body_md": "sent from a session",
-                    });
-                    let (failed, receipt) =
-                        tool("send_message", send_args.clone(), 6, Some(&session));
-                    assert!(!failed, "{receipt}");
-                    assert_eq!(receipt["verified_sender"], true);
-                    assert_eq!(receipt["sender_verification"], "session");
+                let (failed, _) = tool(
+                    "ensure_project",
+                    serde_json::json!({"human_key": project_key}),
+                    2,
+                    Some(&session),
+                );
+                assert!(!failed);
+                let identity = serde_json::json!({
+                    "project_key": project_key,
+                    "program": "codex-cli",
+                    "model": "gpt-5",
+                    "return_registration_token": false,
+                });
+                let (failed, alice) =
+                    tool("create_agent_identity", identity.clone(), 3, Some(&session));
+                assert!(!failed, "{alice}");
+                let alice = alice["name"].as_str().expect("alice").to_string();
+                let (failed, bob) = tool("create_agent_identity", identity, 4, None);
+                assert!(!failed, "{bob}");
+                let bob = bob["name"].as_str().expect("bob").to_string();
+                let (failed, _) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
+                    5,
+                    None,
+                );
+                assert!(!failed);
 
-                    let (failed, _) = tool("send_message", send_args.clone(), 7, None);
-                    assert!(failed, "a stateless request has no session identity");
+                let (failed, refusal) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "block_all"}),
+                    6,
+                    Some(&session),
+                );
+                assert!(
+                    failed,
+                    "a bound session cannot change another agent's policy"
+                );
+                assert_eq!(refusal["error"]["type"], "SESSION_IDENTITY_MISMATCH");
 
-                    let mut end = make_request(
-                        Http1Method::Delete,
-                        "/api",
-                        &[("Mcp-Session-Id", session.as_str())],
-                    );
-                    end.body = Vec::new();
-                    assert_eq!(block_on(state.handle(end)).status, 204);
-                    let (failed, _) = tool("send_message", send_args, 8, Some(&session));
-                    assert!(failed, "an ended session has no identity");
-                    mcp_agent_mail_core::Config::reset_cached();
-                },
-            );
-        });
+                let send_args = serde_json::json!({
+                    "project_key": project_key,
+                    "sender_name": alice,
+                    "to": [bob],
+                    "subject": "hello",
+                    "body_md": "sent from a session",
+                });
+                let (failed, receipt) = tool("send_message", send_args.clone(), 7, Some(&session));
+                assert!(
+                    !failed,
+                    "refused block_all must leave Bob reachable: {receipt}"
+                );
+                assert_eq!(receipt["verified_sender"], true);
+                assert_eq!(receipt["sender_verification"], "session");
+
+                let (failed, _) = tool("send_message", send_args.clone(), 8, None);
+                assert!(failed, "a stateless request has no session identity");
+
+                let mut end = make_request(
+                    Http1Method::Delete,
+                    "/api",
+                    &[("Mcp-Session-Id", session.as_str())],
+                );
+                end.body = Vec::new();
+                assert_eq!(block_on(state.handle(end)).status, 204);
+                let (failed, _) = tool("send_message", send_args, 9, Some(&session));
+                assert!(failed, "an ended session has no identity");
+                let (failed, presence) = tool(
+                    "session_state_probe",
+                    serde_json::json!({}),
+                    11,
+                    Some(&session),
+                );
+                assert!(!failed, "{presence}");
+                assert_eq!(presence["has_session_state"], false);
+            },
+        );
     }
 
     #[test]
