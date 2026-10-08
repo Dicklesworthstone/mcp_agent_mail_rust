@@ -452,12 +452,18 @@ pub fn scrub_snapshot(
                     }
                 }
 
-                // Write back attachment changes
-                if attachments_updated {
-                    let sanitized_json = crate::encode_json(
-                        &attachments_data,
-                        "scrubbed attachments serialization failed",
-                    )?;
+                // Publish the representation actually inspected, even when no
+                // decoded value changed. JSON object parsing discards shadowed
+                // duplicate keys: leaving the original bytes would retain their
+                // uninspected private values. This also normalizes the supported
+                // legacy string-encoded array instead of retaining a second
+                // representation that downstream readers may interpret differently.
+                let sanitized_json = crate::encode_json(
+                    &attachments_data,
+                    "scrubbed attachments serialization failed",
+                )?;
+                if sanitized_json != *attachments_value {
+                    attachments_updated = true;
                     exec_count(
                         &conn,
                         "UPDATE messages SET attachments = ? WHERE id = ?",
@@ -1391,6 +1397,78 @@ mod tests {
         assert!(!bytes.windows(PRIVATE_ATTACHMENT.len()).any(|window| window == PRIVATE_ATTACHMENT.as_bytes()));
         let source_conn = Conn::open_file(source.display().to_string()).unwrap();
         assert_eq!(message_text(&source_conn, "attachments"), private);
+    }
+
+    #[test]
+    fn standard_rewrites_shadowed_json_values_in_plain_and_encoded_arrays() {
+        // The last value is public, so the parsed map looks clean even though
+        // the original stored JSON contains private bytes under the same key.
+        let raw = format!(
+            "[{{\"type\":\"file\",\"path\":\"notes.txt\",\"metadata\":{{\"note\":\"{PRIVATE_ATTACHMENT}\",\"note\":\"public\"}}}}]"
+        );
+        for value in [raw.clone(), serde_json::to_string(&raw).unwrap()] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, &value);
+            let summary = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+            assert_eq!(summary.attachments_sanitized, 1);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let text = message_text(&conn, "attachments");
+            assert!(!text.contains(PRIVATE_ATTACHMENT));
+            let parsed: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed, serde_json::json!([{
+                "type": "file", "path": "notes.txt", "metadata": {"note": "public"}
+            }]));
+            drop(conn);
+            // Normalization is not a perpetual mutation or an inflated count.
+            let again = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+            assert_eq!(again.attachments_sanitized, 0);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            assert_eq!(message_text(&conn, "attachments"), text);
+        }
+    }
+
+    #[test]
+    fn standard_canonicalization_preserves_public_metadata_and_archive_bytes() {
+        let raw = "[ { \"type\": \"file\", \"path\": \"notes.txt\", \"metadata\": { \"unicode\": \"\\u03bb\", \"count\": 2, \"nested\": [null, true] } } ]";
+        for preset in [ScrubPreset::Standard, ScrubPreset::Archive] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, raw);
+            scrub_snapshot(&db, preset).unwrap();
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let text = message_text(&conn, "attachments");
+            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), serde_json::from_str::<Value>(raw).unwrap());
+            if matches!(preset, ScrubPreset::Archive) {
+                assert_eq!(text, raw);
+            } else {
+                assert_eq!(text, crate::encode_json(&serde_json::from_str::<Value>(raw).unwrap(), "test").unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn standard_snapshot_pipeline_does_not_publish_shadowed_private_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = create_fixture_db(dir.path());
+        let raw = format!(
+            "[{{\"metadata\":{{\"note\":\"{}\"}},\"metadata\":{{\"note\":\"public\"}},\"path\":\"notes.txt\"}}]",
+            PRIVATE_ATTACHMENT.repeat(1024)
+        );
+        set_attachment_text(&source, &raw);
+        let target = dir.path().join("shared.sqlite3");
+        crate::create_snapshot_context(&source, &target, &[], ScrubPreset::Standard).unwrap();
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
+        let rows = conn.query_sync("SELECT attachments FROM messages WHERE id = 1", &[]).unwrap();
+        let text = rows[0].get_named::<String>("attachments").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), serde_json::json!([{
+            "metadata": {"note": "public"}, "path": "notes.txt"
+        }]));
+        drop(conn);
+        let bytes = std::fs::read(&target).unwrap();
+        assert!(!bytes.windows(PRIVATE_ATTACHMENT.len()).any(|window| window == PRIVATE_ATTACHMENT.as_bytes()));
+        let source_conn = Conn::open_file(source.display().to_string()).unwrap();
+        assert_eq!(message_text(&source_conn, "attachments"), raw);
     }
 
     #[test]
