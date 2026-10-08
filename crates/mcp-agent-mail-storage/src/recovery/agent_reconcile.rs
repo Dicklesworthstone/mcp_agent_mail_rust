@@ -15,7 +15,7 @@ use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use git2::{ErrorCode, ObjectType, Oid, Repository, Tree};
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{DbError, DbPool, corruption_circuit_breaker};
+use mcp_agent_mail_db::{DbConn, DbError, DbPool, corruption_circuit_breaker};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -155,6 +155,10 @@ fn timestamp(value: i64) -> Result<String, String> {
 
 fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
     let conn = outcome(block_on(pool.acquire(cx)))?;
+    read_source_connection(&conn, id)
+}
+
+fn read_source_connection(conn: &DbConn, id: i64) -> Result<AgentSource, String> {
     // One statement observes identity, lifecycle ledger and project together.
     // Do not select registration_token, even temporarily. The raw text bound
     // precedes materialization; serialization has its own bound below.
@@ -437,6 +441,15 @@ fn reconcile_agent(
     original: &AgentSource,
     stop: &AtomicBool,
 ) -> Result<bool, String> {
+    checkpoint(cx, stop).map_err(|error| error.to_string())?;
+    // Checkout can wait for pool capacity, validation, or database startup.
+    // None of those waits may retain the global archive publication fence.
+    // Keep the connection until the source is reread under both archive locks,
+    // so a lifecycle change during checkout or lock admission is still seen.
+    let checkout = pool.acquire(cx);
+    #[cfg(test)]
+    let checkout = tests::observe_checkout_pending(checkout);
+    let conn = outcome(block_on(checkout))?;
     // Profile recovery shares the archive-maintenance worker with messages
     // and release history. Never retain its source lease behind an unrelated
     // archive publisher, or bypass that publisher to restore a tombstone.
@@ -449,9 +462,10 @@ fn reconcile_agent(
     let publish = || {
         checkpoint(cx, stop)?;
         // Lock waits must not publish an already-obsolete snapshot. Release
-        // the SQL connection before file/Git I/O. A later lifecycle mutation
-        // is intentionally reconciled on the next finite round.
-        let source = read_source(cx, pool, original.id).map_err(invalid)?;
+        // the SQL connection before profile/Git publication. A later lifecycle
+        // mutation is intentionally reconciled on the next finite round.
+        let source = read_source_connection(&conn, original.id).map_err(invalid)?;
+        drop(conn);
         if source.project_slug != original.project_slug
             || source.project_key != original.project_key
             || source.profile["name"] != original.profile["name"]
@@ -601,7 +615,7 @@ fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
 /// Uses only the configured live pool. Missing/ambiguous source rows,
 /// conflicting identity evidence, symlinks and oversized metadata defer;
 /// another finite round retries them. Tokens are never selected or archived.
-/// SQL connections are released before filesystem/Git operations, and each
+/// SQL connections are released before profile/Git publication, and each
 /// successful repair verifies its exact bytes in Git HEAD. A concurrent later
 /// lifecycle change can require a later pass; this is eventual convergence.
 /// Database admission is nonblocking and precedes selection and each source
@@ -689,6 +703,31 @@ pub fn reconcile_agent_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        static CHECKOUT_PENDING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // Observe a real exhausted-pool wait, rather than guessing that a newly
+    // spawned repair has reached checkout. The hook never replaces its future.
+    pub(super) async fn observe_checkout_pending<T>(
+        checkout: impl std::future::Future<Output = T>,
+    ) -> T {
+        let mut checkout = std::pin::pin!(checkout);
+        std::future::poll_fn(|cx| {
+            let result = checkout.as_mut().poll(cx);
+            if result.is_pending() {
+                CHECKOUT_PENDING.with(|hook| {
+                    if let Some(pending) = hook.borrow_mut().take() {
+                        let _ = pending.send(());
+                    }
+                });
+            }
+            result
+        })
+        .await
+    }
 
     // Real process-global admission must not race unrelated libtests. File
     // sinks avoid a child blocking on full stdout/stderr pipes while we wait.
@@ -1371,6 +1410,75 @@ mod tests {
     #[test]
     fn busy_fence_cannot_initialize_a_missing_profile_archive() {
         exercise_busy_fence(false);
+    }
+
+    #[test]
+    fn exhausted_source_pool_does_not_pin_archive_publication_and_reads_latest_lifecycle() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        with_mailbox(|cx, pool, config, _| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            crate::flush_async_commits();
+            let original = read_source(cx, pool, 101).unwrap();
+            let before = fs::read(profile_path(config)).unwrap();
+            // The fixture has exactly one connection. Retaining it forces the
+            // real repair checkout to wait while another publisher proceeds.
+            let held = outcome(block_on(pool.acquire(cx))).unwrap();
+            let (pending_tx, pending_rx) = mpsc::channel();
+            let (published_tx, published_rx) = mpsc::channel();
+            let probe = config.storage_root.join("publisher-progress.json");
+            let (pending, progressed, updated, published, repaired) = std::thread::scope(|scope| {
+                let repair = scope.spawn(|| {
+                    CHECKOUT_PENDING.with(|hook| *hook.borrow_mut() = Some(pending_tx));
+                    let _activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+                    reconcile_agent(cx, pool, config, &original, &AtomicBool::new(false))
+                });
+                let pending = pending_rx.recv_timeout(Duration::from_secs(5));
+                let publisher = scope.spawn(|| {
+                    let result = crate::atomic_write_bytes(&probe, b"published", true);
+                    let _ = published_tx.send(());
+                    result
+                });
+                let progressed = published_rx.recv_timeout(Duration::from_secs(5));
+                // Change the live lifecycle after repair began waiting.
+                // The pre-checkout change must not reuse `original` here.
+                let updated =
+                    held.execute_raw("UPDATE agents SET retired_at = 123456789 WHERE id = 101");
+                let unchanged_while_waiting = fs::read(profile_path(config)).unwrap() == before;
+                // Release before assertions/joins, including when a
+                // regression left the publisher blocked behind repair.
+                drop(held);
+                (
+                    pending,
+                    (progressed, unchanged_while_waiting),
+                    updated,
+                    publisher.join(),
+                    repair.join(),
+                )
+            });
+            assert!(
+                pending.is_ok(),
+                "repair never reached an exhausted-pool wait"
+            );
+            assert!(
+                progressed.0.is_ok(),
+                "repair retained the archive fence while waiting for pool capacity"
+            );
+            assert!(
+                progressed.1,
+                "repair published before its fresh source read"
+            );
+            updated.unwrap();
+            published.unwrap().unwrap();
+            assert!(repaired.unwrap().unwrap());
+            assert_eq!(fs::read(probe).unwrap(), b"published");
+            let profile = assert_profile_committed(config);
+            assert_eq!(profile["retired_at"], timestamp(123_456_789).unwrap());
+            assert_eq!(profile["name"], original.profile["name"]);
+            assert_eq!(reconcile(cx, pool, config).unchanged, 1);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
     }
 
     #[test]
