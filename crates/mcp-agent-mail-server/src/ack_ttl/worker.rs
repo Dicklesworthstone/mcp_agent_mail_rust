@@ -99,13 +99,21 @@ fn run_pass(
     }
     // The slice rechecks shutdown before any query and owns its generation
     // lease through all escalations. Opening a pool is not a scan permit.
-    run_ack_ttl_slice(
+    let result = run_ack_ttl_slice(
         config,
         pool.as_ref().expect("successful admission installs the pool"),
         state,
         || stop.load(Ordering::Acquire),
         has_time,
-    )
+    );
+    if result.is_err() {
+        // The slice has already released its generation lease. A failed or
+        // retired connection family must not be reused forever after recovery.
+        // Preserve the bounded cursor: its next successful read either resumes
+        // the same source or rebinds a changed generation before any escalation.
+        *pool = None;
+    }
+    result
 }
 
 fn pause(duration: Duration, stop: &AtomicBool) -> bool {
@@ -250,6 +258,162 @@ mod tests {
                     .len(),
                 1
             );
+        });
+    }
+
+    fn seed_tail(pool: &DbPool, cx: &Cx) -> String {
+        let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+        for id in [2_i64, 3] {
+            conn.execute_sync(
+                "INSERT INTO messages(id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) SELECT ?, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json FROM messages WHERE id = 1",
+                &[id.into()],
+            )
+            .unwrap();
+            conn.execute_sync(
+                "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(?, 82, 'to')",
+                &[id.into()],
+            )
+            .unwrap();
+        }
+        conn.query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
+            .unwrap()[0]
+            .get_named::<String>("generation_id")
+            .unwrap()
+    }
+
+    fn set_generation(pool: &DbPool, cx: &Cx, generation: &str) {
+        let conn = block_on(pool.acquire(cx)).into_result().unwrap();
+        assert_eq!(
+            conn.execute_sync(
+                "UPDATE db_identity SET generation_id = ? WHERE singleton = 0",
+                &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
+                    generation.to_string()
+                )],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_read_reopens_without_losing_the_tail_or_missing_a_new_ack() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let (temp, mut config) = fixture();
+            std::fs::create_dir_all(temp.path().join("mailbox")).unwrap();
+            config.ack_escalation_enabled = false;
+            let control = seed(&config);
+            let cx = Cx::for_testing();
+            let generation = seed_tail(&control, &cx);
+            let selected = selected_pool(&config);
+            let mut pool = None;
+            let mut state = AckScanState::default();
+            let stop = AtomicBool::new(false);
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || true).unwrap(),
+                (3, 3)
+            );
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || false).unwrap(),
+                (3, 1)
+            );
+            let cursor = state.cursor.clone();
+            let identity = state.identity.clone();
+            let warned = state.warned.clone();
+            let current = state.current.clone();
+            assert!(cursor.is_some());
+            // An actual source-validation error, not a mocked query outcome.
+            set_generation(&control, &cx, "");
+            let error = run_pass(&config, &selected, &mut pool, &mut state, &stop, || true)
+                .expect_err("invalid generation must refuse the page");
+            assert!(error.contains("failed to read overdue ACK page"), "{error}");
+            assert!(pool.is_none(), "a failed source must not pin the worker's pool");
+            assert_eq!(state.cursor, cursor);
+            assert_eq!(state.identity, identity);
+            assert_eq!(state.warned, warned);
+            assert_eq!(state.current, current);
+
+            set_generation(&control, &cx, &generation);
+            block_on(mcp_agent_mail_db::queries::acknowledge_message(&cx, &control, 82, 2))
+                .into_result()
+                .unwrap();
+            // Reopening is not a fresh lap in an unchanged generation. Only
+            // message 3 remains in the unconsumed window; message 2 is now ACKed.
+            config.ack_escalation_enabled = true;
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || true).unwrap(),
+                (1, 1)
+            );
+            assert!(pool.is_some());
+            assert!(state.cursor.is_none());
+            assert_eq!(state.warned.len(), 2);
+            let conn = block_on(control.acquire(&cx)).into_result().unwrap();
+            let claims = conn
+                .query_sync("SELECT agent_id, reason FROM file_reservations", &[])
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].get_named::<i64>("agent_id").unwrap(), 82);
+            assert_eq!(claims[0].get_named::<String>("reason").unwrap(), "ack-overdue");
+            let receipts = conn
+                .query_sync("SELECT ack_ts FROM message_recipients WHERE message_id = 2", &[])
+                .unwrap();
+            assert!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn reopened_pool_restarts_a_changed_generation_before_publishing_a_claim() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let (temp, mut config) = fixture();
+            std::fs::create_dir_all(temp.path().join("mailbox")).unwrap();
+            config.ack_escalation_enabled = false;
+            let control = seed(&config);
+            let cx = Cx::for_testing();
+            let original = seed_tail(&control, &cx);
+            let selected = selected_pool(&config);
+            let mut pool = None;
+            let mut state = AckScanState::default();
+            let stop = AtomicBool::new(false);
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || false).unwrap(),
+                (3, 1)
+            );
+            set_generation(&control, &cx, "");
+            assert!(run_pass(&config, &selected, &mut pool, &mut state, &stop, || true).is_err());
+            assert!(pool.is_none());
+            // Exercise the persisted generation contract. This is not a
+            // physical file-swap or cross-process recovery qualification.
+            let replacement = format!("{original}ab");
+            set_generation(&control, &cx, &replacement);
+            config.ack_escalation_enabled = true;
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || false).unwrap(),
+                (3, 1)
+            );
+            assert_eq!(
+                state.identity.as_ref().unwrap().1.as_deref(),
+                Some(replacement.as_str())
+            );
+            assert_eq!(state.current.len(), 1);
+            assert!(state.current.iter().any(|key| key.message_id == 1));
+            let conn = block_on(control.acquire(&cx)).into_result().unwrap();
+            let claims = conn.query_sync("SELECT id FROM file_reservations", &[]).unwrap();
+            assert_eq!(claims.len(), 1);
+            let id = claims[0].get_named::<i64>("id").unwrap();
+            drop(conn);
+            let filename =
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    Some(&replacement),
+                    id,
+                );
+            let artifact = config
+                .storage_root
+                .join("projects/ack-worker/file_reservations")
+                .join(filename);
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(artifact).unwrap()).unwrap();
+            assert_eq!(value["db_generation"], replacement);
+            assert_eq!(value["id"], id);
+            assert_eq!(value["agent"], "GreenStone");
         });
     }
 
