@@ -5,7 +5,7 @@
 //! references between two excluded projects can cross chunk boundaries safely.
 //! These are bind/allocation bounds, not deadlines on the database's work.
 
-use super::{Conn, build_placeholders, exec, table_exists};
+use super::{Conn, build_placeholders, exec};
 use crate::ShareError;
 use sqlmodel_core::Value;
 
@@ -17,6 +17,11 @@ const PROJECTS_PER_STATEMENT: usize = 128;
 const PHASES: &[(&str, &str, bool)] = &[
     ("agent_links", "a_project_id IN ($ids) OR b_project_id IN ($ids)", true),
     ("project_sibling_suggestions", "project_a_id IN ($ids) OR project_b_id IN ($ids)", true),
+    ("project_mailbox_receipts", "message_id IN (SELECT message_id FROM project_mailbox_deliveries WHERE project_id IN ($ids))", true),
+    ("project_mailbox_receipts", "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", true),
+    ("project_mailbox_deliveries", "project_id IN ($ids) OR message_id IN (SELECT id FROM messages WHERE project_id IN ($ids))", true),
+    ("inbox_delivery_events", "project_id IN ($ids)", true),
+    ("inbox_delivery_events", "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", true),
     ("message_recipients", "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", false),
     ("file_reservation_releases", "reservation_id IN (SELECT id FROM file_reservations WHERE project_id IN ($ids))", true),
     ("file_reservations", "project_id IN ($ids)", false),
@@ -39,7 +44,70 @@ fn statement(table: &str, predicate: &str, ids: &[i64]) -> (String, Vec<Value>) 
     (format!("DELETE FROM {table} WHERE {predicate}"), params)
 }
 
+/// Schema absence is a legacy case; failed inspection or a view is not.
+/// A false "absent" verdict here could leave private rows in a scoped export.
+fn table_exists(conn: &Conn, table: &str) -> Result<bool, ShareError> {
+    let rows = conn.query_sync(
+        "SELECT type FROM sqlite_master WHERE name = ? COLLATE NOCASE AND type IN ('table', 'view')",
+        &[Value::Text(table.to_string())],
+    ).map_err(|error| ShareError::Sqlite {
+        message: format!("inspect scope table {table}: {error}"),
+    })?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    if rows.len() != 1 || rows[0].get_named::<String>("type").map_err(|error| ShareError::Sqlite {
+        message: format!("decode scope table {table}: {error}"),
+    })? != "table" {
+        return Err(ShareError::Validation {
+            message: format!("scope object {table} must be a real table"),
+        });
+    }
+    Ok(true)
+}
+
+fn check_cleared(conn: &Conn, table: &str, predicate: &str, params: &[Value]) -> Result<(), ShareError> {
+    let rows = conn.query_sync(
+        &format!("SELECT 1 FROM {table} WHERE {predicate} LIMIT 1"), params,
+    ).map_err(|error| ShareError::Sqlite {
+        message: format!("verify scoped deletion from {table}: {error}"),
+    })?;
+    if !rows.is_empty() {
+        return Err(ShareError::Validation {
+            message: format!("excluded rows remain in {table}; scope transaction refused"),
+        });
+    }
+    Ok(())
+}
+
+fn clear_matching(conn: &Conn, table: &str, predicate: &str) -> Result<(), ShareError> {
+    exec(conn, &format!("DELETE FROM {table} WHERE {predicate}"), &[])?;
+    check_cleared(conn, table, predicate, &[])
+}
+
 pub(super) fn apply(conn: &Conn, excluded: &[i64]) -> Result<(), ShareError> {
+    if excluded.is_empty() {
+        return Ok(());
+    }
+    if table_exists(conn, "project_mailbox_receipts")?
+        && !table_exists(conn, "project_mailbox_deliveries")? {
+        return Err(ShareError::Validation {
+            message: "project mailbox receipts lack their delivery table; scope refused".to_string(),
+        });
+    }
+    // A shared event is also tied to the delivery's target project. Remove
+    // it before discarding that authority, even if imported event/message
+    // project fields disagree. Legacy direct-only event tables remain valid.
+    if table_exists(conn, "project_mailbox_deliveries")?
+        && table_exists(conn, "inbox_delivery_events")? {
+        let predicate = "kind = 'project' AND message_id IN (SELECT message_id FROM project_mailbox_deliveries WHERE project_id IN ($ids))";
+        for ids in excluded.chunks(PROJECTS_PER_STATEMENT) {
+            let (sql, params) = statement("inbox_delivery_events", predicate, ids);
+            exec(conn, &sql, &params)?;
+            let predicate = predicate.replace("$ids", &build_placeholders(ids.len()));
+            check_cleared(conn, "inbox_delivery_events", &predicate, &params)?;
+        }
+    }
     for &(table, predicate, optional) in PHASES {
         if optional && !table_exists(conn, table)? {
             continue;
@@ -47,18 +115,34 @@ pub(super) fn apply(conn: &Conn, excluded: &[i64]) -> Result<(), ShareError> {
         for ids in excluded.chunks(PROJECTS_PER_STATEMENT) {
             let (sql, params) = statement(table, predicate, ids);
             exec(conn, &sql, &params)?;
+            // Do not infer success from affected-row counts. Validate while
+            // the source parents still exist: checking a child after deleting
+            // its parents could hide a skipped deletion behind an empty join.
+            let predicate = predicate.replace("$ids", &build_placeholders(ids.len()));
+            check_cleared(conn, table, &predicate, &params)?;
         }
     }
 
     // Preserve the previous cleanup of pre-existing dangling markers and
     // recipients, plus products with no remaining selected-project links.
     if table_exists(conn, "file_reservation_releases")? {
-        exec(conn, "DELETE FROM file_reservation_releases WHERE reservation_id NOT IN (SELECT id FROM file_reservations)", &[])?;
+        clear_matching(conn, "file_reservation_releases", "reservation_id NOT IN (SELECT id FROM file_reservations)")?;
     }
     if table_exists(conn, "product_project_links")? && table_exists(conn, "products")? {
-        exec(conn, "DELETE FROM products WHERE id NOT IN (SELECT DISTINCT product_id FROM product_project_links)", &[])?;
+        clear_matching(conn, "products", "id NOT IN (SELECT DISTINCT product_id FROM product_project_links)")?;
     }
-    exec(conn, "DELETE FROM message_recipients WHERE agent_id NOT IN (SELECT id FROM agents)", &[])?;
+    clear_matching(conn, "message_recipients", "agent_id NOT IN (SELECT id FROM agents)")?;
+
+    // These are runtime authorities, not viewer content. A kept project's
+    // idempotency claim can cache an entire result delivered into an excluded
+    // project; filtering by claim.project_id alone would leak that result.
+    // Global proof nonces cannot be attributed to a selected project either.
+    // No-scope exports never enter this function and preserve both tables.
+    for table in ["idempotency_keys", "proof_gate_consumed_nonces"] {
+        if table_exists(conn, table)? {
+            clear_matching(conn, table, "1 = 1")?;
+        }
+    }
     Ok(())
 }
 
@@ -211,6 +295,108 @@ mod tests {
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 3);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM message_recipients"), 4);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM file_reservation_releases"), 2);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 2);
+    }
+
+    fn add_project_mailbox_state(path: &Path) {
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        for sql in [
+            "CREATE TABLE project_mailbox_deliveries(message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
+            "CREATE TABLE project_mailbox_receipts(message_id INTEGER NOT NULL REFERENCES messages(id), agent_id INTEGER NOT NULL REFERENCES agents(id), read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id))",
+            "CREATE TABLE inbox_delivery_events(seq INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), agent_id INTEGER NOT NULL, message_id INTEGER NOT NULL REFERENCES messages(id), kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
+            "INSERT INTO project_mailbox_deliveries VALUES(101,1,'cc',100), (202,2,'to',200)",
+            "INSERT INTO project_mailbox_receipts VALUES(101,11,121,131), (101,22,141,151), (202,11,161,171), (202,22,181,191)",
+            "INSERT INTO inbox_delivery_events VALUES(1,1,0,101,'project',100), (2,2,0,202,'project',200), (3,1,22,101,'bcc',201), (4,2,11,101,'to',202), (5,1,11,202,'to',203)",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_delivery_and_event_cleanup_preserves_only_selected_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        add_project_mailbox_state(&path);
+        apply_project_scope(&path, &["keep".to_string()]).unwrap();
+        assert_kept_scope(&path);
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
+        assert_eq!(scalar(&conn, "SELECT message_id FROM project_mailbox_deliveries"), 101);
+        let rows = conn.query_sync("SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 11);
+        assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 121);
+        assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 131);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_events"), 1);
+        assert_eq!(scalar(&conn, "SELECT seq FROM inbox_delivery_events"), 1);
+        assert_eq!(scalar(&conn, "SELECT agent_id FROM inbox_delivery_events"), 0);
+    }
+
+    #[test]
+    fn excluded_project_delivery_cannot_leave_receipts_on_a_kept_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        add_project_mailbox_state(&path);
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = 101").unwrap();
+        drop(conn);
+        apply_project_scope(&path, &["keep".to_string()]).unwrap();
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 0);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_events"), 0);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 1);
+    }
+
+    #[test]
+    fn scoped_raw_snapshots_drop_cross_project_retry_payloads_but_unscoped_keep_them() {
+        for scoped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fixture(dir.path());
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            conn.execute_raw("CREATE TABLE idempotency_keys(project_id INTEGER, result_json TEXT)").unwrap();
+            conn.execute_raw("INSERT INTO idempotency_keys VALUES(1, 'private result delivered into excluded project')").unwrap();
+            conn.execute_raw("CREATE TABLE proof_gate_consumed_nonces(issuer_key TEXT, nonce TEXT)").unwrap();
+            conn.execute_raw("INSERT INTO proof_gate_consumed_nonces VALUES('issuer', 'private nonce')").unwrap();
+            drop(conn);
+            let ids = if scoped { vec!["keep".to_string()] } else { Vec::new() };
+            apply_project_scope(&path, &ids).unwrap();
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            let expected = i64::from(!scoped);
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM idempotency_keys"), expected);
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM proof_gate_consumed_nonces"), expected);
+        }
+    }
+
+    #[test]
+    fn optional_view_refusal_rolls_back_scope_and_preserves_private_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE private_payloads(secret TEXT)").unwrap();
+        conn.execute_raw("INSERT INTO private_payloads VALUES('private original')").unwrap();
+        conn.execute_raw("CREATE VIEW idempotency_keys AS SELECT secret FROM private_payloads").unwrap();
+        drop(conn);
+        assert!(apply_project_scope(&path, &["keep".to_string()]).is_err());
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 3);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM message_recipients"), 4);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM private_payloads"), 1);
+    }
+
+    #[test]
+    fn readback_rejects_a_silently_ignored_child_delete_before_parent_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TRIGGER ignore_excluded_recipient BEFORE DELETE ON message_recipients WHEN OLD.agent_id = 22 BEGIN SELECT RAISE(IGNORE); END").unwrap();
+        drop(conn);
+        let error = apply_project_scope(&path, &["keep".to_string()]).unwrap_err();
+        assert!(matches!(error, ShareError::Validation { .. }));
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM message_recipients"), 4);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 2);
     }
 }
