@@ -8057,6 +8057,7 @@ pub async fn create_message_with_recipients(
         ack_required,
         attachments,
         recipients,
+        None,
     )
     .await
 }
@@ -8066,6 +8067,10 @@ pub async fn create_message_with_recipients(
 /// `reply_to` is the immediate parent, never inferred from `thread_id`. `None`
 /// records authoritative absence, allowing a fresh threaded send to recover
 /// even if its first archive write and journal enqueue both fail.
+///
+/// `project_mailbox` is `Some(kind)` (`to` or `cc`) when the message is also
+/// addressed to its project's shared mailbox (GH#282): one
+/// `project_mailbox_deliveries` row is written in the same transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients_topic(
     cx: &Cx,
@@ -8081,6 +8086,7 @@ pub async fn create_message_with_recipients_topic(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
 ) -> Outcome<MessageRow, DbError> {
     match create_message_with_recipients_impl(
         cx,
@@ -8096,6 +8102,7 @@ pub async fn create_message_with_recipients_topic(
         ack_required,
         attachments,
         recipients,
+        project_mailbox,
         None,
     )
     .await
@@ -8154,6 +8161,7 @@ pub async fn create_message_with_recipients_idempotent(
         ack_required,
         attachments,
         recipients,
+        None,
         claim,
     )
     .await
@@ -8175,6 +8183,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     create_message_with_recipients_impl(
@@ -8191,6 +8200,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
         ack_required,
         attachments,
         recipients,
+        project_mailbox,
         Some(claim),
     )
     .await
@@ -8211,8 +8221,15 @@ async fn create_message_with_recipients_impl(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
+    project_mailbox: Option<&str>,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    if project_mailbox.is_some_and(|kind| !matches!(kind, "to" | "cc")) {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "project_mailbox",
+            message: "a project mailbox delivery is addressed as to or cc".to_string(),
+        });
+    }
     if reply_to.is_some_and(|parent| parent <= 0)
         || (reply_to.is_some() && thread_id.is_none_or(str::is_empty))
     {
@@ -8322,6 +8339,7 @@ async fn create_message_with_recipients_impl(
                     ack_required,
                     attachments,
                     recipients,
+                    project_mailbox,
                     now,
                     archive_seed,
                     idempotency,
@@ -8622,6 +8640,7 @@ async fn create_message_with_recipients_tx(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
     now: i64,
     archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
@@ -8740,6 +8759,38 @@ async fn create_message_with_recipients_tx(
         }
     }
 
+    // GH#282: the shared-mailbox address appears in the slot the sender used,
+    // so every reader of the envelope (and the archive frontmatter) shows that
+    // the message went to the project, not only to the named agents.
+    if let Some(kind) = project_mailbox {
+        let slug_rows = try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    tracked,
+                    "SELECT slug FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .await
+            )
+        );
+        let Some(slug) = slug_rows
+            .first()
+            .and_then(|row| row.get_as::<String>(0).ok())
+        else {
+            rollback_tx(cx, tracked).await;
+            return Outcome::Err(DbError::not_found("Project", project_id.to_string()));
+        };
+        let address = crate::project_mailbox::project_mailbox_address(&slug);
+        if kind == "cc" {
+            cc_names.push(address);
+        } else {
+            to_names.push(address);
+        }
+    }
+
     let recipients_json_val = serde_json::json!({
         "to": to_names,
         "cc": cc_names,
@@ -8852,6 +8903,48 @@ async fn create_message_with_recipients_tx(
                 return Outcome::Panicked(payload);
             }
         }
+    }
+
+    // GH#282: one delivery row for the project's shared mailbox. Per-agent
+    // read/ack receipts are created lazily, never here.
+    if let Some(kind) = project_mailbox {
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    tracked,
+                    "INSERT INTO project_mailbox_deliveries \
+                     (message_id, project_id, kind, delivered_ts) VALUES (?, ?, ?, ?)",
+                    &[
+                        Value::BigInt(message_id),
+                        Value::BigInt(project_id),
+                        Value::Text(kind.to_string()),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
+        // The delivery's single cursor event for restart-safe monitors.
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    tracked,
+                    crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(message_id),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
     }
 
     let recipient_agent_ids: Vec<i64> = recipients.iter().map(|(id, _)| *id).collect();
@@ -10736,36 +10829,61 @@ async fn fetch_inbox_for_product_agent_impl(
          WHERE ppl.product_id = ?"
     );
 
-    let mut params = vec![
+    // GH#282: the same agents' views of each linked project's shared mailbox,
+    // under the same filters. Both arms run as ONE fan-in statement whatever
+    // the number of linked projects. The pinned compound-select executor
+    // applies LIMIT without bindings, so the (integer) limit is rendered.
+    let mut shared_sql = crate::project_mailbox::product_inbox_select_sql(body_select);
+    let mut arm_params = vec![
         Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
         Value::Text(agent_name.to_string()),
         Value::BigInt(product_id),
     ];
-    if options.urgent_only {
-        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    for query in [&mut sql, &mut shared_sql] {
+        if options.urgent_only {
+            query.push_str(" AND m.importance IN ('high', 'urgent')");
+        }
+        if since_ts.is_some() {
+            query.push_str(" AND m.created_ts > ?");
+        }
     }
     if let Some(ts) = since_ts {
-        sql.push_str(" AND m.created_ts > ?");
-        params.push(Value::BigInt(ts));
+        arm_params.push(Value::BigInt(ts));
     }
-    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
-    params.push(Value::BigInt(limit_i64));
+    let compound =
+        format!("{sql} UNION ALL {shared_sql} ORDER BY created_ts DESC, id DESC LIMIT {limit_i64}");
+    let compound_params = [arm_params.as_slice(), arm_params.as_slice()].concat();
 
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                match decode_inbox_row_indexed(&row) {
-                    Ok(decoded) => out.push(decoded),
-                    Err(error) => return Outcome::Err(error),
-                }
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &compound, &compound_params).await) {
+        Outcome::Ok(rows) => rows,
+        // A mailbox read before its schema upgrade has no shared mailbox.
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            let direct = format!("{sql} ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+            let mut direct_params = arm_params;
+            direct_params.push(Value::BigInt(limit_i64));
+            match map_sql_outcome(traw_query(cx, &tracked, &direct, &direct_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             }
-            Outcome::Ok(out)
         }
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decode_inbox_row_indexed(&row) {
+            Ok(decoded) => out.push(decoded),
+            Err(error) => return Outcome::Err(error),
+        }
     }
+    Outcome::Ok(out)
 }
 
 /// Search messages using FTS5
@@ -11726,6 +11844,74 @@ pub async fn add_recipients(
 }
 
 /// Mark message as read
+/// GH#282: record a lazy shared-mailbox receipt when `message_id` is a
+/// project mailbox delivery visible to `agent_id`, inside the caller's write
+/// transaction. `Ok(None)` when it is not one, so the caller keeps its
+/// not-a-recipient error; otherwise the stored `(read_ts, ack_ts)`. Never
+/// rolls back: the caller owns the transaction.
+async fn record_project_mailbox_receipt_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    message_id: i64,
+    update: crate::project_mailbox::ReceiptUpdate,
+    now: i64,
+) -> Outcome<Option<(Option<i64>, Option<i64>)>, DbError> {
+    let (sql, params) = crate::project_mailbox::visible_receipt_query(agent_id, message_id);
+    match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+        Outcome::Ok(rows) if rows.is_empty() => return Outcome::Ok(None),
+        Outcome::Ok(_) => {}
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            return Outcome::Ok(None);
+        }
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+    for (sql, params) in
+        crate::project_mailbox::receipt_write_statements(update, message_id, agent_id, now)
+    {
+        match map_sql_outcome(traw_execute(cx, tracked, sql, &params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT read_ts, ack_ts FROM project_mailbox_receipts \
+             WHERE message_id = ? AND agent_id = ?",
+            &[Value::BigInt(message_id), Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::Internal(format!(
+            "project mailbox receipt for {agent_id}:{message_id} was not stored"
+        )));
+    };
+    let integer = |index: usize| {
+        row.get(index).and_then(|value| match value {
+            Value::BigInt(n) => Some(*n),
+            Value::Int(n) => Some(i64::from(*n)),
+            _ => None,
+        })
+    };
+    Outcome::Ok(Some((integer(0), integer(1))))
+}
+
 pub async fn mark_message_read(
     cx: &Cx,
     pool: &DbPool,
@@ -11778,14 +11964,32 @@ pub async fn mark_message_read(
             "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
         let ts = match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-            Outcome::Ok(rows) => {
-                if rows.is_empty() {
+            Outcome::Ok(rows) if rows.is_empty() => {
+                // GH#282: not a direct recipient; a project mailbox delivery
+                // records the agent's own lazy receipt instead.
+                let receipt = try_in_tx!(
+                    cx,
+                    &tracked,
+                    record_project_mailbox_receipt_in_tx(
+                        cx,
+                        &tracked,
+                        agent_id,
+                        message_id,
+                        crate::project_mailbox::ReceiptUpdate::Read,
+                        now,
+                    )
+                    .await
+                );
+                let Some((Some(read_ts), _)) = receipt else {
                     rollback_tx(cx, &tracked).await;
                     return Outcome::Err(DbError::not_found(
                         "MessageRecipient",
                         format!("{agent_id}:{message_id}"),
                     ));
-                }
+                };
+                read_ts
+            }
+            Outcome::Ok(rows) => {
                 let Some(ts) = rows
                     .first()
                     .and_then(|r| r.get(0))
@@ -12143,13 +12347,70 @@ pub async fn mark_messages_read_bulk(
             );
         }
 
+        // GH#282: the remaining budget clears this agent's unread project
+        // mailbox mail (its own lazy receipts). With no budget left, one row
+        // is enough to report that more remains.
+        let shared_budget = limit - message_ids.len();
+        let (shared_sql, shared_params) = crate::project_mailbox::unread_visible_query(
+            agent_id,
+            project_id,
+            older_than_us,
+            i64::try_from(shared_budget.saturating_add(1)).unwrap_or(i64::MAX),
+        );
+        let shared_rows =
+            match map_sql_outcome(traw_query(cx, &tracked, &shared_sql, &shared_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error)
+                    if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                        &error.to_string(),
+                    ) =>
+                {
+                    Vec::new()
+                }
+                Outcome::Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+                Outcome::Cancelled(reason) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(reason);
+                }
+                Outcome::Panicked(payload) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(payload);
+                }
+            };
+        let more = more || shared_rows.len() > shared_budget;
+        let mut shared_marked = 0usize;
+        for row in shared_rows.iter().take(shared_budget) {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "bulk mark-read project mailbox query returned a non-integer id".to_string(),
+                ));
+            };
+            for (sql, params) in crate::project_mailbox::receipt_write_statements(
+                crate::project_mailbox::ReceiptUpdate::Read,
+                message_id,
+                agent_id,
+                now,
+            ) {
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+                );
+            }
+            shared_marked += 1;
+        }
+
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         // Post-commit invalidation — see mark_message_read.
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
         Outcome::Ok(BulkMarkReadOutcome {
-            marked: u64::try_from(message_ids.len()).unwrap_or(u64::MAX),
+            marked: u64::try_from(message_ids.len() + shared_marked).unwrap_or(u64::MAX),
             more,
         })
     })
@@ -12161,11 +12422,25 @@ pub async fn mark_messages_read_bulk(
 /// requires acknowledgement — every recipient has acknowledged it. A message
 /// with no recipient rows left (e.g. repaired FK orphans) is vacuously
 /// settled. The caller adds the age horizon (`m.created_ts <= ?`).
-const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
+// GH#282: a project mailbox message is settled only once every agent that can
+// see it has read it (and acknowledged it when required). It has no
+// message_recipients rows, so the first clause alone would call it settled at
+// once.
+const SETTLED_MESSAGE_PREDICATE: &str = concat!(
+    "NOT EXISTS (\
      SELECT 1 FROM message_recipients r \
      WHERE r.message_id = m.id \
        AND (r.read_ts IS NULL \
-            OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
+            OR (m.ack_required != 0 AND r.ack_ts IS NULL))) \
+     AND NOT EXISTS (\
+     SELECT 1 FROM project_mailbox_deliveries d \
+     JOIN agents viewer ON viewer.project_id = d.project_id \
+     LEFT JOIN project_mailbox_receipts pr \
+            ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+     WHERE d.message_id = m.id AND ",
+    crate::project_mailbox::visible_to_viewer_sql!(),
+    " AND (pr.read_ts IS NULL OR (m.ack_required != 0 AND pr.ack_ts IS NULL)))"
+);
 
 /// Maximum message payload admitted to an archive observation.
 pub const MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
@@ -12182,6 +12457,8 @@ pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
 /// body is not repeated for every recipient. Archive verification and the final
 /// retention transaction use this same projection. The final identity/receipt
 /// columns also detect changes that do not alter a rendered recipient name.
+/// A project shared-mailbox delivery (GH#282) is the last row (`row_kind` 2),
+/// named by its `project:<slug>` address, with no recipient id or receipts.
 /// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
 /// then append the fixed recipient limit plus two rows as an overflow witness.
 pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
@@ -12215,6 +12492,14 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
             THEN mr.ack_ts ELSE 'invalid_receipt' END \
 FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
 WHERE mr.message_id = ?1 \
+UNION ALL \
+SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, NULL, d.project_id, \
+       CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
+       CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
+       NULL, NULL, NULL, NULL \
+FROM project_mailbox_deliveries d LEFT JOIN projects p ON p.id = d.project_id \
+WHERE d.message_id = ?1 \
 ORDER BY row_kind, recipient_id";
 
 const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
@@ -12585,6 +12870,15 @@ pub async fn prune_verified_settled_messages(
                 map_sql_outcome(traw_execute(cx, &tracked, &del_events, &chunk_params).await)
             );
 
+            for table in ["project_mailbox_receipts", "project_mailbox_deliveries"] {
+                let del_shared = format!("DELETE FROM {table} WHERE message_id IN ({ph})");
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &del_shared, &chunk_params).await)
+                );
+            }
+
             let del_recipients =
                 format!("DELETE FROM message_recipients WHERE message_id IN ({ph})");
             let recipients_deleted = try_in_tx!(
@@ -12770,14 +13064,32 @@ async fn acknowledge_message_impl(
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
         let (read_ts, ack_ts) =
             match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-                Outcome::Ok(rows) => {
-                    if rows.is_empty() {
+                Outcome::Ok(rows) if rows.is_empty() => {
+                    // GH#282: a project mailbox delivery records this agent's
+                    // own lazy acknowledgement; other agents stay unacked.
+                    let receipt = try_in_tx!(
+                        cx,
+                        &tracked,
+                        record_project_mailbox_receipt_in_tx(
+                            cx,
+                            &tracked,
+                            agent_id,
+                            message_id,
+                            crate::project_mailbox::ReceiptUpdate::Acknowledge,
+                            now,
+                        )
+                        .await
+                    );
+                    let Some((Some(read_ts), Some(ack_ts))) = receipt else {
                         rollback_tx(cx, &tracked).await;
                         return Outcome::Err(DbError::not_found(
                             "MessageRecipient",
                             format!("{agent_id}:{message_id}"),
                         ));
-                    }
+                    };
+                    (read_ts, ack_ts)
+                }
+                Outcome::Ok(rows) => {
                     let row = rows.first();
                     let read_ts = row.and_then(|r| r.get(0)).and_then(|value| match value {
                         Value::BigInt(n) => Some(*n),
@@ -32553,6 +32865,7 @@ mod tests {
                 false,
                 "[]",
                 &[],
+                None,
             )
             .await
             .into_result()
@@ -33305,6 +33618,7 @@ mod tests {
                 false,
                 "[]",
                 &[(recipient_id, "to")],
+                None,
             )
             .await
             .into_result()

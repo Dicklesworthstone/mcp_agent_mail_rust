@@ -1456,6 +1456,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "direct".into(),
+                via: None,
                 attachments: Vec::new(),
                 body_md: Some("Body text".into()),
             }],

@@ -525,6 +525,18 @@ pub struct Config {
     /// a receipt that omits message payload fields. This remains opt-in so the
     /// default MCP/Python-parity send contract is unchanged.
     pub messaging_fail_closed_send_profile: bool,
+    /// Opt-in MCP session-bound agent identity (GH#279,
+    /// `MESSAGING_SESSION_IDENTITY`).
+    ///
+    /// When enabled, an MCP session (one stdio process, or one Streamable
+    /// HTTP session identified by `Mcp-Session-Id`) remembers the agent
+    /// identities it established (`create_agent_identity`, or a
+    /// `register_agent` that created the agent). A bound agent is a verified
+    /// sender in that session without a `sender_token` in the transcript, and
+    /// a session that holds an identity in a project cannot act as another
+    /// agent of that project by naming it. Off by default: the trusted-local,
+    /// stateless contract is unchanged.
+    pub messaging_session_identity: bool,
 
     // Message size limits (bytes). 0 = unlimited.
     pub max_message_body_bytes: usize,
@@ -1731,6 +1743,7 @@ impl Default for Config {
             messaging_auto_register_recipients: true,
             messaging_auto_handshake_on_block: true,
             messaging_fail_closed_send_profile: false,
+            messaging_session_identity: false,
 
             // Message size limits
             max_message_body_bytes: 1_048_576,   // 1 MiB
@@ -2484,6 +2497,10 @@ impl Config {
         config.messaging_fail_closed_send_profile = env_bool(
             "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
             config.messaging_fail_closed_send_profile,
+        );
+        config.messaging_session_identity = env_bool(
+            "MESSAGING_SESSION_IDENTITY",
+            config.messaging_session_identity,
         );
 
         // Message size limits

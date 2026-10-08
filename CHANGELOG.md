@@ -27,7 +27,51 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-No changes since v0.3.37.
+### Project-addressed shared mailboxes (GH#282, br-vsj5s)
+
+- `send_message` / `reply_message` accept `project:<slug>` (or
+  `project:<human_key>`) in `to` or `cc` to address the sender's own project
+  mailbox. The message is stored once with one `project_mailbox_deliveries`
+  row; nothing is fanned out per agent, so `broadcast=true` stays rejected.
+- Every other non-retired agent of the project that was registered when the
+  message was sent sees it in `fetch_inbox`, `resource://inbox/...` and the
+  robot/CLI inbox views with `"via": "project"` (`kind: "project"`). Agents
+  with `contact_policy=block_all` opt out, and a direct delivery to the same
+  agent takes precedence.
+- Read and acknowledgement state is per agent and lazy
+  (`project_mailbox_receipts`): `fetch_inbox` read receipts,
+  `mark_message_read`, `acknowledge_message` and `mark_all_read` record only
+  the caller's state; a plain read writes nothing.
+  `get_message_delivery_receipt` reports `project_mailbox` with each visible
+  agent's state.
+- Restart-safe monitors: a project delivery appends one cursor event to
+  `inbox_delivery_events`, and every visible agent's `fetch_inbox_events` /
+  `am inbox-events` page includes it (`kind: "project"`) under its single
+  cursor.
+- Retention prunes a project message only after every agent that can see it
+  has read (and, when required, acknowledged) it. Archive reconstruction
+  restores the delivery from the envelope's `project:<slug>` address instead of
+  minting a placeholder agent, salvage carries the per-agent receipts over,
+  and archive repair treats the address as routing, never as an inbox.
+- New tables arrive through the regular schema migration (v1 DDL plus the
+  `v32_trg_messages_cascade_project_mailbox` cleanup trigger).
+
+### Opt-in session-bound agent identity (GH#279, br-30nk1)
+
+- `MESSAGING_SESSION_IDENTITY=true` lets an MCP session act as the identities
+  it established without a registration token in the transcript. Over
+  Streamable HTTP, `initialize` now returns an `Mcp-Session-Id` (when the
+  setting is on); requests that send it back share the session, `DELETE` ends
+  it, and a session is tied to the authorization it was created under.
+- `create_agent_identity` (and a `register_agent` that creates its agent) binds
+  the identity. A bound sender is verified without `sender_token`
+  (`"sender_verification": "session"`), also under the fail-closed send
+  profile.
+- A session that holds an identity in a project cannot send, read or
+  acknowledge mail, reserve/renew/release files or re-register as another
+  agent of that project (`SESSION_IDENTITY_MISMATCH`); a send or reply carrying
+  that agent's own `sender_token` is still accepted. Sessions without an
+  identity keep the trusted-local behavior; the setting is off by default.
 
 ## v0.3.37 — 2026-10-05 [Release]
 

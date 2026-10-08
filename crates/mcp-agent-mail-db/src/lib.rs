@@ -57,6 +57,7 @@ pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;
 pub mod pool;
+pub mod project_mailbox;
 pub mod queries;
 pub mod query_assistance;
 pub mod query_plan_diagnostics;

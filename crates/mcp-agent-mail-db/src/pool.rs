@@ -7986,6 +7986,8 @@ const DURABLE_MAILBOX_STATE_TABLES: &[&str] = &[
     "agents",
     "messages",
     "message_recipients",
+    "project_mailbox_deliveries",
+    "project_mailbox_receipts",
     "file_reservations",
     "file_reservation_releases",
     "agent_links",

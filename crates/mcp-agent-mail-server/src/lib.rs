@@ -79,6 +79,7 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
 pub mod maintenance;
@@ -11346,6 +11347,8 @@ struct HttpState {
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
     /// Aggregates the failed-request WARN for repeated 401/404 probes.
     probe_rejection_log: HttpProbeRejectionLog,
+    /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
+    http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11540,6 +11543,7 @@ impl HttpState {
             ws_state_fallback,
             request_diagnostics,
             probe_rejection_log: HttpProbeRejectionLog::default(),
+            http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11762,6 +11766,25 @@ impl HttpState {
             return self.error_response(&req, 404, "Not Found");
         }
 
+        // GH#279: a Streamable HTTP client ends its MCP session with DELETE.
+        if self.config.messaging_session_identity && matches!(req.method, Http1Method::Delete) {
+            let principal = http_sessions::principal_digest(header_value(&req, "authorization"));
+            let ended = header_value(&req, http_sessions::MCP_SESSION_ID_HEADER)
+                .is_some_and(|id| self.http_sessions.terminate(id, principal));
+            if !ended {
+                return self.error_response(&req, 404, "Not Found");
+            }
+            let mut resp = Http1Response::new(204, default_reason(204), Vec::new());
+            apply_cors_headers(
+                &mut resp,
+                self.cors_origin(&req),
+                self.config.http_cors_allow_credentials,
+                &self.config.http_cors_allow_methods,
+                &self.config.http_cors_allow_headers,
+            );
+            return resp;
+        }
+
         if !matches!(req.method, Http1Method::Post) {
             return self.error_response(&req, 405, "Method Not Allowed");
         }
@@ -11806,18 +11829,56 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let response = self.dispatch(json_rpc).await.map_or_else(
-            || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
-            |resp| HttpResponse::ok().with_json(&resp),
-        );
+        let (session_state, new_session_id) = self.resolve_mcp_session(&req, &json_rpc);
+        let response = self
+            .dispatch_with_session(json_rpc, session_state)
+            .await
+            .map_or_else(
+                || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
+                |resp| HttpResponse::ok().with_json(&resp),
+            );
 
-        to_http1_response(
+        let mut out = to_http1_response(
             response,
             self.cors_origin(&req),
             self.config.http_cors_allow_credentials,
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
-        )
+        );
+        if let Some(id) = new_session_id {
+            out.headers
+                .push((http_sessions::MCP_SESSION_ID_HEADER.to_string(), id));
+            out.headers.push((
+                "access-control-expose-headers".to_string(),
+                http_sessions::MCP_SESSION_ID_HEADER.to_string(),
+            ));
+        }
+        out
+    }
+
+    /// The MCP session a request belongs to (GH#279, opt-in). `initialize`
+    /// starts a session whose id is returned to the client; any other request
+    /// joins the live session named by its `Mcp-Session-Id` header, provided
+    /// it carries the same authorization the session was created under.
+    /// Otherwise the request is stateless, exactly as with the feature off.
+    fn resolve_mcp_session(
+        &self,
+        req: &Http1Request,
+        request: &JsonRpcRequest,
+    ) -> (Option<SessionState>, Option<String>) {
+        if !self.config.messaging_session_identity {
+            return (None, None);
+        }
+        let principal = http_sessions::principal_digest(header_value(req, "authorization"));
+        if request.method == "initialize" {
+            return self
+                .http_sessions
+                .create(principal)
+                .map_or((None, None), |(id, state)| (Some(state), Some(id)));
+        }
+        let state = header_value(req, http_sessions::MCP_SESSION_ID_HEADER)
+            .and_then(|id| self.http_sessions.lookup(id, principal));
+        (state, None)
     }
 
     fn emit_http_request_log(
@@ -12977,7 +13038,20 @@ to skip auth for local requests.</p>
         None
     }
 
+    /// Stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.dispatch_with_session(request, None).await
+    }
+
+    /// Dispatch one JSON-RPC request. `session` is the persistent state of the
+    /// caller's MCP session (GH#279) when it has one; otherwise each request
+    /// gets fresh, request-local state.
+    async fn dispatch_with_session(
+        &self,
+        request: JsonRpcRequest,
+        session: Option<SessionState>,
+    ) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
@@ -12990,7 +13064,11 @@ to skip auth for local requests.</p>
             let id = request.id.clone();
             let outcome = std::thread::scope(|scope| {
                 scope
-                    .spawn(|| self.dispatch_inner(request))
+                    .spawn(|| {
+                        let cx = self.request_cx();
+                        let cancel = DispatchCancel::new();
+                        self.dispatch_inner_with_cx(request, session, &cx, &cancel)
+                    })
                     .join()
                     .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             });
@@ -13037,7 +13115,7 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
+            move |cancel| arc_self.dispatch_inner_with_cx(request, session, &worker_cx, &cancel),
         )
         .await;
 
@@ -13049,17 +13127,19 @@ to skip auth for local requests.</p>
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Synchronous stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
         let cx = self.request_cx();
         let cancel = DispatchCancel::new();
-        self.dispatch_inner_with_cx(request, &cx, &cancel)
+        self.dispatch_inner_with_cx(request, None, &cx, &cancel)
     }
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_inner_with_cx(
         &self,
         request: JsonRpcRequest,
+        session_state: Option<SessionState>,
         cx: &Cx,
         cancel: &DispatchCancel,
     ) -> Result<serde_json::Value, McpError> {
@@ -13194,7 +13274,7 @@ to skip auth for local requests.</p>
                 let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state.unwrap_or_default(),
                     None,
                     None,
                 ));
@@ -13358,7 +13438,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
-                    SessionState::new(),
+                    session_state.unwrap_or_default(),
                     None,
                     None,
                 ))?;
@@ -13386,7 +13466,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state.unwrap_or_default(),
                     None,
                     None,
                 ))?;
@@ -24574,6 +24654,131 @@ first body
                 .is_some(),
             "expected tools list result"
         );
+    }
+
+    /// GH#279: with `MESSAGING_SESSION_IDENTITY` on, `initialize` mints an
+    /// `Mcp-Session-Id`; requests that send it back share the session's agent
+    /// identity (verified without a token, even fail-closed), stateless
+    /// requests do not, and `DELETE` ends the session.
+    #[test]
+    fn opt_in_http_sessions_carry_identity_across_requests() {
+        with_serialized_tool_dispatch_env(|project_key| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("MESSAGING_SESSION_IDENTITY", "true"),
+                    ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+                ],
+                || {
+                    mcp_agent_mail_core::Config::reset_cached();
+                    let state = build_state(mcp_agent_mail_core::Config::from_env());
+                    let post = |method: &str,
+                                params: serde_json::Value,
+                                id: i64,
+                                session: Option<&str>| {
+                        let headers: Vec<(&str, &str)> = session
+                            .map(|session| vec![("Mcp-Session-Id", session)])
+                            .unwrap_or_default();
+                        let mut req = make_request(Http1Method::Post, "/api", &headers);
+                        req.body =
+                            serde_json::to_vec(&JsonRpcRequest::new(method, Some(params), id))
+                                .expect("serialize json-rpc");
+                        block_on(state.handle(req))
+                    };
+                    let tool = |name: &str,
+                                arguments: serde_json::Value,
+                                id: i64,
+                                session: Option<&str>| {
+                        let resp = post(
+                            "tools/call",
+                            serde_json::json!({"name": name, "arguments": arguments}),
+                            id,
+                            session,
+                        );
+                        assert_eq!(resp.status, 200, "{name}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&resp.body).expect("json-rpc body");
+                        let result = body["result"].clone();
+                        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+                        (
+                            body.get("error").is_some()
+                                || result["isError"].as_bool().unwrap_or(false),
+                            serde_json::from_str::<serde_json::Value>(text)
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    };
+
+                    let init = post(
+                        "initialize",
+                        serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "session-test", "version": "1"},
+                        }),
+                        1,
+                        None,
+                    );
+                    assert_eq!(init.status, 200);
+                    let session = response_header(&init, "mcp-session-id")
+                        .expect("initialize mints a session id")
+                        .to_string();
+
+                    let (failed, _) = tool(
+                        "ensure_project",
+                        serde_json::json!({"human_key": project_key}),
+                        2,
+                        Some(&session),
+                    );
+                    assert!(!failed);
+                    let identity = serde_json::json!({
+                        "project_key": project_key,
+                        "program": "codex-cli",
+                        "model": "gpt-5",
+                        "return_registration_token": false,
+                    });
+                    let (failed, alice) =
+                        tool("create_agent_identity", identity.clone(), 3, Some(&session));
+                    assert!(!failed, "{alice}");
+                    let alice = alice["name"].as_str().expect("alice").to_string();
+                    let (failed, bob) = tool("create_agent_identity", identity, 4, None);
+                    assert!(!failed, "{bob}");
+                    let bob = bob["name"].as_str().expect("bob").to_string();
+                    let (failed, _) = tool(
+                        "set_contact_policy",
+                        serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
+                        5,
+                        None,
+                    );
+                    assert!(!failed);
+
+                    let send_args = serde_json::json!({
+                        "project_key": project_key,
+                        "sender_name": alice,
+                        "to": [bob],
+                        "subject": "hello",
+                        "body_md": "sent from a session",
+                    });
+                    let (failed, receipt) =
+                        tool("send_message", send_args.clone(), 6, Some(&session));
+                    assert!(!failed, "{receipt}");
+                    assert_eq!(receipt["verified_sender"], true);
+                    assert_eq!(receipt["sender_verification"], "session");
+
+                    let (failed, _) = tool("send_message", send_args.clone(), 7, None);
+                    assert!(failed, "a stateless request has no session identity");
+
+                    let mut end = make_request(
+                        Http1Method::Delete,
+                        "/api",
+                        &[("Mcp-Session-Id", session.as_str())],
+                    );
+                    end.body = Vec::new();
+                    assert_eq!(block_on(state.handle(end)).status, 204);
+                    let (failed, _) = tool("send_message", send_args, 8, Some(&session));
+                    assert!(failed, "an ended session has no identity");
+                    mcp_agent_mail_core::Config::reset_cached();
+                },
+            );
+        });
     }
 
     #[test]

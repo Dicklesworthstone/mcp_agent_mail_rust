@@ -3032,6 +3032,9 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_resource_agent(ctx, &pool, project_id, &agent_name).await?;
+    // GH#279 (opt-in): a session holding another identity here reads only
+    // its own inbox, as through `fetch_inbox`.
+    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     let agent_name = agent.name;
 

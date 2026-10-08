@@ -201,8 +201,11 @@ fn select_routing(cached: Value, durable: &Value) -> Result<Value, String> {
     Ok(cached)
 }
 
+/// The agent inboxes a routing delivers to. A project shared-mailbox address
+/// (GH#282) is routing but never an inbox, so it is counted, not returned.
 fn routing_names(routing: &Value) -> Result<Vec<String>, String> {
     let mut recipients = Vec::new();
+    let mut addressed = 0usize;
     for kind in ["to", "cc", "bcc"] {
         for name in routing
             .get(kind)
@@ -214,13 +217,20 @@ fn routing_names(routing: &Value) -> Result<Vec<String>, String> {
                 .ok_or_else(|| "non-string message recipient".to_string())?;
             crate::validate_archive_component("recipient", name)
                 .map_err(|error| error.to_string())?;
-            recipients.push(name.to_string());
-            if recipients.len() > MAX_RECIPIENTS {
+            addressed += 1;
+            if addressed > MAX_RECIPIENTS {
                 return Err("message recipient budget exceeded".to_string());
             }
+            if mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_some() {
+                if kind == "bcc" {
+                    return Err("a project mailbox cannot be a bcc recipient".to_string());
+                }
+                continue;
+            }
+            recipients.push(name.to_string());
         }
     }
-    if recipients.is_empty() {
+    if addressed == 0 {
         return Err("message has no authoritative recipients".to_string());
     }
     recipients.sort_unstable();
@@ -237,8 +247,36 @@ fn routing_from_rows(rows: &[Row], id: i64, project_id: i64) -> Result<Value, St
     let mut names = HashSet::new();
     for row in rows {
         let integer = |key| row.get_named::<i64>(key).map_err(source_error);
-        if integer("row_kind")? != 1 || integer("id")? != id {
+        let row_kind = integer("row_kind")?;
+        if !matches!(row_kind, 1 | 2) || integer("id")? != id {
             return Err("recipient projection has a mismatched message identity".to_string());
+        }
+        if row_kind == 2 {
+            // GH#282: the project shared-mailbox delivery, named by address.
+            if integer("recipient_project_id")? != project_id {
+                return Err(
+                    "project mailbox delivery belongs to a different project; archive repair refused"
+                        .to_string(),
+                );
+            }
+            let address = row
+                .get_named::<Option<String>>("recipient_name")
+                .map_err(source_error)?
+                .filter(|name| {
+                    mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name)
+                        .is_some_and(|ident| !ident.is_empty())
+                })
+                .ok_or_else(|| "project mailbox delivery has no valid address".to_string())?;
+            let kind = row
+                .get_named::<Option<String>>("recipient_kind")
+                .map_err(source_error)?
+                .filter(|kind| matches!(kind.as_str(), "to" | "cc"))
+                .ok_or_else(|| "project mailbox delivery has an invalid kind".to_string())?;
+            routing[&kind]
+                .as_array_mut()
+                .ok_or_else(|| "recipient routing is not an array".to_string())?
+                .push(Value::String(address));
+            continue;
         }
         let agent_id = integer("recipient_id")?;
         if agent_id <= 0 || !ids.insert(agent_id) {
@@ -383,6 +421,7 @@ mod tests {
                         true,
                         "[]",
                         &[(102, "to"), (103, "bcc"), (104, "cc")],
+                        None,
                     ),
                 ))
                 .unwrap();
@@ -472,6 +511,7 @@ mod tests {
                     true,
                     &attachments.to_string(),
                     &[(102, "to"), (103, "bcc"), (104, "cc")],
+                    None,
                 ),
             ))
             .unwrap();
@@ -524,6 +564,7 @@ mod tests {
                         false,
                         "[]",
                         &[(102, "to")],
+                        None,
                         mcp_agent_mail_db::IdempotencyClaim {
                             project_id: 101,
                             tool: "reply_message",
@@ -598,6 +639,7 @@ mod tests {
                         false,
                         "[]",
                         &[(102, "to")],
+                        None,
                     ),
                 ))
                 .unwrap_err();
@@ -624,6 +666,7 @@ mod tests {
                     false,
                     "[]",
                     &[(102, "to")],
+                    None,
                 ),
             ))
             .unwrap();
