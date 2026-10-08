@@ -209,7 +209,10 @@ mod tests {
         }
         assert_eq!(restart_delay(Duration::MAX, Duration::ZERO), POLL_INTERVAL);
         assert_eq!(
-            restart_delay(POLL_INTERVAL, POLL_INTERVAL - Duration::from_nanos(1)),
+            restart_delay(
+                POLL_INTERVAL,
+                POLL_INTERVAL.saturating_sub(Duration::from_nanos(1))
+            ),
             POLL_INTERVAL
         );
         assert_eq!(
@@ -227,9 +230,7 @@ mod tests {
             &stop,
             || {
                 attempts.set(attempts.get() + 1);
-                if attempts.get() == 1 {
-                    panic!("injected active lease repair failure");
-                }
+                assert!(attempts.get() != 1, "injected active lease repair failure");
                 if attempts.get() >= 3 {
                     stop.store(true, Ordering::Release);
                 }
@@ -312,9 +313,7 @@ mod tests {
                 active.set(active.get() + 1);
                 let _lease = Lease(&active);
                 attempts.set(attempts.get() + 1);
-                if attempts.get() == 1 {
-                    panic!("unwind while owning run-local state");
-                }
+                assert!(attempts.get() != 1, "unwind while owning run-local state");
                 stop.store(true, Ordering::Release);
             },
             |_| {
@@ -324,7 +323,10 @@ mod tests {
         );
         assert_eq!(attempts.get(), 2);
         assert_eq!(active.get(), 0);
-        assert!(clean_on_entry.get(), "restart retained failed run resources");
+        assert!(
+            clean_on_entry.get(),
+            "restart retained failed run resources"
+        );
         assert!(
             clean_during_backoff.get(),
             "backoff retained failed run resources"
@@ -378,9 +380,10 @@ mod tests {
                     &worker_stop,
                     || {
                         let attempt = worker_attempts.fetch_add(1, Ordering::AcqRel);
-                        if fail_first && attempt == 0 {
-                            panic!("injected failure before active reservation repair");
-                        }
+                        assert!(
+                            !(fail_first && attempt == 0),
+                            "injected failure before active reservation repair"
+                        );
                         run(&config, &worker_stop);
                     },
                     |delay| pause(delay, &worker_stop),

@@ -449,7 +449,7 @@ mod tests {
             bind(&ctx, 10, 1, "BlueLake");
             bind(&ctx, 20, 2, "RedStone");
             interleave_updates(state, |ctx| unbind(ctx, 1), |ctx| unbind(ctx, 2));
-            assert!(session_bindings(&ctx).is_empty());
+            assert_eq!(session_bindings(&ctx), Vec::new());
         });
     }
 }

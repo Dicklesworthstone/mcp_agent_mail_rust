@@ -434,24 +434,32 @@ pub fn scrub_snapshot_redacting(
             let messages: Vec<(i64, String, String, String)> = message_rows
                 .iter()
                 .map(|row| {
-                    let id = row.get_named::<i64>("id").map_err(|_| ShareError::Validation {
-                        message: "message export requires an integer identity".to_string(),
-                    })?;
+                    let id = row
+                        .get_named::<i64>("id")
+                        .map_err(|_| ShareError::Validation {
+                            message: "message export requires an integer identity".to_string(),
+                        })?;
                     let text = |column: &str| {
                         let storage_type = row
                             .get_named::<String>(&format!("{column}_type"))
                             .map_err(|_| ShareError::Validation {
-                                message: format!("cannot inspect message {id} export column {column}"),
+                                message: format!(
+                                    "cannot inspect message {id} export column {column}"
+                                ),
                             })?;
                         if !matches!(storage_type.as_str(), "text" | "null") {
                             return Err(ShareError::Validation {
-                                message: format!("message {id} has non-text export column {column}"),
+                                message: format!(
+                                    "message {id} has non-text export column {column}"
+                                ),
                             });
                         }
                         row.get_named::<Option<String>>(column)
                             .map(Option::unwrap_or_default)
                             .map_err(|_| ShareError::Validation {
-                                message: format!("message {id} has non-text export column {column}"),
+                                message: format!(
+                                    "message {id} has non-text export column {column}"
+                                ),
                             })
                     };
                     Ok((id, text("subject")?, text("body_md")?, text("attachments")?))
@@ -1249,8 +1257,11 @@ mod tests {
     const PRIVATE_ATTACHMENT: &str = "ATTACHMENT_PRIVATE_SENTINEL_7e5d";
 
     fn message_text(conn: &Conn, column: &str) -> String {
-        conn.query_sync(&format!("SELECT {column} AS value FROM messages WHERE id = 1"), &[])
-            .unwrap()[0]
+        conn.query_sync(
+            &format!("SELECT {column} AS value FROM messages WHERE id = 1"),
+            &[],
+        )
+        .unwrap()[0]
             .get_named("value")
             .unwrap()
     }
@@ -1275,7 +1286,11 @@ mod tests {
             "false".to_string(),
             "42".to_string(),
             String::new(),
-            format!("{}\"{PRIVATE_ATTACHMENT}\"{}", "[".repeat(300), "]".repeat(300)),
+            format!(
+                "{}\"{PRIVATE_ATTACHMENT}\"{}",
+                "[".repeat(300),
+                "]".repeat(300)
+            ),
         ];
         for raw in cases {
             let dir = tempfile::tempdir().unwrap();
@@ -1304,9 +1319,13 @@ mod tests {
             assert!(!error.to_string().contains(PRIVATE_ATTACHMENT));
             let conn = Conn::open_file(db.display().to_string()).unwrap();
             assert_eq!(message_text(&conn, "attachments"), raw);
-            let rows = conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<i64>("ack_required").unwrap(), 1);
-            let rows = conn.query_sync("SELECT human_key FROM projects WHERE id = 1", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT human_key FROM projects WHERE id = 1", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<String>("human_key").unwrap(), "/test");
         }
     }
@@ -1324,7 +1343,8 @@ mod tests {
             conn.execute_sync(
                 "UPDATE messages SET attachments = CAST(? AS BLOB) WHERE id = 1",
                 &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
-            ).unwrap();
+            )
+            .unwrap();
             drop(conn);
             let result = scrub_snapshot(&db, preset);
             assert_eq!(result.is_ok(), succeeds, "preset={preset:?}");
@@ -1337,8 +1357,14 @@ mod tests {
                 &[],
             ).unwrap();
             let strict = matches!(preset, ScrubPreset::Strict);
-            assert_eq!(rows[0].get_named::<String>("storage_type").unwrap(), if strict { "text" } else { "blob" });
-            assert_eq!(rows[0].get_named::<String>("value").unwrap(), if strict { "[]" } else { PRIVATE_ATTACHMENT });
+            assert_eq!(
+                rows[0].get_named::<String>("storage_type").unwrap(),
+                if strict { "text" } else { "blob" }
+            );
+            assert_eq!(
+                rows[0].get_named::<String>("value").unwrap(),
+                if strict { "[]" } else { PRIVATE_ATTACHMENT }
+            );
         }
     }
 
@@ -1363,20 +1389,27 @@ mod tests {
         let summary = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
         assert_eq!(summary.secrets_replaced, 1008);
         let conn = Conn::open_file(db.display().to_string()).unwrap();
-        assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages").unwrap(), 505);
+        assert_eq!(
+            count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages").unwrap(),
+            505
+        );
         assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE subject LIKE '%sk-%' OR body_md LIKE '%sk-%'").unwrap(), 0);
     }
 
     #[test]
     fn standard_supports_string_encoded_arrays_and_archive_preserves_invalid_data() {
         let array = serde_json::json!([{"metadata": {"token": "sk-abcdef0123456789012345"}}]);
-        for raw in [array.to_string(), serde_json::to_string(&array.to_string()).unwrap()] {
+        for raw in [
+            array.to_string(),
+            serde_json::to_string(&array.to_string()).unwrap(),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let db = create_fixture_db(dir.path());
             set_attachment_text(&db, &raw);
             scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
             let conn = Conn::open_file(db.display().to_string()).unwrap();
-            let metadata: Value = serde_json::from_str(&message_text(&conn, "attachments")).unwrap();
+            let metadata: Value =
+                serde_json::from_str(&message_text(&conn, "attachments")).unwrap();
             assert_eq!(metadata[0]["metadata"]["token"], "[REDACTED]");
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1393,36 +1426,77 @@ mod tests {
         conn.execute_raw("CREATE TABLE idempotency_keys (project_id INTEGER NOT NULL, tool TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, PRIMARY KEY (project_id, tool, idempotency_key))").unwrap();
         conn.execute_raw("CREATE TABLE proof_gate_consumed_nonces (issuer_key TEXT NOT NULL, nonce TEXT NOT NULL, retain_until INTEGER NOT NULL, consumed_at INTEGER NOT NULL, PRIMARY KEY (issuer_key, nonce))").unwrap();
         conn.execute_raw("CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, message_id INTEGER, kind TEXT, delivered_ts INTEGER)").unwrap();
-        conn.execute_raw("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT").unwrap();
-        conn.execute_sync("UPDATE messages SET archive_metadata_json = ?", &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())]).unwrap();
+        conn.execute_raw("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT")
+            .unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET archive_metadata_json = ?",
+            &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
+        )
+        .unwrap();
         for project_id in [1, 999] {
             conn.execute_sync(
                 "INSERT INTO idempotency_keys VALUES (?, 'send_message', 'private-retry-key', 'fingerprint', ?, 1, 999999999)",
                 &[SqlValue::BigInt(project_id), SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
             ).unwrap();
         }
-        conn.execute_raw("INSERT INTO proof_gate_consumed_nonces VALUES ('issuer', 'private-nonce', 99, 1)").unwrap();
-        conn.execute_raw("INSERT INTO inbox_delivery_events VALUES (1, 1, 1, 1, 'bcc', 1)").unwrap();
+        conn.execute_raw(
+            "INSERT INTO proof_gate_consumed_nonces VALUES ('issuer', 'private-nonce', 99, 1)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO inbox_delivery_events VALUES (1, 1, 1, 1, 'bcc', 1)")
+            .unwrap();
     }
 
     #[test]
     fn direct_scrubbing_clears_private_copies_but_archive_is_lossless() {
-        for preset in [ScrubPreset::Standard, ScrubPreset::Strict, ScrubPreset::Archive] {
+        for preset in [
+            ScrubPreset::Standard,
+            ScrubPreset::Strict,
+            ScrubPreset::Archive,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let db = create_fixture_db(dir.path());
             seed_private_runtime_state(&db);
             scrub_snapshot(&db, preset).unwrap();
             let conn = Conn::open_file(db.display().to_string()).unwrap();
             let archive = matches!(preset, ScrubPreset::Archive);
-            for (table, original) in [("idempotency_keys", 2), ("proof_gate_consumed_nonces", 1), ("inbox_delivery_events", 1)] {
-                assert_eq!(count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(), if archive { original } else { 0 });
+            for (table, original) in [
+                ("idempotency_keys", 2),
+                ("proof_gate_consumed_nonces", 1),
+                ("inbox_delivery_events", 1),
+            ] {
+                assert_eq!(
+                    count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),
+                    if archive { original } else { 0 }
+                );
             }
-            let rows = conn.query_sync("SELECT archive_metadata_json FROM messages WHERE id = 1", &[]).unwrap();
-            let metadata = rows[0].get_named::<Option<String>>("archive_metadata_json").unwrap();
-            assert_eq!(metadata.as_deref(), if archive { Some(PRIVATE_ATTACHMENT) } else { None });
+            let rows = conn
+                .query_sync(
+                    "SELECT archive_metadata_json FROM messages WHERE id = 1",
+                    &[],
+                )
+                .unwrap();
+            let metadata = rows[0]
+                .get_named::<Option<String>>("archive_metadata_json")
+                .unwrap();
+            assert_eq!(
+                metadata.as_deref(),
+                if archive {
+                    Some(PRIVATE_ATTACHMENT)
+                } else {
+                    None
+                }
+            );
             if archive {
-                let rows = conn.query_sync("SELECT result_json FROM idempotency_keys ORDER BY project_id", &[]).unwrap();
-                assert!(rows.iter().all(|row| row.get_named::<String>("result_json").unwrap() == PRIVATE_ATTACHMENT));
+                let rows = conn
+                    .query_sync(
+                        "SELECT result_json FROM idempotency_keys ORDER BY project_id",
+                        &[],
+                    )
+                    .unwrap();
+                assert!(rows.iter().all(
+                    |row| row.get_named::<String>("result_json").unwrap() == PRIVATE_ATTACHMENT
+                ));
             }
         }
     }
@@ -1433,17 +1507,32 @@ mod tests {
         let db = create_fixture_db(dir.path());
         set_attachment_text(&db, PRIVATE_ATTACHMENT);
         let conn = Conn::open_file(db.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE idempotency_keys (result_json TEXT)").unwrap();
-        conn.execute_sync("INSERT INTO idempotency_keys VALUES (?)", &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())]).unwrap();
-        conn.execute_raw("CREATE VIEW proof_gate_consumed_nonces AS SELECT 1 AS nonce").unwrap();
+        conn.execute_raw("CREATE TABLE idempotency_keys (result_json TEXT)")
+            .unwrap();
+        conn.execute_sync(
+            "INSERT INTO idempotency_keys VALUES (?)",
+            &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
+        )
+        .unwrap();
+        conn.execute_raw("CREATE VIEW proof_gate_consumed_nonces AS SELECT 1 AS nonce")
+            .unwrap();
         drop(conn);
         let error = scrub_snapshot(&db, ScrubPreset::Strict).unwrap_err();
         assert!(error.to_string().contains("must be a table"));
         let conn = Conn::open_file(db.display().to_string()).unwrap();
-        assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM idempotency_keys").unwrap(), 1);
+        assert_eq!(
+            count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM idempotency_keys").unwrap(),
+            1
+        );
         assert_eq!(message_text(&conn, "attachments"), PRIVATE_ATTACHMENT);
         assert_eq!(message_text(&conn, "body_md"), "Hello world");
-        assert_eq!(conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[]).unwrap()[0].get_named::<i64>("ack_required").unwrap(), 1);
+        assert_eq!(
+            conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                .unwrap()[0]
+                .get_named::<i64>("ack_required")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1462,13 +1551,26 @@ mod tests {
             crate::SnapshotPurpose::Publish,
         )
         .unwrap();
-        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
-        let rows = conn.query_sync("SELECT attachments, body_md FROM messages WHERE id = 1", &[]).unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT attachments, body_md FROM messages WHERE id = 1",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].get_named::<String>("attachments").unwrap(), "[]");
-        assert_eq!(rows[0].get_named::<String>("body_md").unwrap(), "[Message body redacted]");
+        assert_eq!(
+            rows[0].get_named::<String>("body_md").unwrap(),
+            "[Message body redacted]"
+        );
         drop(conn);
         let bytes = std::fs::read(&target).unwrap();
-        assert!(!bytes.windows(PRIVATE_ATTACHMENT.len()).any(|window| window == PRIVATE_ATTACHMENT.as_bytes()));
+        assert!(
+            !bytes
+                .windows(PRIVATE_ATTACHMENT.len())
+                .any(|window| window == PRIVATE_ATTACHMENT.as_bytes())
+        );
         let source_conn = Conn::open_file(source.display().to_string()).unwrap();
         assert_eq!(message_text(&source_conn, "attachments"), private);
     }
@@ -1490,9 +1592,12 @@ mod tests {
             let text = message_text(&conn, "attachments");
             assert!(!text.contains(PRIVATE_ATTACHMENT));
             let parsed: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(parsed, serde_json::json!([{
-                "type": "file", "path": "notes.txt", "metadata": {"note": "public"}
-            }]));
+            assert_eq!(
+                parsed,
+                serde_json::json!([{
+                    "type": "file", "path": "notes.txt", "metadata": {"note": "public"}
+                }])
+            );
             drop(conn);
             // Normalization is not a perpetual mutation or an inflated count.
             let again = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
@@ -1512,11 +1617,18 @@ mod tests {
             scrub_snapshot(&db, preset).unwrap();
             let conn = Conn::open_file(db.display().to_string()).unwrap();
             let text = message_text(&conn, "attachments");
-            assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), serde_json::from_str::<Value>(raw).unwrap());
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap(),
+                serde_json::from_str::<Value>(raw).unwrap()
+            );
             if matches!(preset, ScrubPreset::Archive) {
                 assert_eq!(text, raw);
             } else {
-                assert_eq!(text, crate::encode_json(&serde_json::from_str::<Value>(raw).unwrap(), "test").unwrap());
+                assert_eq!(
+                    text,
+                    crate::encode_json(&serde_json::from_str::<Value>(raw).unwrap(), "test")
+                        .unwrap()
+                );
             }
         }
     }
@@ -1539,15 +1651,25 @@ mod tests {
             crate::SnapshotPurpose::Publish,
         )
         .unwrap();
-        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
-        let rows = conn.query_sync("SELECT attachments FROM messages WHERE id = 1", &[]).unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
         let text = rows[0].get_named::<String>("attachments").unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), serde_json::json!([{
-            "metadata": {"note": "public"}, "path": "notes.txt"
-        }]));
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            serde_json::json!([{
+                "metadata": {"note": "public"}, "path": "notes.txt"
+            }])
+        );
         drop(conn);
         let bytes = std::fs::read(&target).unwrap();
-        assert!(!bytes.windows(PRIVATE_ATTACHMENT.len()).any(|window| window == PRIVATE_ATTACHMENT.as_bytes()));
+        assert!(
+            !bytes
+                .windows(PRIVATE_ATTACHMENT.len())
+                .any(|window| window == PRIVATE_ATTACHMENT.as_bytes())
+        );
         let source_conn = Conn::open_file(source.display().to_string()).unwrap();
         assert_eq!(message_text(&source_conn, "attachments"), raw);
     }

@@ -13155,11 +13155,13 @@ to skip auth for local requests.</p>
         // filtering; the separate router argument does not install it. Keep
         // stateless contexts without a bag so macros cannot bind identities
         // to a session that does not exist.
-        let request_ctx = match &session_state {
-            Some(state) => McpContext::with_state(cx.clone(), request_id, state.clone()),
-            None => McpContext::new(cx.clone(), request_id),
-        }
-        .with_budget_ceiling(budget);
+        let request_ctx = session_state
+            .as_ref()
+            .map_or_else(
+                || McpContext::new(cx.clone(), request_id),
+                |state| McpContext::with_state(cx.clone(), request_id, state.clone()),
+            )
+            .with_budget_ceiling(budget);
         let session_state = session_state.unwrap_or_default();
 
         match request.method.as_str() {

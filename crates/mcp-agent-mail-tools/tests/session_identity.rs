@@ -436,11 +436,9 @@ fn contact_mutations_authorize_the_requester_recipient_and_policy_owner() {
                 .len(),
             1
         );
-        assert!(
-            inbox(&session_a, &project, &alice)
-                .await
-                .expect("inbox")
-                .is_empty()
+        assert_eq!(
+            inbox(&session_a, &project, &alice).await.expect("inbox"),
+            Vec::<Value>::new()
         );
 
         // Contact discovery stays read-only and usable across identities.
@@ -516,11 +514,9 @@ fn handshake_preflights_both_actors_before_creating_links_agents_or_projects() {
         assert_eq!(tool_error_code(&error), Some("SESSION_IDENTITY_MISMATCH"));
 
         assert_eq!(contact_rows(&cx, &project, &bob).await, before_links);
-        assert!(
-            inbox(&session_b, &project, &bob)
-                .await
-                .expect("inbox")
-                .is_empty()
+        assert_eq!(
+            inbox(&session_b, &project, &bob).await.expect("inbox"),
+            Vec::<Value>::new()
         );
         let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("db pool");
         let missing =
@@ -530,7 +526,7 @@ fn handshake_preflights_both_actors_before_creating_links_agents_or_projects() {
                 .expect_err("failed handshake must not create the missing project");
         assert!(matches!(
             missing,
-            mcp_agent_mail_db::DbError::NotFound { .. }
+            asupersync::OutcomeError::Err(mcp_agent_mail_db::DbError::NotFound { .. })
         ));
 
         // A session that explicitly holds both identities can still use the
@@ -667,7 +663,7 @@ fn implicit_contact_registration_does_not_borrow_or_establish_session_identity()
         .expect_err("refused implicit registration leaves no agent row");
         assert!(matches!(
             missing,
-            mcp_agent_mail_db::DbError::NotFound { .. }
+            asupersync::OutcomeError::Err(mcp_agent_mail_db::DbError::NotFound { .. })
         ));
 
         // The same first-use macro remains valid for a trusted-local caller:
@@ -676,7 +672,10 @@ fn implicit_contact_registration_does_not_borrow_or_establish_session_identity()
             .await
             .expect("unbound implicit requester can complete its handshake");
         assert_eq!(approved["response"]["approved"], true);
-        assert!(mcp_agent_mail_tools::session_identity::session_bindings(&unbound).is_empty());
+        assert_eq!(
+            mcp_agent_mail_tools::session_identity::session_bindings(&unbound),
+            Vec::new()
+        );
         let before = serde_json::to_value(stored_agent(&cx, &project, implicit_requester).await)
             .expect("implicit requester snapshot");
         let error = request(&owner, &project, implicit_requester, &target, None)
@@ -702,7 +701,10 @@ fn disabled_session_identity_preserves_trusted_local_contact_macros() {
             .expect("ensure project");
         let alice = create_identity(&session_a, &project).await;
         let bob = create_identity(&session_b, &project).await;
-        assert!(mcp_agent_mail_tools::session_identity::session_bindings(&session_a).is_empty());
+        assert_eq!(
+            mcp_agent_mail_tools::session_identity::session_bindings(&session_a),
+            Vec::new()
+        );
 
         let approved = handshake(&session_a, &project, &bob, &alice, None, true)
             .await

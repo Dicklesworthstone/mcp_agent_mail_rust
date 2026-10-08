@@ -248,12 +248,9 @@ fn text_blocks(blocks: Option<&Value>, is_anthropic: bool) -> Result<String, Llm
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                let part = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        invalid_response("LLM response contains a malformed text block")
-                    })?;
+                let part = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    invalid_response("LLM response contains a malformed text block")
+                })?;
                 // Preserve exact boundaries: JSON can span several text blocks.
                 text.push_str(part);
             }
@@ -321,7 +318,11 @@ mod tests {
                 "claude-custom",
             ),
             ("Gemini:gemini-custom", "GOOGLE_API_KEY", "gemini-custom"),
-            ("DeepSeek/deepseek-chat", "DEEPSEEK_API_KEY", "deepseek-chat"),
+            (
+                "DeepSeek/deepseek-chat",
+                "DEEPSEEK_API_KEY",
+                "deepseek-chat",
+            ),
             ("XAI:grok-3", "XAI_API_KEY", "grok-3"),
         ] {
             assert_eq!(route(model, key).2, expected);
@@ -381,7 +382,12 @@ mod tests {
     #[test]
     fn openai_reasoning_models_use_supported_token_and_sampling_parameters() {
         for model in [
-            "o1", "o3-mini", "o4-mini-2025-04-16", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+            "o1",
+            "o3-mini",
+            "o4-mini-2025-04-16",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
         ] {
             let body = request_payload(OPENAI_URL, model, "system", "user", 0.2, 4096);
             assert_eq!(body["max_completion_tokens"], 4096);
@@ -414,14 +420,7 @@ mod tests {
 
     #[test]
     fn anthropic_payload_keeps_system_outside_messages() {
-        let body = request_payload(
-            ANTHROPIC_URL,
-            "claude-custom",
-            "system",
-            "user",
-            0.3,
-            1000,
-        );
+        let body = request_payload(ANTHROPIC_URL, "claude-custom", "system", "user", 0.3, 1000);
         assert_eq!(body["system"], "system");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");

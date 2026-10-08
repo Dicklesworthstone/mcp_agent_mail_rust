@@ -101,7 +101,8 @@ fn run_pass(
     // lease through all escalations. Opening a pool is not a scan permit.
     let result = run_ack_ttl_slice(
         config,
-        pool.as_ref().expect("successful admission installs the pool"),
+        pool.as_ref()
+            .expect("successful admission installs the pool"),
         state,
         || stop.load(Ordering::Acquire),
         has_time,
@@ -122,9 +123,9 @@ fn pause(duration: Duration, stop: &AtomicBool) -> bool {
         if stop.load(Ordering::Acquire) {
             return true;
         }
-        let step = remaining.min(Duration::from_millis(100));
-        std::thread::sleep(step);
-        remaining = remaining.saturating_sub(step);
+        let nap = remaining.min(Duration::from_millis(100));
+        std::thread::sleep(nap);
+        remaining = remaining.saturating_sub(nap);
     }
     stop.load(Ordering::Acquire)
 }
@@ -160,7 +161,10 @@ mod tests {
         conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'ack-worker', '/ack-worker', 1)").unwrap();
         conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1), (82, 71, 'GreenStone', 'test', 'test', 1, 1)").unwrap();
         conn.execute_raw("INSERT INTO messages(id, project_id, sender_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES(1, 71, 81, 'worker admission', 'Body', 'normal', 1, 1000000, '[]', '{}')").unwrap();
-        conn.execute_raw("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(1, 82, 'to')").unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(1, 82, 'to')",
+        )
+        .unwrap();
         drop(conn);
         pool
     }
@@ -197,7 +201,10 @@ mod tests {
             let stop = AtomicBool::new(false);
             let error = run_pass(&config, &selected, &mut pool, &mut state, &stop, || true)
                 .expect_err("a regular-file parent cannot admit a database");
-            assert!(error.contains("ACK scan database admission failed"), "{error}");
+            assert!(
+                error.contains("ACK scan database admission failed"),
+                "{error}"
+            );
             assert!(pool.is_none());
             assert!(state.cursor.is_none());
             assert!(state.identity.is_none());
@@ -223,19 +230,24 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 82);
-            assert_eq!(rows[0].get_named::<String>("reason").unwrap(), "ack-overdue");
+            assert_eq!(
+                rows[0].get_named::<String>("reason").unwrap(),
+                "ack-overdue"
+            );
             let id = rows[0].get_named::<i64>("id").unwrap();
             let generation = conn
-                .query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
+                .query_sync(
+                    "SELECT generation_id FROM db_identity WHERE singleton = 0",
+                    &[],
+                )
                 .unwrap()[0]
                 .get_named::<String>("generation_id")
                 .unwrap();
             drop(conn);
-            let filename =
-                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
-                    Some(&generation),
-                    id,
-                );
+            let filename = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                Some(&generation),
+                id,
+            );
             let artifact = config
                 .storage_root
                 .join("projects/ack-worker/file_reservations")
@@ -275,8 +287,11 @@ mod tests {
             )
             .unwrap();
         }
-        conn.query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
-            .unwrap()[0]
+        conn.query_sync(
+            "SELECT generation_id FROM db_identity WHERE singleton = 0",
+            &[],
+        )
+        .unwrap()[0]
             .get_named::<String>("generation_id")
             .unwrap()
     }
@@ -326,16 +341,21 @@ mod tests {
             let error = run_pass(&config, &selected, &mut pool, &mut state, &stop, || true)
                 .expect_err("invalid generation must refuse the page");
             assert!(error.contains("failed to read overdue ACK page"), "{error}");
-            assert!(pool.is_none(), "a failed source must not pin the worker's pool");
+            assert!(
+                pool.is_none(),
+                "a failed source must not pin the worker's pool"
+            );
             assert_eq!(state.cursor, cursor);
             assert_eq!(state.identity, identity);
             assert_eq!(state.warned, warned);
             assert_eq!(state.current, current);
 
             set_generation(&control, &cx, &generation);
-            block_on(mcp_agent_mail_db::queries::acknowledge_message(&cx, &control, 82, 2))
-                .into_result()
-                .unwrap();
+            block_on(mcp_agent_mail_db::queries::acknowledge_message(
+                &cx, &control, 82, 2,
+            ))
+            .into_result()
+            .unwrap();
             // Reopening is not a fresh lap in an unchanged generation. Only
             // message 3 remains in the unconsumed window; message 2 is now ACKed.
             config.ack_escalation_enabled = true;
@@ -352,11 +372,22 @@ mod tests {
                 .unwrap();
             assert_eq!(claims.len(), 1);
             assert_eq!(claims[0].get_named::<i64>("agent_id").unwrap(), 82);
-            assert_eq!(claims[0].get_named::<String>("reason").unwrap(), "ack-overdue");
+            assert_eq!(
+                claims[0].get_named::<String>("reason").unwrap(),
+                "ack-overdue"
+            );
             let receipts = conn
-                .query_sync("SELECT ack_ts FROM message_recipients WHERE message_id = 2", &[])
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = 2",
+                    &[],
+                )
                 .unwrap();
-            assert!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap().is_some());
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("ack_ts")
+                    .unwrap()
+                    .is_some()
+            );
         });
     }
 
@@ -396,15 +427,16 @@ mod tests {
             assert_eq!(state.current.len(), 1);
             assert!(state.current.iter().any(|key| key.message_id == 1));
             let conn = block_on(control.acquire(&cx)).into_result().unwrap();
-            let claims = conn.query_sync("SELECT id FROM file_reservations", &[]).unwrap();
+            let claims = conn
+                .query_sync("SELECT id FROM file_reservations", &[])
+                .unwrap();
             assert_eq!(claims.len(), 1);
             let id = claims[0].get_named::<i64>("id").unwrap();
             drop(conn);
-            let filename =
-                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
-                    Some(&replacement),
-                    id,
-                );
+            let filename = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                Some(&replacement),
+                id,
+            );
             let artifact = config
                 .storage_root
                 .join("projects/ack-worker/file_reservations")

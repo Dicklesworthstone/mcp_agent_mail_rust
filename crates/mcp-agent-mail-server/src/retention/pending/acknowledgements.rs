@@ -326,7 +326,11 @@ mod tests {
         }
 
         fn bytes(&self) -> Vec<u8> {
-            std::fs::read(journal::log_path(&self.config, journal::ACK_INTENT_LOG_FILE)).unwrap()
+            std::fs::read(journal::log_path(
+                &self.config,
+                journal::ACK_INTENT_LOG_FILE,
+            ))
+            .unwrap()
         }
 
         fn acknowledged(&self) -> bool {
@@ -380,7 +384,13 @@ mod tests {
             .id
             .unwrap();
             journal::append_ack_intent(
-                &self.config, "/replay", "BlueLake", message, "test", "busy", None,
+                &self.config,
+                "/replay",
+                "BlueLake",
+                message,
+                "test",
+                "busy",
+                None,
             )
             .unwrap();
             self.intents = journal::read_queued_ack_intents(&self.config).unwrap();
@@ -396,7 +406,10 @@ mod tests {
             key: key.into(),
             fingerprint: mcp_agent_mail_tools::idempotency::compute_fingerprint(
                 "acknowledge_message",
-                &[("agent", "BlueLake".into()), ("message_id", message.to_string())],
+                &[
+                    ("agent", "BlueLake".into()),
+                    ("message_id", message.to_string()),
+                ],
             ),
         }
     }
@@ -447,10 +460,9 @@ mod tests {
                 (1, 1, 1)
             );
             assert!(fixture.acknowledged());
-            assert!(
-                journal::read_queued_ack_intents(&fixture.config)
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config).unwrap(),
+                Vec::new()
             );
         });
     }
@@ -467,8 +479,7 @@ mod tests {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                 let (release_tx, release_rx) = std::sync::mpsc::channel();
                 let owner = scope.spawn(move || {
-                    let promotion =
-                        write_barrier::try_acquire_promotion_barrier_if_idle().unwrap();
+                    let promotion = write_barrier::try_acquire_promotion_barrier_if_idle().unwrap();
                     ready_tx.send(()).unwrap();
                     let explicitly_released =
                         release_rx.recv_timeout(Duration::from_secs(15)).is_ok();
@@ -489,7 +500,10 @@ mod tests {
             assert_eq!(fixture.bytes(), before);
             assert!(!fixture.acknowledged());
             assert_eq!(
-                fixture.replay(&mut RoundCursor::default(), false).unwrap().completed,
+                fixture
+                    .replay(&mut RoundCursor::default(), false)
+                    .unwrap()
+                    .completed,
                 1
             );
             assert!(fixture.acknowledged());
@@ -519,21 +533,43 @@ mod tests {
             });
             let mut cursor = RoundCursor::default();
             let report = fixture.replay(&mut cursor, false).unwrap();
-            assert_eq!((report.attempted, report.completed, report.deferred), (1, 1, 1));
+            assert_eq!(
+                (report.attempted, report.completed, report.deferred),
+                (1, 1, 1)
+            );
             assert!(report.more);
-            assert_eq!(cursor.after, Some((
-                fixture.intents[0].created_ts, fixture.intents[0].content_sha256.clone(),
-            )));
-            assert_eq!(journal::read_queued_ack_intents(&fixture.config).unwrap().len(), 1);
-            drop(held.borrow_mut().take().expect("promotion stayed held through refusal"));
+            assert_eq!(
+                cursor.after,
+                Some((
+                    fixture.intents[0].created_ts,
+                    fixture.intents[0].content_sha256.clone(),
+                ))
+            );
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            drop(
+                held.borrow_mut()
+                    .take()
+                    .expect("promotion stayed held through refusal"),
+            );
             let first_receipts = fixture.receipts(first);
             assert!(first_receipts.0.is_some() && first_receipts.1.is_some());
             assert_eq!(fixture.receipts(second), (None, None));
             let resumed = fixture.replay(&mut cursor, false).unwrap();
-            assert_eq!((resumed.attempted, resumed.completed, resumed.deferred), (1, 1, 0));
+            assert_eq!(
+                (resumed.attempted, resumed.completed, resumed.deferred),
+                (1, 1, 0)
+            );
             assert_eq!(fixture.receipts(first), first_receipts);
             assert!(fixture.receipts(second).1.is_some());
-            assert!(journal::read_queued_ack_intents(&fixture.config).unwrap().is_empty());
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config).unwrap(),
+                Vec::new()
+            );
         });
     }
 
@@ -561,11 +597,19 @@ mod tests {
             let mut cursor = RoundCursor::default();
             let report = fixture.replay(&mut cursor, false).unwrap();
             assert!(write_barrier::promotion_epoch() > epoch);
-            assert_eq!((report.attempted, report.completed, report.deferred), (1, 1, 1));
+            assert_eq!(
+                (report.attempted, report.completed, report.deferred),
+                (1, 1, 1)
+            );
             assert!(report.more);
             assert!(fixture.receipts(first).1.is_some());
             assert_eq!(fixture.receipts(second), (None, None));
-            assert_eq!(journal::read_queued_ack_intents(&fixture.config).unwrap().len(), 1);
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config)
+                    .unwrap()
+                    .len(),
+                1
+            );
             // Match run(): a deferred pass discards its pool before retrying.
             fixture.pool = DbPool::new(&super::super::pool_config(&fixture.config)).unwrap();
             let resumed = fixture.replay(&mut cursor, false).unwrap();
@@ -590,26 +634,43 @@ mod tests {
                 *slot.borrow_mut() = Some(Box::new(move || {
                     assert_eq!(write_barrier::active_writer_count(), 1);
                     assert!(write_barrier::try_acquire_promotion_barrier_if_idle().is_none());
-                    let lock = std::fs::OpenOptions::new().read(true).write(true)
-                        .open(lock_path).unwrap();
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(lock_path)
+                        .unwrap();
                     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
                     *captured.borrow_mut() = Some(lock);
                 }));
             });
             let report = fixture.replay(&mut RoundCursor::default(), false).unwrap();
-            assert_eq!((report.applied, report.completed, report.deferred), (1, 0, 1));
+            assert_eq!(
+                (report.applied, report.completed, report.deferred),
+                (1, 0, 1)
+            );
             assert_eq!(write_barrier::active_writer_count(), 0);
-            assert_eq!(fixture.bytes(), before, "no false completion or new failure record");
+            assert_eq!(
+                fixture.bytes(),
+                before,
+                "no false completion or new failure record"
+            );
             let first = fixture.receipts(fixture.message);
             assert!(first.0.is_some() && first.1.is_some());
             let queued = journal::read_queued_ack_intents(&fixture.config).unwrap();
             assert_eq!(queued[0].idempotency, fixture.intents[0].idempotency);
-            drop(held.borrow_mut().take().expect("receipt lock remained held"));
+            drop(
+                held.borrow_mut()
+                    .take()
+                    .expect("receipt lock remained held"),
+            );
             // A fresh cursor models losing all in-memory replay progress.
             let retry = fixture.replay(&mut RoundCursor::default(), false).unwrap();
             assert_eq!((retry.applied, retry.completed, retry.deferred), (1, 1, 0));
             assert_eq!(fixture.receipts(fixture.message), first);
-            assert!(journal::read_queued_ack_intents(&fixture.config).unwrap().is_empty());
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config).unwrap(),
+                Vec::new()
+            );
         });
     }
 
@@ -634,9 +695,18 @@ mod tests {
             assert!(first.0.is_some() && first.1.is_some());
             let promotion = write_barrier::try_acquire_promotion_barrier_if_idle().unwrap();
             drop(promotion);
-            assert_eq!(fixture.replay(&mut RoundCursor::default(), false).unwrap().completed, 1);
+            assert_eq!(
+                fixture
+                    .replay(&mut RoundCursor::default(), false)
+                    .unwrap()
+                    .completed,
+                1
+            );
             assert_eq!(fixture.receipts(fixture.message), first);
-            assert!(journal::read_queued_ack_intents(&fixture.config).unwrap().is_empty());
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config).unwrap(),
+                Vec::new()
+            );
         });
     }
 
@@ -659,14 +729,25 @@ mod tests {
             });
             let mut cursor = RoundCursor::default();
             let report = fastmcp_core::block_on(replay_ack_batch(
-                &fixture.cx, &fixture.pool, &fixture.config, &mut cursor, &stop, &fixture.intents,
-            )).unwrap();
+                &fixture.cx,
+                &fixture.pool,
+                &fixture.config,
+                &mut cursor,
+                &stop,
+                &fixture.intents,
+            ))
+            .unwrap();
             assert_eq!((report.attempted, report.completed), (1, 1));
             assert!(report.interrupted && report.more);
             assert_eq!(write_barrier::active_writer_count(), 0);
             assert!(fixture.receipts(first).1.is_some());
             assert_eq!(fixture.receipts(second), (None, None));
-            assert_eq!(journal::read_queued_ack_intents(&fixture.config).unwrap().len(), 1);
+            assert_eq!(
+                journal::read_queued_ack_intents(&fixture.config)
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert_eq!(fixture.replay(&mut cursor, false).unwrap().completed, 1);
             assert!(fixture.receipts(second).1.is_some());
         });
@@ -680,7 +761,10 @@ mod tests {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let fixture = Fixture::new(None);
             let before = fixture.bytes();
-            let key = (fixture.intents[0].created_ts, fixture.intents[0].content_sha256.clone());
+            let key = (
+                fixture.intents[0].created_ts,
+                fixture.intents[0].content_sha256.clone(),
+            );
             let mut cursor = RoundCursor {
                 after: Some(key.clone()),
                 ceiling: Some(key.clone()),
@@ -693,8 +777,14 @@ mod tests {
                 }));
             });
             let report = fastmcp_core::block_on(replay_ack_batch(
-                &fixture.cx, &fixture.pool, &fixture.config, &mut cursor, &stop, &fixture.intents,
-            )).unwrap();
+                &fixture.cx,
+                &fixture.pool,
+                &fixture.config,
+                &mut cursor,
+                &stop,
+                &fixture.intents,
+            ))
+            .unwrap();
             assert!(report.interrupted);
             assert_eq!((report.attempted, report.completed), (0, 0));
             assert_eq!(cursor.after, Some(key.clone()));

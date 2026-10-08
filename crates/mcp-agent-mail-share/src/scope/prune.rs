@@ -15,19 +15,59 @@ const PROJECTS_PER_STATEMENT: usize = 128;
 // remain bound values, including legacy negative and zero project identities.
 // Each predicate uses the same chunk once or twice (at most 256 bindings).
 const PHASES: &[(&str, &str, bool)] = &[
-    ("agent_links", "a_project_id IN ($ids) OR b_project_id IN ($ids)", true),
-    ("project_sibling_suggestions", "project_a_id IN ($ids) OR project_b_id IN ($ids)", true),
-    ("project_mailbox_receipts", "message_id IN (SELECT message_id FROM project_mailbox_deliveries WHERE project_id IN ($ids))", true),
-    ("project_mailbox_receipts", "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", true),
-    ("project_mailbox_deliveries", "project_id IN ($ids) OR message_id IN (SELECT id FROM messages WHERE project_id IN ($ids))", true),
+    (
+        "agent_links",
+        "a_project_id IN ($ids) OR b_project_id IN ($ids)",
+        true,
+    ),
+    (
+        "project_sibling_suggestions",
+        "project_a_id IN ($ids) OR project_b_id IN ($ids)",
+        true,
+    ),
+    (
+        "project_mailbox_receipts",
+        "message_id IN (SELECT message_id FROM project_mailbox_deliveries WHERE project_id IN ($ids))",
+        true,
+    ),
+    (
+        "project_mailbox_receipts",
+        "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
+        true,
+    ),
+    (
+        "project_mailbox_deliveries",
+        "project_id IN ($ids) OR message_id IN (SELECT id FROM messages WHERE project_id IN ($ids))",
+        true,
+    ),
     ("inbox_delivery_events", "project_id IN ($ids)", true),
-    ("inbox_delivery_events", "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", true),
-    ("message_recipients", "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", false),
-    ("file_reservation_releases", "reservation_id IN (SELECT id FROM file_reservations WHERE project_id IN ($ids))", true),
+    (
+        "inbox_delivery_events",
+        "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
+        true,
+    ),
+    (
+        "message_recipients",
+        "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
+        false,
+    ),
+    (
+        "file_reservation_releases",
+        "reservation_id IN (SELECT id FROM file_reservations WHERE project_id IN ($ids))",
+        true,
+    ),
     ("file_reservations", "project_id IN ($ids)", false),
     ("messages", "project_id IN ($ids)", false),
-    ("agent_deregistrations", "agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", true),
-    ("inbox_stats", "agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))", true),
+    (
+        "agent_deregistrations",
+        "agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
+        true,
+    ),
+    (
+        "inbox_stats",
+        "agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
+        true,
+    ),
     ("product_project_links", "project_id IN ($ids)", true),
     ("agents", "project_id IN ($ids)", false),
     ("projects", "id IN ($ids)", false),
@@ -56,9 +96,14 @@ fn table_exists(conn: &Conn, table: &str) -> Result<bool, ShareError> {
     if rows.is_empty() {
         return Ok(false);
     }
-    if rows.len() != 1 || rows[0].get_named::<String>("type").map_err(|error| ShareError::Sqlite {
-        message: format!("decode scope table {table}: {error}"),
-    })? != "table" {
+    if rows.len() != 1
+        || rows[0]
+            .get_named::<String>("type")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("decode scope table {table}: {error}"),
+            })?
+            != "table"
+    {
         return Err(ShareError::Validation {
             message: format!("scope object {table} must be a real table"),
         });
@@ -66,12 +111,20 @@ fn table_exists(conn: &Conn, table: &str) -> Result<bool, ShareError> {
     Ok(true)
 }
 
-fn check_cleared(conn: &Conn, table: &str, predicate: &str, params: &[Value]) -> Result<(), ShareError> {
-    let rows = conn.query_sync(
-        &format!("SELECT 1 FROM {table} WHERE {predicate} LIMIT 1"), params,
-    ).map_err(|error| ShareError::Sqlite {
-        message: format!("verify scoped deletion from {table}: {error}"),
-    })?;
+fn check_cleared(
+    conn: &Conn,
+    table: &str,
+    predicate: &str,
+    params: &[Value],
+) -> Result<(), ShareError> {
+    let rows = conn
+        .query_sync(
+            &format!("SELECT 1 FROM {table} WHERE {predicate} LIMIT 1"),
+            params,
+        )
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("verify scoped deletion from {table}: {error}"),
+        })?;
     if !rows.is_empty() {
         return Err(ShareError::Validation {
             message: format!("excluded rows remain in {table}; scope transaction refused"),
@@ -90,16 +143,19 @@ pub(super) fn apply(conn: &Conn, excluded: &[i64]) -> Result<(), ShareError> {
         return Ok(());
     }
     if table_exists(conn, "project_mailbox_receipts")?
-        && !table_exists(conn, "project_mailbox_deliveries")? {
+        && !table_exists(conn, "project_mailbox_deliveries")?
+    {
         return Err(ShareError::Validation {
-            message: "project mailbox receipts lack their delivery table; scope refused".to_string(),
+            message: "project mailbox receipts lack their delivery table; scope refused"
+                .to_string(),
         });
     }
     // A shared event is also tied to the delivery's target project. Remove
     // it before discarding that authority, even if imported event/message
     // project fields disagree. Legacy direct-only event tables remain valid.
     if table_exists(conn, "project_mailbox_deliveries")?
-        && table_exists(conn, "inbox_delivery_events")? {
+        && table_exists(conn, "inbox_delivery_events")?
+    {
         let predicate = "kind = 'project' AND message_id IN (SELECT message_id FROM project_mailbox_deliveries WHERE project_id IN ($ids))";
         for ids in excluded.chunks(PROJECTS_PER_STATEMENT) {
             let (sql, params) = statement("inbox_delivery_events", predicate, ids);
@@ -126,12 +182,24 @@ pub(super) fn apply(conn: &Conn, excluded: &[i64]) -> Result<(), ShareError> {
     // Preserve the previous cleanup of pre-existing dangling markers and
     // recipients, plus products with no remaining selected-project links.
     if table_exists(conn, "file_reservation_releases")? {
-        clear_matching(conn, "file_reservation_releases", "reservation_id NOT IN (SELECT id FROM file_reservations)")?;
+        clear_matching(
+            conn,
+            "file_reservation_releases",
+            "reservation_id NOT IN (SELECT id FROM file_reservations)",
+        )?;
     }
     if table_exists(conn, "product_project_links")? && table_exists(conn, "products")? {
-        clear_matching(conn, "products", "id NOT IN (SELECT DISTINCT product_id FROM product_project_links)")?;
+        clear_matching(
+            conn,
+            "products",
+            "id NOT IN (SELECT DISTINCT product_id FROM product_project_links)",
+        )?;
     }
-    clear_matching(conn, "message_recipients", "agent_id NOT IN (SELECT id FROM agents)")?;
+    clear_matching(
+        conn,
+        "message_recipients",
+        "agent_id NOT IN (SELECT id FROM agents)",
+    )?;
 
     // These are runtime authorities, not viewer content. A kept project's
     // idempotency claim can cache an entire result delivered into an excluded
@@ -148,8 +216,8 @@ pub(super) fn apply(conn: &Conn, excluded: &[i64]) -> Result<(), ShareError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::apply_project_scope;
+    use super::*;
     use std::path::{Path, PathBuf};
 
     fn fixture(root: &Path) -> PathBuf {
@@ -192,7 +260,9 @@ mod tests {
     }
 
     fn scalar(conn: &Conn, sql: &str) -> i64 {
-        conn.query_sync(sql, &[]).unwrap()[0].get_as::<i64>(0).unwrap()
+        conn.query_sync(sql, &[]).unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
     }
 
     fn assert_kept_scope(path: &Path) {
@@ -201,32 +271,73 @@ mod tests {
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agents"), 1);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 1);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM message_recipients"), 1);
-        assert_eq!(scalar(&conn, "SELECT reservation_id FROM file_reservation_releases"), 10);
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_deregistrations"), 0);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT reservation_id FROM file_reservation_releases"
+            ),
+            10
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM agent_deregistrations"),
+            0
+        );
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 0);
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_sibling_suggestions"), 0);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM project_sibling_suggestions"),
+            0
+        );
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM products"), 1);
-        assert_eq!(scalar(&conn, "SELECT total_count FROM inbox_stats WHERE agent_id = 11"), 1);
-        assert!(conn.query_sync("PRAGMA foreign_key_check", &[]).unwrap().is_empty());
-        let rows = conn.query_sync("SELECT kind, read_ts, ack_ts FROM message_recipients WHERE message_id = 101", &[]).unwrap();
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT total_count FROM inbox_stats WHERE agent_id = 11"
+            ),
+            1
+        );
+        assert!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT kind, read_ts, ack_ts FROM message_recipients WHERE message_id = 101",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].get_named::<String>("kind").unwrap(), "to");
         assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 17);
         assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 19);
-        let rows = conn.query_sync("SELECT recipients_json FROM messages WHERE id = 101", &[]).unwrap();
-        let routing: serde_json::Value = serde_json::from_str(&rows[0].get_named::<String>("recipients_json").unwrap()).unwrap();
-        assert_eq!(routing, serde_json::json!({"to": ["BlueLake"], "cc": [], "bcc": []}));
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 101", &[])
+            .unwrap();
+        let routing: serde_json::Value =
+            serde_json::from_str(&rows[0].get_named::<String>("recipients_json").unwrap()).unwrap();
+        assert_eq!(
+            routing,
+            serde_json::json!({"to": ["BlueLake"], "cc": [], "bcc": []})
+        );
     }
 
     #[test]
     fn every_phase_has_a_fixed_bind_ceiling() {
-        let ids: Vec<i64> = (0..PROJECTS_PER_STATEMENT).map(|n| i64::try_from(n).unwrap() - 1).collect();
+        let ids: Vec<i64> = (0..PROJECTS_PER_STATEMENT)
+            .map(|n| i64::try_from(n).unwrap() - 1)
+            .collect();
         for &(table, predicate, _) in PHASES {
             let (sql, params) = statement(table, predicate, &ids);
             assert!(!sql.contains("$ids"));
             assert!(params.len() <= 256);
-            assert_eq!(sql.bytes().filter(|&byte| byte == b'?').count(), params.len());
+            assert_eq!(
+                sql.bytes().filter(|&byte| byte == b'?').count(),
+                params.len()
+            );
             for chunk in params.chunks(ids.len()) {
-                assert_eq!(chunk, ids.iter().copied().map(Value::BigInt).collect::<Vec<_>>());
+                assert_eq!(
+                    chunk,
+                    ids.iter().copied().map(Value::BigInt).collect::<Vec<_>>()
+                );
             }
         }
     }
@@ -249,10 +360,22 @@ mod tests {
         // More than 32766 excluded messages. Only fixture-generated integers
         // are rendered here; the production deletion uses bound project IDs.
         for start in (1000..34000).step_by(100) {
-            let messages = (start..start + 100).map(|id| format!("({id},2,22)")).collect::<Vec<_>>().join(",");
-            conn.execute_raw(&format!("INSERT INTO messages(id, project_id, sender_id) VALUES {messages}")).unwrap();
-            let recipients = (start..start + 100).map(|id| format!("({id},22,'to')")).collect::<Vec<_>>().join(",");
-            conn.execute_raw(&format!("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES {recipients}")).unwrap();
+            let messages = (start..start + 100)
+                .map(|id| format!("({id},2,22)"))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO messages(id, project_id, sender_id) VALUES {messages}"
+            ))
+            .unwrap();
+            let recipients = (start..start + 100)
+                .map(|id| format!("({id},22,'to')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES {recipients}"
+            ))
+            .unwrap();
         }
         conn.execute_raw("COMMIT").unwrap();
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 33003);
@@ -268,11 +391,15 @@ mod tests {
         let conn = Conn::open_file(path.display().to_string()).unwrap();
         conn.execute_raw("BEGIN IMMEDIATE").unwrap();
         for id in 4..400 {
-            conn.execute_raw(&format!("INSERT INTO projects VALUES({id},'p-{id}','/p-{id}')")).unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO projects VALUES({id},'p-{id}','/p-{id}')"
+            ))
+            .unwrap();
         }
         // Project 399 is in a later chunk; its message references an agent
         // from the first chunk. Chunk-major deletion would violate the FK.
-        conn.execute_raw("INSERT INTO messages(id, project_id, sender_id) VALUES(999,399,22)").unwrap();
+        conn.execute_raw("INSERT INTO messages(id, project_id, sender_id) VALUES(999,399,22)")
+            .unwrap();
         conn.execute_raw("COMMIT").unwrap();
         drop(conn);
         let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
@@ -287,14 +414,20 @@ mod tests {
         let conn = Conn::open_file(path.display().to_string()).unwrap();
         // An existing optional table with an incompatible schema must fail;
         // it is not an absent legacy table. Earlier phases already touch rows.
-        conn.execute_raw("ALTER TABLE agent_deregistrations RENAME COLUMN agent_id TO broken_agent_id").unwrap();
+        conn.execute_raw(
+            "ALTER TABLE agent_deregistrations RENAME COLUMN agent_id TO broken_agent_id",
+        )
+        .unwrap();
         drop(conn);
         assert!(apply_project_scope(&path, &["keep".to_string()]).is_err());
         let conn = Conn::open_file(path.display().to_string()).unwrap();
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 3);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM message_recipients"), 4);
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM file_reservation_releases"), 2);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM file_reservation_releases"),
+            2
+        );
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 2);
     }
 
@@ -320,16 +453,33 @@ mod tests {
         apply_project_scope(&path, &["keep".to_string()]).unwrap();
         assert_kept_scope(&path);
         let conn = Conn::open_file(path.display().to_string()).unwrap();
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
-        assert_eq!(scalar(&conn, "SELECT message_id FROM project_mailbox_deliveries"), 101);
-        let rows = conn.query_sync("SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts", &[]).unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+            1
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT message_id FROM project_mailbox_deliveries"),
+            101
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 11);
         assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 121);
         assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 131);
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_events"), 1);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_events"),
+            1
+        );
         assert_eq!(scalar(&conn, "SELECT seq FROM inbox_delivery_events"), 1);
-        assert_eq!(scalar(&conn, "SELECT agent_id FROM inbox_delivery_events"), 0);
+        assert_eq!(
+            scalar(&conn, "SELECT agent_id FROM inbox_delivery_events"),
+            0
+        );
     }
 
     #[test]
@@ -338,13 +488,25 @@ mod tests {
         let path = fixture(dir.path());
         add_project_mailbox_state(&path);
         let conn = Conn::open_file(path.display().to_string()).unwrap();
-        conn.execute_raw("UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = 101").unwrap();
+        conn.execute_raw(
+            "UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = 101",
+        )
+        .unwrap();
         drop(conn);
         apply_project_scope(&path, &["keep".to_string()]).unwrap();
         let conn = Conn::open_file(path.display().to_string()).unwrap();
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 0);
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_events"), 0);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+            0
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+            0
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM inbox_delivery_events"),
+            0
+        );
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 1);
     }
 
@@ -354,17 +516,34 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = fixture(dir.path());
             let conn = Conn::open_file(path.display().to_string()).unwrap();
-            conn.execute_raw("CREATE TABLE idempotency_keys(project_id INTEGER, result_json TEXT)").unwrap();
+            conn.execute_raw("CREATE TABLE idempotency_keys(project_id INTEGER, result_json TEXT)")
+                .unwrap();
             conn.execute_raw("INSERT INTO idempotency_keys VALUES(1, 'private result delivered into excluded project')").unwrap();
-            conn.execute_raw("CREATE TABLE proof_gate_consumed_nonces(issuer_key TEXT, nonce TEXT)").unwrap();
-            conn.execute_raw("INSERT INTO proof_gate_consumed_nonces VALUES('issuer', 'private nonce')").unwrap();
+            conn.execute_raw(
+                "CREATE TABLE proof_gate_consumed_nonces(issuer_key TEXT, nonce TEXT)",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "INSERT INTO proof_gate_consumed_nonces VALUES('issuer', 'private nonce')",
+            )
+            .unwrap();
             drop(conn);
-            let ids = if scoped { vec!["keep".to_string()] } else { Vec::new() };
+            let ids = if scoped {
+                vec!["keep".to_string()]
+            } else {
+                Vec::new()
+            };
             apply_project_scope(&path, &ids).unwrap();
             let conn = Conn::open_file(path.display().to_string()).unwrap();
             let expected = i64::from(!scoped);
-            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM idempotency_keys"), expected);
-            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM proof_gate_consumed_nonces"), expected);
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM idempotency_keys"),
+                expected
+            );
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM proof_gate_consumed_nonces"),
+                expected
+            );
         }
     }
 
@@ -373,9 +552,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fixture(dir.path());
         let conn = Conn::open_file(path.display().to_string()).unwrap();
-        conn.execute_raw("CREATE TABLE private_payloads(secret TEXT)").unwrap();
-        conn.execute_raw("INSERT INTO private_payloads VALUES('private original')").unwrap();
-        conn.execute_raw("CREATE VIEW idempotency_keys AS SELECT secret FROM private_payloads").unwrap();
+        conn.execute_raw("CREATE TABLE private_payloads(secret TEXT)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO private_payloads VALUES('private original')")
+            .unwrap();
+        conn.execute_raw("CREATE VIEW idempotency_keys AS SELECT secret FROM private_payloads")
+            .unwrap();
         drop(conn);
         assert!(apply_project_scope(&path, &["keep".to_string()]).is_err());
         let conn = Conn::open_file(path.display().to_string()).unwrap();
