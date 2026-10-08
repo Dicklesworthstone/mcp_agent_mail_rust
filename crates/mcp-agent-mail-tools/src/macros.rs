@@ -26,8 +26,8 @@ use crate::messaging::InboxMessage;
 use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_existing_project,
-    resolve_project,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
+    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
 };
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
@@ -715,6 +715,73 @@ pub async fn macro_contact_handshake(
         mcp_agent_mail_core::models::normalize_agent_name(&target_agent).unwrap_or(target_agent);
     let target_resolution =
         crate::contacts::resolve_contact_target(&target_agent, to_project.as_deref(), &project_key);
+    let should_auto_accept = auto_accept.unwrap_or(false);
+
+    // A handshake has two actors when it auto-accepts: the requester and the
+    // recipient deciding the link. Check both on the read-only lane before
+    // implicit registration, project creation, link refresh, or intro mail.
+    // A project in which this session holds no identity keeps trusted-local
+    // behavior, just as each granular contact tool does.
+    if !crate::session_identity::session_bindings(ctx).is_empty() {
+        let read_pool = get_coalescer_bypass_read_db_pool()?;
+        match resolve_existing_project(ctx, &read_pool, &project_key).await {
+            Ok(project) => {
+                let project_id = project.id.unwrap_or(0);
+                match resolve_agent(
+                    ctx,
+                    &read_pool,
+                    project_id,
+                    &from_agent,
+                    &project.slug,
+                    &project.human_key,
+                )
+                .await
+                {
+                    Ok(agent) => crate::session_identity::authorize_actor(
+                        ctx,
+                        &agent,
+                        false,
+                        "request contacts",
+                    )?,
+                    Err(error)
+                        if register_if_missing != Some(false)
+                            && tool_error_code(&error) == Some("NOT_FOUND") =>
+                    {
+                        crate::contacts::authorize_requester_creation(
+                            ctx,
+                            project_id,
+                            &from_agent,
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error)
+                if register_if_missing != Some(false)
+                    && tool_error_code(&error) == Some("NOT_FOUND") => {}
+            Err(error) => return Err(error),
+        }
+        if should_auto_accept {
+            let project =
+                resolve_existing_project(ctx, &read_pool, &target_resolution.project_key).await?;
+            let target = resolve_agent(
+                ctx,
+                &read_pool,
+                project.id.unwrap_or(0),
+                &target_resolution.agent_name,
+                &project.slug,
+                &project.human_key,
+            )
+            .await?;
+            crate::session_identity::authorize_actor(
+                ctx,
+                &target,
+                false,
+                "respond to contact requests",
+            )?;
+        }
+    }
+
     let pool = get_db_pool()?;
     // register_if_missing=false means nothing is created implicitly: a missing
     // source project is NOT_FOUND here, before the contact flow's own check.
@@ -731,7 +798,6 @@ pub async fn macro_contact_handshake(
             .unwrap_or_else(|| target_resolution.agent_name.clone());
     let is_cross_project = source_project.id != target_project.id;
 
-    let should_auto_accept = auto_accept.unwrap_or(false);
     let ttl = match ttl_seconds {
         Some(t) if t > 0 => t.clamp(60, 31_536_000), // consistent with other macros
         _ => 604_800,                                // 7 days

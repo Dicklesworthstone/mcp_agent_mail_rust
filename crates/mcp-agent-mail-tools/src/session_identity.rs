@@ -18,12 +18,18 @@
 //!   accepted as proof in place of the token.
 //! - **No borrowed names.** A session that holds an identity in a project may
 //!   only act as the agents it holds there: sending, replying, reading and
-//!   acknowledging mail, and reserving or releasing files as any other agent
-//!   of that project is refused with `SESSION_IDENTITY_MISMATCH` unless the
-//!   call presents that agent's registration token. `register_agent` of
+//!   acknowledging mail, managing contacts and contact policy, and reserving
+//!   or releasing files as any other agent of that project is refused with
+//!   `SESSION_IDENTITY_MISMATCH` unless the call presents that agent's
+//!   registration token. `register_agent` of
 //!   another existing agent is refused too, so its profile and token are not
 //!   rewritten. A session that holds no identity in the project keeps the
 //!   trusted-local behavior.
+//! - **Contact actors.** Requests act as the requester; approvals and blocks
+//!   act as the recipient. An auto-accepting handshake preflights both actors
+//!   before creating or refreshing a link. A bound session must explicitly
+//!   create or register additional requester identities before using them;
+//!   implicit contact registration never establishes a session binding.
 //! - **Lifetime.** Bindings live in session memory: ending the session,
 //!   letting it expire or restarting the server ends them; message history is
 //!   untouched. Retiring or deregistering an agent drops it from the calling

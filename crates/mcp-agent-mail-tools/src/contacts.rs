@@ -17,7 +17,7 @@ use crate::messaging::{
 };
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
-    resolve_agent, resolve_existing_project, resolve_project,
+    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
 };
 
 /// Contact link state (tool-facing).
@@ -114,8 +114,28 @@ fn parse_contact_policy(raw: &str) -> String {
     }
 }
 
+/// Implicit registration is a trusted-local convenience, not an identity
+/// binding. A session already bound in this project must explicitly create
+/// any additional identity before acting as it.
+pub(crate) fn authorize_requester_creation(
+    ctx: &McpContext,
+    project_id: i64,
+    agent_name: &str,
+) -> McpResult<()> {
+    crate::session_identity::authorize_actor(
+        ctx,
+        &mcp_agent_mail_db::AgentRow {
+            project_id,
+            name: agent_name.to_string(),
+            ..mcp_agent_mail_db::AgentRow::default()
+        },
+        false,
+        "auto-register a contact requester",
+    )
+}
+
 /// Resolve the sender agent, optionally auto-registering if missing.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn resolve_or_register_sender(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -144,9 +164,13 @@ pub(crate) async fn resolve_or_register_sender(
     )
     .await
     {
-        Ok(a) => Ok(a),
-        Err(e) if !register_if_missing => Err(e),
+        Ok(a) => {
+            crate::session_identity::authorize_actor(ctx, &a, false, "request contacts")?;
+            Ok(a)
+        }
+        Err(e) if !register_if_missing || tool_error_code(&e) != Some("NOT_FOUND") => Err(e),
         Err(_) => {
+            authorize_requester_creation(ctx, project_id, &from_agent_norm)?;
             // Proof gate (fail-closed): auto-registering a not-yet-known
             // `from_agent` here cannot carry a signed `registration_proof`
             // bundle, so when the gate is enabled we refuse instead of minting
@@ -173,7 +197,10 @@ pub(crate) async fn resolve_or_register_sender(
                 )
             })?;
 
-            let out = mcp_agent_mail_db::queries::register_agent(
+            // Never rewrite an identity created by another session between
+            // our lookup and insert. Resolve and authorize a raced existing
+            // row instead of upserting its profile.
+            let out = mcp_agent_mail_db::queries::create_agent(
                 ctx.cx(),
                 pool,
                 project_id,
@@ -182,10 +209,29 @@ pub(crate) async fn resolve_or_register_sender(
                 &model,
                 task_description,
                 Some("auto"),
-                None,
             )
             .await;
-            let row = db_outcome_to_mcp_result(out)?;
+            let row = match out {
+                Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                    let existing = resolve_agent(
+                        ctx,
+                        pool,
+                        project_id,
+                        &from_agent_norm,
+                        project_slug,
+                        project_human_key,
+                    )
+                    .await?;
+                    crate::session_identity::authorize_actor(
+                        ctx,
+                        &existing,
+                        false,
+                        "request contacts",
+                    )?;
+                    return Ok(existing);
+                }
+                other => db_outcome_to_mcp_result(other)?,
+            };
             enqueue_agent_semantic_index(&row);
             // Implicit requesters need the same durable identity profile as
             // explicit registrations and implicitly registered recipients.
@@ -645,6 +691,19 @@ pub async fn respond_contact(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
+    // The recipient decides this directed link. Authorize that identity
+    // before resolving (and potentially creating) the requester's project.
+    let to_row = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &to_agent,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    crate::session_identity::authorize_actor(ctx, &to_row, false, "respond to contact requests")?;
+
     let source_project_key = from_project.unwrap_or_else(|| project_key.clone());
     let source_project_row = resolve_project(ctx, &pool, &source_project_key).await?;
     let source_project_id = source_project_row.id.unwrap_or(0);
@@ -658,16 +717,6 @@ pub async fn respond_contact(
         &source_project_row.human_key,
     )
     .await?;
-    let to_row = resolve_agent(
-        ctx,
-        &pool,
-        project_id,
-        &to_agent,
-        &project.slug,
-        &project.human_key,
-    )
-    .await?;
-
     // Mirror request_contact: clamp caller-supplied TTL to [60s, 1 year] so the DB's
     // expires_ts = now + ttl*1_000_000 cannot be driven past a reasonable horizon.
     let ttl = match ttl_seconds {
@@ -888,6 +937,17 @@ pub async fn set_contact_policy(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "set contact policy")?;
 
     // Use name-based lookup to avoid ID issues with ORM row decoding
     let updated_agent = db_outcome_to_mcp_result(
