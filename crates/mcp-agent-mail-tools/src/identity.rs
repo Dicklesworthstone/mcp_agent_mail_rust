@@ -2586,6 +2586,23 @@ Check that all parameters have valid values."
         .await?;
     }
 
+    // GH#279 (opt-in): naming an existing agent never binds it to this
+    // session, and a session that holds another identity in this project may
+    // not rewrite this agent's profile or rotate its token.
+    let existing_before = if crate::session_identity::enabled()
+        && let Some(agent_name) = explicit_name.as_deref()
+    {
+        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await {
+            asupersync::Outcome::Ok(existing) => Some(existing),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(existing) = &existing_before {
+        crate::session_identity::authorize_actor(ctx, existing, false, "re-register")?;
+    }
+
     let mut row = if let Some(agent_name) = explicit_name {
         // Explicit name: documented upsert/idempotent-re-registration
         // semantics (refresh program/model/task, bump last_active_ts).
@@ -2687,6 +2704,14 @@ Check that all parameters have valid values."
         row.registration_token = Some(registration_token.clone());
     }
 
+    // GH#279 (opt-in): this session established the agent when it created
+    // it, or already held it.
+    if let Some(agent_id) = row.id
+        && (existing_before.is_none() || crate::session_identity::holds(ctx, row.id))
+    {
+        crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
+    }
+
     // Invalidate + repopulate read cache after mutation. Scope to the live
     // pool's identity key so subsequent reads against the same pool
     // (resolve_agent → queries::get_agent) see the freshly persisted row
@@ -2784,7 +2809,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nNote: unlike the Python server, this server has no per-session identity binding, so a\ncaller that opts out of the token echo sends messages with `verified_sender: false`\nunless it obtains the token through an operator/admin path. Under the fail-closed send\nprofile a sender token is mandatory; only opt out of the echo if you have another way\nto obtain the token.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -3027,6 +3052,12 @@ Choose a different name (or omit the name to auto-generate one)."
         }
     }
 
+    // GH#279 (opt-in): a freshly created identity belongs to this session, so
+    // it can act as that agent without the token in its transcript.
+    if let Some(agent_id) = row.id {
+        crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
+    }
+
     // Transcript safety (GH#255, Python-parity with issue #154): when the
     // caller opts out of the token echo, omit the token from the tool result
     // entirely and mark the omission explicitly. The token was still
@@ -3133,6 +3164,8 @@ pub async fn retire_agent(
         )
         .await,
     )?;
+    // GH#279: a retired identity no longer belongs to the calling session.
+    crate::session_identity::unbind(ctx, agent_id);
     let agent_json = agent_archive_profile_json(&updated, None);
     try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
 
@@ -3261,6 +3294,8 @@ pub async fn deregister_agent(
         )
         .await,
     )?;
+    // GH#279: a deregistered identity no longer belongs to the calling session.
+    crate::session_identity::unbind(ctx, agent_id);
     // Read back the ledger timestamp so concurrent/idempotent retries archive
     // the authoritative first deregistration time, never a later candidate.
     let deregistered_at = db_outcome_to_mcp_result(

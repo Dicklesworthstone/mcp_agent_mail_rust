@@ -29,9 +29,12 @@ use mcp_agent_mail_tools::degraded_intents::{
 use mcp_agent_mail_tools::tool_util::{resolve_agent, resolve_existing_project};
 use serde_json::json;
 
+mod acknowledgements;
 mod journal_scan;
 mod releases;
 mod supervision;
+
+use acknowledgements::replay_ack_batch;
 
 const MAX_ATTEMPTS: usize = 16;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -626,68 +629,6 @@ async fn validate_live_pool(cx: &Cx, pool: &DbPool, config: &Config) -> Result<(
         return Err("query-only snapshots cannot authorize durable replay".to_string());
     }
     Ok(())
-}
-
-async fn replay_ack_batch(
-    cx: &Cx,
-    pool: &DbPool,
-    config: &Config,
-    cursor: &mut RoundCursor,
-    shutdown: &AtomicBool,
-    intents: &[QueuedAckIntent],
-) -> Result<ReplayReport, String> {
-    let mut report = ReplayReport::default();
-    if shutdown.load(Ordering::Acquire) {
-        report.interrupted = true;
-        return Ok(report);
-    }
-    // Background replay bypasses the public tool's WriteDbPool guard. Keep
-    // identities, mutation and completion on one live database generation.
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-    validate_live_pool(cx, pool, config).await?;
-    let keys: Vec<_> = intents
-        .iter()
-        .map(|intent| (intent.created_ts, intent.content_sha256.clone()))
-        .collect();
-    let candidates = cursor.candidates(&keys);
-    report.more = candidates.len() > MAX_ATTEMPTS;
-    let ctx = McpContext::new(cx.clone(), 0);
-    for index in candidates.into_iter().take(MAX_ATTEMPTS) {
-        if shutdown.load(Ordering::Acquire) || ctx.checkpoint().is_err() {
-            report.interrupted = true;
-            report.more = true;
-            break;
-        }
-        let intent = &intents[index];
-        cursor.after = Some(keys[index].clone());
-        report.attempted += 1;
-        match apply_ack(&ctx, pool, intent).await {
-            Ok(completion) => {
-                if matches!(completion, Completion::Replayed) {
-                    report.applied += 1;
-                }
-                match append_ack_completion(config, intent, completion) {
-                    Ok(()) => {
-                        report.completed += 1;
-                        if matches!(completion, Completion::KeyConflict) {
-                            report.abandoned += 1;
-                        }
-                    }
-                    Err(error) => {
-                        report.deferred += 1;
-                        tracing::warn!(intent_id = %intent.intent_id, %error,
-                            "acknowledgement outcome resolved but completion receipt unavailable; safe replay retained");
-                    }
-                }
-            }
-            Err(error) => {
-                report.deferred += 1;
-                tracing::warn!(intent_id = %intent.intent_id, %error,
-                    "durable acknowledgement remains queued");
-            }
-        }
-    }
-    Ok(report)
 }
 
 async fn apply_ack(

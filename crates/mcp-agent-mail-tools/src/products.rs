@@ -836,6 +836,7 @@ pub async fn fetch_inbox_product(
                 created_ts: Some(micros_to_iso(created_ts)),
                 read_ts: row.read_ts.map(micros_to_iso),
                 ack_ts: row.ack_ts.map(micros_to_iso),
+                via: crate::messaging::inbox_via(&row.kind),
                 kind: row.kind,
                 attachments: parse_attachment_metadata_json(&msg.attachments),
                 body_md: if with_bodies { Some(msg.body_md) } else { None },

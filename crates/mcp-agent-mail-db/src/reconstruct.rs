@@ -441,6 +441,11 @@ pub struct ReconstructStats {
     pub messages: usize,
     /// Number of message-recipient rows inserted.
     pub recipients: usize,
+    /// Number of project shared-mailbox deliveries restored (GH#282).
+    pub project_mailbox_deliveries: usize,
+    /// Number of shared-mailbox read/ack receipts restored from a salvaged
+    /// database (GH#282).
+    pub salvaged_project_mailbox_receipts: usize,
     /// Number of duplicate canonical archive files skipped because their
     /// positive frontmatter `id` had already been recovered within the same
     /// project.
@@ -721,6 +726,13 @@ impl std::fmt::Display for ReconstructStats {
                 f,
                 "; preserved {} same-project canonical id reuse collision(s) under generated DB ids",
                 self.same_project_canonical_identity_collisions
+            )?;
+        }
+        if self.project_mailbox_deliveries > 0 || self.salvaged_project_mailbox_receipts > 0 {
+            write!(
+                f,
+                "; restored {} project mailbox deliveries ({} salvaged receipts)",
+                self.project_mailbox_deliveries, self.salvaged_project_mailbox_receipts
             )?;
         }
         if self.suppressed_warnings > 0 {
@@ -2538,7 +2550,7 @@ fn parse_and_insert_message(
     conn: &DbConn,
     file_path: &Path,
     project_id: i64,
-    _project_slug: &str,
+    project_slug: &str,
     agent_ids: &mut HashMap<(i64, String), i64>,
     stats: &mut ReconstructStats,
     deferred: Option<&mut Vec<DeferredCollisionMessage>>,
@@ -2772,20 +2784,24 @@ fn parse_and_insert_message(
     stats.messages += 1;
 
     // Insert recipients
-    for name in &to_names {
-        let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
-        insert_recipient(conn, message_id, aid, "to")?;
-        stats.recipients += 1;
-    }
-    for name in &cc_names {
-        let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
-        insert_recipient(conn, message_id, aid, "cc")?;
-        stats.recipients += 1;
-    }
-    for name in &bcc_names {
-        let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
-        insert_recipient(conn, message_id, aid, "bcc")?;
-        stats.recipients += 1;
+    for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")] {
+        for name in names {
+            if reconstruct_project_mailbox_recipient(
+                conn,
+                project_id,
+                project_slug,
+                message_id,
+                created_ts,
+                name,
+                kind,
+                stats,
+            )? {
+                continue;
+            }
+            let aid = ensure_agent_exists(conn, project_id, name, agent_ids)?;
+            insert_recipient(conn, message_id, aid, kind)?;
+            stats.recipients += 1;
+        }
     }
 
     Ok(())
@@ -3019,6 +3035,68 @@ fn ensure_agent_exists(
     Ok(aid)
 }
 
+fn project_slug_by_id(conn: &DbConn, project_id: i64) -> DbResult<Option<String>> {
+    conn.query_sync(
+        "SELECT slug FROM projects WHERE id = ?",
+        &[Value::BigInt(project_id)],
+    )
+    .map_err(|e| DbError::Sqlite(format!("query slug of project {project_id}: {e}")))
+    .map(|rows| {
+        rows.first()
+            .and_then(|row| row.get_named::<String>("slug").ok())
+    })
+}
+
+/// GH#282: restore a shared-mailbox delivery named in a recovered envelope.
+///
+/// Returns `true` when `name` is a project mailbox address, which is handled
+/// here and must never become a (placeholder) agent. Only the message's own
+/// project can be addressed, and only as to/cc; anything else is reported and
+/// skipped rather than invented.
+fn reconstruct_project_mailbox_recipient(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    message_id: i64,
+    delivered_ts: i64,
+    name: &str,
+    kind: &str,
+    stats: &mut ReconstructStats,
+) -> DbResult<bool> {
+    let Some(ident) = crate::project_mailbox::parse_project_mailbox_address(name) else {
+        return Ok(false);
+    };
+    if ident != project_slug || !matches!(kind, "to" | "cc") {
+        stats.push_warning(format!(
+            "message {message_id} names project mailbox {name:?} as {kind}; only its own \
+             project's mailbox ('project:{project_slug}') as to/cc is restored"
+        ));
+        return Ok(true);
+    }
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO project_mailbox_deliveries \
+         (message_id, project_id, kind, delivered_ts) VALUES (?, ?, ?, ?)",
+        &[
+            Value::BigInt(message_id),
+            Value::BigInt(project_id),
+            Value::Text(kind.to_string()),
+            Value::BigInt(delivered_ts),
+        ],
+    )
+    .map_err(|e| DbError::Sqlite(format!("insert project mailbox delivery {message_id}: {e}")))?;
+    conn.execute_sync(
+        crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+        &[
+            Value::BigInt(project_id),
+            Value::BigInt(message_id),
+            Value::BigInt(delivered_ts),
+        ],
+    )
+    .map_err(|e| DbError::Sqlite(format!("insert project mailbox event {message_id}: {e}")))?;
+    stats.project_mailbox_deliveries += 1;
+    Ok(true)
+}
+
 fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -> DbResult<()> {
     conn.execute_sync(
         "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
@@ -3240,6 +3318,36 @@ fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) ->
             "cc" => cc_names.push(name),
             "bcc" => bcc_names.push(name),
             _ => to_names.push(name),
+        }
+    }
+
+    // GH#282: the shared-mailbox address has no recipient row; keep it in the
+    // envelope while the project delivery exists.
+    let delivery = match conn.query_sync(
+        "SELECT project_id, kind FROM project_mailbox_deliveries WHERE message_id = ?",
+        &[Value::BigInt(message_id)],
+    ) {
+        Ok(rows) => rows,
+        Err(e)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(&e.to_string()) =>
+        {
+            Vec::new()
+        }
+        Err(e) => {
+            return Err(DbError::Sqlite(format!(
+                "reconstruct salvage: query project mailbox delivery for message {message_id}: {e}"
+            )));
+        }
+    };
+    if let Some(row) = delivery.first() {
+        let project_id = row.get_named::<i64>("project_id").unwrap_or_default();
+        if let Some(slug) = project_slug_by_id(conn, project_id)? {
+            let address = crate::project_mailbox::project_mailbox_address(&slug);
+            if row.get_named::<String>("kind").ok().as_deref() == Some("cc") {
+                cc_names.push(address);
+            } else {
+                to_names.push(address);
+            }
         }
     }
 
@@ -5919,9 +6027,36 @@ fn merge_salvaged_database(
                     message_id_map.insert(source_message_id, target_message_id);
                     stats.salvaged_messages += 1;
 
+                    let target_project_slug = if to_names
+                        .iter()
+                        .chain(&cc_names)
+                        .chain(&bcc_names)
+                        .any(|name| {
+                            crate::project_mailbox::parse_project_mailbox_address(name).is_some()
+                        }) {
+                        project_slug_by_id(&target_conn, target_project_id)?
+                    } else {
+                        None
+                    };
                     for (names, kind) in [(&to_names, "to"), (&cc_names, "cc"), (&bcc_names, "bcc")]
                     {
                         for name in names {
+                            // GH#282: a shared-mailbox address restores the
+                            // project delivery, never a placeholder agent.
+                            if let Some(slug) = target_project_slug.as_deref()
+                                && reconstruct_project_mailbox_recipient(
+                                    &target_conn,
+                                    target_project_id,
+                                    slug,
+                                    target_message_id,
+                                    source_created_ts,
+                                    name,
+                                    kind,
+                                    stats,
+                                )?
+                            {
+                                continue;
+                            }
                             let agent_id = ensure_agent_exists(
                                 &target_conn,
                                 target_project_id,
@@ -6144,6 +6279,107 @@ fn merge_salvaged_database(
                     }
                 }
                 if recipient_rows.len() < SALVAGE_RECIPIENT_BATCH_ROWS {
+                    break;
+                }
+            }
+        }
+
+        // GH#282: shared-mailbox read/ack receipts are DB-only state, like
+        // recipient read/ack. Carry them over for deliveries the candidate
+        // holds, so a rebuild neither loses reads nor revives acknowledged
+        // project mail as unacknowledged.
+        if table_exists(&salvage_conn, "project_mailbox_receipts")? {
+            let mut receipt_rowid_floor = 0i64;
+            loop {
+                let receipt_rows = salvage_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT rowid AS salvage_rowid, message_id, agent_id, read_ts, ack_ts \
+                             FROM project_mailbox_receipts WHERE rowid > ? \
+                             ORDER BY rowid LIMIT {SALVAGE_RECIPIENT_BATCH_ROWS}"
+                        ),
+                        &[Value::BigInt(receipt_rowid_floor)],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: query project mailbox receipts: {e}"
+                        ))
+                    })?;
+                if receipt_rows.is_empty() {
+                    break;
+                }
+                for row in &receipt_rows {
+                    receipt_rowid_floor = row.get_named::<i64>("salvage_rowid").map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: decode project mailbox receipt rowid: {e}"
+                        ))
+                    })?;
+                    let source_message_id = row.get_named::<i64>("message_id").unwrap_or(0);
+                    let source_agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
+                    let (Some(target_message_id), Some(target_agent_id)) = (
+                        message_id_map.get(&source_message_id).copied(),
+                        agent_id_map.get(&source_agent_id).copied(),
+                    ) else {
+                        stats.push_warning(format!(
+                            "skipped salvaged project mailbox receipt ({source_message_id}, {source_agent_id}): message or agent was not carried into the candidate"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    };
+                    let delivery = target_conn
+                        .query_sync(
+                            "SELECT d.message_id FROM project_mailbox_deliveries d \
+                             JOIN agents a ON a.id = ? AND a.project_id = d.project_id \
+                             WHERE d.message_id = ?",
+                            &[
+                                Value::BigInt(target_agent_id),
+                                Value::BigInt(target_message_id),
+                            ],
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: query project mailbox delivery {target_message_id}: {e}"
+                            ))
+                        })?;
+                    if delivery.is_empty() {
+                        stats.push_warning(format!(
+                            "skipped salvaged project mailbox receipt ({source_message_id}, {source_agent_id}): the candidate holds no matching project delivery"
+                        ));
+                        stats.salvaged_rows_skipped_unmapped += 1;
+                        continue;
+                    }
+                    let read_ts = row.get_named::<i64>("read_ts").ok();
+                    let ack_ts = row.get_named::<i64>("ack_ts").ok();
+                    for (sql, params) in [
+                        (
+                            "INSERT OR IGNORE INTO project_mailbox_receipts \
+                             (message_id, agent_id, read_ts, ack_ts) VALUES (?, ?, NULL, NULL)",
+                            vec![
+                                Value::BigInt(target_message_id),
+                                Value::BigInt(target_agent_id),
+                            ],
+                        ),
+                        (
+                            "UPDATE project_mailbox_receipts \
+                             SET read_ts = COALESCE(read_ts, ?), ack_ts = COALESCE(ack_ts, ?) \
+                             WHERE message_id = ? AND agent_id = ?",
+                            vec![
+                                read_ts.map_or(Value::Null, Value::BigInt),
+                                ack_ts.map_or(Value::Null, Value::BigInt),
+                                Value::BigInt(target_message_id),
+                                Value::BigInt(target_agent_id),
+                            ],
+                        ),
+                    ] {
+                        target_conn.execute_sync(sql, &params).map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: restore project mailbox receipt ({target_message_id}, {target_agent_id}): {e}"
+                            ))
+                        })?;
+                    }
+                    stats.salvaged_project_mailbox_receipts += 1;
+                }
+                if receipt_rows.len() < SALVAGE_RECIPIENT_BATCH_ROWS {
                     break;
                 }
             }
@@ -7355,6 +7591,87 @@ mod tests {
         assert_eq!(rows[2].get_as::<Option<String>>(0).unwrap(), None);
     }
 
+    /// GH#282: an archived envelope addressed to the project mailbox restores
+    /// the single project delivery and its cursor event, never a placeholder
+    /// agent named after the address. A foreign project's address or a bcc
+    /// slot is reported and skipped.
+    #[test]
+    fn reconstruct_restores_project_mailbox_deliveries_without_placeholder_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = tmp.path().join("archive");
+        let project = storage.join("projects/team");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).expect("message directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"team","human_key":"/team","created_at":1}"#,
+        )
+        .expect("project metadata");
+        for (id, to, bcc) in [
+            (
+                1,
+                serde_json::json!(["project:team"]),
+                serde_json::json!([]),
+            ),
+            (
+                2,
+                serde_json::json!(["Bob", "project:elsewhere"]),
+                serde_json::json!(["project:team"]),
+            ),
+        ] {
+            let message = serde_json::json!({
+                "id": id, "from": "Alice", "to": to, "cc": [], "bcc": bcc,
+                "subject": format!("shared {id}"), "created": "2026-10-01T00:00:00Z",
+                "attachments": [], "importance": "normal", "ack_required": false
+            });
+            std::fs::write(
+                messages.join(format!("2026-10-01T00-00-00Z__shared__{id}.md")),
+                format!("---json\n{message}\n---\n\nbody\n"),
+            )
+            .expect("message artifact");
+        }
+        let db = tmp.path().join("reconstructed.db");
+        let stats = reconstruct_from_archive(&db, &storage).expect("reconstruct");
+        assert_eq!(stats.messages, 2);
+        assert_eq!(stats.project_mailbox_deliveries, 1);
+        assert_eq!(
+            stats
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("project mailbox"))
+                .count(),
+            2,
+            "{:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect database");
+        let deliveries = conn
+            .query_sync(
+                "SELECT message_id, kind FROM project_mailbox_deliveries ORDER BY message_id",
+                &[],
+            )
+            .expect("deliveries");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].get_as::<i64>(0).unwrap(), 1);
+        assert_eq!(deliveries[0].get_as::<String>(1).unwrap(), "to");
+        let events = conn
+            .query_sync(
+                "SELECT COUNT(*) FROM inbox_delivery_events WHERE agent_id = 0 AND message_id = 1",
+                &[],
+            )
+            .expect("cursor event");
+        assert_eq!(events[0].get_as::<i64>(0).unwrap(), 1);
+        let agents = conn
+            .query_sync("SELECT name FROM agents ORDER BY name", &[])
+            .expect("agents");
+        let names: Vec<String> = agents
+            .iter()
+            .map(|row| row.get_as::<String>(0).unwrap())
+            .collect();
+        assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
     #[test]
     fn salvage_preserves_known_reply_metadata_and_legacy_uncertainty() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -7898,6 +8215,8 @@ mod tests {
             agents: 5,
             messages: 100,
             recipients: 200,
+            project_mailbox_deliveries: 0,
+            salvaged_project_mailbox_receipts: 0,
             duplicate_canonical_message_files: 0,
             duplicate_canonical_message_ids: 0,
             cross_project_canonical_collisions: 0,

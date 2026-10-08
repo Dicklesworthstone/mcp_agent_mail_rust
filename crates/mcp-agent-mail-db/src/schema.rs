@@ -111,6 +111,33 @@ CREATE INDEX IF NOT EXISTS idx_message_recipients_agent_message ON message_recip
 CREATE INDEX IF NOT EXISTS idx_mr_agent_ack ON message_recipients(agent_id, ack_ts);
 CREATE INDEX IF NOT EXISTS idx_mr_ack_message ON message_recipients(ack_ts, message_id);
 
+-- Project-addressed shared mailbox deliveries (GH#282). A message sent to the
+-- `project:<slug>` recipient is stored ONCE, with exactly one delivery row
+-- here, instead of a message_recipients row per agent. Every active agent of
+-- the project other than the sender reads it from its inbox. `kind` is the
+-- address slot the sender used (to or cc). This is not broadcast: nothing is
+-- fanned out per agent at send time or at registration time.
+CREATE TABLE IF NOT EXISTS project_mailbox_deliveries (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    kind TEXT NOT NULL DEFAULT 'to',
+    delivered_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_project_mailbox_deliveries_project_ts ON project_mailbox_deliveries(project_id, delivered_ts);
+
+-- Per-agent read and acknowledgement state for project mailbox deliveries
+-- (GH#282). Rows are created lazily, only when an agent marks a project
+-- message read or acknowledges it, so reading the shared mailbox never
+-- materializes per-agent delivery rows and never touches another agent.
+CREATE TABLE IF NOT EXISTS project_mailbox_receipts (
+    message_id INTEGER NOT NULL REFERENCES messages(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    read_ts INTEGER,
+    ack_ts INTEGER,
+    PRIMARY KEY(message_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_mailbox_receipts_agent ON project_mailbox_receipts(agent_id, message_id);
+
 -- File reservations table
 CREATE TABLE IF NOT EXISTS file_reservations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2477,6 +2504,29 @@ pub fn schema_migrations() -> Vec<Migration> {
         "rewrite pre-v30 messages rows as full records".to_string(),
         "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NULL"
             .to_string(),
+        String::new(),
+    ));
+
+    // ── v32: project-addressed shared mailboxes (GH#282) ──────────────
+    //
+    // The delivery and receipt tables themselves come from the static DDL
+    // above (generated v1 IDs). Removing a message must not leave a delivery
+    // that resurrects an empty row in every agent's inbox, a receipt that
+    // would claim a later message reusing the id was already read, or the
+    // delivery's cursor event (`inbox_delivery_events` row with agent_id 0,
+    // see `project_mailbox::PROJECT_MAILBOX_EVENT_AGENT_ID`).
+    migrations.push(Migration::new(
+        "v32_trg_messages_cascade_project_mailbox".to_string(),
+        "GH#282: cascade-delete project mailbox delivery and receipts with their message"
+            .to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_messages_cascade_project_mailbox \
+         AFTER DELETE ON messages \
+         BEGIN \
+             DELETE FROM project_mailbox_receipts WHERE message_id = OLD.id; \
+             DELETE FROM project_mailbox_deliveries WHERE message_id = OLD.id; \
+             DELETE FROM inbox_delivery_events WHERE message_id = OLD.id AND agent_id = 0; \
+         END"
+        .to_string(),
         String::new(),
     ));
 

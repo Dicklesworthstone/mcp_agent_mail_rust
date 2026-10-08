@@ -42,6 +42,7 @@ pub mod reservation_parity;
 pub mod reservations;
 pub mod resources;
 pub mod search;
+pub mod session_identity;
 
 // Re-export tool handlers for server registration
 pub use build_slots::*;

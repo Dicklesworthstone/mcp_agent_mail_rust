@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 use crate::search::{AggregateSummary, MentionCount, ThreadEntry, ThreadSummary, TopMention};
 use mcp_agent_mail_core::{LockLevel, OrderedMutex, config::dotenv_value};
 
+mod protocol;
+
 // ---------------------------------------------------------------------------
 // Provider env bridge
 // ---------------------------------------------------------------------------
@@ -255,125 +257,11 @@ impl std::error::Error for LlmError {}
 // ---------------------------------------------------------------------------
 
 /// Determine the API base URL and auth header for a given model.
-#[allow(clippy::too_many_lines)]
 fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmError> {
-    // Provider-qualified: "provider/model" or "provider:model"
-    let provider = if model.contains('/') {
-        model.split('/').next().unwrap_or("")
-    } else if model.contains(':') {
-        model.split(':').next().unwrap_or("")
-    } else {
-        // Guess provider from model name prefix
-        if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
-            "openai"
-        } else if model.starts_with("claude") {
-            "anthropic"
-        } else if model.starts_with("gemini") {
-            "google"
-        } else {
-            "openai" // default
-        }
-    };
-
-    let provider_lower = provider.to_ascii_lowercase();
-    match provider_lower.as_str() {
-        "openai" | "gpt" => {
-            let key = get_env_var("OPENAI_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = strip_provider_prefix(model, &["openai", "gpt"]);
-            Ok((
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "anthropic" | "claude" => {
-            let key = get_env_var("ANTHROPIC_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = strip_provider_prefix(model, &["anthropic", "claude"]);
-            Ok((
-                "https://api.anthropic.com/v1/messages".to_string(),
-                key, // Raw key for x-api-key header
-                api_model.to_string(),
-            ))
-        }
-        "google" | "gemini" => {
-            let key = get_env_var("GOOGLE_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = strip_provider_prefix(model, &["google", "gemini"]);
-            Ok((
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-                    .to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "groq" => {
-            let key =
-                get_env_var("GROQ_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            // Strip provider prefix for the API
-            let api_model = model
-                .strip_prefix("groq/")
-                .or_else(|| model.strip_prefix("groq:"))
-                .unwrap_or(model);
-            Ok((
-                "https://api.groq.com/openai/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "deepseek" => {
-            let key = get_env_var("DEEPSEEK_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model
-                .strip_prefix("deepseek/")
-                .or_else(|| model.strip_prefix("deepseek:"))
-                .unwrap_or(model);
-            Ok((
-                "https://api.deepseek.com/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "xai" => {
-            let key =
-                get_env_var("XAI_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model
-                .strip_prefix("xai/")
-                .or_else(|| model.strip_prefix("xai:"))
-                .unwrap_or(model);
-            Ok((
-                "https://api.x.ai/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "openrouter" => {
-            let key = get_env_var("OPENROUTER_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model
-                .strip_prefix("openrouter/")
-                .or_else(|| model.strip_prefix("openrouter:"))
-                .unwrap_or(model);
-            Ok((
-                "https://openrouter.ai/api/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        _ => {
-            // Try OpenAI-compatible endpoint
-            let key = get_env_var("OPENAI_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            Ok((
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                model.to_string(),
-            ))
-        }
-    }
+    protocol::resolve_api_endpoint(model, get_env_var)
 }
 
+#[cfg(test)]
 fn strip_provider_prefix<'a>(model: &'a str, providers: &[&str]) -> &'a str {
     let lower_model = model.to_ascii_lowercase();
     for provider in providers {
@@ -464,27 +352,7 @@ async fn complete_single(
 
     let is_anthropic = url.contains("api.anthropic.com");
 
-    let payload = if is_anthropic {
-        serde_json::json!({
-            "model": api_model,
-            "system": system,
-            "messages": [
-                {"role": "user", "content": user}
-            ],
-            "temperature": temp,
-            "max_tokens": max_tok
-        })
-    } else {
-        serde_json::json!({
-            "model": api_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ],
-            "temperature": temp,
-            "max_tokens": max_tok
-        })
-    };
+    let payload = protocol::request_payload(&url, &api_model, system, user, temp, max_tok);
 
     let body_bytes =
         serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
@@ -520,24 +388,7 @@ async fn complete_single(
     let resp_json: Value = serde_json::from_slice(&response.body)
         .map_err(|e| LlmError::ParseError(format!("response JSON: {e}")))?;
 
-    let content = if is_anthropic {
-        resp_json
-            .get("content")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    } else {
-        resp_json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
+    let content = protocol::response_content(&resp_json, is_anthropic)?;
 
     let resp_model = resp_json
         .get("model")

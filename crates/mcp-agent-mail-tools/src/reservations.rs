@@ -1775,6 +1775,7 @@ pub async fn file_reservation_paths(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "reserve files")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -2363,6 +2364,7 @@ pub async fn release_file_reservations(
         }
         Err(error) => return Err(error),
     };
+    crate::session_identity::authorize_actor(ctx, &agent, false, "release file reservations")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -2590,6 +2592,7 @@ pub async fn renew_file_reservations(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "renew file reservations")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 

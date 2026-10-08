@@ -2,10 +2,12 @@
 //!
 //! The storage pass is create-only and never changes database rows. This worker
 //! shares the reservation archive-reconciliation switch, not retention settings.
+//! Its owned thread restarts failed runs with bounded backoff. A failed run's
+//! database pool and scan cursor are dropped before a fresh run is admitted.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use mcp_agent_mail_core::Config;
@@ -42,7 +44,7 @@ pub(super) fn start(config: &Config) {
     match std::thread::Builder::new()
         .name("active-lease-repair".into())
         .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || run(&config, &SHUTDOWN))
+        .spawn(move || supervise(&config, &SHUTDOWN))
     {
         Ok(handle) => *worker = Some(handle),
         Err(error) => tracing::warn!(%error, "could not start active lease repair worker"),
@@ -89,6 +91,55 @@ fn next_delay(report: &ActiveReservationReport) -> Duration {
         CATCH_UP_INTERVAL
     } else {
         POLL_INTERVAL
+    }
+}
+
+fn restart_delay(previous: Duration, lived: Duration) -> Duration {
+    if lived >= POLL_INTERVAL {
+        CATCH_UP_INTERVAL
+    } else {
+        previous
+            .saturating_mul(2)
+            .clamp(CATCH_UP_INTERVAL, POLL_INTERVAL)
+    }
+}
+
+fn supervise(config: &Config, stop: &AtomicBool) {
+    supervise_with(stop, || run(config, stop), |delay| pause(delay, stop));
+}
+
+/// A restart begins from authoritative storage, not a failed run's cursor or
+/// connection. The production closure captures only immutable configuration and
+/// the stop flag; all mutable recovery state belongs to `run` and unwinds before
+/// this boundary returns. No failed transaction is resumed or marked successful.
+///
+/// This handles unwinding/early exit, not a blocked syscall or process abort.
+/// The original thread remains owned and joined; retries never spawn or detach
+/// another worker, and shutdown is checked before every attempt and after exit.
+fn supervise_with(
+    stop: &AtomicBool,
+    mut attempt: impl FnMut(),
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    let mut previous_delay = Duration::ZERO;
+    while !stop.load(Ordering::Acquire) {
+        let started = Instant::now();
+        // Drop the panic payload too before backoff; it may own run resources.
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut attempt)).is_err();
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let delay = restart_delay(previous_delay, started.elapsed());
+        previous_delay = delay;
+        tracing::warn!(
+            panicked,
+            retry_in_secs = delay.as_secs(),
+            "active lease repair exited unexpectedly; restarting from live database state"
+        );
+        if wait(delay) {
+            return;
+        }
     }
 }
 
@@ -147,6 +198,138 @@ fn run(config: &Config, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn restart_backoff_is_bounded_and_recovers_after_a_stable_run() {
+        let mut previous = Duration::ZERO;
+        for seconds in [1, 2, 4, 8, 16, 30, 30, 30] {
+            previous = restart_delay(previous, Duration::ZERO);
+            assert_eq!(previous, Duration::from_secs(seconds));
+        }
+        assert_eq!(restart_delay(Duration::MAX, Duration::ZERO), POLL_INTERVAL);
+        assert_eq!(
+            restart_delay(POLL_INTERVAL, POLL_INTERVAL - Duration::from_nanos(1)),
+            POLL_INTERVAL
+        );
+        assert_eq!(
+            restart_delay(POLL_INTERVAL, POLL_INTERVAL),
+            CATCH_UP_INTERVAL
+        );
+    }
+
+    #[test]
+    fn supervisor_restarts_panics_and_unexpected_returns() {
+        let stop = AtomicBool::new(false);
+        let attempts = Cell::new(0);
+        let mut delays = Vec::new();
+        supervise_with(
+            &stop,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    panic!("injected active lease repair failure");
+                }
+                if attempts.get() >= 3 {
+                    stop.store(true, Ordering::Release);
+                }
+            },
+            |delay| {
+                delays.push(delay);
+                false
+            },
+        );
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(delays, [Duration::from_secs(1), Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn supervisor_does_not_start_or_restart_after_shutdown() {
+        let stop = AtomicBool::new(true);
+        let attempts = Cell::new(0);
+        let waits = Cell::new(0);
+        supervise_with(
+            &stop,
+            || attempts.set(attempts.get() + 1),
+            |_| {
+                waits.set(waits.get() + 1);
+                true
+            },
+        );
+        assert_eq!(attempts.get(), 0);
+        assert_eq!(waits.get(), 0);
+        stop.store(false, Ordering::Release);
+        supervise_with(
+            &stop,
+            || {
+                attempts.set(attempts.get() + 1);
+                stop.store(true, Ordering::Release);
+                panic!("failure races shutdown");
+            },
+            |_| {
+                waits.set(waits.get() + 1);
+                true
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(waits.get(), 0, "shutdown must win over restart backoff");
+    }
+
+    #[test]
+    fn shutdown_during_backoff_prevents_the_next_attempt() {
+        let stop = AtomicBool::new(false);
+        let attempts = Cell::new(0);
+        supervise_with(
+            &stop,
+            || attempts.set(attempts.get() + 1),
+            |_| {
+                stop.store(true, Ordering::Release);
+                // Even a completed wait must recheck shutdown before a restart.
+                false
+            },
+        );
+        assert_eq!(attempts.get(), 1);
+        assert!(pause(POLL_INTERVAL, &stop));
+    }
+
+    #[test]
+    fn failed_run_resources_are_dropped_before_backoff_and_restart() {
+        struct Lease<'a>(&'a Cell<usize>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let active = Cell::new(0);
+        let attempts = Cell::new(0);
+        let clean_on_entry = Cell::new(true);
+        let clean_during_backoff = Cell::new(true);
+        supervise_with(
+            &stop,
+            || {
+                clean_on_entry.set(clean_on_entry.get() && active.get() == 0);
+                active.set(active.get() + 1);
+                let _lease = Lease(&active);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    panic!("unwind while owning run-local state");
+                }
+                stop.store(true, Ordering::Release);
+            },
+            |_| {
+                clean_during_backoff.set(clean_during_backoff.get() && active.get() == 0);
+                false
+            },
+        );
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(active.get(), 0);
+        assert!(clean_on_entry.get(), "restart retained failed run resources");
+        assert!(
+            clean_during_backoff.get(),
+            "backoff retained failed run resources"
+        );
+    }
 
     #[test]
     fn pool_and_backoff_follow_the_selected_mailbox_without_enabling_retention() {
@@ -181,6 +364,34 @@ mod tests {
     struct TestWorker {
         stop: std::sync::Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TestWorker {
+        fn spawn(config: Config, fail_first: bool) -> Self {
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let worker_attempts = attempts.clone();
+            let thread = std::thread::spawn(move || {
+                supervise_with(
+                    &worker_stop,
+                    || {
+                        let attempt = worker_attempts.fetch_add(1, Ordering::AcqRel);
+                        if fail_first && attempt == 0 {
+                            panic!("injected failure before active reservation repair");
+                        }
+                        run(&config, &worker_stop);
+                    },
+                    |delay| pause(delay, &worker_stop),
+                );
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+                attempts,
+            }
+        }
     }
 
     impl Drop for TestWorker {
@@ -194,6 +405,15 @@ mod tests {
 
     #[test]
     fn worker_restores_an_active_guard_artifact_without_another_client_request() {
+        assert_worker_restores_artifact(false);
+    }
+
+    #[test]
+    fn failed_worker_restarts_and_restores_the_real_guard_artifact() {
+        assert_worker_restores_artifact(true);
+    }
+
+    fn assert_worker_restores_artifact(fail_first: bool) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
@@ -228,21 +448,18 @@ mod tests {
                 .storage_root
                 .join("projects/project/file_reservations/id-401-gaabb.json");
             assert!(!path.exists());
-            let stop = std::sync::Arc::new(AtomicBool::new(false));
-            let worker_stop = stop.clone();
-            let worker_config = config.clone();
-            let worker = TestWorker {
-                stop,
-                thread: Some(std::thread::spawn(move || {
-                    run(&worker_config, &worker_stop);
-                })),
-            };
+            let worker = TestWorker::spawn(config.clone(), fail_first);
+            let attempts = worker.attempts.clone();
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while !path.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
             // Join before inspecting results, including on assertion failure.
             drop(worker);
+            assert_eq!(
+                attempts.load(Ordering::Acquire),
+                if fail_first { 2 } else { 1 }
+            );
             let value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             assert_eq!(value["id"], 401);

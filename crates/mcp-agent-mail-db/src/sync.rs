@@ -63,6 +63,9 @@ pub struct MessageDeliveryReceipt {
     pub project_id: i64,
     pub persisted_ts: i64,
     pub recipients: Vec<MessageDeliveryRecipientReceipt>,
+    /// The project shared-mailbox delivery (GH#282) and each visible agent's
+    /// read/ack state, when the message was addressed to the project.
+    pub project_mailbox: Option<crate::project_mailbox::ProjectMailboxDeliveryReceipt>,
 }
 
 /// A cursor condition is explicit so monitor clients never confuse retention
@@ -214,11 +217,15 @@ pub fn message_delivery_receipt_from_conn(
         }
     }
 
+    let project_mailbox =
+        crate::project_mailbox::project_mailbox_delivery_from_conn(conn, message_id)?;
+
     Ok(MessageDeliveryReceipt {
         message_id,
         project_id,
         persisted_ts,
         recipients,
+        project_mailbox,
     })
 }
 
@@ -534,7 +541,12 @@ fn fetch_inbox_rows_from_conn_impl(
         });
     }
 
-    Ok(out)
+    // GH#282: the agent's view of its project's shared mailbox, under the same
+    // filters, merged into one newest-first window.
+    let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+        conn, project_id, agent_id, since_ts, limit, options,
+    )?;
+    Ok(crate::project_mailbox::merge_inbox_rows(out, shared, limit))
 }
 
 /// Read an append-only, recipient-scoped inbox delivery page.
@@ -571,9 +583,11 @@ pub fn inbox_delivery_events_from_conn(
 
     let range_rows = conn
         .query_sync(
+            // GH#282: the project's shared-mailbox cursor events (agent 0)
+            // share this recipient's cursor space.
             "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor, \
                     (SELECT MIN(seq) FROM inbox_delivery_events) AS global_oldest \
-             FROM inbox_delivery_events WHERE project_id = ? AND agent_id = ?",
+             FROM inbox_delivery_events WHERE project_id = ? AND agent_id IN (?, 0)",
             &[Value::BigInt(project_id), Value::BigInt(agent_id)],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
@@ -631,7 +645,7 @@ pub fn inbox_delivery_events_from_conn(
     }
 
     let cursor = after.unwrap_or(0);
-    let rows = conn
+    let mut rows = conn
         .query_sync(
             "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
                     COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
@@ -649,6 +663,28 @@ pub fn inbox_delivery_events_from_conn(
             ],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
+    // GH#282: this agent's view of the project's shared-mailbox deliveries.
+    match conn.query_sync(
+        &crate::project_mailbox::visible_events_sql(),
+        &[
+            Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+            Value::BigInt(agent_id),
+            Value::BigInt(project_id),
+            Value::BigInt(cursor),
+            Value::BigInt(limit_i64),
+        ],
+    ) {
+        Ok(shared) => rows.extend(shared),
+        Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) => {}
+        Err(error) => {
+            return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
+                error.to_string(),
+            )));
+        }
+    }
 
     let mut events = Vec::with_capacity(rows.len().min(limit));
     for row in rows {
@@ -679,6 +715,8 @@ pub fn inbox_delivery_events_from_conn(
             })? != 0,
         });
     }
+    events.sort_by_key(|event| event.seq);
+    events.truncate(limit_with_probe);
     let has_more = events.len() > limit;
     if has_more {
         events.pop();

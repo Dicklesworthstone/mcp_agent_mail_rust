@@ -672,6 +672,134 @@ fn split_qualified_recipient(raw: &str) -> McpResult<Option<(String, String)>> {
     Ok(Some((name, project.to_string())))
 }
 
+// ---------------------------------------------------------------------------
+// Project-addressed shared mailboxes (GH#282)
+// ---------------------------------------------------------------------------
+//
+// `project:<slug>` (or `project:<human_key>`) addresses the sender's own
+// project mailbox. The message is stored once with one project delivery; every
+// active agent of the project reads it from its inbox. It is never broadcast:
+// no per-agent rows, signals or archive copies are fanned out.
+
+/// The shared-mailbox address taken out of the recipient lists, if any.
+#[derive(Debug, Clone)]
+struct ProjectMailboxRecipient {
+    /// `to` or `cc`: the slot the address was written in (`to` wins).
+    kind: &'static str,
+    /// Canonical address, `project:<slug>`.
+    address: String,
+}
+
+/// Remove shared-mailbox addresses from `to`/`cc`/`bcc` and validate them.
+///
+/// The address must name the sender's own project (by slug or human key):
+/// a shared mailbox has no agent whose contact policy could admit a
+/// cross-project delivery. BCC is refused because every agent of the project
+/// sees the message.
+async fn take_project_mailbox_recipient(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    sender_project: &mcp_agent_mail_db::ProjectRow,
+    to: &mut Vec<String>,
+    cc: &mut Vec<String>,
+    bcc: &[String],
+) -> McpResult<Option<ProjectMailboxRecipient>> {
+    use mcp_agent_mail_db::project_mailbox::{
+        parse_project_mailbox_address, project_mailbox_address,
+    };
+
+    if let Some(raw) = bcc
+        .iter()
+        .find(|name| parse_project_mailbox_address(name).is_some())
+    {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "'{}' is a project mailbox, which every agent of the project reads; it cannot \
+                 be a bcc recipient. Put it in to or cc.",
+                raw.trim()
+            ),
+            true,
+            json!({ "field": "bcc", "error_detail": raw.trim() }),
+        ));
+    }
+
+    let mut kind: Option<&'static str> = None;
+    for (slot, names) in [("to", &mut *to), ("cc", &mut *cc)] {
+        let mut kept = Vec::with_capacity(names.len());
+        for raw in names.drain(..) {
+            let Some(ident) = parse_project_mailbox_address(&raw) else {
+                kept.push(raw);
+                continue;
+            };
+            if ident.is_empty() {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Invalid recipient '{}': a project mailbox is addressed as \
+                         'project:<slug>' (see resource://projects).",
+                        raw.trim()
+                    ),
+                    true,
+                    json!({ "field": slot, "error_detail": raw.trim() }),
+                ));
+            }
+            let names_sender_project = ident == sender_project.slug
+                || ident == sender_project.human_key
+                || match resolve_existing_project(ctx, pool, ident).await {
+                    Ok(project) => project.id == sender_project.id,
+                    Err(_) => false,
+                };
+            if !names_sender_project {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "'{}' does not name this project's mailbox. A project mailbox can only \
+                         be addressed from inside its own project ('{}'); to reach agents of \
+                         another project, address each one as 'Name@project' over an approved \
+                         contact link.",
+                        raw.trim(),
+                        project_mailbox_address(&sender_project.slug)
+                    ),
+                    true,
+                    json!({
+                        "field": slot,
+                        "error_detail": raw.trim(),
+                        "project_mailbox": project_mailbox_address(&sender_project.slug),
+                    }),
+                ));
+            }
+            if kind.is_none() {
+                kind = Some(slot);
+            }
+        }
+        *names = kept;
+    }
+    Ok(kind.map(|kind| ProjectMailboxRecipient {
+        kind,
+        address: project_mailbox_address(&sender_project.slug),
+    }))
+}
+
+/// Recipient lists for envelopes, archives and responses: the agent names
+/// plus the shared-mailbox address in the slot it was written in.
+fn with_project_mailbox_address(
+    to: &[String],
+    cc: &[String],
+    mailbox: Option<&ProjectMailboxRecipient>,
+) -> (Vec<String>, Vec<String>) {
+    let mut to = to.to_vec();
+    let mut cc = cc.to_vec();
+    if let Some(mailbox) = mailbox {
+        if mailbox.kind == "cc" {
+            cc.push(mailbox.address.clone());
+        } else {
+            to.push(mailbox.address.clone());
+        }
+    }
+    (to, cc)
+}
+
 /// Whether any recipient in the three lists is project-qualified.
 fn any_qualified_recipient<'a>(names: impl IntoIterator<Item = &'a String>) -> bool {
     names
@@ -2081,6 +2209,71 @@ fn redacted_send_target_outcomes(
     outcomes
 }
 
+/// How a send's sender was proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderProof {
+    /// No proof: the trusted-local default.
+    Unverified,
+    /// A matching `sender_token`.
+    Token,
+    /// The caller's MCP session established this agent (GH#279, opt-in).
+    Session,
+}
+
+impl SenderProof {
+    const fn verified(self) -> bool {
+        !matches!(self, Self::Unverified)
+    }
+}
+
+/// Sender proof for a send or reply, including the caller's MCP session
+/// (GH#279). A supplied token is always checked; without one, an agent this
+/// session holds is verified by the session, also under the fail-closed send
+/// profile. A session that holds another identity in the project cannot send
+/// as this agent by naming it.
+fn verify_sender(
+    ctx: &McpContext,
+    sender: &mcp_agent_mail_db::AgentRow,
+    sender_name: &str,
+    sender_token: Option<&str>,
+    require_verified_sender: bool,
+) -> McpResult<SenderProof> {
+    let token = sender_token.filter(|token| !token.is_empty());
+    if token.is_none() && crate::session_identity::holds(ctx, sender.id) {
+        return Ok(SenderProof::Session);
+    }
+    let verified = verify_sender_identity(
+        sender_name,
+        token,
+        sender.registration_token.as_deref(),
+        require_verified_sender,
+    )?;
+    crate::session_identity::authorize_actor(ctx, sender, verified, "send messages")?;
+    Ok(if verified {
+        SenderProof::Token
+    } else {
+        SenderProof::Unverified
+    })
+}
+
+/// Mark a session-verified send so audit and diagnostics can tell it from a
+/// token-verified one (`"sender_verification": "session"`).
+fn with_sender_proof_marker(response_json: String, proof: SenderProof) -> String {
+    if proof != SenderProof::Session {
+        return response_json;
+    }
+    match serde_json::from_str::<Value>(&response_json) {
+        Ok(Value::Object(mut map)) => {
+            map.insert(
+                "sender_verification".to_string(),
+                Value::String("session".to_string()),
+            );
+            serde_json::to_string(&Value::Object(map)).unwrap_or(response_json)
+        }
+        _ => response_json,
+    }
+}
+
 fn verify_sender_identity(
     sender_name: &str,
     sender_token: Option<&str>,
@@ -2166,9 +2359,18 @@ pub struct InboxMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_ts: Option<String>,
     pub kind: String,
+    /// `"project"` when the message reached this inbox through the project's
+    /// shared mailbox (GH#282) rather than as a direct to/cc/bcc delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
+}
+
+/// The `via` marker of an inbox row with recipient `kind`.
+pub(crate) fn inbox_via(kind: &str) -> Option<String> {
+    (kind == mcp_agent_mail_db::project_mailbox::PROJECT_MAILBOX_KIND).then(|| kind.to_string())
 }
 
 /// Project-scoped message returned by `fetch_topic`.
@@ -2430,12 +2632,14 @@ async fn try_replay_message(
         &project.human_key,
     )
     .await?;
-    let verified_sender = verify_sender_identity(
+    let sender_proof = verify_sender(
+        ctx,
+        &sender,
         sender_name,
         sender_token,
-        sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    let verified_sender = sender_proof.verified();
     let claim = mcp_agent_mail_db::IdempotencyClaim {
         project_id: project.id.unwrap_or(0),
         tool: if reply_to.is_some() {
@@ -2477,7 +2681,7 @@ async fn try_replay_message(
                 reply_to,
                 verified_sender,
             )
-            .map(Some)
+            .map(|json| Some(with_sender_proof_marker(json, sender_proof)))
         }
         Some(Err(conflict)) => Err(crate::idempotency::idempotency_conflict_error(&conflict)),
         None => Ok(None),
@@ -2511,7 +2715,7 @@ async fn try_replay_message(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\n    `Name@project` (project slug or human key) addresses an agent in another project;\n    see Edge cases.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- A plain name addresses this project only: a name that is not registered here but is your contact (or a product peer) in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- `Name@project` (or `project:<project>#Name`) is resolved in that project only, never auto-registered, and delivered only over an approved, unexpired contact link with that agent (else CONTACT_REQUIRED / CONTACT_BLOCKED). The message is stored in the recipient's project, so it is read, acknowledged and replied to there; the delivery's `project` names it. One message lives in one project, so qualified and local recipients cannot be mixed in one call.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\n    `Name@project` (project slug or human key) addresses an agent in another project;\n    see Edge cases. `project:<slug>` addresses this project's shared mailbox\n    (stored once; every other agent of the project reads it); see Edge cases.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- A plain name addresses this project only: a name that is not registered here but is your contact (or a product peer) in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- `Name@project` (or `project:<project>#Name`) is resolved in that project only, never auto-registered, and delivered only over an approved, unexpired contact link with that agent (else CONTACT_REQUIRED / CONTACT_BLOCKED). The message is stored in the recipient's project, so it is read, acknowledged and replied to there; the delivery's `project` names it. One message lives in one project, so qualified and local recipients cannot be mixed in one call.\n- `project:<slug>` (or `project:<human_key>`) in `to` or `cc` addresses the sender's own project mailbox. The message is stored ONCE with one project delivery, not copied per agent: every other non-retired agent of the project that was registered when it was sent sees it in `fetch_inbox` with `via: \"project\"` (an agent whose contact_policy is `block_all` opts out; a direct to/cc/bcc delivery to the same agent takes precedence). Each agent's read/ack state is its own (`acknowledge_message`, `mark_message_read`); `get_message_delivery_receipt` reports them under `project_mailbox`. It can be combined with named recipients, cannot be bcc, and cannot name another project. This is not `broadcast`: nothing is fanned out.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -2799,14 +3003,20 @@ effective_free_bytes={free}"
     let project_id = project.id.unwrap_or(0);
     let base_dir = Path::new(&project.human_key);
 
+    // GH#282: take the shared-mailbox address out of the agent lists before
+    // any name is parsed as an agent or a project-qualified agent.
+    let mut to = to;
+    let mut cc_list = cc.unwrap_or_default();
+    let bcc_list = bcc.unwrap_or_default();
+    let project_mailbox =
+        take_project_mailbox_recipient(ctx, &pool, &project, &mut to, &mut cc_list, &bcc_list)
+            .await?;
+
     // A qualified send validates its thread in the project that stores the
     // message, once that is resolved (after sender verification). A delegated
     // reply inherits an already-validated thread from its parent.
-    let has_qualified_recipients = any_qualified_recipient(
-        to.iter()
-            .chain(cc.iter().flatten())
-            .chain(bcc.iter().flatten()),
-    );
+    let has_qualified_recipients =
+        any_qualified_recipient(to.iter().chain(&cc_list).chain(&bcc_list));
     if !has_qualified_recipients
         && reply.is_none()
         && let Some(ref tid) = thread_id
@@ -2839,12 +3049,14 @@ effective_free_bytes={free}"
     // The opt-in fail-closed profile rejects missing/unavailable proof before
     // recipient resolution, auto-registration, contact handshakes, DB writes,
     // notifications, or archive dispatch can occur.
-    let verified_sender = verify_sender_identity(
+    let sender_proof = verify_sender(
+        ctx,
+        &sender,
         &sender_name,
         sender_token.as_deref(),
-        sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    let verified_sender = sender_proof.verified();
     crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
@@ -2852,8 +3064,8 @@ effective_free_bytes={free}"
         let sender_lower = sender_name.trim().to_ascii_lowercase();
         let all_named: Vec<&str> = to
             .iter()
-            .chain(cc.iter().flatten())
-            .chain(bcc.iter().flatten())
+            .chain(&cc_list)
+            .chain(&bcc_list)
             .map(String::as_str)
             .collect();
         if all_named
@@ -2870,10 +3082,7 @@ effective_free_bytes={free}"
     }
 
     // Validate recipients
-    let cc_list = cc.unwrap_or_default();
-    let bcc_list = bcc.unwrap_or_default();
-
-    if !has_any_recipients(&to, &cc_list, &bcc_list) {
+    if project_mailbox.is_none() && !has_any_recipients(&to, &cc_list, &bcc_list) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             "At least one recipient is required. Provide agent names in to, cc, or bcc.",
@@ -2890,6 +3099,12 @@ effective_free_bytes={free}"
     // qualified send, the recipients' own project, which then stores it.
     let routed = route_qualified_recipients(ctx, &pool, &project, to, cc_list, bcc_list).await?;
     let foreign_project = routed.foreign_project;
+    if let (Some(mailbox), Some(foreign)) = (&project_mailbox, &foreign_project) {
+        return Err(mixed_project_recipients_error(
+            &[project.human_key.as_str(), foreign.human_key.as_str()],
+            std::slice::from_ref(&mailbox.address),
+        ));
+    }
     let (to, cc_list, bcc_list) = (routed.to, routed.cc, routed.bcc);
     let (local_to, local_cc, local_bcc): (&[String], &[String], &[String]) =
         if foreign_project.is_some() {
@@ -3427,6 +3642,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(false),
                 &attachments_json,
                 &recipient_refs,
+                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
                 claim,
             )
             .await,
@@ -3453,6 +3669,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(false),
                 &attachments_json,
                 &recipient_refs,
+                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
             )
             .await,
         )?;
@@ -3467,10 +3684,16 @@ effective_free_bytes={free}"
             message,
             reply_to,
             verified_sender,
-        );
+        )
+        .map(|json| with_sender_proof_marker(json, sender_proof));
     }
 
     let message_id = message.id.unwrap_or(0);
+    let (envelope_to, envelope_cc) = with_project_mailbox_address(
+        &resolved_to,
+        &resolved_cc_recipients,
+        project_mailbox.as_ref(),
+    );
 
     // On an idempotent replay, skip all one-time side effects (search indexing,
     // notification signals, git archive) — the original send already performed
@@ -3550,11 +3773,13 @@ effective_free_bytes={free}"
             all_recipient_names.sort_unstable();
             all_recipient_names.dedup();
 
+            // The shared-mailbox address is part of the envelope but gets no
+            // per-agent inbox copy (it is not an agent).
             let msg_json = serde_json::json!({
                 "id": message_id,
                 "from": &sender.name,
-                "to": &resolved_to,
-                "cc": &resolved_cc_recipients,
+                "to": &envelope_to,
+                "cc": &envelope_cc,
                 "bcc": &resolved_bcc_recipients,
                 "subject": &message.subject,
                 "created": micros_to_iso(message.created_ts),
@@ -3579,11 +3804,8 @@ effective_free_bytes={free}"
     }
 
     let response = if config.messaging_fail_closed_send_profile {
-        let target_outcomes = redacted_send_target_outcomes(
-            &resolved_to,
-            &resolved_cc_recipients,
-            &resolved_bcc_recipients,
-        );
+        let target_outcomes =
+            redacted_send_target_outcomes(&envelope_to, &envelope_cc, &resolved_bcc_recipients);
         if let Some(parent) = reply_to {
             serde_json::to_string(&RedactedReplyMessageReceipt {
                 receipt_mode: "redacted".to_string(),
@@ -3624,8 +3846,8 @@ effective_free_bytes={free}"
             created_ts: Some(micros_to_iso(message.created_ts)),
             attachments: all_attachment_meta,
             from: sender.name.clone(),
-            to: resolved_to.into_vec(),
-            cc: resolved_cc_recipients.into_vec(),
+            to: envelope_to,
+            cc: envelope_cc,
             bcc: resolved_bcc_recipients.into_vec(),
         };
         recorded_message_payload_response(delivery, payload, reply_to, verified_sender)
@@ -3641,6 +3863,7 @@ effective_free_bytes={free}"
 
     response
         .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map(|json| with_sender_proof_marker(json, sender_proof))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -3921,12 +4144,14 @@ effective_free_bytes={free}"
     // missing/unverifiable token REFUSES before any thread resolution or
     // write. Reply is a message-creation path — it must not be the token-free
     // way to speak as another agent.
-    let verified_sender = verify_sender_identity(
+    let sender_proof = verify_sender(
+        ctx,
+        &sender,
         &sender_name,
         sender_token.as_deref(),
-        sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    let verified_sender = sender_proof.verified();
     crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
     // Resolve original sender name for default recipient
@@ -3996,13 +4221,20 @@ effective_free_bytes={free}"
     // that came from another project, or an explicit `Name@project`) is stored
     // in that agent's project. Hand it to the send path, which owns
     // qualified-recipient routing and the approved-contact requirement, before
-    // any attachment is written to this project's archive.
-    if any_qualified_recipient(
+    // any attachment is written to this project's archive. A reply that
+    // (also) addresses the project mailbox (GH#282) takes the same path,
+    // which owns shared-mailbox validation and delivery.
+    let explicit_recipients = || {
         to.iter()
             .flatten()
             .chain(cc.iter().flatten())
-            .chain(bcc.iter().flatten()),
-    ) {
+            .chain(bcc.iter().flatten())
+    };
+    if any_qualified_recipient(explicit_recipients())
+        || explicit_recipients().any(|name| {
+            mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_some()
+        })
+    {
         return Box::pin(send_message_routed(
             ctx,
             project_key,
@@ -4481,6 +4713,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
                 &recipient_refs,
+                None,
                 claim,
             )
             .await,
@@ -4507,6 +4740,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
                 &recipient_refs,
+                None,
             )
             .await,
         )?;
@@ -4521,7 +4755,8 @@ effective_free_bytes={free}"
             reply,
             Some(message_id),
             verified_sender,
-        );
+        )
+        .map(|json| with_sender_proof_marker(json, sender_proof));
     }
 
     let reply_id = reply.id.unwrap_or(0);
@@ -4704,6 +4939,7 @@ effective_free_bytes={free}"
 
     response
         .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map(|json| with_sender_proof_marker(json, sender_proof))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -4819,6 +5055,7 @@ pub async fn fetch_inbox(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     phase.mark("scope_resolution");
 
@@ -4894,6 +5131,7 @@ pub async fn fetch_inbox(
                 created_ts: Some(micros_to_iso(row.message.created_ts)),
                 read_ts: row.read_ts.map(micros_to_iso),
                 ack_ts: row.ack_ts.map(micros_to_iso),
+                via: inbox_via(&row.kind),
                 kind: row.kind,
                 attachments,
                 body_md: if include_body {
@@ -4940,7 +5178,37 @@ pub async fn fetch_inbox(
     // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
     // must leave read state untouched.
     if mark_read.unwrap_or(true) && !messages.is_empty() {
-        let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+        // GH#282: shared-mailbox rows record this agent's own lazy receipt;
+        // direct rows update their recipient row.
+        let mut ids: Vec<i64> = Vec::with_capacity(messages.len());
+        let mut shared_ids: Vec<i64> = Vec::new();
+        for message in &messages {
+            if message.via.is_some() {
+                shared_ids.push(message.id);
+            } else {
+                ids.push(message.id);
+            }
+        }
+        if let Some(live_sqlite_path) = read_pool.live_sqlite_path()
+            && !shared_ids.is_empty()
+        {
+            match mcp_agent_mail_db::project_mailbox::mark_project_mailbox_read_batch_sync(
+                live_sqlite_path,
+                agent_id,
+                &shared_ids,
+            ) {
+                Ok(Some(batch)) => {
+                    apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    agent_id = agent_id,
+                    count = shared_ids.len(),
+                    error = %e,
+                    "project mailbox auto-mark-read on fetch_inbox failed"
+                ),
+            }
+        }
         if let Some(live_sqlite_path) = read_pool.live_sqlite_path() {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
@@ -5152,6 +5420,7 @@ pub async fn fetch_inbox_events(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5292,14 +5561,44 @@ pub async fn get_message_delivery_receipt(
         })
         .collect::<Vec<_>>();
 
-    serde_json::to_string(&json!({
+    let mut response = json!({
         "message_id": receipt.message_id,
         "project_id": receipt.project_id,
         "persisted": true,
         "persisted_at": micros_to_iso(receipt.persisted_ts),
         "recipients": recipients,
-    }))
-    .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+    });
+    // GH#282: one delivery to the project's shared mailbox, with the lazily
+    // recorded state of every agent that can see it.
+    if let Some(mailbox) = receipt.project_mailbox {
+        let acknowledged = mailbox
+            .agents
+            .iter()
+            .filter(|agent| agent.ack_ts.is_some())
+            .count();
+        let read = mailbox
+            .agents
+            .iter()
+            .filter(|agent| agent.read_ts.is_some())
+            .count();
+        response["project_mailbox"] = json!({
+            "address": mcp_agent_mail_db::project_mailbox::project_mailbox_address(&project.slug),
+            "kind": mailbox.kind,
+            "delivered_at": micros_to_iso(mailbox.delivered_ts),
+            "visible_agents": mailbox.agents.len(),
+            "read_count": read,
+            "acknowledged_count": acknowledged,
+            "agents": mailbox.agents.iter().map(|agent| json!({
+                "agent": agent.agent_name,
+                "read": agent.read_ts.is_some(),
+                "read_at": agent.read_ts.map(micros_to_iso),
+                "acknowledged": agent.ack_ts.is_some(),
+                "acknowledged_at": agent.ack_ts.map(micros_to_iso),
+            })).collect::<Vec<_>>(),
+        });
+    }
+    serde_json::to_string(&response)
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
 }
 
 fn apply_auto_read_timestamp(
@@ -5352,6 +5651,7 @@ pub async fn mark_message_read(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "mark mail read")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5458,6 +5758,7 @@ pub async fn mark_all_read(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "mark mail read")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5816,6 +6117,7 @@ pub async fn acknowledge_message(
         }
         Err(error) => return Err(error),
     };
+    crate::session_identity::authorize_actor(ctx, &agent, false, "acknowledge mail")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -8423,6 +8725,7 @@ mod tests {
             read_ts: None,
             ack_ts: None,
             kind: "to".into(),
+            via: None,
             attachments: vec![],
             body_md: None,
         };
@@ -8449,6 +8752,7 @@ mod tests {
             read_ts: None,
             ack_ts: None,
             kind: "to".into(),
+            via: None,
             attachments: vec![json!({"path": "img.webp", "type": "file"})],
             body_md: Some("Hello world".into()),
         };
@@ -8501,6 +8805,7 @@ mod tests {
             read_ts: None,
             ack_ts: None,
             kind: "to".into(),
+            via: None,
             attachments: vec![],
             body_md: None,
         };
@@ -8533,6 +8838,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "to".into(),
+                via: None,
                 attachments: vec![],
                 body_md: None,
             },
@@ -8553,6 +8859,7 @@ mod tests {
                 read_ts: Some(old_read_at.clone()),
                 ack_ts: None,
                 kind: "to".into(),
+                via: None,
                 attachments: vec![],
                 body_md: None,
             },
@@ -8573,6 +8880,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "to".into(),
+                via: None,
                 attachments: vec![],
                 body_md: None,
             },

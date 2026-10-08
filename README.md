@@ -594,6 +594,43 @@ This controls CLI token selection; it does not establish MCP session ownership
 or isolate hostile processes sharing the same OS account. Server-side verified
 send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
+#### Session-bound agent identity (opt-in)
+
+Set `MESSAGING_SESSION_IDENTITY=true` on the server to let an MCP session act as
+the identities it established without a registration token in the model-visible
+transcript:
+
+- **The session.** Over stdio, the session is the client's server process. Over
+  Streamable HTTP, a successful `initialize` returns an `Mcp-Session-Id` header;
+  requests that send it back (over any connection) share the session, and
+  `DELETE` on the MCP endpoint with the header ends it. A session is tied to the
+  `Authorization` it was created under: another credential, an unknown id or an
+  expired id (24 h idle) gets a stateless request. Sessions live in memory, so a
+  restart ends them. Bearer/JWT authorization is still checked on every request:
+  this is identity context inside an authorized connection, not authentication.
+- **Binding.** `create_agent_identity` (use `return_registration_token: false`
+  to keep the token out of the transcript) binds the new agent, and so does a
+  `register_agent` that creates its agent. Naming an existing agent never binds
+  it.
+- **Acting as a bound agent.** `send_message` / `reply_message` from the session
+  as a bound agent are verified without `sender_token` (`"verified_sender": true,
+  "sender_verification": "session"`), including under
+  `MESSAGING_FAIL_CLOSED_SEND_PROFILE`.
+- **No borrowed names.** A session that holds an identity in a project cannot,
+  in that project, send/reply, read an inbox (`fetch_inbox`,
+  `fetch_inbox_events`), mark read or acknowledge, reserve/renew/release files,
+  or re-register (rewriting the profile and rotating the token) as any other
+  agent: those calls fail with `SESSION_IDENTITY_MISMATCH` (a send or reply that
+  carries the other agent's own `sender_token` is still accepted). A session
+  holding no identity in the project keeps the trusted-local behavior.
+- **Lifecycle.** `retire_agent` / `deregister_agent` drop the identity from the
+  calling session; lifecycle authorization itself is unchanged (registration
+  token, or a bound tmux pane over stdio).
+
+This does not authenticate the model, provider or OS process, and it cannot
+isolate hostile clients that share one bearer credential and can read each
+other's session ids.
+
 When an interactive `am` finds a healthy Agent Mail service already serving the
 configured endpoint, it attaches a read-only terminal view to that service's
 `/mail/ws-state` snapshot. It does not stop or restart the service, acquire a
@@ -962,6 +999,20 @@ sequenceDiagram
 2. **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=3600, exclusive=true)`
 3. **Communicate with threads:** `send_message(..., thread_id="FEAT-123")`, check with `fetch_inbox`, acknowledge with `acknowledge_message`
 4. **Quick reads:** `resource://inbox/{Agent}?project=<abs-path>&limit=20`
+5. **Tell the whole project once:** address the project's shared mailbox as `project:<slug>` (or `project:<human_key>`):
+
+   ```
+   send_message(project_key="/abs/path", sender_name="GreenCastle",
+                to=["project:abs-path"], subject="Schema freeze until 18:00",
+                body_md="Do not touch migrations/ until the release is cut.", ack_required=true)
+   ```
+
+   - The message is stored **once**, with one project delivery: no per-agent copies, rows, signals or archive inbox files. This is not `broadcast` (which stays rejected).
+   - Every other non-retired agent of the project that was registered when the message was sent sees it in `fetch_inbox` (and `resource://inbox/...`, `am robot inbox`) with `"via": "project"`. An agent that joins later is not handed the backlog; project history stays readable through threads, `fetch_topic` and search. An agent whose `contact_policy` is `block_all` opts out, and a direct to/cc/bcc delivery to the same agent takes precedence so nothing appears twice.
+   - Read and acknowledgement state is per agent and recorded lazily: `fetch_inbox` read receipts, `mark_message_read`, `acknowledge_message` and `mark_all_read` record only the calling agent's state. `get_message_delivery_receipt` reports the delivery under `project_mailbox` with each visible agent's read/ack state.
+   - It can be combined with named recipients in `to`/`cc`, cannot be `bcc`, and can only name the sender's own project. Replies may address it too.
+   - Retention treats a project message as settled only after every agent that can see it has read it (and acknowledged it when required). Archive reconstruction restores the delivery from the canonical message's `to`/`cc` envelope, and salvage restores the per-agent receipts.
+   - Restart-safe monitors see it too: a project delivery appends one event to the durable `fetch_inbox_events` / `am inbox-events` cursor ledger, and each visible agent's page includes it (`"kind": "project"`) under the same single cursor.
 
 ### Across Different Repos
 
