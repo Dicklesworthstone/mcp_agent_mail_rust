@@ -21,7 +21,7 @@ use mcp_agent_mail_db::{CanonicalDbConn, DbConn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -240,6 +240,161 @@ struct ImportPlan {
     target_db: PathBuf,
     target_storage_root: PathBuf,
     operations: Vec<String>,
+}
+
+/// One import's private files, retained on failure and after publication.
+///
+/// The final database pathname never participates in copying, migration, or
+/// validation. In particular, a failed import must not mistake a concurrently
+/// created final database for a partial file that it owns.
+#[derive(Debug)]
+struct LegacyImportWorkspace {
+    target_parent: PathBuf,
+    target_parent_file: fs::File,
+    directory: PathBuf,
+    directory_file: fs::File,
+    migration_db: PathBuf,
+    publication_db: PathBuf,
+    verification_db: PathBuf,
+    publication_witness: Option<LegacyImportFileWitness>,
+    published: bool,
+}
+
+impl LegacyImportWorkspace {
+    fn create(target_db: &Path) -> CliResult<Self> {
+        let parent = target_db
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let name = target_db
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                CliError::InvalidArgument("legacy import target needs a UTF-8 filename".to_string())
+            })?;
+        // A same-filesystem private directory gives publication one atomic
+        // no-replace rename. Keep it immediately: failed migration/WAL/namespace
+        // evidence must not be removed by a temporary-directory destructor.
+        let directory = crate::canonical_snapshot_tempdir_in(
+            parent,
+            &format!(".{name}.import-"),
+            "legacy import candidate",
+        )?
+        .keep();
+        let target_parent = directory
+            .parent()
+            .ok_or_else(|| CliError::Other("private import directory has no parent".to_string()))?
+            .to_path_buf();
+        let target_parent_file = open_import_directory(&target_parent)?;
+        let directory_file = open_import_directory(&directory)?;
+        Ok(Self {
+            target_parent,
+            target_parent_file,
+            migration_db: directory.join("migration.sqlite3"),
+            publication_db: directory.join("publication.sqlite3"),
+            verification_db: directory.join("runtime-verification.sqlite3"),
+            directory,
+            directory_file,
+            publication_witness: None,
+            published: false,
+        })
+    }
+
+    fn verify_directories(&self) -> CliResult<()> {
+        require_import_file_binding(&self.target_parent, &self.target_parent_file, true)?;
+        require_import_file_binding(&self.directory, &self.directory_file, true)
+    }
+}
+
+/// Retain the inode and exact bytes that passed both database engines' checks.
+/// Keeping the handle open prevents inode-number reuse; hashing also rejects
+/// in-place edits whose author restores the file's length or modification time.
+#[derive(Debug)]
+struct LegacyImportFileWitness {
+    file: fs::File,
+    sha256: [u8; 32],
+}
+
+impl LegacyImportFileWitness {
+    fn capture(path: &Path) -> CliResult<Self> {
+        let file = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)?;
+        let sha256 = hash_import_file(&file)?;
+        let witness = Self { file, sha256 };
+        witness.verify(path)?;
+        Ok(witness)
+    }
+
+    fn verify(&self, path: &Path) -> CliResult<()> {
+        require_import_file_binding(path, &self.file, false)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if self.file.metadata()?.nlink() != 1 {
+                return Err(CliError::Other(format!(
+                    "legacy import candidate {} acquired a hard-link alias",
+                    path.display()
+                )));
+            }
+        }
+        if hash_import_file(&self.file)? != self.sha256 {
+            return Err(CliError::Other(format!(
+                "legacy import candidate {} changed after validation",
+                path.display()
+            )));
+        }
+        require_import_file_binding(path, &self.file, false)
+    }
+}
+
+fn hash_import_file(file: &fs::File) -> CliResult<[u8; 32]> {
+    use sha2::Digest as _;
+
+    let length = file.metadata()?.len();
+    let mut reader = file.try_clone()?;
+    reader.rewind()?;
+    let mut reader = reader.take(length.saturating_add(1));
+    let mut digest = sha2::Sha256::new();
+    let mut read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read = read.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        digest.update(&buffer[..count]);
+    }
+    reader.get_mut().rewind()?;
+    if read != length || file.metadata()?.len() != length {
+        return Err(CliError::Other(
+            "legacy import candidate changed while hashing its validated bytes".to_string(),
+        ));
+    }
+    Ok(digest.finalize().into())
+}
+
+fn require_import_file_binding(path: &Path, retained: &fs::File, directory: bool) -> CliResult<()> {
+    let observed = if directory {
+        open_import_directory(path)
+    } else {
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(path)
+    }
+    .map_err(|error| {
+        CliError::Other(format!(
+            "legacy import authority changed at {}: {error}",
+            path.display()
+        ))
+    })?;
+    let retained = same_file::Handle::from_file(retained.try_clone()?)?;
+    let observed = same_file::Handle::from_file(observed)?;
+    if retained != observed {
+        return Err(CliError::Other(format!(
+            "legacy import authority changed at {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -782,12 +937,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
             "legacy import requires a target DB path different from source DB".to_string(),
         ));
     }
-    if fs::symlink_metadata(&target_db).is_ok() {
-        return Err(CliError::InvalidArgument(format!(
-            "legacy import requires target DB path that does not already exist: {}",
-            target_db.display()
-        )));
-    }
+    require_unused_import_target(&target_db)?;
     if source_storage == target_storage {
         return Err(CliError::InvalidArgument(
             "legacy import requires target storage root different from source storage root"
@@ -832,16 +982,20 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
             .to_string(),
     );
     operations.push(format!(
-        "copy source DB to target DB with a canonical SQLite online backup: {}",
+        "copy source DB into a private candidate beside the target with a canonical SQLite online backup: {}",
         target_db.display()
     ));
     operations.push(format!(
         "copy source storage root to target storage root: {}",
         target_storage.display()
     ));
-    operations.push("run schema::migrate_to_latest against target DB only".to_string());
-    operations.push("verify source and target DB readability before recording success".to_string());
-    operations.push("run target integrity_check and core-table sanity queries".to_string());
+    operations.push("run schema::migrate_to_latest against the private candidate only".to_string());
+    operations.push("verify source and candidate DB readability before publication".to_string());
+    operations.push("run candidate integrity_check and core-table sanity queries".to_string());
+    operations.push(
+        "publish a validated standalone database atomically without replacing an existing target; sync the file and parent directories"
+            .to_string(),
+    );
     operations.push("write JSON receipt under target storage root".to_string());
     operations.push("refresh agent MCP config via setup run".to_string());
 
@@ -860,6 +1014,7 @@ fn build_import_plan(opts: &ImportOptions) -> CliResult<ImportPlan> {
 fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<LegacyImportReceipt> {
     // Import only locks existing target paths. Source paths stay entirely
     // read-only, including during detection and the SQLite online backup.
+    require_unused_import_target(&plan.target_db)?;
     let _mailbox_locks = acquire_legacy_import_mailbox_locks(&plan)?;
     let now = Utc::now();
     let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -874,22 +1029,36 @@ fn execute_import(plan: ImportPlan, should_refresh_setup: bool) -> CliResult<Leg
     // error unchanged (there is nothing to stage aside and no target storage
     // root that this run owns to hold a failure receipt).
     verify_source_canonical_sqlite_readable(source_snapshot)?;
+    require_unused_import_target(&plan.target_db)?;
     ensure_target_storage_root_usable(&plan.target_storage_root)?;
 
-    match execute_import_body(&plan, should_refresh_setup, &now) {
-        Ok(receipt) => {
-            write_receipt(&plan.target_storage_root, &receipt, &timestamp)?;
-            Ok(receipt)
-        }
-        Err(err) => Err(handle_failed_import(&plan, &err, &now, &timestamp)),
+    let mut workspace = LegacyImportWorkspace::create(&plan.target_db)?;
+    match execute_import_body(&plan, &mut workspace, should_refresh_setup, &now) {
+        Ok(receipt) => match write_receipt(&plan.target_storage_root, &receipt, &timestamp) {
+            Ok(_) => Ok(receipt),
+            Err(err) => Err(handle_failed_import(
+                &plan,
+                &mut workspace,
+                &err,
+                &now,
+                &timestamp,
+            )),
+        },
+        Err(err) => Err(handle_failed_import(
+            &plan,
+            &mut workspace,
+            &err,
+            &now,
+            &timestamp,
+        )),
     }
 }
 
-/// Import steps that create/modify target artifacts. Any `Err` from here means
-/// a partially created target may exist; `execute_import` stages it aside and
-/// records a failure receipt so the run is auditable and retryable.
+/// Import steps that create private candidates and copy the archive. A final
+/// target becomes visible only after every database validation has succeeded.
 fn execute_import_body(
     plan: &ImportPlan,
+    workspace: &mut LegacyImportWorkspace,
     should_refresh_setup: bool,
     now: &chrono::DateTime<Utc>,
 ) -> CliResult<LegacyImportReceipt> {
@@ -898,21 +1067,65 @@ fn execute_import_body(
         CliError::Other("legacy import body lost its retained source snapshot".to_string())
     })?;
 
-    copy_db_via_sqlite_backup(source_snapshot, &plan.target_db)?;
-    copy_dir_recursive(&plan.source_storage_root, &plan.target_storage_root)?;
+    workspace.verify_directories()?;
+    copy_db_via_sqlite_backup(source_snapshot, &workspace.migration_db)?;
+    let mut archive_exclusions = vec![
+        workspace.directory.clone(),
+        plan.source_storage_root.join(".mailbox.activity.lock"),
+    ];
+    // The database already travels through its WAL-coherent typed snapshot.
+    // Copying it again as an archive file could expose its unmigrated bytes at
+    // the final target (the normal <storage-root>/storage.sqlite3 layout) and
+    // transfer namespace/lock state belonging to the source mailbox.
+    for suffix in [
+        "",
+        "-journal",
+        "-wal",
+        "-shm",
+        "-wal-cert",
+        "-wal-cert-head",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+    ] {
+        archive_exclusions.push(mcp_agent_mail_core::disk::sqlite_sidecar_path(
+            &plan.source_db,
+            suffix,
+        ));
+    }
+    copy_dir_recursive(
+        &plan.source_storage_root,
+        &plan.target_storage_root,
+        &archive_exclusions,
+    )?;
 
-    let migrated_ids = migrate_sqlite_db(&plan.target_db)?;
-    let integrity_ok = integrity_check_ok(&plan.target_db)?;
+    let migrated_ids = migrate_sqlite_db(&workspace.migration_db)?;
+    let integrity_ok = integrity_check_ok(&workspace.migration_db)?;
     if !integrity_ok {
         return Err(CliError::Other(format!(
             "integrity_check failed after migration for {}",
-            plan.target_db.display()
+            workspace.migration_db.display()
         )));
     }
-    let core_counts = query_core_table_counts(&plan.target_db)?;
+    let core_counts = query_core_table_counts(&workspace.migration_db)?;
+    verify_canonical_sqlite_readable(&workspace.migration_db, "migrated candidate DB")?;
+    verify_runtime_sqlite_readable(&workspace.migration_db, "migrated candidate DB")?;
+
+    prepare_import_publication(workspace, &core_counts)?;
     verify_source_canonical_sqlite_readable(source_snapshot)?;
-    verify_canonical_sqlite_readable(&plan.target_db, "target DB")?;
-    verify_runtime_sqlite_readable(&plan.target_db, "target DB")?;
+    publish_import_database(workspace, &plan.target_db)?;
+    if let Err(error) = retain_import_workspace(workspace, &plan.target_storage_root) {
+        // Cross-filesystem evidence retention may leave the private workspace
+        // in place. Observed authority replacement is different: never turn it
+        // into a warning on an otherwise successful import.
+        workspace.verify_directories()?;
+        warnings.push(format!(
+            "could not move private import artifacts below the receipts directory: {error}"
+        ));
+    }
+    warnings.push(format!(
+        "private migration and validation artifacts retained at {}",
+        workspace.directory.display()
+    ));
 
     let setup_ok = if should_refresh_setup {
         match run_setup_refresh_once(Some(plan.search_root.clone())) {
@@ -925,6 +1138,12 @@ fn execute_import_body(
     } else {
         true
     };
+    workspace.verify_directories()?;
+    workspace
+        .publication_witness
+        .as_ref()
+        .ok_or_else(|| CliError::Other("published import lost its file witness".to_string()))?
+        .verify(&plan.target_db)?;
 
     Ok(LegacyImportReceipt {
         receipt_version: LEGACY_IMPORT_RECEIPT_VERSION,
@@ -982,44 +1201,62 @@ fn legacy_import_control_entry(entry: &fs::DirEntry) -> CliResult<bool> {
     Ok(false)
 }
 
-/// Failure path for `execute_import`: stage the partially created target DB
-/// (plus `-wal`/`-shm` sidecars) aside as `<target>.failed-<UTC ts>` siblings
-/// so the original target path is free for a retry, write a failure receipt so
-/// `am legacy status` can report the attempt, and return the original error
-/// annotated with the staged and receipt paths.
-///
-/// Staging uses rename (never deletion) for partial target DB/archive entries.
-/// Source paths and the held target activity lock are never moved or modified.
+/// Retain this attempt's private database family and record its failure.
+/// Before publication, partial archive copies are staged for retry. Once the
+/// validated database has been published, preserve its archive too: a later
+/// durability or receipt error must not dismantle the published mailbox.
+/// The final database is never moved here, including a raced-in foreign file.
 fn handle_failed_import(
     plan: &ImportPlan,
+    workspace: &mut LegacyImportWorkspace,
     original: &CliError,
     now: &chrono::DateTime<Utc>,
     timestamp: &str,
 ) -> CliError {
     let failure_reason = original.to_string();
-    let mut warnings = Vec::new();
-    let staged = stage_failed_target_db_aside(&plan.target_db, timestamp, &mut warnings);
-    match stage_failed_target_storage_aside(&plan.target_storage_root) {
-        Ok(Some(path)) => warnings.push(format!(
-            "partial target storage preserved at {} (rename, not deletion)",
-            path.display()
-        )),
-        Ok(None) => {}
-        Err(error) => warnings.push(format!("failed to stage partial target storage: {error}")),
+    if let Err(authority_error) = workspace.verify_directories() {
+        return CliError::Other(format!(
+            "legacy import failed: {failure_reason}; {authority_error}; directory authority changed, so candidate, target, archive, and receipt paths were left untouched"
+        ));
     }
-
-    let staged_note = if staged.is_empty() {
-        "no partial target DB was created".to_string()
+    let mut warnings = Vec::new();
+    if let Err(error) = retain_import_workspace(workspace, &plan.target_storage_root) {
+        if let Err(authority_error) = workspace.verify_directories() {
+            return CliError::Other(format!(
+                "legacy import failed: {failure_reason}; {error}; {authority_error}; directory authority changed while retaining candidates, so no further target, archive, or receipt paths were changed"
+            ));
+        }
+        warnings.push(format!(
+            "private import artifacts remain at their original location: {error}"
+        ));
+    }
+    if workspace.published {
+        warnings.push(format!(
+            "validated database was published at {}; its archive at {} is preserved, but this import did not complete successfully",
+            plan.target_db.display(),
+            plan.target_storage_root.display()
+        ));
     } else {
-        format!(
-            "partial target DB staged aside at {}",
-            staged
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
+        match stage_failed_target_storage_aside(
+            &plan.target_storage_root,
+            require_unused_import_target(&plan.target_db)
+                .is_err()
+                .then_some(plan.target_db.as_path()),
+            Some(&workspace.directory),
+        ) {
+            Ok(Some(path)) => warnings.push(format!(
+                "partial target storage preserved at {} (rename, not deletion)",
+                path.display()
+            )),
+            Ok(None) => {}
+            Err(error) => warnings.push(format!("failed to stage partial target storage: {error}")),
+        }
+    }
+    let staged_note = format!(
+        "private import candidates preserved at {}",
+        workspace.directory.display()
+    );
+    warnings.push(staged_note.clone());
 
     let receipt = LegacyImportReceipt {
         receipt_version: LEGACY_IMPORT_RECEIPT_VERSION,
@@ -1036,31 +1273,20 @@ fn handle_failed_import(
         integrity_check_ok: false,
         core_table_counts: BTreeMap::new(),
         setup_refresh_ok: false,
-        warnings: {
-            let mut all = warnings;
-            if !staged.is_empty() {
-                all.push(format!("{staged_note} (rename, not deletion)"));
-            }
-            all
-        },
+        warnings,
     };
     let receipt_note = match write_receipt(&plan.target_storage_root, &receipt, timestamp) {
         Ok(path) => format!("failure receipt written to {}", path.display()),
         Err(receipt_err) => format!("failure receipt could not be written: {receipt_err}"),
     };
 
-    let database_path_free = ["", "-wal", "-shm"].iter().all(|suffix| {
-        let mut path = plan.target_db.as_os_str().to_os_string();
-        path.push(suffix);
-        matches!(fs::symlink_metadata(Path::new(&path)), Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound)
-    });
-    let retry_note = if database_path_free
+    let retry_note = if !workspace.published
+        && require_unused_import_target(&plan.target_db).is_ok()
         && ensure_target_storage_root_usable(&plan.target_storage_root).is_ok()
     {
         "the original target paths are free again, so the same command can be retried once the cause is fixed"
     } else {
-        "partial target artifacts remain; inspect the failure receipt and choose fresh target paths before retrying"
+        "target artifacts remain untouched; inspect the failure receipt and choose fresh target paths before retrying"
     };
     CliError::Other(format!(
         "legacy import failed: {failure_reason}; {staged_note}; {receipt_note}; \
@@ -1071,14 +1297,41 @@ fn handle_failed_import(
 /// Preserve partial archive copies below the receipt directory, the only
 /// content accepted in a retry target. Each attempt gets a private, unique
 /// directory; existing receipts and earlier quarantines are never moved.
-fn stage_failed_target_storage_aside(storage: &Path) -> CliResult<Option<PathBuf>> {
+fn stage_failed_target_storage_aside(
+    storage: &Path,
+    protected_database: Option<&Path>,
+    protected_workspace: Option<&Path>,
+) -> CliResult<Option<PathBuf>> {
     if !require_storage_directory(storage, "failed target storage", true)? {
         return Ok(None);
     }
+    let canonical_storage = fs::canonicalize(storage)?;
+    let protected_database = protected_database.map(|database| {
+        let parent = database.parent().unwrap_or_else(|| Path::new("."));
+        crate::canonicalize_existing_prefix(parent).join(database.file_name().unwrap_or_default())
+    });
     let mut entries = Vec::new();
     for entry in fs::read_dir(storage)? {
         let entry = entry?;
-        if !legacy_import_control_entry(&entry)? {
+        let canonical_entry = canonical_storage.join(entry.file_name());
+        // A database inside the archive root, or one of its companion files,
+        // may have been created by another actor. Never move that family via
+        // the broader archive-failure cleanup, including its containing folder.
+        let protects_database = protected_database.as_ref().is_some_and(|database| {
+            database.starts_with(&canonical_entry)
+                || (database.parent() == canonical_entry.parent()
+                    && database
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            entry.file_name().to_str().is_some_and(|entry_name| {
+                                entry_name.starts_with(&format!("{name}-"))
+                            })
+                        }))
+        });
+        let protects_workspace =
+            protected_workspace.is_some_and(|workspace| workspace.starts_with(&canonical_entry));
+        if !legacy_import_control_entry(&entry)? && !protects_database && !protects_workspace {
             entries.push(entry);
         }
     }
@@ -1095,7 +1348,11 @@ fn stage_failed_target_storage_aside(storage: &Path) -> CliResult<Option<PathBuf
         .tempdir_in(&receipts)?
         .keep();
     for entry in entries {
-        fs::rename(entry.path(), quarantine.join(entry.file_name())).map_err(|error| {
+        mcp_agent_mail_db::pool::rename_noreplace_preserving_source(
+            &entry.path(),
+            &quarantine.join(entry.file_name()),
+        )
+        .map_err(|error| {
             CliError::Other(format!(
                 "cannot move {} into {}; earlier moved entries remain preserved there: {error}",
                 entry.path().display(),
@@ -1106,45 +1363,43 @@ fn stage_failed_target_storage_aside(storage: &Path) -> CliResult<Option<PathBuf
     Ok(Some(quarantine))
 }
 
-/// Rename the partially created target DB and its SQLite sidecars aside as
-/// `<target>.failed-<ts>` (sidecars become `<target>.failed-<ts>-wal` /
-/// `<target>.failed-<ts>-shm`, keeping them associated with the staged DB).
-/// Missing files are skipped; rename errors are reported as warnings rather
-/// than masking the original import error.
-fn stage_failed_target_db_aside(
-    target_db: &Path,
-    timestamp: &str,
-    warnings: &mut Vec<String>,
-) -> Vec<PathBuf> {
-    let base = format!("{}.failed-{timestamp}", target_db.display());
-    let mut staged = Vec::new();
-    for suffix in ["", "-wal", "-shm"] {
-        let candidate = if suffix.is_empty() {
-            target_db.to_path_buf()
-        } else {
-            PathBuf::from(format!("{}{suffix}", target_db.display()))
-        };
-        if fs::symlink_metadata(&candidate).is_err() {
-            continue;
-        }
-        let mut dest = PathBuf::from(format!("{base}{suffix}"));
-        let mut counter = 1_u32;
-        while fs::symlink_metadata(&dest).is_ok() {
-            dest = PathBuf::from(format!("{base}-{counter}{suffix}"));
-            counter = counter.saturating_add(1);
-            if counter > 1000 {
-                break;
-            }
-        }
-        match fs::rename(&candidate, &dest) {
-            Ok(()) => staged.push(dest),
-            Err(err) => warnings.push(format!(
-                "failed to stage partial target artifact {} aside: {err}",
-                candidate.display()
-            )),
-        }
+/// Move the retained private workspace below the receipt directory when it is
+/// on the same filesystem. This also keeps a failed import retryable when its
+/// target database lives inside the target archive root. A failed move leaves
+/// every candidate at its original, explicitly reported location.
+fn retain_import_workspace(workspace: &mut LegacyImportWorkspace, storage: &Path) -> CliResult<()> {
+    workspace.verify_directories()?;
+    if !require_storage_directory(storage, "target storage root", true)? {
+        fs::create_dir_all(storage)?;
     }
-    staged
+    let receipts = storage.join("legacy_import_receipts");
+    if !require_storage_directory(&receipts, "legacy import receipts", true)? {
+        fs::create_dir(&receipts)?;
+    }
+    require_storage_directory(&receipts, "legacy import receipts", false)?;
+    let receipts = fs::canonicalize(&receipts)?;
+    if workspace.directory.parent() == Some(receipts.as_path()) {
+        return Ok(());
+    }
+    let name = workspace.directory.file_name().ok_or_else(|| {
+        CliError::Other("private legacy import workspace lost its directory name".to_string())
+    })?;
+    let destination = receipts.join(name);
+    mcp_agent_mail_db::pool::rename_noreplace_preserving_source(
+        &workspace.directory,
+        &destination,
+    )?;
+    let old_directory = std::mem::replace(&mut workspace.directory, destination);
+    workspace.migration_db = workspace.directory.join("migration.sqlite3");
+    workspace.publication_db = workspace.directory.join("publication.sqlite3");
+    workspace.verification_db = workspace.directory.join("runtime-verification.sqlite3");
+    workspace.verify_directories()?;
+    sync_import_directory(&receipts)?;
+    sync_import_directory(storage)?;
+    if let Some(parent) = old_directory.parent() {
+        sync_import_directory(parent)?;
+    }
+    Ok(())
 }
 
 fn run_setup_refresh_once(project_dir: Option<PathBuf>) -> CliResult<()> {
@@ -1339,24 +1594,33 @@ fn write_receipt(
 ) -> CliResult<PathBuf> {
     let dir = target_storage_root.join("legacy_import_receipts");
     fs::create_dir_all(&dir)?;
-    let mut path = dir.join(format!("legacy_import_{timestamp}.json"));
-    if path.exists() {
-        let mut suffix = 1_u32;
-        loop {
-            let candidate = dir.join(format!("legacy_import_{timestamp}_{suffix}.json"));
-            if !candidate.exists() {
-                path = candidate;
-                break;
-            }
-            suffix = suffix
-                .checked_add(1)
-                .ok_or_else(|| CliError::Other("too many legacy import receipts".to_string()))?;
-        }
-    }
+    require_storage_directory(&dir, "legacy import receipts", false)?;
     let content = serde_json::to_string_pretty(receipt)
         .map_err(|e| CliError::Other(format!("failed to serialize receipt: {e}")))?;
-    fs::write(&path, format!("{content}\n"))?;
-    Ok(path)
+    let mut suffix = 0_u32;
+    loop {
+        let name = if suffix == 0 {
+            format!("legacy_import_{timestamp}.json")
+        } else {
+            format!("legacy_import_{timestamp}_{suffix}.json")
+        };
+        let path = dir.join(name);
+        match mcp_agent_mail_core::disk::create_new_private_file_no_follow(&path) {
+            Ok(mut file) => {
+                file.write_all(format!("{content}\n").as_bytes())?;
+                file.sync_all()?;
+                sync_import_directory(&dir)?;
+                sync_import_directory(target_storage_root)?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    CliError::Other("too many legacy import receipts".to_string())
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn build_detect_report(
@@ -2456,6 +2720,216 @@ fn verify_runtime_sqlite_readable(path: &Path, label: &str) -> CliResult<()> {
     Ok(())
 }
 
+fn require_unused_import_target(target_db: &Path) -> CliResult<()> {
+    match fs::symlink_metadata(target_db) {
+        Ok(_) => {
+            return Err(CliError::InvalidArgument(format!(
+                "legacy import requires target DB path that does not already exist: {}",
+                target_db.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if !mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(target_db) {
+        return Err(CliError::InvalidArgument(format!(
+            "legacy import target {} has existing SQLite or FrankenSQLite companion state; choose a fresh database path",
+            target_db.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Export all migrated WAL state into an engine-neutral image. Only a separate
+/// byte copy is opened through the runtime: moving a FrankenSQLite-admitted
+/// inode to the final name would strand its namespace at the staging pathname
+/// and make the next process unable to start (GH#268).
+fn prepare_import_publication(
+    workspace: &mut LegacyImportWorkspace,
+    expected_counts: &BTreeMap<String, i64>,
+) -> CliResult<()> {
+    workspace.verify_directories()?;
+    crate::vacuum_live_franken_sqlite_into_snapshot(
+        &workspace.migration_db,
+        &workspace.publication_db,
+        "legacy import publication candidate",
+    )?;
+    let witness = LegacyImportFileWitness::capture(&workspace.publication_db)?;
+    let canonical_ok =
+        mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(
+            &workspace.publication_db,
+        )
+        .map_err(|error| {
+            CliError::Other(format!(
+                "legacy import publication candidate integrity check failed: {error}"
+            ))
+        })?;
+    if !canonical_ok {
+        return Err(CliError::Other(format!(
+            "legacy import publication candidate {} is not a healthy standalone mailbox",
+            workspace.publication_db.display()
+        )));
+    }
+
+    witness.verify(&workspace.publication_db)?;
+    let mut source = witness.file.try_clone()?;
+    source.rewind()?;
+    let mut verification =
+        mcp_agent_mail_core::disk::create_new_private_file_no_follow(&workspace.verification_db)?;
+    std::io::copy(&mut source, &mut verification)?;
+    verification.sync_all()?;
+    drop(verification);
+    drop(source);
+    verify_runtime_sqlite_readable(&workspace.verification_db, "publication candidate copy")?;
+    if !integrity_check_ok(&workspace.verification_db)?
+        || query_core_table_counts(&workspace.verification_db)? != *expected_counts
+    {
+        return Err(CliError::Other(format!(
+            "legacy import publication candidate {} failed runtime integrity or changed core-table counts",
+            workspace.publication_db.display()
+        )));
+    }
+    witness.verify(&workspace.publication_db)?;
+    workspace.verify_directories()?;
+    workspace.publication_witness = Some(witness);
+    Ok(())
+}
+
+#[cfg(test)]
+type LegacyImportPublicationHook = Box<dyn FnOnce(&Path, &Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static LEGACY_IMPORT_BEFORE_DATABASE_PUBLICATION:
+        std::cell::RefCell<Option<LegacyImportPublicationHook>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+fn publish_import_database(
+    workspace: &mut LegacyImportWorkspace,
+    target_db: &Path,
+) -> CliResult<()> {
+    workspace.verify_directories()?;
+    require_unused_import_target(target_db)?;
+    if !mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&workspace.publication_db)
+    {
+        return Err(CliError::Other(format!(
+            "legacy import candidate {} gained companion state before publication",
+            workspace.publication_db.display()
+        )));
+    }
+    let parent = target_db
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent)?;
+    if workspace.directory.parent() != Some(canonical_parent.as_path()) {
+        return Err(CliError::Other(format!(
+            "legacy import target parent {} changed after candidate creation; refusing publication",
+            parent.display()
+        )));
+    }
+    let name = target_db.file_name().ok_or_else(|| {
+        CliError::InvalidArgument("legacy import target needs a filename".to_string())
+    })?;
+    let destination = canonical_parent.join(name);
+    let witness = workspace.publication_witness.as_ref().ok_or_else(|| {
+        CliError::Other("legacy import publication requires a validated file witness".to_string())
+    })?;
+    witness.verify(&workspace.publication_db)?;
+    mcp_agent_mail_core::disk::set_private_writable_file_permissions(&witness.file)?;
+    witness.file.sync_all()?;
+    workspace.directory_file.sync_all()?;
+    workspace.target_parent_file.sync_all()?;
+
+    #[cfg(test)]
+    LEGACY_IMPORT_BEFORE_DATABASE_PUBLICATION.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook(&workspace.publication_db, &destination);
+        }
+    });
+
+    workspace.verify_directories()?;
+    witness.verify(&workspace.publication_db)?;
+    mcp_agent_mail_db::pool::rename_noreplace_preserving_source(
+        &workspace.publication_db,
+        &destination,
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "cannot publish legacy import candidate {} at {} without replacing an existing target: {error}; both generations are preserved",
+            workspace.publication_db.display(),
+            target_db.display()
+        ))
+    })?;
+    // Set ownership before any fallible post-publication step. An fsync or
+    // receipt error must preserve this database and its corresponding archive.
+    workspace.published = true;
+    witness.verify(&destination)?;
+    workspace.verify_directories()?;
+    witness.file.sync_all()?;
+    workspace.target_parent_file.sync_all()?;
+    workspace.directory_file.sync_all()?;
+    if !mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&destination) {
+        return Err(CliError::Other(format!(
+            "legacy import database was published at {}, but companion state appeared concurrently; the database and archive are preserved without recording success",
+            target_db.display()
+        )));
+    }
+    Ok(())
+}
+
+fn open_import_directory(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        // A directory handle needs backup semantics, and flushing it needs
+        // write access. Match the recovery publisher's durability contract.
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legacy import directory is not a regular directory authority",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable legacy import directory publication is unavailable on this platform",
+        ))
+    }
+}
+
+fn sync_import_directory(path: &Path) -> std::io::Result<()> {
+    open_import_directory(path)?.sync_all()
+}
+
 fn copy_db_via_sqlite_backup(
     source_snapshot: &LegacySourceSnapshot,
     target_db: &Path,
@@ -2487,7 +2961,7 @@ fn copy_db_via_sqlite_backup(
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
+fn copy_dir_recursive(src: &Path, dst: &Path, excluded_sources: &[PathBuf]) -> CliResult<()> {
     require_storage_directory(src, "source storage directory", false)?;
     if !require_storage_directory(dst, "target storage directory", true)? {
         fs::create_dir_all(dst)?;
@@ -2508,19 +2982,33 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
                 path.display()
             )));
         }
+        if excluded_sources.iter().any(|excluded| {
+            normalize_path_for_overlap(&path) == normalize_path_for_overlap(excluded)
+        }) {
+            continue;
+        }
         if metadata.file_type().is_dir() {
-            copy_dir_recursive(&path, &target)?;
+            copy_dir_recursive(&path, &target, excluded_sources)?;
         } else if metadata.file_type().is_file() {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&path, &target)?;
+            let mut source = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path)?;
+            let mut destination =
+                mcp_agent_mail_core::disk::create_new_private_file_no_follow(&target)?;
+            std::io::copy(&mut source, &mut destination)?;
+            destination.set_permissions(metadata.permissions())?;
+            destination.sync_all()?;
         } else {
             return Err(CliError::InvalidArgument(format!(
                 "unsupported special file encountered during recursive copy: {}",
                 path.display()
             )));
         }
+    }
+    sync_import_directory(dst)?;
+    if let Some(parent) = dst.parent().filter(|path| !path.as_os_str().is_empty()) {
+        sync_import_directory(parent)?;
     }
     Ok(())
 }
@@ -3547,6 +4035,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_import_refuses_orphaned_target_companions() {
+        let tmp = tempfile::tempdir().unwrap();
+        for suffix in [
+            "-journal",
+            "-wal",
+            "-shm",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+        ] {
+            let target = tmp.path().join(format!("target{suffix}.sqlite3"));
+            let companion = mcp_agent_mail_core::disk::sqlite_sidecar_path(&target, suffix);
+            fs::write(&companion, b"unrelated database generation").unwrap();
+            let error = require_unused_import_target(&target).unwrap_err();
+            assert!(error.to_string().contains("companion state"), "{error}");
+            assert!(!target.exists());
+            assert_eq!(
+                fs::read(companion).unwrap(),
+                b"unrelated database generation"
+            );
+        }
+    }
+
+    #[test]
     fn build_import_plan_copy_rejects_target_storage_file() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("legacy.sqlite3");
@@ -3913,10 +4426,10 @@ mod tests {
     #[test]
     fn legacy_import_v20_autoindex_fixture_preserves_source_and_reopens_copy() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let source_db = tmp.path().join("legacy-v20.sqlite3");
         let source_storage = tmp.path().join("legacy-storage");
-        let target_db = tmp.path().join("rust-copy.sqlite3");
+        let source_db = source_storage.join("storage.sqlite3");
         let target_storage = tmp.path().join("rust-storage");
+        let target_db = target_storage.join("storage.sqlite3");
         fs::create_dir_all(&source_storage).expect("create source storage");
         fs::write(source_storage.join("message.json"), "legacy archive")
             .expect("seed source storage");
@@ -3948,9 +4461,42 @@ mod tests {
             yes: true,
         })
         .expect("build copy-only import plan");
+        let publication_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_seen = std::sync::Arc::clone(&publication_seen);
+        LEGACY_IMPORT_BEFORE_DATABASE_PUBLICATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |candidate, target| {
+                assert!(
+                    !target.exists(),
+                    "migration must never expose a partial target"
+                );
+                assert!(
+                    mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(
+                        candidate
+                    )
+                    .unwrap(),
+                    "publication must see a fully validated standalone mailbox"
+                );
+                hook_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            }));
+        });
         let receipt = execute_import(plan, false).expect("import v20 fixture into a copy");
 
+        assert!(publication_seen.load(std::sync::atomic::Ordering::Relaxed));
         assert!(receipt.integrity_check_ok);
+        assert!(
+            mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&target_db),
+            "published inode must not inherit temporary-path runtime namespace state"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&target_db).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(target_os = "linux")]
+        assert_target_reopens_in_fresh_process(&target_db);
         assert!(
             receipt
                 .migrated_migration_ids
@@ -3998,6 +4544,375 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_import_migration_gate_failure_preserves_source_and_private_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_storage = tmp.path().join("legacy-storage");
+        let source_db = source_storage.join("storage.sqlite3");
+        let target_storage = tmp.path().join("rust-storage");
+        let target_db = target_storage.join("storage.sqlite3");
+        fs::create_dir_all(&source_storage).unwrap();
+        fs::write(
+            source_storage.join("message.md"),
+            b"source archive sentinel",
+        )
+        .unwrap();
+        seed_v20_agents_fixture(&source_db);
+        let source = CanonicalDbConn::open_file(source_db.display().to_string()).unwrap();
+        source
+            .execute_raw(
+                "UPDATE agents SET retired_at = 'invalid-retirement-timestamp' WHERE id = 1",
+            )
+            .unwrap();
+        drop(source);
+        let source_before = fs::read(&source_db).unwrap();
+        let plan = build_import_plan(&ImportOptions {
+            auto: false,
+            search_root: Some(tmp.path().to_path_buf()),
+            db: Some(source_db.clone()),
+            storage_root: Some(source_storage.clone()),
+            target_db: Some(target_db.clone()),
+            target_storage_root: Some(target_storage.clone()),
+            dry_run: false,
+            yes: true,
+        })
+        .expect("valid SQLite source with an unconvertible lifecycle value");
+
+        let error = execute_import(plan, false)
+            .expect_err("migration must refuse a timestamp that would reactivate a retired agent")
+            .to_string();
+        assert!(
+            error.contains("cannot convert legacy retired_at"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&source_db).unwrap(), source_before);
+        assert_eq!(
+            fs::read(source_storage.join("message.md")).unwrap(),
+            b"source archive sentinel"
+        );
+        assert!(!target_db.exists(), "failed migration must never publish");
+        assert!(mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&target_db));
+        let workspaces: Vec<_> = fs::read_dir(target_storage.join("legacy_import_receipts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".storage.sqlite3.import-"))
+            })
+            .collect();
+        assert_eq!(workspaces.len(), 1);
+        assert!(workspaces[0].join("migration.sqlite3").is_file());
+        assert!(!workspaces[0].join("publication.sqlite3").exists());
+        let report = collect_status_report(&target_storage).unwrap();
+        assert_eq!(report.receipt_count, 1);
+        let receipt = report.latest_receipt.unwrap();
+        assert_eq!(receipt.outcome, LEGACY_IMPORT_OUTCOME_FAILED);
+        assert!(!receipt.integrity_check_ok);
+        assert!(
+            receipt
+                .failure_reason
+                .unwrap()
+                .contains("cannot convert legacy retired_at")
+        );
+        assert!(error.contains("the original target paths are free again"));
+    }
+
+    #[test]
+    fn legacy_import_publication_collision_preserves_foreign_database_and_candidate() {
+        for location in ["outside", "inside", "nested"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let source_db = tmp.path().join("legacy.sqlite3");
+            let source_storage = tmp.path().join("legacy-storage");
+            let target_storage = tmp.path().join("rust-storage");
+            let target_db = match location {
+                "inside" => target_storage.join("mail.sqlite3"),
+                "nested" => target_storage.join("databases/mail.sqlite3"),
+                _ => tmp.path().join("mail.sqlite3"),
+            };
+            fs::create_dir(&source_storage).unwrap();
+            fs::write(source_storage.join("message.md"), b"legacy archive").unwrap();
+            seed_v20_agents_fixture(&source_db);
+            let source_bytes = fs::read(&source_db).unwrap();
+            let plan = build_import_plan(&ImportOptions {
+                auto: false,
+                search_root: Some(tmp.path().to_path_buf()),
+                db: Some(source_db.clone()),
+                storage_root: Some(source_storage.clone()),
+                target_db: Some(target_db.clone()),
+                target_storage_root: Some(target_storage.clone()),
+                dry_run: false,
+                yes: true,
+            })
+            .unwrap();
+            let expected_candidate = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let hook_candidate = std::sync::Arc::clone(&expected_candidate);
+            LEGACY_IMPORT_BEFORE_DATABASE_PUBLICATION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |candidate, target| {
+                    assert!(!target.exists(), "collision must occur after candidate preparation");
+                    assert!(
+                        mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(
+                            candidate
+                        )
+                        .unwrap()
+                    );
+                    *hook_candidate.lock().unwrap() = fs::read(candidate).unwrap();
+                    // These appear after the last unused-target check, at the
+                    // actual atomic publication boundary, not during preflight.
+                    for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate"] {
+                        let path = mcp_agent_mail_core::disk::sqlite_sidecar_path(target, suffix);
+                        fs::write(path, format!("foreign target sentinel {suffix}")).unwrap();
+                    }
+                }));
+            });
+            let error = execute_import(plan, false).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("without replacing an existing target"),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("choose fresh target paths"),
+                "{error}"
+            );
+            for suffix in ["", "-wal", "-shm", "-fsqlite-ns-gate"] {
+                let path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&target_db, suffix);
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    format!("foreign target sentinel {suffix}").as_bytes()
+                );
+            }
+            assert_eq!(fs::read(&source_db).unwrap(), source_bytes);
+            assert_eq!(
+                fs::read(source_storage.join("message.md")).unwrap(),
+                b"legacy archive"
+            );
+            let retained: Vec<_> = fs::read_dir(target_storage.join("legacy_import_receipts"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.join("publication.sqlite3").is_file())
+                .collect();
+            assert_eq!(
+                retained.len(),
+                1,
+                "validated collision candidate must be preserved"
+            );
+            let candidate = retained[0].join("publication.sqlite3");
+            let expected = expected_candidate.lock().unwrap();
+            assert!(
+                !expected.is_empty(),
+                "the real publication seam must execute"
+            );
+            assert_eq!(fs::read(&candidate).unwrap(), *expected);
+            assert!(
+                mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(
+                    &candidate
+                )
+                .unwrap()
+            );
+            let receipt = collect_status_report(&target_storage)
+                .unwrap()
+                .latest_receipt
+                .unwrap();
+            assert_eq!(receipt.outcome, LEGACY_IMPORT_OUTCOME_FAILED);
+            assert!(
+                receipt
+                    .warnings
+                    .iter()
+                    .any(|warning| { warning.contains(&retained[0].display().to_string()) })
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_archive_copy_excludes_its_own_workspace_and_never_clobbers_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("message.md"), b"source archive").unwrap();
+        let workspace = LegacyImportWorkspace::create(&source.join("target.sqlite3")).unwrap();
+        fs::write(&workspace.migration_db, b"private candidate").unwrap();
+        copy_dir_recursive(&source, &target, std::slice::from_ref(&workspace.directory)).unwrap();
+        assert_eq!(
+            fs::read(target.join("message.md")).unwrap(),
+            b"source archive"
+        );
+        assert!(
+            !target
+                .join(workspace.directory.file_name().unwrap())
+                .exists()
+        );
+        let error =
+            copy_dir_recursive(&source, &target, std::slice::from_ref(&workspace.directory))
+                .unwrap_err();
+        assert!(
+            matches!(error, CliError::Io(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            fs::read(target.join("message.md")).unwrap(),
+            b"source archive"
+        );
+        assert_eq!(
+            fs::read(&workspace.migration_db).unwrap(),
+            b"private candidate"
+        );
+    }
+
+    #[test]
+    fn legacy_import_publication_refuses_replaced_or_modified_candidate() {
+        for replace in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("target.sqlite3");
+            let mut workspace = LegacyImportWorkspace::create(&target).unwrap();
+            fs::write(&workspace.publication_db, b"validated candidate bytes").unwrap();
+            workspace.publication_witness =
+                Some(LegacyImportFileWitness::capture(&workspace.publication_db).unwrap());
+            LEGACY_IMPORT_BEFORE_DATABASE_PUBLICATION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |candidate, _target| {
+                    if replace {
+                        fs::rename(candidate, candidate.with_extension("preserved")).unwrap();
+                    }
+                    fs::write(candidate, b"unvalidated replacement sentinel").unwrap();
+                }));
+            });
+            let error = publish_import_database(&mut workspace, &target).unwrap_err();
+            assert!(error.to_string().contains("changed"), "{error}");
+            assert!(!workspace.published);
+            assert!(!target.exists());
+            assert_eq!(
+                fs::read(&workspace.publication_db).unwrap(),
+                b"unvalidated replacement sentinel"
+            );
+            if replace {
+                assert_eq!(
+                    fs::read(workspace.publication_db.with_extension("preserved")).unwrap(),
+                    b"validated candidate bytes"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_import_parent_swap_refuses_publication_and_failure_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("target-parent");
+        let retained_parent = tmp.path().join("retained-parent");
+        fs::create_dir(&parent).unwrap();
+        let target = parent.join("mail.sqlite3");
+        let source = tmp.path().join("source.sqlite3");
+        fs::write(&source, b"source sentinel").unwrap();
+        let mut workspace = LegacyImportWorkspace::create(&target).unwrap();
+        fs::write(&workspace.publication_db, b"validated candidate bytes").unwrap();
+        workspace.publication_witness =
+            Some(LegacyImportFileWitness::capture(&workspace.publication_db).unwrap());
+        let retained_candidate = retained_parent
+            .join(workspace.directory.file_name().unwrap())
+            .join("publication.sqlite3");
+        let moved = retained_parent.clone();
+        LEGACY_IMPORT_BEFORE_DATABASE_PUBLICATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_candidate, target| {
+                let parent = target.parent().unwrap();
+                fs::rename(parent, &moved).unwrap();
+                fs::create_dir(parent).unwrap();
+                fs::write(target, b"foreign database sentinel").unwrap();
+                fs::write(
+                    parent.join("archive-sentinel.md"),
+                    b"foreign archive sentinel",
+                )
+                .unwrap();
+            }));
+        });
+        let original = publish_import_database(&mut workspace, &target).unwrap_err();
+        assert!(
+            original.to_string().contains("authority changed"),
+            "{original}"
+        );
+        let plan = ImportPlan {
+            mode: ImportMode::Copy,
+            search_root: tmp.path().to_path_buf(),
+            source_db: source.clone(),
+            source_snapshot: None,
+            source_storage_root: tmp.path().join("source-storage"),
+            target_db: target.clone(),
+            target_storage_root: parent.clone(),
+            operations: Vec::new(),
+        };
+        let error =
+            handle_failed_import(&plan, &mut workspace, &original, &Utc::now(), "parent-swap");
+        assert!(error.to_string().contains("left untouched"), "{error}");
+        assert!(!workspace.published);
+        assert_eq!(fs::read(&source).unwrap(), b"source sentinel");
+        assert_eq!(fs::read(&target).unwrap(), b"foreign database sentinel");
+        assert_eq!(
+            fs::read(parent.join("archive-sentinel.md")).unwrap(),
+            b"foreign archive sentinel"
+        );
+        assert_eq!(
+            fs::read(retained_candidate).unwrap(),
+            b"validated candidate bytes"
+        );
+        assert!(!parent.join("legacy_import_receipts").exists());
+    }
+
+    #[test]
+    fn legacy_import_failure_after_publication_preserves_database_and_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("archive");
+        fs::create_dir(&storage).unwrap();
+        fs::write(storage.join("message.md"), b"imported archive").unwrap();
+        let target = storage.join("mail.sqlite3");
+        let source = tmp.path().join("source.sqlite3");
+        fs::write(&source, b"source sentinel").unwrap();
+        let mut workspace = LegacyImportWorkspace::create(&target).unwrap();
+        fs::write(&workspace.publication_db, b"validated candidate bytes").unwrap();
+        workspace.publication_witness =
+            Some(LegacyImportFileWitness::capture(&workspace.publication_db).unwrap());
+        publish_import_database(&mut workspace, &target).unwrap();
+        assert!(workspace.published);
+        let plan = ImportPlan {
+            mode: ImportMode::Copy,
+            search_root: tmp.path().to_path_buf(),
+            source_db: source.clone(),
+            source_snapshot: None,
+            source_storage_root: tmp.path().join("source-storage"),
+            target_db: target.clone(),
+            target_storage_root: storage.clone(),
+            operations: Vec::new(),
+        };
+        let original = CliError::Other("post-publication durability failure".to_string());
+        let error = handle_failed_import(
+            &plan,
+            &mut workspace,
+            &original,
+            &Utc::now(),
+            "published-failure",
+        );
+        assert!(
+            error.to_string().contains("choose fresh target paths"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"source sentinel");
+        assert_eq!(fs::read(&target).unwrap(), b"validated candidate bytes");
+        assert_eq!(
+            fs::read(storage.join("message.md")).unwrap(),
+            b"imported archive"
+        );
+        let receipt = collect_status_report(&storage)
+            .unwrap()
+            .latest_receipt
+            .unwrap();
+        assert_eq!(receipt.outcome, LEGACY_IMPORT_OUTCOME_FAILED);
+        assert!(
+            receipt
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("validated database was published"))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn legacy_hardening_copy_rejects_symlinked_directories() {
@@ -4011,7 +4926,7 @@ mod tests {
         fs::write(nested.join("file.txt"), "payload").unwrap();
         symlink(&nested, src.join("nested-link")).unwrap();
 
-        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+        let err = copy_dir_recursive(&src, &dst, &[]).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
                 assert!(msg.contains("symlink or reparse-point entry"));
@@ -4031,7 +4946,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         symlink("/does/not/exist", src.join("broken-link")).unwrap();
 
-        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+        let err = copy_dir_recursive(&src, &dst, &[]).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
                 assert!(msg.contains("symlink or reparse-point entry"));
@@ -4053,7 +4968,7 @@ mod tests {
         fs::write(real_source.join("message.txt"), "payload").unwrap();
         symlink(&real_source, &linked_source).unwrap();
 
-        let error = copy_dir_recursive(&linked_source, &destination)
+        let error = copy_dir_recursive(&linked_source, &destination, &[])
             .expect_err("source storage root symlink must not be followed");
         assert!(
             error.to_string().contains("must not be a symlink"),
@@ -4079,7 +4994,7 @@ mod tests {
         fs::write(source.join("message.txt"), "payload").unwrap();
         symlink(&outside, &linked_destination).unwrap();
 
-        let error = copy_dir_recursive(&source, &linked_destination)
+        let error = copy_dir_recursive(&source, &linked_destination, &[])
             .expect_err("target storage root symlink must not be followed");
         assert!(
             error.to_string().contains("must not be a symlink"),
@@ -4103,7 +5018,7 @@ mod tests {
         let socket_path = source.join("agent.sock");
         let _listener = UnixListener::bind(&socket_path).unwrap();
 
-        let error = copy_dir_recursive(&source, &destination)
+        let error = copy_dir_recursive(&source, &destination, &[])
             .expect_err("socket entries must not be silently skipped");
         assert!(
             error.to_string().contains("unsupported special file"),
@@ -4122,10 +5037,9 @@ mod tests {
         let target_db = tmp.path().join("rust-copy.sqlite3");
         let target_storage = tmp.path().join("rust-storage");
 
-        // Valid SQLite source so the preflight quick_check passes and the
-        // target DB copy is created; the storage copy then fails on a broken
-        // symlink (existing validation), which is the cleanest failure
-        // injection AFTER the partial target DB exists.
+        // Valid SQLite source so the private candidate is created; the storage
+        // copy then fails on a broken symlink. The final target must never
+        // become visible, and the private source copy must remain inspectable.
         seed_v20_agents_fixture(&source_db);
         let messages = source_storage.join("messages");
         fs::create_dir_all(&messages).expect("create source storage");
@@ -4153,35 +5067,35 @@ mod tests {
             "original link-like-entry failure must be preserved: {message}"
         );
         assert!(
-            message.contains(".failed-"),
-            "error should name the staged partial target: {message}"
+            message.contains(".import-"),
+            "error should name the retained private candidate: {message}"
         );
         assert!(
             message.contains("failure receipt written to"),
             "error should name the failure receipt: {message}"
         );
 
-        // The partial target DB was renamed aside (never deleted), freeing the
-        // original target path for retry.
+        // No partially validated database was ever placed at the target path.
         assert!(
             !target_db.exists(),
-            "original target DB path must be free again"
+            "unvalidated target DB path must remain absent"
         );
-        let staged: Vec<PathBuf> = fs::read_dir(tmp.path())
-            .expect("list tempdir")
+        let staged: Vec<PathBuf> = fs::read_dir(target_storage.join("legacy_import_receipts"))
+            .expect("list retained import workspaces")
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("rust-copy.sqlite3.failed-"))
+                    .is_some_and(|name| name.starts_with(".rust-copy.sqlite3.import-"))
             })
             .collect();
         assert_eq!(
             staged.len(),
             1,
-            "exactly one staged partial target DB expected, got {staged:?}"
+            "exactly one retained private workspace expected, got {staged:?}"
         );
+        assert!(staged[0].join("migration.sqlite3").is_file());
 
         // A failure receipt is discoverable via the status reader.
         let report = collect_status_report(&target_storage).expect("status report");
@@ -4203,7 +5117,11 @@ mod tests {
         let quarantines: Vec<_> = fs::read_dir(target_storage.join("legacy_import_receipts"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("failed-storage-"))
+            })
             .collect();
         assert_eq!(quarantines.len(), 1);
         assert!(quarantines[0].join("messages").is_dir());
@@ -4245,12 +5163,12 @@ mod tests {
         let activity_lock = storage.join(".mailbox.activity.lock");
         fs::write(&activity_lock, b"held activity lock").unwrap();
         fs::write(storage.join("message.md"), b"first partial payload").unwrap();
-        let first = stage_failed_target_storage_aside(&storage)
+        let first = stage_failed_target_storage_aside(&storage, None, None)
             .unwrap()
             .unwrap();
         ensure_target_storage_root_usable(&storage).unwrap();
         fs::write(storage.join("message.md"), b"second partial payload").unwrap();
-        let second = stage_failed_target_storage_aside(&storage)
+        let second = stage_failed_target_storage_aside(&storage, None, None)
             .unwrap()
             .unwrap();
         assert_ne!(first, second);
@@ -4268,7 +5186,7 @@ mod tests {
         );
         ensure_target_storage_root_usable(&storage).unwrap();
         assert!(
-            stage_failed_target_storage_aside(&storage)
+            stage_failed_target_storage_aside(&storage, None, None)
                 .unwrap()
                 .is_none()
         );
@@ -4281,7 +5199,7 @@ mod tests {
         let receipts = root.path().join("legacy_import_receipts");
         fs::write(&receipts, b"occupied receipt path").unwrap();
         fs::write(root.path().join("message.md"), b"partial payload").unwrap();
-        assert!(stage_failed_target_storage_aside(root.path()).is_err());
+        assert!(stage_failed_target_storage_aside(root.path(), None, None).is_err());
         assert!(ensure_target_storage_root_usable(root.path()).is_err());
         assert_eq!(fs::read(&receipts).unwrap(), b"occupied receipt path");
         assert_eq!(
@@ -4300,7 +5218,7 @@ mod tests {
         fs::create_dir(&storage).unwrap();
         std::os::unix::fs::symlink(&outside, storage.join(".mailbox.activity.lock")).unwrap();
         assert!(ensure_target_storage_root_usable(&storage).is_err());
-        assert!(stage_failed_target_storage_aside(&storage).is_err());
+        assert!(stage_failed_target_storage_aside(&storage, None, None).is_err());
         assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
     }
 
@@ -4897,7 +5815,7 @@ mod tests {
         fs::write(&outside, "outside-payload").unwrap();
         symlink(&outside, src.join("file-link")).unwrap();
 
-        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+        let err = copy_dir_recursive(&src, &dst, &[]).unwrap_err();
         match err {
             CliError::InvalidArgument(msg) => {
                 assert!(msg.contains("symlink or reparse-point entry"));
