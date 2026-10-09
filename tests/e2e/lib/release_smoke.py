@@ -128,6 +128,36 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+ELF_MACHINES = {0x3E: "x86_64", 0xB7: "aarch64"}
+
+
+def elf_target(data: bytes) -> str | None:
+    """`<arch>-static` or `<arch>-dynamic` for a little-endian ELF64 image.
+
+    install.sh ships the static musl archive on x86_64 and the glibc archive
+    elsewhere, so a receipt must say which one it measured. A PT_INTERP
+    program header means a dynamic loader is required.
+    """
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return None
+    arch = ELF_MACHINES.get(int.from_bytes(data[18:20], "little"), "unknown")
+    phoff = int.from_bytes(data[32:40], "little")
+    phentsize = int.from_bytes(data[54:56], "little")
+    phnum = int.from_bytes(data[56:58], "little")
+    for i in range(phnum):
+        start = phoff + i * phentsize
+        if start + 4 > len(data):
+            return None
+        if int.from_bytes(data[start:start + 4], "little") == 3:  # PT_INTERP
+            return f"{arch}-dynamic"
+    return f"{arch}-static"
+
+
+def cpu_governors() -> list[str]:
+    paths = Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor")
+    return sorted({p.read_text().strip() for p in paths}) or ["unavailable"]
+
+
 def has_emfile(text: str) -> bool:
     return any(marker in text for marker in EMFILE_MARKERS)
 
@@ -1016,7 +1046,10 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
     arm = Arm(name, binary, root)
     # Host load is recorded per arm: a verdict measured on a saturated shared
     # host is a signal to re-run, never a pass or a clean loss.
+    with binary.open("rb") as f:
+        target = elf_target(f.read(1 << 16))
     result: dict = {"arm": name, "binary": str(binary), "binary_sha256": sha256(binary),
+                    "binary_target": target,
                     "loadavg_start": open("/proc/loadavg").read().split()[:3], "phases": {}}
     try:
         version = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
@@ -1075,7 +1108,8 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     receipt = {"schema_version": 3,
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               "host": socket.gethostname(), "soak_secs": SOAK_SECS,
+               "host": socket.gethostname(), "cpu_governors": cpu_governors(),
+               "soak_secs": SOAK_SECS,
                "converge_secs": CONVERGE_SECS,
                "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S,
                "swarm_agents": SWARM_AGENTS, "swarm_secs": SWARM_SECS,

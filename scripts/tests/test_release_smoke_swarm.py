@@ -5,6 +5,7 @@ against real binaries through tests/e2e/test_release_smoke.sh.
 """
 import importlib.util
 from pathlib import Path
+import sys
 import unittest
 
 spec = importlib.util.spec_from_file_location(
@@ -119,6 +120,36 @@ class KnobTests(unittest.TestCase):
         self.assertEqual(checks, [])
         self.assertEqual(smoke.verdict(checks), 'NO_VERDICT')
         self.assertIn('cannot_pass', extra)
+
+
+def elf_image(machine: int, program_header_types: list) -> bytes:
+    """A little-endian ELF64 header followed by its program headers."""
+    header = bytearray(64)
+    header[:6] = b'\x7fELF\x02\x01'
+    header[18:20] = machine.to_bytes(2, 'little')
+    header[32:40] = (64).to_bytes(8, 'little')
+    header[54:56] = (56).to_bytes(2, 'little')
+    header[56:58] = len(program_header_types).to_bytes(2, 'little')
+    return bytes(header) + b''.join(
+        p_type.to_bytes(4, 'little') + bytes(52) for p_type in program_header_types)
+
+
+class ElfTargetTests(unittest.TestCase):
+    def test_no_interpreter_is_static(self):
+        self.assertEqual(smoke.elf_target(elf_image(0x3E, [1, 1])), 'x86_64-static')
+
+    def test_interpreter_header_is_dynamic(self):
+        self.assertEqual(smoke.elf_target(elf_image(0xB7, [6, 3, 1])), 'aarch64-dynamic')
+
+    def test_the_running_python_is_recognised(self):
+        with open(sys.executable, 'rb') as f:
+            target = smoke.elf_target(f.read(1 << 16))
+        self.assertIsNotNone(target)
+        self.assertNotIn('unknown', target)
+
+    def test_non_elf_and_truncated_headers_are_unknown(self):
+        self.assertIsNone(smoke.elf_target(b'#!/bin/sh\n' + bytes(64)))
+        self.assertIsNone(smoke.elf_target(elf_image(0x3E, [1, 1])[:100]))
 
 
 if __name__ == '__main__':
