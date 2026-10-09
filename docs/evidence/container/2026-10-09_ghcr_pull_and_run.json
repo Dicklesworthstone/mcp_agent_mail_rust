@@ -1,0 +1,166 @@
+{
+ "schema": "br-ocys6 pull-and-run acceptance (scratchpad container_accept.py, session 202ec80d)",
+ "host": "thinkstation1 (x86_64; arm64 via qemu-aarch64 binfmt)",
+ "date": "2026-10-09",
+ "release_archive_sha256": {
+  "x86_64-unknown-linux-gnu am": "171713fa43e891f8a3430fc4f0218ff966c78465f53a79eb65253370762dfe3c",
+  "x86_64-unknown-linux-gnu mcp-agent-mail": "7a7d164bb39edf7f6a71cae3286ae01d2b04721c47caee3841cdee17e333238e",
+  "aarch64-unknown-linux-gnu am": "694be3ea4c7245ec76b7e401a26b4ce32911fd4f0ac1452c0aceea286b8767f5",
+  "aarch64-unknown-linux-gnu mcp-agent-mail": "3ff83b7c42e228eb913ad265a91c72f601d33b14507c05ae572826d2fcdf3f6d"
+ },
+ "receipts": [
+  {
+   "image": "ghcr.io/dicklesworthstone/mcp_agent_mail_rust:v0.3.38",
+   "image_id": "sha256:cc1424e79d4ea2f912a17da754e168a3a75ff656cc112c06fdfa5d465a8df3f7",
+   "repo_digests": [
+    "ghcr.io/dicklesworthstone/mcp_agent_mail_rust@sha256:4828d21f76d2f9a1073d56ee13cc206835a4808bab29490f0253da0abffdddb1"
+   ],
+   "am_version": "am 0.3.38",
+   "mcp-agent-mail_version": "mcp-agent-mail 0.3.38",
+   "binaries_sha256": [
+    "171713fa43e891f8a3430fc4f0218ff966c78465f53a79eb65253370762dfe3c",
+    "/usr/local/bin/am",
+    "7a7d164bb39edf7f6a71cae3286ae01d2b04721c47caee3841cdee17e333238e",
+    "/usr/local/bin/mcp-agent-mail"
+   ],
+   "container": "2fa72f95b080",
+   "docker_health": "healthy",
+   "unauthenticated_status": 401,
+   "wrong_token_status": 401,
+   "initialize_status": 200,
+   "tools_list": [
+    200,
+    45
+   ],
+   "ensure_project": [
+    200,
+    false
+   ],
+   "register_agent": [
+    [
+     200,
+     false
+    ],
+    [
+     200,
+     false
+    ]
+   ],
+   "send_message": [
+    200,
+    false
+   ],
+   "fetch_inbox": [
+    200,
+    false,
+    [
+     "container acceptance",
+     "Contact approved: BrownMountain -> GentlePeak"
+    ]
+   ],
+   "pass": true
+  },
+  {
+   "image": "ghcr.io/dicklesworthstone/mcp_agent_mail_rust@sha256:b7094c9e750ab2454dcb5b4196d6f3ba226d2c6adb541e71eb6dc05827ece815",
+   "image_id": "sha256:2bf0b49fd5b25919de41c378ba26b3161f3b4b87af1ef3440ad9424ef71067da",
+   "repo_digests": [
+    "ghcr.io/dicklesworthstone/mcp_agent_mail_rust@sha256:b7094c9e750ab2454dcb5b4196d6f3ba226d2c6adb541e71eb6dc05827ece815"
+   ],
+   "am_version": "am 0.3.38",
+   "mcp-agent-mail_version": "mcp-agent-mail 0.3.38",
+   "binaries_sha256": [
+    "694be3ea4c7245ec76b7e401a26b4ce32911fd4f0ac1452c0aceea286b8767f5",
+    "/usr/local/bin/am",
+    "3ff83b7c42e228eb913ad265a91c72f601d33b14507c05ae572826d2fcdf3f6d",
+    "/usr/local/bin/mcp-agent-mail"
+   ],
+   "container": "f26f25a382c2",
+   "docker_health": "healthy",
+   "unauthenticated_status": 401,
+   "wrong_token_status": 401,
+   "initialize_status": 200,
+   "tools_list": [
+    200,
+    45
+   ],
+   "ensure_project": [
+    200,
+    false
+   ],
+   "register_agent": [
+    [
+     200,
+     false
+    ],
+    [
+     200,
+     false
+    ]
+   ],
+   "send_message": [
+    200,
+    false
+   ],
+   "fetch_inbox": [
+    200,
+    false,
+    [
+     "container acceptance",
+     "Contact approved: IndigoSummit -> WildPelican"
+    ]
+   ],
+   "pass": true
+  },
+  {
+   "image": "ghcr.io/dicklesworthstone/mcp_agent_mail_rust:v0.3.34",
+   "image_id": "sha256:8cea8209967c09f58c4387043392cf927e963b1927705bc33c2b803c4ec737ea",
+   "repo_digests": [
+    "ghcr.io/dicklesworthstone/mcp_agent_mail_rust@sha256:9ec88865a2961fd2eb9c87971825678d8c3da7b4a14a02802d682a2f58efb175"
+   ],
+   "am_version": "am 0.3.34",
+   "mcp-agent-mail_version": "mcp-agent-mail 0.3.34",
+   "binaries_sha256": [
+    "5931c453048d78154046865986a2c274e6189cc53714e418967b77b38f0785c7",
+    "/usr/local/bin/am",
+    "687d5569130a7366cfe2abad2b6510ceec2acf8d618b49e9dab34c282aa94f20",
+    "/usr/local/bin/mcp-agent-mail"
+   ],
+   "container": "083efdd15b99",
+   "docker_health": "healthy",
+   "unauthenticated_status": 401,
+   "wrong_token_status": 401,
+   "initialize_status": 200,
+   "tools_list": [
+    200,
+    45
+   ],
+   "ensure_project": [
+    200,
+    false
+   ],
+   "register_agent": [
+    [
+     200,
+     false
+    ],
+    [
+     200,
+     false
+    ]
+   ],
+   "send_message": [
+    200,
+    false
+   ],
+   "fetch_inbox": [
+    200,
+    false,
+    [
+     "container acceptance",
+     "Contact request from PurpleCondor"
+    ]
+   ],
+   "pass": true
+  }
+ ]
+}
