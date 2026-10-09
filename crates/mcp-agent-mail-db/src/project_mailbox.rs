@@ -349,6 +349,19 @@ pub fn merge_inbox_rows(
 /// A visible project delivery: `(message_id, read_ts, ack_ts)` of the viewer.
 type VisibleReceipt = (i64, Option<i64>, Option<i64>);
 
+/// Receipt state is authority, not best-effort display data. A malformed
+/// timestamp must never become an apparently unread/unacknowledged delivery.
+fn receipt_timestamp(row: &sqlmodel_core::Row, column: &str) -> Result<Option<i64>, DbError> {
+    match row.get_by_name(column) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::BigInt(value)) => Ok(Some(*value)),
+        Some(Value::Int(value)) => Ok(Some(i64::from(*value))),
+        _ => Err(DbError::Sqlite(format!(
+            "project mailbox receipt column {column} is missing or not an integer"
+        ))),
+    }
+}
+
 /// Message ids among `message_ids` that are project deliveries visible to
 /// `agent_id`, together with the agent's stored receipt.
 fn visible_receipts(
@@ -384,8 +397,8 @@ fn visible_receipts(
             let message_id = row
                 .get_named::<i64>("message_id")
                 .map_err(|error| DbError::Sqlite(error.to_string()))?;
-            let read_ts = row.get_named::<Option<i64>>("read_ts").ok().flatten();
-            let ack_ts = row.get_named::<Option<i64>>("ack_ts").ok().flatten();
+            let read_ts = receipt_timestamp(&row, "read_ts")?;
+            let ack_ts = receipt_timestamp(&row, "ack_ts")?;
             out.push((message_id, read_ts, ack_ts));
         }
     }
@@ -502,9 +515,84 @@ pub struct ProjectMailboxReadBatch {
     pub message_ids: Vec<i64>,
 }
 
+/// Own only the transaction this call successfully began. A failed COMMIT can
+/// leave it active; a failed body or unwinding must also release its writer.
+/// Never roll back a caller's transaction when our nested BEGIN was refused.
+struct ReceiptTransaction<'a> {
+    conn: &'a DbConn,
+    active: bool,
+}
+
+impl<'a> ReceiptTransaction<'a> {
+    fn begin(conn: &'a DbConn) -> Result<Self, DbError> {
+        conn.execute_sync("BEGIN IMMEDIATE", &[])
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn finish<T>(mut self, result: Result<T, DbError>) -> Result<T, DbError> {
+        let result = result.and_then(|value| {
+            self.conn
+                .execute_sync("COMMIT", &[])
+                .map(|_| value)
+                .map_err(|error| DbError::Sqlite(error.to_string()))
+        });
+        match result {
+            Ok(value) => {
+                self.active = false;
+                Ok(value)
+            }
+            Err(error) => match self.conn.execute_sync("ROLLBACK", &[]) {
+                Ok(_) => {
+                    self.active = false;
+                    Err(error)
+                }
+                Err(rollback) => {
+                    // Drop makes one last cleanup attempt. The caller still
+                    // receives an error, not a reusable-session guarantee.
+                    Err(DbError::Sqlite(format!(
+                        "project mailbox receipt transaction failed ({error}); rollback failed ({rollback})"
+                    )))
+                }
+            },
+        }
+    }
+}
+
+impl Drop for ReceiptTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_sync("ROLLBACK", &[]);
+        }
+    }
+}
+
+/// Recheck every observed receipt after the writes, within the same transaction.
+/// Do not trust affected-row counts: an ignored insert/update is not a receipt.
+/// Checking the complete observation also catches a trigger changing a receipt
+/// that was already read, or changing an ACK while recording another read.
+fn verify_read_receipts(
+    conn: &DbConn,
+    agent_id: i64,
+    message_ids: &[i64],
+    expected: &mut [VisibleReceipt],
+) -> Result<(), DbError> {
+    let mut actual = visible_receipts(conn, agent_id, message_ids)?;
+    actual.sort_unstable_by_key(|receipt| receipt.0);
+    expected.sort_unstable_by_key(|receipt| receipt.0);
+    if actual.as_slice() != &*expected {
+        return Err(DbError::Sqlite(
+            "project mailbox read receipts did not match the requested state".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Record read receipts for the visible, still-unread project deliveries
 /// among `message_ids`. Ids that are not project deliveries visible to the
-/// agent are ignored. Runs in one write transaction on `conn`.
+/// agent are ignored. Runs in one write transaction on `conn`, verifies the
+/// resulting receipts before commit, and rolls back failures. A caller-owned
+/// transaction is never committed or rolled back by this function.
 pub fn mark_project_mailbox_read_batch_sync_conn(
     conn: &DbConn,
     agent_id: i64,
@@ -518,38 +606,33 @@ pub fn mark_project_mailbox_read_batch_sync_conn(
     unique.dedup();
     let read_ts = crate::now_micros();
 
-    conn.execute_sync("BEGIN IMMEDIATE", &[])
-        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    let transaction = ReceiptTransaction::begin(conn)?;
     let result = (|| -> Result<Vec<i64>, DbError> {
         let mut updated = Vec::new();
-        for (message_id, existing_read, _) in visible_receipts(conn, agent_id, &unique)? {
+        let mut expected = visible_receipts(conn, agent_id, &unique)?;
+        for (message_id, existing_read, _) in &mut expected {
             if existing_read.is_some() {
                 continue;
             }
             for (sql, params) in
-                receipt_write_statements(ReceiptUpdate::Read, message_id, agent_id, read_ts)
+                receipt_write_statements(ReceiptUpdate::Read, *message_id, agent_id, read_ts)
             {
                 conn.execute_sync(sql, &params)
                     .map_err(|error| DbError::Sqlite(error.to_string()))?;
             }
-            updated.push(message_id);
+            *existing_read = Some(read_ts);
+            updated.push(*message_id);
+        }
+        if !updated.is_empty() {
+            verify_read_receipts(conn, agent_id, &unique, &mut expected)?;
         }
         Ok(updated)
     })();
-    match result {
-        Ok(updated) => {
-            conn.execute_sync("COMMIT", &[])
-                .map_err(|error| DbError::Sqlite(error.to_string()))?;
-            Ok((!updated.is_empty()).then_some(ProjectMailboxReadBatch {
-                read_ts,
-                message_ids: updated,
-            }))
-        }
-        Err(error) => {
-            let _ = conn.execute_sync("ROLLBACK", &[]);
-            Err(error)
-        }
-    }
+    let updated = transaction.finish(result)?;
+    Ok((!updated.is_empty()).then_some(ProjectMailboxReadBatch {
+        read_ts,
+        message_ids: updated,
+    }))
 }
 
 /// Open `sqlite_path` and run [`mark_project_mailbox_read_batch_sync_conn`].
@@ -659,6 +742,221 @@ pub fn project_mailbox_delivery_from_conn(
 mod tests {
     use super::*;
     use crate::schema;
+
+    fn receipt_fixture(test: impl FnOnce(&DbConn)) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("receipts.sqlite3");
+        let conn = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "project mailbox receipt fixture",
+        );
+        for sql in [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), inception_ts INTEGER NOT NULL, retired_at INTEGER, contact_policy TEXT)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), sender_id INTEGER NOT NULL REFERENCES agents(id), created_ts INTEGER NOT NULL)",
+            "CREATE TABLE message_recipients (message_id INTEGER REFERENCES messages(id), agent_id INTEGER REFERENCES agents(id), PRIMARY KEY(message_id, agent_id))",
+            "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER NOT NULL REFERENCES projects(id))",
+            "CREATE TABLE project_mailbox_receipts (message_id INTEGER REFERENCES messages(id), agent_id INTEGER REFERENCES agents(id), read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+            "INSERT INTO projects VALUES (1)",
+            "INSERT INTO agents VALUES (10, 1, 1, NULL, 'auto'), (20, 1, 1, NULL, 'auto'), (30, 1, 1, NULL, 'auto')",
+            "INSERT INTO messages VALUES (100, 1, 10, 1000), (200, 1, 10, 2000)",
+            "INSERT INTO project_mailbox_deliveries VALUES (100, 1), (200, 1)",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+        test(&conn);
+    }
+
+    fn assert_receipt_writer_released(conn: &DbConn) {
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        conn.execute_raw("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn read_batch_verifies_receipts_and_preserves_existing_ack_and_peer_state() {
+        receipt_fixture(|conn| {
+            conn.execute_raw(
+                "INSERT INTO project_mailbox_receipts VALUES (100, 20, NULL, 77), (200, 20, 55, 66), (100, 30, 11, 22)",
+            )
+            .unwrap();
+            let first = mark_project_mailbox_read_batch_sync_conn(conn, 20, &[200, 100, 100, 999])
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.message_ids, vec![100]);
+            let mut receipts = visible_receipts(conn, 20, &[100, 200]).unwrap();
+            receipts.sort_unstable_by_key(|receipt| receipt.0);
+            assert_eq!(
+                receipts,
+                vec![(100, Some(first.read_ts), Some(77)), (200, Some(55), Some(66))]
+            );
+            assert_eq!(
+                visible_receipts(conn, 30, &[100]).unwrap(),
+                vec![(100, Some(11), Some(22))]
+            );
+            assert_eq!(
+                mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100, 200]).unwrap(),
+                None
+            );
+            assert!(
+                conn.query_sync("SELECT 1 FROM message_recipients", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_receipt_writer_released(conn);
+        });
+    }
+
+    #[test]
+    fn ignored_receipt_insert_or_update_refuses_success_and_rolls_back_the_batch() {
+        for operation in ["INSERT", "UPDATE"] {
+            receipt_fixture(|conn| {
+                conn.execute_raw(&format!(
+                    "CREATE TRIGGER ignore_receipt BEFORE {operation} ON project_mailbox_receipts \
+                     WHEN NEW.message_id = 200 BEGIN SELECT RAISE(IGNORE); END"
+                ))
+                .unwrap();
+                let error = mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100, 200])
+                    .expect_err("an ignored write is not a read receipt");
+                assert!(error.to_string().contains("did not match"));
+                assert!(
+                    conn.query_sync("SELECT 1 FROM project_mailbox_receipts", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_receipt_writer_released(conn);
+            });
+        }
+    }
+
+    #[test]
+    fn trigger_changed_ack_is_not_committed_as_a_read_receipt() {
+        receipt_fixture(|conn| {
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, NULL, 77)")
+                .unwrap();
+            conn.execute_raw(
+                "CREATE TRIGGER change_ack AFTER UPDATE OF read_ts ON project_mailbox_receipts \
+                 BEGIN UPDATE project_mailbox_receipts SET ack_ts = 99 \
+                       WHERE message_id = NEW.message_id AND agent_id = NEW.agent_id; END",
+            )
+            .unwrap();
+            assert!(mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100]).is_err());
+            assert_eq!(
+                visible_receipts(conn, 20, &[100]).unwrap(),
+                vec![(100, None, Some(77))]
+            );
+            assert_receipt_writer_released(conn);
+        });
+    }
+
+    #[test]
+    fn malformed_receipt_state_is_not_treated_as_an_unread_delivery() {
+        for column in ["read_ts", "ack_ts"] {
+            receipt_fixture(|conn| {
+                conn.execute_raw(&format!(
+                    "INSERT INTO project_mailbox_receipts (message_id, agent_id, {column}) VALUES (100, 20, X'01')"
+                ))
+                .unwrap();
+                let error = mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100, 200])
+                    .expect_err("malformed receipt must be refused");
+                assert!(error.to_string().contains("not an integer"));
+                let rows = conn
+                    .query_sync("SELECT message_id FROM project_mailbox_receipts", &[])
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get_named::<i64>("message_id").unwrap(), 100);
+                assert_receipt_writer_released(conn);
+            });
+        }
+    }
+
+    #[test]
+    fn receipt_transaction_rolls_back_body_errors_and_unwinding() {
+        receipt_fixture(|conn| {
+            let transaction = ReceiptTransaction::begin(conn).unwrap();
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, 42, NULL)")
+                .unwrap();
+            let result = conn
+                .execute_raw("INSERT INTO missing_receipt_table VALUES (1)")
+                .map_err(|error| DbError::Sqlite(error.to_string()));
+            assert!(transaction.finish(result).is_err());
+            assert!(
+                conn.query_sync("SELECT 1 FROM project_mailbox_receipts", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_receipt_writer_released(conn);
+
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _transaction = ReceiptTransaction::begin(conn).unwrap();
+                conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, 42, NULL)")
+                    .unwrap();
+                panic!("receipt transaction unwind");
+            }));
+            assert!(panicked.is_err());
+            assert!(
+                conn.query_sync("SELECT 1 FROM project_mailbox_receipts", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_receipt_writer_released(conn);
+        });
+    }
+
+    #[test]
+    fn failed_receipt_commit_releases_transaction_without_publishing_reads() {
+        receipt_fixture(|conn| {
+            conn.execute_raw(
+                "CREATE TABLE deferred_receipt_check (agent_id INTEGER REFERENCES agents(id) DEFERRABLE INITIALLY DEFERRED)",
+            )
+            .unwrap();
+            // This is a real COMMIT failure, not an early statement error.
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("INSERT INTO deferred_receipt_check VALUES (999)")
+                .unwrap();
+            assert!(conn.execute_raw("COMMIT").is_err());
+            conn.execute_raw("ROLLBACK").unwrap();
+
+            conn.execute_raw(
+                "CREATE TRIGGER fail_receipt_commit AFTER INSERT ON project_mailbox_receipts \
+                 BEGIN INSERT INTO deferred_receipt_check VALUES (999); END",
+            )
+            .unwrap();
+            assert!(mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100, 200]).is_err());
+            assert!(
+                conn.query_sync("SELECT 1 FROM project_mailbox_receipts", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query_sync("SELECT 1 FROM deferred_receipt_check", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_receipt_writer_released(conn);
+        });
+    }
+
+    #[test]
+    fn nested_receipt_call_preserves_the_callers_transaction() {
+        receipt_fixture(|conn| {
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 30, 11, 22)")
+                .unwrap();
+            assert!(mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100]).is_err());
+            assert_eq!(
+                visible_receipts(conn, 30, &[100]).unwrap(),
+                vec![(100, Some(11), Some(22))]
+            );
+            conn.execute_raw("ROLLBACK").unwrap();
+            assert!(
+                conn.query_sync("SELECT 1 FROM project_mailbox_receipts", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_receipt_writer_released(conn);
+        });
+    }
 
     fn test_conn() -> DbConn {
         let conn = DbConn::open_memory().expect("open in-memory db");
