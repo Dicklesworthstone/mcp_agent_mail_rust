@@ -98,7 +98,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 ### Quick Example
 
 ```bash
-# Install and start (auto-detects all installed coding agents)
+# Start the server (the installer already configured your detected coding agents;
+# `am setup run` re-runs that setup at any time)
 am
 
 # That's it. Server starts on 127.0.0.1:8765 with the interactive TUI.
@@ -328,18 +329,14 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294`, recorded in `Cargo.toml` and `Cargo.lock` and aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This revision shares FastMCP's rustix 1.1.5 requirement; the enabled search features retain local Model2Vec and native reranking without FastEmbed or Tokio. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses FrankenSQLite 0.4.4 through SQLModel 0.5.0 on Asupersync 0.5.0, with an immutable engine revision retaining SQL binding and schema-prefix fixes omitted from the release. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.6.0` retains its separate, patched FrankenSQLite 0.3.18 dependency, with default features disabled.
-
-The current engine pin also includes NOCASE consistency, `INSERT ... SELECT`
-UPSERT parameter binding, and Linux retained-descriptor fixes. See
-[`UPGRADE_LOG.md`](UPGRADE_LOG.md) for qualification results and remaining
-release gates; these changes are not part of the published v0.3.36 binaries.
+Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294`, recorded in `Cargo.toml` and `Cargo.lock` and aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This revision shares FastMCP's rustix 1.1.5 requirement; the enabled search features retain local Model2Vec and native reranking without FastEmbed or Tokio. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses registry FrankenSQLite `=0.4.10` through SQLModel 0.5.0 on Asupersync 0.5.0. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results.
 
 ### Platforms
 
 | Platform | Architecture | Binary |
 |----------|-------------|--------|
-| Linux | x86_64 | `mcp-agent-mail-x86_64-unknown-linux-gnu` |
+| Linux | x86_64 (static; the installer's default) | `mcp-agent-mail-x86_64-unknown-linux-musl` |
+| Linux | x86_64 (glibc 2.28+) | `mcp-agent-mail-x86_64-unknown-linux-gnu` |
 | Linux | aarch64 | `mcp-agent-mail-aarch64-unknown-linux-gnu` |
 | macOS | x86_64 | `mcp-agent-mail-x86_64-apple-darwin` |
 | macOS | Apple Silicon | `mcp-agent-mail-aarch64-apple-darwin` |
@@ -355,7 +352,7 @@ release gates; these changes are not part of the published v0.3.36 binaries.
 am
 ```
 
-Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, OMP, etc.), refreshes their MCP connections as needed, and starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
+Starts the HTTP server on `127.0.0.1:8765` with the interactive TUI. It leaves existing MCP client configuration untouched: the curl installer configures detected coding agents (Claude Code, Codex CLI, Gemini CLI, OMP, etc.), and `am setup run` (or `am serve-http --setup`) configures them explicitly afterwards.
 
 ### 2. Agents register and coordinate
 
@@ -552,6 +549,8 @@ Agent Mail supports both stdio and HTTP transports:
 
 - **stdio**: Run `mcp-agent-mail` as a subprocess (the default for most MCP clients)
 - **HTTP**: Connect to `http://127.0.0.1:8765/mcp/` when the server is running via `am` or `mcp-agent-mail serve`
+
+One server process owns a mailbox at a time. While `am` (or `mcp-agent-mail serve`) is serving a storage root, a stdio `mcp-agent-mail` started for the same root refuses to start ("another Agent Mail server is already serving this storage root") instead of contending for it, so configure clients with the HTTP URL whenever `am` runs; the installer and `am setup run` write HTTP URL entries.
 - **Examples**: Token-free client templates live under `docs/examples/mcp/`
 
 ---
@@ -596,6 +595,7 @@ send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
 #### Session-bound agent identity (opt-in)
 
+Available from the first release after v0.3.38 (see [CHANGELOG.md](CHANGELOG.md)).
 Set `MESSAGING_SESSION_IDENTITY=true` on the server to let an MCP session act as
 the identities it established without a registration token in the model-visible
 transcript:
@@ -709,7 +709,7 @@ token values.
 | `projects` | `mark-identity`, `discovery-init`, `adopt` |
 | `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread`, `replay-queued`, `discard-queued` |
 | `products` | `ensure`, `link`, `status`, `search`, `inbox`, `summarize-thread` |
-| `doctor` (28 verbs) | `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `ls`, `explain`, `fixers`, `capabilities`, `robot-docs`, `artifacts`, `reclaim`, `selftest`, `mcp-selftest`, `write-selftest`, `support-bundle`, `repair`, `reconstruct`, `backups`, `restore`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix-orphan-refs`, `pack-archive`, `vacuum` (`vacuum` is on `main` and unreleased as of 2026-09-01) |
+| `doctor` (28 verbs) | `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `ls`, `explain`, `fixers`, `capabilities`, `robot-docs`, `artifacts`, `reclaim`, `selftest`, `mcp-selftest`, `write-selftest`, `support-bundle`, `repair`, `reconstruct`, `backups`, `restore`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix-orphan-refs`, `pack-archive`, `vacuum` |
 | `agents` | `register`, `create`, `list`, `show`, `detect`, `reap`, `resolve-pane` |
 | `tooling` | `directory`, `schemas`, `metrics`, `metrics-core`, `diagnostics`, `locks`, `decommission-fts` |
 | `macros` | `start-session`, `prepare-thread`, `file-reservation-cycle`, `contact-handshake` |
@@ -1010,7 +1010,7 @@ sequenceDiagram
 2. **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=3600, exclusive=true)`
 3. **Communicate with threads:** `send_message(..., thread_id="FEAT-123")`, check with `fetch_inbox`, acknowledge with `acknowledge_message`
 4. **Quick reads:** `resource://inbox/{Agent}?project=<abs-path>&limit=20`
-5. **Tell the whole project once:** address the project's shared mailbox as `project:<slug>` (or `project:<human_key>`):
+5. **Tell the whole project once:** address the project's shared mailbox as `project:<slug>` (or `project:<human_key>`). Available from the first release after v0.3.38 (see [CHANGELOG.md](CHANGELOG.md)):
 
    ```
    send_message(project_key="/abs/path", sender_name="GreenCastle",

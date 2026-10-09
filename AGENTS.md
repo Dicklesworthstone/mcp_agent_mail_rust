@@ -103,12 +103,12 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.10.0`, immutable Git revision `1c2e5e4b`; imported as `fastmcp`) | MCP protocol implementation; full family pinned to preserve legacy stdio version negotiation on Asupersync 0.5 |
-| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; FrankenSQLite `=0.4.4` is the runtime `DbConn`, pinned to `db458bfba780e79d099d9f8986da5a1f7b360901` for SQL binding, schema-prefix, NOCASE, INSERT SELECT UPSERT, and Linux descriptor-retention repairs. Embedded Beads still uses a separate patched 0.3.18 engine |
+| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; registry FrankenSQLite `=0.4.10` is the runtime `DbConn`. The `[patch]` Git revision `2633b38a` in `Cargo.toml` applies only to embedded Beads' separate 0.3.18 engine |
 | `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
 | `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Search V3 engine; lexical (Tantivy) tier by default, semantic/rerank behind the `hybrid` feature. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
 | `beads_rust` (`=0.6.0`, default features disabled) | Issue tracking integration; separate patched FrankenSQLite 0.3.18 engine |
-| `franken-agent-detection` (`0.2.2`) | Installed coding-agent detection for setup/doctor |
+| `franken-agent-detection` (`0.3.7`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
 | `chrono` | Timestamp handling (i64 microseconds since epoch) |
 | `thiserror` | Ergonomic error type derivation |
@@ -337,7 +337,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 | `am doctor support-bundle` (`--json`) | Writes a sanitized support bundle only (N2) | 0 |
 | `am doctor artifacts` | No (read-only run inventory) | 0 |
 | `am doctor archive-verify` | No (archive vs SQLite tamper cross-check) | see `--help` |
-| `am doctor vacuum` (main, unreleased as of 2026-09-01) | Yes (in-place VACUUM/ANALYZE; supervised-owner protocol; `--dry-run` is read-only) | see `--help` |
+| `am doctor vacuum` | Yes (in-place VACUUM/ANALYZE; supervised-owner protocol; `--dry-run` is read-only) | see `--help` |
 
 Legacy verbs preserved for backward compat: `repair`, `backups`, `restore`, `reconstruct`, `archive-scan`, `archive-normalize`, `fix` (without `--only`, runs the legacy multi-detector flow), `fix-orphan-refs`, `pack-archive`. New work should prefer the per-FM verbs above.
 
@@ -746,7 +746,7 @@ documented (GH#290).
 ### Quick Start
 
 ```bash
-am                                        # Auto-detect agents, configure MCP, start server + TUI
+am                                        # Start server + TUI (keeps client configs; `am setup run` configures them)
 am serve-http --path api                  # Use /api/ transport instead of /mcp/
 am serve-http --no-auth                   # Skip authentication (local dev)
 mcp-agent-mail serve --no-tui             # Headless server (no interactive TUI)
@@ -916,12 +916,13 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
    ```
    file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
    ```
-   For an exact retry after a timeout, `file_reservation_paths` alone accepts a
-   stable optional `idempotency_key`. Reusing that key with the same normalized
-   request replays the grant with `idempotent_replay: true`; different arguments
+   For an exact retry after a timeout, `file_reservation_paths`, `send_message`,
+   `reply_message` and `acknowledge_message` accept a stable optional
+   `idempotency_key`. Reusing that key with the same normalized request replays
+   the original result with `idempotent_replay: true`; different arguments
    return `IDEMPOTENCY_KEY_CONFLICT`. Keys are scoped to `(project, tool)` and
-   retained for `AM_IDEMPOTENCY_RETENTION_SECS` (24h by default). Do not imply
-   that every mutating tool currently exposes this key.
+   retained for `AM_IDEMPOTENCY_RETENTION_SECS` (24h by default). Other
+   mutating tools do not expose this key.
 
 3. **Communicate with threads:**
    ```
