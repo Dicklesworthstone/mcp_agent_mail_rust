@@ -1317,9 +1317,47 @@ fn current_exe_is_cargo_test_artifact() -> bool {
     std::env::current_exe()
         .ok()
         .as_deref()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "deps")
+        .is_some_and(path_has_cargo_test_artifact_layout)
+}
+
+/// Cargo test/bench artifact locations, from the executable path alone:
+///
+/// * `<target>/<profile>/deps/<name>-<hash>` (the classic layout), and
+/// * `<target>/<profile>/build/<package>/<hash>/out/<name>-<hash>` (the
+///   build-dir layout of the pinned nightly, also where RCH-relocated test
+///   binaries run from; GH#340). There no binary lives under `deps/`, so a
+///   `deps`-only check left every integration-test binary outside this crate
+///   undetected under plain `cargo test`.
+///
+/// Shipped binaries (`<target>/<profile>/am`, `~/.local/bin/am`) match neither.
+fn path_has_cargo_test_artifact_layout(exe: &Path) -> bool {
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    if parent.file_name().is_some_and(|name| name == "deps") {
+        return true;
+    }
+    let in_build_out_dir = parent.file_name().is_some_and(|name| name == "out")
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "build");
+    in_build_out_dir
+        && exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(has_cargo_metadata_hash_suffix)
+}
+
+/// `<name>-<16 hex digits>` (optionally `.exe`): the hash Cargo appends to
+/// test and bench artifacts. Build-script outputs in `out/` carry no such tag.
+fn has_cargo_metadata_hash_suffix(file_name: &str) -> bool {
+    let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    stem.rsplit_once('-').is_some_and(|(name, hash)| {
+        !name.is_empty() && hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    })
 }
 
 /// When this process is running under a test harness and `storage_root`
@@ -7482,6 +7520,40 @@ mod tests {
                 guard_against_default_storage_root_in_test_mode(&explicit);
             },
         );
+    }
+
+    #[test]
+    fn cargo_test_artifacts_are_recognised_in_both_layouts() {
+        // GH#340: the pinned nightly (and RCH-relocated binaries) run tests from
+        // `build/<package>/<hash>/out/`, where a `deps`-only check missed them.
+        for test_binary in [
+            "/w/target/debug/deps/it-0123456789abcdef",
+            "/w/target/debug/build/mcp-agent-mail-storage/62e7a103e31a8cdc/out/it-0123456789abcdef",
+            "/w/target/debug/build/mcp-agent-mail-db/fffffffffffffff0/out/mcp_agent_mail_db-a1b2c3d4e5f60718",
+            "/w/target/debug/build/mcp-agent-mail-cli/0123456789abcdef/out/it-0123456789abcdef.exe",
+        ] {
+            assert!(
+                path_has_cargo_test_artifact_layout(Path::new(test_binary)),
+                "{test_binary} is a cargo test artifact"
+            );
+        }
+        // Shipped binaries, build-script outputs and look-alikes must never be
+        // mistaken for a test harness (the guard would then refuse real use).
+        for not_a_test in [
+            "/home/u/.local/bin/am",
+            "/w/target/release/am",
+            "/w/target/debug/mcp-agent-mail",
+            "/w/target/debug/build/zstd-sys/0123456789abcdef/out/libzstd.a",
+            "/w/target/debug/build/pkg/0123456789abcdef/out/gen-notahexhash12",
+            "/w/target/debug/build/pkg/out/it-0123456789abcdef",
+            "/srv/out/it-0123456789abcdef",
+            "am",
+        ] {
+            assert!(
+                !path_has_cargo_test_artifact_layout(Path::new(not_a_test)),
+                "{not_a_test} is not a cargo test artifact"
+            );
+        }
     }
 
     #[test]

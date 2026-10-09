@@ -20002,11 +20002,19 @@ mod tests {
     }
 
     fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        // Only the isolated child that run_prepared_http_test_in_child spawns
+        // calls this; its private DATABASE_URL and STORAGE_ROOT reach Config
+        // through the ordinary env parsing rather than a raw re-read (GH#340).
+        // Outside that child the env is not private: refuse instead of
+        // resolving the operator's default mailbox.
+        assert!(
+            std::env::var_os("AM_PREPARED_HTTP_STARTUP_TEST_CHILD").is_some(),
+            "prepared_http_test_config runs only inside the isolated child"
+        );
+        let isolated = mcp_agent_mail_core::Config::from_env();
         let config = mcp_agent_mail_core::Config {
-            database_url: std::env::var("DATABASE_URL").expect("isolated child database"),
-            storage_root: std::env::var_os("STORAGE_ROOT")
-                .expect("isolated child archive")
-                .into(),
+            database_url: isolated.database_url,
+            storage_root: isolated.storage_root,
             http_host: "127.0.0.1".to_string(),
             http_port: 0,
             http_bearer_token: None,
