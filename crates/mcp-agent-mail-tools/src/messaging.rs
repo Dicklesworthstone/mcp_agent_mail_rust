@@ -7165,10 +7165,10 @@ mod tests {
                                         mcp_error_cause(&error)
                                             .contains(blocked_parent.to_str().unwrap())
                                     );
-                                    assert!(
+                                    assert_eq!(
                                         crate::degraded_intents::read_queued_ack_intents(&config)
-                                            .unwrap()
-                                            .is_empty()
+                                            .unwrap(),
+                                        Vec::<crate::degraded_intents::QueuedAckIntent>::new()
                                     );
                                 } else {
                                     let queued: Value = serde_json::from_str(
@@ -7218,10 +7218,9 @@ mod tests {
                         )
                         .await
                         .expect_err("cancelled request must not queue");
-                        assert!(
-                            crate::degraded_intents::read_queued_ack_intents(&config)
-                                .unwrap()
-                                .is_empty()
+                        assert_eq!(
+                            crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                            Vec::<crate::degraded_intents::QueuedAckIntent>::new()
                         );
                         let queued: Value = serde_json::from_str(
                             &acknowledge_message(
@@ -7317,10 +7316,9 @@ mod tests {
                     Some("SESSION_IDENTITY_MISMATCH")
                 );
                 let config = Config::get();
-                assert!(
-                    crate::degraded_intents::read_queued_ack_intents(&config)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                    Vec::<crate::degraded_intents::QueuedAckIntent>::new()
                 );
                 for key in [None, Some("authorized-outage-key".to_string())] {
                     let queued: Value = serde_json::from_str(
@@ -7366,10 +7364,9 @@ mod tests {
                 )
                 .await
                 .expect("another session triggers accepted intent replay");
-                assert!(
-                    crate::degraded_intents::read_queued_ack_intents(&config)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                    Vec::<crate::degraded_intents::QueuedAckIntent>::new()
                 );
                 let state =
                     queries::fetch_inbox(&cx, &pool, project_id, bob.id.unwrap(), false, None, 10)

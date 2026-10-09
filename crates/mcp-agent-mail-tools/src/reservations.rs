@@ -6910,8 +6910,9 @@ mod tests {
                                         mcp_error_supports_release_intent(&error),
                                         "original DB error: {error}"
                                     );
-                                    assert!(
-                                        read_queued_release_intents(&config).unwrap().is_empty()
+                                    assert_eq!(
+                                        read_queued_release_intents(&config).unwrap(),
+                                        Vec::<QueuedReleaseIntent>::new()
                                     );
                                 } else {
                                     let queued: Value = serde_json::from_str(
@@ -6939,7 +6940,10 @@ mod tests {
                                 .iter()
                                 .all(|lease| lease.released_ts.is_none() == enabled)
                         );
-                        assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                        assert_eq!(
+                            read_queued_release_intents(&config).unwrap(),
+                            Vec::<QueuedReleaseIntent>::new()
+                        );
 
                         let cancelled = McpContext::with_state(
                             cx.clone(),
@@ -6956,7 +6960,10 @@ mod tests {
                         )
                         .await
                         .expect_err("cancelled request cannot queue");
-                        assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                        assert_eq!(
+                            read_queued_release_intents(&config).unwrap(),
+                            Vec::<QueuedReleaseIntent>::new()
+                        );
                         let queued: Value = serde_json::from_str(
                             &release_file_reservations(
                                 &unbound,
@@ -7049,7 +7056,10 @@ mod tests {
                         Some("SESSION_IDENTITY_MISMATCH")
                     );
                     let config = Config::get();
-                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        Vec::<QueuedReleaseIntent>::new()
+                    );
                     let queued: Value = serde_json::from_str(
                         &release_file_reservations(
                             &bob_ctx,
@@ -7090,7 +7100,10 @@ mod tests {
                     )
                     .await
                     .expect("another session triggers accepted release replay");
-                    assert!(read_queued_release_intents(&config).unwrap().is_empty());
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        Vec::<QueuedReleaseIntent>::new()
+                    );
                     let leases = queries::get_reservations_by_ids(
                         &cx,
                         &pool,

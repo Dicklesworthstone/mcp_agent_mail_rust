@@ -879,6 +879,7 @@ fn product_inbox_authorizes_every_project_before_returning_body_or_metadata() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn product_inbox_scope_excludes_later_links_and_legacy_name_aliases() {
     run_with_identity_options(true, false, true, |cx| async move {
         use mcp_agent_mail_db::queries;
@@ -1056,6 +1057,7 @@ fn product_inbox_scope_excludes_later_links_and_legacy_name_aliases() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn build_slots_authorize_before_creating_or_changing_lease_files() {
     for enabled in [true, false] {
         run_with_identity_options(enabled, false, true, |cx| async move {
@@ -1229,6 +1231,7 @@ fn build_slots_authorize_before_creating_or_changing_lease_files() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn force_release_authorizes_the_requester_and_preserves_operator_override() {
     for enabled in [true, false] {
         run_with_session_identity(enabled, false, |cx| async move {
@@ -1299,11 +1302,11 @@ fn force_release_authorizes_the_requester_and_preserves_operator_override() {
                     .unwrap(),
                     before
                 );
-                assert!(
+                assert_eq!(
                     inbox(&other, &project, &holder)
                         .await
-                        .expect("holder inbox")
-                        .is_empty()
+                        .expect("holder inbox"),
+                    Vec::<Value>::new()
                 );
                 let released: Value = serde_json::from_str(
                     &force_release_file_reservation(

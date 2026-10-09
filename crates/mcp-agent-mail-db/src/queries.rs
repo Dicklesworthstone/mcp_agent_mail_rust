@@ -10753,8 +10753,9 @@ struct ProductInboxQueryOptions<'a> {
     viewer_ids: Option<&'a [i64]>,
 }
 
-/// Resolve the canonical viewer in every linked project in one read. Match
-/// `get_agent`'s lowest-ID rule for legacy case-variant registrations. The
+/// Resolve the canonical viewer in every linked project in one read.
+///
+/// Match `get_agent`'s lowest-ID rule for legacy case-variant registrations. The
 /// returned IDs can pin a later inbox read to exactly these identities, even
 /// if product links or same-name registrations change during authorization.
 pub async fn product_inbox_agents(
@@ -10796,7 +10797,9 @@ pub async fn product_inbox_agents(
     }
 }
 
-/// Read only the preflighted viewers. Both mailbox arms still require current
+/// Read only the preflighted viewers.
+///
+/// Both mailbox arms still require current
 /// membership in this product; new links or name aliases cannot expand the
 /// caller's authorized identity scope between preflight and the read.
 #[allow(clippy::too_many_arguments)]

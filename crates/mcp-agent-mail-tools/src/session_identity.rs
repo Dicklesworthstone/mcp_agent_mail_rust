@@ -373,7 +373,7 @@ mod tests {
             assert!(!authorization.permits_unresolved_actor(Some(10)));
             assert!(authorization.permits_unresolved_actor(Some(20)));
             unbind(&ctx, 1);
-            assert!(session_bindings(&ctx).is_empty());
+            assert_eq!(session_bindings(&ctx), Vec::<SessionBinding>::new());
             authorization
                 .authorize(&ctx, &own, "acknowledge mail")
                 .expect("original owner");

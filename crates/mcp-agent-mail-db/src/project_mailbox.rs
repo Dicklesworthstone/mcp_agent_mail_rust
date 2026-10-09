@@ -630,7 +630,9 @@ fn verify_read_receipts(
 }
 
 /// Record read receipts for the visible, still-unread project deliveries
-/// among `message_ids`. Ids that are not project deliveries visible to the
+/// among `message_ids`.
+///
+/// Ids that are not project deliveries visible to the
 /// agent are ignored. Runs in one write transaction on `conn`, verifies the
 /// resulting receipts before commit, and rolls back failures. A caller-owned
 /// transaction is never committed or rolled back by this function.
@@ -829,7 +831,10 @@ mod tests {
             receipts.sort_unstable_by_key(|receipt| receipt.0);
             assert_eq!(
                 receipts,
-                vec![(100, Some(first.read_ts), Some(77)), (200, Some(55), Some(66))]
+                vec![
+                    (100, Some(first.read_ts), Some(77)),
+                    (200, Some(55), Some(66))
+                ]
             );
             assert_eq!(
                 visible_receipts(conn, 30, &[100]).unwrap(),
@@ -1013,7 +1018,8 @@ mod tests {
             "project_mailbox_deliveries ADD COLUMN kind TEXT NOT NULL DEFAULT 'to'",
             "project_mailbox_deliveries ADD COLUMN delivered_ts INTEGER NOT NULL DEFAULT 1000",
         ] {
-            conn.execute_raw(&format!("ALTER TABLE {addition}")).unwrap();
+            conn.execute_raw(&format!("ALTER TABLE {addition}"))
+                .unwrap();
         }
     }
 
@@ -1049,7 +1055,11 @@ mod tests {
             conn.execute_raw("PRAGMA query_only = ON").unwrap();
             let error = fetch_project_mailbox_rows_from_conn(conn, 1, 20, None, 10, options())
                 .expect_err("missing receipts cannot erase an existing shared inbox");
-            assert!(error.to_string().contains("incomplete project mailbox schema"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("incomplete project mailbox schema")
+            );
             assert!(!is_missing_project_mailbox_table_error(&error.to_string()));
             assert!(project_mailbox_delivery_from_conn(conn, 100).is_err());
             conn.execute_raw("PRAGMA query_only = OFF").unwrap();
@@ -1079,8 +1089,10 @@ mod tests {
             add_reader_columns(conn);
             conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, 42, 77)")
                 .unwrap();
-            conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
-                .unwrap();
+            conn.execute_raw(
+                "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            )
+            .unwrap();
             for error in [
                 fetch_project_mailbox_rows_from_conn(conn, 1, 20, None, 10, options())
                     .expect_err("missing delivery authority"),
@@ -1089,7 +1101,11 @@ mod tests {
                 mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100])
                     .expect_err("must not acknowledge missing delivery authority"),
             ] {
-                assert!(error.to_string().contains("incomplete project mailbox schema"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("incomplete project mailbox schema")
+                );
                 assert!(!is_missing_project_mailbox_table_error(&error.to_string()));
             }
             assert_receipt_writer_released(conn);
@@ -1128,7 +1144,9 @@ mod tests {
                 assert!(error.to_string().contains("not an integer"));
                 let rows = conn
                     .query_sync(
-                        &format!("SELECT typeof({column}) AS storage_type FROM project_mailbox_receipts"),
+                        &format!(
+                            "SELECT typeof({column}) AS storage_type FROM project_mailbox_receipts"
+                        ),
                         &[],
                     )
                     .unwrap();
