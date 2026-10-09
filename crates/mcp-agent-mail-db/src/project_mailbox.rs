@@ -95,14 +95,55 @@ pub fn project_mailbox_address(project_slug: &str) -> String {
     format!("{PROJECT_MAILBOX_ADDRESS_PREFIX}{project_slug}")
 }
 
-/// Whether a database error only says the shared-mailbox tables do not exist.
+/// Whether an error names the missing shared-delivery table specifically.
 ///
-/// That is a mailbox opened read-only before its schema was upgraded. It
-/// cannot hold project deliveries, so readers treat it as empty.
+/// Missing receipts are NOT evidence of an empty mailbox: existing deliveries
+/// may still require reads and acknowledgements. This classifier is also used
+/// by product-inbox and event readers; never hide a receipt-schema failure.
 #[must_use]
 pub fn is_missing_project_mailbox_table_error(message: &str) -> bool {
     let lowered = message.to_ascii_lowercase();
-    lowered.contains("no such table") && lowered.contains("project_mailbox_")
+    missing_table_name(&lowered) == Some("project_mailbox_deliveries")
+}
+
+fn missing_table_name(message: &str) -> Option<&str> {
+    let (_, suffix) = message.split_once("no such table:")?;
+    let name = suffix.split_whitespace().next()?;
+    let name = name.strip_prefix("main.").unwrap_or(name);
+    Some(name.trim_matches(['\'', '"', '`', '[', ']']))
+}
+
+/// Only a genuinely pre-upgrade shared schema may use the empty-mailbox
+/// fallback. Run this catalog check on a missing-table error, not on healthy
+/// reads. An incomplete schema, failed inspection or broken view stays an
+/// error; callers must not mistake it for a successfully observed empty inbox.
+fn allow_absent_shared_schema(
+    conn: &impl crate::pool::SyncQuery,
+    error: &str,
+) -> Result<(), DbError> {
+    let lowered = error.to_ascii_lowercase();
+    if !matches!(
+        missing_table_name(&lowered),
+        Some("project_mailbox_deliveries" | "project_mailbox_receipts")
+    ) {
+        return Err(DbError::Sqlite(error.to_string()));
+    }
+    let objects = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE name COLLATE NOCASE \
+             IN ('project_mailbox_deliveries', 'project_mailbox_receipts')",
+            &[],
+        )
+        .map_err(|failure| DbError::Sqlite(failure.to_string()))?;
+    if !objects.is_empty() {
+        // Do not echo a missing-table signature that an outer legacy reader
+        // could catch again and turn into an empty result.
+        return Err(DbError::Sqlite(
+            "incomplete project mailbox schema; delivery and receipt tables must be repaired"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Shared-mailbox inbox rows for one agent, newest first, with the same
@@ -162,10 +203,10 @@ pub fn fetch_project_mailbox_rows_from_conn(
 
     let rows = match conn.query_sync(&sql, &params) {
         Ok(rows) => rows,
-        Err(error) if is_missing_project_mailbox_table_error(&error.to_string()) => {
+        Err(error) => {
+            allow_absent_shared_schema(conn, &error.to_string())?;
             return Ok(Vec::new());
         }
-        Err(error) => return Err(DbError::Sqlite(error.to_string())),
     };
 
     let column = |row: &sqlmodel_core::Row, index: usize| -> Result<Value, DbError> {
@@ -388,10 +429,10 @@ fn visible_receipts(
         params.extend(chunk.iter().copied().map(Value::BigInt));
         let rows = match conn.query_sync(&sql, &params) {
             Ok(rows) => rows,
-            Err(error) if is_missing_project_mailbox_table_error(&error.to_string()) => {
+            Err(error) => {
+                allow_absent_shared_schema(conn, &error.to_string())?;
                 return Ok(Vec::new());
             }
-            Err(error) => return Err(DbError::Sqlite(error.to_string())),
         };
         for row in rows {
             let message_id = row
@@ -685,10 +726,10 @@ pub fn project_mailbox_delivery_from_conn(
         &[Value::BigInt(message_id)],
     ) {
         Ok(rows) => rows,
-        Err(error) if is_missing_project_mailbox_table_error(&error.to_string()) => {
+        Err(error) => {
+            allow_absent_shared_schema(conn, &error.to_string())?;
             return Ok(None);
         }
-        Err(error) => return Err(DbError::Sqlite(error.to_string())),
     };
     let Some(row) = delivery.into_iter().next() else {
         return Ok(None);
@@ -726,8 +767,8 @@ pub fn project_mailbox_delivery_from_conn(
             agent_name: row
                 .get_named::<String>("agent_name")
                 .map_err(|error| DbError::Sqlite(error.to_string()))?,
-            read_ts: row.get_named::<Option<i64>>("read_ts").ok().flatten(),
-            ack_ts: row.get_named::<Option<i64>>("ack_ts").ok().flatten(),
+            read_ts: receipt_timestamp(&row, "read_ts")?,
+            ack_ts: receipt_timestamp(&row, "ack_ts")?,
         });
     }
     Ok(Some(ProjectMailboxDeliveryReceipt {
@@ -956,6 +997,192 @@ mod tests {
             );
             assert_receipt_writer_released(conn);
         });
+    }
+
+    fn add_reader_columns(conn: &DbConn) {
+        for addition in [
+            "agents ADD COLUMN name TEXT NOT NULL DEFAULT 'Viewer'",
+            "messages ADD COLUMN thread_id TEXT",
+            "messages ADD COLUMN topic TEXT",
+            "messages ADD COLUMN subject TEXT NOT NULL DEFAULT 'shared'",
+            "messages ADD COLUMN body_md TEXT NOT NULL DEFAULT 'body'",
+            "messages ADD COLUMN importance TEXT NOT NULL DEFAULT 'normal'",
+            "messages ADD COLUMN ack_required INTEGER NOT NULL DEFAULT 1",
+            "messages ADD COLUMN recipients_json TEXT NOT NULL DEFAULT '{}'",
+            "messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+            "project_mailbox_deliveries ADD COLUMN kind TEXT NOT NULL DEFAULT 'to'",
+            "project_mailbox_deliveries ADD COLUMN delivered_ts INTEGER NOT NULL DEFAULT 1000",
+        ] {
+            conn.execute_raw(&format!("ALTER TABLE {addition}")).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_receipt_errors_are_not_classified_as_empty_shared_deliveries() {
+        for error in [
+            "no such table: project_mailbox_receipts",
+            "Query error: no such table: main.project_mailbox_receipts",
+            "no such table: project_mailbox_deliveries_backup",
+            "no such table: messages; SELECT * FROM project_mailbox_deliveries",
+            "database is busy: project_mailbox_deliveries",
+        ] {
+            assert!(!is_missing_project_mailbox_table_error(error), "{error}");
+        }
+        for error in [
+            "no such table: project_mailbox_deliveries",
+            "Query error: no such table: main.project_mailbox_deliveries",
+            "no such table: \"PROJECT_MAILBOX_DELIVERIES\"",
+        ] {
+            assert!(is_missing_project_mailbox_table_error(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn missing_receipt_table_refuses_reads_and_writeback_until_schema_is_restored() {
+        receipt_fixture(|conn| {
+            add_reader_columns(conn);
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, 42, 77)")
+                .unwrap();
+            assert_eq!(visible_ids(conn, 1, 20), vec![200, 100]);
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+                .unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            let error = fetch_project_mailbox_rows_from_conn(conn, 1, 20, None, 10, options())
+                .expect_err("missing receipts cannot erase an existing shared inbox");
+            assert!(error.to_string().contains("incomplete project mailbox schema"));
+            assert!(!is_missing_project_mailbox_table_error(&error.to_string()));
+            assert!(project_mailbox_delivery_from_conn(conn, 100).is_err());
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            assert!(mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100, 200]).is_err());
+            assert_receipt_writer_released(conn);
+
+            conn.execute_raw("ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts")
+                .unwrap();
+            assert_eq!(visible_ids(conn, 1, 20), vec![200, 100]);
+            assert_eq!(
+                visible_receipts(conn, 20, &[100]).unwrap(),
+                vec![(100, Some(42), Some(77))]
+            );
+            assert_eq!(
+                mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100, 200])
+                    .unwrap()
+                    .unwrap()
+                    .message_ids,
+                vec![200]
+            );
+        });
+    }
+
+    #[test]
+    fn missing_delivery_table_with_retained_receipts_is_not_a_legacy_empty_schema() {
+        receipt_fixture(|conn| {
+            add_reader_columns(conn);
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, 42, 77)")
+                .unwrap();
+            conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+                .unwrap();
+            for error in [
+                fetch_project_mailbox_rows_from_conn(conn, 1, 20, None, 10, options())
+                    .expect_err("missing delivery authority"),
+                project_mailbox_delivery_from_conn(conn, 100)
+                    .expect_err("orphan receipts are not a pre-upgrade schema"),
+                mark_project_mailbox_read_batch_sync_conn(conn, 20, &[100])
+                    .expect_err("must not acknowledge missing delivery authority"),
+            ] {
+                assert!(error.to_string().contains("incomplete project mailbox schema"));
+                assert!(!is_missing_project_mailbox_table_error(&error.to_string()));
+            }
+            assert_receipt_writer_released(conn);
+            assert_eq!(
+                conn.query_sync("SELECT ack_ts FROM project_mailbox_receipts", &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("ack_ts")
+                    .unwrap(),
+                77
+            );
+        });
+    }
+
+    #[test]
+    fn delivery_receipt_report_refuses_malformed_state_without_overwriting_it() {
+        for column in ["read_ts", "ack_ts"] {
+            receipt_fixture(|conn| {
+                add_reader_columns(conn);
+                conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (100, 20, 42, 77)")
+                    .unwrap();
+                let receipt = project_mailbox_delivery_from_conn(conn, 100)
+                    .unwrap()
+                    .unwrap();
+                let reader = receipt
+                    .agents
+                    .iter()
+                    .find(|agent| agent.agent_id == 20)
+                    .unwrap();
+                assert_eq!((reader.read_ts, reader.ack_ts), (Some(42), Some(77)));
+                conn.execute_raw(&format!(
+                    "UPDATE project_mailbox_receipts SET {column} = X'0102' WHERE agent_id = 20"
+                ))
+                .unwrap();
+                let error = project_mailbox_delivery_from_conn(conn, 100)
+                    .expect_err("malformed state must not be reported as NULL");
+                assert!(error.to_string().contains("not an integer"));
+                let rows = conn
+                    .query_sync(
+                        &format!("SELECT typeof({column}) AS storage_type FROM project_mailbox_receipts"),
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<String>("storage_type").unwrap(), "blob");
+            });
+        }
+    }
+
+    #[test]
+    fn receipt_verification_covers_the_last_sql_chunk_and_preserves_atomicity() {
+        for ignore_last in [false, true] {
+            receipt_fixture(|conn| {
+                let last = 1000 + i64::try_from(MAX_IN_CLAUSE_ITEMS).unwrap();
+                conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                for message in 1000..=last {
+                    conn.execute_sync(
+                        "INSERT INTO messages VALUES (?, 1, 10, 3000)",
+                        &[Value::BigInt(message)],
+                    )
+                    .unwrap();
+                    conn.execute_sync(
+                        "INSERT INTO project_mailbox_deliveries VALUES (?, 1)",
+                        &[Value::BigInt(message)],
+                    )
+                    .unwrap();
+                }
+                conn.execute_raw("COMMIT").unwrap();
+                if ignore_last {
+                    conn.execute_raw(&format!(
+                        "CREATE TRIGGER ignore_last BEFORE UPDATE ON project_mailbox_receipts \
+                         WHEN NEW.message_id = {last} BEGIN SELECT RAISE(IGNORE); END"
+                    ))
+                    .unwrap();
+                }
+                let ids: Vec<i64> = (1000..=last).collect();
+                let result = mark_project_mailbox_read_batch_sync_conn(conn, 20, &ids);
+                if ignore_last {
+                    assert!(result.is_err());
+                    assert!(
+                        conn.query_sync("SELECT 1 FROM project_mailbox_receipts", &[])
+                            .unwrap()
+                            .is_empty()
+                    );
+                } else {
+                    assert_eq!(result.unwrap().unwrap().message_ids.len(), ids.len());
+                    assert!(
+                        mark_project_mailbox_read_batch_sync_conn(conn, 20, &ids)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                assert_receipt_writer_released(conn);
+            });
+        }
     }
 
     fn test_conn() -> DbConn {
