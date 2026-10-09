@@ -10211,7 +10211,7 @@ pub fn stage_sqlite_family_for_health_probe(
     // Reclaim copies left behind by earlier invocations that were killed before
     // their staging guard could run (GH#308).
     sweep_stale_health_probe_dirs_once();
-    let mut last_not_found = None;
+    let mut last_retry_error = None;
     for _ in 0..3 {
         match stage_sqlite_family_for_health_probe_once(source) {
             Ok(staged) => return Ok(staged),
@@ -10225,21 +10225,43 @@ pub fn stage_sqlite_family_for_health_probe(
                 // metadata classification and a no-follow open. Retry the
                 // complete private copy instead of treating that race as
                 // corruption or falling back to a writable live open.
-                last_not_found = Some(error);
+                last_retry_error = Some(error);
                 std::thread::yield_now();
             }
             Err(error) => {
-                return Err(SqlError::Custom(format!(
-                    "failed to stage source-byte-neutral SQLite health probe for {}: {error}",
-                    source.display()
+                // Preserve I/O as a probe failure, not an engine verdict. In
+                // particular, a full or quota-limited TMPDIR says nothing
+                // about the mailbox and must not authorize reconstruction.
+                return Err(SqlError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not stage source-byte-neutral SQLite health probe for {} using temporary directory {} (TMPDIR/TEMP/TMP): {error}; mailbox health could not be determined",
+                        source.display(),
+                        snapshot_temp_root().display()
+                    ),
                 )));
             }
         }
     }
-    Err(SqlError::Custom(format!(
-        "failed to stage source-byte-neutral SQLite health probe for {} because its family changed repeatedly: {}",
-        source.display(),
-        last_not_found.map_or_else(|| "unknown race".to_string(), |error| error.to_string())
+    let error = last_retry_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "unknown staging race")
+    });
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        // Preserve the existing guarded live-read fallback for contention.
+        // Explicitly identify it as busy even if a source pathname happens
+        // to contain a database-corruption signature.
+        return Err(SqlError::Custom(format!(
+            "database is busy: failed to stage source-byte-neutral SQLite health probe for {} because its family changed repeatedly: {error}",
+            source.display()
+        )));
+    }
+    Err(SqlError::Io(std::io::Error::new(
+        error.kind(),
+        format!(
+            "could not stage source-byte-neutral SQLite health probe for {} using temporary directory {} (TMPDIR/TEMP/TMP) after three attempts: {error}; mailbox health could not be determined",
+            source.display(),
+            snapshot_temp_root().display()
+        ),
     )))
 }
 

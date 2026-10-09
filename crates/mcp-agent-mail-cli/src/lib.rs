@@ -14313,11 +14313,12 @@ fn sqlite_file_is_healthy(path: &Path) -> CliResult<bool> {
     if !path.exists() {
         return Ok(true);
     }
-    mcp_agent_mail_db::pool::sqlite_file_is_healthy(path).map_err(|error| {
-        CliError::Other(format!(
+    mcp_agent_mail_db::pool::sqlite_file_is_healthy(path).map_err(|error| match error {
+        mcp_agent_mail_db::sqlmodel_core::Error::Io(error) => CliError::Io(error),
+        error => CliError::Other(format!(
             "source-byte-neutral SQLite health check failed for {}: {error}",
             path.display()
-        ))
+        )),
     })
 }
 
@@ -14396,6 +14397,7 @@ where
     let mut probe_error_was_inconclusive = false;
     let mut healthy = match health_probe(selected_path.as_path()) {
         Ok(v) => v,
+        Err(error @ CliError::Io(_)) => return Err(error),
         Err(e) => {
             let msg = e.to_string();
             if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
@@ -14425,6 +14427,7 @@ where
                 used_absolute_fallback = true;
             }
             Ok(false) => {}
+            Err(error @ CliError::Io(_)) => return Err(error),
             Err(e) => {
                 let msg = e.to_string();
                 if is_snapshot_conflict_cli_error(&e) || is_sqlite_recovery_error_message(&msg) {
@@ -16133,15 +16136,23 @@ fn canonical_snapshot_tempdir_in(
     context: &str,
 ) -> CliResult<tempfile::TempDir> {
     let canonical_temp_dir = std::fs::canonicalize(temp_dir).map_err(|e| {
-        CliError::Other(format!(
-            "{context} snapshot tempdir {} is unusable: {e}",
-            temp_dir.display()
+        CliError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{context}: TMPDIR unusable at {}: {e}", temp_dir.display()),
         ))
     })?;
     tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(&canonical_temp_dir)
-        .map_err(|e| CliError::Other(format!("{context} snapshot tempdir failed: {e}")))
+        .map_err(|e| {
+            CliError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{context}: TMPDIR unusable at {}: {e}",
+                    canonical_temp_dir.display()
+                ),
+            ))
+        })
 }
 
 impl CanonicalSnapshotSource {
@@ -27288,9 +27299,10 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                         "doctor_check",
                     )
                     .map_err(|e| {
-                        CliError::Other(format!(
+                        let detail = format!(
                             "database probe failed at {candidate_path}: {probe_err}; fallback {fallback_path} failed: {e}"
-                        ))
+                        );
+                        e.into_cli_error(detail)
                     })?;
                     fallback
                         .conn
@@ -27318,6 +27330,11 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
         },
         Err(primary_err) => {
             let primary_err_text = primary_err.to_string();
+            if primary_err.source_unavailable {
+                return Err(primary_err.into_cli_error(format!(
+                    "cannot probe database at {candidate_path}: {primary_err_text}"
+                )));
+            }
             if let Some(fallback_path) =
                 sqlite_absolute_fallback_path(&candidate_path, &primary_err_text)
             {
@@ -27326,9 +27343,10 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                     "doctor_check",
                 )
                 .map_err(|e| {
-                    CliError::Other(format!(
+                    let detail = format!(
                         "cannot open database at {candidate_path}: {primary_err}; fallback {fallback_path} failed: {e}"
-                    ))
+                    );
+                    e.into_cli_error(detail)
                 })?;
                 fallback
                     .conn
@@ -27349,8 +27367,8 @@ fn open_db_for_doctor_check_read_only_with_context_inner(
                     fallback_due_to_missing_configured_path,
                 });
             }
-            Err(CliError::Other(format!(
-                "cannot open database at {candidate_path}: {primary_err}"
+            Err(primary_err.into_cli_error(format!(
+                "cannot open database at {candidate_path}: {primary_err_text}"
             )))
         }
     }
@@ -28376,9 +28394,29 @@ struct DoctorCanonicalDiagnosticOpenFailure {
     // inspected/refused the source. A prior live-export failure is never
     // canonical evidence.
     offline_authority_error: Option<String>,
+    // The source selector failed before a database probe could run. Keep
+    // this typed across the composite diagnostic so its text cannot turn a
+    // staging I/O error into a recoverable database error (br-txx8u).
+    source_unavailable: bool,
 }
 
 impl DoctorCanonicalDiagnosticOpenFailure {
+    fn unavailable(error: CliError) -> Self {
+        Self {
+            detail: error.to_string(),
+            offline_authority_error: None,
+            source_unavailable: true,
+        }
+    }
+
+    fn into_cli_error(self, detail: String) -> CliError {
+        if self.source_unavailable {
+            CliError::Io(std::io::Error::other(detail))
+        } else {
+            CliError::Other(detail)
+        }
+    }
+
     fn offline_corruption_detail(&self) -> Option<&str> {
         let detail = self.offline_authority_error.as_deref()?;
         matches!(
@@ -28439,11 +28477,12 @@ fn doctor_open_staged_family_copy_canonical(
     operation: &str,
 ) -> CliResult<DoctorCanonicalDiagnosticOpen> {
     let staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(db_path)
-        .map_err(|error| {
-            CliError::Other(format!(
+        .map_err(|error| match error {
+            mcp_agent_mail_db::sqlmodel_core::Error::Io(error) => CliError::Io(error),
+            error => CliError::Other(format!(
                 "{operation} staged family copy of {} failed: {error}",
                 db_path.display()
-            ))
+            )),
         })?
         .ok_or_else(|| {
             CliError::Other(format!(
@@ -28521,6 +28560,7 @@ fn doctor_open_canonical_source_for_diagnostic(
                 "{operation} canonical diagnostic source is unavailable for in-memory databases"
             ),
             offline_authority_error: None,
+            source_unavailable: false,
         });
     }
 
@@ -28543,6 +28583,9 @@ fn doctor_open_canonical_source_for_diagnostic(
     let staged_error = if franken_admitted {
         match doctor_open_staged_family_copy_canonical(db_path, operation) {
             Ok(opened) => return Ok(opened),
+            Err(error @ CliError::Io(_)) => {
+                return Err(DoctorCanonicalDiagnosticOpenFailure::unavailable(error));
+            }
             Err(error) => error.to_string(),
         }
     } else {
@@ -28563,6 +28606,7 @@ fn doctor_open_canonical_source_for_diagnostic(
                 .map_err(|error| DoctorCanonicalDiagnosticOpenFailure {
                     detail: error.to_string(),
                     offline_authority_error: None,
+                    source_unavailable: matches!(error, CliError::Io(_)),
                 })?;
                 return Ok(DoctorCanonicalDiagnosticOpen {
                     conn,
@@ -28570,6 +28614,9 @@ fn doctor_open_canonical_source_for_diagnostic(
                     _staged_family: None,
                     kind: DoctorCanonicalDiagnosticSourceKind::LiveLogicalSnapshot,
                 });
+            }
+            Err(error @ CliError::Io(_)) => {
+                return Err(DoctorCanonicalDiagnosticOpenFailure::unavailable(error));
             }
             Err(error) => error.to_string(),
         }
@@ -28599,6 +28646,9 @@ fn doctor_open_canonical_source_for_diagnostic(
             } else {
                 match doctor_open_staged_family_copy_canonical(db_path, operation) {
                     Ok(opened) => return Ok(opened),
+                    Err(error @ CliError::Io(_)) => {
+                        return Err(DoctorCanonicalDiagnosticOpenFailure::unavailable(error));
+                    }
                     Err(error) => error.to_string(),
                 }
             };
@@ -28613,6 +28663,7 @@ fn doctor_open_canonical_source_for_diagnostic(
                     truncate_doctor_open_source_clause(&offline_authority_error)
                 ),
                 offline_authority_error: Some(offline_authority_error),
+                source_unavailable: false,
             })
         }
     }
@@ -33492,12 +33543,13 @@ fn doctor_database_inventory_failure_strategy(
     error: &CliError,
     archive_reconstruct_available: bool,
     archive_root: &Path,
-) -> DoctorDatabaseFixStrategy {
+) -> CliResult<DoctorDatabaseFixStrategy> {
+    doctor_require_recoverable_probe_error(error)?;
     let detail = format!(
         "Database inventory probe failed: {}",
         truncate_doctor_command(&error.to_string())
     );
-    if archive_reconstruct_available {
+    Ok(if archive_reconstruct_available {
         DoctorDatabaseFixStrategy::Reconstruct(format!(
             "{detail}; reconstruct from archive {}",
             archive_root.display()
@@ -33507,7 +33559,25 @@ fn doctor_database_inventory_failure_strategy(
             "{detail}; no authoritative archive data was found under {}, attempting in-place repair",
             archive_root.display()
         ))
+    })
+}
+
+/// A failed probe authorizes recovery only when it actually describes a
+/// recoverable database defect. Resource exhaustion, failed staging, busy
+/// admission, cancellation and unknown errors are refusals, not damage.
+/// Keep this check before recovery admission so repeated startup attempts do
+/// not create or advance the durable breaker on a healthy mailbox.
+fn doctor_require_recoverable_probe_error(error: &CliError) -> CliResult<()> {
+    doctor_refuse_host_storage_fault("Database probe", error)?;
+    let detail = error.to_string();
+    if matches!(error, CliError::Io(_))
+        || !mcp_agent_mail_db::classify_db_error_message(&detail).repairable
+    {
+        return Err(CliError::Other(format!(
+            "Database probe could not complete; automatic repair/reconstruction is not authorized by this failure: {detail}"
+        )));
     }
+    Ok(())
 }
 
 fn doctor_database_probe_failure_strategy(
@@ -33515,12 +33585,13 @@ fn doctor_database_probe_failure_strategy(
     error: &CliError,
     archive_reconstruct_available: bool,
     archive_root: &Path,
-) -> DoctorDatabaseFixStrategy {
+) -> CliResult<DoctorDatabaseFixStrategy> {
+    doctor_require_recoverable_probe_error(error)?;
     let detail = format!(
         "{probe} failed: {}",
         truncate_doctor_command(&error.to_string())
     );
-    if archive_reconstruct_available {
+    Ok(if archive_reconstruct_available {
         DoctorDatabaseFixStrategy::Reconstruct(format!(
             "{detail}; reconstruct from archive {}",
             archive_root.display()
@@ -33530,7 +33601,7 @@ fn doctor_database_probe_failure_strategy(
             "{detail}; no authoritative archive data was found under {}, attempting in-place repair",
             archive_root.display()
         ))
-    }
+    })
 }
 
 /// Evaluate physical integrity without letting a clean logical rebuild hide a
@@ -33674,7 +33745,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     let opened = match open_db_for_doctor_check_read_only_with_context(database_url) {
         Ok(opened) => opened,
         Err(error) => {
-            doctor_refuse_host_storage_fault("Database open probe", &error)?;
+            doctor_require_recoverable_probe_error(&error)?;
             // The open error is a composite of every canonical-source branch
             // (`guarded live snapshot failed: ...; staged family copy failed:
             // ...; guarded offline canonical open failed: ...`); keep all of
@@ -33697,13 +33768,12 @@ fn doctor_database_fix_strategy_read_only_probes(
     let missing_tables = match doctor_required_tables_canonical(&opened.conn) {
         Ok(missing_tables) => missing_tables,
         Err(error) => {
-            doctor_refuse_host_storage_fault("Required-table probe", &error)?;
-            return Ok(doctor_database_probe_failure_strategy(
+            return doctor_database_probe_failure_strategy(
                 "Required-table probe",
                 &error,
                 archive_reconstruct_available,
                 archive_root,
-            ));
+            );
         }
     };
     if !missing_tables.is_empty() {
@@ -33727,12 +33797,11 @@ fn doctor_database_fix_strategy_read_only_probes(
         let db = match collect_doctor_db_inventory_canonical(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
-                doctor_refuse_host_storage_fault("Database inventory probe", &error)?;
-                return Ok(doctor_database_inventory_failure_strategy(
+                return doctor_database_inventory_failure_strategy(
                     &error,
                     archive_reconstruct_available,
                     archive_root,
-                ));
+                );
             }
         };
         if let Some(archive) = doctor_archive_inventory_for_drift(storage_root, archive_probe, &db)
@@ -33756,7 +33825,7 @@ fn doctor_database_fix_strategy_read_only_probes(
     ) {
         Ok(ok) => ok,
         Err(error) => {
-            doctor_refuse_host_storage_fault("PRAGMA integrity_check", &error)?;
+            doctor_require_recoverable_probe_error(&error)?;
             let detail = format!(
                 "PRAGMA integrity_check failed for {}: {error}",
                 opened.opened_path
@@ -33793,13 +33862,12 @@ fn doctor_database_fix_strategy_read_only_probes(
         match doctor_relational_integrity_diagnostics_canonical(&opened.conn) {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
-                doctor_refuse_host_storage_fault("Relational consistency probe", &error)?;
-                return Ok(doctor_database_probe_failure_strategy(
+                return doctor_database_probe_failure_strategy(
                     "Relational consistency probe",
                     &error,
                     archive_reconstruct_available,
                     archive_root,
-                ));
+                );
             }
         };
     let relational_diagnostic_detail =
@@ -33953,10 +34021,6 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
                     resolved.display()
                 ))
             })?;
-    } else if let Some(detail) = doctor_truncated_wal_sidecar_detail(resolved) {
-        return Ok(DoctorDatabaseFixStrategy::Repair(format!(
-            "{detail}; run `am doctor repair` to quarantine it before opening the database"
-        )));
     }
 
     let file_sanity = if cleanup_truncated_wal {
@@ -33964,6 +34028,37 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     } else {
         sqlite_doctor_file_sanity_read_only(&resolved_path)
     };
+    let file_sanity = match file_sanity {
+        Ok(sanity) => sanity,
+        Err(error) => {
+            doctor_refuse_host_storage_fault("Database sanity probe", &error)?;
+            return Err(error);
+        }
+    };
+
+    // A cached healthy verdict can describe a private copy whose truncated
+    // WAL was cleaned up. Require a fresh staging admission before proposing
+    // that cleanup on the live family: temporary storage may have become
+    // unusable since the cached probe (br-txx8u).
+    if !cleanup_truncated_wal && let Some(detail) = doctor_truncated_wal_sidecar_detail(resolved) {
+        let _staged = mcp_agent_mail_db::pool::stage_sqlite_family_for_health_probe(resolved)
+            .map_err(|error| match error {
+                mcp_agent_mail_db::sqlmodel_core::Error::Io(error) => CliError::Io(error),
+                error => CliError::Other(format!(
+                    "WAL repair preflight could not stage {}: {error}",
+                    resolved.display()
+                )),
+            })?
+            .ok_or_else(|| {
+                CliError::Other(format!(
+                    "WAL repair preflight could not stage the SQLite family at {}",
+                    resolved.display()
+                ))
+            })?;
+        return Ok(DoctorDatabaseFixStrategy::Repair(format!(
+            "{detail}; run `am doctor repair` to quarantine it before opening the database"
+        )));
+    }
 
     match file_sanity {
         // GH#300: an inconclusive staged-copy probe proves nothing about the
@@ -33971,14 +34066,14 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         // required tables, canonical integrity, relational consistency) and let
         // them establish a verdict; never turn "could not answer" into a
         // reconstruct recommendation.
-        Ok(sanity) if !sanity.healthy && sanity.inconclusive => {
+        sanity if !sanity.healthy && sanity.inconclusive => {
             tracing::info!(
                 path = %resolved.display(),
                 detail = %sanity.detail,
                 "doctor: the SQLite file-sanity probe was inconclusive; deferring to the live-path probes"
             );
         }
-        Ok(sanity) if !sanity.healthy => {
+        sanity if !sanity.healthy => {
             let detail = sanity.detail;
             let verdict = if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -33996,28 +34091,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
             // reaches the reporting surface, so return it raw here.
             return Ok(verdict);
         }
-        Err(error) => {
-            doctor_refuse_host_storage_fault("Database sanity probe", &error)?;
-            let verdict = if archive_reconstruct_available {
-                DoctorDatabaseFixStrategy::Reconstruct(format!(
-                    "Database sanity probe failed for {}: {}; archive recovery is available under {}",
-                    resolved.display(),
-                    truncate_doctor_command(&error.to_string()),
-                    archive_root.display()
-                ))
-            } else {
-                DoctorDatabaseFixStrategy::Repair(format!(
-                    "Database sanity probe failed for {}: {}",
-                    resolved.display(),
-                    truncate_doctor_command(&error.to_string())
-                ))
-            };
-            // A4 (br-bvq1x.1.4): a non-lock sanity-probe error must not funnel
-            // into a destructive reconstruct when the canonical cross-check at the
-            // entry-point chokepoint proves the DB healthy; return it raw here.
-            return Ok(verdict);
-        }
-        Ok(_) => {}
+        _ => {}
     }
 
     if !cleanup_truncated_wal {
@@ -34035,7 +34109,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let opened = match open_db_for_doctor_check_with_context(database_url) {
         Ok(opened) => opened,
         Err(error) => {
-            doctor_refuse_host_storage_fault("Database open probe", &error)?;
+            doctor_require_recoverable_probe_error(&error)?;
             return Ok(if archive_reconstruct_available {
                 DoctorDatabaseFixStrategy::Reconstruct(format!(
                     "Database open probe failed: {}; archive recovery is available under {}",
@@ -34054,13 +34128,12 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let missing_tables = match doctor_required_tables(&opened.conn) {
         Ok(missing_tables) => missing_tables,
         Err(error) => {
-            doctor_refuse_host_storage_fault("Required-table probe", &error)?;
-            return Ok(doctor_database_probe_failure_strategy(
+            return doctor_database_probe_failure_strategy(
                 "Required-table probe",
                 &error,
                 archive_reconstruct_available,
                 &archive_root,
-            ));
+            );
         }
     };
     if !missing_tables.is_empty() {
@@ -34084,12 +34157,11 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         let db = match collect_doctor_db_inventory(&opened.conn) {
             Ok(db) => db,
             Err(error) => {
-                doctor_refuse_host_storage_fault("Database inventory probe", &error)?;
-                return Ok(doctor_database_inventory_failure_strategy(
+                return doctor_database_inventory_failure_strategy(
                     &error,
                     archive_reconstruct_available,
                     &archive_root,
-                ));
+                );
             }
         };
         if let Some(archive) =
@@ -34121,7 +34193,7 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
     let integrity_ok = match integrity_probe {
         Ok(ok) => ok,
         Err(error) => {
-            doctor_refuse_host_storage_fault("PRAGMA integrity_check", &error)?;
+            doctor_require_recoverable_probe_error(&error)?;
             let detail = format!(
                 "PRAGMA integrity_check failed for {}: {error}",
                 opened.opened_path
@@ -34159,13 +34231,12 @@ fn doctor_database_fix_strategy_with_wal_cleanup(
         {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
-                doctor_refuse_host_storage_fault("Relational consistency probe", &error)?;
-                return Ok(doctor_database_probe_failure_strategy(
+                return doctor_database_probe_failure_strategy(
                     "Relational consistency probe",
                     &error,
                     archive_reconstruct_available,
                     &archive_root,
-                ));
+                );
             }
         };
     let relational_diagnostic_detail =
@@ -60788,7 +60859,8 @@ startup_timeout_sec = 42
                 .to_string(),
         );
 
-        let strategy = doctor_database_inventory_failure_strategy(&error, true, &archive_root);
+        let strategy = doctor_database_inventory_failure_strategy(&error, true, &archive_root)
+            .expect("corrupt inventory remains recoverable");
         match strategy {
             DoctorDatabaseFixStrategy::Reconstruct(detail) => {
                 assert!(detail.contains("Database inventory probe failed"));
@@ -60797,13 +60869,224 @@ startup_timeout_sec = 42
             other => panic!("archive-backed inventory failure should reconstruct: {other:?}"),
         }
 
-        let strategy = doctor_database_inventory_failure_strategy(&error, false, &archive_root);
+        let strategy = doctor_database_inventory_failure_strategy(&error, false, &archive_root)
+            .expect("corrupt inventory remains repairable without an archive");
         match strategy {
             DoctorDatabaseFixStrategy::Repair(detail) => {
                 assert!(detail.contains("Database inventory probe failed"));
                 assert!(detail.contains("no authoritative archive data"));
             }
             other => panic!("inventory failure without archive data should repair: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doctor_probe_failures_do_not_authorize_recovery_without_damage_evidence() {
+        let archive_root = Path::new("/archive/projects");
+        for detail in [
+            "Disk quota exceeded (os error 122)",
+            "No space left on device (os error 28)",
+            "Read-only file system (os error 30)",
+            "Permission denied (os error 13)",
+            "database is busy",
+            "Operation cancelled",
+            "unrecognized engine probe error",
+        ] {
+            let error = CliError::Other(detail.to_string());
+            for archive_available in [false, true] {
+                for result in [
+                    doctor_database_inventory_failure_strategy(
+                        &error,
+                        archive_available,
+                        archive_root,
+                    ),
+                    doctor_database_probe_failure_strategy(
+                        "Required-table probe",
+                        &error,
+                        archive_available,
+                        archive_root,
+                    ),
+                ] {
+                    let refusal = result.expect_err("a failed probe is not damage evidence");
+                    assert!(refusal.to_string().contains(detail));
+                    assert!(
+                        refusal.to_string().contains("not authorized")
+                            || refusal.to_string().contains("not mailbox damage"),
+                        "{refusal}"
+                    );
+                }
+            }
+        }
+
+        // R3 boundary forcing: a staging path/error can contain a corruption
+        // signature. Typed I/O must win over its text. The real filesystem
+        // refusal and startup/breaker path are exercised in the test below.
+        let io = CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "database disk image is malformed/TMPDIR: quota exceeded",
+        ));
+        assert!(doctor_require_recoverable_probe_error(&io).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_unusable_tmpdir_preserves_mailbox_and_recovery_authority() {
+        const FIXTURE: &str = "AM_TEST_STARTUP_TMPDIR_FIXTURE";
+        const PRIME_CACHE: &str = "AM_TEST_STARTUP_TMPDIR_PRIME_CACHE";
+        const TEST: &str =
+            "tests::startup_unusable_tmpdir_preserves_mailbox_and_recovery_authority";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            let db_path = root.join("storage.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
+            let bad_tmp = std::env::temp_dir();
+            assert!(
+                bad_tmp.is_file() || !bad_tmp.exists(),
+                "TMPDIR must be a real unusable path"
+            );
+
+            if std::env::var_os(PRIME_CACHE).is_some() {
+                let good_tmp = root.join("usable-temp");
+                // The DB staging helper honors the config test override;
+                // std::env::temp_dir still points at the bad directory. This
+                // primes only the healthy-verdict cache before the real
+                // canonical source selector encounters the unusable TMPDIR.
+                mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                    &[("TMPDIR", good_tmp.to_str().expect("UTF-8 fixture"))],
+                    || {
+                        assert!(
+                            sqlite_file_is_healthy(&db_path)
+                                .expect("prime unchanged-family healthy verdict")
+                        );
+                    },
+                );
+            }
+
+            let repairs = std::cell::Cell::new(0);
+            let reconstructs = std::cell::Cell::new(0);
+            for _ in 0..3 {
+                let error = run_startup_database_self_heal_with(
+                    &db_url,
+                    &root,
+                    || {
+                        repairs.set(repairs.get() + 1);
+                        Err(CliError::Other("unexpected repair callback".to_string()))
+                    },
+                    |_| {
+                        reconstructs.set(reconstructs.get() + 1);
+                        Err(CliError::Other(
+                            "unexpected reconstruct callback".to_string(),
+                        ))
+                    },
+                )
+                .expect_err("startup must refuse an unavailable health probe");
+                let detail = error.to_string();
+                assert!(detail.contains("TMPDIR"), "{detail}");
+                assert!(detail.contains(&bad_tmp.display().to_string()), "{detail}");
+            }
+            assert_eq!(repairs.get(), 0, "refusal must precede repair admission");
+            assert_eq!(reconstructs.get(), 0, "refusal must precede reconstruction");
+            println!("STARTUP_TMPDIR_REFUSAL_CHILD_RAN");
+            return;
+        }
+
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let bad_tmp_file = fixture.path().join("not-a-directory");
+        std::fs::write(&bad_tmp_file, b"unusable temporary directory witness")
+            .expect("create deterministic ENOTDIR fixture");
+        for case in [
+            "cold",
+            "cached",
+            "truncated-wal",
+            "cached-truncated-wal",
+            "missing-temp",
+            "cached-missing-temp",
+        ] {
+            // Exhausting the staging helper's NotFound retries must retain
+            // its I/O classification even with damage words in the path.
+            let bad_tmp = if case.ends_with("missing-temp") {
+                fixture
+                    .path()
+                    .join("database disk image is malformed")
+                    .join("missing-temp")
+            } else {
+                bad_tmp_file.clone()
+            };
+            for existing_history in [false, true] {
+                let root = fixture.path().join(format!("{case}-{existing_history}"));
+                std::fs::create_dir_all(root.join("usable-temp")).expect("create fixture");
+                let db_path = root.join("storage.sqlite3");
+                seed_matching_archive_project(&root, "tmpdir-health");
+                let writer = seed_hot_franken_wal_family_with_live_owner(&db_path, "tmpdir-health");
+                mcp_agent_mail_db::close_db_conn(writer, "finish startup TMPDIR fixture");
+                if matches!(case, "truncated-wal" | "cached-truncated-wal") {
+                    std::fs::write(sqlite_sidecar_path(&db_path, "-wal"), b"truncated-wal")
+                        .expect("plant repairable WAL without touching the database");
+                }
+                if existing_history {
+                    let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(&db_path);
+                    let prior = mcp_agent_mail_db::recovery_breaker::record_failure(
+                        None,
+                        &fingerprint,
+                        "prior independent recovery failure",
+                        mcp_agent_mail_db::recovery_breaker::RecoveryBreakerConfig {
+                            max_consecutive_failures: 3,
+                            cooldown_secs: 21_600,
+                        },
+                        chrono::Utc::now().timestamp(),
+                    );
+                    mcp_agent_mail_db::recovery_breaker::store(&db_path, &prior)
+                        .expect("retain existing recovery history");
+                }
+                let breaker = mcp_agent_mail_db::recovery_breaker::breaker_sidecar_path(&db_path);
+                let breaker_before = std::fs::read(&breaker).ok();
+                let family_before = sqlite_family_bytes_for_cli_open_test(&db_path);
+                let identity_before = live_family_identity(&db_path);
+                let entries_before = directory_entry_names_for_cli_open_test(&root);
+
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                    .env(FIXTURE, &root)
+                    .env("TMPDIR", &bad_tmp)
+                    .env("TEMP", &bad_tmp)
+                    .env("TMP", &bad_tmp)
+                    .env("STORAGE_ROOT", &root)
+                    .env("AM_HEALTH_VERDICT_REUSE_SECS", "600");
+                if matches!(
+                    case,
+                    "cached" | "cached-truncated-wal" | "cached-missing-temp"
+                ) {
+                    child.env(PRIME_CACHE, "1");
+                } else {
+                    child.env_remove(PRIME_CACHE);
+                }
+                let output = child
+                    .output()
+                    .expect("run real startup refusal in fresh process");
+                assert!(
+                    output.status.success(),
+                    "{case}/{existing_history}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("STARTUP_TMPDIR_REFUSAL_CHILD_RAN"),
+                    "the selected child test must actually run"
+                );
+                assert_eq!(
+                    sqlite_family_bytes_for_cli_open_test(&db_path),
+                    family_before
+                );
+                assert_eq!(live_family_identity(&db_path), identity_before);
+                assert_eq!(std::fs::read(&breaker).ok(), breaker_before);
+                assert_eq!(
+                    directory_entry_names_for_cli_open_test(&root),
+                    entries_before,
+                    "refused probes must not publish breaker locks, forensics, or reconstruction candidates"
+                );
+            }
         }
     }
 
@@ -60820,7 +61103,8 @@ startup_timeout_sec = 42
             &error,
             true,
             &archive_root,
-        );
+        )
+        .expect("corrupt relational probe remains recoverable");
         match strategy {
             DoctorDatabaseFixStrategy::Reconstruct(detail) => {
                 assert!(detail.contains("Foreign-key consistency probe failed"));
@@ -60837,7 +61121,8 @@ startup_timeout_sec = 42
             &error,
             false,
             &archive_root,
-        );
+        )
+        .expect("corrupt relational probe remains repairable without an archive");
         match strategy {
             DoctorDatabaseFixStrategy::Repair(detail) => {
                 assert!(detail.contains("Foreign-key consistency probe failed"));
