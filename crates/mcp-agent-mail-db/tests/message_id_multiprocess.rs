@@ -1,22 +1,28 @@
 //! br-sa58k: message-id election must be durable and atomic across
 //! independent OS processes.
 //!
-//! Two worker processes attach to the same mailbox database, observe the same
-//! starting floor, and elect ids concurrently through the in-transaction
-//! election (`elect_message_id_in_tx` via `create_message`). The parent
-//! asserts the committed ids are distinct and that the canonical archive
-//! filenames derived from them never collide — the duplicate-canonical-file
-//! failure mode that motivated the bead.
+//! Two worker processes open the same mailbox database, register, and then
+//! hold at one gate, so both have observed the same floor before either
+//! allocates. Released together, each elects a run of ids through the
+//! in-transaction election (`elect_message_id_in_tx` via `create_message`).
+//! The parent asserts every committed id is distinct and that each id's row is
+//! the message its worker wrote: the duplicate-canonical-id failure that
+//! motivated the bead.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use asupersync::Cx;
+use asupersync::{Cx, OutcomeError};
 use mcp_agent_mail_db::create_pool;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::queries;
 
 const TEST_NAME: &str = "two_processes_elect_distinct_message_ids_from_a_shared_floor";
+const MESSAGES_PER_WORKER: usize = 20;
+const PROJECT_KEY: &str = "/tmp/br-sa58k-worker";
 
 fn worker_mode() -> Option<String> {
     std::env::var("MAGENTAROBIN_ID_WORKER_DB").ok()
@@ -31,48 +37,31 @@ fn two_processes_elect_distinct_message_ids_from_a_shared_floor() {
     run_worker(&db_path);
 }
 
-fn wait_for_go(go_gate: &str, name: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    while !std::path::Path::new(go_gate).exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "worker {name} never observed the go gate"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
+fn pool_config(db_path: &str) -> DbPoolConfig {
+    DbPoolConfig {
+        database_url: format!("sqlite:///{db_path}"),
+        run_migrations: true,
+        min_connections: 1,
+        max_connections: 1,
+        warmup_connections: 0,
+        ..Default::default()
     }
 }
 
-fn write_worker_result(storage_root: &std::path::Path, name: &str, id: i64) {
-    // Project the elected id into a canonical-shaped archive filename so
-    // the parent can prove filename-level distinctness.
-    let canonical = storage_root
-        .join("projects/p/messages/2026/07")
-        .join(format!("{id:06}__elected.md"));
-    if let Some(parent) = canonical.parent() {
-        std::fs::create_dir_all(parent).expect("create canonical directory");
+fn wait_for(path: &Path, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
     }
-    std::fs::write(&canonical, format!("---json\n{{\"id\": {id}}}\n---\n"))
-        .expect("write canonical marker");
-
-    std::fs::write(
-        storage_root
-            .parent()
-            .expect("storage parent")
-            .join(format!("result-{name}.txt")),
-        format!("{id}\n"),
-    )
-    .expect("write worker result");
 }
 
 fn run_worker(db_path: &str) {
-    let name = std::env::var("MAGENTAROBIN_ID_WORKER_NAME").unwrap_or_else(|_| "A".to_string());
-    let gate = std::env::var("MAGENTAROBIN_ID_WORKER_GATE").expect("worker gate path");
-    let storage_root = std::path::PathBuf::from(
-        std::env::var("MAGENTAROBIN_ID_WORKER_STORAGE").unwrap_or_default(),
+    let name = std::env::var("MAGENTAROBIN_ID_WORKER_NAME").expect("worker name");
+    let gates = std::path::PathBuf::from(
+        std::env::var("MAGENTAROBIN_ID_WORKER_GATES").expect("worker gate directory"),
     );
-    let go_gate = format!("{gate}.go");
-    // The mailbox validates agent names as adjective+noun; pick two valid
-    // deterministic identities.
+    // The mailbox validates agent names as adjective+noun.
     let agent_name = if name == "A" {
         "BlueLake"
     } else {
@@ -84,185 +73,163 @@ fn run_worker(db_path: &str) {
         .expect("build worker runtime");
     runtime.block_on(async {
         let cx = Cx::current().expect("runtime installs worker context");
-        let cfg = DbPoolConfig {
-            database_url: format!("sqlite:///{db_path}"),
-            run_migrations: true,
-            min_connections: 1,
-            max_connections: 1,
-            warmup_connections: 0,
-            ..Default::default()
-        };
-
-        // Worker A initializes the mailbox alone (schema, project, its own
-        // agent) and raises the gate, then waits for the release. Worker B
-        // defers even its pool open until the release, so initialization and
-        // registration never race.
-        let (pool, project_id, sender_id) = if name == "A" {
-            let pool = create_pool(&cfg).expect("initiator pool");
-            let project = queries::ensure_project(&cx, &pool, "/tmp/br-sa58k-worker")
-                .await
-                .into_result()
-                .expect("ensure project");
-            let project_id = project.id.expect("project id");
-            let sender = queries::register_agent(
-                &cx,
-                &pool,
-                project_id,
-                agent_name,
-                "codex-cli",
-                "test",
-                None,
-                None,
-                None,
-            )
-            .await
-            .into_result()
-            .expect("register initiator agent");
-            std::fs::write(&gate, "ready").expect("raise start gate");
-            let sender_id = sender.id.expect("sender id");
-            (pool, project_id, sender_id)
-        } else {
-            wait_for_go(&go_gate, &name);
-            let pool = create_pool(&cfg).expect("follower pool");
-            let project = queries::ensure_project(&cx, &pool, "/tmp/br-sa58k-worker")
-                .await
-                .into_result()
-                .expect("ensure project");
-            let project_id = project.id.expect("project id");
-            let sender = queries::register_agent(
-                &cx,
-                &pool,
-                project_id,
-                agent_name,
-                "codex-cli",
-                "test",
-                None,
-                None,
-                None,
-            )
-            .await
-            .into_result()
-            .expect("register follower agent");
-            let sender_id = sender.id.expect("sender id");
-            (pool, project_id, sender_id)
-        };
-        if name == "A" {
-            wait_for_go(&go_gate, &name);
+        // Worker A creates the schema alone; B opens only once A is set up, so
+        // initialization never races (that path is br-wp4am's).
+        if name == "B" {
+            wait_for(&gates.join("ready-A"), "worker A setup");
         }
-
-        let message = queries::create_message(
+        let pool = create_pool(&pool_config(db_path)).expect("worker pool");
+        let project = queries::ensure_project(&cx, &pool, PROJECT_KEY)
+            .await
+            .into_result()
+            .expect("ensure project");
+        let project_id = project.id.expect("project id");
+        let sender = queries::register_agent(
             &cx,
             &pool,
             project_id,
-            sender_id,
-            &format!("elected by {name}"),
-            "body",
+            agent_name,
+            "codex-cli",
+            "test",
             None,
-            "normal",
-            false,
-            "{}",
+            None,
+            None,
         )
         .await
         .into_result()
-        .expect("worker message creation");
-        let id = message.id.expect("elected message id");
+        .expect("register worker agent");
+        let sender_id = sender.id.expect("sender id");
 
-        write_worker_result(&storage_root, &name, id);
+        // Both workers now hold an open pool over the same floor; neither has
+        // allocated. The parent releases them together.
+        std::fs::write(gates.join(format!("ready-{name}")), "").expect("raise ready gate");
+        wait_for(&gates.join("go"), "the release gate");
+
+        let mut ids = Vec::with_capacity(MESSAGES_PER_WORKER);
+        let mut busy_retries = 0_u32;
+        for index in 0..MESSAGES_PER_WORKER {
+            let subject = format!("elected by {name} #{index}");
+            let message = loop {
+                match queries::create_message(
+                    &cx, &pool, project_id, sender_id, &subject, "body", None, "normal", false,
+                    "{}",
+                )
+                .await
+                .into_result()
+                {
+                    Ok(message) => break message,
+                    // Cross-process writers contend for one database; a busy
+                    // retry is a client retry, and the rolled-back attempt's
+                    // election rolls back with it.
+                    Err(OutcomeError::Err(error))
+                        if error.is_retryable() && busy_retries < 2_000 =>
+                    {
+                        busy_retries += 1;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("worker {name} message {index}: {error:?}"),
+                }
+            };
+            ids.push(message.id.expect("elected message id").to_string());
+        }
+        println!("worker {name}: {MESSAGES_PER_WORKER} ids, {busy_retries} busy retries");
+        std::fs::write(gates.join(format!("result-{name}.txt")), ids.join("\n"))
+            .expect("write worker result");
     });
+}
+
+fn spawn_worker(name: &'static str, db_path: &Path, gates: &Path) -> Child {
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "--exact",
+            &mcp_agent_mail_test_helpers::libtest_path!(TEST_NAME),
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("MAGENTAROBIN_ID_WORKER_DB", db_path.display().to_string())
+        .env("MAGENTAROBIN_ID_WORKER_NAME", name)
+        .env("MAGENTAROBIN_ID_WORKER_GATES", gates.display().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn id-election worker");
+    let stdout = child.stdout.take().expect("worker stdout");
+    let stderr = child.stderr.take().expect("worker stderr");
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            println!("[{name}] {line}");
+        }
+    });
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("[{name}] {line}");
+        }
+    });
+    child
 }
 
 fn run_parent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("shared-floor.sqlite3");
-    let storage_root = dir.path().join("storage");
-    std::fs::create_dir_all(&storage_root).expect("create storage root");
-    let gate = dir.path().join("start.gate");
-    let go_gate = dir.path().join("start.gate.go");
-    let exe = std::env::current_exe().expect("current test executable");
+    let gates = dir.path();
+    let mut workers = [
+        ("A", spawn_worker("A", &db_path, gates)),
+        ("B", spawn_worker("B", &db_path, gates)),
+    ];
 
-    let spawn_worker = |name: &'static str| {
-        let mut child = Command::new(&exe)
-            .args([
-                "--exact",
-                &mcp_agent_mail_test_helpers::libtest_path!(TEST_NAME),
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env("MAGENTAROBIN_ID_WORKER_DB", db_path.display().to_string())
-            .env("MAGENTAROBIN_ID_WORKER_NAME", name)
-            .env("MAGENTAROBIN_ID_WORKER_GATE", gate.display().to_string())
-            .env(
-                "MAGENTAROBIN_ID_WORKER_STORAGE",
-                storage_root.display().to_string(),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn id-election worker");
-        let stdout = child.stdout.take().expect("worker stdout");
-        let stderr = child.stderr.take().expect("worker stderr");
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                println!("[{name}] {line}");
+    // Release only when BOTH workers are set up and parked, so both have seen
+    // the same floor before either elects. A worker that dies early fails fast.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !(gates.join("ready-A").exists() && gates.join("ready-B").exists()) {
+        for (name, child) in &mut workers {
+            if let Some(status) = child.try_wait().expect("poll worker") {
+                panic!("worker {name} exited before the release gate: {status}");
             }
-        });
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("[{name}] {line}");
-            }
-        });
-        child
-    };
-
-    // Worker A initializes the mailbox schema and raises the start gate; both
-    // workers then block until the parent atomically renames the gate, so
-    // they race the same durable floor as simultaneously as the filesystem
-    // allows.
-    let mut worker_a = spawn_worker("A");
-    let mut worker_b = spawn_worker("B");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    while !gate.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "worker A never raised the start gate"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(Instant::now() < deadline, "workers never both became ready");
+        std::thread::sleep(Duration::from_millis(20));
     }
-    std::fs::rename(&gate, &go_gate).expect("release the start gate");
+    std::fs::write(gates.join("go"), "").expect("release both workers");
 
-    let status_a = worker_a.wait().expect("wait worker A");
-    let status_b = worker_b.wait().expect("wait worker B");
-    assert!(status_a.success(), "worker A exited unsuccessfully");
-    assert!(status_b.success(), "worker B exited unsuccessfully");
+    let mut elected: Vec<(&str, i64)> = Vec::new();
+    for (name, child) in &mut workers {
+        let status = child.wait().expect("wait worker");
+        assert!(status.success(), "worker {name} exited unsuccessfully");
+        let ids = std::fs::read_to_string(gates.join(format!("result-{name}.txt")))
+            .expect("read worker result");
+        let ids: Vec<i64> = ids
+            .lines()
+            .map(|line| line.parse().expect("worker id"))
+            .collect();
+        assert_eq!(ids.len(), MESSAGES_PER_WORKER, "worker {name} id count");
+        elected.extend(ids.into_iter().map(|id| (*name, id)));
+    }
 
-    let read_result = |name: &str| {
-        let path = dir.path().join(format!("result-{name}.txt"));
-        std::fs::read_to_string(path).expect("read worker result")
-    };
-    let id_a: i64 = read_result("A").trim().parse().expect("worker A id");
-    let id_b: i64 = read_result("B").trim().parse().expect("worker B id");
-
-    assert_ne!(
-        id_a, id_b,
-        "two OS processes elected the same canonical message id from one floor"
+    let distinct: HashSet<i64> = elected.iter().map(|(_, id)| *id).collect();
+    assert_eq!(
+        distinct.len(),
+        elected.len(),
+        "two OS processes elected the same message id: {elected:?}"
     );
 
-    // Canonical archive filenames derive from the id; prove they are distinct
-    // at the filename level, not just the integer level.
-    let file_a = storage_root.join(format!("projects/p/messages/2026/07/{id_a:06}__elected.md"));
-    let file_b = storage_root.join(format!("projects/p/messages/2026/07/{id_b:06}__elected.md"));
-    assert!(
-        file_a.exists(),
-        "worker A canonical file missing: {}",
-        file_a.display()
-    );
-    assert!(
-        file_b.exists(),
-        "worker B canonical file missing: {}",
-        file_b.display()
-    );
-    assert_ne!(file_a, file_b, "canonical filenames collided");
+    // Each reported id must be the committed row its own worker wrote, not a
+    // row the other process published under the same id.
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build parent runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("runtime installs parent context");
+        let pool = create_pool(&pool_config(&db_path.display().to_string())).expect("parent pool");
+        for (name, id) in &elected {
+            let row = queries::get_message(&cx, &pool, *id)
+                .await
+                .into_result()
+                .unwrap_or_else(|error| panic!("message {id} from worker {name}: {error:?}"));
+            assert!(
+                row.subject.starts_with(&format!("elected by {name} #")),
+                "id {id} reported by worker {name} holds {:?}",
+                row.subject
+            );
+        }
+    });
 }
