@@ -23,8 +23,9 @@ pub(super) fn preflight(
     canonical: &str,
     expected: Oid,
     message_files_missing: bool,
-    budget: &mut CanonicalScanBudget,
+    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<bool> {
+    budget.checkpoint("git root")?;
     let head = match repo.head() {
         Ok(head) => head,
         Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
@@ -53,13 +54,17 @@ pub(super) fn preflight(
     // only repair) introduces no canonical path. Do not rescan history on every
     // unchanged maintenance visit. Missing message copies still require proof.
     if canonical_committed && !message_files_missing {
+        budget.checkpoint("git scan result")?;
         return Ok(true);
     }
     let root = crate::archive_project_root_checked(archive)?.join("messages");
     let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
     let entry = match tree.get_path(Path::new(&relative)) {
         Ok(entry) => entry,
-        Err(error) if error.code() == ErrorCode::NotFound => return Ok(canonical_committed),
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            budget.checkpoint("git scan result")?;
+            return Ok(canonical_committed);
+        }
         Err(error) => return Err(error.into()),
     };
     if entry.kind() != Some(ObjectType::Tree) || entry.filemode() != 0o040000 {
@@ -69,8 +74,10 @@ pub(super) fn preflight(
     }
     let root = repo.find_tree(entry.id())?;
     for (year, year_id) in date_trees(&root, 4, budget)? {
+        budget.checkpoint("git year")?;
         let year_tree = repo.find_tree(year_id)?;
         for (month, month_id) in date_trees(&year_tree, 2, budget)? {
+            budget.checkpoint("git month")?;
             let month_tree = repo.find_tree(month_id)?;
             for entry in &month_tree {
                 budget.visit()?;
@@ -102,14 +109,16 @@ pub(super) fn preflight(
             }
         }
     }
+    budget.checkpoint("git scan result")?;
     Ok(canonical_committed)
 }
 
 fn date_trees(
     tree: &Tree<'_>,
     width: usize,
-    budget: &mut CanonicalScanBudget,
+    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<Vec<(String, Oid)>> {
+    budget.checkpoint("git directory")?;
     let mut entries = Vec::new();
     for entry in tree {
         budget.visit()?;
@@ -128,13 +137,15 @@ fn date_trees(
             .map_err(|_| invalid("committed canonical date shard is not UTF-8"))?;
         entries.push((name.to_string(), entry.id()));
     }
+    budget.checkpoint("git directory result")?;
     Ok(entries)
 }
 
-fn read_id(repo: &Repository, oid: Oid, budget: &mut CanonicalScanBudget) -> crate::Result<i64> {
+fn read_id(repo: &Repository, oid: Oid, budget: &mut CanonicalScanBudget<'_>) -> crate::Result<i64> {
     // libgit2 materializes blobs. Bound and charge the entire object before
     // loading it, even though only its frontmatter is decoded. Never trust a
     // filename's embedded ID or treat an unreadable object as an absent message.
+    budget.checkpoint("git header")?;
     let (size, kind) = repo.odb()?.read_header(oid)?;
     if kind != ObjectType::Blob
         || size > MAX_MESSAGE_ARTIFACT_BYTES
@@ -144,8 +155,10 @@ fn read_id(repo: &Repository, oid: Oid, budget: &mut CanonicalScanBudget) -> cra
             "committed canonical scan byte budget exceeded or source is not a blob; repair refused",
         ));
     }
+    budget.checkpoint("git blob")?;
     budget.bytes_left -= size as u64;
     let blob = repo.find_blob(oid)?;
+    budget.checkpoint("git digest")?;
     if blob.content().len() != size
         || Oid::hash_object_ext(ObjectType::Blob, blob.content(), oid.object_format())? != oid
     {
@@ -153,6 +166,7 @@ fn read_id(repo: &Repository, oid: Oid, budget: &mut CanonicalScanBudget) -> cra
             "committed canonical content does not match its object identity; repair refused",
         ));
     }
+    budget.checkpoint("git decode")?;
     let text = std::str::from_utf8(blob.content())
         .map_err(|_| invalid("committed canonical source is not UTF-8"))?;
     let (frontmatter, _) = text
@@ -160,6 +174,7 @@ fn read_id(repo: &Repository, oid: Oid, budget: &mut CanonicalScanBudget) -> cra
         .and_then(|text| text.split_once("\n---\n"))
         .ok_or_else(|| invalid("committed canonical source has invalid frontmatter"))?;
     let message: serde_json::Value = serde_json::from_str(frontmatter)?;
+    budget.checkpoint("git result")?;
     crate::positive_message_id(&message)
         .ok_or_else(|| invalid("committed canonical source has no positive message ID"))
 }
@@ -358,10 +373,12 @@ mod tests {
             CanonicalScanBudget {
                 entries_left: 2,
                 bytes_left: 2048,
+                ..Default::default()
             },
             CanonicalScanBudget {
                 entries_left: 10,
                 bytes_left: 1,
+                ..Default::default()
             },
         ] {
             let error =
@@ -371,6 +388,7 @@ mod tests {
         let mut budget = CanonicalScanBudget {
             entries_left: 10,
             bytes_left: 2048,
+            ..Default::default()
         };
         assert!(!preflight(&repo, &archive, 42, &relative, oid, true, &mut budget).unwrap());
         assert_eq!(budget.entries_left, 7);

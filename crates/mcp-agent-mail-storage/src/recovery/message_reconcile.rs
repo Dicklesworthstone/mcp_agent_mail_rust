@@ -112,7 +112,8 @@ pub fn reconcile_message_bundle(
 /// as [`reconcile_message_bundle`]. A busy global publication fence defers
 /// immediately; project mutex/flock waits share a 250 ms acquisition budget.
 /// The worker stop flag and Cx are checked before admission, while waiting for
-/// project locks, between file publications, and before committing. Completed
+/// project locks, during canonical identity scans, between file publications,
+/// and before committing. Completed
 /// files survive cancellation and are revalidated on retry, never redelivered.
 ///
 /// # Errors
@@ -251,7 +252,10 @@ fn reconcile_message_bundle_inner(
         // Disk loss does not erase a canonical ID recorded under another Git
         // path. Share one budget across both namespaces. An interrupted repair
         // with all files present still needs this proof before its first commit.
-        let mut identity_budget = CanonicalScanBudget::default();
+        let mut identity_budget = CanonicalScanBudget {
+            control,
+            ..Default::default()
+        };
         let canonical_committed = identity::preflight(
             &repo,
             archive,
@@ -369,22 +373,54 @@ fn reconciliation_inboxes(
     Ok(recipients)
 }
 
-struct CanonicalScanBudget {
+struct CanonicalScanBudget<'a> {
     entries_left: usize,
     bytes_left: u64,
+    control: Option<RepairControl<'a>>,
 }
 
-impl Default for CanonicalScanBudget {
+impl Default for CanonicalScanBudget<'_> {
     fn default() -> Self {
         Self {
             entries_left: MAX_CANONICAL_SCAN_ENTRIES,
             bytes_left: MAX_CANONICAL_SCAN_BYTES,
+            control: None,
         }
     }
 }
 
-impl CanonicalScanBudget {
+#[cfg(test)]
+type ScanHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+std::thread_local! {
+    // Observe real scan boundaries; no filesystem/Git result is substituted.
+    static SCAN_HOOK: std::cell::RefCell<Option<ScanHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl CanonicalScanBudget<'_> {
+    fn checkpoint(&self, stage: &'static str) -> crate::Result<()> {
+        #[cfg(test)]
+        if self.control.is_some() {
+            SCAN_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(stage);
+                }
+            });
+        }
+        if self.control.is_some_and(RepairControl::cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("message archive repair cancelled during canonical {stage}"),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn visit(&mut self) -> crate::Result<()> {
+        self.checkpoint("entry")?;
         self.entries_left = self.entries_left.checked_sub(1).ok_or_else(|| {
             invalid("canonical recovery scan entry budget exceeded; repair refused")
         })?;
@@ -394,6 +430,7 @@ impl CanonicalScanBudget {
     /// Read only frontmatter. Charge actual buffered reads (including any
     /// read-ahead), not the decoded JSON size; a huge body is never materialized.
     fn read_id(&mut self, path: &Path) -> crate::Result<i64> {
+        self.checkpoint("disk open")?;
         let limit = self.bytes_left.min(MAX_MESSAGE_ARTIFACT_BYTES as u64);
         if limit == 0 {
             return Err(invalid(
@@ -405,12 +442,14 @@ impl CanonicalScanBudget {
         let mut reader = BufReader::with_capacity(1024, file.take(limit + 1));
         let result = (|| -> crate::Result<i64> {
             let mut line = String::new();
+            self.checkpoint("disk header")?;
             reader.read_line(&mut line)?;
             if line != "---json\n" {
                 return Err(invalid("canonical recovery source has invalid frontmatter"));
             }
             let mut header = String::new();
             loop {
+                self.checkpoint("disk header")?;
                 line.clear();
                 if reader.read_line(&mut line)? == 0 {
                     return Err(invalid(
@@ -422,7 +461,9 @@ impl CanonicalScanBudget {
                 }
                 header.push_str(&line);
             }
+            self.checkpoint("disk decode")?;
             let message: serde_json::Value = serde_json::from_str(&header)?;
+            self.checkpoint("disk result")?;
             crate::positive_message_id(&message)
                 .ok_or_else(|| invalid("canonical recovery source has no positive message ID"))
         })();
@@ -440,8 +481,9 @@ impl CanonicalScanBudget {
 fn canonical_date_directories(
     root: &Path,
     width: usize,
-    budget: &mut CanonicalScanBudget,
+    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<Vec<PathBuf>> {
+    budget.checkpoint("disk directory")?;
     if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
         return Err(invalid(
             "canonical recovery directory is not a real directory",
@@ -466,6 +508,7 @@ fn canonical_date_directories(
         }
         directories.push(entry.path());
     }
+    budget.checkpoint("disk directory result")?;
     Ok(directories)
 }
 
@@ -478,8 +521,9 @@ fn reject_recovery_canonical_id_collision(
     archive: &ProjectArchive,
     message_id: i64,
     target: &Path,
-    budget: &mut CanonicalScanBudget,
+    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<()> {
+    budget.checkpoint("disk root")?;
     let root = crate::archive_project_root_checked(archive)?.join("messages");
     if crate::path_existing_prefix_has_symlink(&root)? {
         return Err(invalid("canonical recovery root has a symlinked authority"));
@@ -491,6 +535,7 @@ fn reject_recovery_canonical_id_collision(
     }
     for year in canonical_date_directories(&root, 4, budget)? {
         for month in canonical_date_directories(&year, 2, budget)? {
+            budget.checkpoint("disk month")?;
             // Revalidate at descent rather than intentionally following a
             // directory replaced by a symlink since enumeration.
             if !std::fs::symlink_metadata(&month)?.file_type().is_dir() {
@@ -521,7 +566,7 @@ fn reject_recovery_canonical_id_collision(
             }
         }
     }
-    Ok(())
+    budget.checkpoint("disk scan result")
 }
 
 /// A repair may fill a missing Git path or restore an object whose expected
@@ -966,6 +1011,7 @@ mod tests {
         let mut budget = CanonicalScanBudget {
             entries_left: 10,
             bytes_left: 2048,
+            ..Default::default()
         };
         reject_recovery_canonical_id_collision(&archive, 42, &paths.canonical, &mut budget)
             .unwrap();
@@ -988,10 +1034,12 @@ mod tests {
             CanonicalScanBudget {
                 entries_left: 2,
                 bytes_left: 2048,
+                ..Default::default()
             },
             CanonicalScanBudget {
                 entries_left: 10,
                 bytes_left: 16,
+                ..Default::default()
             },
         ] {
             let error =
@@ -1181,6 +1229,9 @@ mod tests {
 
     #[test]
     fn shared_only_repair_commits_two_copies_without_fanout() {
+        if cancellable_tests::isolated() {
+            return;
+        }
         for kind in ["to", "cc"] {
             let (_dir, config, archive, mut message, _) = fixture();
             message["to"] = json!([]);
@@ -1374,6 +1425,9 @@ mod tests {
 
     #[test]
     fn live_shared_source_reconciles_without_touching_delivery_or_receipt_state() {
+        if cancellable_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {

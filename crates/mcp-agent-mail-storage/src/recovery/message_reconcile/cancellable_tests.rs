@@ -6,7 +6,7 @@ use std::fs;
 use std::sync::{TryLockError, mpsc};
 use std::time::Duration;
 
-fn isolated() -> bool {
+pub(super) fn isolated() -> bool {
     const CHILD: &str = "AM_TEST_CANCELLABLE_MESSAGE_CHILD";
     let thread = std::thread::current();
     let name = thread.name().expect("named libtest thread");
@@ -412,4 +412,231 @@ fn attachment_authority_is_required_before_any_cancellable_message_publication()
     assert_committed(&archive, &paths);
     assert_committed(&archive, std::slice::from_ref(&attachment));
     assert_eq!(fs::read(attachment).unwrap(), bytes);
+}
+
+/// Cancel at a named real scan boundary on this test thread. The observer never
+/// substitutes a directory entry, file read, Git object or publication result.
+struct StopOnScan {
+    stop: std::sync::Arc<AtomicBool>,
+    visits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StopOnScan {
+    fn new(stage: &'static str, after: usize) -> Self {
+        assert!(after > 0);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let visits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_stop = stop.clone();
+        let hook_visits = visits.clone();
+        SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested scan observer");
+            *slot.borrow_mut() = Some(Box::new(move |observed| {
+                if observed == stage
+                    && hook_visits.fetch_add(1, Ordering::AcqRel) + 1 >= after
+                {
+                    hook_stop.store(true, Ordering::Release);
+                }
+            }));
+        });
+        Self { stop, visits }
+    }
+}
+
+impl Drop for StopOnScan {
+    fn drop(&mut self) {
+        SCAN_HOOK.with(|slot| {
+            drop(slot.borrow_mut().take());
+        });
+    }
+}
+
+fn assert_scan_interrupted(error: &StorageError, stage: &str) {
+    assert!(
+        matches!(error, StorageError::Io(error)
+            if error.kind() == std::io::ErrorKind::Interrupted),
+        "{error}"
+    );
+    assert!(error.to_string().contains(stage), "{error}");
+}
+
+fn assert_scan_locks_released(archive: &ProjectArchive) {
+    assert_eq!(crate::ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+    assert_eq!(crate::archive_mutations_active(), 0);
+    assert!(crate::archive_publication_fence_holder().is_none());
+    let process = crate::archive_process_lock(archive).unwrap();
+    let lock = process.try_lock().expect("scan retained project mutex");
+    drop(lock);
+    let fence = crate::ArchiveMutationGuard::try_begin_repair(&archive.repo_root, || false)
+        .expect("scan retained publication fence");
+    drop(fence);
+}
+
+#[test]
+fn disk_header_cancellation_releases_locks_and_restarts_complete_identity_proof() {
+    if isolated() {
+        return;
+    }
+    let (_temp, config, archive, message, recipients) = fixture();
+    let source = archive.root.join("messages/2025/01/unrelated.md");
+    crate::ensure_parent_dir(&source).unwrap();
+    let bytes = format!(
+        "---json\n{{\n{}\"id\": 99\n}}\n---\n\nretained",
+        "\n".repeat(32)
+    );
+    fs::write(&source, &bytes).unwrap();
+    let paths = bundle_paths(&archive, &message, &recipients);
+    let repo = Repository::open(&archive.repo_root).unwrap();
+    let head = repo.head().unwrap().target();
+    let observer = StopOnScan::new("disk header", 8);
+    let error = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &observer.stop,
+    )
+    .unwrap_err();
+    assert_scan_interrupted(&error, "disk header");
+    assert_eq!(observer.visits.load(Ordering::Acquire), 8);
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert_eq!(repo.head().unwrap().target(), head);
+    assert_eq!(fs::read(&source).unwrap(), bytes.as_bytes());
+    assert_scan_locks_released(&archive);
+    drop(observer);
+    let result = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(result.files_created, 4);
+    assert_committed(&archive, &paths);
+    assert_eq!(fs::read(source).unwrap(), bytes.as_bytes());
+}
+
+#[test]
+fn cancelled_disk_identity_decode_never_certifies_a_conflicting_id_as_absent() {
+    if isolated() {
+        return;
+    }
+    let (_temp, config, archive, message, recipients) = fixture();
+    let source = archive.root.join("messages/2025/01/prior.md");
+    crate::ensure_parent_dir(&source).unwrap();
+    let bytes = b"---json\n{\"id\": 42}\n---\n\nretain prior generation";
+    fs::write(&source, bytes).unwrap();
+    let paths = bundle_paths(&archive, &message, &recipients);
+    let repo = Repository::open(&archive.repo_root).unwrap();
+    let head = repo.head().unwrap().target();
+    let observer = StopOnScan::new("disk decode", 1);
+    let error = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &observer.stop,
+    )
+    .unwrap_err();
+    assert_scan_interrupted(&error, "disk decode");
+    assert_eq!(observer.visits.load(Ordering::Acquire), 1);
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert_scan_locks_released(&archive);
+    drop(observer);
+    let error = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("canonical message id 42"),
+        "{error}"
+    );
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert_eq!(repo.head().unwrap().target(), head);
+    assert_eq!(fs::read(source).unwrap(), bytes);
+}
+
+#[test]
+fn cancelled_git_identity_scan_keeps_committed_conflicts_authoritative() {
+    if isolated() {
+        return;
+    }
+    for stage in [
+        "entry",
+        "git header",
+        "git blob",
+        "git digest",
+        "git decode",
+        "git result",
+    ] {
+        let (_temp, config, archive, message, recipients) = fixture();
+        let source = archive.root.join("messages/2025/01/prior.md");
+        let bytes = b"---json\n{\"id\": 42}\n---\n\nretained Git identity";
+        crate::ensure_parent_dir(&source).unwrap();
+        fs::write(&source, bytes).unwrap();
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
+        crate::commit_paths_with_retry(
+            &archive.repo_root,
+            &config,
+            "fixture: prior identity",
+            &[relative.as_str()],
+        )
+        .unwrap();
+        let evidence = config.storage_root.join("prior-git-evidence.md");
+        fs::rename(&source, &evidence).unwrap();
+        let paths = bundle_paths(&archive, &message, &recipients);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let head = repo.head().unwrap().target();
+        let observer = StopOnScan::new(stage, 1);
+        let error = reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &observer.stop,
+        )
+        .unwrap_err();
+        assert_scan_interrupted(&error, stage);
+        assert_eq!(observer.visits.load(Ordering::Acquire), 1, "{stage}");
+        assert!(paths.iter().all(|path| !path.exists()), "{stage}");
+        assert_scan_locks_released(&archive);
+        drop(observer);
+        let error = reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already committed"), "{error}");
+        assert!(paths.iter().all(|path| !path.exists()), "{stage}");
+        assert_eq!(repo.head().unwrap().target(), head, "{stage}");
+        assert_eq!(fs::read(evidence).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn stopped_scan_consumes_no_entry_or_byte_admission() {
+    let cx = Cx::for_testing();
+    let stop = AtomicBool::new(true);
+    let mut budget = CanonicalScanBudget {
+        entries_left: 7,
+        bytes_left: 2048,
+        control: Some(RepairControl {
+            cx: &cx,
+            stop: &stop,
+        }),
+    };
+    assert_scan_interrupted(&budget.visit().unwrap_err(), "entry");
+    assert_eq!((budget.entries_left, budget.bytes_left), (7, 2048));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("not-created.md");
+    assert_scan_interrupted(&budget.read_id(&path).unwrap_err(), "disk open");
+    assert!(!path.exists());
+    assert_eq!((budget.entries_left, budget.bytes_left), (7, 2048));
 }
