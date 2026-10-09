@@ -315,6 +315,19 @@ iwr -useb "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_ru
 
 PowerShell enforces the same per-release trust contract before `Expand-Archive`: for releases v0.3.31 and later it verifies the minisign-signed `SHA256SUMS` manifest with the same pinned maintainer key (a `minisign` executable on `PATH` is required; `cosign` is not consulted), and for older releases it requires the same stable `cosign` v3.1.3-or-newer-in-v3 verifier, forces modern-bundle parsing, and isolates verification from the three custom Sigstore trust environment variables named above. The ZIP must contain exactly flat `am.exe` and `mcp-agent-mail.exe`, and their staged and post-install version lines must exactly match the requested release. Both executables are replaced under one per-destination installer mutex and rollback domain; backups remain until byte-for-byte installed-digest and version checks pass. Options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`, `-Verify` (explicitly request the already-default cryptographic checks), and `-NoVerify` (the **unsafe** escape that skips only those checksum and signature checks). Archive-member and exact-version checks still run with `-NoVerify`, which means unauthenticated downloaded executables run during version probes and may execute arbitrary code as the installer user.
 
+### Container (Docker or Podman)
+
+Each release also publishes a `linux/amd64` + `linux/arm64` image to GHCR, tagged `vX.Y.Z`, `X.Y.Z`, `0.3` and `latest`:
+
+```bash
+docker run -d --name agent-mail -p 127.0.0.1:8765:8765 \
+  -e HTTP_BEARER_TOKEN="$(openssl rand -hex 32)" \
+  -v agent-mail-data:/data/mailbox \
+  ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest
+```
+
+The image runs `mcp-agent-mail serve --no-tui` as the non-root `appuser`, serving MCP on port 8765 at `/mcp/`, with the whole mailbox (Git archive and SQLite) under `/data/mailbox`. Mount a volume there so mail survives replacing the container. Every request needs the token (`Authorization: Bearer <token>`); clients connect to `http://127.0.0.1:8765/mcp/` with it. Keep the published port on loopback unless remote agents should reach it. Docker's healthcheck polls `/health/liveness`. The binaries in the image are the same bytes as the release's Linux glibc archives.
+
 ### From Source
 
 ```bash
