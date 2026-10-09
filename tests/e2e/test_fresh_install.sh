@@ -859,6 +859,77 @@ PY
     e2e_assert_exit_code "OMP installer writer is byte-and-mode idempotent" \
       "1" "${OMP_WRITER_THIRD_RC}"
 
+    # br-q8k82: stale OAuth authority is stripped while the operator's own
+    # tuning fields on the entry survive, and a malformed server allow/deny
+    # list is refused with the file untouched rather than rewritten.
+    OMP_TUNING_CONFIG="${OMP_INSTALLER_DIR}/tuning-mcp.json"
+    printf '%s\n' '{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:9999/stale/","timeout":45000,"description":"operator note","autoApprove":["send_message"],"auth":{"type":"oauth","credentialId":"stale"},"headers":{"Authorization":"Bearer stale-token","X-Trace":"keep"}}}}' \
+      > "${OMP_TUNING_CONFIG}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_TUNING_CONFIG}"
+    )
+    OMP_TUNING_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer refreshes an entry carrying tuning fields" \
+      "0" "${OMP_TUNING_RC}"
+    OMP_TUNING_ASSERTIONS="$(python3 - "${OMP_TUNING_CONFIG}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    entry = json.load(handle)["mcpServers"]["mcp-agent-mail"]
+assert entry["url"] == "http://127.0.0.1:8765/mcp/", entry
+assert entry["timeout"] == 45000, entry
+assert entry["description"] == "operator note", entry
+assert entry["autoApprove"] == ["send_message"], entry
+assert "auth" not in entry and "oauth" not in entry, entry
+assert entry["headers"] == {"X-Trace": "keep", "Authorization": "Bearer fresh-token"}, entry
+print("valid")
+PY
+    )" || true  # a failed assert must report FAIL below, not abort the suite under set -e
+    e2e_assert_eq "OMP installer writer keeps tuning fields and drops stale OAuth" \
+      "valid" "${OMP_TUNING_ASSERTIONS}"
+
+    OMP_MALFORMED_INDEX=0
+    for OMP_MALFORMED_LISTS in \
+      '"disabledServers":"mcp-agent-mail"' \
+      '"disabledServers":["sibling",3]' \
+      '"enabledServers":{"mcp-agent-mail":true}' \
+      '"enabledServers":[null]'; do
+      OMP_MALFORMED_INDEX=$((OMP_MALFORMED_INDEX + 1))
+      OMP_MALFORMED_CONFIG="${OMP_INSTALLER_DIR}/malformed-${OMP_MALFORMED_INDEX}-mcp.json"
+      printf '{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:9999/stale/","auth":{"type":"oauth"}}},%s}\n' \
+        "${OMP_MALFORMED_LISTS}" > "${OMP_MALFORMED_CONFIG}"
+      OMP_MALFORMED_BEFORE="$(sha256sum "${OMP_MALFORMED_CONFIG}")"
+      set +e
+      (
+        # shellcheck disable=SC2329
+        verbose() { :; }
+        # shellcheck disable=SC2329
+        desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+        # shellcheck disable=SC2329
+        resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
+        # shellcheck disable=SC1090
+        source "${OMP_WRITER_LIBRARY}"
+        setup_single_standard_http_json_config omp "${OMP_MALFORMED_CONFIG}"
+      )
+      OMP_MALFORMED_RC=$?
+      set -e
+      e2e_assert_exit_code "OMP installer writer refuses malformed lists (${OMP_MALFORMED_LISTS})" \
+        "2" "${OMP_MALFORMED_RC}"
+      e2e_assert_eq "malformed-list refusal leaves the config byte-preserved (${OMP_MALFORMED_LISTS})" \
+        "${OMP_MALFORMED_BEFORE}" "$(sha256sum "${OMP_MALFORMED_CONFIG}")"
+    done
+
     OMP_SYMLINK_TARGET="${OMP_INSTALLER_DIR}/symlink-target.json"
     OMP_SYMLINK_CONFIG="${OMP_INSTALLER_DIR}/symlinked-mcp.json"
     printf '%s\n' '{"sentinel":"must-not-change"}' > "${OMP_SYMLINK_TARGET}"
