@@ -334,6 +334,14 @@ fn current_llm_enabled(config: &Config) -> String {
     bool_string(config.llm_enabled)
 }
 
+fn current_messaging_fail_closed_send_profile(config: &Config) -> String {
+    bool_string(config.messaging_fail_closed_send_profile)
+}
+
+fn current_messaging_session_identity(config: &Config) -> String {
+    bool_string(config.messaging_session_identity)
+}
+
 fn current_notifications_enabled(config: &Config) -> String {
     bool_string(config.notifications_enabled)
 }
@@ -811,6 +819,48 @@ pub const FLAG_REGISTRY: &[FlagDefinition] = &[
         resolve_source: |config| process_or_config_source(config, "LLM_ENABLED"),
     },
     FlagDefinition {
+        name: "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
+        env_var: "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
+        kind: FlagKind::Bool,
+        default_value: "false",
+        doc: "Fail-closed send profile: send_message requires a stored, matching sender \
+              registration token, never auto-registers unknown recipients, and omits \
+              payload fields from its receipt.",
+        stability: FlagStability::Stable,
+        subsystem: "messaging",
+        affected_subsystems: &["messaging", "identity"],
+        dynamic_toggle: false,
+        restart_required: true,
+        notes: Some(
+            "Server processes read this at startup. Opt-in; the default keeps the \
+                     trusted-local send contract.",
+        ),
+        resolve_value: current_messaging_fail_closed_send_profile,
+        resolve_source: |config| {
+            process_or_config_source(config, "MESSAGING_FAIL_CLOSED_SEND_PROFILE")
+        },
+    },
+    FlagDefinition {
+        name: "MESSAGING_SESSION_IDENTITY",
+        env_var: "MESSAGING_SESSION_IDENTITY",
+        kind: FlagKind::Bool,
+        default_value: "false",
+        doc: "Bind agent identities to the MCP session that established them: a bound \
+              session sends without a sender_token and cannot act as another agent of \
+              that project (SESSION_IDENTITY_MISMATCH).",
+        stability: FlagStability::Experimental,
+        subsystem: "messaging",
+        affected_subsystems: &["messaging", "identity", "reservations"],
+        dynamic_toggle: false,
+        restart_required: true,
+        notes: Some(
+            "Server processes read this at startup. Sessions live in memory, so a \
+                     restart ends them. Not authentication: bearer/JWT checks still apply.",
+        ),
+        resolve_value: current_messaging_session_identity,
+        resolve_source: |config| process_or_config_source(config, "MESSAGING_SESSION_IDENTITY"),
+    },
+    FlagDefinition {
         name: "NOTIFICATIONS_ENABLED",
         env_var: "NOTIFICATIONS_ENABLED",
         kind: FlagKind::Bool,
@@ -1095,6 +1145,30 @@ pub(crate) fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::pat
 mod tests {
     use super::*;
     use crate::AtcWriteMode;
+
+    #[test]
+    fn messaging_security_opt_ins_are_registered_and_read_from_config() {
+        // README advertises both switches; `am flags list` must show them with
+        // the value the server actually runs with, default off.
+        for (name, set) in [
+            (
+                "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
+                (|config: &mut Config| config.messaging_fail_closed_send_profile = true)
+                    as fn(&mut Config),
+            ),
+            (
+                "MESSAGING_SESSION_IDENTITY",
+                (|config: &mut Config| config.messaging_session_identity = true) as fn(&mut Config),
+            ),
+        ] {
+            let flag = find_flag(name).unwrap_or_else(|| panic!("{name} is not registered"));
+            assert_eq!(flag.default_value, "false", "{name} must default off");
+            let mut config = Config::default();
+            assert_eq!(flag.current_value(&config), "false", "{name} default value");
+            set(&mut config);
+            assert_eq!(flag.current_value(&config), "true", "{name} follows Config");
+        }
+    }
 
     #[test]
     fn registry_names_and_env_vars_are_unique() {

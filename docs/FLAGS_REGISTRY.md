@@ -60,6 +60,8 @@ am flags off TUI_EFFECTS
 | `INTEGRITY_GUARD_ENABLED` | `INTEGRITY_GUARD_ENABLED` | `true` | stable | no | Periodic integrity checks, automatic backups and database maintenance; independent of the startup probe |
 | `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `300` | stable | no | Background quick-check cadence and initial delay when startup checking is skipped (minimum 1 second) |
 | `LLM_ENABLED` | `LLM_ENABLED` | `false` | experimental | no | LLM-backed features |
+| `MESSAGING_FAIL_CLOSED_SEND_PROFILE` | `MESSAGING_FAIL_CLOSED_SEND_PROFILE` | `false` | stable | no | Fail-closed `send_message`: stored matching sender token required, no recipient auto-registration |
+| `MESSAGING_SESSION_IDENTITY` | `MESSAGING_SESSION_IDENTITY` | `false` | experimental | no | Session-bound agent identity over stdio / `Mcp-Session-Id` (GH#279) |
 | `NOTIFICATIONS_ENABLED` | `NOTIFICATIONS_ENABLED` | `false` | stable | no | Filesystem notification signals |
 | `QUOTA_ENABLED` | `QUOTA_ENABLED` | `false` | experimental | no | Attachment and inbox quota enforcement |
 | `RETENTION_REPORT_ENABLED` | `RETENTION_REPORT_ENABLED` | `false` | stable | no | Periodic retention reports |
