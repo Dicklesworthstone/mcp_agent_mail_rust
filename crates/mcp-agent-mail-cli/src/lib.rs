@@ -37915,9 +37915,13 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
     // Fix 3: MCP config — update entries to HTTP URL mode.
     {
-        use mcp_agent_mail_core::mcp_config::detect_mcp_config_locations_default;
+        // Mutation authority, not the read-only inventory: OMP's compatibility
+        // fallbacks (`.mcp.json` beside its primaries, project `mcp.json`) are
+        // read by OMP but never written by it, exactly as the per-FM fixers
+        // treat them (br-u2vt2).
+        use mcp_agent_mail_core::mcp_config::detect_mcp_config_mutation_locations_default;
 
-        let locations = detect_mcp_config_locations_default();
+        let locations = detect_mcp_config_mutation_locations_default();
         let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
         let mut any_fixable = false;
         let desired_urls = if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
