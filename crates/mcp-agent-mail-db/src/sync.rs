@@ -583,11 +583,12 @@ pub fn inbox_delivery_events_from_conn(
 
     let range_rows = conn
         .query_sync(
-            // GH#282: the project's shared-mailbox cursor events (agent 0)
+            // GH#282: the project's shared-mailbox cursor events (no agent)
             // share this recipient's cursor space.
             "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor, \
                     (SELECT MIN(seq) FROM inbox_delivery_events) AS global_oldest \
-             FROM inbox_delivery_events WHERE project_id = ? AND agent_id IN (?, 0)",
+             FROM inbox_delivery_events WHERE project_id = ? \
+               AND (agent_id = ? OR (agent_id IS NULL AND kind = 'project'))",
             &[Value::BigInt(project_id), Value::BigInt(agent_id)],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;

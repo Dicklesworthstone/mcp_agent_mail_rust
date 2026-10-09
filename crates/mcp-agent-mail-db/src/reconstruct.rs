@@ -221,34 +221,62 @@ fn apply_snapshot_migrations(
             continue;
         }
 
-        let already_satisfied =
-            reconstruct_migration_preflight_already_satisfied(conn, &migration)?;
-        if !already_satisfied {
-            conn.execute_raw(&migration.up).map_err(|e| {
+        // Reconstruction can already own a transaction. A savepoint makes
+        // every multi-step rebuild and its ledger entry atomic in either case.
+        conn.execute_raw("SAVEPOINT reconstruct_migration")
+            .map_err(|error| {
+                DbError::Sqlite(format!("reconstruct: migration savepoint: {error}"))
+            })?;
+        let applied = (|| -> DbResult<()> {
+            let already_satisfied =
+                reconstruct_migration_preflight_already_satisfied(conn, &migration)?;
+            if !already_satisfied {
+                let statements = schema::migration_sql_statements(&migration);
+                if statements.len() > 1 {
+                    let rows = conn
+                        .query_sync(schema::PROJECT_EVENT_SCHEMA_SQL, &[])
+                        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                    schema::validate_project_event_rebuild_schema(&migration, &rows)
+                        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+                }
+                for sql in statements {
+                    conn.execute_raw(sql).map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct: apply {phase} migration {} ({}): {e}",
+                            migration.id, migration.description
+                        ))
+                    })?;
+                }
+            }
+
+            conn.execute_sync(
+                &format!(
+                    "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
+                    schema::MIGRATIONS_TABLE_NAME,
+                ),
+                &[
+                    Value::Text(migration.id.clone()),
+                    Value::Text(migration.description.clone()),
+                    Value::BigInt(crate::now_micros()),
+                ],
+            )
+            .map_err(|e| {
                 DbError::Sqlite(format!(
-                    "reconstruct: apply {phase} migration {} ({}): {e}",
-                    migration.id, migration.description
+                    "reconstruct: record {phase} migration {}: {e}",
+                    migration.id
                 ))
             })?;
+            conn.execute_raw("RELEASE reconstruct_migration")
+                .map_err(|error| {
+                    DbError::Sqlite(format!("reconstruct: commit migration: {error}"))
+                })?;
+            Ok(())
+        })();
+        if let Err(error) = applied {
+            let _ = conn.execute_raw("ROLLBACK TO reconstruct_migration");
+            let _ = conn.execute_raw("RELEASE reconstruct_migration");
+            return Err(error);
         }
-
-        conn.execute_sync(
-            &format!(
-                "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
-                schema::MIGRATIONS_TABLE_NAME,
-            ),
-            &[
-                Value::Text(migration.id.clone()),
-                Value::Text(migration.description.clone()),
-                Value::BigInt(crate::now_micros()),
-            ],
-        )
-        .map_err(|e| {
-            DbError::Sqlite(format!(
-                "reconstruct: record {phase} migration {}: {e}",
-                migration.id
-            ))
-        })?;
         applied_ids.insert(migration.id.clone());
     }
 
@@ -7142,6 +7170,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn snapshot_project_event_migration_rolls_back_and_can_retry() {
+        let conn = DbConn::open_memory().expect("canonical reconstruction database");
+        let mut legacy = schema::schema_migrations_base();
+        let index = legacy
+            .iter()
+            .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
+            .unwrap();
+        let migration = legacy.remove(index);
+        apply_snapshot_migrations(&conn, legacy, "legacy fixture").unwrap();
+        conn.execute_raw(
+            "PRAGMA foreign_keys = OFF; \
+             INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'shared','/shared',1); \
+             INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+             VALUES(1,1,'BlueLake','test','test',1,1); \
+             INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             VALUES(1,1,1,'shared','body',10); \
+             INSERT INTO inbox_delivery_events(seq,project_id,agent_id,message_id,kind,delivered_ts) \
+             VALUES(42,1,0,1,'project',10);"
+        ).unwrap();
+        conn.execute_raw(&format!(
+            "CREATE TRIGGER reject_snapshot_migration BEFORE INSERT ON {} \
+             BEGIN SELECT RAISE(ABORT, 'snapshot ledger failure'); END",
+            schema::MIGRATIONS_TABLE_NAME,
+        ))
+        .unwrap();
+        let error = apply_snapshot_migrations(&conn, vec![migration.clone()], "upgrade")
+            .expect_err("snapshot rebuild must roll back if its ledger write fails");
+        assert!(
+            error.to_string().contains("snapshot ledger failure"),
+            "{error}"
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT agent_id FROM inbox_delivery_events WHERE seq = 42",
+                &[],
+            )
+            .unwrap()[0]
+                .get_named::<i64>("agent_id")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'inbox_delivery_events_v33'",
+                &[],
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        conn.execute_raw("DROP TRIGGER reject_snapshot_migration")
+            .unwrap();
+        apply_snapshot_migrations(&conn, vec![migration], "retry").unwrap();
+        assert_eq!(
+            conn.query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE agent_id IS NULL",
+                &[],
+            )
+            .unwrap()[0]
+                .get_named::<i64>("seq")
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            conn.query_sync("PRAGMA foreign_key_check", &[])
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn recovered_archive_metadata_rejects_unknown_or_invalid_lineage() {
         for raw in [
             "null",
@@ -7657,7 +7757,7 @@ mod tests {
         assert_eq!(deliveries[0].get_as::<String>(1).unwrap(), "to");
         let events = conn
             .query_sync(
-                "SELECT COUNT(*) FROM inbox_delivery_events WHERE agent_id = 0 AND message_id = 1",
+                "SELECT COUNT(*) FROM inbox_delivery_events WHERE agent_id IS NULL AND message_id = 1",
                 &[],
             )
             .expect("cursor event");

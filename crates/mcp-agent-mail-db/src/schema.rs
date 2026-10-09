@@ -608,6 +608,141 @@ const TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL: &str = "CREATE TRIGGER IF 
              FROM messages AS m WHERE m.id = NEW.message_id; \
          END";
 
+const PROJECT_EVENT_SCOPE_MIGRATION: &str = "v33_project_scoped_inbox_delivery_events";
+
+// One atomic migration, including its ledger entry. Keep the historical v25
+// and v32 SQL/checksums intact. Project events have no recipient agent; NULL
+// expresses that without inventing an agent or weakening direct-event FKs.
+// Copy seq verbatim and retain sqlite_sequence even when retention removed
+// the newest (or every) event, so an issued cursor can never be reused.
+pub(crate) const PROJECT_EVENT_SCOPE_STATEMENTS: &[&str] = &[
+    "CREATE TABLE inbox_delivery_events_v33 (\
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,\
+        project_id INTEGER NOT NULL REFERENCES projects(id),\
+        agent_id INTEGER REFERENCES agents(id),\
+        message_id INTEGER NOT NULL REFERENCES messages(id),\
+        kind TEXT NOT NULL,\
+        delivered_ts INTEGER NOT NULL,\
+        UNIQUE(agent_id, message_id),\
+        CHECK ((kind = 'project' AND agent_id IS NULL) OR \
+               (kind <> 'project' AND agent_id IS NOT NULL))\
+    )",
+    "INSERT INTO inbox_delivery_events_v33 \
+        (seq, project_id, agent_id, message_id, kind, delivered_ts) \
+     SELECT seq, project_id, \
+            CASE WHEN kind = 'project' AND agent_id = 0 THEN NULL ELSE agent_id END, \
+            message_id, kind, delivered_ts FROM inbox_delivery_events ORDER BY seq",
+    "INSERT INTO sqlite_sequence (name, seq) \
+     SELECT 'inbox_delivery_events_v33', seq FROM sqlite_sequence \
+     WHERE name = 'inbox_delivery_events' \
+       AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'inbox_delivery_events_v33')",
+    "UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE(\
+        (SELECT MAX(seq) FROM sqlite_sequence WHERE name = 'inbox_delivery_events'), 0)) \
+     WHERE name = 'inbox_delivery_events_v33'",
+    "DROP TRIGGER IF EXISTS trg_inbox_delivery_events_recipient_insert",
+    "DROP TRIGGER IF EXISTS trg_messages_cascade_project_mailbox",
+    "DROP TABLE inbox_delivery_events",
+    "ALTER TABLE inbox_delivery_events_v33 RENAME TO inbox_delivery_events",
+    "CREATE INDEX idx_inbox_delivery_events_agent_seq ON inbox_delivery_events(agent_id, seq)",
+    "CREATE UNIQUE INDEX idx_inbox_delivery_events_project_message \
+     ON inbox_delivery_events(project_id, message_id) WHERE agent_id IS NULL",
+    TRG_INBOX_DELIVERY_EVENTS_RECIPIENT_INSERT_SQL,
+    "CREATE TRIGGER trg_messages_cascade_project_mailbox \
+     AFTER DELETE ON messages BEGIN \
+         DELETE FROM project_mailbox_receipts WHERE message_id = OLD.id; \
+         DELETE FROM project_mailbox_deliveries WHERE message_id = OLD.id; \
+         DELETE FROM inbox_delivery_events WHERE message_id = OLD.id AND agent_id IS NULL; \
+     END",
+];
+
+/// Physical statements of an authored migration. The project-event table
+/// rebuild must run as a unit; its complete SQL is still covered by the
+/// migration checksum. Callers own the surrounding migration transaction.
+pub(crate) fn migration_sql_statements(migration: &Migration) -> Vec<&str> {
+    if migration.id == PROJECT_EVENT_SCOPE_MIGRATION {
+        PROJECT_EVENT_SCOPE_STATEMENTS.to_vec()
+    } else {
+        vec![migration.up.as_str()]
+    }
+}
+
+/// Inspect the complete persistent schema, including references from views,
+/// triggers on other tables, and child foreign keys, before the v33 rebuild.
+pub(crate) const PROJECT_EVENT_SCHEMA_SQL: &str =
+    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL";
+
+/// A rebuild must not silently discard custom columns, indexes or triggers,
+/// or temporarily invalidate an unrecognized view/foreign-key dependency.
+/// Refuse those schemas before any DDL; the surrounding migration transaction
+/// keeps the old ledger usable and leaves its migration record pending.
+pub(crate) fn validate_project_event_rebuild_schema(
+    migration: &Migration,
+    rows: &[sqlmodel_core::Row],
+) -> Result<(), SqlError> {
+    fn normalized(sql: &str) -> String {
+        sql.split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .replace(" if not exists ", " ")
+            .trim_end_matches(';')
+            .to_string()
+    }
+    if migration.id != PROJECT_EVENT_SCOPE_MIGRATION {
+        return Ok(());
+    }
+    let authored = schema_migrations();
+    let mut found_table = false;
+    for row in rows {
+        let kind = row.get_named::<String>("type")?;
+        let name = row.get_named::<String>("name")?;
+        let table = row.get_named::<String>("tbl_name")?;
+        let sql = row.get_named::<String>("sql")?;
+        if !sql.to_ascii_lowercase().contains("inbox_delivery_events")
+            && !table.eq_ignore_ascii_case("inbox_delivery_events")
+            && !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "inbox_delivery_events"
+                    | "idx_inbox_delivery_events_agent_seq"
+                    | "trg_inbox_delivery_events_recipient_insert"
+                    | "trg_messages_cascade_project_mailbox"
+            )
+        {
+            continue;
+        }
+        let expected_id = match (kind.as_str(), name.as_str()) {
+            ("table", "inbox_delivery_events") => {
+                found_table = true;
+                "v25_create_inbox_delivery_events"
+            }
+            ("index", "idx_inbox_delivery_events_agent_seq") => {
+                "v25_idx_inbox_delivery_events_agent_seq"
+            }
+            ("trigger", "trg_inbox_delivery_events_recipient_insert") => {
+                "v25_trg_inbox_delivery_events_recipient_insert"
+            }
+            ("trigger", "trg_messages_cascade_project_mailbox") => {
+                "v32_trg_messages_cascade_project_mailbox"
+            }
+            _ => "",
+        };
+        if !authored.iter().any(|expected| {
+            expected.id == expected_id && normalized(&expected.up) == normalized(&sql)
+        }) {
+            return Err(SqlError::Custom(format!(
+                "project event migration refuses unsupported {kind} {name}; \
+                 preserve or migrate this custom schema before retrying"
+            )));
+        }
+    }
+    if !found_table {
+        return Err(SqlError::Custom(
+            "project event migration requires the existing inbox_delivery_events table".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // This exact statement (including its comment and whitespace) was already
 // recorded with a checksum before v30. The latest bootstrap DDL may evolve;
 // an applied migration may not. Fresh and existing ledgers both add the new
@@ -633,6 +768,8 @@ CREATE TABLE IF NOT EXISTS messages (
 /// Migrations are designed so each `up` is a single `SQLite` statement (compatible with
 /// `DbConn::execute_sync`, which only executes the first
 /// prepared statement). Triggers are included as single `CREATE TRIGGER ... END;` statements.
+/// The v33 table rebuild is executed through [`migration_sql_statements`] in
+/// the same transaction as its single migration ledger entry.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn schema_migrations() -> Vec<Migration> {
@@ -2513,8 +2650,8 @@ pub fn schema_migrations() -> Vec<Migration> {
     // above (generated v1 IDs). Removing a message must not leave a delivery
     // that resurrects an empty row in every agent's inbox, a receipt that
     // would claim a later message reusing the id was already read, or the
-    // delivery's cursor event (`inbox_delivery_events` row with agent_id 0,
-    // see `project_mailbox::PROJECT_MAILBOX_EVENT_AGENT_ID`).
+    // delivery's cursor event (historically agent_id 0; v33 repairs that
+    // representation without changing this already-recorded migration).
     migrations.push(Migration::new(
         "v32_trg_messages_cascade_project_mailbox".to_string(),
         "GH#282: cascade-delete project mailbox delivery and receipts with their message"
@@ -2527,6 +2664,14 @@ pub fn schema_migrations() -> Vec<Migration> {
              DELETE FROM inbox_delivery_events WHERE message_id = OLD.id AND agent_id = 0; \
          END"
         .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        PROJECT_EVENT_SCOPE_MIGRATION.to_string(),
+        "br-kp1in.39: represent project cursor events without an agent foreign-key violation"
+            .to_string(),
+        PROJECT_EVENT_SCOPE_STATEMENTS.join(";\n"),
         String::new(),
     ));
 
@@ -3213,6 +3358,7 @@ pub async fn validate_startup_schema_gate<C: Connection>(
         "idx_messages_ack_required_id",
         "idx_mr_ack_message",
         "idx_inbox_delivery_events_agent_seq",
+        "idx_inbox_delivery_events_project_message",
         "idx_message_delivery_signal_receipts_message",
         "idx_file_reservations_released_expires_id",
         "idx_file_reservation_releases_ts",
@@ -3797,6 +3943,27 @@ async fn execute_statements<C: Connection>(
     Outcome::Ok(())
 }
 
+async fn execute_project_event_scope_migration<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    migration: &Migration,
+) -> Outcome<(), SqlError> {
+    let rows = match conn.query(cx, PROJECT_EVENT_SCHEMA_SQL, &[]).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if let Err(error) = validate_project_event_rebuild_schema(migration, &rows) {
+        return Outcome::Err(error);
+    }
+    let statements = migration_sql_statements(migration)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    execute_statements(cx, conn, &statements).await
+}
+
 async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -4279,6 +4446,32 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         }
 
+        // The pending list was read before this write lock. Another startup
+        // may already have completed the rebuild; trust its checked ledger
+        // record, not a guess based on the new table's appearance. In
+        // particular, preserve custom indexes added after the winner finished.
+        if migration.id == PROJECT_EVENT_SCOPE_MIGRATION {
+            match migration_set_is_complete(cx, conn, std::slice::from_ref(migration)).await {
+                Outcome::Ok(false) => {}
+                Outcome::Ok(true) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Ok(());
+                }
+                Outcome::Err(error) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Err(error);
+                }
+                Outcome::Cancelled(reason) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Cancelled(reason);
+                }
+                Outcome::Panicked(payload) => {
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    return Outcome::Panicked(payload);
+                }
+            }
+        }
+
         let already_satisfied =
             match migration_preflight_already_satisfied(cx, conn, migration).await {
                 Outcome::Ok(value) => value,
@@ -4318,6 +4511,8 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                     execute_v10a_dedup_agents_case_insensitive(cx, conn).await
                 } else if migration.id == "v15_add_recipients_json_to_messages" {
                     execute_v15_add_recipients_json_to_messages(cx, conn).await
+                } else if migration.id == PROJECT_EVENT_SCOPE_MIGRATION {
+                    execute_project_event_scope_migration(cx, conn, migration).await
                 } else {
                     match conn.execute(cx, &migration.up, &[]).await {
                         Outcome::Ok(_) => Outcome::Ok(()),
@@ -4789,6 +4984,448 @@ mod tests {
             .build()
             .expect("build runtime");
         rt.block_on(f(cx))
+    }
+
+    async fn seed_legacy_project_events<C: Connection>(cx: &Cx, conn: &C) -> Migration {
+        init_migrations_table(cx, conn)
+            .await
+            .into_result()
+            .expect("initialize migration ledger");
+        let mut migrations = schema_migrations_base();
+        let position = migrations
+            .iter()
+            .position(|migration| migration.id == PROJECT_EVENT_SCOPE_MIGRATION)
+            .expect("v33 migration");
+        let migration = migrations.remove(position);
+        run_specific_migrations(cx, conn, migrations)
+            .await
+            .into_result()
+            .expect("apply historical base migrations");
+        let statements = [
+            "PRAGMA foreign_keys = OFF",
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'events','/events',1)",
+            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) \
+             VALUES(1,1,'BlueLake','test','test',1,1),(2,1,'RedStone','test','test',1,1)",
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             VALUES(1,1,1,'direct','body',10),(2,1,1,'shared','body',20),\
+                   (3,1,1,'pruned','body',30),(4,1,1,'next','body',40)",
+            "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(1,2,'to')",
+            "UPDATE inbox_delivery_events SET seq = 41 WHERE message_id = 1",
+            "INSERT INTO inbox_delivery_events(seq,project_id,agent_id,message_id,kind,delivered_ts) \
+             VALUES(42,1,0,2,'project',20),(700,1,0,3,'project',30)",
+            "DELETE FROM inbox_delivery_events WHERE seq = 700",
+            "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+             VALUES(2,1,'to',20),(4,1,'to',40)",
+        ].map(str::to_string);
+        execute_statements(cx, conn, &statements)
+            .await
+            .into_result()
+            .expect("seed genuine legacy sentinel events and pruned high-water mark");
+        migration
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_project_events_upgrade<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+        prune_all: bool,
+    ) {
+        let migration = seed_legacy_project_events(cx, conn).await;
+        if prune_all {
+            conn.execute(cx, "DELETE FROM inbox_delivery_events", &[])
+                .await
+                .into_result()
+                .expect("prune entire ledger");
+        }
+        let applied = run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .expect("atomically upgrade project events");
+        assert_eq!(applied, vec![PROJECT_EVENT_SCOPE_MIGRATION.to_string()]);
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration])
+                .await
+                .into_result()
+                .expect("idempotent restart migration"),
+            Vec::<String>::new()
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT seq, agent_id FROM inbox_delivery_events ORDER BY seq",
+                &[],
+            )
+            .expect("migrated events");
+        if prune_all {
+            assert_eq!(rows.len(), 0);
+        } else {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get_named::<i64>("seq").unwrap(), 41);
+            assert_eq!(
+                rows[0].get_named::<Option<i64>>("agent_id").unwrap(),
+                Some(2)
+            );
+            assert_eq!(rows[1].get_named::<i64>("seq").unwrap(), 42);
+            assert_eq!(rows[1].get_named::<Option<i64>>("agent_id").unwrap(), None);
+            let page = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(41), 10)
+                .expect("resume an issued pre-upgrade cursor");
+            assert_eq!(
+                page.events
+                    .iter()
+                    .map(|event| event.seq)
+                    .collect::<Vec<_>>(),
+                vec![42]
+            );
+        }
+        let floor = conn
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'inbox_delivery_events'",
+                &[],
+            )
+            .expect("read retained sequence floor");
+        assert_eq!(floor[0].get_named::<i64>("seq").unwrap(), 700);
+        let parameters = [Value::BigInt(1), Value::BigInt(4), Value::BigInt(40)];
+        for _ in 0..2 {
+            conn.execute(
+                cx,
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &parameters,
+            )
+            .await
+            .into_result()
+            .expect("append and replay project delivery");
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE message_id = 4",
+                &[],
+            )
+            .expect("project replay is deduplicated despite NULL agent");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get_named::<i64>("seq").unwrap() > 700);
+        conn.execute(
+            cx,
+            "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(3,2,'cc')",
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("recipient trigger survives rebuild");
+        let page = crate::sync::inbox_delivery_events_from_conn(conn, 1, 2, Some(700), 10)
+            .expect("new direct and shared delivery events");
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| (event.message_id, event.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, "project"), (3, "cc")]
+        );
+        conn.execute(cx, "DELETE FROM messages WHERE id = 4", &[])
+            .await
+            .into_result()
+            .expect("delete project message");
+        assert_eq!(
+            conn.query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE message_id = 4",
+                &[]
+            )
+            .unwrap()
+            .len(),
+            0,
+            "updated cascade removes the NULL-scoped event"
+        );
+    }
+
+    #[test]
+    fn project_event_scope_upgrade_canonical_preserves_cursors_and_foreign_keys() {
+        for prune_all in [false, true] {
+            let conn = crate::CanonicalDbConn::open_memory().expect("canonical database");
+            let conn_ref = &conn;
+            block_on(|cx| async move {
+                assert_project_events_upgrade(&cx, conn_ref, prune_all).await;
+            });
+            assert_eq!(
+                conn.query_sync("PRAGMA foreign_key_check", &[])
+                    .unwrap()
+                    .len(),
+                0
+            );
+            conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+            let error = conn.execute_raw(
+                "INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) \
+                 VALUES(1,999,2,'to',20)"
+            ).expect_err("direct delivery still requires a real agent");
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("foreign key")
+            );
+            for values in ["(1,NULL,2,'to',20)", "(1,2,2,'project',20)"] {
+                conn.execute_raw(&format!(
+                    "INSERT INTO inbox_delivery_events(project_id,agent_id,message_id,kind,delivered_ts) VALUES{values}"
+                )).expect_err("scope CHECK rejects ambiguous project/direct ownership");
+            }
+        }
+    }
+
+    #[test]
+    fn project_event_scope_upgrade_runtime_survives_reopen_and_empty_ledger() {
+        for prune_all in [false, true] {
+            let directory = tempfile::tempdir().expect("test directory");
+            let path = directory.path().join("events.sqlite3");
+            let conn = DbConn::open_file(path.display().to_string()).expect("runtime database");
+            let conn_ref = &conn;
+            block_on(|cx| async move {
+                assert_project_events_upgrade(&cx, conn_ref, prune_all).await;
+            });
+            drop(conn);
+            let reopened =
+                DbConn::open_file(path.display().to_string()).expect("reopen runtime database");
+            let page = crate::sync::inbox_delivery_events_from_conn(&reopened, 1, 2, Some(700), 10)
+                .expect("persisted cursor works after reopen");
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].message_id, 3);
+            assert!(page.events[0].seq > 700);
+            reopened
+                .execute_sync(
+                    "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                 VALUES(5,1,1,'after restart','body',50)",
+                    &[],
+                )
+                .expect("persist a new message after restart");
+            reopened.execute_sync(
+                "INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) \
+                 VALUES(5,1,'to',50)",
+                &[],
+            )
+            .unwrap();
+            for _ in 0..2 {
+                reopened
+                    .execute_sync(
+                        crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                        &[Value::BigInt(1), Value::BigInt(5), Value::BigInt(50)],
+                    )
+                    .expect("insert and replay a project event after restart");
+            }
+            let next = crate::sync::inbox_delivery_events_from_conn(
+                &reopened,
+                1,
+                2,
+                Some(page.next_cursor),
+                10,
+            )
+            .expect("continue the saved cursor with a newly inserted event");
+            assert_eq!(next.events.len(), 1);
+            assert_eq!(next.events[0].message_id, 5);
+            assert!(next.events[0].seq > page.next_cursor);
+        }
+    }
+
+    async fn assert_project_event_rebuild_rollback<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        let migration = seed_legacy_project_events(cx, conn).await;
+        conn.execute(
+            cx,
+            &format!(
+                "CREATE TRIGGER reject_migration_record BEFORE INSERT ON {MIGRATIONS_TABLE_NAME} \
+             BEGIN SELECT RAISE(ABORT, 'injected ledger write failure'); END"
+            ),
+            &[],
+        )
+        .await
+        .into_result()
+        .expect("inject failure after all rebuild DDL");
+        let error = run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .expect_err("ledger failure rolls back complete rebuild");
+        assert!(
+            error.to_string().contains("injected ledger write failure"),
+            "{error}"
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT seq,agent_id FROM inbox_delivery_events ORDER BY seq",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].get_named::<i64>("seq").unwrap(), 42);
+        assert_eq!(rows[1].get_named::<i64>("agent_id").unwrap(), 0);
+        assert_eq!(
+            conn.query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'inbox_delivery_events'",
+                &[]
+            )
+            .unwrap()[0]
+                .get_named::<i64>("seq")
+                .unwrap(),
+            700
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'inbox_delivery_events_v33'",
+                &[]
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+        conn.execute(cx, "DROP TRIGGER reject_migration_record", &[])
+            .await
+            .into_result()
+            .expect("remove injected failure");
+        assert_eq!(
+            run_specific_migrations(cx, conn, vec![migration])
+                .await
+                .into_result()
+                .expect("failed migration remains retryable"),
+            vec![PROJECT_EVENT_SCOPE_MIGRATION.to_string()]
+        );
+    }
+
+    #[test]
+    fn project_event_scope_rebuild_and_ledger_rollback_together() {
+        let canonical = crate::CanonicalDbConn::open_memory().expect("canonical database");
+        block_on(|cx| async move {
+            assert_project_event_rebuild_rollback(&cx, &canonical).await;
+        });
+        let directory = tempfile::tempdir().expect("test directory");
+        let runtime = DbConn::open_file(
+            directory
+                .path()
+                .join("rollback.sqlite3")
+                .display()
+                .to_string(),
+        )
+        .expect("runtime database");
+        block_on(|cx| async move {
+            assert_project_event_rebuild_rollback(&cx, &runtime).await;
+        });
+    }
+
+    async fn assert_project_event_stale_pending<C: Connection + crate::pool::SyncQuery>(
+        cx: &Cx,
+        conn: &C,
+    ) {
+        let migration = seed_legacy_project_events(cx, conn).await;
+        run_specific_migrations(cx, conn, vec![migration.clone()])
+            .await
+            .into_result()
+            .unwrap();
+        conn.execute(
+            cx,
+            "CREATE INDEX operator_event_kind ON inbox_delivery_events(kind)",
+            &[],
+        )
+        .await
+        .into_result()
+        .unwrap();
+        // Simulate a second initializer that observed Pending before the
+        // winner acquired its transaction, without relying on scheduling.
+        run_single_migration_with_lock_retry(cx, conn, &migration)
+            .await
+            .into_result()
+            .expect("the under-lock ledger witness wins over a stale pending observation");
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'operator_event_kind'",
+                &[],
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let mut drifted = migration;
+        drifted.up.push_str(" -- changed after application");
+        let error = run_single_migration_with_lock_retry(cx, conn, &drifted)
+            .await
+            .into_result()
+            .expect_err("an applied record must still reject checksum drift under the lock");
+        assert!(
+            error.to_string().contains("changed after application"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn project_event_scope_stale_pending_checks_the_locked_ledger() {
+        let canonical = crate::CanonicalDbConn::open_memory().unwrap();
+        block_on(|cx| async move {
+            assert_project_event_stale_pending(&cx, &canonical).await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let runtime =
+            DbConn::open_file(directory.path().join("stale.sqlite3").display().to_string())
+                .unwrap();
+        block_on(|cx| async move {
+            assert_project_event_stale_pending(&cx, &runtime).await;
+        });
+    }
+
+    #[test]
+    fn project_event_scope_refuses_custom_dependencies_without_dropping_them() {
+        for custom in [
+            "CREATE INDEX custom_event_time ON inbox_delivery_events(delivered_ts)",
+            "CREATE TRIGGER custom_event_delete AFTER DELETE ON inbox_delivery_events BEGIN SELECT 1; END",
+            "CREATE VIEW custom_events AS SELECT seq FROM inbox_delivery_events",
+            "CREATE TABLE custom_child(event_seq INTEGER REFERENCES inbox_delivery_events(seq))",
+            "ALTER TABLE inbox_delivery_events ADD COLUMN custom_payload TEXT",
+            "DROP TRIGGER trg_inbox_delivery_events_recipient_insert; \
+             CREATE TRIGGER trg_inbox_delivery_events_recipient_insert \
+             AFTER INSERT ON message_recipients BEGIN SELECT 1; END",
+            "DROP TRIGGER trg_messages_cascade_project_mailbox; \
+             CREATE TRIGGER trg_messages_cascade_project_mailbox \
+             AFTER DELETE ON messages BEGIN SELECT 1; END",
+        ] {
+            let conn = crate::CanonicalDbConn::open_memory().expect("canonical database");
+            block_on(|cx| async move {
+                let migration = seed_legacy_project_events(&cx, &conn).await;
+                conn.execute_raw(custom)
+                    .expect("install custom schema dependency");
+                let snapshot = || {
+                    conn.query_sync(
+                        "SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name",
+                        &[],
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<String>("name").unwrap(),
+                            row.get_named::<String>("sql").unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                };
+                let before = snapshot();
+                let error = run_specific_migrations(&cx, &conn, vec![migration])
+                    .await
+                    .into_result()
+                    .expect_err("custom schema needs explicit migration");
+                assert!(
+                    error.to_string().contains("refuses unsupported"),
+                    "{custom}: {error}"
+                );
+                assert_eq!(
+                    snapshot(),
+                    before,
+                    "custom schema must remain intact: {custom}"
+                );
+                assert_eq!(
+                    conn.query_sync(
+                        "SELECT agent_id FROM inbox_delivery_events WHERE seq = 42",
+                        &[]
+                    )
+                    .unwrap()[0]
+                        .get_named::<i64>("agent_id")
+                        .unwrap(),
+                    0
+                );
+            });
+        }
     }
 
     #[test]
@@ -6236,19 +6873,17 @@ mod tests {
         conn.execute_raw(&deferred)
             .expect("deferring base DDL initializes a legacy database");
 
-        // The column migrations run first and the deferred index migrations follow.
-        for migration in schema_migrations_base() {
-            if let Err(error) = conn.execute_raw(&migration.up) {
-                let text = error.to_string().to_ascii_lowercase();
-                assert!(
-                    text.contains("already exists")
-                        || text.contains("duplicate column name")
-                        || text.contains("duplicate trigger name"),
-                    "migration {} failed: {text}",
-                    migration.id
-                );
+        // Exercise the production executor, including atomic multi-step
+        // rebuilds: column migrations precede their deferred indexes.
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("migrate the legacy schema with deferred indexes");
             }
-        }
+        });
         let indexes = conn
             .query_sync(
                 "SELECT name FROM sqlite_master WHERE type = 'index' \

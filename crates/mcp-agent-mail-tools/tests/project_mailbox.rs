@@ -331,6 +331,88 @@ fn project_mailbox_send_is_one_delivery_read_by_each_present_agent() {
         assert_eq!(mailbox["visible_agents"], 2);
         assert_eq!(mailbox["read_count"], 2);
         assert_eq!(mailbox["acknowledged_count"], 1);
+
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+        // Open a fresh runtime handle to the persisted file, then resume a
+        // cursor obtained before closing that handle. Both eligible viewers
+        // share one durable project event, even after receipt writes.
+        let resumed_cursor = {
+            let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path())
+                .expect("reopen runtime mailbox");
+            let viewers = reopened.query_sync(
+                "SELECT project_id, id FROM agents WHERE name IN ('BlueLake','RedStone') ORDER BY id",
+                &[],
+            ).expect("resolve persisted viewers");
+            let mut cursors = Vec::new();
+            for viewer in viewers {
+                let project_id = viewer.get_named::<i64>("project_id").unwrap();
+                let agent_id = viewer.get_named::<i64>("id").unwrap();
+                let page = mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(
+                    &reopened, project_id, agent_id, None, 100,
+                )
+                .expect("read shared event after reopening the file");
+                assert_eq!(page.events.len(), 1);
+                assert_eq!(page.events[0].message_id, message_id);
+                cursors.push((project_id, agent_id, page.next_cursor));
+            }
+            assert_eq!(cursors[0].2, cursors[1].2, "one event serves both viewers");
+            cursors
+        };
+        let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path())
+            .expect("reopen for cursor continuation");
+        for (project_id, agent_id, cursor) in resumed_cursor {
+            let page = mcp_agent_mail_db::sync::inbox_delivery_events_from_conn(
+                &reopened,
+                project_id,
+                agent_id,
+                Some(cursor),
+                100,
+            )
+            .expect("resume saved shared mailbox cursor");
+            assert!(
+                page.events.is_empty(),
+                "restart must not repeat a consumed event"
+            );
+        }
+        drop(reopened);
+
+        // Canonical SQLite is the FK oracle. Use the production same-engine
+        // backup path first: never attach a canonical handle to the live
+        // FrankenSQLite-managed inode just to validate it.
+        let backup = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect("capture an isolated consistent mailbox backup")
+            .expect("file-backed backup");
+        let canonical = mcp_agent_mail_db::CanonicalDbConn::open_file(backup.display().to_string())
+            .expect("open only the private backup with canonical SQLite");
+        assert!(
+            canonical
+                .query_sync("PRAGMA foreign_key_check", &[])
+                .expect("canonical FK check after actual project send")
+                .is_empty()
+        );
+        assert_eq!(canonical.query_sync(
+            "SELECT COUNT(*) FROM inbox_delivery_events WHERE agent_id IS NULL AND kind = 'project'",
+            &[],
+        ).unwrap()[0].get_as::<i64>(0).unwrap(), 1);
+
+        // Restore the historical defect only in the private oracle copy. A
+        // green check above must mean valid FKs, not a missing/disabled check.
+        canonical
+            .execute_raw("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        canonical
+            .execute_raw("UPDATE inbox_delivery_events SET agent_id = 0 WHERE kind = 'project'")
+            .unwrap();
+        let broken = canonical
+            .query_sync("PRAGMA foreign_key_check", &[])
+            .unwrap();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(
+            broken[0].get_as::<String>(0).unwrap(),
+            "inbox_delivery_events"
+        );
+        assert_eq!(broken[0].get_as::<String>(2).unwrap(), "agents");
     });
 }
 

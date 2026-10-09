@@ -32,8 +32,8 @@
 //! # Delivery cursor
 //!
 //! Restart-safe monitors page `inbox_delivery_events` by its global `seq`. A
-//! project delivery appends ONE event there, for the pseudo-recipient
-//! [`PROJECT_MAILBOX_EVENT_AGENT_ID`], in the send transaction. Each viewer's
+//! project delivery appends ONE event there with no agent recipient
+//! (`agent_id IS NULL`), in the send transaction. Each viewer's
 //! event page merges its own events with the visible project events, so one
 //! cursor covers both without a per-agent row.
 
@@ -51,14 +51,10 @@ pub const PROJECT_MAILBOX_KIND: &str = "project";
 /// Address prefix that names a project's shared mailbox.
 pub const PROJECT_MAILBOX_ADDRESS_PREFIX: &str = "project:";
 
-/// `inbox_delivery_events.agent_id` of a project delivery's single cursor
-/// event. Agent ids start at 1, so 0 never names a real recipient.
-pub const PROJECT_MAILBOX_EVENT_AGENT_ID: i64 = 0;
-
 /// Append a project delivery's cursor event. Binds: project id, message id,
 /// delivered timestamp. Idempotent for a re-driven insert.
 pub const INSERT_PROJECT_MAILBOX_EVENT_SQL: &str = "INSERT OR IGNORE INTO inbox_delivery_events \
-     (project_id, agent_id, message_id, kind, delivered_ts) VALUES (?, 0, ?, 'project', ?)";
+     (project_id, agent_id, message_id, kind, delivered_ts) VALUES (?, NULL, ?, 'project', ?)";
 
 const MAX_IN_CLAUSE_ITEMS: usize = 500;
 
@@ -262,8 +258,8 @@ pub fn product_inbox_select_sql(body_select: &str) -> String {
 
 /// Project cursor events visible to a viewer, oldest first.
 ///
-/// These are the `inbox_delivery_events` rows of the
-/// [`PROJECT_MAILBOX_EVENT_AGENT_ID`], in the column shape of the recipient
+/// These are the `inbox_delivery_events` rows with no recipient agent,
+/// in the column shape of the recipient
 /// event page. Binds: unknown-sender display, viewer agent id, project id,
 /// cursor (`seq >`), limit.
 #[must_use]
@@ -276,7 +272,7 @@ pub fn visible_events_sql() -> String {
          JOIN messages AS m ON m.id = e.message_id \
          JOIN agents AS viewer ON viewer.id = ? \
          LEFT JOIN agents AS sender ON sender.id = m.sender_id \
-         WHERE e.project_id = ? AND e.agent_id = {PROJECT_MAILBOX_EVENT_AGENT_ID} \
+         WHERE e.project_id = ? AND e.agent_id IS NULL AND e.kind = 'project' \
            AND e.seq > ? AND {VISIBLE_TO_VIEWER_SQL} \
          ORDER BY e.seq ASC LIMIT ?"
     )

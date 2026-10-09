@@ -15667,6 +15667,14 @@ fn open_sqlite_with_fallback_internal(
 }
 
 fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to build canonical schema migration runtime: {error}"
+            ))
+        })?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     retry_sync_sqlite_lock(|| {
         let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path).map_err(|e| {
             sqlite_retryable_error(
@@ -15711,52 +15719,30 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
             )
         })?;
 
-        conn.execute_raw(&format!(
-            "CREATE TABLE IF NOT EXISTS {} (\
-                id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
-                description TEXT NOT NULL,\
-                applied_at INTEGER NOT NULL\
-            )",
-            mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME,
-        ))
-        .map_err(|e| {
-            sqlite_retryable_error(
-                format!("failed to initialize migrations table for {path}: {e}"),
-                &e.to_string(),
-            )
-        })?;
-
-        let migration_ts = mcp_agent_mail_db::timestamps::now_micros();
-        for migration in mcp_agent_mail_db::schema::schema_migrations_base() {
-            if let Err(e) = conn.execute_raw(&migration.up) {
-                let err_text = e.to_string();
-                if !sqlite_migration_error_is_benign(&err_text) {
-                    return Err(sqlite_retryable_error(
-                        format!(
-                            "failed to apply base migration {} for {path}: {e}",
-                            migration.id
-                        ),
-                        &err_text,
-                    ));
-                }
+        // Share the transactional, checksummed migration runner with normal
+        // startup. Replaying raw migration SQL on every canonical open would
+        // rebuild v33's delivery-event table after it had already migrated,
+        // bypassing both custom-schema preflight and atomic ledger recording.
+        match runtime.block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
+            &cx, &conn,
+        )) {
+            asupersync::Outcome::Ok(_) => {}
+            asupersync::Outcome::Err(error) => {
+                return Err(sqlite_retryable_error(
+                    format!("failed to apply base migrations for {path}: {error}"),
+                    &error.to_string(),
+                ));
             }
-            conn.execute_sync(
-                &format!(
-                    "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
-                    mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME,
-                ),
-                &[
-                    sqlmodel_core::Value::Text(migration.id),
-                    sqlmodel_core::Value::Text(migration.description),
-                    sqlmodel_core::Value::BigInt(migration_ts),
-                ],
-            )
-            .map_err(|e| {
-                sqlite_retryable_error(
-                    format!("failed to record base migration for {path}: {e}"),
-                    &e.to_string(),
-                )
-            })?;
+            asupersync::Outcome::Cancelled(reason) => {
+                return Err(mcp_agent_mail_db::DbError::Internal(format!(
+                    "canonical schema migration cancelled for {path}: {reason:?}"
+                )));
+            }
+            asupersync::Outcome::Panicked(payload) => {
+                return Err(mcp_agent_mail_db::DbError::Internal(format!(
+                    "canonical schema migration panicked for {path}: {payload}"
+                )));
+            }
         }
         drop(conn);
         mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(std::path::Path::new(path)).map_err(
@@ -15769,13 +15755,6 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
         )?;
         Ok(())
     })
-}
-
-fn sqlite_migration_error_is_benign(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("already exists")
-        || lower.contains("duplicate column name")
-        || lower.contains("duplicate trigger name")
 }
 
 fn sqlite_retryable_error(message: String, detail: &str) -> mcp_agent_mail_db::DbError {
@@ -79364,6 +79343,69 @@ startup_timeout_sec = 42
         assert!(
             sqlite_conn_requires_canonical_init(&conn).expect("schema probe"),
             "empty databases should still run canonical bootstrap"
+        );
+    }
+
+    #[test]
+    fn canonical_schema_initializer_records_rebuild_once_and_preserves_later_indexes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical-migration-ledger.sqlite3");
+        let path = db_path.to_string_lossy().into_owned();
+        let read_ledger = |conn: &mcp_agent_mail_db::CanonicalDbConn| {
+            conn.query_sync(
+                &format!(
+                    "SELECT id, checksum, applied_at FROM {} ORDER BY id",
+                    mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME
+                ),
+                &[],
+            )
+            .expect("read canonical migration ledger")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get_named::<String>("id").expect("migration id"),
+                    row.get_named::<String>("checksum").expect("checksum"),
+                    row.get_named::<i64>("applied_at")
+                        .expect("applied timestamp"),
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+
+        init_schema_sqlite_canonical(&path).expect("initialize fresh canonical database");
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&path).expect("open initialized DB");
+        let ledger_before = read_ledger(&conn);
+        let rebuild = mcp_agent_mail_db::schema::schema_migrations_base()
+            .into_iter()
+            .find(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
+            .expect("project-scoped delivery migration is registered");
+        assert!(
+            ledger_before
+                .iter()
+                .any(|(id, checksum, _)| { id == &rebuild.id && checksum == &rebuild.checksum() }),
+            "canonical bootstrap must record the checked migration checksum"
+        );
+        conn.execute_raw(
+            "CREATE INDEX operator_delivery_kind ON inbox_delivery_events(kind, delivered_ts)",
+        )
+        .expect("add an operator index after the rebuild has committed");
+        drop(conn);
+
+        init_schema_sqlite_canonical(&path).expect("reopen without repeating applied rebuilds");
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&path).expect("reopen initialized DB");
+        assert_eq!(read_ledger(&conn), ledger_before);
+        let indexes = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'operator_delivery_kind'",
+                &[],
+            )
+            .expect("read retained custom index");
+        assert_eq!(
+            indexes.len(),
+            1,
+            "an already-applied table rebuild must neither remove nor refuse a later operator index"
         );
     }
 
