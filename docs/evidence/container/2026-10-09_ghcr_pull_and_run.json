@@ -162,5 +162,21 @@
    ],
    "pass": true
   }
- ]
+ ],
+ "volume_persistence": {
+  "image": "ghcr.io/dicklesworthstone/mcp_agent_mail_rust:v0.3.38",
+  "volume": "br-ocys6-accept-data",
+  "first_health": "healthy",
+  "send_error": false,
+  "agents": [
+   "SandyTrout",
+   "WhiteGate"
+  ],
+  "second_health": "healthy",
+  "after_replacement_subjects": [
+   "survives replacement",
+   "Contact approved: SandyTrout -> WhiteGate"
+  ],
+  "pass": true
+ }
 }
