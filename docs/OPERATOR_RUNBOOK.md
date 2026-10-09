@@ -278,8 +278,18 @@ is used in hot paths.
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
-| `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run `PRAGMA quick_check` at boot |
-| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity check    |
+| `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run the boot-time `PRAGMA quick_check`; `false` skips only this probe, leaving the background guard enabled |
+| `INTEGRITY_GUARD_ENABLED`      | `true`                | Enable periodic integrity checks, automatic backups and database maintenance; `false` stops that worker |
+| `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `300`       | Background quick-check cadence and delay before the first cycle when startup checking is skipped (minimum 1 second) |
+| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity-check cadence (`0` disables scheduled full checks, leaving quick checks enabled) |
+| `DB_MAINTENANCE_ENABLED`       | `true`                | Enable checkpoint/ANALYZE/VACUUM/journal-size maintenance inside the guard; `false` leaves checks and backups enabled |
+
+Skipping startup checking leaves the critical integrity verdict yellow until a
+full background check succeeds. Health names `INTEGRITY_CHECK_ON_STARTUP=false`
+and the first cycle's scheduled time, or reports that no running worker has
+published a schedule. Failed checks remain red. Changes to these settings
+require restarting the server; `INTEGRITY_GUARD_ENABLED=false` also disables
+automatic backup refresh and K4 maintenance, even if maintenance is enabled.
 
 ### HTTP Server
 

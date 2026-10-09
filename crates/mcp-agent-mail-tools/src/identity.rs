@@ -922,7 +922,14 @@ fn compute_health_verdicts(
         Err(detail) => HealthVerdict::new(Yellow, false, detail),
     };
 
-    let integrity_check = integrity_health_verdict(integrity);
+    let integrity_check = integrity_health_verdict(
+        config,
+        integrity,
+        mcp_agent_mail_core::global_metrics()
+            .db
+            .integrity_guard_first_check_due_us
+            .load(),
+    );
 
     HealthVerdicts {
         transport_health,
@@ -941,7 +948,11 @@ fn compute_health_verdicts(
 /// outcome remains red until another complete `PRAGMA integrity_check` passes.
 /// Conversely, before a full check has completed, health is deliberately
 /// yellow rather than falsely green about evidence it does not have.
-fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> HealthVerdict {
+fn integrity_health_verdict(
+    config: &Config,
+    metrics: &mcp_agent_mail_db::IntegrityMetrics,
+    first_check_due_us: u64,
+) -> HealthVerdict {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     use mcp_agent_mail_db::IntegrityCheckOutcome::{Failed, Passed, Unknown};
 
@@ -954,22 +965,52 @@ fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> He
                 metrics.last_full_check_ts
             ),
         ),
-        Unknown => HealthVerdict::new(
-            Yellow,
-            true,
-            "no full PRAGMA integrity_check has completed in this process",
-        ),
-        Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
+        Unknown | Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
             Red,
             true,
             format!(
-                "latest {} failed at {} after the last successful full integrity_check",
+                "latest {} failed at {}; full integrity_check evidence is required",
                 metrics
                     .last_check_kind
                     .map_or_else(|| "integrity probe".to_string(), |kind| kind.to_string()),
                 metrics.last_check_ts
             ),
         ),
+        Unknown | Passed if !config.integrity_guard_enabled => HealthVerdict::new(
+            Yellow,
+            true,
+            "periodic integrity checks, automatic backups and database maintenance disabled by configuration (INTEGRITY_GUARD_ENABLED=false)",
+        ),
+        Unknown => {
+            let detail = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+                &config.database_url,
+            ) {
+                "no full PRAGMA integrity_check has completed; the periodic guard does not run for an in-memory DATABASE_URL".to_string()
+            } else if config.integrity_check_interval_hours == 0 {
+                "no full PRAGMA integrity_check has completed; periodic full checking disabled by configuration (INTEGRITY_CHECK_INTERVAL_HOURS=0); quick checks remain enabled".to_string()
+            } else {
+                let startup = if config.integrity_check_on_startup {
+                    "no full PRAGMA integrity_check has completed in this process"
+                } else {
+                    "startup integrity check skipped by configuration (INTEGRITY_CHECK_ON_STARTUP=false)"
+                };
+                if first_check_due_us == 0 {
+                    format!(
+                        "{startup}; first periodic check has not been scheduled by a running integrity guard"
+                    )
+                } else {
+                    let due = i64::try_from(first_check_due_us).unwrap_or(i64::MAX);
+                    let when = mcp_agent_mail_db::micros_to_iso(due);
+                    let pending = if due <= mcp_agent_mail_db::now_micros() {
+                        "; awaiting the first successful full result"
+                    } else {
+                        ""
+                    };
+                    format!("{startup}; first periodic check due at {when}{pending}")
+                }
+            };
+            HealthVerdict::new(Yellow, true, detail)
+        }
         Passed if metrics.last_check_outcome == Unknown => HealthVerdict::new(
             Yellow,
             true,
@@ -4003,7 +4044,7 @@ mod tests {
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
         metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
 
-        let verdict = integrity_health_verdict(&metrics);
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(verdict.status, "red");
         assert!(verdict.critical);
         assert!(verdict.detail.contains("later quick check cannot clear it"));
@@ -4012,7 +4053,7 @@ mod tests {
         metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
         metrics.last_check_ts = 300;
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Full);
-        let repaired = integrity_health_verdict(&metrics);
+        let repaired = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(repaired.status, "green");
     }
 
@@ -4023,9 +4064,62 @@ mod tests {
         metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
 
-        let verdict = integrity_health_verdict(&metrics);
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(verdict.status, "yellow");
         assert!(verdict.critical);
+    }
+
+    #[test]
+    fn skipped_startup_health_reports_schedule_then_full_success_then_failure() {
+        let mut config = Config {
+            integrity_check_on_startup: false,
+            ..Config::default()
+        };
+        let mut metrics = healthy_integrity_metrics();
+        metrics.last_full_check_ts = 0;
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        let due = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap() + 300_000_000;
+        let waiting = integrity_health_verdict(&config, &metrics, due);
+        assert_eq!(waiting.status, "yellow");
+        assert!(waiting.critical);
+        assert!(
+            waiting
+                .detail
+                .contains("skipped by configuration (INTEGRITY_CHECK_ON_STARTUP=false)")
+        );
+        assert!(waiting.detail.contains(&format!(
+            "first periodic check due at {}",
+            mcp_agent_mail_db::micros_to_iso(i64::try_from(due).unwrap())
+        )));
+        let unavailable = integrity_health_verdict(&config, &metrics, 0);
+        assert!(unavailable.detail.contains("has not been scheduled"));
+
+        metrics = healthy_integrity_metrics();
+        assert_eq!(
+            integrity_health_verdict(&config, &metrics, due).status,
+            "green"
+        );
+        config.integrity_guard_enabled = false;
+        let disabled = integrity_health_verdict(&config, &metrics, 0);
+        assert_eq!(disabled.status, "yellow");
+        assert!(disabled.detail.contains("INTEGRITY_GUARD_ENABLED=false"));
+
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        assert_eq!(integrity_health_verdict(&config, &metrics, 0).status, "red");
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        assert_eq!(integrity_health_verdict(&config, &metrics, 0).status, "red");
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        config.integrity_guard_enabled = true;
+        config.integrity_check_interval_hours = 0;
+        let no_full_checks = integrity_health_verdict(&config, &metrics, due);
+        assert_eq!(no_full_checks.status, "yellow");
+        assert!(
+            no_full_checks
+                .detail
+                .contains("INTEGRITY_CHECK_INTERVAL_HOURS=0")
+        );
     }
 
     #[test]

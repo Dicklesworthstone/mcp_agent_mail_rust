@@ -347,6 +347,11 @@ pub struct Config {
     pub read_cache_entries_per_category: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
+    /// Run periodic integrity checks, automatic backups and database maintenance.
+    /// Independent of the boot-time probe (default: true).
+    pub integrity_guard_enabled: bool,
+    /// Seconds between background quick-check cycles (default: 300, minimum: 1).
+    pub integrity_quick_check_interval_seconds: u64,
     /// Hours between periodic full `PRAGMA integrity_check` runs
     /// (default: 1, 0 = disabled).
     ///
@@ -1598,6 +1603,8 @@ impl Default for Config {
             read_cache_entries_per_category: CacheProfile::Balanced
                 .read_cache_entries_per_category(),
             integrity_check_on_startup: true,
+            integrity_guard_enabled: true,
+            integrity_quick_check_interval_seconds: 300,
             integrity_check_interval_hours: 1,
 
             fsqlite_concurrent_mode: false,
@@ -2149,6 +2156,13 @@ impl Config {
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,
         );
+        config.integrity_guard_enabled =
+            env_bool("INTEGRITY_GUARD_ENABLED", config.integrity_guard_enabled);
+        config.integrity_quick_check_interval_seconds = env_u64(
+            "INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS",
+            config.integrity_quick_check_interval_seconds,
+        )
+        .max(1);
 
         // Periodic SQLite maintenance knobs (bead K4). Each interval is in
         // seconds; 0 disables that op (and `DB_MAINTENANCE_ENABLED=false`
@@ -7336,6 +7350,40 @@ mod tests {
             resolved,
             xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo")
         );
+    }
+
+    #[test]
+    fn integrity_guard_and_startup_flags_resolve_independently() {
+        assert!(Config::default().integrity_guard_enabled);
+        assert_eq!(
+            Config::default().integrity_quick_check_interval_seconds,
+            300
+        );
+        for (startup, guard, maintenance) in [
+            ("false", "true", "true"),
+            ("true", "false", "true"),
+            ("false", "true", "false"),
+        ] {
+            with_isolated_default_storage_root_and_env_overrides_for_test(
+                &[
+                    ("INTEGRITY_CHECK_ON_STARTUP", startup),
+                    ("INTEGRITY_GUARD_ENABLED", guard),
+                    ("DB_MAINTENANCE_ENABLED", maintenance),
+                    ("INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS", "0"),
+                ],
+                |_| {
+                    let config = Config::from_env();
+                    assert_eq!(config.integrity_check_on_startup, startup == "true");
+                    assert_eq!(config.integrity_guard_enabled, guard == "true");
+                    assert_eq!(config.db_maintenance_enabled, maintenance == "true");
+                    assert_eq!(config.integrity_quick_check_interval_seconds, 1);
+                    let flag = crate::flags::find_flag("INTEGRITY_GUARD_ENABLED").unwrap();
+                    let snapshot = crate::flags::flag_snapshot(&config, flag);
+                    assert_eq!(snapshot.current_value, guard);
+                    assert_eq!(snapshot.source, "env");
+                },
+            );
+        }
     }
 
     #[test]

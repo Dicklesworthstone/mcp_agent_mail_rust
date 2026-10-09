@@ -3484,7 +3484,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             let (status, detail) = proactive_backup_health(
                 probe_target
                     .integrity_guard_enabled
-                    .unwrap_or(config.integrity_check_on_startup),
+                    .unwrap_or(config.integrity_guard_enabled),
                 probe_target.integrity_guard_enabled.is_some(),
                 backup_age_secs,
                 owner_age_secs,

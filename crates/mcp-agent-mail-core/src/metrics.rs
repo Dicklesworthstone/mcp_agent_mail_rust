@@ -551,6 +551,9 @@ pub struct DbMetrics {
     pub pool_peak_active_connections: GaugeU64,
     pub pool_over_80_since_us: GaugeU64,
     pub integrity_failures_total: Counter,
+    /// First background check's scheduled wall-clock time in microseconds.
+    /// Zero means no live integrity worker has published a schedule.
+    pub integrity_guard_first_check_due_us: GaugeU64,
     /// Count of runtime corruption triggers where file-level health probes
     /// (canonical `SQLite` `quick_check` + `integrity_check`) report healthy.
     /// These are bespoke-parser-only rejections: typically a record or page
@@ -604,6 +607,7 @@ pub struct DbMetricsSnapshot {
     pub pool_utilization_pct: u64,
     pub pool_over_80_since_us: u64,
     pub integrity_failures_total: u64,
+    pub integrity_guard_first_check_due_us: u64,
     pub bespoke_parser_only_rejections_total: u64,
     pub maintenance_checkpoint_runs_total: u64,
     pub maintenance_analyze_runs_total: u64,
@@ -633,6 +637,7 @@ impl Default for DbMetrics {
             pool_peak_active_connections: GaugeU64::new(),
             pool_over_80_since_us: GaugeU64::new(),
             integrity_failures_total: Counter::new(),
+            integrity_guard_first_check_due_us: GaugeU64::new(),
             bespoke_parser_only_rejections_total: Counter::new(),
             maintenance_checkpoint_runs_total: Counter::new(),
             maintenance_analyze_runs_total: Counter::new(),
@@ -671,6 +676,7 @@ impl DbMetrics {
             pool_utilization_pct,
             pool_over_80_since_us: self.pool_over_80_since_us.load(),
             integrity_failures_total: self.integrity_failures_total.load(),
+            integrity_guard_first_check_due_us: self.integrity_guard_first_check_due_us.load(),
             bespoke_parser_only_rejections_total: self.bespoke_parser_only_rejections_total.load(),
             maintenance_checkpoint_runs_total: self.maintenance_checkpoint_runs_total.load(),
             maintenance_analyze_runs_total: self.maintenance_analyze_runs_total.load(),

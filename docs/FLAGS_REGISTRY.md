@@ -57,6 +57,8 @@ am flags off TUI_EFFECTS
 | `BACKPRESSURE_SHEDDING_ENABLED` | `BACKPRESSURE_SHEDDING_ENABLED` | `false` | experimental | no | Capacity-governor shedding for low-priority reads under red health |
 | `COALESCER_ADAPTIVE_FLUSH_ENABLED` | `AM_COALESCER_ADAPTIVE_FLUSH_ENABLED` | `false` | experimental | no | Adaptive archive commit-coalescer flush windows |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `false` | experimental | no | Local development auth bypass |
+| `INTEGRITY_GUARD_ENABLED` | `INTEGRITY_GUARD_ENABLED` | `true` | stable | no | Periodic integrity checks, automatic backups and database maintenance; independent of the startup probe |
+| `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `300` | stable | no | Background quick-check cadence and initial delay when startup checking is skipped (minimum 1 second) |
 | `LLM_ENABLED` | `LLM_ENABLED` | `false` | experimental | no | LLM-backed features |
 | `NOTIFICATIONS_ENABLED` | `NOTIFICATIONS_ENABLED` | `false` | stable | no | Filesystem notification signals |
 | `QUOTA_ENABLED` | `QUOTA_ENABLED` | `false` | experimental | no | Attachment and inbox quota enforcement |

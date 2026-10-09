@@ -81,6 +81,21 @@ which overrides the working-directory `.env`.
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.
 
+For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
+only that startup probe. The background guard remains enabled and starts its
+first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,
+minimum 1). The integrity verdict stays yellow with the configured skip and
+scheduled time until a full check passes; a failed check stays red. The full
+check cadence remains `INTEGRITY_CHECK_INTERVAL_HOURS` (default 1; `0` disables
+scheduled full checks).
+
+Keep `INTEGRITY_GUARD_ENABLED=true` to retain periodic checks and automatic
+backups. Setting it to `false` disables the entire worker, including database
+maintenance. To disable only checkpoint/ANALYZE/VACUUM/journal-size maintenance,
+use `DB_MAINTENANCE_ENABLED=false`; checks and backups still run. These settings
+take effect when the server starts. Existing service overrides remain an
+operator decision; inspect them before changing a deployment.
+
 ## 3. Register a named operator agent [stateful]
 
 **Goal:** Create or refresh an explicit agent identity for a project.
