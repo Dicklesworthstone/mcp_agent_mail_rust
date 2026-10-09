@@ -618,11 +618,19 @@ transcript:
   `MESSAGING_FAIL_CLOSED_SEND_PROFILE`.
 - **No borrowed names.** A session that holds an identity in a project cannot,
   in that project, send/reply, read an inbox (`fetch_inbox`,
-  `fetch_inbox_events`), mark read or acknowledge, reserve/renew/release files,
-  or re-register (rewriting the profile and rotating the token) as any other
+  `fetch_inbox_events`, or that project's view in `fetch_inbox_product`), mark
+  read or acknowledge, reserve/renew/release files, manage build slots, request
+  a forced reservation release, or re-register (rewriting the profile and
+  rotating the token) as any other
   agent: those calls fail with `SESSION_IDENTITY_MISMATCH` (a send or reply that
   carries the other agent's own `sender_token` is still accepted). A session
   holding no identity in the project keeps the trusted-local behavior.
+- **Database outages.** ACKs and reservation releases can be queued durably
+  after the acting identity is authorized. If an outage prevents that check
+  and the session holds a potentially relevant binding, the call returns the
+  database error without queuing an intent, even for its own supplied name.
+  Retry after database access recovers. Already authorized intents remain
+  replayable when another session triggers recovery.
 - **Lifecycle.** `retire_agent` / `deregister_agent` drop the identity from the
   calling session; lifecycle authorization itself is unchanged (registration
   token, or a bound tmux pane over stdio).

@@ -6085,6 +6085,7 @@ pub async fn acknowledge_message(
 ) -> McpResult<String> {
     let agent_name = normalize_agent_name_or_original(agent_name);
     let config = Config::get();
+    let authorization = crate::session_identity::ActorAuthorizationSnapshot::capture(ctx)?;
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
     // Fingerprint the normalized ack payload (only when a key was supplied). The
@@ -6101,11 +6102,17 @@ pub async fn acknowledge_message(
         ),
     });
 
-    // Each step that can hit a corrupt/busy/unavailable DB queues a durable
-    // ack intent (fail-soft) rather than dropping a closeout acknowledgement.
+    // A durable intent is an accepted future mutation. If this session has a
+    // binding that could constrain an unresolved actor, preserve the original
+    // DB error so the caller retries after authorization becomes possible.
+    // Trusted-local callers and already-authorized actors keep fail-soft ACKs.
     let pool = match get_db_pool() {
         Ok(pool) => pool,
         Err(error) => {
+            if !authorization.permits_unresolved_actor(None) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6120,6 +6127,10 @@ pub async fn acknowledge_message(
     let project = match resolve_existing_project(ctx, &pool, &project_key).await {
         Ok(project) => project,
         Err(error) if mcp_error_supports_ack_intent(&error) => {
+            if !authorization.permits_unresolved_actor(None) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6146,6 +6157,10 @@ pub async fn acknowledge_message(
     {
         Ok(agent) => agent,
         Err(error) if mcp_error_supports_ack_intent(&error) => {
+            if !authorization.permits_unresolved_actor(Some(project_id)) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6158,7 +6173,7 @@ pub async fn acknowledge_message(
         }
         Err(error) => return Err(error),
     };
-    crate::session_identity::authorize_actor(ctx, &agent, false, "acknowledge mail")?;
+    authorization.authorize(ctx, &agent, "acknowledge mail")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -6188,6 +6203,7 @@ pub async fn acknowledge_message(
         if let Outcome::Err(error) = &idem_outcome
             && db_error_supports_ack_intent(error)
         {
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -6220,6 +6236,7 @@ pub async fn acknowledge_message(
         {
             Outcome::Ok(value) => value,
             Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
+                ctx.ensure_live()?;
                 return queued_ack_intent_response(
                     &config,
                     &project_key,
@@ -7061,6 +7078,308 @@ mod tests {
         .expect("create acknowledgement test message")
         .id
         .expect("message ID")
+    }
+
+    #[test]
+    fn ack_outage_cannot_queue_unresolved_session_actors() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for enabled in [true, false] {
+            let tmp = tempfile::tempdir().expect("ack identity outage fixture");
+            let root = tmp.path().canonicalize().expect("canonical fixture root");
+            let blocked_parent = root.join("database-parent-is-a-file");
+            std::fs::write(&blocked_parent, b"blocked database parent").expect("block database");
+            let unavailable_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &blocked_parent.join("mailbox.sqlite3"),
+            );
+            let archive = root.join("archive");
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", &unavailable_url),
+                    ("STORAGE_ROOT", archive.to_str().unwrap()),
+                    (
+                        "MESSAGING_SESSION_IDENTITY",
+                        if enabled { "true" } else { "false" },
+                    ),
+                ],
+                || {
+                    let pool = DbPool::new(&DbPoolConfig {
+                        database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                            &root.join("live.sqlite3"),
+                        ),
+                        ..DbPoolConfig::default()
+                    })
+                    .expect("independent live mailbox");
+                    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                    rt.block_on(async {
+                        let cx = Cx::current().expect("test context");
+                        let project =
+                            ensure_project_row(&cx, &pool, "/tmp/ack-identity-outage").await;
+                        let project_id = project.id.unwrap();
+                        let alice = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                        let bob = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                        let message_id = create_ack_test_message(
+                            &cx,
+                            &pool,
+                            project_id,
+                            alice.id.unwrap(),
+                            &[(alice.id.unwrap(), "cc"), (bob.id.unwrap(), "to")],
+                        )
+                        .await;
+                        let bound = McpContext::with_state(
+                            cx.clone(),
+                            1,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        crate::session_identity::bind(
+                            &bound,
+                            project_id,
+                            alice.id.unwrap(),
+                            &alice.name,
+                        );
+                        assert_eq!(
+                            crate::session_identity::session_bindings(&bound).is_empty(),
+                            !enabled
+                        );
+                        let config = Config::get();
+                        for name in [&alice.name, &bob.name] {
+                            for key in [None, Some("ack-identity-outage-key".to_string())] {
+                                let result = acknowledge_message(
+                                    &bound,
+                                    project.human_key.clone(),
+                                    name.clone(),
+                                    message_id,
+                                    key,
+                                )
+                                .await;
+                                if enabled {
+                                    let error = result.expect_err(
+                                        "cannot accept an unresolved actor during outage",
+                                    );
+                                    assert!(
+                                        mcp_error_supports_ack_intent(&error),
+                                        "preserve database error: {error}"
+                                    );
+                                    assert!(
+                                        mcp_error_cause(&error)
+                                            .contains(blocked_parent.to_str().unwrap())
+                                    );
+                                    assert!(
+                                        crate::degraded_intents::read_queued_ack_intents(&config)
+                                            .unwrap()
+                                            .is_empty()
+                                    );
+                                } else {
+                                    let queued: Value = serde_json::from_str(
+                                        &result.expect("default-off durable closeout"),
+                                    )
+                                    .unwrap();
+                                    assert_eq!(queued["queued"], true);
+                                    assert_eq!(queued["acknowledged"], false);
+                                }
+                            }
+                        }
+                        let unbound = McpContext::with_state(
+                            cx.clone(),
+                            2,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        replay_queued_ack_intents(&unbound, &pool, &config).await;
+                        let state = queries::fetch_inbox(
+                            &cx,
+                            &pool,
+                            project_id,
+                            bob.id.unwrap(),
+                            false,
+                            None,
+                            10,
+                        )
+                        .await
+                        .into_result()
+                        .expect("actual recipient state");
+                        assert_eq!(state[0].ack_ts.is_none(), enabled);
+                        assert_eq!(state[0].read_ts.is_none(), enabled);
+
+                        // A separately unbound caller keeps the original durable
+                        // closeout behavior, and a cancelled call never appends.
+                        let cancelled = McpContext::with_state(
+                            cx.clone(),
+                            3,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        cancelled.request_cancellation().cancel();
+                        acknowledge_message(
+                            &cancelled,
+                            project.human_key.clone(),
+                            bob.name.clone(),
+                            message_id,
+                            None,
+                        )
+                        .await
+                        .expect_err("cancelled request must not queue");
+                        assert!(
+                            crate::degraded_intents::read_queued_ack_intents(&config)
+                                .unwrap()
+                                .is_empty()
+                        );
+                        let queued: Value = serde_json::from_str(
+                            &acknowledge_message(
+                                &unbound,
+                                project.human_key.clone(),
+                                bob.name.clone(),
+                                message_id,
+                                None,
+                            )
+                            .await
+                            .expect("unbound outage closeout"),
+                        )
+                        .unwrap();
+                        assert_eq!(queued["queued"], true);
+                        replay_queued_ack_intents(&unbound, &pool, &config).await;
+                        let state = queries::fetch_inbox(
+                            &cx,
+                            &pool,
+                            project_id,
+                            bob.id.unwrap(),
+                            false,
+                            None,
+                            10,
+                        )
+                        .await
+                        .into_result()
+                        .expect("replayed recipient state");
+                        assert!(state[0].ack_ts.is_some());
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_ack_write_failure_queues_and_replays_under_another_session() {
+        with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |_| {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("test context");
+                let pool = get_db_pool().expect("live pool");
+                let project =
+                    ensure_project_row(&cx, &pool, "/tmp/authorized-ack-write-failure").await;
+                let project_id = project.id.unwrap();
+                let alice = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let bob = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                let queued_id = create_ack_test_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    alice.id.unwrap(),
+                    &[(bob.id.unwrap(), "to")],
+                )
+                .await;
+                let trigger_id = create_ack_test_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    bob.id.unwrap(),
+                    &[(alice.id.unwrap(), "to")],
+                )
+                .await;
+                let alice_ctx =
+                    McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                let bob_ctx =
+                    McpContext::with_state(cx.clone(), 2, fastmcp_core::SessionState::new());
+                crate::session_identity::bind(
+                    &alice_ctx,
+                    project_id,
+                    alice.id.unwrap(),
+                    &alice.name,
+                );
+                crate::session_identity::bind(&bob_ctx, project_id, bob.id.unwrap(), &bob.name);
+                let conn = pool.acquire(&cx).await.into_result().expect("connection");
+                conn.execute_sync(
+                    "CREATE TRIGGER reject_test_ack BEFORE UPDATE ON message_recipients \
+                     BEGIN SELECT RAISE(ABORT, 'ack storage unavailable in identity test'); END;",
+                    &[],
+                )
+                .expect("force a real receipt-write failure");
+                drop(conn);
+                let refusal = acknowledge_message(
+                    &alice_ctx,
+                    project.human_key.clone(),
+                    bob.name.clone(),
+                    queued_id,
+                    None,
+                )
+                .await
+                .expect_err("borrowed actor must not reach failing write");
+                assert_eq!(
+                    crate::tool_error_code(&refusal),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                let config = Config::get();
+                assert!(
+                    crate::degraded_intents::read_queued_ack_intents(&config)
+                        .unwrap()
+                        .is_empty()
+                );
+                for key in [None, Some("authorized-outage-key".to_string())] {
+                    let queued: Value = serde_json::from_str(
+                        &acknowledge_message(
+                            &bob_ctx,
+                            project.human_key.clone(),
+                            bob.name.clone(),
+                            queued_id,
+                            key,
+                        )
+                        .await
+                        .expect("authorized actor keeps durable closeout"),
+                    )
+                    .unwrap();
+                    assert_eq!(queued["queued"], true);
+                }
+                let intents = crate::degraded_intents::read_queued_ack_intents(&config).unwrap();
+                assert_eq!(intents.len(), 2);
+                assert!(
+                    intents
+                        .iter()
+                        .all(|intent| intent.failure.stage == "acknowledge_message")
+                );
+                assert!(intents.iter().all(|intent| {
+                    intent
+                        .failure
+                        .error_detail
+                        .contains("ack storage unavailable in identity test")
+                }));
+                let conn = pool.acquire(&cx).await.into_result().expect("connection");
+                conn.execute_sync("DROP TRIGGER reject_test_ack", &[])
+                    .expect("restore receipt writes");
+                drop(conn);
+
+                // Alice's legitimate ACK triggers Bob's previously authorized
+                // durable intent. Replay must not impersonate Alice as Bob.
+                acknowledge_message(
+                    &alice_ctx,
+                    project.human_key.clone(),
+                    alice.name,
+                    trigger_id,
+                    None,
+                )
+                .await
+                .expect("another session triggers accepted intent replay");
+                assert!(
+                    crate::degraded_intents::read_queued_ack_intents(&config)
+                        .unwrap()
+                        .is_empty()
+                );
+                let state =
+                    queries::fetch_inbox(&cx, &pool, project_id, bob.id.unwrap(), false, None, 10)
+                        .await
+                        .into_result()
+                        .expect("replayed Bob receipt");
+                assert!(state[0].ack_ts.is_some());
+                assert!(state[0].read_ts.is_some());
+            });
+        });
     }
 
     #[test]

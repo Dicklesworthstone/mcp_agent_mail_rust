@@ -156,6 +156,43 @@ pub fn holds(ctx: &McpContext, agent_id: Option<i64>) -> bool {
     })
 }
 
+/// Keep deferred mutation admission and its eventual actor check on the same
+/// identity snapshot. An outage must not turn an unresolved constrained actor
+/// into a trusted-local durable intent that can run after this session ends.
+pub(crate) struct ActorAuthorizationSnapshot {
+    held: Vec<SessionBinding>,
+}
+
+impl ActorAuthorizationSnapshot {
+    pub(crate) fn capture(ctx: &McpContext) -> McpResult<Self> {
+        ctx.ensure_live()?;
+        let held = session_bindings(ctx);
+        // An expired request scope makes get_state return None. Never mistake
+        // that unavailable state for an intentionally unbound caller.
+        ctx.ensure_live()?;
+        Ok(Self { held })
+    }
+
+    /// Before resolving the project, every binding could constrain the call.
+    /// Once its ID is known, only that project's bindings matter.
+    pub(crate) fn permits_unresolved_actor(&self, project_id: Option<i64>) -> bool {
+        !self
+            .held
+            .iter()
+            .any(|binding| project_id.is_none_or(|id| binding.project_id == id))
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        ctx: &McpContext,
+        agent: &mcp_agent_mail_db::AgentRow,
+        action: &str,
+    ) -> McpResult<()> {
+        ctx.ensure_live()?;
+        authorize_actor_from_bindings(&self.held, agent, action)
+    }
+}
+
 /// Refuse acting as `agent` when this session holds another identity there.
 ///
 /// "There" is the agent's project. `token_verified` is true when the call
@@ -170,8 +207,16 @@ pub fn authorize_actor(
     if token_verified {
         return Ok(());
     }
-    let held: Vec<SessionBinding> = session_bindings(ctx)
-        .into_iter()
+    authorize_actor_from_bindings(&session_bindings(ctx), agent, action)
+}
+
+fn authorize_actor_from_bindings(
+    bindings: &[SessionBinding],
+    agent: &mcp_agent_mail_db::AgentRow,
+    action: &str,
+) -> McpResult<()> {
+    let held: Vec<&SessionBinding> = bindings
+        .iter()
         .filter(|binding| binding.project_id == agent.project_id)
         .collect();
     if held.is_empty()
@@ -314,6 +359,40 @@ mod tests {
             1,
             fastmcp_core::SessionState::new(),
         )
+    }
+
+    #[test]
+    fn deferred_authorization_keeps_its_binding_snapshot_and_checks_liveness() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            let own = agent(1, 10, "BlueLake");
+            let other = agent(2, 10, "RedStone");
+            bind(&ctx, 10, 1, &own.name);
+            let authorization = ActorAuthorizationSnapshot::capture(&ctx).expect("live snapshot");
+            assert!(!authorization.permits_unresolved_actor(None));
+            assert!(!authorization.permits_unresolved_actor(Some(10)));
+            assert!(authorization.permits_unresolved_actor(Some(20)));
+            unbind(&ctx, 1);
+            assert!(session_bindings(&ctx).is_empty());
+            authorization
+                .authorize(&ctx, &own, "acknowledge mail")
+                .expect("original owner");
+            let error = authorization
+                .authorize(&ctx, &other, "acknowledge mail")
+                .expect_err("concurrent unbind cannot downgrade an accepted request");
+            assert_eq!(
+                crate::tool_error_code(&error),
+                Some("SESSION_IDENTITY_MISMATCH")
+            );
+
+            ctx.request_cancellation().cancel();
+            assert!(
+                authorization
+                    .authorize(&ctx, &own, "acknowledge mail")
+                    .is_err()
+            );
+            assert!(ActorAuthorizationSnapshot::capture(&ctx).is_err());
+        });
     }
 
     #[test]
