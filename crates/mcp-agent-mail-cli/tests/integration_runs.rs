@@ -7351,3 +7351,132 @@ fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
         "reload must precede restart: {calls}"
     );
 }
+
+/// Hermetic env for one `am` run against a private HOME and mailbox. The
+/// listener port is one nothing listens on, so mutations take the local path
+/// instead of reaching a live daemon.
+fn user_env_guard_env(root: &Path, port: u16) -> Vec<(String, String)> {
+    let home = root.join("home");
+    let storage = root.join("storage");
+    [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", home.display().to_string()),
+        (
+            "XDG_CONFIG_HOME",
+            home.join(".config").display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME",
+            home.join(".local/share").display().to_string(),
+        ),
+        ("XDG_CACHE_HOME", home.join(".cache").display().to_string()),
+        ("STORAGE_ROOT", storage.display().to_string()),
+        (
+            "DATABASE_URL",
+            format!("sqlite:///{}/storage.sqlite3", storage.display()),
+        ),
+        ("AM_INTERFACE_MODE", "cli".to_string()),
+        ("AM_ATC_ENABLED", "false".to_string()),
+        ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1".to_string()),
+        ("HTTP_HOST", "127.0.0.1".to_string()),
+        ("HTTP_PORT", port.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
+/// br-ww5js: through the real `execute` path, an unsafe (symlinked) user
+/// `config.env` makes config-consuming mutations fail closed before they open
+/// any mailbox state and without echoing the credential, while an exempt
+/// reflection verb still runs. The control arm, with a regular private
+/// `config.env`, shows the same registration does create the mailbox, so the
+/// missing storage in the unsafe arm is the guard's doing.
+#[cfg(unix)]
+#[test]
+fn unsafe_user_config_env_blocks_mutations_before_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let port = unused_loopback_port();
+    let unsafe_root = tmp.path().join("unsafe");
+    let control_root = tmp.path().join("control");
+    for root in [&unsafe_root, &control_root] {
+        std::fs::create_dir_all(root.join("home/.config/mcp-agent-mail")).expect("config dir");
+        std::fs::create_dir_all(root.join("project")).expect("project dir");
+    }
+    let elsewhere = tmp.path().join("elsewhere.env");
+    std::fs::write(&elsewhere, "HTTP_BEARER_TOKEN=elsewhere-secret\n").expect("target env");
+    std::os::unix::fs::symlink(
+        &elsewhere,
+        unsafe_root.join("home/.config/mcp-agent-mail/config.env"),
+    )
+    .expect("symlinked config.env");
+    let control_env = control_root.join("home/.config/mcp-agent-mail/config.env");
+    std::fs::write(&control_env, "HTTP_BEARER_TOKEN=control-secret\n").expect("control env");
+    std::fs::set_permissions(
+        &control_env,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod control env");
+
+    let project = unsafe_root.join("project");
+    let project_key = project.to_str().expect("utf-8 project path");
+    let env = user_env_guard_env(&unsafe_root, port);
+    // Temp paths contain no whitespace, so each command splits into its argv.
+    for command in [
+        format!("agents register --project {project_key} --program x --model y"),
+        format!(
+            "mail send --project {project_key} --from BlueLake --to RedStone --subject s --body b"
+        ),
+        format!("file_reservations reserve {project_key} BlueLake src/**"),
+        "doctor fix --yes".to_string(),
+    ] {
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let out = run_am_hermetic(&env, Some(&project), &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must fail closed: {stdout}");
+        assert!(
+            stderr.contains("refusing unsafe user configuration authority"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !format!("{stdout}{stderr}").contains("elsewhere-secret"),
+            "{args:?} disclosed the credential"
+        );
+        assert!(
+            !unsafe_root.join("storage").exists(),
+            "{args:?} created mailbox state despite the unsafe authority"
+        );
+    }
+    let reflection = run_am_hermetic(
+        &env,
+        Some(&project),
+        &["doctor", "capabilities", "--format", "json"],
+    );
+    assert!(
+        reflection.status.success(),
+        "exempt reflection must still run"
+    );
+    assert!(!unsafe_root.join("storage").exists());
+
+    let control_project = control_root.join("project");
+    let control_command = format!(
+        "agents register --project {} --program x --model y",
+        control_project.display()
+    );
+    let control_args: Vec<&str> = control_command.split_whitespace().collect();
+    let control = run_am_hermetic(
+        &user_env_guard_env(&control_root, port),
+        Some(&control_project),
+        &control_args,
+    );
+    assert!(
+        control.status.success(),
+        "control registration: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(
+        control_root.join("storage").exists(),
+        "control must create the mailbox"
+    );
+}
