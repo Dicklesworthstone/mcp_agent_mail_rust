@@ -326,7 +326,7 @@ docker run -d --name agent-mail -p 127.0.0.1:8765:8765 \
   ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest
 ```
 
-The image runs `mcp-agent-mail serve --no-tui` as the non-root `appuser`, serving MCP on port 8765 at `/mcp/`, with the whole mailbox (Git archive and SQLite) under `/data/mailbox`. Mount a volume there so mail survives replacing the container. Every request needs the token (`Authorization: Bearer <token>`); clients connect to `http://127.0.0.1:8765/mcp/` with it. Keep the published port on loopback unless remote agents should reach it. Docker's healthcheck polls `/health/liveness`. The binaries in the image are the same bytes as the release's Linux glibc archives.
+The image runs `mcp-agent-mail serve --no-tui` as the non-root `appuser`, serving MCP on port 8765 at `/mcp/`, with the whole mailbox (Git archive and SQLite) under `/data/mailbox`. Mount a volume there so mail survives replacing the container. Every request needs the token (`Authorization: Bearer <token>`); clients connect to `http://127.0.0.1:8765/mcp/` with it. Keep the published port on loopback unless remote agents should reach it. Docker's healthcheck polls `/health/liveness`. The image packages the release's Linux glibc binaries unchanged ([`Dockerfile.release`](Dockerfile.release)).
 
 ### From Source
 
