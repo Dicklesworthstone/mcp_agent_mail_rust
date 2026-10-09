@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use asupersync::Cx;
+use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_db::DbPool;
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value as SqlValue};
@@ -15,7 +15,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::super::MAX_RECIPIENTS;
-use super::{MAX_DB_PAYLOAD_BYTES, PreparedMessage, outcome, source_error};
+#[cfg(test)]
+use super::outcome;
+use super::{MAX_DB_PAYLOAD_BYTES, PreparedMessage, ReconcileFailure, source_error};
 
 const MAX_RECIPIENT_NAME_BYTES: i64 = 1024;
 
@@ -63,17 +65,38 @@ fn decode_archive_metadata(
 // that the recovery worker is allowed to discard.
 const SOURCE_SQL: &str = mcp_agent_mail_db::queries::MESSAGE_ARCHIVE_SOURCE_SQL;
 
+#[cfg(test)]
 pub(super) fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
+    prepare_message_classified(cx, pool, id).map_err(|error| error.detail)
+}
+
+pub(super) fn prepare_message_classified(
+    cx: &Cx,
+    pool: &DbPool,
+    id: i64,
+) -> Result<PreparedMessage, ReconcileFailure> {
+    let conn = match block_on(pool.acquire(cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Err(ReconcileFailure::source_unavailable(error)),
+        Outcome::Cancelled(_) => {
+            return Err(ReconcileFailure::source_unavailable(
+                "source read cancelled",
+            ));
+        }
+        Outcome::Panicked(_) => {
+            return Err(ReconcileFailure::source_unavailable("source read panicked"));
+        }
+    };
     read_source(id, |sql, params| {
-        conn.query_sync(sql, params).map_err(source_error)
+        conn.query_sync(sql, params)
+            .map_err(ReconcileFailure::source_unavailable)
     })
 }
 
 fn read_source(
     id: i64,
-    query: impl FnOnce(&str, &[SqlValue]) -> Result<Vec<Row>, String>,
-) -> Result<PreparedMessage, String> {
+    query: impl FnOnce(&str, &[SqlValue]) -> Result<Vec<Row>, ReconcileFailure>,
+) -> Result<PreparedMessage, ReconcileFailure> {
     // The pinned runtime's compound-select executor applies LIMIT without
     // bindings. Only the fixed internal row budget is rendered as SQL; message
     // IDs and payload bounds remain bound, with explicit indices across arms.
@@ -87,7 +110,7 @@ fn read_source(
             MAX_RECIPIENT_NAME_BYTES.into(),
         ],
     )?;
-    prepare_source_rows(id, &rows)
+    prepare_source_rows(id, &rows).map_err(ReconcileFailure::from)
 }
 
 /// Retention verifies the exact projection captured by the database, then the
@@ -430,7 +453,9 @@ mod tests {
                 // the writer's pooled connection, returned row or archive queue.
                 let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
                 let original = read_source(id, |sql, params| {
-                    reopened.query_sync(sql, params).map_err(source_error)
+                    reopened
+                        .query_sync(sql, params)
+                        .map_err(ReconcileFailure::source_unavailable)
                 })
                 .unwrap();
                 drop(reopened);
@@ -517,7 +542,9 @@ mod tests {
             .unwrap();
             let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
             let prepared = read_source(created.id.unwrap(), |sql, params| {
-                reopened.query_sync(sql, params).map_err(source_error)
+                reopened
+                    .query_sync(sql, params)
+                    .map_err(ReconcileFailure::source_unavailable)
             })
             .unwrap();
             drop(reopened);

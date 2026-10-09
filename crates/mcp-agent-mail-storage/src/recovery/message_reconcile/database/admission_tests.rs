@@ -279,6 +279,14 @@ fn exercise_busy_fence(existing: bool) {
             survivor.as_ref().map(|(_, bytes)| bytes.clone())
         );
         assert_eq!(cursor.tail_after, Some(902));
+        assert_eq!(
+            (
+                report.deferred_transient,
+                report.deferred_conflict,
+                report.retry_len
+            ),
+            (2, 0, 2)
+        );
 
         // Deferred work must be reread, not retained as a stale publication
         // payload. The second message has never had any archive copy.
@@ -286,7 +294,14 @@ fn exercise_busy_fence(existing: bool) {
         conn.execute_raw("UPDATE messages SET body_md='Live body after admission reopens', topic='updated' WHERE id=902").unwrap();
         drop(conn);
         let before_resume = database_evidence(cx, pool);
-        assert_eq!(catch_up(cx, pool, config, &mut cursor), 2);
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(
+            (resumed.repaired, resumed.retry_len),
+            (2, 0),
+            "transient refusals must retry on the next pass, without a cursor wrap"
+        );
         assert_recovered(cx, pool, config, 901, existing);
         assert_recovered(cx, pool, config, 902, false);
         assert_eq!(database_evidence(cx, pool), before_resume);
@@ -338,10 +353,287 @@ fn busy_project_is_skipped_while_another_mailbox_project_repairs_then_is_revisit
         assert_eq!(database_evidence(cx, pool), before);
         assert_eq!(active_writer_count(), 0);
         drop(owner);
-        assert_eq!(catch_up(cx, pool, config, &mut cursor), 1);
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((resumed.repaired, resumed.retry_len), (1, 0));
         assert_recovered(cx, pool, config, 901, true);
         assert_eq!(database_evidence(cx, pool), before);
         assert_eq!(fs::read(&survivor).unwrap(), bytes);
+    });
+}
+
+#[test]
+fn large_retained_lock_refusals_cannot_starve_fresh_mail_for_another_project() {
+    fixture(|cx, pool, config| {
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET body_md = ? WHERE id = 901",
+            &["x".repeat(7 * 1024 * 1024 / 2).into()],
+        )
+        .unwrap();
+        for id in 903..=906 {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages(id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+                 ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+                 SELECT {id}, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+                 ack_required, created_ts, recipients_json, attachments, archive_metadata_json FROM messages WHERE id = 901"
+            )).unwrap();
+            conn.execute_raw(&format!(
+                "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+                 SELECT {id}, agent_id, kind, read_ts, ack_ts FROM message_recipients WHERE message_id = 901"
+            )).unwrap();
+        }
+        drop(conn);
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        crate::ensure_archive(config, "other").unwrap();
+        crate::flush_async_commits();
+        let process = crate::archive_process_lock(&archive).unwrap();
+        let owner = process.lock().unwrap();
+        let mut cursor = ReconcileCursor::default();
+        for _ in 0..4 {
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+            if cursor.retries.len() == 5 {
+                break;
+            }
+        }
+        assert_eq!(
+            cursor.retries.len(),
+            5,
+            "real lock refusals retain all large rows"
+        );
+        assert!(!archive.root.join("messages").exists());
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages(id, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+             ack_required, created_ts, recipients_json, attachments, archive_metadata_json) \
+             SELECT 907, project_id, sender_id, thread_id, topic, subject, body_md, importance, \
+             ack_required, created_ts, recipients_json, attachments, archive_metadata_json FROM messages WHERE id = 902",
+        ).unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+             SELECT 907, agent_id, kind, read_ts, ack_ts FROM message_recipients WHERE message_id = 902",
+        ).unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        // Even when retry owns the first turn, five large refusals cannot
+        // exhaust the byte budget before fresh unrelated mail gets a turn.
+        cursor.next_lane_is_retry = true;
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert!(report.deferred_transient > 0, "{report:?}");
+        assert_eq!(report.retry_len, 5);
+        assert!(report.repaired > 0, "fresh mail was starved: {report:?}");
+        assert!(report.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+        assert!(matches!(
+            process.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert_recovered(cx, pool, config, 907, false);
+        assert!(!archive.root.join("messages").exists());
+        assert_eq!(database_evidence(cx, pool), before);
+        drop(owner);
+    });
+}
+
+#[test]
+fn repeated_fence_refusal_backs_off_without_scan_lanes_bypassing_the_retry() {
+    fixture(|cx, pool, config| {
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        crate::with_archive_snapshot_publication_fence(|| {
+            for attempt in 0..2 {
+                let report =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!((report.deferred_transient, report.retry_len), (2, 2));
+                assert!(cursor.retries.iter().all(|retry| retry.attempts == attempt));
+            }
+            let deadline = Instant::now() + MAX_RETRY_BACKOFF;
+            // Hold the recorded cooldown fixed so a slow test host cannot
+            // accidentally turn this into a wall-clock scheduling test.
+            for retry in &mut cursor.retries {
+                retry.ready_at = deadline;
+            }
+            for _ in 0..3 {
+                let report =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(
+                    (report.scanned, report.deferred, report.retry_len),
+                    (0, 0, 2)
+                );
+            }
+        });
+        assert_eq!(database_evidence(cx, pool), before);
+        assert!(!config.storage_root.join(".git").exists());
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((resumed.repaired, resumed.retry_len), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn unavailable_source_query_preserves_an_existing_transient_retry_until_recovery() {
+    fixture(|cx, pool, config| {
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        crate::with_archive_snapshot_publication_fence(|| {
+            let report =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(report.retry_len, 2);
+        });
+        // Keep every source row, but make the real source statement temporarily
+        // unavailable. Selection still succeeds against the messages table.
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("ALTER TABLE agents RENAME TO retained_agents")
+            .unwrap();
+        drop(conn);
+        let unavailable =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("ALTER TABLE retained_agents RENAME TO agents")
+            .unwrap();
+        drop(conn);
+        let report = unavailable.unwrap();
+        assert_eq!(
+            (
+                report.deferred_transient,
+                report.deferred_conflict,
+                report.retry_len
+            ),
+            (2, 0, 2),
+            "an unavailable source is not conflict evidence and cannot forget a deferred ID"
+        );
+        assert_eq!(database_evidence(cx, pool), before);
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((resumed.repaired, resumed.retry_len), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn conflicting_evidence_is_preserved_and_does_not_enter_the_transient_retry_lane() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let (path, _) = seed_outbox(config, &prepared);
+        let conflict =
+            crate::render_message_bundle_content(&prepared.message, "conflicting body").unwrap();
+        fs::write(&path, &conflict).unwrap();
+        crate::flush_async_commits();
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(
+            (
+                report.repaired,
+                report.deferred_transient,
+                report.deferred_conflict,
+                report.retry_len
+            ),
+            (1, 0, 1, 0)
+        );
+        for _ in 0..3 {
+            let report =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(
+                report.deferred, 0,
+                "wrapping history must respect conflict cooldown"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), conflict.as_bytes());
+        assert_eq!(database_evidence(cx, pool), before);
+        for (_, until) in &mut cursor.conflict_backoff {
+            *until = Instant::now();
+        }
+        let mut conflicts = 0;
+        for _ in 0..3 {
+            conflicts +=
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap()
+                    .deferred_conflict;
+        }
+        assert_eq!(
+            conflicts, 1,
+            "a cooled conflict may be checked again without hot-looping"
+        );
+        assert_eq!(fs::read(path).unwrap(), conflict.as_bytes());
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn full_retry_lane_preserves_unconsumed_scan_positions_instead_of_evicting_ids() {
+    fixture(|cx, pool, config| {
+        let deadline = Instant::now() + MAX_RETRY_BACKOFF;
+        let mut cursor = ReconcileCursor {
+            source_identity: pool.sqlite_identity_key(),
+            retries: (10_000..10_000 + i64::try_from(MAX_RETRY_IDS).unwrap())
+                .map(|id| DeferredRetry {
+                    id,
+                    attempts: 1,
+                    ready_at: deadline,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let ids = cursor
+            .retries
+            .iter()
+            .map(|retry| retry.id)
+            .collect::<Vec<_>>();
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!((report.scanned, report.retry_len), (0, MAX_RETRY_IDS));
+        assert_eq!(cursor.tail_after, None);
+        assert_eq!(cursor.backfill_ceiling, None);
+        assert_eq!(
+            cursor
+                .retries
+                .iter()
+                .map(|retry| retry.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(!config.storage_root.join(".git").exists());
+        // A due real retry must drain even while the full queue and untouched
+        // normal-first cursor also expose fresh IDs. Do not free capacity by
+        // hand: that would conceal a permanently pinned saturated queue.
+        cursor.retries.front_mut().unwrap().id = 901;
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed =
+            reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(resumed.repaired, 2);
+        assert!(resumed.retry_len < MAX_RETRY_IDS);
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
     });
 }
 
@@ -352,6 +644,7 @@ fn retained_cursor() -> ReconcileCursor {
         backfill_ceiling: Some(29),
         next_lane_is_history: true,
         settled_before_us: 1_234_567,
+        ..Default::default()
     }
 }
 

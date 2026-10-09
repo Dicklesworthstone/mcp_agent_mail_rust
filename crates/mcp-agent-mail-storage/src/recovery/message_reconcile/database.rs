@@ -10,8 +10,9 @@ mod admission_tests;
 mod source;
 mod staged;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
@@ -26,7 +27,9 @@ use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 
+#[cfg(test)]
 use self::source::prepare_message;
+use self::source::prepare_message_classified;
 use super::{ReconcileResult, RepairControl, read_surviving_message, reconcile_message_bundle};
 use crate::{MessageBundleBatchEntry, ProjectArchive};
 
@@ -35,6 +38,59 @@ const MAX_REPAIRS_PER_BATCH: usize = 4;
 const MAX_DB_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const NORMAL_ARCHIVE_GRACE_US: i64 = 30 * 1_000_000;
+const MAX_RETRY_IDS: usize = 1024;
+const MAX_RETRIES_PER_PASS: usize = 16;
+const MAX_IDS_PER_PASS: usize = 32;
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct DeferredRetry {
+    id: i64,
+    attempts: u32,
+    ready_at: Instant,
+}
+
+#[derive(Debug)]
+struct ReconcileFailure {
+    detail: String,
+    transient: bool,
+}
+
+impl ReconcileFailure {
+    fn source_unavailable(error: impl std::fmt::Display) -> Self {
+        // A failed source read is not conflicting evidence. Keep its ID for
+        // retry; the corruption observer still stops all repair when needed.
+        Self {
+            detail: source_error(error),
+            transient: true,
+        }
+    }
+}
+
+impl From<String> for ReconcileFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+        }
+    }
+}
+
+impl From<crate::StorageError> for ReconcileFailure {
+    fn from(error: crate::StorageError) -> Self {
+        let transient = matches!(
+            error,
+            crate::StorageError::LockContention { .. }
+                | crate::StorageError::LockTimeout(_)
+                | crate::StorageError::GitIndexLock { .. }
+        ) || matches!(&error, crate::StorageError::Io(error)
+            if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        Self {
+            detail: error.to_string(),
+            transient,
+        }
+    }
+}
 
 /// Separate new-message and rotating backfill cursors prevent old broken
 /// records from pinning catch-up and continuous new mail from starving history.
@@ -47,10 +103,17 @@ pub struct ReconcileCursor {
     // A byte budget can admit only one message. Resume with the opposite lane
     // after the last consumed item, not unconditionally with new-mail catch-up.
     next_lane_is_history: bool,
+    // Retry payloads share the same byte budget as new/history work. Preserve
+    // the opposite lane's turn even when one admitted item fills a whole pass.
+    next_lane_is_retry: bool,
     // Rows created before this instant (µs) predate the reconciling process's
     // own write-behind queue, so they cannot still be in flight there and need
     // no grace period. 0 = always apply the grace.
     settled_before_us: i64,
+    // Only IDs are retained. Every retry rereads the current live source and
+    // repeats the ordinary authority/no-clobber checks before publication.
+    retries: VecDeque<DeferredRetry>,
+    conflict_backoff: VecDeque<(i64, Instant)>,
 }
 
 impl ReconcileCursor {
@@ -74,6 +137,42 @@ impl ReconcileCursor {
         }
         self.next_lane_is_history = tail;
     }
+
+    fn forget_retry(&mut self, id: i64) {
+        self.retries.retain(|retry| retry.id != id);
+    }
+
+    fn defer_transient(&mut self, id: i64, now: Instant) {
+        let previous = self
+            .retries
+            .iter()
+            .position(|retry| retry.id == id)
+            .and_then(|index| self.retries.remove(index));
+        let attempts = previous.map_or(0, |retry| retry.attempts.saturating_add(1));
+        // The first deferral is eligible in the very next pass. Repeated
+        // contention backs off without exceeding the normal worker cadence.
+        let backoff = if attempts == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1_u64 << attempts.saturating_sub(1).min(6)).min(MAX_RETRY_BACKOFF)
+        };
+        self.retries.push_back(DeferredRetry {
+            id,
+            attempts,
+            ready_at: now + backoff,
+        });
+    }
+
+    fn defer_conflict(&mut self, id: i64, now: Instant) {
+        self.forget_retry(id);
+        self.conflict_backoff
+            .retain(|(known, until)| *known != id && *until > now);
+        if self.conflict_backoff.len() == MAX_RETRY_IDS {
+            self.conflict_backoff.pop_front();
+        }
+        self.conflict_backoff
+            .push_back((id, now + MAX_RETRY_BACKOFF));
+    }
 }
 
 /// Counts describe this bounded pass, not whole-mailbox durability.
@@ -84,6 +183,9 @@ pub struct ReconcileReport {
     pub repaired: usize,
     pub files_created: usize,
     pub deferred: usize,
+    pub deferred_transient: usize,
+    pub deferred_conflict: usize,
+    pub retry_len: usize,
     /// Serialized payload bytes admitted to archive work, excluding rejected
     /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
@@ -414,37 +516,32 @@ fn reconcile_prepared(
     config: &Config,
     prepared: &PreparedMessage,
 ) -> Result<ReconcileResult, String> {
-    reconcile_prepared_inner(config, prepared, None)
+    reconcile_prepared_inner(config, prepared, None).map_err(|error| error.detail)
 }
 
 fn reconcile_prepared_inner(
     config: &Config,
     prepared: &PreparedMessage,
     control: Option<RepairControl<'_>>,
-) -> Result<ReconcileResult, String> {
+) -> Result<ReconcileResult, ReconcileFailure> {
     // Admit before ensure_archive: even creating a missing archive must not
     // wait behind an unrelated publisher while retaining the DB source lease.
     // Nested bundle publication retains this same native mutation window.
     let _mutation = control
         .map(|control| control.begin_at(&config.storage_root))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let archive =
-        crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
+        .transpose()?;
+    let archive = crate::ensure_archive(config, &prepared.project_slug)?;
     let paths = crate::message_paths_for_bundle(
         &archive,
         &prepared.message,
         &prepared.sender,
         &prepared.recipients,
-    )
-    .map_err(|error| error.to_string())?
+    )?
     .0;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
-        super::checkpoint(control).map_err(|error| error.to_string())?;
-        if let Some((message, body)) =
-            read_surviving_message(path).map_err(|error| error.to_string())?
-        {
+        super::checkpoint(control)?;
+        if let Some((message, body)) = read_surviving_message(path)? {
             validate_surviving_message(prepared, &message, &body)?;
             merge_surviving_metadata(
                 &mut surviving,
@@ -462,7 +559,7 @@ fn reconcile_prepared_inner(
     };
     if let Some(committed) = &committed {
         for path in [&paths.canonical, &paths.outbox] {
-            super::checkpoint(control).map_err(|error| error.to_string())?;
+            super::checkpoint(control)?;
             if let Some((message, body)) = committed.read(&archive, path)? {
                 validate_surviving_message(prepared, &message, &body)?;
                 merge_surviving_metadata(
@@ -478,10 +575,8 @@ fn reconcile_prepared_inner(
     // extension fields; BCC comes exclusively from the authoritative DB row.
     if surviving.is_none() {
         for path in &paths.inbox {
-            super::checkpoint(control).map_err(|error| error.to_string())?;
-            if let Some((message, body)) =
-                read_surviving_message(path).map_err(|error| error.to_string())?
-            {
+            super::checkpoint(control)?;
+            if let Some((message, body)) = read_surviving_message(path)? {
                 let message = restore_inbox_metadata(prepared, message, &body)?;
                 merge_surviving_metadata(
                     &mut surviving,
@@ -498,7 +593,7 @@ fn reconcile_prepared_inner(
         && let Some(committed) = &committed
     {
         for path in &paths.inbox {
-            super::checkpoint(control).map_err(|error| error.to_string())?;
+            super::checkpoint(control)?;
             if let Some((message, body)) = committed.read(&archive, path)? {
                 let message = restore_inbox_metadata(prepared, message, &body)?;
                 merge_surviving_metadata(
@@ -516,7 +611,7 @@ fn reconcile_prepared_inner(
     if surviving.is_none()
         && let Some(committed) = &committed
     {
-        super::checkpoint(control).map_err(|error| error.to_string())?;
+        super::checkpoint(control)?;
         surviving = staged::read_metadata(
             &committed.repo,
             &archive,
@@ -534,10 +629,10 @@ fn reconcile_prepared_inner(
         None => {
             // Legacy SQLite rows store only the thread. A fabricated parent
             // can collide with a delayed original WBQ write.
-            return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string());
+            return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string().into());
         }
     };
-    super::checkpoint(control).map_err(|error| error.to_string())?;
+    super::checkpoint(control)?;
     let entry = MessageBundleBatchEntry {
         message: &message,
         body_md: &prepared.body,
@@ -555,7 +650,7 @@ fn reconcile_prepared_inner(
         ),
         None => reconcile_message_bundle(&archive, config, entry),
     }
-    .map_err(|error| error.to_string())
+    .map_err(ReconcileFailure::from)
 }
 
 /// Immutable Git observation for all surviving copies of one message.
@@ -683,12 +778,13 @@ impl CommittedMessages {
 /// serialization; an expanded payload that cannot fit any batch is deferred
 /// without pinning the cursor. These are work bounds, not deadlines on SQL,
 /// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace.
-/// No row, receipt, delivery, notification or thread digest is mutated. Failed
-/// messages are reported and revisited by backfill, not retried in a tight loop.
+/// No row, receipt, delivery, notification or thread digest is mutated. Transient
+/// archive refusals retain a bounded FIFO retry lane; conflicts stay on backfill
+/// with a cooldown. Retries never bypass source or archive authority checks.
 /// Database-promotion contention defers before consuming a candidate. A busy
 /// global archive fence or project lock defers that message within the finite
-/// scan; other messages can progress and backfill revisits it. Shutdown reaches
-/// the archive admission path as well as the outer loop. Blocking I/O and Git
+/// scan; other messages can progress and the next pass revisits it. Shutdown
+/// reaches the archive admission path as well as the outer loop. Blocking I/O and Git
 /// operations still have no hard deadline.
 ///
 /// # Errors
@@ -724,8 +820,28 @@ pub fn reconcile_message_batch(
         select_ids(cx, pool, cursor, cutoff)?
     };
     let selected_identity = cursor.source_identity.clone();
+    let now = Instant::now();
+    let mut retries = cursor
+        .retries
+        .iter()
+        .filter(|retry| retry.ready_at <= now)
+        .take(MAX_RETRIES_PER_PASS)
+        .map(|retry| (retry.id, None))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut selected = selected.into_iter().map(|(id, tail)| (id, Some(tail)));
     let mut seen = HashSet::new();
-    for (id, tail) in selected {
+    loop {
+        // At saturation only a retained item can free capacity. Do not let
+        // normal-lane priority pin a full queue before any due retry runs.
+        let next = if cursor.next_lane_is_retry || cursor.retries.len() >= MAX_RETRY_IDS {
+            retries.next().or_else(|| selected.next())
+        } else {
+            selected.next().or_else(|| retries.next())
+        };
+        let Some((id, tail)) = next else {
+            break;
+        };
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             report.interrupted = true;
             break;
@@ -733,8 +849,34 @@ pub fn reconcile_message_batch(
         if corruption_circuit_breaker().is_tripped() {
             return Err("message reconciliation stopped: source corruption observed".to_string());
         }
-        if report.repaired >= MAX_REPAIRS_PER_BATCH {
+        if report.repaired >= MAX_REPAIRS_PER_BATCH || report.scanned >= MAX_IDS_PER_PASS {
             report.budget_exhausted = true;
+            break;
+        }
+        // A scan-lane duplicate cannot bypass a retry's cooldown or cause a
+        // second publication attempt during the same bounded pass.
+        let cooling_down = cursor
+            .retries
+            .iter()
+            .any(|retry| retry.id == id && retry.ready_at > now)
+            || cursor
+                .conflict_backoff
+                .iter()
+                .any(|(known, until)| *known == id && *until > now);
+        // A retained ID belongs to the retry lane. Consuming its scan-lane
+        // duplicate must not steal the normal lane's turn or byte allowance.
+        let retained_scan = tail.is_some() && cursor.retries.iter().any(|retry| retry.id == id);
+        if seen.contains(&id) || cooling_down || retained_scan {
+            if let Some(tail) = tail {
+                cursor.advance(id, tail);
+            }
+            continue;
+        }
+        // At saturation, leave the unconsumed scan position intact. Evicting
+        // a transiently deferred ID would recreate the days-long wrap delay.
+        if cursor.retries.len() >= MAX_RETRY_IDS
+            && !cursor.retries.iter().any(|retry| retry.id == id)
+        {
             break;
         }
         // Freeze recovery promotion through source observation and archive
@@ -748,11 +890,8 @@ pub fn reconcile_message_batch(
                 "message reconciliation source changed after selection; rescan required".into(),
             );
         }
-        if !seen.insert(id) {
-            cursor.advance(id, tail);
-            continue;
-        }
-        let result = match prepare_message(cx, pool, id) {
+        seen.insert(id);
+        let result = match prepare_message_classified(cx, pool, id) {
             Ok(prepared) => match payload_admission(report.payload_bytes, prepared.payload_bytes) {
                 PayloadAdmission::Oversized => {
                     // SQL's raw-text bound does not bound JSON escaping. This
@@ -761,7 +900,7 @@ pub fn reconcile_message_batch(
                     Err(format!(
                         "serialized message payload exceeds per-batch limit ({} > {} bytes); source preserved",
                         prepared.payload_bytes, MAX_BATCH_PAYLOAD_BYTES,
-                    ))
+                    ).into())
                 }
                 PayloadAdmission::NextBatch => {
                     // This item CAN fit a fresh batch. Do not consume its
@@ -788,23 +927,38 @@ pub fn reconcile_message_batch(
             break;
         }
         report.scanned += 1;
+        cursor.next_lane_is_retry = tail.is_some();
         match result {
             Ok(result) if result.files_created > 0 || result.git_commit_needed => {
                 report.repaired += 1;
                 report.files_created += result.files_created;
+                cursor.forget_retry(id);
             }
-            Ok(_) => report.unchanged += 1,
+            Ok(_) => {
+                report.unchanged += 1;
+                cursor.forget_retry(id);
+            }
             Err(error) => {
                 report.deferred += 1;
+                if error.transient {
+                    report.deferred_transient += 1;
+                    cursor.defer_transient(id, now);
+                } else {
+                    report.deferred_conflict += 1;
+                    cursor.defer_conflict(id, now);
+                }
                 tracing::warn!(
                     target: "maintenance", event = "message_archive_reconcile_deferred",
-                    message_id = id, reason = %error,
+                    message_id = id, reason = %error.detail, transient = error.transient,
                     "message archive repair deferred; source and conflicting evidence retained"
                 );
             }
         }
-        cursor.advance(id, tail);
+        if let Some(tail) = tail {
+            cursor.advance(id, tail);
+        }
     }
+    report.retry_len = cursor.retries.len();
     Ok(report)
 }
 
