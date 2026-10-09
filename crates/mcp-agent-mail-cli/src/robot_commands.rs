@@ -1344,6 +1344,10 @@ pub struct InboxEntry {
     pub age: String,
     pub ack_status: String,
     pub importance: String,
+    /// `"project"` for mail delivered through the project's shared mailbox
+    /// (GH#282), as `fetch_inbox` reports it; absent for direct deliveries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
 }
@@ -6186,6 +6190,10 @@ fn server_inbox_row_to_entry(
             age: format_age(age_seconds),
             ack_status,
             importance,
+            via: row
+                .get("via")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             body_md: if include_bodies {
                 row.get("body_md")
                     .and_then(serde_json::Value::as_str)
@@ -6573,6 +6581,9 @@ fn build_inbox_with_phase(
             age: format_age(age_seconds),
             ack_status,
             importance,
+            // This offline read covers direct deliveries only; project mail
+            // is listed by the server path (br-vsj5s).
+            via: None,
             body_md,
         });
     }
@@ -7004,6 +7015,7 @@ fn build_outbox_entries(
             age: format_age(age_seconds),
             ack_status,
             importance,
+            via: None,
             body_md,
         });
     }
@@ -18905,6 +18917,7 @@ mod tests {
             age: "5m".into(),
             ack_status: "pending".into(),
             importance: "urgent".into(),
+            via: None,
             body_md: None,
         }];
         let json = serde_json::to_string(&inbox).unwrap();
@@ -19048,12 +19061,38 @@ mod tests {
             age: "35m ago".into(),
             ack_status: "overdue".into(),
             importance: "high".into(),
+            via: Some("project".into()),
             body_md: Some("Please review the auth changes".into()),
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["id"], 100);
         assert_eq!(json["priority"], "ack-overdue");
+        assert_eq!(json["via"], "project");
         assert_eq!(json["body_md"], "Please review the auth changes");
+    }
+
+    #[test]
+    fn server_inbox_rows_keep_the_project_mailbox_marker() {
+        // GH#282: fetch_inbox flags shared-mailbox mail with via="project";
+        // the robot inbox must not drop it on the way to its own entries.
+        let project_row = serde_json::json!({
+            "id": 7, "importance": "normal", "ack_required": false,
+            "from": "GreenCastle", "subject": "Schema freeze", "thread_id": null,
+            "created_ts": "2026-10-08T12:00:00Z", "kind": "project", "via": "project"
+        });
+        let direct_row = serde_json::json!({
+            "id": 8, "importance": "normal", "ack_required": false,
+            "from": "GreenCastle", "subject": "Direct", "thread_id": null,
+            "created_ts": "2026-10-08T12:00:00Z", "kind": "to"
+        });
+        let now_us = 1_791_500_000_000_000;
+        let shared = server_inbox_row_to_entry(&project_row, now_us, 0, false).entry;
+        let direct = server_inbox_row_to_entry(&direct_row, now_us, 0, false).entry;
+        assert_eq!(shared.via.as_deref(), Some("project"));
+        assert_eq!(direct.via, None);
+        let json = serde_json::to_value(&shared).unwrap();
+        assert_eq!(json["via"], "project");
+        assert!(serde_json::to_value(&direct).unwrap().get("via").is_none());
     }
 
     #[test]
@@ -19068,6 +19107,7 @@ mod tests {
             age: "1h ago".into(),
             ack_status: "none".into(),
             importance: "normal".into(),
+            via: None,
             body_md: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
@@ -19075,6 +19115,10 @@ mod tests {
         assert!(
             json.get("body_md").is_none(),
             "body_md should be omitted when None"
+        );
+        assert!(
+            json.get("via").is_none(),
+            "a direct delivery carries no via marker"
         );
     }
 
@@ -19098,6 +19142,7 @@ mod tests {
                     age: "35m ago".into(),
                     ack_status: "overdue".into(),
                     importance: "high".into(),
+                    via: None,
                     body_md: None,
                 },
                 InboxEntry {
@@ -19110,6 +19155,7 @@ mod tests {
                     age: "10m ago".into(),
                     ack_status: "required".into(),
                     importance: "urgent".into(),
+                    via: None,
                     body_md: None,
                 },
             ],
@@ -21502,6 +21548,7 @@ mod tests {
             age: "5m".into(),
             ack_status: "overdue".into(),
             importance: "high".into(),
+            via: None,
             body_md: Some("Message body".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -21528,6 +21575,7 @@ mod tests {
                 age: "45m".into(),
                 ack_status: "overdue".into(),
                 importance: "urgent".into(),
+                via: None,
                 body_md: None,
             },
             InboxEntry {
@@ -21540,6 +21588,7 @@ mod tests {
                 age: "10m".into(),
                 ack_status: "none".into(),
                 importance: "urgent".into(),
+                via: None,
                 body_md: None,
             },
         ];
