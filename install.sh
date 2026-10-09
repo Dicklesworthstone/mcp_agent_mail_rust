@@ -2950,6 +2950,17 @@ installer_entry_exists() {
   [ -e "$1" ] || [ -L "$1" ]
 }
 
+# Extract a verified release archive into the private staging directory.
+# --no-same-owner: tar running as root (containers, Dockerfile RUN, CI) would
+# otherwise keep the uid/gid recorded in the archive (the build host's user),
+# and the staged-file ownership check below would then refuse every binary
+# (GH#339). GNU tar and bsdtar both accept the flag.
+extract_release_archive() {
+  local archive="$1"
+  local dest="$2"
+  tar --no-same-owner -xf "$archive" -C "$dest"
+}
+
 validate_installer_owned_regular_file() {
   local path="$1"
   local label="$2"
@@ -9211,7 +9222,7 @@ else
   info "Extracting"
   EXTRACT_DIR="$TMP/extract"
   mkdir "$EXTRACT_DIR"
-  tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"
+  extract_release_archive "$TMP/$TAR" "$EXTRACT_DIR"
   SERVER_BIN="$EXTRACT_DIR/$BIN_SERVER"
   CLI_BIN="$EXTRACT_DIR/$BIN_CLI"
 fi
