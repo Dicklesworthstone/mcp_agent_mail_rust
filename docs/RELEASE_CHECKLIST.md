@@ -41,6 +41,9 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
   from release-archive checksums; synchronize the ACFS repository if they change.
 - [ ] Push the release source to `main` and synchronize the legacy branch as
   required by `AGENTS.md`. Verify public downloads and installation after publishing.
+  The release is blocked until both branch names resolve to the release commit:
+  `git ls-remote origin refs/heads/main refs/heads/master` must print one SHA
+  twice, and that SHA is the one recorded for the release.
 
 The runtime router, `TOOL_CLUSTER_MAP`, `ALL_SCREEN_IDS`, the Clap command tree,
 and Cargo workspace membership are the inventory authorities. Run the existing
