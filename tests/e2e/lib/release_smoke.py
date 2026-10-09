@@ -25,10 +25,21 @@ control, usually the previous release) runs the same phases:
                  every 10 s window, fetch_inbox p99 under budget, zero dispatch
                  zombies, zero EMFILE, zero HTTP server restarts, no archive
                  re-root, and archive convergence after the load stops.
+  swarm          >= 60 agents, each with its own MCP session, over 3 projects
+                 for >= 8 minutes (send to 2 peers, fetch, ack, reserve +
+                 release, search), SIGKILL + restart at the midpoint: zero
+                 acknowledged-id loss, independent integrity_check ok,
+                 bounded descriptors, zero zombies, WBQ progress in every
+                 window, send/reserve/release p99 under budget with zero
+                 30 s dispatch timeouts or tool errors, no connection errors
+                 outside the kill window, and archive convergence after load.
 
 It exists because two opposite defects reached artifacts in September 2026
 while every in-process suite was green: v0.3.36 leaked descriptors to EMFILE
-within a minute of mixed load, and a main build wedged its archive drain.
+within a minute of mixed load, and a main build wedged its archive drain. The
+swarm phase exists because shipped v0.3.38 passed every other phase but, at
+60 agents, timed reservation tools out at 30 s and left crash orphans out of
+the archive for hours (br-kp1in.34, br-kp1in.35, br-9bwnb).
 
 Usage:  release_smoke.py --bin PATH [--control-bin PATH] --out DIR
 Exit 0 only when every phase of the CANDIDATE passes. A phase that raises
@@ -42,6 +53,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import resource
 import signal
@@ -69,6 +81,26 @@ SOAK_WINDOW_SECS = 10
 # "fetch_inbox p99 is under budget"). Change only through the AGENTS.md
 # gate-defect rule, publishing what the change admits.
 FETCH_INBOX_P99_BUDGET_S = 2.0
+# Swarm phase (br-kp1in.34). Release minimums; fewer agents or a shorter run
+# can only produce NO_VERDICT. AM_RELEASE_SMOKE_SWARM_AGENTS=0 skips the phase
+# for development runs (also NO_VERDICT).
+RELEASE_MIN_SWARM_AGENTS = 60
+RELEASE_MIN_SWARM_SECS = 480
+SWARM_AGENTS = int(os.environ.get("AM_RELEASE_SMOKE_SWARM_AGENTS",
+                                  str(RELEASE_MIN_SWARM_AGENTS)))
+SWARM_SECS = int(os.environ.get("AM_RELEASE_SMOKE_SWARM_SECS", str(RELEASE_MIN_SWARM_SECS)))
+SWARM_PROJECTS = 3
+# A connection cut by the deliberate SIGKILL is not a failure when the call was
+# in flight at the kill or started before the restarted server had answered
+# for this many seconds.
+SWARM_KILL_GRACE_S = 5.0
+# Predeclared on 2026-10-08 before any candidate was measured with this phase
+# (br-kp1in.34). An interactive agent that waits longer than this for a lease
+# or a send retries and amplifies load. Change only through the AGENTS.md
+# gate-defect rule, publishing what the change admits.
+SWARM_TOOL_P99_BUDGET_S = 5.0
+SWARM_GATED_TOOLS = ("send_message", "file_reservation_paths", "release_file_reservations")
+DISPATCH_TIMEOUT_MARKER = "timed out after"
 HTTP_RESTART_MARKERS = (
     "HTTP server instance exited unexpectedly; restarting",
     "HTTP server auto-restarted",
@@ -98,6 +130,67 @@ def sha256(path: Path) -> str:
 
 def has_emfile(text: str) -> bool:
     return any(marker in text for marker in EMFILE_MARKERS)
+
+
+INITIALIZE_PARAMS = {"protocolVersion": "2025-06-18", "capabilities": {},
+                     "clientInfo": {"name": "release-smoke", "version": "1"}}
+
+
+def mcp_post(url: str, session: str | None, rid: int, method: str, params: dict | None,
+             timeout: float) -> tuple[dict, str | None]:
+    """One JSON-RPC request over MCP Streamable HTTP: (response, Mcp-Session-Id)."""
+    body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
+                       "params": params or {}}).encode()
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream"}
+    if session:
+        headers["Mcp-Session-Id"] = session
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        sid = r.headers.get("Mcp-Session-Id")
+        raw = r.read().decode()
+    if raw.lstrip().startswith("{"):
+        return json.loads(raw), sid
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[5:].strip()), sid
+    raise RuntimeError(f"unparseable response: {raw[:300]}")
+
+
+def tool_result(resp: dict) -> tuple[bool, object]:
+    """(is_error, payload) of a tools/call response; JSON-RPC errors are errors."""
+    if "error" in resp:
+        return True, resp["error"]
+    res = resp["result"]
+    text = "".join(c.get("text", "") for c in res.get("content", []))
+    try:
+        payload: object = json.loads(text)
+    except ValueError:
+        payload = text
+    return bool(res.get("isError")), payload
+
+
+class Session:
+    """One agent's own MCP session against a server URL (swarm agents do not
+    share one, as real agents do not)."""
+
+    def __init__(self, url: str):
+        self.url = url
+        self.sid: str | None = None
+        self.rid = 0
+        self.initialized = False
+
+    def call(self, tool: str, args: dict, timeout: float = 60) -> tuple[bool, object]:
+        if not self.initialized:
+            self.rid += 1
+            _, self.sid = mcp_post(self.url, None, self.rid, "initialize", INITIALIZE_PARAMS,
+                                   timeout)
+            self.initialized = True
+        self.rid += 1
+        resp, sid = mcp_post(self.url, self.sid, self.rid, "tools/call",
+                             {"name": tool, "arguments": args}, timeout)
+        self.sid = sid or self.sid
+        return tool_result(resp)
 
 
 class Arm:
@@ -204,44 +297,21 @@ class Arm:
         with self.lock:
             self.rid += 1
             rid = self.rid
-        body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
-                           "params": params or {}}).encode()
-        headers = {"Content-Type": "application/json",
-                   "Accept": "application/json, text/event-stream"}
-        if self.session:
-            headers["Mcp-Session-Id"] = self.session
-        req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            sid = r.headers.get("Mcp-Session-Id")
-            if sid:
-                self.session = sid
-            raw = r.read().decode()
-        if raw.lstrip().startswith("{"):
-            return json.loads(raw)
-        for line in raw.splitlines():
-            if line.startswith("data:"):
-                return json.loads(line[5:].strip())
-        raise RuntimeError(f"unparseable response: {raw[:300]}")
+        resp, sid = mcp_post(self.url, self.session, rid, method, params, timeout)
+        if sid:
+            self.session = sid
+        return resp
 
     def initialize(self) -> None:
-        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                "clientInfo": {"name": "release-smoke", "version": "1"}})
+        self.rpc("initialize", INITIALIZE_PARAMS)
         try:
             self.rpc("notifications/initialized")
         except Exception:  # notification replies are optional
             pass
 
     def call(self, tool: str, args: dict, timeout: float = 60) -> tuple[bool, object]:
-        resp = self.rpc("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
-        if "error" in resp:
-            return True, resp["error"]
-        res = resp["result"]
-        text = "".join(c.get("text", "") for c in res.get("content", []))
-        try:
-            payload: object = json.loads(text)
-        except ValueError:
-            payload = text
-        return bool(res.get("isError")), payload
+        return tool_result(self.rpc("tools/call", {"name": tool, "arguments": args},
+                                    timeout=timeout))
 
     def read_resource(self, uri: str) -> tuple[bool, object]:
         resp = self.rpc("resources/read", {"uri": uri})
@@ -675,16 +745,279 @@ def phase_soak(arm: Arm, state: dict, c: list) -> dict:
     return extra
 
 
+# --- swarm (br-kp1in.34) -----------------------------------------------------
+# Pure judgement helpers first, so the assertion logic is unit-tested
+# (scripts/tests/test_release_smoke_swarm.py) without a server.
+
+def classify_call(is_error: bool, payload: object) -> str:
+    """ok | timeout (the server's 30 s dispatch deadline) | tool_error."""
+    if not is_error:
+        return "ok"
+    return "timeout" if DISPATCH_TIMEOUT_MARKER in json.dumps(payload, default=str) else "tool_error"
+
+
+def in_kill_window(start: float, end: float, kill_t: float | None,
+                   restarted_t: float | None, grace_s: float = SWARM_KILL_GRACE_S) -> bool:
+    """True for a call the deliberate SIGKILL could have cut: it was still in
+    flight at the kill, and it began before the restarted server had been
+    answering for `grace_s`. Only connection failures are excused this way."""
+    if kill_t is None or restarted_t is None:
+        return False
+    return end >= kill_t and start <= restarted_t + grace_s
+
+
+def percentile(values: list, q: float) -> float | None:
+    s = sorted(values)
+    return s[min(len(s) - 1, int(len(s) * q))] if s else None
+
+
+def swarm_tool_stats(records: list, kill_t: float | None, restarted_t: float | None) -> dict:
+    """records: (tool, start, end, outcome, code) with outcome in ok | timeout |
+    tool_error | conn_error. Latency covers every answered call (a timed-out
+    call counts at its full duration); connection errors inside the kill window
+    are excused, every other one is a failure."""
+    stats: dict = {}
+    for tool, start, end, outcome, code in records:
+        s = stats.setdefault(tool, {"n": 0, "durations": [], "timeouts": 0, "tool_errors": {},
+                                    "conn_errors": 0, "kill_window": 0})
+        if outcome == "conn_error":
+            if in_kill_window(start, end, kill_t, restarted_t):
+                s["kill_window"] += 1
+            else:
+                s["conn_errors"] += 1
+            continue
+        s["n"] += 1
+        s["durations"].append(end - start)
+        if outcome == "timeout":
+            s["timeouts"] += 1
+        elif outcome == "tool_error":
+            s["tool_errors"][code] = s["tool_errors"].get(code, 0) + 1
+    for s in stats.values():
+        d = s.pop("durations")
+        s["p50_s"] = percentile(d, 0.5)
+        s["p99_s"] = percentile(d, 0.99)
+        s["max_s"] = max(d) if d else None
+    return stats
+
+
+def drain_stalled_windows(samples: list) -> list:
+    """Windows in which work queued at the window's start saw no drain progress.
+    samples: (t, drained_total, depth) from ONE server process (drained_total
+    restarts at zero after a restart, so segments are judged separately)."""
+    bad = []
+    for prev, cur in zip(samples, samples[1:]):
+        if prev[2] > 0 and cur[1] <= prev[1]:
+            bad.append({"t": round(cur[0]), "drained_total": cur[1],
+                        "depth_at_open": prev[2], "depth_at_close": cur[2]})
+    return bad
+
+
+def error_code(payload: object) -> str:
+    text = json.dumps(payload, default=str)
+    m = re.search(r'"type":\s*"([A-Z_]+)"', text)
+    return m.group(1) if m else text[:60]
+
+
+def swarm_knob_shortfall(agents: int, secs: int) -> str | None:
+    """Why a swarm with these knobs cannot PASS, or None at release strength."""
+    if agents >= RELEASE_MIN_SWARM_AGENTS and secs >= RELEASE_MIN_SWARM_SECS:
+        return None
+    return (f"swarm {agents} agents x {secs}s is below the release minimum "
+            f"{RELEASE_MIN_SWARM_AGENTS} x {RELEASE_MIN_SWARM_SECS}s")
+
+
+def phase_swarm(arm: Arm, state: dict, c: list) -> dict:
+    extra: dict = {"agents": SWARM_AGENTS, "secs": SWARM_SECS}
+    shortfall = swarm_knob_shortfall(SWARM_AGENTS, SWARM_SECS)
+    if shortfall:
+        extra["cannot_pass"] = shortfall
+    if SWARM_AGENTS <= 0 or SWARM_SECS <= 0:
+        return extra  # skipped: no checks, so NO_VERDICT
+    log_offset = arm.server_log.stat().st_size if arm.server_log.exists() else 0
+    projects = []
+    for k in range(SWARM_PROJECTS):
+        p = arm.root / f"swarm{k + 1}"
+        p.mkdir(exist_ok=True)
+        e, _ = arm.call("ensure_project", {"human_key": str(p)})
+        projects.append(str(p))
+    agents: list = []  # (project, name)
+    for k in range(SWARM_AGENTS):
+        proj = projects[k % SWARM_PROJECTS]
+        e, a = arm.call("register_agent", {"project_key": proj, "program": "swarm",
+                                           "model": "smoke"})
+        if not e and isinstance(a, dict) and a.get("name"):
+            agents.append((proj, a["name"]))
+    check(c, f"register {SWARM_AGENTS} swarm agents", len(agents) == SWARM_AGENTS,
+          f"{len(agents)}/{SWARM_AGENTS}")
+    peers: dict = {}
+    for proj, name in agents:
+        peers.setdefault(proj, []).append(name)
+
+    records: list = []
+    acked: list = []
+    lock = threading.Lock()
+    stop = threading.Event()
+    restarting = threading.Event()
+    clock = {"kill_t": None, "restarted_t": None}
+
+    def timed(sess: Session, tool: str, args: dict) -> tuple[bool, object] | None:
+        t0 = time.time()
+        try:
+            e, p = sess.call(tool, args, timeout=60)
+        except Exception as ex:  # connection refused/reset (SIGKILL) or client timeout
+            with lock:
+                records.append((tool, t0, time.time(), "conn_error", type(ex).__name__))
+            return None
+        outcome = classify_call(e, p)
+        with lock:
+            records.append((tool, t0, time.time(), outcome,
+                            error_code(p) if outcome != "ok" else ""))
+        return e, p
+
+    def agent_loop(idx: int) -> None:
+        proj, me = agents[idx]
+        rnd = random.Random(idx)  # recorded seed per agent: the plan replays
+        sess = Session(arm.url)
+        others = [n for n in peers[proj] if n != me]
+        while not stop.is_set():
+            if restarting.is_set():
+                time.sleep(0.2)
+                continue
+            r = timed(sess, "send_message", {
+                "project_key": proj, "sender_name": me, "to": rnd.sample(others, k=min(2, len(others))),
+                "subject": f"swarm {me} {rnd.randrange(1 << 30)}",
+                "body_md": "swarm body " * rnd.randint(1, 40),
+                "thread_id": f"swarm-{rnd.randint(1, 50)}", "ack_required": rnd.random() < 0.25})
+            if r is None:
+                sess = Session(arm.url)
+                time.sleep(0.5)
+                continue
+            if not r[0]:
+                mid = deliveries_id(r[1])
+                if mid is not None:
+                    with lock:
+                        acked.append(mid)
+            r = timed(sess, "fetch_inbox", {"project_key": proj, "agent_name": me, "limit": 10})
+            if r is not None and not r[0] and isinstance(r[1], list):
+                for m in r[1][:3]:
+                    if isinstance(m, dict) and m.get("ack_required") and not m.get("ack_ts"):
+                        timed(sess, "acknowledge_message", {"project_key": proj,
+                                                            "agent_name": me,
+                                                            "message_id": m.get("id")})
+            if rnd.random() < 0.3:
+                path = [f"src/mod{rnd.randint(1, 30)}/**"]
+                timed(sess, "file_reservation_paths", {"project_key": proj, "agent_name": me,
+                                                       "paths": path, "ttl_seconds": 300,
+                                                       "exclusive": True})
+                timed(sess, "release_file_reservations", {"project_key": proj,
+                                                          "agent_name": me, "paths": path})
+            if rnd.random() < 0.1:
+                timed(sess, "search_messages", {"project_key": proj, "query": "swarm body",
+                                                "limit": 10})
+            time.sleep(rnd.uniform(0.0, 0.3))
+
+    started = time.time()
+    threads = [threading.Thread(target=agent_loop, args=(k,), daemon=True)
+               for k in range(len(agents))]
+    for t in threads:
+        t.start()
+    segments: list = [[]]  # WBQ samples per server process
+    fds_max = 0
+    zombies_max = 0
+    unobserved = 0
+    kill_at = started + SWARM_SECS / 2
+    while time.time() - started < SWARM_SECS:
+        time.sleep(SOAK_WINDOW_SECS)
+        if clock["kill_t"] is None and time.time() >= kill_at:
+            restarting.set()
+            clock["kill_t"] = time.time()
+            arm.kill(signal.SIGKILL)
+            arm.start()
+            clock["restarted_t"] = time.time()
+            restarting.clear()
+            segments.append([])
+            continue
+        try:
+            fds_max = max(fds_max, arm.sqlite_fds())
+            h = arm.health()
+            zombies_max = max(zombies_max, h["timeout_diagnostics"]["blocking_dispatch_zombies"])
+            segments[-1].append((time.time(), h["queues"]["wbq"]["drained_total"],
+                                 h["queues"]["wbq"]["depth"]))
+        except Exception:  # a server too sick to answer health is judged by its windows
+            unobserved += 1
+    stop.set()
+    for t in threads:
+        t.join(timeout=120)
+    load_secs = time.time() - started
+    stats = swarm_tool_stats(records, clock["kill_t"], clock["restarted_t"])
+    stalled = [w for seg in segments for w in drain_stalled_windows(seg)]
+    for tool in SWARM_GATED_TOOLS:
+        s = stats.get(tool, {})
+        check(c, f"{tool} p99 <= {SWARM_TOOL_P99_BUDGET_S}s at {len(agents)} agents",
+              s.get("n", 0) > 0 and s["p99_s"] <= SWARM_TOOL_P99_BUDGET_S,
+              {k: s.get(k) for k in ("n", "p50_s", "p99_s", "max_s")})
+    timeouts = {t: s["timeouts"] for t, s in stats.items() if s["timeouts"]}
+    check(c, "zero 30 s dispatch timeouts", not timeouts, timeouts)
+    tool_errors = {t: s["tool_errors"] for t, s in stats.items() if s["tool_errors"]}
+    check(c, "zero tool errors", not tool_errors, tool_errors)
+    conn = {t: s["conn_errors"] for t, s in stats.items() if s["conn_errors"]}
+    check(c, "no connection errors outside the SIGKILL window", not conn, conn)
+    check(c, f"WBQ drained_total advances in every {SOAK_WINDOW_SECS}s window with queued work",
+          sum(len(s) for s in segments) >= 4 and not stalled and unobserved == 0,
+          f"samples={[len(s) for s in segments]} unobserved={unobserved} stalled={stalled[:5]}")
+    check(c, f"storage.sqlite3 descriptors bounded (<= {FD_BOUND})", fds_max <= FD_BOUND,
+          f"max={fds_max}")
+    check(c, "no dispatch zombies", zombies_max == 0, f"max={zombies_max}")
+    ok, detail = arm.wait_converged(CONVERGE_SECS, 10)
+    check(c, f"archive converges to DB after the swarm without client reads "
+             f"(<= {CONVERGE_SECS}s)", ok, detail)
+    log_text = arm.server_log.read_text(errors="replace")[log_offset:]
+    restarts = [m for m in HTTP_RESTART_MARKERS if m in log_text]
+    check(c, "zero HTTP server restarts and no EMFILE", not restarts and not has_emfile(log_text),
+          {"markers": restarts, "emfile": has_emfile(log_text)})
+    check(c, "server exits within 60 s of SIGTERM", arm.kill(signal.SIGTERM))
+    ok, detail = arm.offline_integrity_check()
+    check(c, "full PRAGMA integrity_check ok (independent C SQLite, server stopped)", ok, detail)
+    present: set = set()
+    try:
+        con = sqlite3.connect(f"file:{arm.db_path}?mode=ro", uri=True, timeout=30)
+        try:
+            present = {r[0] for r in con.execute("SELECT id FROM messages")}
+        finally:
+            con.close()
+    except sqlite3.Error as ex:
+        present = set()
+        detail = f"{type(ex).__name__}: {ex}"
+    lost = sorted(set(acked) - present)
+    check(c, f"all {len(acked)} acknowledged swarm sends survive SIGKILL", acked and not lost,
+          f"lost={lost[:10]}")
+    arm.start()
+    extra.update({
+        "agents_registered": len(agents), "load_secs": round(load_secs, 1),
+        "kill_at_s": round(clock["kill_t"] - started, 1) if clock["kill_t"] else None,
+        "restart_s": (round(clock["restarted_t"] - clock["kill_t"], 2)
+                      if clock["kill_t"] and clock["restarted_t"] else None),
+        "acked_sends": len(acked), "sends_per_s": round(len(acked) / load_secs, 2),
+        "tools": stats, "sqlite_fds_max": fds_max, "zombies_max": zombies_max,
+        "wbq_samples": [len(s) for s in segments], "stalled_windows": len(stalled)})
+    if CONVERGE_SECS > RELEASE_CONVERGE_SECS:
+        extra["cannot_pass"] = f"convergence bound {CONVERGE_SECS}s is looser than release"
+    return extra
+
+
 PHASES = (("flow", phase_flow), ("cross_project", phase_cross_project),
-          ("storm", phase_storm), ("crash", phase_crash), ("soak", phase_soak))
+          ("storm", phase_storm), ("crash", phase_crash), ("soak", phase_soak),
+          ("swarm", phase_swarm))
 
 
 def run_arm(name: str, binary: Path, out: Path) -> dict:
     # A fresh directory per run: never delete earlier evidence.
     root = out / f"{name}-{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
     arm = Arm(name, binary, root)
+    # Host load is recorded per arm: a verdict measured on a saturated shared
+    # host is a signal to re-run, never a pass or a clean loss.
     result: dict = {"arm": name, "binary": str(binary), "binary_sha256": sha256(binary),
-                    "phases": {}}
+                    "loadavg_start": open("/proc/loadavg").read().split()[:3], "phases": {}}
     try:
         version = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
                                  timeout=60, env=arm.env())
@@ -725,6 +1058,7 @@ def run_arm(name: str, binary: Path, out: Path) -> dict:
             if "WAL-FEC" in line)
     except OSError:
         pass
+    result["loadavg_end"] = open("/proc/loadavg").read().split()[:3]
     verdicts = [p.get("verdict") for p in result["phases"].values()]
     result["verdict"] = ("PASS" if len(verdicts) == len(PHASES)
                          and all(v == "PASS" for v in verdicts)
@@ -739,15 +1073,19 @@ def main() -> int:
     ap.add_argument("--out", required=True, type=Path, help="output directory for the receipt")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
-    receipt = {"schema_version": 2,
+    receipt = {"schema_version": 3,
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "host": socket.gethostname(), "soak_secs": SOAK_SECS,
                "converge_secs": CONVERGE_SECS,
-               "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S, "arms": []}
+               "fetch_inbox_p99_budget_s": FETCH_INBOX_P99_BUDGET_S,
+               "swarm_agents": SWARM_AGENTS, "swarm_secs": SWARM_SECS,
+               "swarm_tool_p99_budget_s": SWARM_TOOL_P99_BUDGET_S,
+               "loadavg_start": open("/proc/loadavg").read().split()[:3], "arms": []}
     receipt["arms"].append(run_arm("candidate", args.bin.resolve(), args.out))
     if args.control_bin:
         receipt["arms"].append(run_arm("control", args.control_bin.resolve(), args.out))
     receipt["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    receipt["loadavg_end"] = open("/proc/loadavg").read().split()[:3]
     receipt["candidate_verdict"] = receipt["arms"][0]["verdict"]
     (args.out / "release_smoke_receipt.json").write_text(json.dumps(receipt, indent=2))
     log(f"receipt: {args.out / 'release_smoke_receipt.json'}")
