@@ -822,29 +822,31 @@ pub async fn fetch_inbox_product(
     validate_product_inbox_agent_name(&agent_name)?;
     phase.mark("argument_validation");
 
-    let rows = db_outcome_to_mcp_result(if with_bodies {
-        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent(
+    // Resolve canonical viewers once, before returning any project data.
+    // Pin the fan-in to those exact IDs so concurrent link/registration
+    // changes cannot introduce an identity that was never authorized.
+    let viewers = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::product_inbox_agents(ctx.cx(), &pool, product_id, &agent_name)
+            .await,
+    )?;
+    for viewer in &viewers {
+        crate::session_identity::authorize_actor(ctx, viewer, false, "read the product inbox")?;
+    }
+    let viewer_ids: Vec<i64> = viewers.iter().filter_map(|viewer| viewer.id).collect();
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent_scoped(
             ctx.cx(),
             &pool,
             product_id,
             &agent_name,
+            &viewer_ids,
             urgent,
             since_micros,
             max_messages,
+            with_bodies,
         )
-        .await
-    } else {
-        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent_metadata(
-            ctx.cx(),
-            &pool,
-            product_id,
-            &agent_name,
-            urgent,
-            since_micros,
-            max_messages,
-        )
-        .await
-    })?;
+        .await,
+    )?;
     phase.mark("sqlite_query");
 
     let out: Vec<InboxMessage> = rows

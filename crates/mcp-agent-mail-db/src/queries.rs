@@ -10747,9 +10747,88 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
 }
 
 #[derive(Clone, Copy)]
-struct ProductInboxQueryOptions {
+struct ProductInboxQueryOptions<'a> {
     urgent_only: bool,
     body_policy: InboxBodyPolicy,
+    viewer_ids: Option<&'a [i64]>,
+}
+
+/// Resolve the canonical viewer in every linked project in one read. Match
+/// `get_agent`'s lowest-ID rule for legacy case-variant registrations. The
+/// returned IDs can pin a later inbox read to exactly these identities, even
+/// if product links or same-name registrations change during authorization.
+pub async fn product_inbox_agents(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+                      a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+                      a.reaper_exempt, a.registration_token, a.retired_at \
+               FROM product_project_links ppl JOIN agents a ON a.project_id = ppl.project_id \
+               WHERE ppl.product_id = ? AND a.name = ? COLLATE NOCASE \
+               ORDER BY a.project_id ASC, a.id ASC";
+    let params = [
+        Value::BigInt(product_id),
+        Value::Text(agent_name.to_string()),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut seen_projects = HashSet::new();
+            let agents = rows
+                .iter()
+                .map(decode_agent_row_indexed)
+                .filter(|agent| seen_projects.insert(agent.project_id))
+                .collect();
+            Outcome::Ok(agents)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Read only the preflighted viewers. Both mailbox arms still require current
+/// membership in this product; new links or name aliases cannot expand the
+/// caller's authorized identity scope between preflight and the read.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_inbox_for_product_agent_scoped(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+    viewer_ids: &[i64],
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    include_bodies: bool,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_for_product_agent_impl(
+        cx,
+        pool,
+        product_id,
+        agent_name,
+        since_ts,
+        limit,
+        ProductInboxQueryOptions {
+            urgent_only,
+            body_policy: if include_bodies {
+                InboxBodyPolicy::Full
+            } else {
+                InboxBodyPolicy::MetadataOnly
+            },
+            viewer_ids: Some(viewer_ids),
+        },
+    )
+    .await
 }
 
 pub async fn fetch_inbox_for_product_agent(
@@ -10771,6 +10850,7 @@ pub async fn fetch_inbox_for_product_agent(
         ProductInboxQueryOptions {
             urgent_only,
             body_policy: InboxBodyPolicy::Full,
+            viewer_ids: None,
         },
     )
     .await
@@ -10795,6 +10875,7 @@ pub async fn fetch_inbox_for_product_agent_metadata(
         ProductInboxQueryOptions {
             urgent_only,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            viewer_ids: None,
         },
     )
     .await
@@ -10807,7 +10888,7 @@ async fn fetch_inbox_for_product_agent_impl(
     agent_name: &str,
     since_ts: Option<i64>,
     limit: usize,
-    options: ProductInboxQueryOptions,
+    options: ProductInboxQueryOptions<'_>,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     let Ok(limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
@@ -10842,6 +10923,24 @@ async fn fetch_inbox_for_product_agent_impl(
     // the number of linked projects. The pinned compound-select executor
     // applies LIMIT without bindings, so the (integer) limit is rendered.
     let mut shared_sql = crate::project_mailbox::product_inbox_select_sql(body_select);
+    if let Some(viewer_ids) = options.viewer_ids {
+        if viewer_ids.is_empty() {
+            return Outcome::Ok(Vec::new());
+        }
+        // IDs are typed database identities, not caller-supplied SQL. Render
+        // them to avoid multiplying bind parameters across the two arms.
+        let ids = viewer_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(" AND recipient.id IN (");
+        sql.push_str(&ids);
+        sql.push(')');
+        shared_sql.push_str(" AND viewer.id IN (");
+        shared_sql.push_str(&ids);
+        shared_sql.push(')');
+    }
     let mut arm_params = vec![
         Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
         Value::Text(agent_name.to_string()),

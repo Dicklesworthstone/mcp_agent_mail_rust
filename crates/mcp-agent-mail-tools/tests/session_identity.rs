@@ -14,9 +14,10 @@ use fastmcp::prelude::{McpContext, McpResult};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    create_agent_identity, ensure_project, fetch_inbox, list_contacts, macro_contact_handshake,
-    register_agent, request_contact, respond_contact, send_message, set_contact_policy,
-    tool_error_code,
+    acquire_build_slot, create_agent_identity, ensure_product, ensure_project, fetch_inbox,
+    fetch_inbox_product, force_release_file_reservation, list_contacts, macro_contact_handshake,
+    products_link, register_agent, release_build_slot, renew_build_slot, request_contact,
+    respond_contact, send_message, set_contact_policy, tool_error_code,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -41,6 +42,19 @@ where
     F: FnOnce(Cx) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
+    run_with_identity_options(enabled, fail_closed, false, f)
+}
+
+fn run_with_identity_options<F, Fut, T>(
+    enabled: bool,
+    fail_closed: bool,
+    worktrees: bool,
+    f: F,
+) -> T
+where
+    F: FnOnce(Cx) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -51,6 +65,7 @@ where
     let env = [
         ("DATABASE_URL", database_url.as_str()),
         ("STORAGE_ROOT", storage_root.as_str()),
+        ("WORKTREES_ENABLED", if worktrees { "1" } else { "0" }),
         (
             "MESSAGING_SESSION_IDENTITY",
             if enabled { "true" } else { "false" },
@@ -734,4 +749,586 @@ fn disabled_session_identity_preserves_trusted_local_contact_macros() {
             "block_all"
         );
     });
+}
+
+async fn register_named(ctx: &McpContext, project: &str, name: &str) {
+    register_agent(
+        ctx,
+        project.to_string(),
+        "codex-cli".to_string(),
+        "gpt-5".to_string(),
+        Some(name.to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register named identity");
+    set_contact_policy(
+        ctx,
+        project.to_string(),
+        name.to_string(),
+        "open".to_string(),
+    )
+    .await
+    .expect("open named identity contacts");
+}
+
+async fn product_inbox(
+    ctx: &McpContext,
+    product: &str,
+    agent: &str,
+    with_bodies: bool,
+    limit: i32,
+) -> McpResult<Value> {
+    fetch_inbox_product(
+        ctx,
+        product.to_string(),
+        agent.to_string(),
+        Some(limit),
+        None,
+        Some(with_bodies),
+        None,
+    )
+    .await
+    .map(|json| serde_json::from_str(&json).expect("product inbox JSON"))
+}
+
+#[test]
+fn product_inbox_authorizes_every_project_before_returning_body_or_metadata() {
+    for enabled in [true, false] {
+        run_with_identity_options(enabled, false, true, |cx| async move {
+            let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+            let other = McpContext::with_state(cx.clone(), 2, SessionState::new());
+            let unbound = McpContext::with_state(cx.clone(), 3, SessionState::new());
+            let suffix = unique_suffix();
+            let first = format!("/tmp/session-product-first-{suffix}");
+            let second = format!("/tmp/session-product-second-{suffix}");
+            let product = format!("session-product-{suffix}");
+            ensure_product(&owner, None, Some(product.clone()))
+                .await
+                .expect("ensure product");
+            for project in [&first, &second] {
+                ensure_project(&owner, project.clone(), None)
+                    .await
+                    .expect("ensure linked project");
+                products_link(&owner, product.clone(), project.clone())
+                    .await
+                    .expect("link product project");
+            }
+            register_named(&owner, &first, "BlueLake").await;
+            register_named(&other, &second, "BlueLake").await;
+            let sender_second = create_identity(&other, &second).await;
+            let sender_first = create_identity(&other, &first).await;
+            send_as(&other, &second, &sender_second, "BlueLake")
+                .await
+                .expect("second project message");
+            send_as(&other, &first, &sender_first, "BlueLake")
+                .await
+                .expect("first project message");
+
+            // Ownership in the first project does not constrain the second
+            // project's trusted-local behavior until this session binds there.
+            for bodies in [false, true] {
+                let rows = product_inbox(&owner, &product, "bluelake", bodies, 50)
+                    .await
+                    .expect("own and unbound-project inboxes");
+                assert_eq!(rows.as_array().expect("inbox array").len(), 2);
+                assert_eq!(rows[0].get("body_md").is_some(), bodies);
+            }
+            let second_before = serde_json::to_value(stored_agent(&cx, &second, "BlueLake").await)
+                .expect("second viewer snapshot");
+            let _different_second_identity = create_identity(&owner, &second).await;
+            for bodies in [false, true] {
+                let result = product_inbox(&owner, &product, "bluelake", bodies, 1).await;
+                if enabled {
+                    let error = result.expect_err("every viewer is checked even below the limit");
+                    assert_eq!(tool_error_code(&error), Some("SESSION_IDENTITY_MISMATCH"));
+                } else {
+                    assert_eq!(
+                        result
+                            .expect("default-off borrowed inbox")
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(stored_agent(&cx, &second, "BlueLake").await)
+                    .expect("second viewer snapshot"),
+                second_before,
+                "product inbox authorization never updates agent activity or profile"
+            );
+            let rows = product_inbox(&unbound, &product, "BlueLake", true, 50)
+                .await
+                .expect("unbound session retains product access");
+            assert_eq!(rows.as_array().unwrap().len(), 2);
+            assert!(
+                rows.as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["read_ts"].is_null())
+            );
+        });
+    }
+}
+
+#[test]
+fn product_inbox_scope_excludes_later_links_and_legacy_name_aliases() {
+    run_with_identity_options(true, false, true, |cx| async move {
+        use mcp_agent_mail_db::queries;
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+        let sender = McpContext::with_state(cx.clone(), 2, SessionState::new());
+        let suffix = unique_suffix();
+        let first = format!("/tmp/session-scope-first-{suffix}");
+        let second = format!("/tmp/session-scope-second-{suffix}");
+        let foreign = format!("/tmp/session-scope-foreign-{suffix}");
+        let product = format!("session-scope-{suffix}");
+        let product_json: Value = serde_json::from_str(
+            &ensure_product(&owner, None, Some(product.clone()))
+                .await
+                .expect("product"),
+        )
+        .unwrap();
+        let product_id = product_json["id"].as_i64().unwrap();
+        for project in [&first, &second, &foreign] {
+            ensure_project(&owner, project.clone(), None)
+                .await
+                .expect("project");
+            register_named(&owner, project, "BlueLake").await;
+        }
+        products_link(&owner, product.clone(), first.clone())
+            .await
+            .expect("initial link");
+        let sender_name = create_identity(&sender, &first).await;
+        send_as(&sender, &first, &sender_name, "BlueLake")
+            .await
+            .expect("canonical direct mail");
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("pool");
+        let viewers = queries::product_inbox_agents(&cx, &pool, product_id, "bluelake")
+            .await
+            .into_result()
+            .expect("preflight scope");
+        assert_eq!(viewers.len(), 1);
+        let viewer_ids = [viewers[0].id.unwrap()];
+        let first_id = viewers[0].project_id;
+
+        // Deterministically mutate both lookup inputs after preflight. The
+        // preflighted identity set remains the scope of the subsequent read.
+        products_link(&owner, product.clone(), second.clone())
+            .await
+            .expect("later link");
+        let second_sender = create_identity(&sender, &second).await;
+        send_as(&sender, &second, &second_sender, "BlueLake")
+            .await
+            .expect("later-project mail");
+        let foreign_sender = create_identity(&sender, &foreign).await;
+        send_as(&sender, &foreign, &foreign_sender, "BlueLake")
+            .await
+            .expect("foreign-product mail");
+        let conn = pool.acquire(&cx).await.into_result().expect("connection");
+        conn.execute_sync(
+            "INSERT INTO agents(project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (?, 'bluelake', 'test', 'test', 1, 1)",
+            &[SqlValue::BigInt(first_id)],
+        )
+        .expect("legacy case-variant registration");
+        let aliases = conn
+            .query_sync(
+                "SELECT id FROM agents WHERE project_id = ? AND name = 'bluelake' COLLATE BINARY",
+                &[SqlValue::BigInt(first_id)],
+            )
+            .expect("alias id");
+        let alias_id = aliases[0].get_named::<i64>("id").unwrap();
+        drop(conn);
+        let sender_row = stored_agent(&cx, &first, &sender_name).await;
+        queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            first_id,
+            sender_row.id.unwrap(),
+            "Legacy alias only",
+            "Alias body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(alias_id, "to")],
+        )
+        .await
+        .into_result()
+        .expect("alias-only mail");
+        let first_project = queries::get_project_by_human_key(&cx, &pool, &first)
+            .await
+            .into_result()
+            .expect("first project");
+        send_as(
+            &sender,
+            &first,
+            &sender_name,
+            &format!("project:{}", first_project.slug),
+        )
+        .await
+        .expect("shared mailbox mail");
+
+        for bodies in [false, true] {
+            let rows = queries::fetch_inbox_for_product_agent_scoped(
+                &cx,
+                &pool,
+                product_id,
+                "bluelake",
+                &viewer_ids,
+                false,
+                None,
+                50,
+                bodies,
+            )
+            .await
+            .into_result()
+            .expect("pinned scope read");
+            assert_eq!(rows.len(), 2, "only canonical direct and shared deliveries");
+            assert!(rows.iter().all(|row| row.message.project_id == first_id));
+            assert!(
+                rows.iter()
+                    .all(|row| row.message.subject != "Legacy alias only")
+            );
+            assert_eq!(rows.iter().filter(|row| row.kind == "project").count(), 1);
+            assert!(
+                rows.iter()
+                    .all(|row| row.message.body_md.is_empty() != bodies)
+            );
+        }
+        let refreshed = queries::product_inbox_agents(&cx, &pool, product_id, "bluelake")
+            .await
+            .into_result()
+            .expect("canonical refreshed viewers");
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(
+            refreshed
+                .iter()
+                .find(|viewer| viewer.project_id == first_id)
+                .unwrap()
+                .id,
+            Some(viewer_ids[0])
+        );
+        let foreign_id = stored_agent(&cx, &foreign, "BlueLake").await.id.unwrap();
+        let foreign_rows = queries::fetch_inbox_for_product_agent_scoped(
+            &cx,
+            &pool,
+            product_id,
+            "BlueLake",
+            &[foreign_id],
+            false,
+            None,
+            50,
+            true,
+        )
+        .await
+        .into_result()
+        .expect("foreign scope read");
+        assert!(
+            foreign_rows.is_empty(),
+            "IDs never bypass product membership"
+        );
+        let empty = queries::fetch_inbox_for_product_agent_scoped(
+            &cx,
+            &pool,
+            product_id,
+            "BlueLake",
+            &[],
+            false,
+            None,
+            50,
+            true,
+        )
+        .await
+        .into_result()
+        .expect("empty scope");
+        assert!(empty.is_empty());
+    });
+}
+
+#[test]
+fn build_slots_authorize_before_creating_or_changing_lease_files() {
+    for enabled in [true, false] {
+        run_with_identity_options(enabled, false, true, |cx| async move {
+            let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+            let other = McpContext::with_state(cx.clone(), 2, SessionState::new());
+            let unbound = McpContext::with_state(cx.clone(), 3, SessionState::new());
+            let project = format!("/tmp/session-build-slots-{}", unique_suffix());
+            let project_json: Value = serde_json::from_str(
+                &ensure_project(&owner, project.clone(), None)
+                    .await
+                    .expect("project"),
+            )
+            .expect("project JSON");
+            register_named(&owner, &project, "BlueLake").await;
+            register_named(&other, &project, "PurpleHill").await;
+            let slots_root = Config::get()
+                .storage_root
+                .join("projects")
+                .join(project_json["slug"].as_str().expect("project slug"))
+                .join("build_slots");
+            let denied = acquire_build_slot(
+                &owner,
+                project.clone(),
+                "purplehill".to_string(),
+                "new-slot".to_string(),
+                None,
+                None,
+            )
+            .await;
+            if enabled {
+                assert_eq!(
+                    tool_error_code(&denied.expect_err("borrowed acquire")),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                assert!(
+                    !slots_root.join("new-slot").exists(),
+                    "authorization precedes directory and lock creation"
+                );
+            } else {
+                denied.expect("default-off borrowed acquire");
+            }
+
+            acquire_build_slot(
+                &other,
+                project.clone(),
+                "PurpleHill".to_string(),
+                "existing".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("holder acquires lease");
+            let lease_path = std::fs::read_dir(slots_root.join("existing"))
+                .expect("slot files")
+                .map(|entry| entry.expect("slot entry").path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .expect("persisted lease");
+            let before = std::fs::read(&lease_path).expect("lease bytes");
+            let borrowed = [
+                acquire_build_slot(
+                    &owner,
+                    project.clone(),
+                    "purplehill".to_string(),
+                    "existing".to_string(),
+                    Some(7200),
+                    None,
+                )
+                .await,
+                renew_build_slot(
+                    &owner,
+                    project.clone(),
+                    "purplehill".to_string(),
+                    "existing".to_string(),
+                    Some(7200),
+                )
+                .await,
+                release_build_slot(
+                    &owner,
+                    project.clone(),
+                    "purplehill".to_string(),
+                    "existing".to_string(),
+                )
+                .await,
+            ];
+            for result in borrowed {
+                if enabled {
+                    assert_eq!(
+                        tool_error_code(&result.expect_err("borrowed lease mutation")),
+                        Some("SESSION_IDENTITY_MISMATCH")
+                    );
+                } else {
+                    result.expect("default-off borrowed lease mutation");
+                }
+            }
+            if enabled {
+                assert_eq!(
+                    std::fs::read(&lease_path).expect("unchanged lease bytes"),
+                    before
+                );
+            }
+
+            acquire_build_slot(
+                &owner,
+                project.clone(),
+                "bluelake".to_string(),
+                "owned".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("own canonical-name acquire");
+            let renewed: Value = serde_json::from_str(
+                &renew_build_slot(
+                    &owner,
+                    project.clone(),
+                    "bluelake".to_string(),
+                    "owned".to_string(),
+                    None,
+                )
+                .await
+                .expect("own renew"),
+            )
+            .unwrap();
+            assert_eq!(renewed["renewed"], true);
+            let released: Value = serde_json::from_str(
+                &release_build_slot(
+                    &owner,
+                    project.clone(),
+                    "bluelake".to_string(),
+                    "owned".to_string(),
+                )
+                .await
+                .expect("own release"),
+            )
+            .unwrap();
+            assert_eq!(released["released"], true);
+
+            let missing = acquire_build_slot(
+                &owner,
+                project.clone(),
+                "UnregisteredBuilder".to_string(),
+                "unknown".to_string(),
+                None,
+                None,
+            )
+            .await;
+            if enabled {
+                assert_eq!(
+                    tool_error_code(&missing.expect_err("bound unknown actor")),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                assert!(!slots_root.join("unknown").exists());
+            } else {
+                missing.expect("default-off unregistered actor");
+            }
+            acquire_build_slot(
+                &unbound,
+                project,
+                "UnregisteredBuilder".to_string(),
+                "trusted".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("unbound unregistered actor remains supported");
+        });
+    }
+}
+
+#[test]
+fn force_release_authorizes_the_requester_and_preserves_operator_override() {
+    for enabled in [true, false] {
+        run_with_session_identity(enabled, false, |cx| async move {
+            let owner = McpContext::with_state(cx.clone(), 1, SessionState::new());
+            let other = McpContext::with_state(cx.clone(), 2, SessionState::new());
+            let project = format!("/tmp/session-force-release-{}", unique_suffix());
+            ensure_project(&owner, project.clone(), None)
+                .await
+                .expect("project");
+            let alice = create_identity(&owner, &project).await;
+            let bob = create_identity(&other, &project).await;
+            let holder = create_identity(&other, &project).await;
+            let holder_row = stored_agent(&cx, &project, &holder).await;
+            let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("pool");
+            let rows = mcp_agent_mail_db::queries::create_file_reservations(
+                &cx,
+                &pool,
+                holder_row.project_id,
+                holder_row.id.unwrap(),
+                &["src/stale.rs"],
+                3600,
+                true,
+                "identity force-release test",
+            )
+            .await
+            .into_result()
+            .expect("reservation fixture");
+            let reservation_id = rows[0].id.unwrap();
+            let conn = pool.acquire(&cx).await.into_result().expect("connection");
+            conn.execute_sync(
+                "UPDATE file_reservations SET expires_ts = 1 WHERE id = ?",
+                &[mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id)],
+            )
+            .expect("expire lease for legitimate operator release");
+            drop(conn);
+            let before = serde_json::to_value(
+                mcp_agent_mail_db::queries::get_reservations_by_ids(&cx, &pool, &[reservation_id])
+                    .await
+                    .into_result()
+                    .expect("reservation snapshot"),
+            )
+            .unwrap();
+            let refused = force_release_file_reservation(
+                &owner,
+                project.clone(),
+                bob.to_ascii_lowercase(),
+                reservation_id,
+                Some("borrowed requester".to_string()),
+                Some(true),
+            )
+            .await;
+            if enabled {
+                assert_eq!(
+                    tool_error_code(&refused.expect_err("borrowed operator name")),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        mcp_agent_mail_db::queries::get_reservations_by_ids(
+                            &cx,
+                            &pool,
+                            &[reservation_id]
+                        )
+                        .await
+                        .into_result()
+                        .expect("unchanged reservation")
+                    )
+                    .unwrap(),
+                    before
+                );
+                assert!(
+                    inbox(&other, &project, &holder)
+                        .await
+                        .expect("holder inbox")
+                        .is_empty()
+                );
+                let released: Value = serde_json::from_str(
+                    &force_release_file_reservation(
+                        &owner,
+                        project.clone(),
+                        alice.clone(),
+                        reservation_id,
+                        Some("actual requester".to_string()),
+                        Some(true),
+                    )
+                    .await
+                    .expect("bound operator may release another holder's expired lease"),
+                )
+                .unwrap();
+                assert_eq!(released["released"], 1);
+            } else {
+                let released: Value =
+                    serde_json::from_str(&refused.expect("default-off borrowed operator")).unwrap();
+                assert_eq!(released["released"], 1);
+            }
+            let notices = inbox(&other, &project, &holder)
+                .await
+                .expect("holder notice");
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0]["from"], if enabled { alice } else { bob });
+        });
+    }
 }

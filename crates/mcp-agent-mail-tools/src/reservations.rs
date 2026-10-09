@@ -2728,6 +2728,12 @@ pub async fn force_release_file_reservation(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(
+        ctx,
+        &actor,
+        false,
+        "force-release file reservations",
+    )?;
 
     let mut reservations = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_reservations_by_ids(

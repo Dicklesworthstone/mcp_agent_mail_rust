@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::tool_util::{get_db_pool, legacy_tool_error, resolve_project};
+use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
 
 static LEASE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -295,18 +295,32 @@ fn compute_renewed_expiry(
     (std::cmp::max(now, current_expiry) + chrono::Duration::seconds(extend_seconds)).to_rfc3339()
 }
 
-async fn resolve_canonical_agent_name(
+async fn resolve_authorized_agent_name(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::pool::DbPool,
     project_id: i64,
     agent_name: &str,
-) -> String {
+) -> McpResult<String> {
     let agent_name = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
         .unwrap_or_else(|| agent_name.to_string());
-    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name).await {
-        asupersync::Outcome::Ok(agent) => agent.name,
-        _ => agent_name,
-    }
+    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name)
+        .await
+    {
+        asupersync::Outcome::Ok(agent) => agent,
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+            // Trusted-local callers historically need not register before
+            // taking a slot. An unknown name still cannot borrow the identity
+            // of a session already bound in this project.
+            mcp_agent_mail_db::AgentRow {
+                project_id,
+                name: agent_name,
+                ..mcp_agent_mail_db::AgentRow::default()
+            }
+        }
+        other => db_outcome_to_mcp_result(other)?,
+    };
+    crate::session_identity::authorize_actor(ctx, &agent, false, "manage build slots")?;
+    Ok(agent.name)
 }
 
 fn collect_slot_conflicts(
@@ -461,7 +475,7 @@ pub async fn acquire_build_slot(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-    let agent_name = resolve_canonical_agent_name(ctx, &pool, project_id, &agent_name).await;
+    let agent_name = resolve_authorized_agent_name(ctx, &pool, project_id, &agent_name).await?;
     let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000)); // 1 hour default
     let branch = compute_branch(&project.human_key);
     let project_root = project_archive_root(config, &project.slug);
@@ -499,7 +513,7 @@ pub async fn renew_build_slot(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-    let agent_name = resolve_canonical_agent_name(ctx, &pool, project_id, &agent_name).await;
+    let agent_name = resolve_authorized_agent_name(ctx, &pool, project_id, &agent_name).await?;
     let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000)); // 30 minutes default
     let branch = compute_branch(&project.human_key);
     let project_root = project_archive_root(config, &project.slug);
@@ -531,7 +545,7 @@ pub async fn release_build_slot(
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-    let agent_name = resolve_canonical_agent_name(ctx, &pool, project_id, &agent_name).await;
+    let agent_name = resolve_authorized_agent_name(ctx, &pool, project_id, &agent_name).await?;
     let branch = compute_branch(&project.human_key);
     let project_root = project_archive_root(config, &project.slug);
     let slot_path = slot_dir(&project_root, &slot);
