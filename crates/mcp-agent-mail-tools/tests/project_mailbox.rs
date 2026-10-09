@@ -190,6 +190,28 @@ async fn delivery_events(ctx: &McpContext, project: &str, agent: &str) -> Vec<(i
         .collect()
 }
 
+/// `resource://inbox/{agent}` lists exactly `message_id`, with the given `via`.
+async fn assert_resource_inbox_via(
+    ctx: &McpContext,
+    slug: &str,
+    agent: &str,
+    message_id: i64,
+    want_via: Option<&str>,
+) {
+    let raw = mcp_agent_mail_tools::resources::inbox(ctx, format!("{agent}?project={slug}"))
+        .await
+        .expect("inbox resource");
+    let resource: Value = serde_json::from_str(&raw).expect("inbox resource JSON");
+    let rows = resource["messages"].as_array().expect("resource messages");
+    assert_eq!(rows.len(), 1, "{agent} resource rows: {rows:?}");
+    assert_eq!(rows[0]["id"], message_id);
+    assert_eq!(
+        rows[0].get("via").and_then(Value::as_str),
+        want_via,
+        "{agent}"
+    );
+}
+
 async fn table_count(cx: &Cx, sql: &str) -> i64 {
     let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
     let conn = pool.acquire(cx).await.into_result().expect("DB checkout");
@@ -481,6 +503,11 @@ fn project_mailbox_addresses_are_validated_and_combine_with_direct_recipients() 
         assert_eq!(red.len(), 1);
         assert_eq!(red[0]["id"], message_id);
         assert_eq!(red[0]["via"], "project");
+
+        // resource://inbox marks the same rows the same way (README: agents see
+        // project mail "in fetch_inbox (and resource://inbox/...)").
+        assert_resource_inbox_via(&ctx, &slug, "BlueLake", message_id, None).await;
+        assert_resource_inbox_via(&ctx, &slug, "RedStone", message_id, Some("project")).await;
 
         // A reply can address the project mailbox too.
         let reply: Value = serde_json::from_str(

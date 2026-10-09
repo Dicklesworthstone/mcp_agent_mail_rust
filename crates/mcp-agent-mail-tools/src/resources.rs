@@ -2984,6 +2984,10 @@ pub struct InboxResourceMessage {
     pub from: String,
     pub created_ts: Option<String>,
     pub kind: String,
+    /// `"project"` when the message reached this inbox through the project's
+    /// shared mailbox (GH#282), exactly as `fetch_inbox` reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -3086,6 +3090,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
                 from: row.sender_name.clone(),
                 created_ts: Some(micros_to_iso(msg.created_ts)),
                 kind: row.kind.clone(),
+                via: crate::messaging::inbox_via(&row.kind),
                 attachments: parse_attachment_metadata(&msg.attachments),
                 body_md: if include_bodies {
                     Some(msg.body_md.clone())
