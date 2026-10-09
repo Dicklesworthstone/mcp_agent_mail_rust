@@ -412,14 +412,26 @@ mod tests {
                 run(grant_ack_escalation(cx, pool, &request)),
                 Outcome::Ok(AckEscalationOutcome::AlreadyCovered)
             ));
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
             assert_eq!(
                 scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
                 first.expires_ts
             );
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"), 0);
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"),
+                0
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
 
             // Reading alone is not an ACK. A subsequent real ACK is terminal
             // for this proposal even though its earlier reservation still exists.
@@ -438,13 +450,22 @@ mod tests {
             let ack = scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts");
             assert!(ack > 0);
             stale(run(grant_ack_escalation(cx, pool, &request)));
-            assert_eq!(scalar(pool, cx, "SELECT read_ts FROM project_mailbox_receipts"), 77);
-            assert_eq!(scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"), ack);
+            assert_eq!(
+                scalar(pool, cx, "SELECT read_ts FROM project_mailbox_receipts"),
+                77
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"),
+                ack
+            );
             assert_eq!(
                 scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
                 first.expires_ts
             );
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"), 0);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"),
+                0
+            );
         });
     }
 
@@ -478,7 +499,10 @@ mod tests {
                     0,
                     "{sql}"
                 );
-                assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+                assert_eq!(
+                    scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                    0
+                );
             });
         }
     }
@@ -497,9 +521,18 @@ mod tests {
                 pool,
                 &request(generation, observed),
             )));
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 0);
-            assert_eq!(scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"), ack);
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"), 0);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                0
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"),
+                ack
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"),
+                0
+            );
         });
     }
 
@@ -525,7 +558,11 @@ mod tests {
             );
             let request = request(generation, observed);
             let first = granted(run(grant_ack_escalation(cx, pool, &request)));
-            execute(pool, cx, "UPDATE agents SET contact_policy = 'auto' WHERE id = 102");
+            execute(
+                pool,
+                cx,
+                "UPDATE agents SET contact_policy = 'auto' WHERE id = 102",
+            );
             execute(
                 pool,
                 cx,
@@ -537,12 +574,18 @@ mod tests {
                 "UPDATE project_mailbox_receipts SET ack_ts = NULL WHERE message_id = 901",
             );
             stale(run(grant_ack_escalation(cx, pool, &request)));
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
             assert_eq!(
                 scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
                 first.expires_ts
             );
-            assert_eq!(scalar(pool, cx, "SELECT ack_ts FROM message_recipients"), 43);
+            assert_eq!(
+                scalar(pool, cx, "SELECT ack_ts FROM message_recipients"),
+                43
+            );
         });
     }
 
@@ -576,7 +619,10 @@ mod tests {
                 run(grant_ack_escalation(cx, pool, &request)),
                 Outcome::Err(DbError::ResourceBusy(_))
             ));
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
             assert_eq!(
                 scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
                 competing[0].expires_ts
@@ -592,8 +638,14 @@ mod tests {
             .into_result()
             .unwrap();
             granted(run(grant_ack_escalation(cx, pool, &request)));
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 2);
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                2
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
         });
     }
 
@@ -607,10 +659,17 @@ mod tests {
                 "ALTER TABLE project_mailbox_receipts RENAME TO unavailable_receipts",
             );
             assert!(matches!(
-                run(grant_ack_escalation(cx, pool, &request(generation, observed))),
+                run(grant_ack_escalation(
+                    cx,
+                    pool,
+                    &request(generation, observed)
+                )),
                 Outcome::Err(_)
             ));
-            assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"), 0);
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                0
+            );
             let conn = run(pool.acquire(cx)).expect("checkout after failed admission");
             conn.execute_raw("BEGIN IMMEDIATE").unwrap();
             conn.execute_raw("ROLLBACK").unwrap();

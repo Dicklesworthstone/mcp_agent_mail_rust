@@ -386,10 +386,19 @@ mod tests {
             assert_eq!(keys(&observed), vec![(10, 2), (10, 6)]);
             assert!(observed.continuation_after(2).unwrap().is_none());
             assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 2);
-            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 4);
-            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
             assert_eq!(
-                count(conn, "SELECT read_ts FROM project_mailbox_receipts WHERE agent_id = 2"),
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                4
+            );
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
+            assert_eq!(
+                count(
+                    conn,
+                    "SELECT read_ts FROM project_mailbox_receipts WHERE agent_id = 2"
+                ),
                 44
             );
             assert!(
@@ -430,8 +439,14 @@ mod tests {
             }
             assert_eq!(seen, (2..=131).map(|agent| (7, agent)).collect::<Vec<_>>());
             assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 0);
-            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
-            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
         });
     }
 
@@ -499,7 +514,10 @@ mod tests {
             let (sql, params) = page_query("db", None, 10, 128).unwrap();
             assert!(conn.query_sync(&sql, &params).is_err());
             assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 1);
-            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 1);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
         });
     }
 
@@ -587,8 +605,14 @@ mod tests {
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
             assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 103);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 1);
-            assert_eq!(count(&conn, "SELECT agent_id FROM project_mailbox_receipts"), 102);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                1
+            );
+            assert_eq!(
+                count(&conn, "SELECT agent_id FROM project_mailbox_receipts"),
+                102
+            );
             assert!(count(&conn, "SELECT ack_ts FROM project_mailbox_receipts") > 0);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM message_recipients"), 0);
         });
