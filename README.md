@@ -1901,6 +1901,7 @@ need to do anything.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
+- **Slow file reservations at swarm scale.** The release smoke's 60-agent swarm phase runs 3 projects of mixed sends, reads, acks and reservations, with a server kill midway. In it, `file_reservation_paths` and `release_file_reservations` take about 13 s at the median and about 25 s at p99, on v0.3.38 and on current `main`; the budget is 5 s. Each reservation writes its archive file with fsyncs under one process-wide archive lock ([#345](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/345)). In the same runs no acknowledged message was lost across the kill, and integrity checks passed. Receipts: [`docs/evidence/release_smoke/`](docs/evidence/release_smoke/).
 
 ---
 
