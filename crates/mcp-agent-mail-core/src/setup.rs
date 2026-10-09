@@ -9160,6 +9160,22 @@ mod tests {
         let sentinel = project.join("operator-owned");
         std::fs::write(&sentinel, "sentinel\n").unwrap();
         let missing_process_home = EnvVarGuard::unset(TEST_OMP_HOME_DIR_OVERRIDE_KEY);
+        // The original leak wrote `./~/.omp/agent/mcp.json` under the process
+        // cwd, not under project_dir, so watch the cwd for relative roots too.
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_roots: Vec<PathBuf> = ["~", "relative-home", "relative-omp"]
+            .iter()
+            .map(|root| cwd.join(root))
+            .filter(|root| !root.exists())
+            .collect();
+        let relative_override = |path: &str| SetupParams {
+            project_dir: project.clone(),
+            omp_user_config_path_override: Some(PathBuf::from(path)),
+            agents: Some(vec![AgentPlatform::Omp]),
+            token: "must-not-be-written".to_string(),
+            skip_hooks: true,
+            ..SetupParams::default()
+        };
 
         for mut params in [
             SetupParams {
@@ -9192,6 +9208,8 @@ mod tests {
                 skip_hooks: true,
                 ..SetupParams::default()
             },
+            relative_override("~/.omp/agent/mcp.json"),
+            relative_override("relative-omp/agent/mcp.json"),
         ] {
             params.skip_user_config = true;
             let results = run_setup(&params);
@@ -9203,6 +9221,13 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
             assert!(!project.join(".omp").exists());
             assert!(!project.join(".gitignore").exists());
+            for root in &cwd_roots {
+                assert!(
+                    !root.exists(),
+                    "relative OMP authority wrote under the process cwd: {}",
+                    root.display()
+                );
+            }
         }
 
         drop(missing_process_home);
