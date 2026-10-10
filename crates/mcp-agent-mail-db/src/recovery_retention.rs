@@ -43,7 +43,8 @@ pub enum DebrisCategory {
     /// a full copy of the DB + sidecars, so they are large).
     ForensicBundle,
     /// A quarantined corrupt DB / sidecar sibling of the live database, e.g.
-    /// `storage.sqlite3.corrupt-<ts>` or `storage.sqlite3-wal.reconstruct-failed-<ts>`.
+    /// `storage.sqlite3.corrupt-<ts>`, `storage.sqlite3.corrupt<N>`, or
+    /// `storage.sqlite3-wal.reconstruct-failed-<ts>`.
     CorruptQuarantine,
     /// A direct `storage.sqlite3.archive-reconcile-<ts>` incident snapshot.
     /// These are also known to server-side `backup_rotation`, but reclaim
@@ -243,7 +244,7 @@ pub fn select_recovery_debris_to_reclaim(
 /// Enumerate all recovery debris under `storage_root` / next to `db_path`.
 ///
 /// Combines forensic bundles (`doctor/forensics/.../`) with quarantine siblings
-/// (`<db>.corrupt-*`, `<db>.reconstruct-failed-*`), archive-reconcile incident
+/// (`<db>.corrupt-*`, `<db>.corrupt<N>`, `<db>.reconstruct-failed-*`), archive-reconcile incident
 /// snapshots (`<db>.archive-reconcile-*`), startup sidecar snapshots (`<db>-wal.startup-precheckpoint-*`,
 /// `<db>-shm.startup-precheckpoint-*`, `<db>*.startup-quarantine-*`), and
 /// `.stale`-marked artifacts (`<db>*.stale`, `<db>*.stale-*`, `<db>*.stale.*`).
@@ -312,6 +313,15 @@ pub fn enumerate_forensic_bundles(storage_root: &Path) -> Vec<DebrisArtifact> {
     out
 }
 
+/// Recognize the complete legacy `corrupt<N>` suffix (br-kp1in.36).
+/// Callers must first establish the exact database/companion namespace. Do
+/// not accept a bare `corrupt`, appended metadata, or Unicode digit lookalikes.
+fn is_numbered_corrupt_suffix(suffix: &[u8]) -> bool {
+    suffix
+        .strip_prefix(b"corrupt")
+        .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.iter().all(u8::is_ascii_digit))
+}
+
 /// Classify only an artifact suffix of this exact configured database family.
 ///
 /// Recovery words in the database basename carry no ownership information:
@@ -350,7 +360,10 @@ fn classify_recovery_debris_file(
         if has_payload(b"archive-reconcile-") {
             return Some(DebrisCategory::ArchiveReconcileBackup);
         }
-        if has_payload(b"corrupt-") || has_payload(b"reconstruct-failed-") {
+        if has_payload(b"corrupt-")
+            || has_payload(b"reconstruct-failed-")
+            || is_numbered_corrupt_suffix(suffix)
+        {
             return Some(DebrisCategory::CorruptQuarantine);
         }
         if has_payload(b"startup-precheckpoint-") || has_payload(b"startup-quarantine-") {
@@ -466,7 +479,7 @@ pub fn is_stale_artifact_name(name: &str) -> bool {
 /// evict unrelated pre-migration backups, and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BackupKind {
-    /// `storage.sqlite3.corrupt-*` (plus -wal/-shm siblings)
+    /// `storage.sqlite3.corrupt-*` / `.corrupt<N>` (plus -wal/-shm siblings)
     Corrupt,
     /// `storage.sqlite3.reconstruct-failed-*` and `storage.sqlite3.reconstructing-*`
     Reconstruct,
@@ -550,7 +563,7 @@ pub fn classify_backup_file(
     if after_stem.starts_with("reconstruct-") || after_stem.starts_with("reconstructing-") {
         return Some(BackupKind::Reconstruct);
     }
-    if after_stem.starts_with("corrupt-") {
+    if after_stem.starts_with("corrupt-") || is_numbered_corrupt_suffix(suffix) {
         return Some(BackupKind::Corrupt);
     }
     if after_stem.starts_with("salvage-") {
@@ -841,6 +854,153 @@ mod tests {
             modified_us,
             category,
         }
+    }
+
+    #[test]
+    fn numbered_quarantines_require_exact_ascii_ordinals_and_database_families() {
+        use std::ffi::OsStr;
+        for database in ["mail.db", "mail.corrupt1"] {
+            for companion in ["", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head", "-fsqlite-ns-gate", "-fsqlite-ns-use", ".lock"] {
+                for ordinal in ["0", "1", "70", "18446744073709551615"] {
+                    let name = format!("{database}{companion}.corrupt{ordinal}");
+                    assert_eq!(
+                        classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
+                        Some(DebrisCategory::CorruptQuarantine),
+                        "{name}"
+                    );
+                    if matches!(companion, "" | "-wal" | "-shm") {
+                        assert_eq!(
+                            classify_backup_file(OsStr::new(database), OsStr::new(&name)),
+                            Some(BackupKind::Corrupt),
+                            "{name}"
+                        );
+                    }
+                }
+            }
+            for suffix in ["", "-wal", "-shm", ".lock", ".bak", ".bak.meta.json"] {
+                let name = format!("{database}{suffix}");
+                assert_eq!(
+                    classify_recovery_debris_file(OsStr::new(database), OsStr::new(&name)),
+                    None,
+                    "live family: {name}"
+                );
+            }
+        }
+        for name in [
+            "mail.db.corrupt",
+            "mail.db.corrupt1.meta.json",
+            "mail.db.corrupt1notes",
+            "mail.db.corrupt1.bak",
+            "mail.db.corrupt+1",
+            "mail.db.corrupt１",
+            "mail.db.corrupt١",
+            "mail.db.CORRUPT1",
+            "mail.db2.corrupt1",
+            "mail.db.notes.corrupt1",
+            "mail.db-wal2.corrupt1",
+            "mail.db.bak.corrupt1",
+        ] {
+            assert_eq!(
+                classify_recovery_debris_file(OsStr::new("mail.db"), OsStr::new(name)),
+                None,
+                "unowned or incomplete: {name}"
+            );
+            assert_eq!(classify_backup_file(OsStr::new("mail.db"), OsStr::new(name)), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn numbered_quarantine_inventory_is_external_database_scoped_and_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("archive");
+        let database_dir = root.path().join("database");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::create_dir(&database_dir).unwrap();
+        let primary = database_dir.join("mail.db");
+        std::fs::write(&primary, [0_u8; 7]).unwrap();
+        for (name, bytes) in [
+            ("mail.db.corrupt1", 11),
+            ("mail.db-wal.corrupt2", 13),
+            ("mail.db-shm.corrupt70", 17),
+            ("mail.db.bak", 19),
+            ("other.db.corrupt1", 23),
+            ("mail.db.corrupt1.meta.json", 29),
+        ] {
+            std::fs::write(database_dir.join(name), vec![0_u8; bytes]).unwrap();
+        }
+        std::fs::write(archive.join("mail.db.corrupt1"), [0_u8; 31]).unwrap();
+        std::fs::create_dir(database_dir.join("mail.db.corrupt3")).unwrap();
+        std::fs::write(database_dir.join("mail.db.corrupt3/unrelated"), [0_u8; 37]).unwrap();
+        let stats = retention_resident_stats(
+            &archive,
+            &primary,
+            Some((RetentionPolicy { keep_min: 0, max_age_secs: 0, max_total_bytes_per_category: None }, i64::MAX)),
+        ).unwrap();
+        assert_eq!(stats.recovery_debris_artifacts, 3);
+        assert_eq!(stats.direct_backup_only_artifacts, 1);
+        assert_eq!(stats.resident_bytes, 60);
+        assert_eq!(stats.reclaimable_bytes, 41);
+        assert_eq!(stats.live_database_bytes, Some(7));
+        assert_eq!(stats.resident_bytes_by_category.get("corrupt_quarantine"), Some(&41));
+        assert_eq!(stats.resident_bytes_by_category.get("direct_backup"), Some(&19));
+        let inventory = inspect_storage_backups(&primary).unwrap();
+        assert_eq!(inventory.artifact_count, 4);
+        assert_eq!(inventory.resident_bytes, 60);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn numbered_quarantine_reclaim_preserves_live_state_and_retains_all_evidence() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.corrupt1");
+        let protected = [
+            primary.clone(),
+            root.join("mail.corrupt1-wal"),
+            root.join("mail.corrupt1-shm"),
+            root.join("mail.corrupt1.bak"),
+            root.join("mail.corrupt1.bak.meta.json"),
+            root.join("mail.corrupt12.corrupt1"),
+        ];
+        for path in &protected {
+            std::fs::write(path, b"protected").unwrap();
+        }
+        let artifact = root.join("mail.corrupt1.corrupt70");
+        std::fs::write(&artifact, b"incident evidence").unwrap();
+        let linked = root.join("mail.corrupt1.corrupt71");
+        std::os::unix::fs::symlink(&primary, &linked).unwrap();
+        let debris = enumerate_recovery_debris(&root, &primary);
+        assert_eq!(debris.len(), 1, "{debris:?}");
+        let plan = select_recovery_debris_to_reclaim(
+            debris,
+            RetentionPolicy { keep_min: 0, max_age_secs: 0, max_total_bytes_per_category: Some(0) },
+            i64::MAX,
+        );
+        let destination = root.join("doctor/reclaimable/numbered-run");
+        let outcome = consolidate_debris(&plan, &destination).unwrap();
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.moved_bytes, 17);
+        assert!(outcome.failures.is_empty());
+        assert!(!artifact.exists());
+        assert_eq!(std::fs::read(destination.join("mail.corrupt1.corrupt70")).unwrap(), b"incident evidence");
+        assert_eq!(reclaimable_staging_bytes(&root), 17);
+        for path in protected {
+            assert_eq!(std::fs::read(path).unwrap(), b"protected");
+        }
+        assert_eq!(std::fs::read_link(linked).unwrap(), primary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn numbered_quarantine_classification_keeps_non_unicode_identity_byte_exact() {
+        use std::os::unix::ffi::OsStringExt;
+        let database = std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec());
+        let mut numbered = database.clone();
+        numbered.push("-wal.corrupt7");
+        assert_eq!(classify_recovery_debris_file(&database, &numbered), Some(DebrisCategory::CorruptQuarantine));
+        assert_eq!(classify_backup_file(&database, &numbered), Some(BackupKind::Corrupt));
+        let alias = std::ffi::OsStr::new("mail-�.db-wal.corrupt7");
+        assert_eq!(classify_recovery_debris_file(&database, alias), None);
+        assert_eq!(classify_backup_file(&database, alias), None);
     }
 
     #[test]
