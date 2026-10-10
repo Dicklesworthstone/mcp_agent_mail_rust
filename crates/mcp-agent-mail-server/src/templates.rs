@@ -302,4 +302,124 @@ mod tests {
         // Force lazy initialization
         let _ = &*ENV;
     }
+
+    // --- third-party assets (br-kp1in.43) ---
+
+    /// Whether a CDN URL names an exact `x.y.z` version: every `name@version`
+    /// segment must be exact (`@latest`, `@3` and `@3.x.x` float), and some
+    /// segment must carry one (cdnjs and Tailwind use a bare `x.y.z` segment).
+    fn version_pinned(url: &str) -> bool {
+        let is_semver = |text: &str| {
+            let parts: Vec<&str> = text.split('.').collect();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let mut versioned = false;
+        for segment in url.trim_start_matches("https://").split(['/', '?']) {
+            // A leading `@` is an npm scope (`@mojs/core`), not a version.
+            if segment
+                .split_once('@')
+                .is_some_and(|(name, _)| !name.is_empty())
+            {
+                if !segment.rsplit('@').next().is_some_and(is_semver) {
+                    return false;
+                }
+                versioned = true;
+            } else if is_semver(segment) {
+                versioned = true;
+            }
+        }
+        versioned
+    }
+
+    #[test]
+    fn version_pinning_rejects_floating_tags() {
+        for floating in [
+            "https://unpkg.com/lucide@latest",
+            "https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js",
+            "https://cdn.jsdelivr.net/npm/marked@11/marked.min.js",
+            "https://unpkg.com/@popperjs/core@2",
+            "https://cdn.tailwindcss.com",
+        ] {
+            assert!(
+                !version_pinned(floating),
+                "{floating} must count as floating"
+            );
+        }
+        for pinned in [
+            "https://unpkg.com/@popperjs/core@2.11.8/dist/umd/popper.min.js",
+            "https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js",
+            "https://cdn.tailwindcss.com/3.4.17",
+        ] {
+            assert!(version_pinned(pinned), "{pinned} is pinned");
+        }
+    }
+
+    /// Every third-party script and stylesheet the Mail UI loads names an exact
+    /// version and, where the CDN serves CORS, carries SRI. A floating tag lets
+    /// an upstream release or a compromised CDN change what runs on pages that
+    /// render the mailbox (lucide@latest resolved to a same-day release).
+    #[test]
+    fn third_party_assets_are_version_pinned_with_sri() {
+        // The Tailwind play CDN sends no CORS headers and Google Fonts CSS
+        // varies by user agent: neither can carry SRI.
+        const NO_SRI: [&str; 2] = [
+            "https://cdn.tailwindcss.com/",
+            "https://fonts.googleapis.com/",
+        ];
+        let mut with_sri = 0;
+        for file in TEMPLATE_DIR.files() {
+            let Some(html) = file.contents_utf8() else {
+                continue;
+            };
+            let name = file.path().display();
+            for tag in html.split('<').skip(1) {
+                let tag = tag.split('>').next().unwrap_or_default();
+                let attr = if tag.starts_with("script") {
+                    "src=\""
+                } else if tag.starts_with("link") && tag.contains("stylesheet") {
+                    "href=\""
+                } else {
+                    continue;
+                };
+                let Some(url) = tag
+                    .split(attr)
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                else {
+                    continue;
+                };
+                if !url.starts_with("https://") {
+                    continue;
+                }
+                assert!(
+                    version_pinned(url) || url.starts_with("https://fonts.googleapis.com/"),
+                    "{name}: {url} is not pinned to an exact version"
+                );
+                if NO_SRI.iter().any(|host| url.starts_with(host)) {
+                    continue;
+                }
+                assert!(
+                    tag.contains("integrity=\"sha384-")
+                        && tag.contains("crossorigin=\"anonymous\""),
+                    "{name}: {url} loads without SRI"
+                );
+                with_sri += 1;
+            }
+            // A module import cannot carry SRI; it must still be pinned.
+            for import in html.split("from 'https://").skip(1) {
+                let url = format!("https://{}", import.split('\'').next().unwrap_or_default());
+                assert!(
+                    version_pinned(&url),
+                    "{name}: module import {url} is not pinned"
+                );
+            }
+        }
+        assert!(
+            with_sri >= 30,
+            "only {with_sri} SRI-checked assets: the scan no longer matches base.html"
+        );
+    }
 }

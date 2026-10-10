@@ -27,8 +27,12 @@
       })();
     </script>
 
+    <!-- Third-party assets are pinned to exact versions and carry SRI where the
+         CDN allows it (br-kp1in.43), so an upstream release or a compromised CDN
+         cannot change what runs on a page that renders the mailbox. The Tailwind
+         play CDN sends no CORS headers, so it is version-pinned without SRI. -->
     <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
     <script>
       tailwind.config = {
         darkMode: 'class',
@@ -108,28 +112,28 @@
     </script>
 
     <!-- Alpine.js -->
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.17.4/dist/cdn.min.js" integrity="sha384-5/joNqFnRyVWzXp99bHot6RHG+EksGp+USSgZwPar7T9SD9PKKER37n/8bXBAZGd" crossorigin="anonymous"></script>
 
     <!-- Lucide Icons -->
-    <script defer src="https://unpkg.com/lucide@latest"></script>
+    <script defer src="https://unpkg.com/lucide@1.48.0/dist/umd/lucide.min.js" integrity="sha384-Hh7C333mXel+qppGoFs4qAOXp7h67eur4XsQVF2bvHAM3MQ4DX4cQI7oRCzb98J4" crossorigin="anonymous"></script>
 
     <!-- Prism.js for code highlighting -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" integrity="sha384-wFjoQjtV1y5jVHbt0p35Ui8aV8GVpEZkyF99OXWqP/eNJDU93D3Ugxkoyh6Y2I4A" crossorigin="anonymous" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js" integrity="sha384-06z5D//U/xpvxZHuUz92xBvq3DqBBFi7Up53HRrbV7Jlv7Yvh/MZ7oenfUe9iCEt" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" integrity="sha384-WJdEkJKrbsqw0evQ4GB6mlsKe5cGTxBOw4KAEIa52ZLB7DDpliGkwdme/HMa5n1m" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" integrity="sha384-RhrmFFMb0ZCHImjFMpR/UE3VEtIVTCtNrtKQqXCzqXZNJala02N3UbVhi+qzw3CY" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js" integrity="sha384-s888ApkYHxfPsp8n81g77Unl/0XYnYltLvWbwqKHcheRE8/dZPlT4IjW3mRGv/Hd" crossorigin="anonymous"></script>
 
     <!-- Marked.js for markdown rendering -->
-    <script src="https://cdn.jsdelivr.net/npm/marked@11/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@11.2.0/marked.min.js" integrity="sha384-9Md4MlJk24bo2Ifubp0FbKhuES4/iAwyTGMeWpBG4RoHGTKygpEGEpOYhEQxbfa9" crossorigin="anonymous"></script>
 
     <!-- DOMPurify for HTML sanitization (prevent XSS in markdown previews) -->
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.16/dist/purify.min.js" integrity="sha384-a7SzOxErzJ3ZpQz0zJ32d67dSitNzPcbfybc/ykU9KJhMgZkwqfSxlhhdJRS+XGL" crossorigin="anonymous"></script>
 
     <!-- Day.js for date formatting (lightweight utility) -->
-    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/relativeTime.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/calendar.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js" integrity="sha384-DpVxUeeBWjUvUV1czyIHJAjh+jYUZFu2lLakbdua5vbwOrBGi1UgaKCHjTC+x3Ky" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/relativeTime.min.js" integrity="sha384-vKerUi5OCpHqrrB94OiqdEjkyS5mc6nmgIo0zpddqoPEhV/fW+h7Srkcxq3BVVHo" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/calendar.min.js" integrity="sha384-R2v6EnP1AvQUIs7kG9XB8pK8nbqAxfdaecMZAjnecM03oyeUnqO3wR78mqntmZLt" crossorigin="anonymous"></script>
 
     <!--
       Local-timezone timestamp formatter shared by every Alpine template.
@@ -258,47 +262,49 @@
     </script>
 
     <!-- Tippy.js for beautiful tooltips -->
-    <script src="https://unpkg.com/@popperjs/core@2"></script>
-    <script src="https://unpkg.com/tippy.js@6"></script>
-    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/dist/tippy.css" />
-    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/themes/light.css" />
-    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/animations/scale.css" />
+    <script src="https://unpkg.com/@popperjs/core@2.11.8/dist/umd/popper.min.js" integrity="sha384-I7E8VVD/ismYTF4hNIPjVp/Zjvgyol6VFvRkX/vR+Vc4jQkC+hVqc2pM8ODewa9r" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/tippy.js@6.3.7/dist/tippy-bundle.umd.min.js" integrity="sha384-AiTRpehQ7zqeua0Ypfa6Q4ki/ddhczZxrKtiQbTQUlJIhBkTeyoZP9/W/5ulFt29" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6.3.7/dist/tippy.css" integrity="sha384-IBgYl+I5X6ZDZXI5zv1vsSE3VopDomz4BxSu/GlxaPHfFtcrJ3uj70z1w6srO9zU" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6.3.7/themes/light.css" integrity="sha384-O3zpKcmNU1sKUh+lNrViF6kgcRBBz27MhfBgmK1g1Te/UNvsu7l+jGYeNK9vXpKj" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6.3.7/animations/scale.css" integrity="sha384-8N4IYsfQ62z/mL0F4DjUmQ/Zf5ezlpJAEwFWjgA0uLAtYXBZjyTiTARsn1MbBlRQ" crossorigin="anonymous" />
 
     <!-- NProgress for loading indicators -->
-    <script src="https://unpkg.com/nprogress@0.2.0/nprogress.js"></script>
-    <link rel="stylesheet" href="https://unpkg.com/nprogress@0.2.0/nprogress.css" />
+    <script src="https://unpkg.com/nprogress@0.2.0/nprogress.js" integrity="sha384-Khp+WGU135XsFuEWvnA1WVJNvQ7T6CI9uxs+8RZes7B2JOmM5kjifb3AJ6V3JxY8" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="https://unpkg.com/nprogress@0.2.0/nprogress.css" integrity="sha384-pwTVmaXgbbFRCYPBh1yaHpccJ0KzibGT/RTD3LUT0gjddQ1UkDxcimqlUvZaziZP" crossorigin="anonymous" />
 
     <!-- Chart.js for data visualization -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4" crossorigin="anonymous"></script>
 
     <!-- Anime.js for advanced animations -->
-    <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.1/lib/anime.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.1/lib/anime.min.js" integrity="sha384-fXdIufVbE9aU7STmdk/DWK0imNOozId9fTwzM/gi0NfPjphEIC3gq0M760UnsKVy" crossorigin="anonymous"></script>
 
     <!-- SortableJS for drag and drop -->
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js" integrity="sha384-BSxuMLxX+FCbTdYec3TbXlnMGEEM2QXTFdtDaveen71o+jswm2J36+xFqp8k4VHM" crossorigin="anonymous"></script>
 
     <!-- Fuse.js for fuzzy search -->
-    <script src="https://cdn.jsdelivr.net/npm/fuse.js@7.0.0/dist/fuse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fuse.js@7.0.0/dist/fuse.min.js" integrity="sha384-PCSoOZTpbkikBEtd/+uV3WNdc676i9KUf01KOA8CnJotvlx8rRrETbDuwdjqTYvt" crossorigin="anonymous"></script>
 
     <!-- Hotkeys.js for keyboard shortcuts -->
-    <script src="https://unpkg.com/hotkeys-js@3.13.7/dist/hotkeys.min.js"></script>
+    <script src="https://unpkg.com/hotkeys-js@3.13.7/dist/hotkeys.min.js" integrity="sha384-sEDMZQTPyHjKRqJDJ3uRzZ8fKsX7dJvacMzLCEUO9j2JtdeTvCeDoUR181LyDr5O" crossorigin="anonymous"></script>
 
-    <!-- Particles.js for background effects -->
-    <script src="https://cdn.jsdelivr.net/npm/particles.js@2.0.0/particles.min.js"></script>
+    <!-- Particles.js for background effects. The package's own file: jsDelivr
+         generates particles.min.js on the fly, so its bytes are not stable. -->
+    <script src="https://unpkg.com/particles.js@2.0.0/particles.js" integrity="sha384-AWFROZ10DoeXcNjhoQe0agryexFsipZEA17Cde6/tknpOUacvUGk27vXQ2a6ljSt" crossorigin="anonymous"></script>
 
     <!-- CountUp.js for number animations -->
-    <script src="https://cdn.jsdelivr.net/npm/countup@1.8.2/dist/countUp.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/countup@1.8.2/dist/countUp.min.js" integrity="sha384-dgk2PzpAZIdPWyfb9vpnmZIookg8v+Y/zGa47pSWx/sELl/7N5ltEKECobrpvMJ3" crossorigin="anonymous"></script>
 
     <!-- Mo.js for micro-animations -->
-    <script defer src="https://cdn.jsdelivr.net/npm/@mojs/core@1.7.1/dist/mo.umd.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/@mojs/core@1.7.1/dist/mo.umd.js" integrity="sha384-sQme5EoZ8tkzqlsLwlH3pEEYaAZIW3bTFTZMs4BHDzNRkXMkJD+mAaAmoJmAQJiG" crossorigin="anonymous"></script>
 
     <!-- Splitting.js for advanced text animations -->
-    <script src="https://unpkg.com/splitting@1.0.6/dist/splitting.min.js"></script>
-    <link rel="stylesheet" href="https://unpkg.com/splitting@1.0.6/dist/splitting.css" />
+    <script src="https://unpkg.com/splitting@1.0.6/dist/splitting.min.js" integrity="sha384-taxnKSnzdVS5gZB4jZcieFZlmBPQMFqhdEmCScZsrIFCxX8Zizq4fKJJH5kBwMXT" crossorigin="anonymous"></script>
+    <link rel="stylesheet" href="https://unpkg.com/splitting@1.0.6/dist/splitting.css" integrity="sha384-6z/M4zCNHzM59q8BnJ1btvx5I7ArdKNNBgb/V4m7ZTUPI4e2SVF0o5IQAGCO414a" crossorigin="anonymous" />
 
-    <!-- Mermaid.js for git graphs and diagrams -->
+    <!-- Mermaid.js for git graphs and diagrams. A module import cannot carry
+         SRI, so the version is pinned exactly instead. -->
     <script type="module">
-      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.esm.min.mjs';
       window.mermaid = mermaid;
       mermaid.initialize({
         startOnLoad: false,
@@ -325,12 +331,12 @@
     </script>
 
     <!-- Diff2Html for beautiful git diffs -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/css/diff2html.min.css" />
-    <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/js/diff2html-ui.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/css/diff2html.min.css" integrity="sha384-iBvSlI3tNrrSIy7s6mvLg+5B2Z/QXbR4L0Pzg1nRf8zkXrz5JF316MLm2igMIpi2" crossorigin="anonymous" />
+    <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/js/diff2html-ui.min.js" integrity="sha384-99bAn+VpNpavq3FarkwuSuDPDHMeakTiNqxxz3ezwdGUr414srIXY3YmXjaAkYne" crossorigin="anonymous"></script>
 
     <!-- Vis.js for network graphs -->
-    <script src="https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js"></script>
-    <link href="https://unpkg.com/vis-network@9.1.9/styles/vis-network.min.css" rel="stylesheet" type="text/css" />
+    <script src="https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js" integrity="sha384-6ox9IspbVlrc5vabD45kZcCJ8HeSwMAQjf9Iq48U/+srTVTNzsB7EqDC5oYpA0WC" crossorigin="anonymous"></script>
+    <link href="https://unpkg.com/vis-network@9.1.9/styles/vis-network.min.css" rel="stylesheet" type="text/css" integrity="sha384-dyJxWiQJAf9QvdWzvgaFgxG2+qGBlxRcGINxMWNJBYZ7731QjuquKfhX2OUkb22J" crossorigin="anonymous" />
 
     <style>
       [x-cloak] { display: none !important; }
