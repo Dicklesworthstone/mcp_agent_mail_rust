@@ -8,9 +8,14 @@
 //! The parent asserts every committed id is distinct and that each id's row is
 //! the message its worker wrote: the duplicate-canonical-id failure that
 //! motivated the bead.
+//!
+//! A second test SIGKILLs a writer process in the middle of its election loop,
+//! several times, and proves the election stays retryable: every acknowledged
+//! id survives, no killed election advanced the durable allocator past the
+//! committed rows, and the next writer elects exactly the following id.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -231,5 +236,217 @@ fn run_parent() {
                 row.subject
             );
         }
+    });
+}
+
+const CRASH_TEST_NAME: &str = "a_writer_killed_mid_election_leaves_the_election_retryable";
+/// Committed messages the parent waits for before each SIGKILL; varied so the
+/// kill lands at different points of the writer's loop.
+const CRASH_KILL_AFTER: [usize; 3] = [3, 7, 12];
+
+/// br-sa58k gap 3: a process killed mid-election never burns, reserves or
+/// duplicates an id. The worker elects in a tight loop and reports each id
+/// only after its transaction committed; the parent SIGKILLs it while the
+/// next election is in flight, three times over one database.
+#[test]
+fn a_writer_killed_mid_election_leaves_the_election_retryable() {
+    let Ok(db_path) = std::env::var("MAGENTAROBIN_CRASH_WORKER_DB") else {
+        run_crash_parent();
+        return;
+    };
+    run_crash_worker(&db_path);
+}
+
+fn run_crash_worker(db_path: &str) {
+    let cycle = std::env::var("MAGENTAROBIN_CRASH_WORKER_CYCLE").expect("worker cycle");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build worker runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("runtime installs worker context");
+        let pool = create_pool(&pool_config(db_path)).expect("worker pool");
+        let project = queries::ensure_project(&cx, &pool, PROJECT_KEY)
+            .await
+            .into_result()
+            .expect("ensure project");
+        let project_id = project.id.expect("project id");
+        let sender = queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "BlueLake",
+            "codex-cli",
+            "test",
+            None,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("register worker agent");
+        let sender_id = sender.id.expect("sender id");
+        // Elect until killed. A line is printed only after its commit.
+        for index in 0_u64.. {
+            let subject = format!("crash cycle {cycle} #{index}");
+            match queries::create_message(
+                &cx, &pool, project_id, sender_id, &subject, "body", None, "normal", false, "{}",
+            )
+            .await
+            .into_result()
+            {
+                Ok(message) => {
+                    let id = message.id.expect("elected message id");
+                    let mut stdout = std::io::stdout().lock();
+                    writeln!(stdout, "committed {id} {subject}").expect("report commit");
+                    stdout.flush().expect("flush commit report");
+                }
+                Err(OutcomeError::Err(error)) if error.is_retryable() => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("crash worker cycle {cycle} message {index}: {error:?}"),
+            }
+        }
+    });
+}
+
+fn run_crash_parent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("crash-election.sqlite3");
+    let mut acknowledged: Vec<(i64, String)> = Vec::new();
+    for (cycle, kill_after) in CRASH_KILL_AFTER.into_iter().enumerate() {
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                &mcp_agent_mail_test_helpers::libtest_path!(CRASH_TEST_NAME),
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(
+                "MAGENTAROBIN_CRASH_WORKER_DB",
+                db_path.display().to_string(),
+            )
+            .env("MAGENTAROBIN_CRASH_WORKER_CYCLE", cycle.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn crash worker");
+        let stdout = child.stdout.take().expect("worker stdout");
+        let mut seen = 0;
+        let mut killed = false;
+        // After the kill the pipe still yields every line written before it.
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let Some(report) = line.strip_prefix("committed ") else {
+                continue;
+            };
+            let (id, subject) = report.split_once(' ').expect("id and subject");
+            acknowledged.push((id.parse().expect("committed id"), subject.to_string()));
+            seen += 1;
+            if seen == kill_after && !killed {
+                child.kill().expect("SIGKILL the writer mid-election");
+                killed = true;
+            }
+        }
+        let status = child.wait().expect("reap crash worker");
+        assert!(
+            killed && !status.success(),
+            "cycle {cycle}: worker must be killed after {kill_after} commits, exited {status}"
+        );
+    }
+
+    verify_after_crashes(&db_path, &acknowledged);
+}
+
+/// Recover the database the killed writers left and prove the election state.
+fn verify_after_crashes(db_path: &Path, acknowledged: &[(i64, String)]) {
+    let distinct: HashSet<i64> = acknowledged.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        distinct.len(),
+        acknowledged.len(),
+        "duplicate ids: {acknowledged:?}"
+    );
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build parent runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("runtime installs parent context");
+        let pool = create_pool(&pool_config(&db_path.display().to_string())).expect("parent pool");
+        for (id, subject) in acknowledged {
+            let row = queries::get_message(&cx, &pool, *id)
+                .await
+                .into_result()
+                .unwrap_or_else(|error| panic!("acknowledged message {id} lost: {error:?}"));
+            assert_eq!(&row.subject, subject, "id {id} holds another message");
+        }
+
+        let (max_id, durable_seq) = {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            let rows = conn
+                .query_sync(
+                    "SELECT COALESCE(MAX(id), 0), \
+                     (SELECT seq FROM sqlite_sequence WHERE name = 'messages') FROM messages",
+                    &[],
+                )
+                .expect("allocator state");
+            let row = rows.first().expect("allocator row");
+            (
+                row.get_as::<i64>(0).expect("max id"),
+                row.get_as::<i64>(1).expect("durable sequence"),
+            )
+        };
+        assert!(
+            max_id >= distinct.iter().copied().max().expect("acknowledged ids"),
+            "committed rows end below an acknowledged id"
+        );
+        assert_eq!(
+            durable_seq, max_id,
+            "a killed election must roll back with its transaction, never advance the allocator"
+        );
+
+        let project = queries::ensure_project(&cx, &pool, PROJECT_KEY)
+            .await
+            .into_result()
+            .expect("ensure project");
+        let sender = queries::register_agent(
+            &cx,
+            &pool,
+            project.id.expect("project id"),
+            "BlueLake",
+            "codex-cli",
+            "test",
+            None,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("re-register agent");
+        let next = queries::create_message(
+            &cx,
+            &pool,
+            project.id.expect("project id"),
+            sender.id.expect("sender id"),
+            "after the crashes",
+            "body",
+            None,
+            "normal",
+            false,
+            "{}",
+        )
+        .await
+        .into_result()
+        .expect("election stays retryable after SIGKILL");
+        assert_eq!(
+            next.id,
+            Some(max_id + 1),
+            "the next election follows the last commit"
+        );
+
+        let integrity = pool.run_full_integrity_check().expect("integrity check");
+        assert!(
+            integrity.ok,
+            "integrity after SIGKILLs: {:?}",
+            integrity.details
+        );
     });
 }
