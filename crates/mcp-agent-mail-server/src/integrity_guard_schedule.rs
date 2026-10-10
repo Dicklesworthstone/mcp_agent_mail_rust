@@ -6,6 +6,15 @@
 //! This limits retry amplification; it is not a disk quota, a cross-process
 //! lock, or a repair for an export/validation failure.
 //!
+//! Verified restore points have their own refresh deadline (br-kp1in.36).
+//! Ordinary proactive publication does not refresh verification metadata, so
+//! it must not keep postponing the verified route until a daily live check.
+//! The first proactive attempt is unchanged. Once it completes successfully
+//! or skips an already-recent backup, request verified publication within an
+//! hour, and renew that deadline only on actual verified publication. These
+//! are scheduling requests, never substitutes for the producer's integrity
+//! checks, the worker's full-verification gate, or filesystem admission.
+//!
 //! A full-check failure is separately sticky: time passing or a weaker quick
 //! check cannot authorize backups, reconciliation, or database maintenance.
 
@@ -13,6 +22,7 @@ use std::time::{Duration, Instant};
 
 pub(super) const BACKUP_RETRY_INITIAL: Duration = Duration::from_secs(15 * 60);
 pub(super) const BACKUP_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+const VERIFIED_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const FULL_RETRY_INITIAL: Duration = Duration::from_secs(5 * 60);
 const FULL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
@@ -106,6 +116,10 @@ pub(super) enum BackupCompletion {
 pub(super) struct AutomaticBackupSchedule {
     retry: RetryWindow,
     verification_pending: bool,
+    // Completion of the first non-failed proactive attempt, then completion
+    // of the most recent verified publication. Never advanced by subsequent
+    // proactive work: that work cannot renew verification metadata.
+    verified_refresh_anchor: Option<Instant>,
 }
 
 impl AutomaticBackupSchedule {
@@ -119,7 +133,10 @@ impl AutomaticBackupSchedule {
         if !self.retry.remaining(now).is_zero() {
             return None;
         }
-        Some(if self.verification_pending {
+        let refresh_due = self.verified_refresh_anchor.is_some_and(|anchor| {
+            now.saturating_duration_since(anchor) >= VERIFIED_REFRESH_INTERVAL
+        });
+        Some(if self.verification_pending || refresh_due {
             BackupKind::Verified
         } else {
             BackupKind::Proactive
@@ -137,17 +154,31 @@ impl AutomaticBackupSchedule {
     }
 
     pub(super) fn complete(&mut self, kind: BackupKind, outcome: BackupCompletion, now: Instant) {
+        // A verified attempt selected by the refresh deadline carries the
+        // same persistent-in-this-worker obligation as an explicit request.
+        // A skip or failure cannot silently demote it to proactive work.
+        if kind == BackupKind::Verified {
+            self.verification_pending = true;
+        }
         match outcome {
             BackupCompletion::Published => {
                 self.retry.clear();
                 if kind == BackupKind::Verified {
                     self.verification_pending = false;
+                    self.verified_refresh_anchor = Some(now);
+                } else {
+                    self.verified_refresh_anchor.get_or_insert(now);
                 }
             }
             BackupCompletion::Failed => {
                 self.retry.fail(now, BACKUP_RETRY_INITIAL, BACKUP_RETRY_MAX);
             }
             BackupCompletion::Skipped => {
+                if kind == BackupKind::Proactive {
+                    // An age-gated skip cannot make verification wait
+                    // forever on a worker that never publishes proactively.
+                    self.verified_refresh_anchor.get_or_insert(now);
+                }
                 if kind == BackupKind::Verified || self.retry.failures > 0 {
                     // A verified snapshot may be skipped because its fresh
                     // live check failed. Keep that request pending, but do not
@@ -171,6 +202,151 @@ mod tests {
             Some(BackupKind::Proactive)
         );
         assert_eq!(schedule.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn verified_refresh_has_an_independent_deadline_after_publication_or_skip() {
+        let now = Instant::now();
+        for completion in [BackupCompletion::Published, BackupCompletion::Skipped] {
+            let mut schedule = AutomaticBackupSchedule::default();
+            schedule.complete(BackupKind::Proactive, completion, now);
+            assert_eq!(
+                schedule.next_attempt(
+                    now + VERIFIED_REFRESH_INTERVAL.saturating_sub(Duration::from_nanos(1))
+                ),
+                Some(BackupKind::Proactive),
+                "{completion:?}"
+            );
+            assert_eq!(
+                schedule.next_attempt(now + VERIFIED_REFRESH_INTERVAL),
+                Some(BackupKind::Verified),
+                "no scheduled live full check is needed to request a verified restore point"
+            );
+            assert!(!schedule.verification_pending, "deadline selected the route");
+        }
+    }
+
+    #[test]
+    fn repeated_proactive_work_cannot_slide_the_verified_refresh_deadline() {
+        let start = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        for minute in (0_u64..60).step_by(5) {
+            let now = start + Duration::from_secs(minute * 60);
+            assert_eq!(schedule.next_attempt(now), Some(BackupKind::Proactive));
+            let completion = if minute % 10 == 0 {
+                BackupCompletion::Published
+            } else {
+                BackupCompletion::Skipped
+            };
+            schedule.complete(BackupKind::Proactive, completion, now);
+        }
+        assert_eq!(
+            schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL),
+            Some(BackupKind::Verified)
+        );
+        assert_eq!(schedule.verified_refresh_anchor, Some(start));
+    }
+
+    #[test]
+    fn verified_refresh_deadline_cannot_bypass_failed_export_backoff() {
+        let start = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
+        let failed_at = start + VERIFIED_REFRESH_INTERVAL - Duration::from_secs(1);
+        schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, failed_at);
+        assert_eq!(schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL), None);
+        assert_eq!(
+            schedule.next_attempt(
+                failed_at + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)
+            ),
+            None
+        );
+        assert_eq!(
+            schedule.next_attempt(failed_at + BACKUP_RETRY_INITIAL),
+            Some(BackupKind::Verified)
+        );
+        assert_eq!(schedule.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn deadline_selected_verified_failure_or_skip_remains_pending() {
+        let start = Instant::now();
+        for completion in [BackupCompletion::Failed, BackupCompletion::Skipped] {
+            let mut schedule = AutomaticBackupSchedule::default();
+            schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
+            let due = start + VERIFIED_REFRESH_INTERVAL;
+            assert_eq!(schedule.next_attempt(due), Some(BackupKind::Verified));
+            schedule.complete(BackupKind::Verified, completion, due);
+            assert!(schedule.verification_pending, "{completion:?}");
+            assert_eq!(schedule.verified_refresh_anchor, Some(start));
+            assert_eq!(schedule.next_attempt(due), None);
+            assert_eq!(
+                schedule.next_attempt(due + BACKUP_RETRY_INITIAL),
+                Some(BackupKind::Verified)
+            );
+        }
+    }
+
+    #[test]
+    fn only_verified_publication_renews_the_refresh_deadline() {
+        let start = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
+        let published_at = start + VERIFIED_REFRESH_INTERVAL + Duration::from_secs(120);
+        schedule.complete(
+            BackupKind::Verified,
+            BackupCompletion::Published,
+            published_at,
+        );
+        assert_eq!(schedule.verified_refresh_anchor, Some(published_at));
+        assert_eq!(schedule.next_attempt(published_at), Some(BackupKind::Proactive));
+        let before_due = published_at + VERIFIED_REFRESH_INTERVAL - Duration::from_nanos(1);
+        schedule.complete(BackupKind::Proactive, BackupCompletion::Skipped, before_due);
+        assert_eq!(schedule.next_attempt(before_due), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(published_at + VERIFIED_REFRESH_INTERVAL),
+            Some(BackupKind::Verified)
+        );
+        schedule.request_verified();
+        assert_eq!(
+            schedule.next_attempt(published_at),
+            Some(BackupKind::Verified),
+            "an explicit full-check request may refresh earlier"
+        );
+    }
+
+    #[test]
+    fn day_of_successful_proactive_cycles_still_refreshes_verified_restore_points() {
+        let start = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        let mut verified_minutes = Vec::new();
+        for minute in (0_u64..=24 * 60).step_by(5) {
+            let now = start + Duration::from_secs(minute * 60);
+            let kind = schedule.next_attempt(now).expect("healthy schedule");
+            if kind == BackupKind::Verified {
+                verified_minutes.push(minute);
+            }
+            // No request_verified calls: verification must not depend on the
+            // live full-check interval or on how often proactive copies run.
+            schedule.complete(kind, BackupCompletion::Published, now);
+        }
+        assert_eq!(verified_minutes, (1_u64..=24).map(|hour| hour * 60).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reversed_refresh_clock_does_not_manufacture_a_due_verification() {
+        let start = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        schedule.complete(
+            BackupKind::Verified,
+            BackupCompletion::Published,
+            start + VERIFIED_REFRESH_INTERVAL,
+        );
+        assert_eq!(schedule.next_attempt(start), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL * 2),
+            Some(BackupKind::Verified)
+        );
     }
 
     #[test]
