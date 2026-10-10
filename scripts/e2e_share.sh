@@ -475,10 +475,25 @@ def strip_volatile(obj):
 
 m1 = strip_volatile(json.load(open(sys.argv[1], "r")))
 m2 = strip_volatile(json.load(open(sys.argv[2], "r")))
+# viewer/data/meta.json records when the export ran (generated_at), so its
+# file hash differs per export; its content is compared on its own below.
+for m in (m1, m2):
+    (m.get("files") or {}).pop("viewer/data/meta.json", None)
 print("match" if m1 == m2 else "mismatch")
 PY
 )"
 e2e_assert_eq "manifest structures match (ignoring timestamps)" "match" "${MANIFEST_MATCH}"
+
+META_MATCH="$(python3 - <<'PY' "${BUNDLE1}/viewer/data/meta.json" "${BUNDLE2}/viewer/data/meta.json"
+import json, sys
+
+metas = [json.load(open(path, "r")) for path in sys.argv[1:3]]
+for meta in metas:
+    meta.pop("generated_at", None)
+print("match" if metas[0] == metas[1] else "mismatch")
+PY
+)"
+e2e_assert_eq "viewer meta.json matches apart from generated_at" "match" "${META_MATCH}"
 
 MANIFEST_DIFF="$(python3 - <<'PY' "${BUNDLE1}/manifest.json" "${BUNDLE2}/manifest.json"
 import difflib
