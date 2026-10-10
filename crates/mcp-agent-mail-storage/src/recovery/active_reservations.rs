@@ -699,12 +699,16 @@ mod tests {
     #[test]
     fn released_expired_and_in_flight_grants_are_not_recreated() {
         for change in [
-            "UPDATE file_reservations SET released_ts=5000000 WHERE id=401".to_string(),
-            "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)".to_string(),
-            "UPDATE file_reservations SET expires_ts=9000000 WHERE id=401".to_string(),
-            format!("UPDATE file_reservations SET created_ts={} WHERE id=401", mcp_agent_mail_db::now_micros()),
+            "UPDATE file_reservations SET released_ts=5000000 WHERE id=401",
+            "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)",
+            "UPDATE file_reservations SET expires_ts=9000000 WHERE id=401",
+            "UPDATE file_reservations SET created_ts={now} WHERE id=401",
         ] {
             fixture(|cx, pool, config| {
+                // The in-flight grant is stamped as the fixture runs: stamped
+                // before the earlier fixtures, a slow host aged it past
+                // GRANT_GRACE_US and the pass repaired it.
+                let change = change.replace("{now}", &mcp_agent_mail_db::now_micros().to_string());
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();
                 conn.execute_raw(&change).unwrap();
                 drop(conn);
