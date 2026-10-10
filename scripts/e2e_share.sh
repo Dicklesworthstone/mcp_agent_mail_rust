@@ -286,6 +286,32 @@ print(json.dumps({
     fi
 done
 
+# Bodies for the browser render case (Case 17): Markdown the viewer must
+# render, and hostile HTML whose payloads set a DOM marker if they ever run.
+for kind in markdown hostile; do
+    rpc_call "send_msg_${kind}" "send_message" "$(python3 -c "
+import json,sys
+bodies = {
+    'markdown': '## Plan\n\n- **bold item**\n- \`inline code\`\n\n[docs](https://example.invalid/docs)',
+    'hostile': 'before <img src=x onerror=\"document.documentElement.dataset.pwned=1\"> '
+               '<script>document.documentElement.dataset.pwned=2</script> '
+               '<svg><animate onbegin=\"document.documentElement.dataset.pwned=3\" attributeName=x dur=1s></svg> '
+               '[link](javascript:document.documentElement.dataset.pwned=4) after',
+}
+print(json.dumps({
+    'project_key': sys.argv[1],
+    'sender_name': 'RedFox',
+    'to': ['BlueBear'],
+    'subject': 'Viewer ' + sys.argv[2],
+    'body_md': bodies[sys.argv[2]],
+    'thread_id': 'share-viewer-thread'
+}))
+" "${PROJECT_DIR}" "${kind}")"
+    if rpc_has_error "${E2E_ARTIFACT_DIR}/send_msg_${kind}_body.json"; then
+        e2e_fatal "send_message ${kind} failed"
+    fi
+done
+
 # Reply
 rpc_call "reply_msg" "reply_message" "$(python3 -c "
 import json,sys
@@ -307,7 +333,7 @@ print(json.dumps({
 }))
 " "${PROJECT_DIR}")"
 
-e2e_pass "seeded mailbox (3 messages + 1 reply + 1 ack)"
+e2e_pass "seeded mailbox (5 messages + 1 reply + 1 ack)"
 
 # Stop server (we only need the seeded DB from here)
 e2e_stop_server || true
@@ -854,9 +880,7 @@ if e2e_wait_port 127.0.0.1 "${CF_PORT}" 5; then
         http_get_capture "case_16_cf_asset_${CF_ASSET_IDX}" "http://127.0.0.1:${CF_PORT}/${rel}"
         local_status="${HTTP_LAST_STATUS}"
         printf "%s %s\n" "${local_status}" "${rel}" >>"${CF_ASSET_PROBE}"
-        if [ "${rel##*/}" = "viewer.js" ] && [ "${local_status}" != "200" ]; then
-            e2e_pass "CF optional asset absent: ${rel} (status=${local_status})"
-        elif [ "${local_status}" = "200" ]; then
+        if [ "${local_status}" = "200" ]; then
             e2e_pass "CF asset reachable: ${rel}"
         else
             e2e_fail "CF asset missing: ${rel} (status=${local_status})"
@@ -896,9 +920,7 @@ if e2e_wait_port 127.0.0.1 "${GH_PORT}" 5; then
         http_get_capture "case_16_gh_asset_${GH_ASSET_IDX}" "http://127.0.0.1:${GH_PORT}/repo/${rel}"
         local_status="${HTTP_LAST_STATUS}"
         printf "%s %s\n" "${local_status}" "${rel}" >>"${GH_ASSET_PROBE}"
-        if [ "${rel}" = "viewer/viewer.js" ] && [ "${local_status}" != "200" ]; then
-            e2e_pass "GH optional asset absent: /repo/${rel} (status=${local_status})"
-        elif [ "${local_status}" = "200" ]; then
+        if [ "${local_status}" = "200" ]; then
             e2e_pass "GH asset reachable: /repo/${rel}"
         else
             e2e_fail "GH asset missing: /repo/${rel} (status=${local_status})"
@@ -918,6 +940,87 @@ GitHub-Pages-like smoke (repo subpath):
 python3 -m http.server ${GH_PORT} --bind 127.0.0.1 --directory ${GH_ROOT}
 EOF
 )"
+
+# ---------------------------------------------------------------------------
+# Case 17: the exported viewer renders mail in a real browser (br-kp1in.42)
+# ---------------------------------------------------------------------------
+
+e2e_case_banner "viewer renders mail in headless Chromium and sanitizes hostile bodies"
+
+CHROMIUM_BIN=""
+for candidate in chromium-browser chromium google-chrome; do
+    if command -v "${candidate}" >/dev/null 2>&1; then
+        CHROMIUM_BIN="$(command -v "${candidate}")"
+        break
+    fi
+done
+NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)"
+if [ -z "${CHROMIUM_BIN}" ] || [ "${NODE_MAJOR}" -lt 22 ]; then
+    e2e_skip "viewer browser render needs Chromium and Node >= 22 (chromium='${CHROMIUM_BIN}' node=${NODE_MAJOR})"
+else
+    # Snap-packaged Chromium can only write a profile inside its own snap dir.
+    if [ -d "${HOME}/snap/chromium" ]; then
+        VIEWER_PROFILE="${HOME}/snap/chromium/common/am-e2e-share-viewer-profile"
+        mkdir -p "${VIEWER_PROFILE}"
+    else
+        VIEWER_PROFILE="$(e2e_mktemp "e2e_share_viewer_profile")"
+    fi
+    VIEWER_PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
+    python3 -m http.server "${VIEWER_PORT}" --bind 127.0.0.1 --directory "${BUNDLE1}" \
+        >"${E2E_ARTIFACT_DIR}/case_17_server.log" 2>&1 &
+    VIEWER_PID=$!
+    if e2e_wait_port 127.0.0.1 "${VIEWER_PORT}" 5; then
+        VIEWER_REPORT="${E2E_ARTIFACT_DIR}/case_17_viewer_report.json"
+        timeout 240 node "${SCRIPT_DIR}/../tests/e2e/lib/share_viewer_cdp.mjs" \
+            "http://127.0.0.1:${VIEWER_PORT}/viewer/" "${VIEWER_PROFILE}" "${CHROMIUM_BIN}" \
+            >"${VIEWER_REPORT}" 2>"${E2E_ARTIFACT_DIR}/case_17_driver_stderr.txt" </dev/null || true
+        # One "PASS <label>" or "FAIL <label>" line per check.
+        while IFS= read -r line; do
+            case "${line}" in
+                "PASS "*) e2e_pass "${line#PASS }" ;;
+                *) e2e_fail "${line#FAIL }" ;;
+            esac
+        done < <(python3 - "${VIEWER_REPORT}" <<'PY'
+import json
+import sys
+
+try:
+    report = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as exc:  # an empty or truncated report is a failure
+    print(f"FAIL viewer report unreadable: {exc}")
+    sys.exit(0)
+
+
+def check(ok, label):
+    print(("PASS " if ok else "FAIL ") + label)
+
+
+state = report.get("state") or {}
+rendered = {m.get("subject"): m.get("body_html", "") for m in report.get("rendered") or []}
+markdown = rendered.get("Viewer markdown", "")
+hostile = rendered.get("Viewer hostile", "")
+check(not report.get("error"), f"browser driver ran (error={report.get('error')})")
+check(state.get("loading") is False and state.get("messages", 0) >= 6,
+      f"viewer controller loaded the snapshot ({state})")
+check(report.get("alpine_errors") == 0,
+      f"zero Alpine expression errors ({report.get('alpine_errors')})")
+check(not report.get("dialogs"), f"no failure dialogs ({report.get('dialogs')})")
+check("<strong>bold item</strong>" in markdown and "<code>inline code</code>" in markdown,
+      "Markdown body renders as HTML")
+check("before" in hostile and "after" in hostile, "hostile body still shows its text")
+check(not any(token in hostile.lower() for token in ("onerror", "onbegin", "<script", "javascript:")),
+      "hostile body keeps no handler, script or javascript: URL")
+check(report.get("pwned") == [], f"no hostile payload executed ({report.get('pwned')})")
+check(report.get("live_handlers") == [],
+      f"no live handler in any rendered body ({report.get('live_handlers')})")
+PY
+)
+    else
+        e2e_fail "viewer smoke server failed to start"
+    fi
+    kill "${VIEWER_PID}" 2>/dev/null || true
+    wait "${VIEWER_PID}" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # Finalize: save hashes and summary

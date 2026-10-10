@@ -3208,6 +3208,65 @@ mod tests {
     }
 
     #[test]
+    fn embedded_viewer_scripts_load_with_the_sri_of_their_shipped_bytes() {
+        // br-kp1in.42: the page's Alpine root is `window.viewerController()`,
+        // which only viewer.js defines; a missing or stale script tag leaves
+        // the exported viewer dead. Every local script must carry the SRI of
+        // the bytes the bundle ships, or the browser refuses to run it.
+        use base64::Engine;
+
+        let index = std::str::from_utf8(
+            BUILTIN_VIEWER_ASSETS
+                .get_file("index.html")
+                .expect("embedded index.html")
+                .contents(),
+        )
+        .expect("index.html is UTF-8");
+        let attr = |tag: &str, name: &str| -> Option<String> {
+            let start = tag.find(&format!("{name}=\""))? + name.len() + 2;
+            Some(tag[start..].split('"').next()?.to_string())
+        };
+        let mut checked = Vec::new();
+        for chunk in index.split("<script").skip(1) {
+            let tag = chunk.split('>').next().unwrap_or_default();
+            let Some(src) = attr(tag, "src").and_then(|src| src.strip_prefix("./").map(String::from))
+            else {
+                continue;
+            };
+            if tag.contains("type=\"module\"") {
+                continue; // preview-reload.js only runs under `am share preview`
+            }
+            let bytes = BUILTIN_VIEWER_ASSETS
+                .get_file(&src)
+                .unwrap_or_else(|| panic!("index.html loads {src}, which the viewer does not ship"))
+                .contents();
+            let expected = format!(
+                "sha256-{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
+            );
+            assert_eq!(
+                attr(tag, "integrity").as_deref(),
+                Some(expected.as_str()),
+                "{src} must load with the SRI of its shipped bytes"
+            );
+            checked.push(src);
+        }
+        assert!(
+            checked.iter().any(|src| src == "viewer.js"),
+            "index.html must load the viewer controller: {checked:?}"
+        );
+        assert!(checked.iter().any(|src| src == "vendor/dompurify.min.js"));
+        let controller = std::str::from_utf8(
+            BUILTIN_VIEWER_ASSETS
+                .get_file("viewer.js")
+                .expect("embedded viewer.js")
+                .contents(),
+        )
+        .expect("viewer.js is UTF-8");
+        assert!(controller.contains("window.viewerController = viewerController"));
+    }
+
+    #[test]
     fn compute_viewer_sri_generates_hashes() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("bundle");

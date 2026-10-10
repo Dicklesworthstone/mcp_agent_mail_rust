@@ -48,11 +48,13 @@
     }
   },
   "dompurify": {
-    "version": "3.0.8",
-    "source": "https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js",
+    "version": "3.4.16",
+    "source": "https://registry.npmjs.org/dompurify/-/dompurify-3.4.16.tgz (package/dist/purify.min.js)",
+    "tarball_integrity": "sha512-sqo+pNp3qRhCIpbgRi1y8Tgk27Bo2Ry7w0dC1NBeNTdZChWjz9Xb/KOoZbRP/R6pQZ80Qw8YhXw13hWWBbMRnQ==",
+    "license": "MPL-2.0 OR Apache-2.0",
     "files": {
       "dompurify.min.js": {
-        "sha256": "d2469862adea8ad924559a4fffab8a4c9c1f4e9a8534ce8e1c36ec698cf0f54c"
+        "sha256": "2c90a9b46d6463f26038a29b686e82bc91de01fdac9d5229e7cfe3b360134ea2"
       }
     }
   },
