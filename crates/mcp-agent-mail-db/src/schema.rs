@@ -5181,8 +5181,28 @@ mod tests {
             drop(conn);
             let reopened =
                 DbConn::open_file(path.display().to_string()).expect("reopen runtime database");
-            let page = crate::sync::inbox_delivery_events_from_conn(&reopened, 1, 2, Some(700), 10)
-                .expect("persisted cursor works after reopen");
+            let after_cursor = if prune_all {
+                let expired =
+                    crate::sync::inbox_delivery_events_from_conn(&reopened, 1, 2, Some(700), 10)
+                        .expect_err("cursor before pruned cascade deletion is expired");
+                match expired {
+                    crate::sync::InboxDeliveryEventError::CursorExpired {
+                        after: 700,
+                        oldest_available,
+                    } => oldest_available.saturating_sub(1),
+                    other => panic!("expected CursorExpired, got {other:?}"),
+                }
+            } else {
+                700
+            };
+            let page = crate::sync::inbox_delivery_events_from_conn(
+                &reopened,
+                1,
+                2,
+                Some(after_cursor),
+                10,
+            )
+            .expect("persisted cursor works after reopen");
             assert_eq!(page.events.len(), 1);
             assert_eq!(page.events[0].message_id, 3);
             assert!(page.events[0].seq > 700);
