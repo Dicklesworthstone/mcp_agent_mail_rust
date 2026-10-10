@@ -196,18 +196,22 @@ impl ActorAuthorizationSnapshot {
 /// Refuse acting as `agent` when this session holds another identity there.
 ///
 /// "There" is the agent's project. `token_verified` is true when the call
-/// presented the agent's own registration token, which always authorizes
-/// acting as it.
+/// presented the agent's own registration token, which authorizes acting as
+/// it only while the request is live.
 pub fn authorize_actor(
     ctx: &McpContext,
     agent: &mcp_agent_mail_db::AgentRow,
     token_verified: bool,
     action: &str,
 ) -> McpResult<()> {
+    ctx.ensure_live()?;
     if token_verified {
         return Ok(());
     }
-    authorize_actor_from_bindings(&session_bindings(ctx), agent, action)
+    // Use the same fail-closed snapshot boundary as deferred mutations.
+    // get_state may return None after cancellation; that is not evidence of
+    // an unbound, trusted-local session, even when this feature is disabled.
+    ActorAuthorizationSnapshot::capture(ctx)?.authorize(ctx, agent, action)
 }
 
 fn authorize_actor_from_bindings(
@@ -359,6 +363,56 @@ mod tests {
             1,
             fastmcp_core::SessionState::new(),
         )
+    }
+
+    #[test]
+    fn cancelled_actor_checks_never_downgrade_to_trusted_local() {
+        for feature_enabled in [false, true] {
+            with_feature(feature_enabled, || {
+                let ctx = session_ctx();
+                bind(&ctx, 10, 1, "BlueLake");
+                ctx.request_cancellation().cancel();
+
+                for target in [
+                    agent(1, 10, "BlueLake"),
+                    agent(2, 10, "RedStone"),
+                    agent(3, 20, "GreenCastle"),
+                ] {
+                    for token_verified in [false, true] {
+                        assert!(
+                            authorize_actor(&ctx, &target, token_verified, "acknowledge mail")
+                                .is_err(),
+                            "cancelled request authorized agent {} (identity={feature_enabled}, token={token_verified})",
+                            target.name
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn cancelling_one_request_preserves_other_requests_session_authority() {
+        with_feature(true, || {
+            let state = fastmcp_core::SessionState::new();
+            let cancelled =
+                McpContext::with_state(asupersync::Cx::for_testing(), 1, state.clone());
+            let live = McpContext::with_state(asupersync::Cx::for_testing(), 2, state);
+            let own = agent(1, 10, "BlueLake");
+            let other = agent(2, 10, "RedStone");
+            bind(&cancelled, 10, 1, &own.name);
+            cancelled.request_cancellation().cancel();
+
+            assert!(authorize_actor(&cancelled, &own, false, "send messages").is_err());
+            assert!(authorize_actor(&live, &own, false, "send messages").is_ok());
+            let error = authorize_actor(&live, &other, false, "send messages")
+                .expect_err("the live request must retain its project's restriction");
+            assert_eq!(
+                crate::tool_error_code(&error),
+                Some("SESSION_IDENTITY_MISMATCH")
+            );
+            assert!(authorize_actor(&live, &other, true, "send messages").is_ok());
+        });
     }
 
     #[test]
