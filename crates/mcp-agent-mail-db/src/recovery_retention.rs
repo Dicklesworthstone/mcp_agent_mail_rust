@@ -637,35 +637,158 @@ pub fn inspect_storage_backups(database_path: &Path) -> std::io::Result<BackupIn
     Ok(inventory)
 }
 
+const PROACTIVE_STAGING_PREFIX: &[u8] = b".mcp-agent-mail-proactive-backup-";
+const MAX_STAGING_INVENTORY_ENTRIES: usize = 16_384;
+
+/// Read-only footprint of proactive-backup stages beside the database.
+///
+/// Stage names do not identify a mailbox. This intentionally covers the whole
+/// database parent, just like automatic backup admission. It includes active
+/// and failed stages; neither a name nor this inventory authorizes reclamation.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProactiveBackupStagingInventory {
+    pub directories: usize,
+    /// Logical regular-file lengths, not allocated blocks. Sparse files count
+    /// fully, matching the admission budget; no `SQLite` file is opened.
+    pub bytes: u64,
+}
+
+/// Inspect all staging-shaped directories beside the configured database.
+///
+/// Unlike admission's count-only early refusal, health needs the whole bounded
+/// footprint even when there are already more than three stages. Read failures,
+/// symlinks, special files, byte overflow, and an exhausted entry budget return
+/// unavailable evidence, never a successful empty or truncated inventory.
+/// Missing parents remain empty during first-run bootstrap. This is a live
+/// metadata observation, not a transactional snapshot or a hostile-user sandbox.
+pub fn inspect_proactive_backup_staging(
+    database_path: &Path,
+) -> std::io::Result<ProactiveBackupStagingInventory> {
+    inspect_proactive_backup_staging_with_limit(database_path, MAX_STAGING_INVENTORY_ENTRIES)
+}
+
+fn staging_inventory_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn inspect_proactive_backup_staging_with_limit(
+    database_path: &Path,
+    max_entries: usize,
+) -> std::io::Result<ProactiveBackupStagingInventory> {
+    if database_path.file_name().is_none() {
+        return Ok(ProactiveBackupStagingInventory::default());
+    }
+    // Freeze relative paths once; do not change the process working directory.
+    let primary = if database_path.is_absolute() {
+        database_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(database_path)
+    };
+    let parent = primary
+        .parent()
+        .ok_or_else(|| staging_inventory_error("staging inventory database has no parent"))?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(staging_inventory_error(
+                "staging inventory database parent is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProactiveBackupStagingInventory::default());
+        }
+        Err(error) => return Err(error),
+    }
+    let mut remaining = max_entries;
+    let mut visit = || -> std::io::Result<()> {
+        remaining = remaining.checked_sub(1).ok_or_else(|| {
+            staging_inventory_error("proactive backup staging inventory entry limit exceeded")
+        })?;
+        Ok(())
+    };
+    let mut inventory = ProactiveBackupStagingInventory::default();
+    let mut pending = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        visit()?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(PROACTIVE_STAGING_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+            return Err(staging_inventory_error(format!(
+                "staging-shaped entry {} is not a real directory",
+                path.display()
+            )));
+        }
+        inventory.directories += 1; // Bounded by the entry budget.
+        pending.push(path);
+    }
+    while let Some(directory) = pending.pop() {
+        // Recheck before descent, as the admission inventory does. Never
+        // intentionally follow a substituted symlink into an unrelated tree.
+        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
+            return Err(staging_inventory_error(
+                "proactive backup staging directory changed type during inventory",
+            ));
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            visit()?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            } else if metadata.file_type().is_file() {
+                inventory.bytes = inventory.bytes.checked_add(metadata.len()).ok_or_else(|| {
+                    staging_inventory_error("proactive backup staging byte count overflow")
+                })?;
+            } else {
+                return Err(staging_inventory_error(format!(
+                    "proactive backup staging entry {} is a symlink or special file; footprint unavailable",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(inventory)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
-// Combined retention resident footprint (GH#210).
+// Combined retention resident footprint (GH#210, br-kp1in.36).
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Read-only retention footprint for one mailbox.
+/// Read-only retention footprint for one mailbox and its shared staging parent.
 ///
 /// Combines recovery debris + direct backups (de-duplicated —
 /// archive-reconcile files are visible to both inventories) + move-only
-/// reclaim staging. This is the ONE implementation behind both
+/// reclaim staging + proactive-backup stages beside the configured database.
+/// This is the ONE implementation behind both
 /// `am doctor health`'s `retention_resident` line and the MCP `health_check`
-/// `retention` block.
+/// `retention` block. Proactive stages are observation-only, not reclaimable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionResidentStats {
     pub recovery_debris_artifacts: usize,
     pub direct_backup_only_artifacts: usize,
     pub reclaimable_staging_bytes: u64,
-    /// Total resident bytes: recovery debris + de-duplicated direct backups
-    /// + reclaim staging.
+    /// Total resident logical bytes, including parent-wide proactive stages.
     pub resident_bytes: u64,
     pub live_database_bytes: Option<u64>,
     /// Resident bytes per category label: the [`DebrisCategory::as_str`]
-    /// labels, plus `"direct_backup"` (rotation-eligible files not already
-    /// counted as recovery debris) and `"reclaimable_staging"`. Only nonzero
-    /// categories are present.
+    /// labels, plus `"direct_backup"`, `"reclaimable_staging"`, and the
+    /// parent-wide `"proactive_backup_staging"`. Only nonzero categories are
+    /// present. The latter may include another mailbox's stages when several
+    /// databases share one parent, since the stage names are not mailbox-bound.
     pub resident_bytes_by_category: BTreeMap<&'static str, u64>,
     /// Bytes the retention policy would consolidate right now (`0` when the
     /// caller passed no policy). Compared against the operator alert
     /// threshold, this is the "reclaimable attention" signal the integrity
-    /// guard's observe-and-alert sweep warns on.
+    /// guard's observe-and-alert sweep warns on. Proactive stages never enter
+    /// this value: observation is not authority to move an active export.
     pub reclaimable_bytes: u64,
 }
 
@@ -718,6 +841,10 @@ pub fn retention_resident_stats(
     if staging_bytes > 0 {
         resident_bytes_by_category.insert("reclaimable_staging", staging_bytes);
     }
+    let proactive_staging = inspect_proactive_backup_staging(database_path)?;
+    if proactive_staging.bytes > 0 {
+        resident_bytes_by_category.insert("proactive_backup_staging", proactive_staging.bytes);
+    }
 
     let reclaimable_bytes = reclaim_policy.map_or(0, |(policy, now_us)| {
         select_recovery_debris_to_reclaim(recovery_debris.clone(), policy, now_us).reclaimable_bytes
@@ -729,7 +856,8 @@ pub fn retention_resident_stats(
         reclaimable_staging_bytes: staging_bytes,
         resident_bytes: recovery_bytes
             .saturating_add(direct_backup_only_bytes)
-            .saturating_add(staging_bytes),
+            .saturating_add(staging_bytes)
+            .saturating_add(proactive_staging.bytes),
         live_database_bytes: std::fs::metadata(database_path)
             .ok()
             .map(|metadata| metadata.len()),
@@ -2099,5 +2227,234 @@ mod tests {
             b"owned"
         );
         assert_eq!(std::fs::read_dir(destination).unwrap().count(), 1);
+    }
+
+    fn proactive_stage_fixture(parent: &Path, ordinal: usize) -> PathBuf {
+        let stage = parent.join(format!(".mcp-agent-mail-proactive-backup-{ordinal:06}"));
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("snapshot.sqlite3"), [0_u8; 7]).unwrap();
+        std::fs::write(stage.join("live-export.sqlite3"), [0_u8; 11]).unwrap();
+        std::fs::create_dir(stage.join("nested")).unwrap();
+        std::fs::write(stage.join("nested/sidecar"), [0_u8; 13]).unwrap();
+        stage
+    }
+
+    #[test]
+    fn proactive_staging_health_counts_all_external_stages_without_granting_reclaim() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let archive = root.join("archive");
+        let parent = root.join("database");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let primary = parent.join("mail.db");
+        std::fs::write(&primary, [0_u8; 7]).unwrap();
+        std::fs::write(parent.join("mail.db.bak"), [0_u8; 17]).unwrap();
+        std::fs::write(parent.join("mail.db.corrupt1"), [0_u8; 23]).unwrap();
+        let reclaim = archive.join("doctor/reclaimable/earlier");
+        std::fs::create_dir_all(&reclaim).unwrap();
+        std::fs::write(reclaim.join("evidence"), [0_u8; 29]).unwrap();
+        let stages: Vec<_> = (0..6)
+            .map(|id| proactive_stage_fixture(&parent, id))
+            .collect();
+        // This similarly named archive-root tree is not in the DB parent's
+        // admission namespace and must not be mistaken for another stage.
+        proactive_stage_fixture(&archive, 99);
+        let policy = RetentionPolicy {
+            keep_min: 0,
+            max_age_secs: 0,
+            max_total_bytes_per_category: Some(0),
+        };
+        assert_eq!(
+            inspect_proactive_backup_staging(&primary).unwrap(),
+            ProactiveBackupStagingInventory {
+                directories: 6,
+                bytes: 186,
+            }
+        );
+        let before =
+            retention_resident_stats(&archive, &primary, Some((policy, i64::MAX))).unwrap();
+        assert_eq!(before.resident_bytes, 255);
+        assert_eq!(before.reclaimable_bytes, 23);
+        assert_eq!(before.recovery_debris_artifacts, 1);
+        assert_eq!(before.direct_backup_only_artifacts, 1);
+        assert_eq!(before.reclaimable_staging_bytes, 29);
+        assert_eq!(
+            before
+                .resident_bytes_by_category
+                .get("proactive_backup_staging"),
+            Some(&186)
+        );
+        let plan = select_recovery_debris_to_reclaim(
+            enumerate_recovery_debris(&archive, &primary),
+            policy,
+            i64::MAX,
+        );
+        assert_eq!(plan.prune.len(), 1);
+        assert_eq!(plan.prune[0].path, parent.join("mail.db.corrupt1"));
+        // Simulate an explicit operator relocation. The footprint must not
+        // disappear or double-count merely because evidence changed category.
+        std::fs::rename(&stages[0], reclaim.join("relocated-stage")).unwrap();
+        let after =
+            retention_resident_stats(&archive, &primary, Some((policy, i64::MAX))).unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 60);
+        assert_eq!(after.reclaimable_bytes, 23);
+        assert_eq!(
+            after
+                .resident_bytes_by_category
+                .get("proactive_backup_staging"),
+            Some(&155)
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 7]);
+        assert_eq!(
+            std::fs::read(parent.join("mail.db.bak")).unwrap(),
+            [0_u8; 17]
+        );
+        for stage in &stages[1..] {
+            assert_eq!(
+                std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
+                [0_u8; 7]
+            );
+        }
+    }
+
+    #[test]
+    fn proactive_staging_inventory_is_parent_wide_and_reads_no_database_content() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let first = root.join("first.db");
+        let second = root.join("second.db");
+        std::fs::write(&first, b"not opened with SQLite").unwrap();
+        std::fs::write(&second, b"different mailbox").unwrap();
+        proactive_stage_fixture(&root, 1);
+        assert_eq!(
+            inspect_proactive_backup_staging(&first).unwrap(),
+            inspect_proactive_backup_staging(&second).unwrap()
+        );
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("large"), [0_u8; 101]).unwrap();
+        std::fs::write(root.join("proactive-backup-not-a-stage"), [0_u8; 103]).unwrap();
+        assert_eq!(inspect_proactive_backup_staging(&first).unwrap().bytes, 31);
+        assert_eq!(std::fs::read(&first).unwrap(), b"not opened with SQLite");
+        assert_eq!(std::fs::read(&second).unwrap(), b"different mailbox");
+    }
+
+    #[test]
+    fn proactive_staging_inventory_bounds_parent_and_nested_work() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, b"live").unwrap();
+        proactive_stage_fixture(&root, 1);
+        // Two parent entries and four descendants: no early success at the
+        // directory count, and unrelated parent entries consume the budget too.
+        assert_eq!(
+            inspect_proactive_backup_staging_with_limit(&primary, 6)
+                .unwrap()
+                .bytes,
+            31
+        );
+        for limit in [0, 1, 2, 5] {
+            let error = inspect_proactive_backup_staging_with_limit(&primary, limit)
+                .expect_err("incomplete scans must not claim a complete footprint");
+            assert!(error.to_string().contains("entry limit exceeded"));
+        }
+        std::fs::write(root.join("unrelated"), b"not a backup").unwrap();
+        assert!(inspect_proactive_backup_staging_with_limit(&primary, 6).is_err());
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live");
+    }
+
+    #[test]
+    fn proactive_staging_empty_and_unavailable_are_distinct() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let missing = root.join("not-created/mail.db");
+        assert_eq!(
+            inspect_proactive_backup_staging(&missing).unwrap(),
+            ProactiveBackupStagingInventory::default()
+        );
+        assert!(!root.join("not-created").exists());
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, b"live").unwrap();
+        let stats = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(stats.resident_bytes, 0);
+        assert!(
+            !stats
+                .resident_bytes_by_category
+                .contains_key("proactive_backup_staging")
+        );
+        let malformed = root.join(".mcp-agent-mail-proactive-backup-not-a-directory");
+        std::fs::write(&malformed, b"preserved evidence").unwrap();
+        assert!(inspect_proactive_backup_staging(&primary).is_err());
+        assert!(retention_resident_stats(&root, &primary, None).is_err());
+        assert_eq!(std::fs::read(malformed).unwrap(), b"preserved evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_staging_inventory_refuses_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        let outside = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside evidence").unwrap();
+        for nested in [false, true] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let primary = root.join("mail.db");
+            std::fs::write(&primary, b"live").unwrap();
+            if nested {
+                let stage = proactive_stage_fixture(&root, 1);
+                symlink(&outside, stage.join("linked")).unwrap();
+            } else {
+                symlink(
+                    &outside,
+                    root.join(".mcp-agent-mail-proactive-backup-link"),
+                )
+                .unwrap();
+            }
+            assert!(inspect_proactive_backup_staging(&primary).is_err());
+            assert_eq!(std::fs::read(&primary).unwrap(), b"live");
+        }
+        // Keep the Unix socket name below sun_path's limit even when macOS
+        // supplies a long per-user TMPDIR. No process-global chdir/env changes.
+        let root = tempfile::tempdir_in("/tmp")
+            .unwrap()
+            .keep()
+            .canonicalize()
+            .unwrap();
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, b"live").unwrap();
+        let stage = proactive_stage_fixture(&root, 1);
+        let _socket = UnixListener::bind(stage.join("socket")).unwrap();
+        assert!(inspect_proactive_backup_staging(&primary).is_err());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"outside evidence"
+        );
+        symlink(&root, outside.join("database-alias")).unwrap();
+        assert!(
+            inspect_proactive_backup_staging(&outside.join("database-alias/mail.db")).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_staging_inventory_preserves_non_unicode_names_and_sparse_lengths() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join(std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec()));
+        std::fs::write(&primary, b"live").unwrap();
+        let mut stage_name = PROACTIVE_STAGING_PREFIX.to_vec();
+        stage_name.push(0xff);
+        let stage = root.join(std::ffi::OsString::from_vec(stage_name));
+        std::fs::create_dir(&stage).unwrap();
+        let large = 24_u64 * 1024 * 1024 * 1024;
+        let snapshot = std::fs::File::create(stage.join("snapshot.sqlite3")).unwrap();
+        snapshot.set_len(large).unwrap();
+        drop(snapshot);
+        let inventory = inspect_proactive_backup_staging(&primary).unwrap();
+        assert_eq!(inventory.directories, 1);
+        assert_eq!(inventory.bytes, large);
+        let stats = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(stats.resident_bytes, large);
+        assert_eq!(stats.reclaimable_bytes, 0);
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live");
     }
 }
