@@ -935,6 +935,19 @@ fn product_inbox_scope_excludes_later_links_and_legacy_name_aliases() {
             .await
             .expect("foreign-product mail");
         let conn = pool.acquire(&cx).await.into_result().expect("connection");
+        // A legacy mailbox can predate v10b's case-insensitive unique index
+        // (idx_agents_project_name_nocase) and so hold a case-variant alias.
+        // Represent that schema. The DDL runs in an explicit transaction
+        // because FrankenSQLite refuses autocommit DDL on a pooled connection
+        // that has seen later commits (br-1a63i).
+        for statement in [
+            "BEGIN IMMEDIATE",
+            "DROP INDEX IF EXISTS idx_agents_project_name_nocase",
+            "COMMIT",
+        ] {
+            conn.execute_raw(statement)
+                .expect("represent pre-guard legacy schema");
+        }
         conn.execute_sync(
             "INSERT INTO agents(project_id, name, program, model, inception_ts, last_active_ts) \
              VALUES (?, 'bluelake', 'test', 'test', 1, 1)",
