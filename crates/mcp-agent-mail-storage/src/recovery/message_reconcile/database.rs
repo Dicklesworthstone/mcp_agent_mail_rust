@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 mod admission_tests;
+mod checkpoint;
 mod source;
 mod staged;
 
@@ -95,6 +96,8 @@ impl From<crate::StorageError> for ReconcileFailure {
 /// Separate new-message and rotating backfill cursors prevent old broken
 /// records from pinning catch-up and continuous new mail from starving history.
 /// Cursors are only hints: restarting or wrapping always safely checks again.
+/// The startup-aware worker cursor checkpoints its hints; `Default` remains
+/// in-memory for independent one-shot scans and callers without a startup anchor.
 #[derive(Debug, Default)]
 pub struct ReconcileCursor {
     source_identity: String,
@@ -114,6 +117,10 @@ pub struct ReconcileCursor {
     // repeats the ordinary authority/no-clobber checks before publication.
     retries: VecDeque<DeferredRetry>,
     conflict_backoff: VecDeque<(i64, Instant)>,
+    persist_progress: bool,
+    // A failed checkpoint must not replace newer in-memory retry debt with
+    // an older disk snapshot on the next pass. A successful save clears this.
+    checkpoint_dirty: bool,
 }
 
 impl ReconcileCursor {
@@ -121,10 +128,15 @@ impl ReconcileCursor {
     /// `settled_before_us`. After a crash, the mail that the dead process
     /// committed but never archived is then eligible on the first pass instead
     /// of waiting behind a 16-ids-per-pass walk of healthy recent mail.
+    ///
+    /// Scan positions and retry debt are checkpointed together beside the live
+    /// database. Restoring them never restores the old process's grace anchor
+    /// or grants authority to repair a message without rereading its source.
     #[must_use]
     pub fn settled_before(settled_before_us: i64) -> Self {
         Self {
             settled_before_us,
+            persist_progress: true,
             ..Self::default()
         }
     }
@@ -191,6 +203,11 @@ pub struct ReconcileReport {
     pub payload_bytes: usize,
     pub interrupted: bool,
     pub budget_exhausted: bool,
+    /// Scheduling hints were restored, not archive authority or read/ack state.
+    pub checkpoint_restored: bool,
+    /// `None` for an in-memory or pre-cancelled pass; false means progress is
+    /// currently memory-only and a restart may replay an older bounded pass.
+    pub checkpoint_saved: Option<bool>,
 }
 
 /// A finite retention round revisits unavailable archive evidence without
@@ -318,6 +335,7 @@ fn select_ids(
         *cursor = ReconcileCursor {
             source_identity: identity,
             settled_before_us: cursor.settled_before_us,
+            persist_progress: cursor.persist_progress,
             ..Default::default()
         };
     }
@@ -787,11 +805,29 @@ impl CommittedMessages {
 /// reaches the archive admission path as well as the outer loop. Blocking I/O and Git
 /// operations still have no hard deadline.
 ///
+/// Startup-aware cursors atomically checkpoint scan positions and retry debt.
+/// A checkpoint is source-generation scoped scheduling metadata, never archive
+/// authority. Unavailable checkpoint storage leaves repair enabled in memory.
+///
 /// # Errors
 ///
 /// Refuses mismatched/readonly sources, source acquisition/query errors, or an
 /// open corruption breaker. Ambiguous/conflicting/oversized artifacts defer.
 pub fn reconcile_message_batch(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+) -> Result<ReconcileReport, String> {
+    if cursor.persist_progress {
+        checkpoint::run(cx, pool, config, cursor, stop)
+    } else {
+        reconcile_message_batch_inner(cx, pool, config, cursor, stop)
+    }
+}
+
+fn reconcile_message_batch_inner(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
@@ -1874,7 +1910,7 @@ mod tests {
         });
     }
 
-    fn retention_fixture(count: i64, test: impl FnOnce(&Cx, &DbPool, &Config)) {
+    pub(super) fn retention_fixture(count: i64, test: impl FnOnce(&Cx, &DbPool, &Config)) {
         // Recovery now refuses unrelated process-global lock contention.
         // Keep the existing exact expectations isolated from parallel tests.
         if admission_tests::isolated() {
