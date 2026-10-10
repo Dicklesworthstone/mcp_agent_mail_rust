@@ -642,5 +642,462 @@ raise AssertionError('the process never reached an actual rename')
         self.assertFalse((self.archive / "doctor").exists())
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux no-replace recovery contract")
+class BackupRotationTests(unittest.TestCase):
+    mailbox = StagingRecoveryTests.mailbox
+    cli = StagingRecoveryTests.cli
+    exporter = StagingRecoveryTests.exporter
+    assert_protected = StagingRecoveryTests.assert_protected
+    recover = StagingRecoveryTests.recover
+    replace_manifest = StagingRecoveryTests.replace_manifest
+    stage = StagingRecoveryTests.stage
+
+    def setUp(self):
+        StagingRecoveryTests.setUp(self)
+        self.meta = self.parent / (self.database.name + ".bak.meta.json")
+        preserved = self.root / "original-unparseable-metadata"
+        self.meta.rename(preserved)
+        self.protected[preserved] = self.protected.pop(self.meta)
+
+    def backup(self, ordinal=0, *, generation=None, old=True):
+        generation = generation or f"20260101_{ordinal // 60:02}{ordinal % 60:02}00"
+        path = self.parent / (self.database.name + ".bak." + generation)
+        connection = sqlite3.connect(path)
+        connection.execute("CREATE TABLE mail (generation INTEGER, payload TEXT)")
+        connection.execute("INSERT INTO mail VALUES (?, ?)", (ordinal, "retained acknowledged mail"))
+        connection.commit()
+        connection.close()
+        if old:
+            when = time.time_ns() - 7200 * 1_000_000_000
+            os.utime(path, ns=(when, when))
+        return path
+
+    def claim(self, source, **overrides):
+        value = {"schema": 1, "created_us": 1_800_000_000_000_000,
+                 "integrity_verified": True, "integrity_kind": "integrity_check",
+                 "schema_version": 1, "row_counts": {"messages": 1},
+                 "source_path": str(self.database), "snapshot_path": str(self.database) + ".bak",
+                 "snapshot_size_bytes": source.stat().st_size,
+                 "snapshot_sha256": reclaim.hashlib.sha256(source.read_bytes()).hexdigest(),
+                 "binary_version": "test-fixture", **overrides}
+        self.meta.write_bytes(reclaim.canonical_json(value))
+        return value
+
+    def preview(self, **kwargs):
+        with self.mailbox() as mailbox:
+            return mailbox.backup_plan(3600, **kwargs)
+
+    def apply(self, plan=None, **kwargs):
+        plan = self.preview(**kwargs) if plan is None else plan
+        with self.mailbox() as mailbox:
+            return reclaim.apply_plan(mailbox, plan["plan_sha256"], 3600, offline=True,
+                                      rotated_backups=True, keep_backups=plan["keep_backups"],
+                                      max_hash_bytes=plan["max_hash_bytes"])
+
+    def rehash_manifest(self, manifest):
+        plan = manifest["plan"]
+        plan["plan_sha256"] = reclaim.digest({key: value for key, value in plan.items() if key != "plan_sha256"})
+
+    def test_fifty_stale_metadata_backups_rotate_without_deleting_or_rewriting_authority(self):
+        backups = [self.backup(i) for i in range(50)]
+        self.claim(backups[0], snapshot_sha256="0" * 64)
+        meta_before = self.meta.read_bytes()
+        identities = {path.name: path.stat().st_ino for path in backups}
+        before = sorted(str(path) for path in self.root.rglob("*"))
+        plan = self.preview()
+        self.assertEqual(len(plan["eligible"]), 47)
+        self.assertEqual({item["name"] for item in plan["retained"]}, {path.name for path in backups[-3:]})
+        self.assertEqual(before, sorted(str(path) for path in self.root.rglob("*")))
+        self.assertEqual(plan, self.preview())
+        result = self.apply(plan)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(result["moved"]), 47)
+        self.assertEqual(result["freed_bytes"], 0)
+        run = Path(result["run_directory"])
+        for index, path in enumerate(backups):
+            actual = path if index >= 47 else run / path.name
+            self.assertEqual(actual.stat().st_ino, identities[path.name])
+            with sqlite3.connect(f"file:{actual}?mode=ro&immutable=1", uri=True) as conn:
+                self.assertEqual(conn.execute("SELECT generation FROM mail").fetchone()[0], index)
+        self.assertEqual(self.meta.read_bytes(), meta_before)
+        self.assertEqual(self.preview()["eligible"], [])
+        self.assert_protected()
+
+    def test_every_metadata_bound_copy_is_pinned_in_addition_to_the_newest_three(self):
+        backups = [self.backup(i) for i in range(8)]
+        # Two different inodes carrying the recorded bytes must both survive.
+        backups[1].write_bytes(backups[0].read_bytes())
+        when = time.time_ns() - 7200 * 1_000_000_000
+        os.utime(backups[1], ns=(when, when))
+        self.claim(backups[0])
+        plan = self.preview()
+        self.assertEqual({item["name"] for item in plan["retained"]},
+                         {path.name for path in [*backups[:2], *backups[-3:]]})
+        matches = [item for item in plan["retained"] if "snapshot_metadata_match" in item["retention_reasons"]]
+        self.assertEqual(len(matches), 2)
+        self.assertTrue(self.apply(plan)["ok"])
+        for path in [*backups[:2], *backups[-3:]]:
+            self.assertTrue(path.exists())
+        self.assert_protected()
+
+    def test_generation_order_uses_filename_timestamp_and_numeric_collision_not_mtime(self):
+        names = ["20260101_000000", "20260102_000000", "20260102_000000-02", "20260102_000000-10"]
+        backups = [self.backup(i, generation=name) for i, name in enumerate(names)]
+        for index, path in enumerate(backups):
+            when = time.time_ns() - (7200 + index * 3600) * 1_000_000_000
+            os.utime(path, ns=(when, when))
+        plan = self.preview(keep_backups=2)
+        self.assertEqual({item["name"] for item in plan["retained"]}, {path.name for path in backups[-2:]})
+
+    def test_complete_native_timestamp_grammar_rejects_private_and_lookalike_names(self):
+        primary = "mail.db"
+        valid = ["20260824_120102", "20260824_120102-01", "20260824_120102-100",
+                 "20260824_120102-4294967295", "20240229_120000"]
+        for suffix in valid:
+            self.assertIsNotNone(reclaim.backup_generation(primary, primary + ".bak." + suffix))
+        invalid = ["20260824_120102_345", "20260824_120102-00", "20260824_120102-1",
+                   "20260824_120102-001", "20260824_120102-4294967296", "20260824_120102-wal",
+                   "20260824_120102.meta.json", "20260824_120102-１", "2026082_120102",
+                   "20260229_120000", "20260101_250000", "20260824_120102/child", ""]
+        for suffix in invalid:
+            self.assertIsNone(reclaim.backup_generation(primary, primary + ".bak." + suffix), suffix)
+        for name in [primary + ".bak", primary + ".backup-20260824-120102",
+                     "mail.db2.bak.20260824_120102", primary + "-wal.bak.20260824_120102"]:
+            self.assertIsNone(reclaim.backup_generation(primary, name), name)
+
+    def test_young_and_future_backups_survive_even_outside_the_keep_count(self):
+        backups = [self.backup(i) for i in range(6)]
+        os.utime(backups[0], None)
+        future = time.time_ns() + 3600 * 1_000_000_000
+        os.utime(backups[1], ns=(future, future))
+        plan = self.preview(keep_backups=1)
+        self.assertEqual({item["name"] for item in plan["retained"]},
+                         {backups[0].name, backups[1].name, backups[-1].name})
+
+    def test_sqlite_and_historical_companions_keep_the_whole_generation_in_place(self):
+        backups = [self.backup(i) for i in range(5)]
+        (self.parent / (backups[0].name + "-wal")).write_bytes(b"committed WAL")
+        (self.parent / (self.database.name + "-shm" + backups[1].name[len(self.database.name):])).write_bytes(b"historical SHM")
+        (self.parent / (backups[2].name + "-wal-cert")).symlink_to("missing-certificate")
+        plan = self.preview(keep_backups=1)
+        self.assertEqual([item["name"] for item in plan["eligible"]], [backups[3].name])
+        self.assertTrue(self.apply(plan)["ok"])
+        self.assertTrue(all(path.exists() for path in backups[:3]))
+        self.assertEqual((self.parent / (backups[0].name + "-wal")).read_bytes(), b"committed WAL")
+
+    def test_unknown_or_malformed_snapshot_authority_refuses_before_quarantine(self):
+        backups = [self.backup(i) for i in range(5)]
+        for change in [{"schema": 99}, {"schema": True}, {"integrity_verified": False},
+                       {"snapshot_sha256": "garbage"}, {"snapshot_size_bytes": True},
+                       {"source_path": "/another/mailbox"}, {"snapshot_path": str(backups[0])},
+                       {"integrity_kind": "quick_check"}]:
+            self.claim(backups[0], **change)
+            with self.subTest(change=change), self.assertRaises(reclaim.Refused):
+                self.preview()
+            self.assertFalse((self.archive / "doctor").exists())
+        for data in [b"not json", b'{"schema":1,"schema":1}', b"x" * (reclaim.MAX_SNAPSHOT_METADATA_BYTES + 1)]:
+            self.meta.write_bytes(data)
+            with self.assertRaises(reclaim.Refused):
+                self.preview()
+            self.assertEqual(self.meta.read_bytes(), data)
+
+    def test_snapshot_metadata_symlinks_and_hardlinks_are_not_followed(self):
+        self.backup()
+        target = self.root / "outside-metadata"
+        target.write_bytes(b"untouched")
+        self.meta.symlink_to(target)
+        with self.assertRaises(OSError):
+            self.preview()
+        self.meta.rename(self.root / "preserved-metadata-link")
+        os.link(target, self.meta)
+        with self.assertRaises(reclaim.Refused):
+            self.preview()
+        self.assertEqual(target.read_bytes(), b"untouched")
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_file_fingerprints_detect_same_size_edits_even_with_restored_mtime(self):
+        backups = [self.backup(i) for i in range(5)]
+        plan = self.preview()
+        path = backups[0]
+        before = path.stat()
+        changed = bytearray(path.read_bytes())
+        changed[-1] ^= 1
+        path.write_bytes(changed)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaisesRegex(reclaim.Refused, "plan changed"):
+            self.apply(plan)
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_new_metadata_or_backup_or_companion_invalidates_preview(self):
+        backups = [self.backup(i) for i in range(5)]
+        plan = self.preview()
+        self.claim(backups[0])
+        with self.assertRaisesRegex(reclaim.Refused, "plan changed"):
+            self.apply(plan)
+        plan = self.preview()
+        self.backup(6)
+        with self.assertRaisesRegex(reclaim.Refused, "plan changed"):
+            self.apply(plan)
+        plan = self.preview()
+        (self.parent / (backups[1].name + "-journal")).write_bytes(b"new companion")
+        with self.assertRaisesRegex(reclaim.Refused, "plan changed"):
+            self.apply(plan)
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_hash_budget_refuses_sparse_oversize_before_reading_or_mutating(self):
+        backup = self.backup()
+        with backup.open("r+b") as file:
+            file.truncate(2**32 + 17)
+        with mock.patch.object(reclaim.os, "read", side_effect=AssertionError("oversized payload must not be read")):
+            with self.assertRaisesRegex(reclaim.Refused, "hash byte budget"):
+                self.preview(max_hash_bytes=1024)
+        self.assertEqual(backup.stat().st_size, 2**32 + 17)
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_policy_bounds_and_entry_budget_are_enforced(self):
+        self.backup()
+        for kwargs in [{"keep_backups": 0}, {"keep_backups": -1}, {"keep_backups": True},
+                       {"max_hash_bytes": 0}, {"max_hash_bytes": 2**64}, {"max_entries": 0}]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(reclaim.Refused):
+                self.preview(**kwargs)
+
+    def test_backup_namespace_is_byte_exact_for_nonunicode_database_names(self):
+        original = self.database
+        self.database = self.parent / os.fsdecode(b"mail-\xff.db")
+        original.rename(self.database)
+        self.protected[self.database] = self.protected.pop(original)
+        self.meta = self.parent / (self.database.name + ".bak.meta.json")
+        backups = [self.backup(i) for i in range(5)]
+        neighbor = self.parent / "mail-�.db.bak.20260101_000000"
+        neighbor.write_bytes(b"another database's backup")
+        plan = self.preview()
+        self.assertEqual(len(plan["eligible"]), 2)
+        self.assertTrue(self.apply(plan)["ok"])
+        self.assertEqual(neighbor.read_bytes(), b"another database's backup")
+        self.assertTrue(all(path.exists() for path in backups[-3:]))
+        self.assert_protected()
+
+    def test_stage_and_backup_scopes_do_not_move_each_others_artifacts(self):
+        stage = self.stage()
+        backups = [self.backup(i) for i in range(5)]
+        plan = self.preview()
+        self.assertTrue(self.apply(plan)["ok"])
+        self.assertTrue(stage.exists())
+        with self.mailbox() as mailbox:
+            stage_plan = mailbox.plan(3600)
+        self.assertEqual([item["name"] for item in stage_plan["eligible"]], [stage.name])
+        self.assertTrue(all(path.exists() for path in backups[-3:]))
+
+    def test_backup_cli_apply_inspect_restore_and_resume_use_the_original_manifest(self):
+        backups = [self.backup(i) for i in range(6)]
+        inodes = {path.name: path.stat().st_ino for path in backups}
+        completed, plan = self.cli("--rotated-backups", "--keep-backups", "2")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(plan["scope"], "rotated_backups")
+        completed, applied = self.cli("--rotated-backups", "--keep-backups", "2", "--apply", "--offline",
+                                      "--expect-plan", plan["plan_sha256"])
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(applied["moved"]), 4)
+        run = Path(applied["run_directory"])
+        before = sorted(path.name for path in run.iterdir())
+        completed, inspection = self.cli("--inspect-run", str(run))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(before, sorted(path.name for path in run.iterdir()))
+        self.assertEqual(len(inspection["locations"]), 4)
+        for mode in ("restore", "restore", "resume", "resume"):
+            completed, result = self.cli("--" + mode, str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+            self.assertEqual(completed.returncode, 0, (completed.stderr, result))
+        self.assertEqual(result["moved"], [])
+        self.assertEqual(len(result["unchanged"]), 4)
+        for index, path in enumerate(backups):
+            actual = path if index >= 4 else run / path.name
+            self.assertEqual(actual.stat().st_ino, inodes[path.name])
+        self.assert_protected()
+
+    def test_real_process_crash_after_backup_rename_recovers_without_duplicate_moves(self):
+        backups = [self.backup(i) for i in range(5)]
+        plan = self.preview()
+        code = """
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('recovery_child', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real = module.rename_noreplace
+def crash(*args):
+    real(*args)
+    os._exit(77)
+module.rename_noreplace = crash
+with module.Mailbox(sys.argv[2], sys.argv[3]) as mailbox:
+    module.apply_plan(mailbox, sys.argv[4], 3600, offline=True, rotated_backups=True)
+raise AssertionError('no actual backup rename')
+"""
+        child = subprocess.run([sys.executable, "-c", code, str(SCRIPT), str(self.database), str(self.archive),
+                                plan["plan_sha256"]], capture_output=True, timeout=10)
+        self.assertEqual(child.returncode, 77, child.stderr)
+        run, = (self.archive / "doctor/reclaimable").iterdir()
+        completed, inspection = self.cli("--inspect-run", str(run))
+        self.assertEqual(completed.returncode, 0, (completed.stderr, inspection))
+        self.assertEqual({item["location"] for item in inspection["locations"]}, {"source", "quarantine"})
+        completed, resumed = self.cli("--resume", str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+        self.assertEqual(completed.returncode, 0, (completed.stderr, resumed))
+        self.assertEqual(len(resumed["moved"]), 1)
+        self.assertEqual(len(resumed["unchanged"]), 1)
+        completed, restored = self.cli("--restore", str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+        self.assertEqual(completed.returncode, 0, (completed.stderr, restored))
+        self.assertEqual(len(restored["moved"]), 2)
+        self.assertTrue(all(path.exists() for path in backups))
+
+    def test_metadata_change_before_rename_stops_publication_without_destroying_evidence(self):
+        backups = [self.backup(i) for i in range(5)]
+        plan = self.preview()
+        write = reclaim.write_record
+        def inject(fd, value):
+            if isinstance(value, dict) and value.get("phase") == "intent":
+                self.claim(backups[0])
+            return write(fd, value)
+        with mock.patch.object(reclaim, "write_record", side_effect=inject):
+            result = self.apply(plan)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["failures"][0]["rename_completed"])
+        self.assertIn("metadata changed", result["failures"][0]["error"])
+        self.assertTrue(all(path.exists() for path in backups))
+
+    def test_new_companion_before_rename_is_refused(self):
+        backups = [self.backup(i) for i in range(5)]
+        plan = self.preview()
+        write = reclaim.write_record
+        def inject(fd, value):
+            if isinstance(value, dict) and value.get("phase") == "intent":
+                (self.parent / (value["name"] + "-wal")).write_bytes(b"raced WAL")
+            return write(fd, value)
+        with mock.patch.object(reclaim, "write_record", side_effect=inject):
+            result = self.apply(plan)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["failures"][0]["rename_completed"])
+        self.assertIn("companion", result["failures"][0]["error"])
+        self.assertTrue(all(path.exists() for path in backups))
+
+    def test_quarantined_backup_edit_is_detected_even_if_mtime_is_restored(self):
+        backups = [self.backup(i) for i in range(5)]
+        run = Path(self.apply()["run_directory"])
+        path = run / backups[0].name
+        before = path.stat()
+        data = bytearray(path.read_bytes())
+        data[-1] ^= 1
+        path.write_bytes(data)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        entries = sorted(path.name for path in run.iterdir())
+        for mode in ("inspect", "resume", "restore"):
+            with self.assertRaisesRegex(reclaim.Refused, "changed since preview"):
+                self.recover(run, mode)
+        self.assertEqual(entries, sorted(path.name for path in run.iterdir()))
+
+    def test_backup_restore_collision_refuses_before_moving_any_generation(self):
+        backups = [self.backup(i) for i in range(5)]
+        run = Path(self.apply()["run_directory"])
+        backups[1].write_bytes(b"replacement generation")
+        with self.assertRaisesRegex(reclaim.Refused, "occupied"):
+            self.recover(run, "restore")
+        self.assertFalse(backups[0].exists())
+        self.assertEqual(backups[1].read_bytes(), b"replacement generation")
+
+    def test_changed_snapshot_authority_blocks_recorded_backup_operations(self):
+        backups = [self.backup(i) for i in range(5)]
+        run = Path(self.apply()["run_directory"])
+        self.claim(backups[-1])
+        before = sorted(path.name for path in run.iterdir())
+        with self.assertRaisesRegex(reclaim.Refused, "metadata changed"):
+            self.recover(run, "resume")
+        self.assertEqual(before, sorted(path.name for path in run.iterdir()))
+
+    def test_manifest_cannot_select_current_backup_or_violate_the_keep_floor(self):
+        for issue in ("current", "newest", "zero_keep"):
+            with self.subTest(issue=issue):
+                # Independent retained fixture for each malformed plan.
+                self.setUp()
+                for i in range(5):
+                    self.backup(i)
+                run = Path(self.apply()["run_directory"])
+                manifest = json.loads((run / "manifest.json").read_text())
+                plan = manifest["plan"]
+                if issue == "current":
+                    plan["eligible"][0]["name"] = self.database.name + ".bak"
+                elif issue == "newest":
+                    item = plan["retained"].pop()
+                    item["retention_reasons"] = []
+                    plan["eligible"].append(item)
+                else:
+                    plan["keep_backups"] = 0
+                self.rehash_manifest(manifest)
+                self.replace_manifest(run, manifest)
+                with self.assertRaises(reclaim.Refused):
+                    self.recover(run, "restore")
+                self.assert_protected()
+
+    def test_backup_symlinks_and_hardlinks_are_not_reclaimed(self):
+        backups = [self.backup(i) for i in range(5)]
+        victim = backups[0]
+        preserved = self.root / "preserved-backup"
+        victim.rename(preserved)
+        victim.symlink_to(preserved)
+        with self.assertRaises(OSError):
+            self.preview()
+        victim.rename(self.root / "preserved-backup-link")
+        os.link(preserved, victim)
+        with self.assertRaises(reclaim.Refused):
+            self.preview()
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_backup_apply_and_recovery_refuse_an_independent_exporter(self):
+        for i in range(5):
+            self.backup(i)
+        plan = self.preview()
+        with self.exporter():
+            completed, result = self.cli("--rotated-backups", "--apply", "--offline", "--expect-plan", plan["plan_sha256"])
+            self.assertEqual(completed.returncode, 3)
+            self.assertIn("lease", result["error"])
+        run = Path(self.apply(plan)["run_directory"])
+        with self.exporter():
+            completed, result = self.cli("--restore", str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+            self.assertEqual(completed.returncode, 3)
+            self.assertIn("lease", result["error"])
+
+    def test_backup_cross_device_moves_have_no_copy_and_delete_fallback(self):
+        if not Path("/dev/shm").is_dir() or self.parent.stat().st_dev == Path("/dev/shm").stat().st_dev:
+            self.skipTest("a second filesystem is unavailable")
+        self.archive = Path(tempfile.mkdtemp(prefix="am-backup-cross-device-", dir="/dev/shm"))
+        backups = [self.backup(i) for i in range(5)]
+        result = self.apply()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["failures"][0]["rename_completed"])
+        self.assertTrue(all(path.exists() for path in backups))
+
+    def test_cli_rejects_ignored_scope_options_and_unsafe_keep_counts(self):
+        for args in [("--keep-backups", "2"), ("--rotated-backups", "--keep-backups", "0"),
+                     ("--rotated-backups", "--max-hash-bytes", "0"),
+                     ("--rotated-backups", "--inspect-run", str(self.archive))]:
+            completed, result = self.cli(*args)
+            self.assertEqual(completed.returncode, 3, (args, result))
+            self.assertFalse(result["ok"])
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_oversized_recovery_manifest_is_refused_before_creating_a_run(self):
+        for i in range(5):
+            self.backup(i)
+        plan = self.preview()
+        with mock.patch.object(reclaim, "MAX_MANIFEST_BYTES", 64):
+            with self.assertRaisesRegex(reclaim.Refused, "manifest would exceed"):
+                self.apply(plan)
+        self.assertFalse((self.archive / "doctor").exists())
+
+    def test_backup_fingerprinting_does_not_open_any_database_connection(self):
+        for i in range(5):
+            self.backup(i)
+        with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("no SQLite opens during recovery")):
+            plan = self.preview()
+            result = self.apply(plan)
+            self.assertTrue(result["ok"], result)
+
+
 if __name__ == "__main__":
     unittest.main()
