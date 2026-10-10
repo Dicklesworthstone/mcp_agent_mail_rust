@@ -22,6 +22,11 @@ Examples:
   # Stop/drain all exporters sharing /mail, then use the returned plan_sha256:
   python3 scripts/reclaim_backup_staging.py --database /mail/storage.sqlite3 \
       --storage-root /mail --apply --offline --expect-plan <plan_sha256>
+  # Inspect an interrupted run; no log line alone is authority to move a stage:
+  python3 scripts/reclaim_backup_staging.py --database /mail/storage.sqlite3 \
+      --storage-root /mail --inspect-run <run_directory>
+  # --resume finishes quarantine; --restore returns the same inodes to source.
+  # Both require --offline and --expect-plan <the_original_plan_sha256>.
 
 Fixtures are exercised with:
   python3 -m unittest discover -s tests -p test_reclaim_backup_staging.py -v
@@ -49,6 +54,7 @@ MAX_ENTRIES = 16_384
 MAX_DEPTH = 64
 DEFAULT_MIN_AGE_SECONDS = 3600
 MAX_BYTES = (1 << 64) - 1
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 SCHEMA = 1
 
 
@@ -135,7 +141,8 @@ class Budget:
 
 
 def stage_name(name: str) -> bool:
-    return name.startswith(STAGE_PREFIX) and len(name) > len(STAGE_PREFIX)
+    return (isinstance(name, str) and name.startswith(STAGE_PREFIX)
+            and len(name) > len(STAGE_PREFIX) and "/" not in name and "\0" not in name)
 
 
 def tree_snapshot(fd: int, budget: Budget, *, sync: bool = False) -> dict[str, Any]:
@@ -262,6 +269,8 @@ class Mailbox:
                 else:
                     retained.append(item)
         self.validate()
+        if sum(item["bytes"] for item in eligible + retained) > MAX_BYTES:
+            raise Refused("total staging bytes exceed the supported range")
         plan = {"schema": SCHEMA, "binding": self.binding, "min_age_seconds": min_age_seconds,
                 "eligible": sorted(eligible, key=lambda item: item["name"]),
                 "retained": sorted(retained, key=lambda item: item["name"])}
@@ -307,6 +316,87 @@ def verify_stage(fd: int, expected: dict[str, Any], budget: Budget, *, sync: boo
         raise Refused(f"staging evidence changed since preview: {expected['name']!r}")
 
 
+def validate_run_path(run_path: Path, run: int) -> None:
+    with open_directory(run_path) as current:
+        if object_id(os.fstat(current)) != object_id(os.fstat(run)):
+            raise Refused("quarantine namespace changed")
+
+
+def stage_location(mailbox: Mailbox, run: int, stage: dict[str, Any]) -> str:
+    locations = []
+    for label, parent in (("source", mailbox.parent), ("quarantine", run)):
+        try:
+            metadata = os.stat(stage["name"], dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode) or object_id(metadata) != stage["identity"]:
+            raise Refused(f"{label} entry is occupied by different evidence: {stage['name']!r}")
+        locations.append(label)
+    if len(locations) != 1:
+        raise Refused(f"stage must exist in exactly one recorded location: {stage['name']!r}")
+    return locations[0]
+
+
+def move_plan(mailbox: Mailbox, run: int, run_path: Path, plan: dict[str, Any],
+              actions: int, result: dict[str, Any], *, restore: bool = False,
+              check_manifest: Any = None) -> None:
+    """Both directions share the same source witness and atomic publication path."""
+    desired = "source" if restore else "quarantine"
+    budget = Budget()
+    for stage in plan["eligible"]:
+        renamed = False
+        try:
+            mailbox.validate()
+            validate_run_path(run_path, run)
+            if check_manifest is not None:
+                check_manifest()
+            location = stage_location(mailbox, run, stage)
+            source_parent = mailbox.parent if location == "source" else run
+            target_parent = mailbox.parent if desired == "source" else run
+            name = stage["name"]
+            with child_directory(source_parent, name) as source:
+                verify_stage(source, stage, budget, sync=True)
+                if location != desired:
+                    write_record(actions, {"phase": "intent", "name": name, "mode": result["mode"]})
+                    if object_id(os.stat(name, dir_fd=source_parent, follow_symlinks=False)) != stage["identity"]:
+                        raise Refused("source entry changed immediately before rename")
+                    rename_noreplace(source_parent, name, target_parent, name)
+                    renamed = True
+                # A crash may have happened after rename but before the old
+                # completion receipt. Re-sync both parents even for an already
+                # present stage; never infer durability from the receipt alone.
+                os.fsync(mailbox.parent)
+                os.fsync(run)
+                mailbox.validate()
+                validate_run_path(run_path, run)
+                if check_manifest is not None:
+                    check_manifest()
+                if stage_location(mailbox, run, stage) != desired:
+                    raise Refused("stage location changed after publication")
+                if object_id(os.stat(name, dir_fd=target_parent, follow_symlinks=False)) != object_id(os.fstat(source)):
+                    raise Refused("destination entry changed after rename")
+                phase = "completed" if renamed else "already_present"
+                write_record(actions, {"phase": phase, "name": name,
+                                       "bytes": stage["bytes"], "mode": result["mode"]})
+            bucket = "moved" if renamed else "unchanged"
+            result.setdefault(bucket, []).append({"name": name, "bytes": stage["bytes"]})
+        except (OSError, Refused) as error:
+            result["ok"] = False
+            result["failures"].append({"name": stage["name"], "rename_completed": renamed,
+                                       "error": str(error),
+                                       "instruction": "preserve the run directory; inspect it before --resume or --restore"})
+            break
+
+
+def finish_receipt(run: int, name: str, result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        new_record(run, name, result)
+    except OSError as error:
+        result["ok"] = False
+        result["failures"].append({"error": f"final receipt unavailable: {error}"})
+    return result
+
+
 def apply_plan(mailbox: Mailbox, expected_digest: str, min_age_seconds: int, *,
                offline: bool = False) -> dict[str, Any]:
     if not offline:
@@ -336,46 +426,167 @@ def apply_plan(mailbox: Mailbox, expected_digest: str, min_age_seconds: int, *,
         actions = os.open("actions.jsonl", flags, 0o600, dir_fd=run)
         stack.callback(os.close, actions)
         os.fsync(run)
-        budget = Budget()
-        for stage in plan["eligible"]:
-            renamed = False
-            try:
-                mailbox.validate()
-                with open_directory(run_path) as current:
-                    if object_id(os.fstat(current)) != object_id(os.fstat(run)):
-                        raise Refused("quarantine namespace changed")
-                name = stage["name"]
-                with child_directory(mailbox.parent, name) as source:
-                    verify_stage(source, stage, budget, sync=True)
-                    write_record(actions, {"phase": "intent", "name": name})
-                    if object_id(os.stat(name, dir_fd=mailbox.parent, follow_symlinks=False)) != stage["identity"]:
-                        raise Refused("source entry changed immediately before rename")
-                    rename_noreplace(mailbox.parent, name, run, name)
-                    renamed = True
-                    os.fsync(mailbox.parent)
-                    os.fsync(run)
-                    mailbox.validate()
-                    with open_directory(run_path) as current:
-                        if object_id(os.fstat(current)) != object_id(os.fstat(run)):
-                            raise Refused("quarantine namespace changed after rename")
-                    if object_id(os.stat(name, dir_fd=run, follow_symlinks=False)) != object_id(os.fstat(source)):
-                        raise Refused("destination entry changed after rename")
-                    write_record(actions, {"phase": "completed", "name": name, "bytes": stage["bytes"]})
-                result["moved"].append({"name": name, "bytes": stage["bytes"]})
-            except (OSError, Refused) as error:
-                result["ok"] = False
-                result["failures"].append({"name": stage["name"], "rename_completed": renamed,
-                                           "error": str(error),
-                                           "instruction": "preserve the run directory; do not blindly retry or roll back"})
-                break
+        move_plan(mailbox, run, run_path, plan, actions, result)
         # This final receipt is supplemental. The synced pre-move manifest and
         # per-move intents survive even if publishing it is interrupted.
+        return finish_receipt(run, "result.json", result)
+
+
+def validate_manifest(manifest: Any, mailbox: Mailbox) -> dict[str, Any]:
+    try:
+        if (type(manifest) is not dict or type(manifest["schema"]) is not int
+                or manifest["schema"] != SCHEMA
+                or manifest["operation"] != "quarantine_proactive_backup_stages"):
+            raise Refused("unsupported recovery manifest")
+        plan = manifest["plan"]
+        keys = {"schema", "binding", "min_age_seconds", "eligible", "retained", "plan_sha256"}
+        if type(plan) is not dict or set(plan) != keys:
+            raise Refused("invalid recovery plan shape")
+        if (type(plan["schema"]) is not int or plan["schema"] != SCHEMA
+                or plan["binding"] != mailbox.binding):
+            raise Refused("manifest belongs to another mailbox, archive, or file generation")
+        unsigned = lambda value: type(value) is int and 0 <= value <= MAX_BYTES
+        if not unsigned(plan["min_age_seconds"]):
+            raise Refused("invalid manifest age")
+        if any(type(plan[key]) is not list for key in ("eligible", "retained")):
+            raise Refused("invalid manifest stage lists")
+        stages = plan["eligible"] + plan["retained"]
+        if len(stages) > MAX_ENTRIES:
+            raise Refused("manifest stage limit exceeded")
+        names: set[str] = set()
+        total_entries = 0
+        total_bytes = 0
+        for stage in stages:
+            if (type(stage) is not dict
+                    or set(stage) != {"name", "identity", "entries", "bytes", "newest_mtime_ns", "tree_sha256"}
+                    or not stage_name(stage["name"]) or stage["name"] in names):
+                raise Refused("invalid or duplicate manifest stage")
+            names.add(stage["name"])
+            identity = stage["identity"]
+            if type(identity) is not list or len(identity) != 2 or not all(unsigned(part) for part in identity):
+                raise Refused("invalid stage identity")
+            if (not all(unsigned(stage[key]) for key in ("entries", "bytes", "newest_mtime_ns"))
+                    or stage["entries"] == 0):
+                raise Refused("invalid stage witness bounds")
+            if (not isinstance(stage["tree_sha256"], str) or len(stage["tree_sha256"]) != 64
+                    or any(char not in "0123456789abcdef" for char in stage["tree_sha256"])):
+                raise Refused("invalid stage witness digest")
+            total_entries += stage["entries"]
+            total_bytes += stage["bytes"]
+            if total_entries > MAX_ENTRIES or total_bytes > MAX_BYTES:
+                raise Refused("manifest inventory bounds exceeded")
+            if mailbox.storage_root.is_relative_to(mailbox.database.parent / stage["name"]):
+                raise Refused("archive root is inside a recorded stage")
+        unsigned_plan = {key: value for key, value in plan.items() if key != "plan_sha256"}
+        if digest(unsigned_plan) != plan["plan_sha256"]:
+            raise Refused("recovery manifest checksum mismatch")
+        return plan
+    except (KeyError, TypeError, ValueError, RecursionError) as error:
+        raise Refused(f"invalid recovery manifest: {error}") from error
+
+
+def unique_json_object(pairs: list[Any]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise Refused("duplicate key in recovery manifest")
+        result[key] = value
+    return result
+
+
+@contextmanager
+def recorded_run(mailbox: Mailbox, requested_path: str | Path) -> Iterator[Any]:
+    run_path = absolute_path(requested_path)
+    if (run_path.parent != mailbox.storage_root / "doctor/reclaimable"
+            or not run_path.name.startswith(RUN_PREFIX)):
+        raise Refused("run must be a recorded proactive-staging quarantine under this archive")
+    with open_directory(run_path) as run:
+        if os.fstat(run).st_mode & 0o077 or os.fstat(run).st_uid != os.geteuid():
+            raise Refused("recovery run must be private and owned by this operator")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        file = os.open("manifest.json", flags, dir_fd=run)
         try:
-            new_record(run, "result.json", result)
-        except OSError as error:
-            result["ok"] = False
-            result["failures"].append({"error": f"final receipt unavailable: {error}"})
-        return result
+            before = os.fstat(file)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_mode & 0o077 or before.st_uid != os.geteuid()
+                    or before.st_size > MAX_MANIFEST_BYTES):
+                raise Refused("manifest is not a bounded, private, singly linked regular file")
+            data = bytearray()
+            while len(data) <= MAX_MANIFEST_BYTES:
+                chunk = os.read(file, min(65536, MAX_MANIFEST_BYTES + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if len(data) > MAX_MANIFEST_BYTES:
+                raise Refused("manifest byte limit exceeded")
+
+            def check_manifest():
+                mailbox.validate()
+                validate_run_path(run_path, run)
+                named = os.stat("manifest.json", dir_fd=run, follow_symlinks=False)
+                if stamp(os.fstat(file)) != stamp(before) or stamp(named) != stamp(before):
+                    raise Refused("manifest identity or contents changed while the run was open")
+
+            check_manifest()
+            try:
+                manifest = json.loads(data, object_pairs_hook=unique_json_object)
+            except (ValueError, UnicodeError, RecursionError) as error:
+                raise Refused(f"manifest cannot be decoded: {error}") from error
+            plan = validate_manifest(manifest, mailbox)
+            yield run, run_path, plan, check_manifest
+        finally:
+            os.close(file)
+
+
+def inspect_recorded_stages(mailbox: Mailbox, run: int, plan: dict[str, Any]) -> list[Any]:
+    locations = []
+    budget = Budget()
+    for stage in plan["eligible"]:
+        location = stage_location(mailbox, run, stage)
+        parent = mailbox.parent if location == "source" else run
+        with child_directory(parent, stage["name"]) as opened:
+            verify_stage(opened, stage, budget)
+        locations.append({"name": stage["name"], "location": location, "bytes": stage["bytes"]})
+    return locations
+
+
+def recover_run(mailbox: Mailbox, run_path: str | Path, *, mode: str = "inspect",
+                offline: bool = False, expected_digest: str = "") -> dict[str, Any]:
+    if mode not in ("inspect", "resume", "restore"):
+        raise Refused("unknown recovery mode")
+    if mode != "inspect" and not offline:
+        raise Refused("--offline is required before resuming or restoring a run")
+    with recorded_run(mailbox, run_path) as (run, run_path, plan, check_manifest):
+        # Validate EVERY stage before opening a new action log. Unknown, moved,
+        # edited, ambiguous, or colliding evidence never triggers partial undo.
+        locations = inspect_recorded_stages(mailbox, run, plan)
+        check_manifest()
+        result = {"schema": SCHEMA, "mode": mode, "ok": True,
+                  "run_directory": str(run_path), "plan_sha256": plan["plan_sha256"],
+                  "locations": locations, "freed_bytes": 0,
+                  "backup_retry_state_unchanged": True, "moved": [], "unchanged": [], "failures": []}
+        if mode == "inspect":
+            return result
+        if expected_digest != plan["plan_sha256"]:
+            raise Refused("recovery plan digest is missing or different; inspect the run first")
+        result["locations_before"] = result.pop("locations")
+        attempt = mode + "-" + uuid.uuid4().hex
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        actions = os.open(attempt + ".actions.jsonl", flags, 0o600, dir_fd=run)
+        try:
+            os.fsync(run)
+            move_plan(mailbox, run, run_path, plan, actions, result,
+                      restore=mode == "restore", check_manifest=check_manifest)
+        finally:
+            os.close(actions)
+        if result["ok"]:
+            try:
+                result["locations_after"] = inspect_recorded_stages(mailbox, run, plan)
+                check_manifest()
+            except (OSError, Refused) as error:
+                result["ok"] = False
+                result["failures"].append({"error": f"post-operation observation unavailable: {error}"})
+        return finish_receipt(run, attempt + ".result.json", result)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -383,16 +594,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", required=True, type=Path)
     parser.add_argument("--storage-root", required=True, type=Path)
     parser.add_argument("--min-age-seconds", type=int, default=DEFAULT_MIN_AGE_SECONDS)
-    parser.add_argument("--apply", action="store_true", help="quarantine the exact previewed stages; never delete")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="quarantine the exact previewed stages; never delete")
+    mode.add_argument("--inspect-run", type=Path, help="read-only inspection of recorded stages and their actual locations")
+    mode.add_argument("--resume", type=Path, help="finish an interrupted quarantine using its original manifest")
+    mode.add_argument("--restore", type=Path, help="return the recorded stages to their original names, without overwriting")
     parser.add_argument("--offline", action="store_true", help="declare that all exporters sharing this parent are stopped")
     parser.add_argument("--expect-plan", help="plan_sha256 from a preceding preview")
     args = parser.parse_args(argv)
     try:
-        if not args.apply and (args.offline or args.expect_plan):
-            raise Refused("--offline and --expect-plan require --apply")
+        mutating = args.apply or args.resume or args.restore
+        if not mutating and (args.offline or args.expect_plan):
+            raise Refused("--offline and --expect-plan require --apply, --resume, or --restore")
         with Mailbox(args.database, args.storage_root) as mailbox:
             if args.apply:
                 result = apply_plan(mailbox, args.expect_plan or "", args.min_age_seconds, offline=args.offline)
+            elif args.inspect_run or args.resume or args.restore:
+                selected_mode = "resume" if args.resume else "restore" if args.restore else "inspect"
+                result = recover_run(mailbox, args.inspect_run or args.resume or args.restore,
+                                     mode=selected_mode, offline=args.offline,
+                                     expected_digest=args.expect_plan or "")
             else:
                 result = {"mode": "dry_run", "ok": True, "freed_bytes": 0,
                           **mailbox.plan(args.min_age_seconds)}

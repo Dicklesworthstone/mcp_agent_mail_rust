@@ -386,6 +386,261 @@ os.close(fd)
         self.assertEqual(preview["eligible"], [])
         self.assert_protected()
 
+    def recover(self, run, mode="inspect", plan=None):
+        plan = json.loads((run / "manifest.json").read_text())["plan"] if plan is None else plan
+        with self.mailbox() as mailbox:
+            return reclaim.recover_run(mailbox, run, mode=mode, offline=mode != "inspect",
+                                       expected_digest=plan["plan_sha256"])
+
+    def replace_manifest(self, run, value):
+        path = run / "manifest.json"
+        ordinal = len(list(run.iterdir()))
+        path.rename(run / f"retained-manifest-{ordinal}.json")
+        path.write_bytes(value if isinstance(value, bytes) else reclaim.canonical_json(value))
+        path.chmod(0o600)
+
+    def test_actual_process_exit_after_rename_can_resume_and_undo_in_fresh_processes(self):
+        stages = [self.stage("first"), self.stage("second")]
+        ids = {stage.name: stage.stat().st_ino for stage in stages}
+        plan = self.preview()
+        code = """
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('recovery_child', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real = module.rename_noreplace
+def crash(*args):
+    real(*args)
+    os._exit(77)
+module.rename_noreplace = crash
+with module.Mailbox(sys.argv[2], sys.argv[3]) as mailbox:
+    module.apply_plan(mailbox, sys.argv[4], 3600, offline=True)
+raise AssertionError('the process never reached an actual rename')
+"""
+        child = subprocess.run([sys.executable, "-c", code, str(SCRIPT), str(self.database),
+                                str(self.archive), plan["plan_sha256"]], capture_output=True, timeout=10)
+        self.assertEqual(child.returncode, 77, child.stderr)
+        runs = list((self.archive / "doctor/reclaimable").iterdir())
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        original_actions = (run / "actions.jsonl").read_bytes()
+        self.assertEqual(len(original_actions.splitlines()), 1, "intent exists but completion does not")
+        self.assertFalse((run / "result.json").exists())
+        before = sorted(path.name for path in run.iterdir())
+        completed, inspection = self.cli("--inspect-run", str(run))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual({item["location"] for item in inspection["locations"]}, {"source", "quarantine"})
+        self.assertEqual(before, sorted(path.name for path in run.iterdir()), "inspection never writes")
+        completed, resumed = self.cli("--resume", str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(resumed["moved"]), 1)
+        self.assertEqual(len(resumed["unchanged"]), 1)
+        self.assertTrue(all(item["location"] == "quarantine" for item in resumed["locations_after"]))
+        again = self.recover(run, "resume", plan)
+        self.assertTrue(again["ok"])
+        self.assertEqual(again["moved"], [])
+        self.assertEqual(len(again["unchanged"]), 2)
+        completed, restored = self.cli("--restore", str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(len(restored["moved"]), 2)
+        self.assertTrue(all(item["location"] == "source" for item in restored["locations_after"]))
+        again = self.recover(run, "restore", plan)
+        self.assertTrue(again["ok"])
+        self.assertEqual(again["moved"], [])
+        self.assertEqual(len(again["unchanged"]), 2)
+        self.assertEqual((run / "actions.jsonl").read_bytes(), original_actions)
+        for stage in stages:
+            self.assertEqual(stage.stat().st_ino, ids[stage.name])
+            self.assertEqual((stage / "snapshot.sqlite3").read_bytes(), b"retained snapshot")
+        self.assert_protected()
+
+    def test_restore_collision_refuses_every_stage_before_new_records(self):
+        first = self.stage("first")
+        second = self.stage("second")
+        run = Path(self.apply()["run_directory"])
+        second.mkdir()
+        (second / "unrelated").write_bytes(b"new active generation")
+        before = sorted(path.name for path in run.iterdir())
+        for mode in ("inspect", "resume", "restore"):
+            with self.assertRaisesRegex(reclaim.Refused, "occupied"):
+                self.recover(run, mode)
+        self.assertFalse(first.exists(), "a later conflict prevents partial restoration")
+        self.assertEqual((second / "unrelated").read_bytes(), b"new active generation")
+        self.assertEqual(before, sorted(path.name for path in run.iterdir()))
+
+    def test_restore_never_overwrites_a_dangling_source_symlink(self):
+        stage = self.stage()
+        run = Path(self.apply()["run_directory"])
+        stage.symlink_to("missing")
+        with self.assertRaisesRegex(reclaim.Refused, "occupied"):
+            self.recover(run, "restore")
+        self.assertEqual(os.readlink(stage), "missing")
+        self.assertTrue((run / stage.name).is_dir())
+
+    def test_edited_quarantined_payload_does_not_match_the_original_witness(self):
+        stage = self.stage()
+        run = Path(self.apply()["run_directory"])
+        changed = run / stage.name / "snapshot.sqlite3"
+        changed.write_bytes(b"operator modified evidence")
+        before = sorted(path.name for path in run.iterdir())
+        for mode in ("resume", "restore"):
+            with self.assertRaisesRegex(reclaim.Refused, "changed since preview"):
+                self.recover(run, mode)
+        self.assertEqual(changed.read_bytes(), b"operator modified evidence")
+        self.assertEqual(before, sorted(path.name for path in run.iterdir()))
+
+    def test_missing_recorded_stage_cannot_be_reported_as_completed(self):
+        stage = self.stage()
+        run = Path(self.apply()["run_directory"])
+        (run / stage.name).rename(self.root / "operator-retained-stage")
+        with self.assertRaisesRegex(reclaim.Refused, "exactly one"):
+            self.recover(run, "resume")
+        self.assertTrue((self.root / "operator-retained-stage/snapshot.sqlite3").is_file())
+
+    def test_other_database_or_archive_cannot_use_a_manifest(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        other = self.parent / "other.sqlite3"
+        other.write_bytes(b"other mailbox")
+        with reclaim.Mailbox(other, self.archive) as mailbox:
+            with self.assertRaisesRegex(reclaim.Refused, "another mailbox"):
+                reclaim.recover_run(mailbox, run)
+        with reclaim.Mailbox(self.database, self.root) as mailbox:
+            with self.assertRaisesRegex(reclaim.Refused, "under this archive"):
+                reclaim.recover_run(mailbox, run)
+
+    def test_corrupt_or_oversized_manifest_is_retained_without_new_actions(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        for payload in (b'{"schema":', b"x" * (reclaim.MAX_MANIFEST_BYTES + 1)):
+            self.replace_manifest(run, payload)
+            before = sorted(path.name for path in run.iterdir())
+            with self.mailbox() as mailbox:
+                with self.assertRaises(reclaim.Refused):
+                    reclaim.recover_run(mailbox, run, mode="resume", offline=True, expected_digest="0" * 64)
+            self.assertEqual((run / "manifest.json").read_bytes(), payload)
+            self.assertEqual(before, sorted(path.name for path in run.iterdir()))
+
+    def test_duplicate_json_keys_in_manifest_fail_closed(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        data = (run / "manifest.json").read_bytes()
+        self.replace_manifest(run, b'{"schema":999,' + data[1:])
+        with self.mailbox() as mailbox:
+            with self.assertRaisesRegex(reclaim.Refused, "duplicate key"):
+                reclaim.recover_run(mailbox, run)
+
+    def test_manifest_traversal_duplicate_stages_and_unknown_schema_are_refused(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        original = json.loads((run / "manifest.json").read_text())
+        for issue in ("traversal", "duplicate", "schema", "bounds", "checksum"):
+            manifest = json.loads(json.dumps(original))
+            plan = manifest["plan"]
+            if issue == "traversal":
+                plan["eligible"][0]["name"] = reclaim.STAGE_PREFIX + "x/../../custom.sqlite3"
+            elif issue == "duplicate":
+                plan["eligible"].append(plan["eligible"][0].copy())
+            elif issue == "schema":
+                manifest["schema"] = 999
+            elif issue == "bounds":
+                plan["eligible"][0]["entries"] = reclaim.MAX_ENTRIES + 1
+            if issue == "checksum":
+                plan["plan_sha256"] = "0" * 64
+            else:
+                plan["plan_sha256"] = reclaim.digest({key: value for key, value in plan.items() if key != "plan_sha256"})
+            self.replace_manifest(run, manifest)
+            with self.subTest(issue=issue), self.mailbox() as mailbox:
+                with self.assertRaises(reclaim.Refused):
+                    reclaim.recover_run(mailbox, run)
+        self.assert_protected()
+
+    def test_symlinked_manifest_is_not_read_or_replaced(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        manifest = run / "manifest.json"
+        preserved = run / "preserved-manifest.json"
+        manifest.rename(preserved)
+        data = preserved.read_bytes()
+        manifest.symlink_to(preserved)
+        with self.mailbox() as mailbox:
+            with self.assertRaises(OSError):
+                reclaim.recover_run(mailbox, run)
+        self.assertEqual(preserved.read_bytes(), data)
+        self.assertEqual(os.readlink(manifest), str(preserved))
+
+    def test_restore_requires_offline_and_original_plan_digest(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        plan = json.loads((run / "manifest.json").read_text())["plan"]
+        before = sorted(path.name for path in run.iterdir())
+        with self.mailbox() as mailbox:
+            with self.assertRaisesRegex(reclaim.Refused, "offline"):
+                reclaim.recover_run(mailbox, run, mode="restore", expected_digest=plan["plan_sha256"])
+            with self.assertRaisesRegex(reclaim.Refused, "digest"):
+                reclaim.recover_run(mailbox, run, mode="restore", offline=True)
+        self.assertEqual(before, sorted(path.name for path in run.iterdir()))
+
+    def test_restore_still_refuses_a_concurrent_exporter(self):
+        self.stage()
+        run = Path(self.apply()["run_directory"])
+        plan = json.loads((run / "manifest.json").read_text())["plan"]
+        with self.exporter():
+            completed, result = self.cli("--restore", str(run), "--offline", "--expect-plan", plan["plan_sha256"])
+            self.assertEqual(completed.returncode, 3)
+            self.assertIn("lease", result["error"])
+
+    def test_resume_after_post_rename_failure_rechecks_actual_evidence(self):
+        stage = self.stage()
+        plan = self.preview()
+        real_rename = reclaim.rename_noreplace
+        real_sync = os.fsync
+        renamed = False
+        with self.mailbox() as mailbox:
+            def rename(*args):
+                nonlocal renamed
+                real_rename(*args)
+                renamed = True
+
+            def sync(fd):
+                if renamed and fd == mailbox.parent:
+                    raise OSError(errno.EIO, "unconfirmed publication")
+                real_sync(fd)
+
+            with mock.patch.object(reclaim, "rename_noreplace", side_effect=rename), \
+                 mock.patch.object(reclaim.os, "fsync", side_effect=sync):
+                result = reclaim.apply_plan(mailbox, plan["plan_sha256"], 3600, offline=True)
+        self.assertFalse(result["ok"])
+        run = Path(result["run_directory"])
+        recovered = self.recover(run, "resume", plan)
+        self.assertTrue(recovered["ok"])
+        self.assertEqual(recovered["moved"], [])
+        self.assertEqual(len(recovered["unchanged"]), 1)
+        self.assertFalse(stage.exists())
+        restored = self.recover(run, "restore", plan)
+        self.assertTrue(restored["ok"])
+        self.assertEqual((stage / "snapshot.sqlite3").read_bytes(), b"retained snapshot")
+
+    def test_retained_young_stages_never_enter_resume_or_restore(self):
+        old = self.stage("old")
+        young = self.stage("young", old=False)
+        run = Path(self.apply()["run_directory"])
+        plan = json.loads((run / "manifest.json").read_text())["plan"]
+        self.assertEqual(len(plan["retained"]), 1)
+        for mode in ("inspect", "resume", "restore"):
+            result = self.recover(run, mode, plan)
+            self.assertTrue(result["ok"])
+            self.assertTrue(young.exists())
+            self.assertEqual((young / "snapshot.sqlite3").read_bytes(), b"retained snapshot")
+        self.assertTrue(old.exists())
+
+    def test_unsupported_platform_has_no_fallback_or_mutation(self):
+        self.stage()
+        with mock.patch.object(reclaim.sys, "platform", "win32"):
+            with self.assertRaisesRegex(reclaim.Refused, "requires Linux"):
+                self.preview()
+        self.assertFalse((self.archive / "doctor").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
