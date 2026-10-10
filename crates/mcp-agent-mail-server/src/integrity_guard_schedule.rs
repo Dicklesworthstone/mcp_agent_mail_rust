@@ -14,6 +14,7 @@
 //! hour, and renew that deadline only on actual verified publication. These
 //! are scheduling requests, never substitutes for the producer's integrity
 //! checks, the worker's full-verification gate, or filesystem admission.
+//! On Unix the admission journal retains the same deadline across restarts.
 //!
 //! A full-check failure is separately sticky: time passing or a weaker quick
 //! check cannot authorize backups, reconciliation, or database maintenance.
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 
 pub(super) const BACKUP_RETRY_INITIAL: Duration = Duration::from_secs(15 * 60);
 pub(super) const BACKUP_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
-const VERIFIED_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const VERIFIED_REFRESH_INTERVAL: Duration = Duration::from_secs(super::BACKUP_MAX_AGE_SECS);
 const FULL_RETRY_INITIAL: Duration = Duration::from_secs(5 * 60);
 const FULL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
@@ -256,9 +257,7 @@ mod tests {
         schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, failed_at);
         assert_eq!(schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL), None);
         assert_eq!(
-            schedule.next_attempt(
-                failed_at + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)
-            ),
+            schedule.next_attempt(failed_at + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)),
             None
         );
         assert_eq!(
@@ -293,13 +292,12 @@ mod tests {
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
         let published_at = start + VERIFIED_REFRESH_INTERVAL + Duration::from_secs(120);
-        schedule.complete(
-            BackupKind::Verified,
-            BackupCompletion::Published,
-            published_at,
-        );
+        schedule.complete(BackupKind::Verified, BackupCompletion::Published, published_at);
         assert_eq!(schedule.verified_refresh_anchor, Some(published_at));
-        assert_eq!(schedule.next_attempt(published_at), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(published_at),
+            Some(BackupKind::Proactive)
+        );
         let before_due = published_at + VERIFIED_REFRESH_INTERVAL - Duration::from_nanos(1);
         schedule.complete(BackupKind::Proactive, BackupCompletion::Skipped, before_due);
         assert_eq!(schedule.next_attempt(before_due), Some(BackupKind::Proactive));
@@ -330,7 +328,10 @@ mod tests {
             // live full-check interval or on how often proactive copies run.
             schedule.complete(kind, BackupCompletion::Published, now);
         }
-        assert_eq!(verified_minutes, (1_u64..=24).map(|hour| hour * 60).collect::<Vec<_>>());
+        assert_eq!(
+            verified_minutes,
+            (1_u64..=24).map(|hour| hour * 60).collect::<Vec<_>>()
+        );
     }
 
     #[test]

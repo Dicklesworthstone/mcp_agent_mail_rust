@@ -9,7 +9,15 @@
 //! never truncates, replaces, or deletes the locked file. Interrupted completion
 //! writes retain the preceding admitted intent. Both invalid slots fail closed
 //! for automatic backup admission only; this is not evidence of live corruption.
+//!
+//! Version 2 also retains the verified-refresh anchor (br-kp1in.36). Restarting
+//! between quick cycles must not postpone verification metadata forever. The
+//! anchor is a scheduling hint, not proof that a backup is healthy. Version 1
+//! records remain readable and acquire the new field on ordinary publication;
+//! mixed slots retain the same consecutive-generation and checksum checks.
+//! Older binaries refuse version 2 instead of overlooking a newer intent.
 
+use super::BACKUP_MAX_AGE_SECS;
 use super::schedule::{BACKUP_RETRY_INITIAL, BACKUP_RETRY_MAX, BackupCompletion, BackupKind};
 use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
@@ -25,7 +33,8 @@ use nix::sys::stat::{Mode, SFlag, fstatat};
 const SLOT_BYTES: usize = 128;
 const PAYLOAD_BYTES: usize = SLOT_BYTES - 32;
 const JOURNAL_BYTES: usize = SLOT_BYTES * 2;
-const MAGIC: &[u8; 8] = b"AMBACK01";
+const MAGIC: &[u8; 8] = b"AMBACK02";
+const LEGACY_MAGIC: &[u8; 8] = b"AMBACK01";
 const DIRECTORY_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_NOFOLLOW)
@@ -40,6 +49,9 @@ struct State {
     in_flight: bool,
     recorded_at: u64,
     delay_secs: u64,
+    // First non-failed proactive completion, then the last verified
+    // publication. Zero means no anchor was recorded, including v1 records.
+    verification_anchor: u64,
 }
 
 impl State {
@@ -47,6 +59,12 @@ impl State {
         // A reversed wall clock is never permission to retry immediately.
         self.delay_secs
             .saturating_sub(now.saturating_sub(self.recorded_at))
+    }
+
+    fn verification_due(self, now: u64) -> bool {
+        self.verification_anchor != 0
+            && (now < self.verification_anchor
+                || now.saturating_sub(self.verification_anchor) >= BACKUP_MAX_AGE_SECS)
     }
 
     fn encode(self) -> [u8; SLOT_BYTES] {
@@ -57,17 +75,24 @@ impl State {
         bytes[20] = u8::from(self.verified_pending) | (u8::from(self.in_flight) << 1);
         bytes[24..32].copy_from_slice(&self.recorded_at.to_le_bytes());
         bytes[32..40].copy_from_slice(&self.delay_secs.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.verification_anchor.to_le_bytes());
         let digest = Sha256::digest(&bytes[..PAYLOAD_BYTES]);
         bytes[PAYLOAD_BYTES..].copy_from_slice(&digest);
         bytes
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != SLOT_BYTES
-            || &bytes[..8] != MAGIC
+        if bytes.len() != SLOT_BYTES {
+            return None;
+        }
+        let legacy = &bytes[..8] == LEGACY_MAGIC;
+        let reserved_start = if legacy { 40 } else { 48 };
+        if (!legacy && &bytes[..8] != MAGIC)
             || bytes[20] & !3 != 0
             || bytes[21..24].iter().any(|byte| *byte != 0)
-            || bytes[40..PAYLOAD_BYTES].iter().any(|byte| *byte != 0)
+            || bytes[reserved_start..PAYLOAD_BYTES]
+                .iter()
+                .any(|byte| *byte != 0)
             || Sha256::digest(&bytes[..PAYLOAD_BYTES])[..] != bytes[PAYLOAD_BYTES..]
         {
             return None;
@@ -79,6 +104,11 @@ impl State {
             in_flight: bytes[20] & 2 != 0,
             recorded_at: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
             delay_secs: u64::from_le_bytes(bytes[32..40].try_into().ok()?),
+            verification_anchor: if legacy {
+                0
+            } else {
+                u64::from_le_bytes(bytes[40..48].try_into().ok()?)
+            },
         };
         if state.sequence == 0
             || state.delay_secs > BACKUP_RETRY_MAX.as_secs()
@@ -215,11 +245,22 @@ impl AutomaticBackupLease {
         };
         lease.validate_entry()?;
         lease.state = lease.read_state()?;
-        let pending_changed = requested == BackupKind::Verified && !lease.state.verified_pending;
-        lease.state.verified_pending |= requested == BackupKind::Verified;
+        let verification_requested =
+            requested == BackupKind::Verified || lease.state.verification_due(now);
+        let pending_changed = verification_requested && !lease.state.verified_pending;
+        lease.state.verified_pending |= verification_requested;
+        // Retain the entire outstanding delay after a backwards wall-clock
+        // step, but anchor it once to the corrected clock. Otherwise a bad
+        // future timestamp can block automatic backups for days or years.
+        // Subsequent forward-moving polls must not keep sliding this window.
+        let clock_rebased = now < lease.state.recorded_at;
+        if clock_rebased {
+            lease.state.recorded_at = now;
+        }
         if lease.state.remaining(now) > 0 {
-            if pending_changed {
-                // Retain the new request without sliding or clearing backoff.
+            if pending_changed || clock_rebased {
+                // Neither a due verification nor a clock correction clears
+                // failure debt. Persist both before releasing the lease.
                 lease.persist()?;
             }
             return Ok(None);
@@ -257,6 +298,9 @@ impl AutomaticBackupLease {
                 self.state.delay_secs = 0;
                 if self.kind == BackupKind::Verified {
                     self.state.verified_pending = false;
+                    self.state.verification_anchor = now;
+                } else if self.state.verification_anchor == 0 {
+                    self.state.verification_anchor = now;
                 }
             }
             BackupCompletion::Failed => {
@@ -274,6 +318,9 @@ impl AutomaticBackupLease {
                     } else {
                         0
                     };
+                if self.kind == BackupKind::Proactive && self.state.verification_anchor == 0 {
+                    self.state.verification_anchor = now;
+                }
             }
         }
         self.state.in_flight = false;
@@ -320,7 +367,10 @@ impl AutomaticBackupLease {
         self.file.read_exact(&mut bytes[..length])?;
         let (slots, _) = bytes.as_chunks::<SLOT_BYTES>();
         for slot in slots {
-            if slot.starts_with(b"AMBACK") && &slot[..8] != MAGIC {
+            if slot.starts_with(b"AMBACK")
+                && &slot[..8] != MAGIC
+                && &slot[..8] != LEGACY_MAGIC
+            {
                 return Err(invalid(
                     "automatic backup journal uses an unsupported version",
                 ));
@@ -394,6 +444,271 @@ mod tests {
         AutomaticBackupLease::try_begin_at(database, kind, now)
             .expect("admission IO")
             .expect("eligible admission")
+    }
+
+    fn legacy_record(state: State) -> [u8; SLOT_BYTES] {
+        let mut bytes = state.encode();
+        bytes[..8].copy_from_slice(LEGACY_MAGIC);
+        bytes[40..48].fill(0);
+        let digest = Sha256::digest(&bytes[..PAYLOAD_BYTES]);
+        bytes[PAYLOAD_BYTES..].copy_from_slice(&digest);
+        bytes
+    }
+
+    #[test]
+    fn verified_refresh_survives_reopens_and_proactive_publications_or_skips() {
+        let (_directory, database) = fixture();
+        for minute in (0_u64..60).step_by(5) {
+            let lease = begin(&database, BackupKind::Proactive, NOW + minute * 60);
+            assert_eq!(lease.kind(), BackupKind::Proactive);
+            let completion = if minute % 10 == 0 {
+                BackupCompletion::Published
+            } else {
+                BackupCompletion::Skipped
+            };
+            lease.finish_at(completion, NOW + minute * 60).unwrap();
+        }
+        let due = NOW + BACKUP_MAX_AGE_SECS;
+        let verified = begin(&database, BackupKind::Proactive, due);
+        assert_eq!(verified.kind(), BackupKind::Verified);
+        assert_eq!(verified.state.verification_anchor, NOW);
+        verified.finish_at(BackupCompletion::Published, due).unwrap();
+        let next = begin(&database, BackupKind::Proactive, due + 1);
+        assert_eq!(next.kind(), BackupKind::Proactive);
+        assert_eq!(next.state.verification_anchor, due);
+        next.finish_at(BackupCompletion::Skipped, due + 1).unwrap();
+        assert_eq!(
+            begin(&database, BackupKind::Proactive, due + BACKUP_MAX_AGE_SECS).kind(),
+            BackupKind::Verified
+        );
+    }
+
+    #[test]
+    fn due_refresh_does_not_override_persisted_failure_backoff() {
+        let (_directory, database) = fixture();
+        begin(&database, BackupKind::Proactive, NOW)
+            .finish_at(BackupCompletion::Published, NOW)
+            .unwrap();
+        let failed_at = NOW + BACKUP_MAX_AGE_SECS - 1;
+        begin(&database, BackupKind::Proactive, failed_at)
+            .finish_at(BackupCompletion::Failed, failed_at)
+            .unwrap();
+        assert!(
+            AutomaticBackupLease::try_begin_at(
+                &database,
+                BackupKind::Proactive,
+                NOW + BACKUP_MAX_AGE_SECS,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            failed_at + BACKUP_RETRY_INITIAL.as_secs(),
+        );
+        assert_eq!(retry.kind(), BackupKind::Verified);
+        assert_eq!(retry.previous_failures, 1);
+        assert_eq!(retry.state.verification_anchor, NOW);
+    }
+
+    #[test]
+    fn failed_and_skipped_refreshes_cannot_renew_verification_freshness() {
+        for completion in [BackupCompletion::Failed, BackupCompletion::Skipped] {
+            let (_directory, database) = fixture();
+            begin(&database, BackupKind::Proactive, NOW)
+                .finish_at(BackupCompletion::Skipped, NOW)
+                .unwrap();
+            let due = NOW + BACKUP_MAX_AGE_SECS;
+            let lease = begin(&database, BackupKind::Proactive, due);
+            assert_eq!(lease.kind(), BackupKind::Verified);
+            lease.finish_at(completion, due).unwrap();
+            assert!(
+                AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, due)
+                    .unwrap()
+                    .is_none()
+            );
+            let retry = begin(
+                &database,
+                BackupKind::Proactive,
+                due + BACKUP_RETRY_INITIAL.as_secs(),
+            );
+            assert_eq!(retry.kind(), BackupKind::Verified);
+            assert_eq!(retry.state.verification_anchor, NOW);
+            assert!(retry.state.verified_pending);
+        }
+    }
+
+    #[test]
+    fn clock_rollback_rebases_once_without_forgiving_or_sliding_cooldown() {
+        let (_directory, database) = fixture();
+        drop(begin(&database, BackupKind::Proactive, NOW));
+        let corrected = NOW - 24 * 3600;
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, corrected)
+                .unwrap()
+                .is_none()
+        );
+        let rebased = fs::read(journal_path(&database)).unwrap();
+        for elapsed in [1, 300, BACKUP_RETRY_MAX.as_secs() - 1] {
+            assert!(
+                AutomaticBackupLease::try_begin_at(
+                    &database,
+                    BackupKind::Proactive,
+                    corrected + elapsed,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(fs::read(journal_path(&database)).unwrap(), rebased);
+        }
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            corrected + BACKUP_RETRY_MAX.as_secs(),
+        );
+        assert_eq!(retry.previous_failures, 1);
+        assert_eq!(retry.state.failures, 2);
+    }
+
+    #[test]
+    fn future_verification_anchor_requests_fresh_evidence_without_bypassing_backoff() {
+        let (_directory, database) = fixture();
+        begin(&database, BackupKind::Verified, NOW)
+            .finish_at(BackupCompletion::Published, NOW)
+            .unwrap();
+        begin(&database, BackupKind::Proactive, NOW + 1)
+            .finish_at(BackupCompletion::Failed, NOW + 1)
+            .unwrap();
+        let corrected = NOW - 3600;
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, corrected)
+                .unwrap()
+                .is_none()
+        );
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            corrected + BACKUP_RETRY_INITIAL.as_secs(),
+        );
+        assert_eq!(retry.kind(), BackupKind::Verified);
+        assert_eq!(retry.state.verification_anchor, NOW);
+        assert_eq!(retry.previous_failures, 1);
+    }
+
+    #[test]
+    fn legacy_journal_upgrade_preserves_failure_debt_and_mixed_slot_authority() {
+        let (_directory, database) = fixture();
+        let completed = State {
+            sequence: 2,
+            failures: 1,
+            recorded_at: NOW,
+            delay_secs: BACKUP_RETRY_INITIAL.as_secs(),
+            ..State::default()
+        };
+        let intent = State {
+            sequence: 1,
+            in_flight: true,
+            delay_secs: BACKUP_RETRY_MAX.as_secs(),
+            ..completed
+        };
+        let mut bytes = [0_u8; JOURNAL_BYTES];
+        bytes[..SLOT_BYTES].copy_from_slice(&legacy_record(completed));
+        bytes[SLOT_BYTES..].copy_from_slice(&legacy_record(intent));
+        fs::write(journal_path(&database), bytes).unwrap();
+        fs::set_permissions(journal_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW + 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(journal_path(&database)).unwrap(), bytes);
+        let due = NOW + BACKUP_RETRY_INITIAL.as_secs();
+        let lease = begin(&database, BackupKind::Proactive, due);
+        assert_eq!(lease.previous_failures, 1);
+        assert_eq!(lease.state.sequence, 3);
+        let mixed = fs::read(journal_path(&database)).unwrap();
+        assert_eq!(&mixed[..8], LEGACY_MAGIC);
+        assert_eq!(&mixed[SLOT_BYTES..SLOT_BYTES + 8], MAGIC);
+        drop(lease);
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, due + 1)
+                .unwrap()
+                .is_none(),
+            "the v2 admitted intent wins over the older v1 completion"
+        );
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            due + BACKUP_RETRY_MAX.as_secs(),
+        );
+        assert_eq!(retry.previous_failures, 2);
+    }
+
+    #[test]
+    fn legacy_padding_and_future_versions_never_supply_verification_authority() {
+        let state = State {
+            sequence: 2,
+            recorded_at: NOW,
+            verification_anchor: NOW,
+            ..State::default()
+        };
+        let legacy = legacy_record(state);
+        assert_eq!(
+            State::decode(&legacy).unwrap().verification_anchor,
+            0,
+            "old reserved bytes carry no scheduling claim"
+        );
+        let mut invalid_legacy = legacy;
+        invalid_legacy[40..48].copy_from_slice(&NOW.to_le_bytes());
+        let digest = Sha256::digest(&invalid_legacy[..PAYLOAD_BYTES]);
+        invalid_legacy[PAYLOAD_BYTES..].copy_from_slice(&digest);
+        assert!(State::decode(&invalid_legacy).is_none());
+
+        let (_directory, database) = fixture();
+        let mut future = State { sequence: 3, ..state }.encode();
+        future[..8].copy_from_slice(b"AMBACK99");
+        let digest = Sha256::digest(&future[..PAYLOAD_BYTES]);
+        future[PAYLOAD_BYTES..].copy_from_slice(&digest);
+        let mut bytes = [0_u8; JOURNAL_BYTES];
+        bytes[..SLOT_BYTES].copy_from_slice(&state.encode());
+        bytes[SLOT_BYTES..].copy_from_slice(&future);
+        fs::write(journal_path(&database), bytes).unwrap();
+        fs::set_permissions(journal_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, NOW).is_err());
+        assert_eq!(fs::read(journal_path(&database)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn interrupted_verified_completion_does_not_renew_the_durable_anchor() {
+        let (_directory, database) = fixture();
+        begin(&database, BackupKind::Proactive, NOW)
+            .finish_at(BackupCompletion::Published, NOW)
+            .unwrap();
+        let due = NOW + BACKUP_MAX_AGE_SECS;
+        let lease = begin(&database, BackupKind::Proactive, due);
+        assert_eq!(lease.kind(), BackupKind::Verified);
+        assert_eq!(lease.state.sequence, 3);
+        drop(lease);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(journal_path(&database))
+            .unwrap();
+        file.write_all(b"interrupted verified completion").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(
+            AutomaticBackupLease::try_begin_at(&database, BackupKind::Proactive, due + 1)
+                .unwrap()
+                .is_none()
+        );
+        let retry = begin(
+            &database,
+            BackupKind::Proactive,
+            due + BACKUP_RETRY_MAX.as_secs(),
+        );
+        assert_eq!(retry.kind(), BackupKind::Verified);
+        assert_eq!(retry.state.verification_anchor, NOW);
     }
 
     #[test]
@@ -690,12 +1005,16 @@ mod tests {
             in_flight: true,
             delay_secs: BACKUP_RETRY_MAX.as_secs(),
             recorded_at: NOW,
+            verification_anchor: NOW - 1,
             ..State::default()
         };
         assert_eq!(State::decode(&state.encode()), Some(state));
         let mut damaged = state.encode();
         damaged[24] ^= 1;
         assert!(State::decode(&damaged).is_none());
+        let mut damaged_anchor = state.encode();
+        damaged_anchor[40] ^= 1;
+        assert!(State::decode(&damaged_anchor).is_none());
         let future = State {
             delay_secs: BACKUP_RETRY_MAX.as_secs() + 1,
             ..state
@@ -735,20 +1054,69 @@ mod tests {
     }
 
     #[test]
+    fn separate_processes_cannot_postpone_verified_refresh_by_restarting() {
+        let (_directory, database) = fixture();
+        for expected in ["seed-refresh", "before-refresh", "refresh", "after-refresh"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "integrity_guard::backup_journal::tests::durable_backup_child_process_probe",
+                    "--nocapture",
+                ])
+                .env("AM_BACKUP_JOURNAL_TEST_PATH", &database)
+                .env("AM_BACKUP_JOURNAL_TEST_EXPECTED", expected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child {expected}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("GH326_CHILD_PROBE_EXECUTED"),
+                "child test filter matched no test"
+            );
+        }
+        assert_eq!(fs::read(&database).unwrap(), b"untouched mailbox sentinel");
+    }
+
+    #[test]
     fn durable_backup_child_process_probe() {
         let Some(path) = std::env::var_os("AM_BACKUP_JOURNAL_TEST_PATH") else {
             return;
         };
         let expected = std::env::var("AM_BACKUP_JOURNAL_TEST_EXPECTED").unwrap();
+        let now = match expected.as_str() {
+            "before-refresh" => NOW + BACKUP_MAX_AGE_SECS - 1,
+            "refresh" => NOW + BACKUP_MAX_AGE_SECS,
+            "after-refresh" => NOW + BACKUP_MAX_AGE_SECS + 1,
+            _ => NOW,
+        };
         let lease =
-            AutomaticBackupLease::try_begin_at(Path::new(&path), BackupKind::Proactive, NOW)
+            AutomaticBackupLease::try_begin_at(Path::new(&path), BackupKind::Proactive, now)
                 .unwrap();
         match expected.as_str() {
             "admitted" => lease
                 .expect("first process admitted")
-                .finish_at(BackupCompletion::Failed, NOW)
+                .finish_at(BackupCompletion::Failed, now)
                 .unwrap(),
             "deferred" => assert!(lease.is_none(), "fresh process bypassed durable failure"),
+            "seed-refresh" | "before-refresh" | "after-refresh" => {
+                let lease = lease.expect("eligible proactive attempt");
+                assert_eq!(lease.kind(), BackupKind::Proactive);
+                let completion = if expected == "seed-refresh" {
+                    BackupCompletion::Published
+                } else {
+                    BackupCompletion::Skipped
+                };
+                lease.finish_at(completion, now).unwrap();
+            }
+            "refresh" => {
+                let lease = lease.expect("eligible verified refresh");
+                assert_eq!(lease.kind(), BackupKind::Verified);
+                assert_eq!(lease.state.verification_anchor, NOW);
+                lease.finish_at(BackupCompletion::Published, now).unwrap();
+            }
             _ => panic!("invalid fixture expectation"),
         }
         eprintln!("GH326_CHILD_PROBE_EXECUTED");
