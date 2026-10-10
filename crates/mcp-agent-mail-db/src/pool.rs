@@ -30,7 +30,7 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -3276,6 +3276,105 @@ fn apply_journal_size_limit(conn: &DbConn, bytes: u64) -> Result<(), SqlError> {
     conn.execute_raw(&format!("PRAGMA journal_size_limit = {value};"))
 }
 
+/// Holds new pool checkouts while one commit resets an over-limit WAL
+/// (br-v0ucm).
+///
+/// FrankenSQLite refuses every checkpoint (`busy = 1`, nothing backfilled)
+/// while any concurrent transaction is active, and its autocheckpoint defers
+/// on the same condition. Under continuous load no such idle moment comes, so
+/// the WAL grows without bound: 216-283 MB in 300 s of a paced 60-agent load.
+/// Every fresh connection rescans the whole WAL on open, so each one gets
+/// slower. A commit that finds the WAL past `journal_size_limit` closes this
+/// gate. In-flight transactions then finish, and the commit truncates the WAL.
+///
+/// The gate is process-wide rather than per database: a mailbox process
+/// serves one database, and the hold is bounded either way.
+pub(crate) struct WalResetGate {
+    closed: AtomicBool,
+    /// Microseconds after [`WalResetGate::epoch`] before which a new reset is
+    /// not attempted, so a WAL pinned by a long reader cannot make every
+    /// commit hold the pool.
+    retry_after_us: AtomicU64,
+    epoch: OnceLock<Instant>,
+}
+
+pub(crate) static WAL_RESET_GATE: WalResetGate = WalResetGate::new();
+
+/// Longest a checkout waits on a closed gate. The holder reopens it well
+/// before this; the bound only guards against a holder that never returns.
+const WAL_RESET_GATE_MAX_WAIT: Duration = Duration::from_secs(2);
+
+/// Releases the [`WalResetGate`] when the reset attempt ends, however it ends.
+pub(crate) struct WalResetGateHold<'gate> {
+    gate: &'gate WalResetGate,
+}
+
+impl Drop for WalResetGateHold<'_> {
+    fn drop(&mut self) {
+        self.gate.closed.store(false, Ordering::Release);
+    }
+}
+
+impl WalResetGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            retry_after_us: AtomicU64::new(0),
+            epoch: OnceLock::new(),
+        }
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        let epoch = self.epoch.get_or_init(Instant::now);
+        u64::try_from(epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// Close the gate unless another reset holds it or one failed recently.
+    #[must_use]
+    pub(crate) fn try_close(&self) -> Option<WalResetGateHold<'_>> {
+        if self.elapsed_us() < self.retry_after_us.load(Ordering::Acquire) {
+            return None;
+        }
+        // Build the hold only on success: dropping one reopens the gate.
+        if self
+            .closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(WalResetGateHold { gate: self })
+        } else {
+            None
+        }
+    }
+
+    /// Skip reset attempts for `cooldown` after one could not truncate.
+    pub(crate) fn defer_retry(&self, cooldown: Duration) {
+        let cooldown_us = u64::try_from(cooldown.as_micros()).unwrap_or(u64::MAX);
+        self.retry_after_us.store(
+            self.elapsed_us().saturating_add(cooldown_us),
+            Ordering::Release,
+        );
+    }
+
+    #[must_use]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Wait (bounded, cancel-aware) while a WAL reset holds the gate.
+    fn wait_while_closed(&self, cx: &Cx) {
+        if !self.is_closed() {
+            return;
+        }
+        let deadline = Instant::now() + WAL_RESET_GATE_MAX_WAIT;
+        // Checkouts run on blocking workers (see `DbPool::acquire`'s retry
+        // backoff), so a short thread sleep is the established wait here.
+        while self.is_closed() && Instant::now() < deadline && cx.checkpoint().is_ok() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 impl DbPool {
     fn live_maintenance_connection(
         &self,
@@ -3658,6 +3757,7 @@ impl DbPool {
     /// tool caller. Cancellation and all other errors propagate unchanged.
     pub async fn acquire(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
         const CHECKOUT_VALIDATION_RETRIES: u32 = 6;
+        WAL_RESET_GATE.wait_while_closed(cx);
         let mut attempt = 0;
         loop {
             let out = self.acquire_once(cx).await;
@@ -17355,6 +17455,51 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     type HealthProbe = fn(&Path) -> Result<bool, SqlError>;
+
+    /// br-v0ucm: one WAL reset holds the gate at a time, checkouts wait for
+    /// it to end, and a holder that never returns cannot stall them.
+    #[test]
+    fn wal_reset_gate_holds_checkouts_only_while_a_reset_runs() {
+        let cx = Cx::for_testing();
+        let gate = WalResetGate::new();
+        let started = Instant::now();
+        gate.wait_while_closed(&cx);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "an open gate admits checkouts at once"
+        );
+
+        let hold = gate.try_close().expect("the first reset closes the gate");
+        assert!(gate.try_close().is_none(), "one reset at a time");
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                drop(hold);
+            });
+            gate.wait_while_closed(&cx);
+        });
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(90) && waited < WAL_RESET_GATE_MAX_WAIT,
+            "a checkout waits exactly until the reset ends, waited {waited:?}"
+        );
+
+        let stuck = gate
+            .try_close()
+            .expect("a successful reset leaves no cooldown");
+        let started = Instant::now();
+        gate.wait_while_closed(&cx);
+        let waited = started.elapsed();
+        assert!(
+            waited >= WAL_RESET_GATE_MAX_WAIT && waited < WAL_RESET_GATE_MAX_WAIT * 2,
+            "a holder that never returns delays checkouts by the bound only, waited {waited:?}"
+        );
+        drop(stuck);
+
+        gate.defer_retry(Duration::from_secs(60));
+        assert!(gate.try_close().is_none(), "a deferred gate refuses resets");
+    }
 
     // GH#288: the "both rejected" WARN dedups per (path, message) — first
     // observation warns, identical repeats inside the cadence stay quiet, a

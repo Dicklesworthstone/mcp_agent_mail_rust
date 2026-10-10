@@ -1786,6 +1786,89 @@ fn wal_checkpoint_progress(rows: &[SqlRow]) -> Option<WalCheckpointProgress> {
     })
 }
 
+/// Smallest WAL a reset is attempted for, whatever `journal_size_limit` says:
+/// a zero limit must not make every contended commit hold the pool.
+const WAL_RESET_MIN_BYTES: i64 = 1 << 20;
+/// How long a WAL reset waits for in-flight transactions before it reopens
+/// the pool without truncating.
+const WAL_RESET_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// After a reset that could not truncate, commits skip resets for this long.
+const WAL_RESET_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `wal_frames` WAL frames exceed this connection's
+/// `journal_size_limit`. A negative limit (unbounded WAL) never does.
+fn wal_exceeds_journal_size_limit(conn: &crate::DbConn, wal_frames: i64) -> bool {
+    if wal_frames <= 0 {
+        return false;
+    }
+    let pragma = |sql: &str| {
+        conn.query_sync(sql, &[])
+            .ok()?
+            .first()?
+            .get(0)
+            .and_then(value_as_i64)
+    };
+    let (Some(limit), Some(page_size)) = (
+        pragma("PRAGMA journal_size_limit;"),
+        pragma("PRAGMA page_size;"),
+    ) else {
+        return false;
+    };
+    // Each WAL frame is a 24-byte header plus one page.
+    limit >= 0
+        && wal_frames.saturating_mul(page_size.saturating_add(24)) > limit.max(WAL_RESET_MIN_BYTES)
+}
+
+/// Truncate an over-limit WAL after a commit whose checkpoint was refused
+/// (br-v0ucm). FrankenSQLite refuses every checkpoint while any concurrent
+/// transaction is active, so under continuous load the WAL never resets.
+/// This closes `gate` ([`crate::pool::WAL_RESET_GATE`] outside tests) so new
+/// checkouts wait, retries a zero-wait TRUNCATE until the in-flight
+/// transactions finish, and reopens the gate. Returns whether the WAL was
+/// truncated. A truncate also publishes this commit, so the caller keeps its
+/// connection.
+fn reset_over_limit_wal(cx: &Cx, conn: &crate::DbConn, gate: &crate::pool::WalResetGate) -> bool {
+    let Some(_hold) = gate.try_close() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts += 1;
+        match conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]) {
+            Ok(rows)
+                if wal_checkpoint_progress(&rows)
+                    .is_some_and(WalCheckpointProgress::fully_published) =>
+            {
+                tracing::debug!(
+                    db_path = %conn.path(),
+                    attempts,
+                    waited_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "wal_reset_truncated"
+                );
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    db_path = %conn.path(),
+                    error = %error,
+                    "wal_reset_checkpoint_failed"
+                );
+                break;
+            }
+        }
+        if started.elapsed() >= WAL_RESET_DRAIN_BUDGET || cx.checkpoint().is_err() {
+            break;
+        }
+        // Commits run on blocking workers (see `mvcc_backoff`).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    gate.defer_retry(WAL_RESET_RETRY_COOLDOWN);
+    tracing::debug!(db_path = %conn.path(), attempts, "wal_reset_deferred");
+    false
+}
+
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
         Outcome::Ok(_) => {
@@ -1801,6 +1884,17 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                                 .is_some_and(WalCheckpointProgress::fully_published) =>
                         {
                             // Canonical publication completed without waiting.
+                        }
+                        Ok(rows)
+                            if wal_checkpoint_progress(&rows).is_some_and(|progress| {
+                                wal_exceeds_journal_size_limit(tracked.inner, progress.log)
+                            }) && reset_over_limit_wal(
+                                cx,
+                                tracked.inner,
+                                &crate::pool::WAL_RESET_GATE,
+                            ) =>
+                        {
+                            // The truncate published this commit too.
                         }
                         Ok(rows) => {
                             retire = true;
@@ -24250,6 +24344,125 @@ mod tests {
             wal_checkpoint_progress(&malformed),
             None,
             "missing progress columns must fail closed"
+        );
+    }
+
+    /// br-v0ucm: while any concurrent transaction is active FrankenSQLite
+    /// refuses every checkpoint, so an over-limit WAL is only reset if new
+    /// transactions are held off until the in-flight one finishes.
+    #[test]
+    fn over_limit_wal_reset_waits_for_the_in_flight_transaction() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().expect("wal-reset tempdir");
+        let db_path = directory.path().join("wal-reset.sqlite3");
+        let wal_path = directory.path().join("wal-reset.sqlite3-wal");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = crate::DbConn::open_file(db_path_str.clone()).expect("open writer");
+        for statement in [
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA journal_size_limit = 1048576;",
+            "CREATE TABLE bodies(id INTEGER PRIMARY KEY, body TEXT NOT NULL);",
+            "CREATE TABLE holder(id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
+        ] {
+            conn.execute_raw(statement)
+                .expect("prepare wal-reset database");
+        }
+
+        // Another connection keeps a concurrent write transaction open until
+        // told to commit. It writes a different table, so committing it later
+        // never conflicts with the writer's pages.
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = db_path_str.clone();
+        let holder = std::thread::spawn(move || {
+            let holder = crate::DbConn::open_file(holder_path).expect("open holder");
+            holder
+                .execute_raw("BEGIN CONCURRENT;")
+                .expect("holder begins");
+            holder
+                .execute_raw("INSERT INTO holder(note) VALUES ('in flight');")
+                .expect("holder writes");
+            ready_tx.send(()).expect("announce holder");
+            release_rx.recv().expect("await release");
+            holder.execute_raw("COMMIT;").expect("holder commits");
+        });
+        ready_rx.recv().expect("holder transaction open");
+
+        let body = Value::Text("x".repeat(32 * 1024));
+        for _ in 0..64 {
+            conn.execute_sync(
+                "INSERT INTO bodies(body) VALUES (?)",
+                std::slice::from_ref(&body),
+            )
+            .expect("grow the WAL");
+        }
+        conn.execute_raw("PRAGMA busy_timeout = 0;")
+            .expect("fail-fast checkpoints");
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
+            .expect("passive checkpoint");
+        let progress = wal_checkpoint_progress(&rows).expect("checkpoint tuple");
+        assert_eq!(
+            progress.busy, 1,
+            "the engine refuses checkpoints while a concurrent transaction is active: {progress:?}"
+        );
+        assert!(
+            wal_exceeds_journal_size_limit(&conn, progress.log),
+            "64 x 32 KiB bodies must exceed the 1 MiB journal_size_limit: {progress:?}"
+        );
+        assert!(
+            !wal_exceeds_journal_size_limit(&conn, 1),
+            "one frame is under the limit"
+        );
+
+        // A holder that outlives the drain budget: the reset gives up in
+        // bounded time, reopens the gate and backs off.
+        let cx = asupersync::Cx::for_testing();
+        let gate = crate::pool::WalResetGate::new();
+        let started = Instant::now();
+        assert!(
+            !reset_over_limit_wal(&cx, &conn, &gate),
+            "the WAL cannot be truncated under an open transaction"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the reset must stop at its drain budget, took {:?}",
+            started.elapsed()
+        );
+        assert!(!gate.is_closed(), "a failed reset reopens the gate");
+        assert!(
+            gate.try_close().is_none(),
+            "a failed reset defers the next attempt"
+        );
+
+        // The holder finishes while a reset waits: the reset truncates.
+        let gate = crate::pool::WalResetGate::new();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).expect("release holder");
+        });
+        assert!(
+            reset_over_limit_wal(&cx, &conn, &gate),
+            "the reset truncates once the in-flight transaction commits"
+        );
+        assert!(!gate.is_closed(), "a successful reset reopens the gate");
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+        let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        assert!(
+            wal_bytes < 64 * 1024,
+            "the WAL must be truncated, still {wal_bytes} bytes"
+        );
+        let rows = conn
+            .query_sync("SELECT count(*) AS count FROM holder", &[])
+            .expect("count holder rows");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "the held transaction committed"
         );
     }
 
