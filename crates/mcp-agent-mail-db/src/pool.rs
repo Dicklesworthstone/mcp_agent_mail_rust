@@ -34175,6 +34175,151 @@ mod tests {
         assert!(shm_path.exists());
     }
 
+    /// br-r6psd: child side of a cross-process lock probe. `F_GETLK` reports
+    /// only a conflicting lock owned by ANOTHER process and never takes one,
+    /// so the probe cannot perturb the parent. Run it only in the re-executed
+    /// child: opening and closing the probed inode in the parent would itself
+    /// release the parent's classic `fcntl` locks on Linux.
+    #[cfg(target_os = "linux")]
+    fn fd_close_lock_probe_reports_foreign_conflict(
+        path: &Path,
+        start: nix::libc::off_t,
+        len: nix::libc::off_t,
+    ) -> bool {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("child opens the probed inode");
+        let short = |value: nix::libc::c_int| {
+            nix::libc::c_short::try_from(value).expect("fcntl lock constant fits c_short")
+        };
+        let mut query = nix::libc::flock {
+            l_type: short(nix::libc::F_WRLCK),
+            l_whence: short(nix::libc::SEEK_SET),
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETLK(&mut query))
+            .expect("non-mutating F_GETLK probe");
+        query.l_type != short(nix::libc::F_UNLCK)
+    }
+
+    /// br-r6psd regression (Linux): the sidecar-cleanup classifier runs on
+    /// every periodic integrity cycle of a live pool. It must not open and
+    /// close the live `-shm` inode, because that releases the SHM dead-man
+    /// switch (DMS) read lock that a live FrankenSQLite WAL attachment holds
+    /// for its whole lifetime, letting a foreign stock-SQLite first opener
+    /// take DMS EXCLUSIVE and truncate/reinitialize the WAL index beneath the
+    /// live mapping. Before the metadata-only `-shm` check in
+    /// `classify_sqlite_family_cleanup`, the classifier raw-opened every
+    /// existing sidecar, including `-shm`, and this test failed. Unlike
+    /// `healthy_wal_classification_does_not_open_shm`, it observes the lock
+    /// itself from a separate process, and also covers the periodic cycle.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_classifier_preserves_live_franken_shm_dms_lock() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_SHM_DMS_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "pool_impl::tests::cleanup_classifier_preserves_live_franken_shm_dms_lock";
+        const CHILD_WITNESS: &str = "shm-dms-lock-probe conflict=";
+        // C SQLite / FrankenSQLite `UNIX_SHM_DMS`: WAL-index lock base 120
+        // plus the 8 WAL lock slots.
+        const SHM_DMS_BYTE: nix::libc::off_t = 128;
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let conflict =
+                fd_close_lock_probe_reports_foreign_conflict(Path::new(&path), SHM_DMS_BYTE, 1);
+            println!("{CHILD_WITNESS}{conflict}");
+            return;
+        }
+
+        fn child_observes_parent_dms_claim(shm_path: &Path) -> bool {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve current test executable"),
+            )
+            .arg(CHILD_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_PATH_ENV, shm_path)
+            .output()
+            .expect("run SHM DMS child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let verdict = stdout
+                .lines()
+                // libtest prints `test <name> ... ` ahead of the child's output on the same line.
+                .find_map(|line| line.split_once(CHILD_WITNESS).map(|(_, rest)| rest))
+                .unwrap_or_else(|| panic!("child filter ran no causal lock probe: {stdout}"));
+            verdict.split_whitespace().next() == Some("true")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("franken-live-shm-lock.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic checkpoints");
+        writer
+            .execute_raw("CREATE TABLE live_value (value INTEGER NOT NULL);")
+            .expect("create live fixture table");
+        writer
+            .execute_raw("INSERT INTO live_value (value) VALUES (8);")
+            .expect("commit live WAL frame");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        assert!(
+            shm_path.is_file(),
+            "FrankenSQLite's native WAL path materializes a canonical SHM sidecar"
+        );
+        assert!(
+            child_observes_parent_dms_claim(&shm_path),
+            "precondition: the live WAL attachment must hold its SHM DMS read claim"
+        );
+
+        assert_eq!(
+            cleanup_truncated_wal_sidecar(&db_path).expect("classify healthy live Franken family"),
+            SqliteFamilyCleanupOutcome::NotNeeded
+        );
+        assert!(
+            child_observes_parent_dms_claim(&shm_path),
+            "sidecar-cleanup classification must not release this process's live SHM locks"
+        );
+
+        // The production entry point that reaches the classifier every 300 s.
+        let pool = maintenance_test_pool(&db_path);
+        let periodic = pool.run_periodic_integrity_check();
+        assert!(
+            child_observes_parent_dms_claim(&shm_path),
+            "the periodic integrity cycle must not release this process's live SHM locks"
+        );
+        assert!(
+            periodic
+                .expect("periodic integrity check of a healthy live family")
+                .ok,
+            "a healthy live WAL family must pass the periodic quick cycle"
+        );
+        drop(pool);
+        assert_eq!(
+            writer
+                .query_sync("SELECT value FROM live_value", &[])
+                .expect("query live value after classification")[0]
+                .get_named::<i64>("value")
+                .expect("decode live value"),
+            8
+        );
+        crate::close_db_conn(writer, "clean up live-SHM lock regression writer");
+    }
+
     #[test]
     fn cleanup_empty_wal_sidecar_quarantines_header_only_wal_and_companion_shm() {
         // GH#99/#119: an all-zeros (INVALID-magic) 32-byte WAL sidecar was

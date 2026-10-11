@@ -31190,6 +31190,142 @@ first body
         assert_eq!(configured, i64::from(INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS));
     }
 
+    /// br-r6psd: child side of a cross-process lock probe. `F_GETLK` reports
+    /// only a conflicting lock owned by ANOTHER process and never takes one,
+    /// so the probe cannot perturb the parent. Run it only in the re-executed
+    /// child: opening and closing the probed inode in the parent would itself
+    /// release the parent's classic `fcntl` locks on Linux.
+    #[cfg(target_os = "linux")]
+    fn fd_close_lock_probe_reports_foreign_conflict(
+        path: &Path,
+        start: nix::libc::off_t,
+        len: nix::libc::off_t,
+    ) -> bool {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("child opens the probed inode");
+        let short = |value: nix::libc::c_int| {
+            nix::libc::c_short::try_from(value).expect("fcntl lock constant fits c_short")
+        };
+        let mut query = nix::libc::flock {
+            l_type: short(nix::libc::F_WRLCK),
+            l_whence: short(nix::libc::SEEK_SET),
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETLK(&mut query))
+            .expect("non-mutating F_GETLK probe");
+        query.l_type != short(nix::libc::F_UNLCK)
+    }
+
+    /// br-r6psd regression (Linux): the raw TUI/metrics/observability open
+    /// guard runs inside the server process, beside live FrankenSQLite pool
+    /// connections. With nonclean durable breaker authority on disk it must
+    /// compare fingerprints without opening the live main inode; on origin/main
+    /// `recovery_breaker::fingerprint_db` opens, hashes and closes it, which
+    /// releases every classic `fcntl` lock this process holds there, so a
+    /// separate process stops seeing the parent's RESERVED/SHARED locks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_live_open_guard_preserves_same_process_franken_main_inode_locks() {
+        const CHILD_PATH_ENV: &str = "AM_TEST_RAW_GUARD_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "tests::raw_live_open_guard_preserves_same_process_franken_main_inode_locks";
+        const CHILD_WITNESS: &str = "raw-guard-lock-probe conflict=";
+        // SQLite's lock-byte page: PENDING (0x4000_0000), RESERVED (+1) and
+        // the 510-byte SHARED range (+2 .. +512).
+        const LOCK_PAGE_START: nix::libc::off_t = 0x4000_0000;
+        const LOCK_PAGE_LEN: nix::libc::off_t = 512;
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let conflict = fd_close_lock_probe_reports_foreign_conflict(
+                Path::new(&path),
+                LOCK_PAGE_START,
+                LOCK_PAGE_LEN,
+            );
+            println!("{CHILD_WITNESS}{conflict}");
+            return;
+        }
+
+        fn child_observes_parent_main_lock(db_path: &Path) -> bool {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", CHILD_TEST_NAME, "--nocapture"])
+                .env(CHILD_PATH_ENV, db_path)
+                .output()
+                .expect("run main-inode child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: {output:?}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let verdict = stdout
+                .lines()
+                // libtest prints `test <name> ... ` ahead of the child's output on the same line.
+                .find_map(|line| line.split_once(CHILD_WITNESS).map(|(_, rest)| rest))
+                .unwrap_or_else(|| panic!("child filter ran no causal lock probe: {stdout}"));
+            verdict.split_whitespace().next() == Some("true")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("raw-guard-lock.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use main-inode rollback locking");
+        writer
+            .execute_raw("CREATE TABLE guard_lock_fixture (value INTEGER NOT NULL);")
+            .expect("create guard fixture table");
+        writer
+            .execute_raw("INSERT INTO guard_lock_fixture (value) VALUES (7);")
+            .expect("seed guard fixture row");
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let mut sidecar = db_path.clone().into_os_string();
+            sidecar.push(suffix);
+            assert!(
+                Path::new(&sidecar).is_file(),
+                "precondition: FrankenSQLite namespace sidecar {suffix} marks a Franken-managed family"
+            );
+        }
+
+        // Nonclean durable authority recorded for a different (lock-neutral
+        // format) generation: the guard must consult it, and it must not apply.
+        let other_generation = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: format!("4096:fdc10ce1{}", "0".repeat(56)),
+            consecutive_failures: 1,
+            last_failure_unix: 1,
+            last_failure_reason: "br-r6psd fd-close regression fixture".to_string(),
+            tripped: false,
+            attempt_in_progress: false,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &other_generation)
+            .expect("persist nonclean breaker authority");
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent RESERVED writer lock");
+        assert!(
+            child_observes_parent_main_lock(&db_path),
+            "precondition: a separate process must observe the parent's live main-inode lock"
+        );
+
+        guard_raw_live_sqlite_engine_open(&db_path, "br-r6psd fd-close regression")
+            .expect("breaker history for another generation must not refuse a healthy family");
+
+        assert!(
+            child_observes_parent_main_lock(&db_path),
+            "the raw-open guard must not release this process's live FrankenSQLite main-inode locks"
+        );
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("end the parent writer transaction");
+        drop(writer);
+    }
+
     #[test]
     fn read_only_sync_db_connection_enforces_query_only_for_memory_database() {
         let conn = open_read_only_sync_db_connection_with_busy_timeout(
