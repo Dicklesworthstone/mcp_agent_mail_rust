@@ -33,7 +33,11 @@
 #
 set -Eeuo pipefail
 umask 022
-shopt -s lastpipe 2>/dev/null || true
+# lastpipe stays off (GH#342). With lastpipe and no job control, Bash records the
+# pipeline's last element through append_process(), which half-links the job's
+# process list while SIGCHLD is unblocked. A pipeline child exiting in that window
+# crashed a fresh ACFS install with SIGSEGV (exit 139) in a `$(a | b | head -1)`
+# substitution. No pipeline in this script ends in a builtin that would need it.
 
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
