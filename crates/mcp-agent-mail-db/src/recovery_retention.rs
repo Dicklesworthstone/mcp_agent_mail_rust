@@ -792,6 +792,33 @@ pub struct RetentionResidentStats {
     pub reclaimable_bytes: u64,
 }
 
+impl RetentionResidentStats {
+    /// Existing policy-selected debris alarm. Zero explicitly disables it.
+    #[must_use]
+    pub const fn reclaimable_attention(&self, alert_bytes: u64) -> bool {
+        alert_bytes > 0 && self.reclaimable_bytes >= alert_bytes
+    }
+
+    /// Excess resident evidence needs attention even when none is movable
+    /// (br-kp1in.36). Require both the configured absolute floor and 20 times
+    /// the live database size, so ordinary backups of a large DB stay quiet.
+    ///
+    /// Missing/zero live size cannot establish a ratio. In that case use the
+    /// absolute floor conservatively; consumers still report the missing size.
+    /// Zero disables the alarm. Widen before multiplying: saturation at
+    /// `u64::MAX` would incorrectly alert for an unrepresentable 20x threshold.
+    /// This is an observation, never permission to delete or move evidence.
+    #[must_use]
+    pub fn resident_attention(&self, alert_bytes: u64) -> bool {
+        alert_bytes > 0
+            && self.resident_bytes >= alert_bytes
+            && self
+                .live_database_bytes
+                .filter(|bytes| *bytes > 0)
+                .is_none_or(|live| u128::from(self.resident_bytes) >= u128::from(live) * 20)
+    }
+}
+
 /// Compute the [`RetentionResidentStats`] for `storage_root` / `database_path`.
 ///
 /// `reclaim_policy` optionally applies [`select_recovery_debris_to_reclaim`]
@@ -974,6 +1001,108 @@ mod tests {
 
     const HOUR_US: i64 = 3_600 * 1_000_000;
     const DAY_US: i64 = 24 * HOUR_US;
+
+    #[test]
+    fn resident_attention_requires_both_floor_and_exact_ratio() {
+        let mut stats = RetentionResidentStats {
+            live_database_bytes: Some(100),
+            ..Default::default()
+        };
+        for (resident, alert, expected) in [
+            (200, 100, false),
+            (1_999, 100, false),
+            (2_000, 100, true),
+            (2_500, 3_000, false),
+            (3_000, 3_000, true),
+            (2_500, 100, true),
+        ] {
+            stats.resident_bytes = resident;
+            assert_eq!(stats.resident_attention(alert), expected, "{resident}/{alert}");
+            assert!(!stats.reclaimable_attention(alert));
+        }
+    }
+
+    #[test]
+    fn retention_alert_zero_disables_both_byte_alarms() {
+        let stats = RetentionResidentStats {
+            resident_bytes: u64::MAX,
+            reclaimable_bytes: u64::MAX,
+            live_database_bytes: Some(1),
+            ..Default::default()
+        };
+        assert!(!stats.resident_attention(0));
+        assert!(!stats.reclaimable_attention(0));
+    }
+
+    #[test]
+    fn resident_ratio_multiplication_does_not_saturate_into_a_false_alarm() {
+        let mut stats = RetentionResidentStats {
+            resident_bytes: u64::MAX,
+            live_database_bytes: Some(u64::MAX / 20 + 1),
+            ..Default::default()
+        };
+        assert!(!stats.resident_attention(1));
+        stats.live_database_bytes = Some(u64::MAX / 20);
+        assert!(stats.resident_attention(1));
+    }
+
+    #[test]
+    fn missing_live_size_uses_the_absolute_floor_without_inventing_a_ratio() {
+        for live_database_bytes in [None, Some(0)] {
+            let mut stats = RetentionResidentStats {
+                resident_bytes: 499,
+                live_database_bytes,
+                ..Default::default()
+            };
+            assert!(!stats.resident_attention(500));
+            stats.resident_bytes = 500;
+            assert!(stats.resident_attention(500));
+            assert_eq!(stats.live_database_bytes, live_database_bytes);
+        }
+    }
+
+    #[test]
+    fn reclaimable_alarm_does_not_require_a_large_resident_ratio() {
+        let stats = RetentionResidentStats {
+            resident_bytes: 2_000,
+            reclaimable_bytes: 500,
+            live_database_bytes: Some(1_000),
+            ..Default::default()
+        };
+        assert!(stats.reclaimable_attention(500));
+        assert!(!stats.reclaimable_attention(501));
+        assert!(!stats.resident_attention(500));
+    }
+
+    #[test]
+    fn resident_alarm_survives_move_only_stage_reclamation() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("mail.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-retention-health");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(4_096)
+            .unwrap();
+        let before = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(before.resident_bytes, 4_096);
+        assert_eq!(before.reclaimable_bytes, 0);
+        assert!(before.resident_attention(512));
+        assert!(!before.reclaimable_attention(512));
+
+        // An explicit operator move removes the stage from admission, but
+        // does not free its bytes or justify an all-clear resident verdict.
+        let destination = root.join("doctor/reclaimable/health-test");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&stage, &destination).unwrap();
+        let after = retention_resident_stats(&root, &primary, None).unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 4_096);
+        assert!(after.resident_attention(512));
+        assert!(!after.reclaimable_attention(512));
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
 
     fn art(name: &str, bytes: u64, modified_us: i64, category: DebrisCategory) -> DebrisArtifact {
         DebrisArtifact {

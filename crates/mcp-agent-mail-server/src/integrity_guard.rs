@@ -1068,12 +1068,11 @@ fn run_db_maintenance_cycle(
         *last_atc_retention = Some(now);
     }
 
-    // br-mudrv: bound doctor recovery-debris growth across recovery events.
-    // OBSERVE + ALERT only — the forensic-bundle manifest declares
-    // `automatic_deletion: false` and RULE 1 forbids automatic deletion, so the
-    // actual reclaim is the explicit `am doctor reclaim` operator verb. Here we
-    // surface (warn) when the reclaimable debris exceeds the configured
-    // threshold so the growth that silently reached ~19 GB in prod is visible.
+    // br-mudrv / br-kp1in.36: OBSERVE + ALERT only. Evidence already staged
+    // for reclaim, direct backups and retained proactive exports still occupy
+    // disk even when the reclaim planner would move nothing. Use the same
+    // full footprint and alarm policy as the native health surfaces. This
+    // never authorizes deletion, reclamation, or bypassing backup admission.
     if config.doctor_retention_enabled
         && maintenance_task_due(
             config.doctor_retention_sweep_interval_secs,
@@ -1081,46 +1080,55 @@ fn run_db_maintenance_cycle(
             now,
         )
     {
-        let artifacts = mcp_agent_mail_db::recovery_retention::enumerate_recovery_debris(
-            &config.storage_root,
-            sqlite_path,
-        );
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|d| i64::try_from(d.as_micros()).ok())
             .unwrap_or(0);
         let live_database_bytes = std::fs::metadata(sqlite_path).map_or(0, |meta| meta.len());
-        let plan = mcp_agent_mail_db::recovery_retention::select_recovery_debris_to_reclaim(
-            artifacts,
-            mcp_agent_mail_db::recovery_retention::RetentionPolicy {
-                keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
-                max_age_secs: config.doctor_retention_max_age_secs,
-                max_total_bytes_per_category:
-                    mcp_agent_mail_db::recovery_retention::effective_byte_budget_per_category(
-                        config.doctor_retention_max_bytes_per_category,
-                        live_database_bytes,
-                    ),
-            },
-            now_us,
-        );
-        if config.doctor_retention_alert_bytes > 0
-            && plan.reclaimable_bytes >= config.doctor_retention_alert_bytes
-        {
-            tracing::warn!(
-                reclaimable_bytes = plan.reclaimable_bytes,
-                reclaimable_artifacts = plan.prune.len(),
-                total_bytes = plan.total_bytes,
-                total_artifacts = plan.total_count,
-                alert_bytes = config.doctor_retention_alert_bytes,
-                "doctor recovery debris exceeds retention threshold; run `am doctor reclaim` to consolidate (br-mudrv)"
-            );
-        } else if plan.has_reclaimable() {
-            tracing::debug!(
-                reclaimable_bytes = plan.reclaimable_bytes,
-                reclaimable_artifacts = plan.prune.len(),
-                "doctor recovery debris reclaimable but under alert threshold"
-            );
+        let policy = mcp_agent_mail_db::recovery_retention::RetentionPolicy {
+            keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
+            max_age_secs: config.doctor_retention_max_age_secs,
+            max_total_bytes_per_category:
+                mcp_agent_mail_db::recovery_retention::effective_byte_budget_per_category(
+                    config.doctor_retention_max_bytes_per_category,
+                    live_database_bytes,
+                ),
+        };
+        match mcp_agent_mail_db::recovery_retention::retention_resident_stats(
+            &config.storage_root,
+            sqlite_path,
+            Some((policy, now_us)),
+        ) {
+            Ok(stats) => {
+                let resident_attention = stats.resident_attention(config.doctor_retention_alert_bytes);
+                let reclaimable_attention =
+                    stats.reclaimable_attention(config.doctor_retention_alert_bytes);
+                if resident_attention || reclaimable_attention {
+                    tracing::warn!(
+                        resident_bytes = stats.resident_bytes,
+                        live_database_bytes = ?stats.live_database_bytes,
+                        resident_bytes_by_category = ?stats.resident_bytes_by_category,
+                        reclaimable_bytes = stats.reclaimable_bytes,
+                        reclaimable_staging_bytes = stats.reclaimable_staging_bytes,
+                        resident_attention,
+                        reclaimable_attention,
+                        alert_bytes = config.doctor_retention_alert_bytes,
+                        "retained recovery evidence exceeds its health threshold; inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk (br-kp1in.36)"
+                    );
+                } else if stats.reclaimable_bytes > 0 {
+                    tracing::debug!(
+                        resident_bytes = stats.resident_bytes,
+                        reclaimable_bytes = stats.reclaimable_bytes,
+                        "doctor recovery debris reclaimable but under alert threshold"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                path = %sqlite_path.display(),
+                "retention footprint unavailable; no empty or healthy inventory inferred; evidence preserved (br-kp1in.36)"
+            ),
         }
         *last_doctor_retention = Some(now);
     }
