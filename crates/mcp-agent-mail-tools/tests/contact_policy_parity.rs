@@ -3,8 +3,8 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    ensure_project, fetch_inbox, list_contacts, macro_contact_handshake, register_agent,
-    request_contact, respond_contact, send_message, set_contact_policy,
+    ensure_project, fetch_inbox, file_reservation_paths, list_contacts, macro_contact_handshake,
+    register_agent, request_contact, respond_contact, send_message, set_contact_policy,
 };
 use serde_json::Value;
 use std::fs;
@@ -684,6 +684,75 @@ fn test_mixed_recipients_partial_block() {
         assert!(
             blue_inbox.is_empty(),
             "blocking checks must happen before any recipient delivery"
+        );
+    });
+}
+
+/// Contact evidence is gathered lazily (br-qbhs0), cheapest source first, and
+/// stops once no recipient still needs it. Overlapping reservations are the last
+/// source, so an `auto` recipient whose only evidence is a shared reservation
+/// must still be allowed: a chain that stopped early would block them. That
+/// evidence must not allow a `contacts_only` recipient, who needs an approved
+/// link whatever else is true.
+#[test]
+fn test_shared_reservation_allows_auto_but_not_contacts_only() {
+    run_serial_async(|cx| async move {
+        let scenario = "shared_reservation_evidence";
+        let project_key = format!("/tmp/{scenario}-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let _project_slug =
+            setup_project_and_agents(&ctx, &project_key, &["GreenCastle", "BlueLake", "RedStone"])
+                .await;
+        set_contact_policy(
+            &ctx,
+            project_key.clone(),
+            "RedStone".to_string(),
+            "contacts_only".to_string(),
+        )
+        .await
+        .expect("set contacts_only policy");
+        for agent in ["GreenCastle", "BlueLake", "RedStone"] {
+            file_reservation_paths(
+                &ctx,
+                project_key.clone(),
+                agent.to_string(),
+                vec!["src/shared/**".to_string()],
+                Some(3600),
+                Some(false),
+                Some(scenario.to_string()),
+                None,
+            )
+            .await
+            .expect("shared non-exclusive reservation");
+        }
+
+        send_basic_message(
+            &ctx,
+            &project_key,
+            vec!["BlueLake".to_string()],
+            Some(false),
+        )
+        .await
+        .expect("an auto recipient with a shared reservation is reachable");
+
+        let err = send_basic_message(
+            &ctx,
+            &project_key,
+            vec!["RedStone".to_string()],
+            Some(false),
+        )
+        .await
+        .expect_err("shared reservations do not satisfy contacts_only");
+        let payload = error_object(&err);
+        assert_eq!(
+            payload.get("type").and_then(Value::as_str),
+            Some("CONTACT_REQUIRED")
+        );
+        assert_eq!(
+            payload
+                .get("data")
+                .and_then(|data| data.get("recipients_blocked")),
+            Some(&serde_json::json!(["RedStone"]))
         );
     });
 }
