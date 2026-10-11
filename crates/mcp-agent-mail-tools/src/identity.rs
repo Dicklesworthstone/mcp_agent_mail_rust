@@ -565,12 +565,19 @@ fn coalescer_latency_health_level(
 ///
 /// Read-only: enumerates the same recovery-debris / direct-backup / staging
 /// inventories `am doctor health` reports, through the single shared
-/// implementation in the db crate. Returns `None` (block omitted) when the
-/// mailbox path cannot be resolved (e.g. `:memory:`) or the storage root
-/// cannot be inspected — health never fails on accounting.
-fn health_check_retention_block(config: &Config) -> Option<RetentionHealthResponse> {
+/// implementation in the db crate. Only an in-memory mailbox is inapplicable.
+/// A failed inventory is unavailable evidence and must degrade readiness, not
+/// silently disappear from a green response. No accounting result authorizes
+/// recovery or deletion.
+fn health_check_retention_block(
+    config: &Config,
+) -> Result<Option<RetentionHealthResponse>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return Ok(None);
+    }
     let resolved =
-        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+            .map_err(|error| format!("resolving retention mailbox: {error}"))?;
     let database_path = Path::new(&resolved.canonical_path);
     let live_database_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
     // Same policy shape as the integrity guard's observe-and-alert sweep
@@ -590,12 +597,10 @@ fn health_check_retention_block(config: &Config) -> Option<RetentionHealthRespon
         database_path,
         Some((policy, now_us)),
     )
-    .ok()?;
-    // The existing operator warn threshold: the integrity guard warns when
-    // the reclaimable debris crosses `doctor_retention_alert_bytes`.
-    let reclaimable_attention = config.doctor_retention_alert_bytes > 0
-        && stats.reclaimable_bytes >= config.doctor_retention_alert_bytes;
-    Some(RetentionHealthResponse {
+    .map_err(|error| format!("inspecting retention footprint: {error}"))?;
+    let reclaimable_attention = stats.reclaimable_attention(config.doctor_retention_alert_bytes);
+    let resident_attention = stats.resident_attention(config.doctor_retention_alert_bytes);
+    Ok(Some(RetentionHealthResponse {
         resident_bytes: stats.resident_bytes,
         resident_bytes_by_category: stats
             .resident_bytes_by_category
@@ -606,7 +611,57 @@ fn health_check_retention_block(config: &Config) -> Option<RetentionHealthRespon
         reclaimable_bytes: stats.reclaimable_bytes,
         live_database_bytes: stats.live_database_bytes,
         reclaimable_attention,
-    })
+        resident_attention,
+    }))
+}
+
+/// Retention is operational degradation, never a live-corruption verdict.
+/// Keep an explicit contributor even when the byte inventory could not run.
+fn retention_health_verdict(
+    retention: &Result<Option<RetentionHealthResponse>, String>,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel;
+    match retention {
+        Err(error) => HealthVerdict::new(
+            HealthLevel::Yellow,
+            false,
+            format!(
+                "retention inventory unavailable: {error}; inspect mailbox paths and permissions; no clean footprint was established"
+            ),
+        ),
+        Ok(None) => HealthVerdict::new(
+            HealthLevel::Green,
+            false,
+            "in-memory mailbox has no filesystem retention footprint",
+        ),
+        Ok(Some(retention)) => {
+            let attention = retention.resident_attention || retention.reclaimable_attention;
+            let live_database = retention
+                .live_database_bytes
+                .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string());
+            HealthVerdict::new(
+                if attention {
+                    HealthLevel::Yellow
+                } else {
+                    HealthLevel::Green
+                },
+                false,
+                format!(
+                    "resident_bytes={} live_database_bytes={} reclaimable_bytes={} resident_attention={} reclaimable_attention={}; {}",
+                    retention.resident_bytes,
+                    live_database,
+                    retention.reclaimable_bytes,
+                    retention.resident_attention,
+                    retention.reclaimable_attention,
+                    if attention {
+                        "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption"
+                    } else {
+                        "retention is below the configured alert thresholds, or alerts are disabled"
+                    }
+                ),
+            )
+        }
+    }
 }
 
 fn percentage_clamped(value: u64, total: u64) -> u64 {
@@ -1431,8 +1486,8 @@ pub struct HealthCheckResponse {
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<DiskHealthResponse>,
-    /// Retention/reclaim resident footprint (GH#210). Omitted only when the
-    /// mailbox path cannot be resolved or inspected.
+    /// Retention/reclaim resident footprint (GH#210). An inapplicable or
+    /// unavailable block is explained by the retention health contributor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1577,13 +1632,15 @@ pub struct DiskHealthResponse {
 /// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionHealthResponse {
-    /// Total resident bytes: recovery debris + de-duplicated direct backups
-    /// + move-only reclaim staging.
+    /// Total resident logical bytes: recovery debris + de-duplicated direct
+    /// backups + move-only reclaim staging + parent-wide proactive stages.
     pub resident_bytes: u64,
     /// Resident bytes per category label (only nonzero categories present):
     /// `forensic_bundle`, `corrupt_quarantine`, `archive_reconcile_backup`,
     /// `sidecar_snapshot`, `stale_artifact`, `direct_backup`,
-    /// `reclaimable_staging`.
+    /// `reclaimable_staging`, `proactive_backup_staging`. Proactive stages may
+    /// belong to another mailbox sharing the database parent; this is a disk
+    /// footprint, not proof of ownership or permission to reclaim them.
     pub resident_bytes_by_category: std::collections::BTreeMap<String, u64>,
     /// Bytes already consolidated into `doctor/reclaimable/` awaiting an
     /// explicit operator removal.
@@ -1596,6 +1653,11 @@ pub struct RetentionHealthResponse {
     /// (`doctor_retention_alert_bytes`) — the same threshold the integrity
     /// guard's observe-and-alert sweep warns on. Next step: `am doctor reclaim`.
     pub reclaimable_attention: bool,
+    /// Resident evidence exceeds both the absolute floor and 20x live DB
+    /// size (absolute floor only when live size is unknown). This includes
+    /// protected backups and stage copies; it is not reclamation authority.
+    #[serde(default)]
+    pub resident_attention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2135,6 +2197,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let descriptor_level =
         descriptor_health_level(descriptors.utilization_pct, descriptor_growth.is_some());
     effective_level = effective_level.max(descriptor_level);
+    // Observe retention once: the payload and roll-up must use the same
+    // inventory. Missing evidence or excessive retained bytes is yellow,
+    // never a reason to clear a stronger verdict or trip the DB breaker.
+    let retention = health_check_retention_block(config);
+    let retention_verdict = retention_health_verdict(&retention);
+    effective_level = effective_level.max(retention_verdict.level());
     let failing_verdicts = verdicts.failing_names();
     // GH#300: name every input behind the effective level so a red or yellow
     // top level that no decomposed verdict explains (live pressure, archive
@@ -2195,6 +2263,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "descriptors".to_string(),
             level: descriptor_level.to_string(),
             detail: descriptor_health_detail(&descriptors, descriptor_growth.as_ref()),
+        },
+        HealthLevelContributor {
+            name: "retention".to_string(),
+            level: retention_verdict.status,
+            detail: retention_verdict.detail,
         },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
@@ -2347,7 +2420,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             fatal_threshold_mb: config.disk_space_fatal_mb,
             errors: s.errors.clone(),
         }),
-        retention: health_check_retention_block(config),
+        retention: retention.ok().flatten(),
         integrity: Some(IntegrityHealthResponse {
             last_ok_ts: integrity_metrics.last_ok_ts,
             last_check_ts: integrity_metrics.last_check_ts,
@@ -4354,6 +4427,284 @@ mod tests {
 
     static HEALTH_CHECK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    #[test]
+    fn retention_inventory_failure_is_yellow_and_not_database_corruption() {
+        use mcp_agent_mail_core::HealthLevel;
+        let verdict = retention_health_verdict(&Err("injected inventory failure".to_string()));
+        assert_eq!(verdict.level(), HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert!(verdict.detail.contains("injected inventory failure"));
+        assert_eq!(HealthLevel::Red.max(verdict.level()), HealthLevel::Red);
+    }
+
+    #[test]
+    fn memory_retention_is_inapplicable_without_inspecting_storage() {
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: PathBuf::from("/not-inspected-by-retention"),
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(matches!(&result, Ok(None)));
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn retention_probe_reports_resident_debt_from_actual_staging_files() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-probe");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(4_096)
+            .unwrap();
+        let mut config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert!(response.resident_attention);
+        assert!(!response.reclaimable_attention);
+        assert_eq!(response.resident_bytes, 4_096);
+        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Yellow);
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["resident_attention"], true);
+
+        config.doctor_retention_alert_bytes = 0;
+        let disabled = health_check_retention_block(&config);
+        assert_eq!(
+            retention_health_verdict(&disabled).level(),
+            HealthLevel::Green
+        );
+        let disabled = disabled.unwrap().unwrap();
+        assert_eq!(disabled.resident_bytes, 4_096);
+        assert!(!disabled.resident_attention);
+        assert!(!disabled.reclaimable_attention);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_probe_does_not_hide_a_staging_symlink_as_an_absent_block() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let linked = root.join(".mcp-agent-mail-proactive-backup-linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            // Disabling byte alarms must not turn an inventory error green.
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(
+            result.is_err(),
+            "unavailable inventory must not become Ok(None)"
+        );
+        let verdict = retention_health_verdict(&result);
+        assert_eq!(verdict.level(), mcp_agent_mail_core::HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert_eq!(std::fs::read_link(&linked).unwrap(), root);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_keeps_resident_attention_after_move_only_consolidation() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-move");
+        std::fs::create_dir(&stage).unwrap();
+        let evidence = [7_u8; 4_096];
+        std::fs::write(stage.join("snapshot.sqlite3"), evidence).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let before = health_check_retention_block(&config).unwrap().unwrap();
+        assert!(before.resident_attention);
+        assert!(!before.reclaimable_attention);
+        assert_eq!(before.resident_bytes, 4_096);
+        assert_eq!(
+            before.resident_bytes_by_category["proactive_backup_staging"],
+            4_096
+        );
+
+        // An operator's explicit move changes the category, not the disk debt.
+        // No health code is authorized to perform this move itself.
+        let destination = root.join("doctor/reclaimable/health-move");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&stage, &destination).unwrap();
+        let result = health_check_retention_block(&config);
+        let after = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 4_096);
+        assert_eq!(after.resident_bytes_by_category["reclaimable_staging"], 4_096);
+        assert!(after.resident_attention);
+        assert!(!after.reclaimable_attention);
+        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Yellow);
+        assert_eq!(
+            std::fs::read(destination.join("snapshot.sqlite3")).unwrap(),
+            evidence
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_preserves_the_independent_reclaimable_alarm() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let debris = root.join("retention.db.corrupt7");
+        std::fs::write(&debris, [7_u8; 1_024]).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            doctor_retention_alert_bytes: 512,
+            // The effective category budget is 5 * 128 = 640 bytes, so
+            // this quarantine is selected even though resident < 20 * 128.
+            doctor_retention_max_bytes_per_category: 1,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(response.resident_bytes, 1_024);
+        assert_eq!(response.reclaimable_bytes, 1_024);
+        assert!(!response.resident_attention);
+        assert!(response.reclaimable_attention);
+        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Yellow);
+        assert_eq!(std::fs::read(&debris).unwrap(), [7_u8; 1_024]);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_keeps_large_mailbox_backups_below_the_ratio_green() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 1_024]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-ratio");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("snapshot.sqlite3"), [7_u8; 4_096]).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(response.resident_bytes, 4_096);
+        assert!(!response.resident_attention);
+        assert!(!response.reclaimable_attention);
+        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Green);
+        assert_eq!(
+            std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
+            [7_u8; 4_096]
+        );
+    }
+
+    #[test]
+    fn retention_response_accepts_legacy_payloads_without_the_resident_flag() {
+        let legacy = json!({
+            "resident_bytes": 1_024,
+            "resident_bytes_by_category": {"direct_backup": 1_024},
+            "reclaimable_staging_bytes": 0,
+            "reclaimable_bytes": 0,
+            "live_database_bytes": 128,
+            "reclaimable_attention": false,
+        });
+        let response: RetentionHealthResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!response.resident_attention);
+        assert_eq!(response.resident_bytes, 1_024);
+    }
+
+    #[test]
+    fn health_check_retention_contributor_reports_the_live_inventory() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        drop(conn);
+        let bytes = std::fs::metadata(&primary)
+            .unwrap()
+            .len()
+            .checked_mul(21)
+            .unwrap()
+            .max(1_024);
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-response");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", primary.display())),
+                ("STORAGE_ROOT", &root.display().to_string()),
+                ("DOCTOR_RETENTION_ALERT_BYTES", "512"),
+            ],
+            || {
+                Config::reset_cached();
+                assert_eq!(Config::get().doctor_retention_alert_bytes, 512);
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health response");
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(value["retention"]["resident_attention"], true, "{value}");
+                assert_eq!(value["retention"]["reclaimable_attention"], false, "{value}");
+                assert_eq!(
+                    value["retention"]["resident_bytes_by_category"]["proactive_backup_staging"],
+                    bytes,
+                    "{value}"
+                );
+                let contributor = value["health_level_contributors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["name"] == "retention")
+                    .unwrap_or_else(|| panic!("retention contributor missing: {value}"));
+                assert_eq!(contributor["level"], "yellow", "{value}");
+                assert!(
+                    contributor["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("this is not database corruption"),
+                    "{value}"
+                );
+                // Independent live signals may be red. Retention must never
+                // erase them, and a retention alarm must never leave green.
+                assert!(
+                    matches!(value["health_level"].as_str(), Some("yellow" | "red")),
+                    "{value}"
+                );
+            },
+        );
+        assert_eq!(
+            std::fs::metadata(stage.join("snapshot.sqlite3")).unwrap().len(),
+            bytes
+        );
+    }
+
     // ── redact_database_url ──
 
     #[test]
@@ -5117,12 +5468,14 @@ mod tests {
             reclaimable_bytes: 540,
             live_database_bytes: None,
             reclaimable_attention: true,
+            resident_attention: true,
         };
         let value = serde_json::to_value(&r).unwrap();
         let object = value.as_object().expect("retention object");
         assert!(!object.contains_key("live_database_bytes"));
         assert_eq!(value["resident_bytes"], 630);
         assert_eq!(value["reclaimable_attention"], true);
+        assert_eq!(value["resident_attention"], true);
         assert_eq!(value["resident_bytes_by_category"]["stale_artifact"], 40);
         assert!(
             value["resident_bytes_by_category"]
