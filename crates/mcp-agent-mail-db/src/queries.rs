@@ -59,6 +59,9 @@ thread_local! {
     /// visibility probe on this thread started (br-kp1in.32 regression test).
     static SERIALIZER_LOCKED_AT_PROBE: std::cell::RefCell<Vec<bool>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The same, for each writer post-commit sample (br-qbhs0).
+    static SERIALIZER_LOCKED_AT_WRITER_SAMPLE: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Fresh durability-probe connections opened on this thread (br-v0ucm).
     static DURABILITY_PROBE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -8333,9 +8336,9 @@ async fn create_message_with_recipients_impl(
                 .to_string(),
         });
     }
-    // Held from id election through the insert transaction and the writer's own
-    // post-commit sample, then released before the fresh-handle visibility
-    // probe (br-kp1in.32).
+    // Held from id election through the insert transaction, then released
+    // before the writer's post-commit sample and the fresh-handle visibility
+    // probe (br-kp1in.32, br-qbhs0).
     let serializer_guard = match lock_message_write_serializer(cx).await {
         Ok(guard) => guard,
         Err(asupersync::sync::LockError::Cancelled) => {
@@ -8372,7 +8375,7 @@ async fn create_message_with_recipients_impl(
     let now = now_micros();
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
-    let (row, writer_post_commit_counts) = {
+    let (row, conn) = {
         // mcp_agent_mail#176 / br-sa58k: the canonical message id is elected
         // durably inside the insert transaction (see
         // `create_message_with_recipients_tx`) rather than relying on the
@@ -8480,7 +8483,6 @@ async fn create_message_with_recipients_impl(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
-        let tracked = tracked(&*conn);
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -8502,8 +8504,23 @@ async fn create_message_with_recipients_impl(
                 return Outcome::Ok(IdempotentOutcome::Conflict(info));
             }
         };
-
-        let writer_post_commit_counts = if let Some(message_id) = row.id {
+        (row, conn)
+    };
+    // The insert is committed. The writer samples its own rows and the
+    // fresh-handle probe re-proves them without the serializer, so neither
+    // holds every other in-process send behind it (br-kp1in.32, br-qbhs0: the
+    // sample was ~10% of the serializer's hold). Only this call's compensating
+    // delete can remove these rows, and it re-takes the serializer. A probe
+    // miss still cannot delete a message the writer's sample confirmed
+    // (GH#179).
+    drop(serializer_guard);
+    #[cfg(test)]
+    SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| {
+        seen.borrow_mut().push(MESSAGE_WRITE_SERIALIZER.is_locked());
+    });
+    let writer_post_commit_counts = {
+        let tracked = tracked(&*conn);
+        if let Some(message_id) = row.id {
             let message_rows = match map_sql_outcome(
                 traw_query(
                     cx,
@@ -8534,17 +8551,9 @@ async fn create_message_with_recipients_impl(
             }
         } else {
             WriterPostCommitCounts::default()
-        };
-
-        drop(conn);
-        (row, writer_post_commit_counts)
+        }
     };
-    // The insert is committed and the writer sampled its own rows; the
-    // fresh-handle probe below opens its own connections per query and must not
-    // hold every other in-process send behind it. A probe miss still cannot
-    // delete a message the writer's sample confirmed (GH#179), and the rare
-    // compensating delete re-takes the serializer.
-    drop(serializer_guard);
+    drop(conn);
 
     let Some(message_id) = row.id else {
         return Outcome::Err(DbError::Internal(
@@ -30600,6 +30609,7 @@ mod tests {
             .build()
             .expect("build runtime");
         SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow_mut().clear());
+        SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| seen.borrow_mut().clear());
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-serializer-scope")
@@ -30656,6 +30666,18 @@ mod tests {
         assert!(
             seen.iter().any(|locked| !locked),
             "every post-commit probe ran with the message serializer still held: {seen:?}"
+        );
+        // br-qbhs0: the writer's own post-commit sample also runs after the
+        // release; it was ~10% of the serializer's hold under swarm load.
+        let sampled = SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| seen.borrow().clone());
+        assert_eq!(
+            sampled.len(),
+            3,
+            "one writer sample per fresh send: {sampled:?}"
+        );
+        assert!(
+            sampled.iter().any(|locked| !locked),
+            "every writer sample ran with the message serializer still held: {sampled:?}"
         );
     }
 
