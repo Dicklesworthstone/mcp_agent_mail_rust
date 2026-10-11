@@ -1,0 +1,2629 @@
+{
+  "schema": "br-9sxrn-ab-v1",
+  "beads": [
+    "br-9sxrn",
+    "br-kp1in.13"
+  ],
+  "issues": [
+    "GH#344",
+    "GH#345"
+  ],
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "decision_rule_fixed_before_the_run": "br-9sxrn / br-kp1in.13 A/B decision rule. Written 2026-10-11 ~02:45Z, before any arm was built or run.\n\nArms (release builds, same host, same session):\n  base     = main a413ddb5 (WAL reset gate + reservation staging already in)\n  stage    = base + message bundles staged and synced outside the archive fence (renames, the id-collision check and digest appends stay under it)\n  stagepar = stage + staging fsyncs on up to 8 threads for sets of >= 8 files\n\nRuns:\n  P. Paced, equal offered load: paced_swarm.py, 60 agents, period 6 s, 300 s, order base stage stagepar stagepar stage base.\n  R. Release smoke via `am e2e run release_smoke`, candidate vs control in one invocation, both orders, for stage vs base and stagepar vs base.\n\nPrimary (br-9sxrn probe): the soak check \"WBQ drained_total advances in every 10s window with queued work\" PASSES for the arm in both orders, with soak sends >= 4000.\n\nGuards (any failure means the arm LOSES and is not landed):\n  G1. Release smoke swarm send p99 is no more than 20% above base's in either order.\n  G2. Release smoke client errors (swarm + soak) are no more than base's + 5 in either order; the durability, integrity and convergence checks pass.\n  G3. Paced: the last-60 s send p90 and the overall send p99 are no more than 20% above base's in either round.\n\nSecondary (br-kp1in.13): release smoke swarm reservation p99 against the 5 s bound, and paced reservation p50/p90.\n\nLanding:\n  - Land the smaller arm (stage before stagepar) that meets the primary and all guards.\n  - If neither meets the primary, an arm that meets every guard and cuts swarm reservation p99 by >= 25% vs base in both orders lands as br-kp1in.13 progress, and br-9sxrn stays open.\n  - Otherwise report the loss on both beads and land nothing.\n",
+  "builds": {
+    "base": {
+      "source": "origin/main a413ddb5 (clean)",
+      "release_am_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6"
+    },
+    "stage": {
+      "source": "a413ddb5 + message bundles staged outside the fence",
+      "release_am_sha256": "fec0020ad6ced81ea5091e51a7eee2220151fa7e024d912481a1db2b02174a60",
+      "patch_sha256": "d55e1685504a3a579edd8859f8cc15df6d11784b89b75bf171189117cd97d96c"
+    },
+    "stagepar": {
+      "source": "stage + parallel staging fsyncs (8 threads, >= 8 files)",
+      "release_am_sha256": "f148caa368bc3822bdca6042713cf961bb433d4005cee60d9bfafdb5d7c9c564",
+      "patch_sha256": "73d9184e5b4176e02082c3df0ab08e660200ee54c4e1eaf2f4a2af4800125bec"
+    }
+  },
+  "paced_equal_load": {
+    "method": "paced_swarm.py: 60 agents, one iteration per agent every 6 s on a fixed schedule (send, fetch, 30% reserve+release), 300 s; identical offered load for all builds; WAL size sampled every 5 s",
+    "order_base_stage_stagepar_stagepar_stage_base": [
+      {
+        "run": "1-base",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "8.91",
+          "6.83",
+          "9.21"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.057,
+            "p90": 0.112,
+            "p99": 0.328,
+            "max": 2.117,
+            "mean": 0.072,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.175,
+            "p90": 3.529,
+            "p99": 8.346,
+            "max": 10.61,
+            "mean": 0.875,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.22,
+            "p90": 3.349,
+            "p99": 8.679,
+            "max": 10.519,
+            "mean": 0.902,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.142,
+            "p90": 0.522,
+            "p99": 6.416,
+            "max": 8.99,
+            "mean": 0.42,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 5840,
+          "archive_commit_queue_p99_ms": 54442,
+          "git_commit_p99_ms": 525
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 243,
+            "slow": 149
+          },
+          "30": {
+            "calls": 355,
+            "slow": 1
+          },
+          "60": {
+            "calls": 302,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16772552,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.511,
+            5.113
+          ],
+          [
+            0.129,
+            0.237
+          ],
+          [
+            0.125,
+            0.183
+          ],
+          [
+            0.134,
+            0.192
+          ],
+          [
+            0.147,
+            0.205
+          ]
+        ]
+      },
+      {
+        "run": "2-stage",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "8.08",
+          "7.84",
+          "8.97"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.055,
+            "p90": 0.123,
+            "p99": 0.295,
+            "max": 0.84,
+            "mean": 0.07,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.14,
+            "p90": 0.221,
+            "p99": 0.649,
+            "max": 1.521,
+            "mean": 0.159,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.194,
+            "p90": 0.321,
+            "p99": 0.681,
+            "max": 1.368,
+            "mean": 0.22,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.139,
+            "p90": 0.292,
+            "p99": 1.469,
+            "max": 2.413,
+            "mean": 0.202,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 5622,
+          "archive_commit_queue_p99_ms": 1211,
+          "git_commit_p99_ms": 17
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 300,
+            "slow": 4
+          },
+          "30": {
+            "calls": 300,
+            "slow": 0
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16018592,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.244,
+            1.156
+          ],
+          [
+            0.128,
+            0.231
+          ],
+          [
+            0.122,
+            0.181
+          ],
+          [
+            0.138,
+            0.21
+          ],
+          [
+            0.144,
+            0.194
+          ]
+        ]
+      },
+      {
+        "run": "3-stagepar",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "6.33",
+          "7.29",
+          "8.45"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.055,
+            "p90": 0.113,
+            "p99": 0.284,
+            "max": 1.392,
+            "mean": 0.07,
+            "outcomes": {
+              "ok": 2999,
+              "error": 1
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.141,
+            "p90": 0.224,
+            "p99": 0.568,
+            "max": 1.323,
+            "mean": 0.159,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.198,
+            "p90": 0.33,
+            "p99": 0.76,
+            "max": 1.413,
+            "mean": 0.224,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.137,
+            "p90": 0.289,
+            "p99": 2.111,
+            "max": 3.881,
+            "mean": 0.212,
+            "outcomes": {
+              "ok": 2999,
+              "error": 1
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 3081,
+          "archive_commit_queue_p99_ms": 1180,
+          "git_commit_p99_ms": 17
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 300,
+            "slow": 37
+          },
+          "30": {
+            "calls": 300,
+            "slow": 0
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16603632,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.228,
+            1.308
+          ],
+          [
+            0.125,
+            0.232
+          ],
+          [
+            0.13,
+            0.199
+          ],
+          [
+            0.134,
+            0.186
+          ],
+          [
+            0.138,
+            0.19
+          ]
+        ]
+      },
+      {
+        "run": "4-stagepar",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "4.29",
+          "5.64",
+          "7.43"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.056,
+            "p90": 0.119,
+            "p99": 0.283,
+            "max": 0.696,
+            "mean": 0.07,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.141,
+            "p90": 0.217,
+            "p99": 0.468,
+            "max": 0.669,
+            "mean": 0.153,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.197,
+            "p90": 0.326,
+            "p99": 0.852,
+            "max": 1.553,
+            "mean": 0.224,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.138,
+            "p90": 0.303,
+            "p99": 2.59,
+            "max": 4.019,
+            "mean": 0.241,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 2098,
+          "archive_commit_queue_p99_ms": 1246,
+          "git_commit_p99_ms": 33
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 300,
+            "slow": 68
+          },
+          "30": {
+            "calls": 300,
+            "slow": 0
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16760192,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.238,
+            2.111
+          ],
+          [
+            0.125,
+            0.232
+          ],
+          [
+            0.122,
+            0.179
+          ],
+          [
+            0.135,
+            0.199
+          ],
+          [
+            0.146,
+            0.219
+          ]
+        ]
+      },
+      {
+        "run": "5-stage",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "5.92",
+          "5.73",
+          "6.94"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.055,
+            "p90": 0.109,
+            "p99": 0.28,
+            "max": 0.507,
+            "mean": 0.067,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.14,
+            "p90": 0.215,
+            "p99": 0.464,
+            "max": 0.701,
+            "mean": 0.151,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.192,
+            "p90": 0.323,
+            "p99": 0.789,
+            "max": 1.282,
+            "mean": 0.221,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.139,
+            "p90": 0.306,
+            "p99": 2.163,
+            "max": 2.886,
+            "mean": 0.223,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 5611,
+          "archive_commit_queue_p99_ms": 1166,
+          "git_commit_p99_ms": 17
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 300,
+            "slow": 38
+          },
+          "30": {
+            "calls": 300,
+            "slow": 0
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16883792,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.261,
+            1.553
+          ],
+          [
+            0.125,
+            0.214
+          ],
+          [
+            0.118,
+            0.182
+          ],
+          [
+            0.133,
+            0.186
+          ],
+          [
+            0.149,
+            0.226
+          ]
+        ]
+      },
+      {
+        "run": "6-base",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "5.63",
+          "5.81",
+          "6.65"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.055,
+            "p90": 0.115,
+            "p99": 0.342,
+            "max": 1.617,
+            "mean": 0.072,
+            "outcomes": {
+              "ok": 2998,
+              "error": 2
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.172,
+            "p90": 3.253,
+            "p99": 7.024,
+            "max": 10.579,
+            "mean": 0.834,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.217,
+            "p90": 3.011,
+            "p99": 7.046,
+            "max": 10.868,
+            "mean": 0.815,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.141,
+            "p90": 0.478,
+            "p99": 2.452,
+            "max": 3.802,
+            "mean": 0.267,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 5236,
+          "archive_commit_queue_p99_ms": 52366,
+          "git_commit_p99_ms": 263
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 284,
+            "slow": 36
+          },
+          "30": {
+            "calls": 316,
+            "slow": 0
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 7
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16826112,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.343,
+            1.62
+          ],
+          [
+            0.128,
+            0.222
+          ],
+          [
+            0.13,
+            0.464
+          ],
+          [
+            0.137,
+            0.204
+          ],
+          [
+            0.141,
+            0.197
+          ]
+        ]
+      }
+    ]
+  },
+  "release_smoke_ab": [
+    {
+      "started_at": "2026-10-11T04:58:12Z",
+      "finished_at": "2026-10-11T05:38:31Z",
+      "host": "thinkstation1",
+      "cpu_governors": [
+        "powersave"
+      ],
+      "swarm_agents": 60,
+      "swarm_secs": 480,
+      "soak_secs": 300,
+      "arms": [
+        {
+          "harness_arm": "candidate",
+          "build": "stage",
+          "binary_sha256": "fec0020ad6ced81ea5091e51a7eee2220151fa7e024d912481a1db2b02174a60",
+          "server_exe_sha256": "fec0020ad6ced81ea5091e51a7eee2220151fa7e024d912481a1db2b02174a60",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "5.50",
+            "5.78",
+            "6.63"
+          ],
+          "loadavg_end": [
+            "14.98",
+            "13.44",
+            "10.94"
+          ],
+          "soak_counts": {
+            "send": 5102,
+            "read": 19857,
+            "search": 895,
+            "health": 271,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=30 bad=[{'t': 1791694834, 'drained_total': 521, 'depth_at_open': 52, 'depth_at_close': 292}, {'t': 1791694864, 'drained_total': 1033, 'depth_at_open': 198, 'depth_at_close': 411}, {'t': 1791694905, 'drained_total': 1801, 'depth_at_open': 201, 'depth_at_close': 369}, {'t': 1791694935, 'drained_total': 2313, 'depth_at_open': 204, 'depth_at_close': 373}, {'t': 1791694976, 'drained_total': 308"
+          },
+          "soak_fetch_inbox_p99_s": 0.06417083740234375,
+          "swarm_acked_sends": 8150,
+          "swarm_send_p99": {
+            "ok": false,
+            "detail": "{'n': 8152, 'p50_s': 2.7804906368255615, 'p99_s': 5.269749879837036, 'max_s': 7.1766579151153564}"
+          },
+          "swarm_reserve_p99": {
+            "ok": true,
+            "detail": "{'n': 2431, 'p50_s': 0.3256514072418213, 'p99_s': 1.5384812355041504, 'max_s': 2.600364923477173}"
+          },
+          "swarm_release_p99": {
+            "ok": true,
+            "detail": "{'n': 2430, 'p50_s': 0.43554186820983887, 'p99_s': 1.8643882274627686, 'max_s': 3.1362385749816895}"
+          },
+          "swarm_tool_errors": {
+            "ok": false,
+            "detail": "{'send_message': {'RESOURCE_BUSY': 2}, 'fetch_inbox': {'RESOURCE_BUSY': 2}}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791695142, 'drained_total': 5642, 'depth_at_open': 129, 'depth_at_close': 433}, {'t': 1791695162, 'drained_total': 5898, 'depth_at_open': 433, 'depth_at_close': 677}, {'t': 1791695182, 'drained_total': 6154, 'depth_at_open': 642, 'depth_at_close': 886}, {'t': 1791695203, 'drained_total': 6410, 'depth_at_open': 868, 'depth_at_close': 1108}, {'t': 179169"
+          },
+          "failed_checks": [
+            "soak: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: send_message p99 <= 5.0s at 60 agents",
+            "swarm: zero tool errors",
+            "swarm: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 0,
+            "ge_5s": 0,
+            "p50_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "top_waiter_sites": [],
+            "top_holder_sites": []
+          }
+        },
+        {
+          "harness_arm": "control",
+          "build": "base",
+          "binary_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "server_exe_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "14.98",
+            "13.44",
+            "10.94"
+          ],
+          "loadavg_end": [
+            "9.89",
+            "13.94",
+            "14.16"
+          ],
+          "soak_counts": {
+            "send": 5115,
+            "read": 19586,
+            "search": 828,
+            "health": 272,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=30 bad=[{'t': 1791696022, 'drained_total': 711, 'depth_at_open': 74, 'depth_at_close': 313}, {'t': 1791696052, 'drained_total': 1223, 'depth_at_open': 216, 'depth_at_close': 427}, {'t': 1791696082, 'drained_total': 1735, 'depth_at_open': 290, 'depth_at_close': 471}, {'t': 1791696123, 'drained_total': 2503, 'depth_at_open': 202, 'depth_at_close': 362}, {'t': 1791696153, 'drained_total': 301"
+          },
+          "soak_fetch_inbox_p99_s": 0.06894969940185547,
+          "swarm_acked_sends": 5647,
+          "swarm_send_p99": {
+            "ok": true,
+            "detail": "{'n': 5647, 'p50_s': 0.549231767654419, 'p99_s': 4.295750617980957, 'max_s': 5.95927882194519}"
+          },
+          "swarm_reserve_p99": {
+            "ok": false,
+            "detail": "{'n': 1647, 'p50_s': 6.350728273391724, 'p99_s': 24.74934458732605, 'max_s': 30.001380443572998}"
+          },
+          "swarm_release_p99": {
+            "ok": false,
+            "detail": "{'n': 1632, 'p50_s': 5.586150646209717, 'p99_s': 24.333303689956665, 'max_s': 30.00168752670288}"
+          },
+          "swarm_tool_errors": {
+            "ok": false,
+            "detail": "{'fetch_inbox': {'RESOURCE_BUSY': 1}, 'file_reservation_paths': {'RESOURCE_BUSY': 2}}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": false,
+            "detail": "{'file_reservation_paths': 4, 'release_file_reservations': 8}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791696310, 'drained_total': 5419, 'depth_at_open': 48, 'depth_at_close': 260}, {'t': 1791696330, 'drained_total': 5675, 'depth_at_open': 238, 'depth_at_close': 254}, {'t': 1791696351, 'drained_total': 5931, 'depth_at_open': 81, 'depth_at_close': 135}, {'t': 1791696765, 'drained_total': 2794, 'depth_at_open': 7, 'depth_at_close': 108}]"
+          },
+          "failed_checks": [
+            "soak: WBQ drained_total advances in every 10s window with queued work",
+            "soak: health archive_lag stall verdict agrees with the WBQ counters",
+            "swarm: file_reservation_paths p99 <= 5.0s at 60 agents",
+            "swarm: release_file_reservations p99 <= 5.0s at 60 agents",
+            "swarm: zero 30 s dispatch timeouts",
+            "swarm: zero tool errors",
+            "swarm: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 3753,
+            "ge_5s": 1309,
+            "p50_ms": 3896,
+            "p90_ms": 7409,
+            "max_ms": 20688,
+            "top_waiter_sites": [
+              [
+                "lib.rs:13368",
+                3626
+              ],
+              [
+                "lib.rs:7444",
+                116
+              ],
+              [
+                "lib.rs:7986",
+                10
+              ],
+              [
+                "lib.rs:3523",
+                1
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3523",
+                1962
+              ],
+              [
+                "lib.rs:3613",
+                1518
+              ],
+              [
+                "lib.rs:13368",
+                201
+              ],
+              [
+                "lib.rs:7444",
+                69
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-10-11T05:58:12Z",
+      "finished_at": "2026-10-11T06:37:39Z",
+      "host": "thinkstation1",
+      "cpu_governors": [
+        "powersave"
+      ],
+      "swarm_agents": 60,
+      "swarm_secs": 480,
+      "soak_secs": 300,
+      "arms": [
+        {
+          "harness_arm": "candidate",
+          "build": "base",
+          "binary_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "server_exe_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "4.14",
+            "17.96",
+            "28.60"
+          ],
+          "loadavg_end": [
+            "6.09",
+            "8.25",
+            "14.92"
+          ],
+          "soak_counts": {
+            "send": 4998,
+            "read": 19735,
+            "search": 784,
+            "health": 272,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=30 bad=[{'t': 1791698414, 'drained_total': 344, 'depth_at_open': 14, 'depth_at_close': 259}, {'t': 1791698444, 'drained_total': 802, 'depth_at_open': 199, 'depth_at_close': 411}, {'t': 1791698474, 'drained_total': 1314, 'depth_at_open': 293, 'depth_at_close': 491}, {'t': 1791698504, 'drained_total': 1826, 'depth_at_open': 338, 'depth_at_close': 509}, {'t': 1791698525, 'drained_total': 2082"
+          },
+          "soak_fetch_inbox_p99_s": 0.06869721412658691,
+          "swarm_acked_sends": 6014,
+          "swarm_send_p99": {
+            "ok": false,
+            "detail": "{'n': 6014, 'p50_s': 0.6908462047576904, 'p99_s': 7.005533695220947, 'max_s': 15.085169792175293}"
+          },
+          "swarm_reserve_p99": {
+            "ok": false,
+            "detail": "{'n': 1764, 'p50_s': 5.308411359786987, 'p99_s': 17.999845027923584, 'max_s': 21.98376703262329}"
+          },
+          "swarm_release_p99": {
+            "ok": false,
+            "detail": "{'n': 1740, 'p50_s': 5.014215707778931, 'p99_s': 16.683537483215332, 'max_s': 23.5604031085968}"
+          },
+          "swarm_tool_errors": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": true,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[]"
+          },
+          "failed_checks": [
+            "soak: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: send_message p99 <= 5.0s at 60 agents",
+            "swarm: file_reservation_paths p99 <= 5.0s at 60 agents",
+            "swarm: release_file_reservations p99 <= 5.0s at 60 agents",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 3650,
+            "ge_5s": 926,
+            "p50_ms": 3545,
+            "p90_ms": 6772,
+            "max_ms": 17186,
+            "top_waiter_sites": [
+              [
+                "lib.rs:13368",
+                3526
+              ],
+              [
+                "lib.rs:7444",
+                124
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3523",
+                2035
+              ],
+              [
+                "lib.rs:3613",
+                1403
+              ],
+              [
+                "lib.rs:13368",
+                157
+              ],
+              [
+                "lib.rs:7444",
+                53
+              ]
+            ]
+          }
+        },
+        {
+          "harness_arm": "control",
+          "build": "stagepar",
+          "binary_sha256": "f148caa368bc3822bdca6042713cf961bb433d4005cee60d9bfafdb5d7c9c564",
+          "server_exe_sha256": "f148caa368bc3822bdca6042713cf961bb433d4005cee60d9bfafdb5d7c9c564",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "PASS",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "6.09",
+            "8.25",
+            "14.92"
+          ],
+          "loadavg_end": [
+            "3.70",
+            "9.84",
+            "13.67"
+          ],
+          "soak_counts": {
+            "send": 5176,
+            "read": 20073,
+            "search": 979,
+            "health": 270,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": true,
+            "detail": "samples=30 bad=[]"
+          },
+          "soak_fetch_inbox_p99_s": 0.06181526184082031,
+          "swarm_acked_sends": 7391,
+          "swarm_send_p99": {
+            "ok": false,
+            "detail": "{'n': 7391, 'p50_s': 3.0869338512420654, 'p99_s': 6.267737865447998, 'max_s': 9.96056056022644}"
+          },
+          "swarm_reserve_p99": {
+            "ok": true,
+            "detail": "{'n': 2197, 'p50_s': 0.3273646831512451, 'p99_s': 2.751331090927124, 'max_s': 4.969834804534912}"
+          },
+          "swarm_release_p99": {
+            "ok": true,
+            "detail": "{'n': 2196, 'p50_s': 0.4386422634124756, 'p99_s': 2.8082287311553955, 'max_s': 5.116033315658569}"
+          },
+          "swarm_tool_errors": {
+            "ok": false,
+            "detail": "{'fetch_inbox': {'RESOURCE_BUSY': 1}, 'search_messages': {'RESOURCE_BUSY': 1}}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791699904, 'drained_total': 6246, 'depth_at_open': 214, 'depth_at_close': 435}, {'t': 1791699945, 'drained_total': 7014, 'depth_at_open': 291, 'depth_at_close': 515}, {'t': 1791699986, 'drained_total': 7782, 'depth_at_open': 292, 'depth_at_close': 480}, {'t': 1791700017, 'drained_total': 8294, 'depth_at_open': 355, 'depth_at_close': 455}, {'t': 1791700"
+          },
+          "failed_checks": [
+            "swarm: send_message p99 <= 5.0s at 60 agents",
+            "swarm: zero tool errors",
+            "swarm: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 0,
+            "ge_5s": 0,
+            "p50_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "top_waiter_sites": [],
+            "top_holder_sites": []
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-10-11T06:58:12Z",
+      "finished_at": "2026-10-11T07:37:56Z",
+      "host": "thinkstation1",
+      "cpu_governors": [
+        "powersave"
+      ],
+      "swarm_agents": 60,
+      "swarm_secs": 480,
+      "soak_secs": 300,
+      "arms": [
+        {
+          "harness_arm": "candidate",
+          "build": "stagepar",
+          "binary_sha256": "f148caa368bc3822bdca6042713cf961bb433d4005cee60d9bfafdb5d7c9c564",
+          "server_exe_sha256": "f148caa368bc3822bdca6042713cf961bb433d4005cee60d9bfafdb5d7c9c564",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "PASS",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "4.33",
+            "4.08",
+            "6.94"
+          ],
+          "loadavg_end": [
+            "2.86",
+            "6.87",
+            "8.71"
+          ],
+          "soak_counts": {
+            "send": 5228,
+            "read": 20150,
+            "search": 994,
+            "health": 270,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": true,
+            "detail": "samples=30 bad=[]"
+          },
+          "soak_fetch_inbox_p99_s": 0.06345248222351074,
+          "swarm_acked_sends": 8190,
+          "swarm_send_p99": {
+            "ok": true,
+            "detail": "{'n': 8191, 'p50_s': 2.7838830947875977, 'p99_s': 4.686038017272949, 'max_s': 6.335741758346558}"
+          },
+          "swarm_reserve_p99": {
+            "ok": true,
+            "detail": "{'n': 2428, 'p50_s': 0.3291635513305664, 'p99_s': 1.5013947486877441, 'max_s': 2.185922145843506}"
+          },
+          "swarm_release_p99": {
+            "ok": true,
+            "detail": "{'n': 2425, 'p50_s': 0.4220290184020996, 'p99_s': 1.8169565200805664, 'max_s': 3.4002435207366943}"
+          },
+          "swarm_tool_errors": {
+            "ok": false,
+            "detail": "{'send_message': {'RESOURCE_BUSY': 1}}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791702290, 'drained_total': 6083, 'depth_at_open': 161, 'depth_at_close': 415}, {'t': 1791702341, 'drained_total': 7107, 'depth_at_open': 347, 'depth_at_close': 565}, {'t': 1791702402, 'drained_total': 8387, 'depth_at_open': 290, 'depth_at_close': 494}, {'t': 1791702443, 'drained_total': 9155, 'depth_at_open': 316, 'depth_at_close': 504}]"
+          },
+          "failed_checks": [
+            "swarm: zero tool errors",
+            "swarm: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 0,
+            "ge_5s": 0,
+            "p50_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "top_waiter_sites": [],
+            "top_holder_sites": []
+          }
+        },
+        {
+          "harness_arm": "control",
+          "build": "base",
+          "binary_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "server_exe_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "2.86",
+            "6.87",
+            "8.71"
+          ],
+          "loadavg_end": [
+            "4.53",
+            "7.10",
+            "8.53"
+          ],
+          "soak_counts": {
+            "send": 5122,
+            "read": 19831,
+            "search": 875,
+            "health": 272,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=30 bad=[{'t': 1791703185, 'drained_total': 347, 'depth_at_open': 5, 'depth_at_close': 264}, {'t': 1791703226, 'drained_total': 1067, 'depth_at_open': 155, 'depth_at_close': 356}, {'t': 1791703256, 'drained_total': 1579, 'depth_at_open': 244, 'depth_at_close': 423}, {'t': 1791703286, 'drained_total': 2091, 'depth_at_open': 272, 'depth_at_close': 435}, {'t': 1791703327, 'drained_total': 2859"
+          },
+          "soak_fetch_inbox_p99_s": 0.06238389015197754,
+          "swarm_acked_sends": 6413,
+          "swarm_send_p99": {
+            "ok": true,
+            "detail": "{'n': 6413, 'p50_s': 0.6769673824310303, 'p99_s': 3.7508347034454346, 'max_s': 6.326866149902344}"
+          },
+          "swarm_reserve_p99": {
+            "ok": false,
+            "detail": "{'n': 1879, 'p50_s': 5.53176474571228, 'p99_s': 17.740056037902832, 'max_s': 20.39467430114746}"
+          },
+          "swarm_release_p99": {
+            "ok": false,
+            "detail": "{'n': 1861, 'p50_s': 4.681401252746582, 'p99_s': 13.866515636444092, 'max_s': 20.33875012397766}"
+          },
+          "swarm_tool_errors": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": true,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[]"
+          },
+          "failed_checks": [
+            "soak: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: file_reservation_paths p99 <= 5.0s at 60 agents",
+            "swarm: release_file_reservations p99 <= 5.0s at 60 agents",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 3511,
+            "ge_5s": 755,
+            "p50_ms": 3701,
+            "p90_ms": 5684,
+            "max_ms": 14645,
+            "top_waiter_sites": [
+              [
+                "lib.rs:13368",
+                3401
+              ],
+              [
+                "lib.rs:7444",
+                110
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3523",
+                1767
+              ],
+              [
+                "lib.rs:3613",
+                1544
+              ],
+              [
+                "lib.rs:13368",
+                140
+              ],
+              [
+                "lib.rs:7444",
+                54
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-10-11T07:58:12Z",
+      "finished_at": "2026-10-11T08:39:18Z",
+      "host": "thinkstation1",
+      "cpu_governors": [
+        "powersave"
+      ],
+      "swarm_agents": 60,
+      "swarm_secs": 480,
+      "soak_secs": 300,
+      "arms": [
+        {
+          "harness_arm": "candidate",
+          "build": "base",
+          "binary_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "server_exe_sha256": "968d9fb539ed68590ab1e9470cf80e8d89a9fb1a23b20507c6d91d20e319a1d6",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "4.36",
+            "3.49",
+            "4.67"
+          ],
+          "loadavg_end": [
+            "11.70",
+            "17.14",
+            "15.66"
+          ],
+          "soak_counts": {
+            "send": 5104,
+            "read": 19686,
+            "search": 806,
+            "health": 272,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=30 bad=[{'t': 1791705634, 'drained_total': 520, 'depth_at_open': 62, 'depth_at_close': 288}, {'t': 1791705664, 'drained_total': 1032, 'depth_at_open': 215, 'depth_at_close': 420}, {'t': 1791705704, 'drained_total': 1800, 'depth_at_open': 222, 'depth_at_close': 411}, {'t': 1791705734, 'drained_total': 2312, 'depth_at_open': 246, 'depth_at_close': 409}, {'t': 1791705765, 'drained_total': 282"
+          },
+          "soak_fetch_inbox_p99_s": 0.06517791748046875,
+          "swarm_acked_sends": 5290,
+          "swarm_send_p99": {
+            "ok": false,
+            "detail": "{'n': 5290, 'p50_s': 0.6854028701782227, 'p99_s': 5.7201783657073975, 'max_s': 7.560880422592163}"
+          },
+          "swarm_reserve_p99": {
+            "ok": false,
+            "detail": "{'n': 1528, 'p50_s': 6.966867923736572, 'p99_s': 30.001190900802612, 'max_s': 30.042353630065918}"
+          },
+          "swarm_release_p99": {
+            "ok": false,
+            "detail": "{'n': 1503, 'p50_s': 4.7691450119018555, 'p99_s': 22.012371063232422, 'max_s': 30.037707567214966}"
+          },
+          "swarm_tool_errors": {
+            "ok": false,
+            "detail": "{'file_reservation_paths': {'RESOURCE_BUSY': 1}}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": false,
+            "detail": "{'file_reservation_paths': 32, 'release_file_reservations': 11}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791705964, 'drained_total': 5934, 'depth_at_open': 25, 'depth_at_close': 221}, {'t': 1791705986, 'drained_total': 6190, 'depth_at_open': 39, 'depth_at_close': 182}, {'t': 1791705996, 'drained_total': 6190, 'depth_at_open': 182, 'depth_at_close': 227}, {'t': 1791706017, 'drained_total': 6446, 'depth_at_open': 96, 'depth_at_close': 149}, {'t': 1791706247"
+          },
+          "failed_checks": [
+            "soak: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: send_message p99 <= 5.0s at 60 agents",
+            "swarm: file_reservation_paths p99 <= 5.0s at 60 agents",
+            "swarm: release_file_reservations p99 <= 5.0s at 60 agents",
+            "swarm: zero 30 s dispatch timeouts",
+            "swarm: zero tool errors",
+            "swarm: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 3169,
+            "ge_5s": 1274,
+            "p50_ms": 4290,
+            "p90_ms": 9155,
+            "max_ms": 29262,
+            "top_waiter_sites": [
+              [
+                "lib.rs:13368",
+                3050
+              ],
+              [
+                "lib.rs:7444",
+                103
+              ],
+              [
+                "lib.rs:7986",
+                13
+              ],
+              [
+                "lib.rs:3523",
+                2
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3523",
+                1662
+              ],
+              [
+                "lib.rs:3613",
+                1246
+              ],
+              [
+                "lib.rs:13368",
+                194
+              ],
+              [
+                "lib.rs:7444",
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "harness_arm": "control",
+          "build": "stage",
+          "binary_sha256": "fec0020ad6ced81ea5091e51a7eee2220151fa7e024d912481a1db2b02174a60",
+          "server_exe_sha256": "fec0020ad6ced81ea5091e51a7eee2220151fa7e024d912481a1db2b02174a60",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "11.70",
+            "17.14",
+            "15.66"
+          ],
+          "loadavg_end": [
+            "5.18",
+            "8.64",
+            "11.81"
+          ],
+          "soak_counts": {
+            "send": 5136,
+            "read": 19762,
+            "search": 883,
+            "health": 272,
+            "err": 0
+          },
+          "soak_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=30 bad=[{'t': 1791706869, 'drained_total': 345, 'depth_at_open': 12, 'depth_at_close': 267}, {'t': 1791706909, 'drained_total': 1079, 'depth_at_open': 175, 'depth_at_close': 382}, {'t': 1791706939, 'drained_total': 1591, 'depth_at_open': 256, 'depth_at_close': 436}, {'t': 1791706979, 'drained_total': 2359, 'depth_at_open': 202, 'depth_at_close': 363}, {'t': 1791707020, 'drained_total': 312"
+          },
+          "soak_fetch_inbox_p99_s": 0.06697368621826172,
+          "swarm_acked_sends": 8126,
+          "swarm_send_p99": {
+            "ok": true,
+            "detail": "{'n': 8127, 'p50_s': 2.820845603942871, 'p99_s': 4.943011283874512, 'max_s': 6.405327081680298}"
+          },
+          "swarm_reserve_p99": {
+            "ok": true,
+            "detail": "{'n': 2432, 'p50_s': 0.3329603672027588, 'p99_s': 1.3688101768493652, 'max_s': 2.878021001815796}"
+          },
+          "swarm_release_p99": {
+            "ok": true,
+            "detail": "{'n': 2430, 'p50_s': 0.4376521110534668, 'p99_s': 1.8423173427581787, 'max_s': 2.6635243892669678}"
+          },
+          "swarm_tool_errors": {
+            "ok": false,
+            "detail": "{'send_message': {'RESOURCE_BUSY': 1}, 'fetch_inbox': {'RESOURCE_BUSY': 1}}"
+          },
+          "swarm_30s_timeouts": {
+            "ok": true,
+            "detail": "{}"
+          },
+          "swarm_wbq_10s_window": {
+            "ok": false,
+            "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791707186, 'drained_total': 5598, 'depth_at_open': 261, 'depth_at_close': 540}, {'t': 1791707207, 'drained_total': 5854, 'depth_at_open': 536, 'depth_at_close': 786}, {'t': 1791707237, 'drained_total': 6366, 'depth_at_open': 763, 'depth_at_close': 1012}, {'t': 1791707258, 'drained_total': 6622, 'depth_at_open': 983, 'depth_at_close': 1201}, {'t': 17917"
+          },
+          "failed_checks": [
+            "soak: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: zero tool errors",
+            "swarm: WBQ drained_total advances in every 10s window with queued work",
+            "swarm: archive converges to DB after the swarm without client reads (<= 300s)"
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 0,
+            "ge_5s": 0,
+            "p50_ms": null,
+            "p90_ms": null,
+            "max_ms": null,
+            "top_waiter_sites": [],
+            "top_holder_sites": []
+          }
+        }
+      ]
+    }
+  ],
+  "paced_equal_load_at_swarm_send_rate": {
+    "decision_rule_fixed_before_the_run": "ab13b: equal-offered-load check at the swarm's send rate. Written 2026-10-11 ~06:05Z, after smoke R1\n(stage_vs_base) and before R2-R4 or any ab13b run.\n\nWhy: in R1, guard G1 of ab13_rule.txt failed for 'stage'. Its closed-loop swarm send p99 was 5.27 s vs\n4.30 s (+22.6%; the limit is +20%), while it completed 8,152 sends vs 5,647 (+44%). G1 stays failed as\nwritten; this experiment does not change ab13_rule.txt. It answers one question: at EQUAL offered work\nnear that rate, are sends slower on the arm?\n  - If they are not, the G1 failure comes from the arm doing more work against a capped send path\n    (br-qbhs0), not from slower sends.\n  - If they are, it is a real send regression (for example, staging fsyncs contending with\n    database commits).\n\nRuns: paced_swarm.py, 60 agents, period 2 s (~30 sends/s, 30 fetches/s, ~9 reserve+release/s offered),\n300 s. Order: base stage stagepar stagepar stage base. Same binaries as ab13 (build14), same host,\none invocation, nothing else of mine running locally.\n\nReading, per arm vs base, in BOTH rounds:\n  S1. Overall send p90 and p99 are no more than 1.2x base's.\n  S2. Last-60 s send p90 is no more than 1.2x base's.\n  If S1 and S2 hold in both rounds, then at equal work the arm's sends are not slower.\n  Otherwise it is a measured send regression, and the arm does not land whatever the smoke says.\n\nReported alongside: reservation p50/p90/p99, errors, end-of-run WAL size, and per-60 s send p50/p90.\n\nLanding remains governed by ab13_rule.txt with G1 recorded as FAILED. A decision to land despite G1\nneeds the user's or owner's call, presented with both results. ab13b alone does not authorize it.\n",
+    "method": "paced_swarm.py: 60 agents, period 2 s (~30 sends/s offered), 300 s; same build14 binaries; WAL size sampled every 5 s",
+    "order_base_stage_stagepar_stagepar_stage_base": [
+      {
+        "run": "1-base",
+        "period_s": 2.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "8.25",
+          "10.68",
+          "9.16"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 9000,
+            "p50": 0.111,
+            "p90": 0.23,
+            "p99": 0.845,
+            "max": 3.288,
+            "mean": 0.142,
+            "outcomes": {
+              "ok": 8999,
+              "error": 1
+            }
+          },
+          "file_reservation_paths": {
+            "n": 2633,
+            "p50": 4.886,
+            "p90": 9.583,
+            "p99": 15.287,
+            "max": 18.531,
+            "mean": 5.266,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "release_file_reservations": {
+            "n": 2633,
+            "p50": 4.359,
+            "p90": 9.477,
+            "p99": 13.779,
+            "max": 20.078,
+            "mean": 5.035,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "send_message": {
+            "n": 9000,
+            "p50": 0.649,
+            "p90": 1.86,
+            "p99": 3.664,
+            "max": 5.656,
+            "mean": 0.861,
+            "outcomes": {
+              "ok": 9000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 132,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 12935,
+          "archive_commit_queue_p99_ms": 576557,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 310,
+            "slow": 119
+          },
+          "30": {
+            "calls": 430,
+            "slow": 0
+          },
+          "60": {
+            "calls": 424,
+            "slow": 18
+          },
+          "90": {
+            "calls": 416,
+            "slow": 0
+          },
+          "120": {
+            "calls": 528,
+            "slow": 3
+          },
+          "150": {
+            "calls": 400,
+            "slow": 0
+          },
+          "180": {
+            "calls": 463,
+            "slow": 0
+          },
+          "210": {
+            "calls": 502,
+            "slow": 0
+          },
+          "240": {
+            "calls": 374,
+            "slow": 0
+          },
+          "270": {
+            "calls": 420,
+            "slow": 0
+          },
+          "300": {
+            "calls": 467,
+            "slow": 30
+          },
+          "330": {
+            "calls": 423,
+            "slow": 30
+          },
+          "360": {
+            "calls": 493,
+            "slow": 2
+          },
+          "390": {
+            "calls": 401,
+            "slow": 18
+          },
+          "420": {
+            "calls": 338,
+            "slow": 17
+          },
+          "450": {
+            "calls": 460,
+            "slow": 30
+          },
+          "480": {
+            "calls": 446,
+            "slow": 42
+          },
+          "510": {
+            "calls": 426,
+            "slow": 126
+          },
+          "540": {
+            "calls": 436,
+            "slow": 31
+          },
+          "570": {
+            "calls": 375,
+            "slow": 231
+          },
+          "600": {
+            "calls": 259,
+            "slow": 1
+          },
+          "630": {
+            "calls": 209,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16990912,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.49,
+            3.722
+          ],
+          [
+            0.31,
+            1.231
+          ],
+          [
+            0.481,
+            1.111
+          ],
+          [
+            0.431,
+            1.083
+          ],
+          [
+            0.343,
+            1.046
+          ]
+        ]
+      },
+      {
+        "run": "2-stage",
+        "period_s": 2.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "11.55",
+          "15.25",
+          "12.77"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 9000,
+            "p50": 0.124,
+            "p90": 0.333,
+            "p99": 0.966,
+            "max": 2.231,
+            "mean": 0.169,
+            "outcomes": {
+              "ok": 9000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 2633,
+            "p50": 0.367,
+            "p90": 0.858,
+            "p99": 1.609,
+            "max": 2.66,
+            "mean": 0.45,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "release_file_reservations": {
+            "n": 2633,
+            "p50": 0.499,
+            "p90": 1.198,
+            "p99": 2.075,
+            "max": 4.229,
+            "mean": 0.627,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "send_message": {
+            "n": 9000,
+            "p50": 2.995,
+            "p90": 4.08,
+            "p99": 5.202,
+            "max": 8.445,
+            "mean": 3.081,
+            "outcomes": {
+              "ok": 9000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 17,
+          "archive_wbq_p99_ms": 81442,
+          "archive_commit_queue_p99_ms": 3014,
+          "git_commit_p99_ms": 132
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 518,
+            "slow": 356
+          },
+          "30": {
+            "calls": 601,
+            "slow": 498
+          },
+          "60": {
+            "calls": 579,
+            "slow": 532
+          },
+          "90": {
+            "calls": 634,
+            "slow": 559
+          },
+          "120": {
+            "calls": 655,
+            "slow": 623
+          },
+          "150": {
+            "calls": 583,
+            "slow": 581
+          },
+          "180": {
+            "calls": 557,
+            "slow": 556
+          },
+          "210": {
+            "calls": 556,
+            "slow": 555
+          },
+          "240": {
+            "calls": 512,
+            "slow": 512
+          },
+          "270": {
+            "calls": 514,
+            "slow": 514
+          },
+          "300": {
+            "calls": 469,
+            "slow": 469
+          },
+          "330": {
+            "calls": 425,
+            "slow": 425
+          },
+          "360": {
+            "calls": 445,
+            "slow": 445
+          },
+          "390": {
+            "calls": 398,
+            "slow": 398
+          },
+          "420": {
+            "calls": 396,
+            "slow": 396
+          },
+          "450": {
+            "calls": 411,
+            "slow": 411
+          },
+          "480": {
+            "calls": 377,
+            "slow": 377
+          },
+          "510": {
+            "calls": 343,
+            "slow": 308
+          },
+          "540": {
+            "calls": 27,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 17052712,
+        "send_p50_p90_by_60s_window": [
+          [
+            2.513,
+            4.985
+          ],
+          [
+            2.406,
+            3.643
+          ],
+          [
+            2.55,
+            2.97
+          ],
+          [
+            2.769,
+            3.343
+          ],
+          [
+            2.968,
+            3.537
+          ]
+        ]
+      },
+      {
+        "run": "3-stagepar",
+        "period_s": 2.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "15.94",
+          "17.77",
+          "15.26"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 9000,
+            "p50": 0.12,
+            "p90": 0.323,
+            "p99": 0.947,
+            "max": 2.589,
+            "mean": 0.167,
+            "outcomes": {
+              "ok": 9000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 2633,
+            "p50": 0.37,
+            "p90": 0.855,
+            "p99": 1.641,
+            "max": 3.069,
+            "mean": 0.455,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "release_file_reservations": {
+            "n": 2633,
+            "p50": 0.498,
+            "p90": 1.117,
+            "p99": 2.125,
+            "max": 3.515,
+            "mean": 0.609,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "send_message": {
+            "n": 9000,
+            "p50": 2.89,
+            "p90": 4.045,
+            "p99": 7.171,
+            "max": 10.872,
+            "mean": 3.058,
+            "outcomes": {
+              "ok": 9000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 2098,
+          "archive_commit_queue_p99_ms": 33555,
+          "git_commit_p99_ms": 132
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 302,
+            "slow": 297
+          },
+          "30": {
+            "calls": 541,
+            "slow": 401
+          },
+          "60": {
+            "calls": 626,
+            "slow": 593
+          },
+          "90": {
+            "calls": 581,
+            "slow": 546
+          },
+          "120": {
+            "calls": 710,
+            "slow": 520
+          },
+          "150": {
+            "calls": 592,
+            "slow": 592
+          },
+          "180": {
+            "calls": 602,
+            "slow": 601
+          },
+          "210": {
+            "calls": 580,
+            "slow": 580
+          },
+          "240": {
+            "calls": 562,
+            "slow": 561
+          },
+          "270": {
+            "calls": 520,
+            "slow": 520
+          },
+          "300": {
+            "calls": 509,
+            "slow": 509
+          },
+          "330": {
+            "calls": 476,
+            "slow": 476
+          },
+          "360": {
+            "calls": 464,
+            "slow": 464
+          },
+          "390": {
+            "calls": 444,
+            "slow": 444
+          },
+          "420": {
+            "calls": 397,
+            "slow": 397
+          },
+          "450": {
+            "calls": 404,
+            "slow": 404
+          },
+          "480": {
+            "calls": 384,
+            "slow": 384
+          },
+          "510": {
+            "calls": 305,
+            "slow": 242
+          },
+          "540": {
+            "calls": 1,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16949712,
+        "send_p50_p90_by_60s_window": [
+          [
+            2.771,
+            7.196
+          ],
+          [
+            2.502,
+            3.299
+          ],
+          [
+            2.336,
+            2.906
+          ],
+          [
+            2.626,
+            3.082
+          ],
+          [
+            2.861,
+            3.35
+          ]
+        ]
+      },
+      {
+        "run": "4-stagepar",
+        "period_s": 2.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "17.02",
+          "20.11",
+          "17.67"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 9000,
+            "p50": 0.125,
+            "p90": 0.344,
+            "p99": 1.037,
+            "max": 3.668,
+            "mean": 0.175,
+            "outcomes": {
+              "ok": 9000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 2633,
+            "p50": 0.38,
+            "p90": 1.037,
+            "p99": 2.538,
+            "max": 5.287,
+            "mean": 0.528,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "release_file_reservations": {
+            "n": 2633,
+            "p50": 0.524,
+            "p90": 1.269,
+            "p99": 2.481,
+            "max": 5.484,
+            "mean": 0.669,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "send_message": {
+            "n": 9000,
+            "p50": 3.191,
+            "p90": 4.328,
+            "p99": 6.007,
+            "max": 8.46,
+            "mean": 3.164,
+            "outcomes": {
+              "ok": 9000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 17,
+          "archive_wbq_p99_ms": 6996,
+          "archive_commit_queue_p99_ms": 41393,
+          "git_commit_p99_ms": 263
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 453,
+            "slow": 328
+          },
+          "30": {
+            "calls": 707,
+            "slow": 380
+          },
+          "60": {
+            "calls": 719,
+            "slow": 406
+          },
+          "90": {
+            "calls": 694,
+            "slow": 544
+          },
+          "120": {
+            "calls": 602,
+            "slow": 564
+          },
+          "150": {
+            "calls": 601,
+            "slow": 577
+          },
+          "180": {
+            "calls": 489,
+            "slow": 489
+          },
+          "210": {
+            "calls": 435,
+            "slow": 435
+          },
+          "240": {
+            "calls": 456,
+            "slow": 456
+          },
+          "270": {
+            "calls": 449,
+            "slow": 449
+          },
+          "300": {
+            "calls": 473,
+            "slow": 473
+          },
+          "330": {
+            "calls": 329,
+            "slow": 329
+          },
+          "360": {
+            "calls": 447,
+            "slow": 447
+          },
+          "390": {
+            "calls": 391,
+            "slow": 391
+          },
+          "420": {
+            "calls": 359,
+            "slow": 359
+          },
+          "450": {
+            "calls": 394,
+            "slow": 394
+          },
+          "480": {
+            "calls": 401,
+            "slow": 401
+          },
+          "510": {
+            "calls": 369,
+            "slow": 369
+          },
+          "540": {
+            "calls": 232,
+            "slow": 141
+          }
+        },
+        "wal_bytes_peak": 16949712,
+        "send_p50_p90_by_60s_window": [
+          [
+            2.205,
+            5.3
+          ],
+          [
+            2.175,
+            2.659
+          ],
+          [
+            2.462,
+            3.309
+          ],
+          [
+            3.286,
+            4.191
+          ],
+          [
+            3.326,
+            4.194
+          ]
+        ]
+      },
+      {
+        "run": "5-stage",
+        "period_s": 2.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "10.92",
+          "14.82",
+          "15.99"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 9000,
+            "p50": 0.121,
+            "p90": 0.313,
+            "p99": 0.918,
+            "max": 2.763,
+            "mean": 0.162,
+            "outcomes": {
+              "ok": 9000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 2633,
+            "p50": 0.362,
+            "p90": 0.841,
+            "p99": 1.671,
+            "max": 3.08,
+            "mean": 0.443,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "release_file_reservations": {
+            "n": 2633,
+            "p50": 0.48,
+            "p90": 1.092,
+            "p99": 1.968,
+            "max": 3.239,
+            "mean": 0.587,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "send_message": {
+            "n": 9000,
+            "p50": 2.796,
+            "p90": 3.792,
+            "p99": 6.349,
+            "max": 9.188,
+            "mean": 2.896,
+            "outcomes": {
+              "ok": 9000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 33,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 85933,
+          "archive_commit_queue_p99_ms": 2544,
+          "git_commit_p99_ms": 66
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 391,
+            "slow": 333
+          },
+          "30": {
+            "calls": 656,
+            "slow": 472
+          },
+          "60": {
+            "calls": 745,
+            "slow": 409
+          },
+          "90": {
+            "calls": 712,
+            "slow": 543
+          },
+          "120": {
+            "calls": 642,
+            "slow": 611
+          },
+          "150": {
+            "calls": 618,
+            "slow": 602
+          },
+          "180": {
+            "calls": 592,
+            "slow": 575
+          },
+          "210": {
+            "calls": 579,
+            "slow": 579
+          },
+          "240": {
+            "calls": 522,
+            "slow": 522
+          },
+          "270": {
+            "calls": 457,
+            "slow": 457
+          },
+          "300": {
+            "calls": 469,
+            "slow": 469
+          },
+          "330": {
+            "calls": 511,
+            "slow": 511
+          },
+          "360": {
+            "calls": 444,
+            "slow": 444
+          },
+          "390": {
+            "calls": 469,
+            "slow": 469
+          },
+          "420": {
+            "calls": 421,
+            "slow": 421
+          },
+          "450": {
+            "calls": 418,
+            "slow": 418
+          },
+          "480": {
+            "calls": 336,
+            "slow": 297
+          },
+          "510": {
+            "calls": 18,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16887912,
+        "send_p50_p90_by_60s_window": [
+          [
+            2.397,
+            6.149
+          ],
+          [
+            2.108,
+            2.476
+          ],
+          [
+            2.449,
+            2.876
+          ],
+          [
+            2.659,
+            3.064
+          ],
+          [
+            3.117,
+            3.751
+          ]
+        ]
+      },
+      {
+        "run": "6-base",
+        "period_s": 2.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "10.77",
+          "12.85",
+          "14.18"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 9000,
+            "p50": 0.111,
+            "p90": 0.223,
+            "p99": 0.838,
+            "max": 2.791,
+            "mean": 0.141,
+            "outcomes": {
+              "ok": 8998,
+              "error": 2
+            }
+          },
+          "file_reservation_paths": {
+            "n": 2633,
+            "p50": 4.828,
+            "p90": 9.606,
+            "p99": 14.615,
+            "max": 21.17,
+            "mean": 5.102,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "release_file_reservations": {
+            "n": 2633,
+            "p50": 4.21,
+            "p90": 9.171,
+            "p99": 13.972,
+            "max": 23.239,
+            "mean": 4.793,
+            "outcomes": {
+              "ok": 2633
+            }
+          },
+          "send_message": {
+            "n": 9000,
+            "p50": 0.673,
+            "p90": 2.024,
+            "p99": 4.312,
+            "max": 7.778,
+            "mean": 0.924,
+            "outcomes": {
+              "ok": 9000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 132,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 13717,
+          "archive_commit_queue_p99_ms": 533209,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 320,
+            "slow": 159
+          },
+          "30": {
+            "calls": 384,
+            "slow": 15
+          },
+          "60": {
+            "calls": 409,
+            "slow": 4
+          },
+          "90": {
+            "calls": 451,
+            "slow": 9
+          },
+          "120": {
+            "calls": 581,
+            "slow": 11
+          },
+          "150": {
+            "calls": 407,
+            "slow": 0
+          },
+          "180": {
+            "calls": 493,
+            "slow": 0
+          },
+          "210": {
+            "calls": 493,
+            "slow": 0
+          },
+          "240": {
+            "calls": 403,
+            "slow": 10
+          },
+          "270": {
+            "calls": 457,
+            "slow": 2
+          },
+          "300": {
+            "calls": 464,
+            "slow": 3
+          },
+          "330": {
+            "calls": 418,
+            "slow": 131
+          },
+          "360": {
+            "calls": 365,
+            "slow": 0
+          },
+          "390": {
+            "calls": 496,
+            "slow": 34
+          },
+          "420": {
+            "calls": 445,
+            "slow": 197
+          },
+          "450": {
+            "calls": 394,
+            "slow": 2
+          },
+          "480": {
+            "calls": 434,
+            "slow": 90
+          },
+          "510": {
+            "calls": 488,
+            "slow": 233
+          },
+          "540": {
+            "calls": 207,
+            "slow": 5
+          },
+          "570": {
+            "calls": 418,
+            "slow": 18
+          },
+          "600": {
+            "calls": 404,
+            "slow": 1
+          },
+          "630": {
+            "calls": 69,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16904392,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.549,
+            5.151
+          ],
+          [
+            0.75,
+            1.505
+          ],
+          [
+            0.466,
+            1.287
+          ],
+          [
+            0.398,
+            0.987
+          ],
+          [
+            0.426,
+            1.093
+          ]
+        ]
+      }
+    ]
+  },
+  "verdict": "LOSS under the predeclared rules (ab13_rule.txt, ab13b_rule.txt). Not landed.\n\nMeasured:\n- Fence: staging message bundles outside ARCHIVE_PUBLICATION_FENCE removes the fence as a bottleneck. Both\n  arms logged 0 contended fence waits >= 2 s in every release-smoke run, vs 3,650-3,753 for base. The base\n  holders were the WBQ bundle batch (lib.rs:3523) and single bundle ops (lib.rs:3613).\n- Paced at equal offered load (period 6 s, ~10 sends/s):\n  - reservation p90 is 0.22 s vs 3.25-3.53 s, and p99 is 0.46-0.65 s vs 7.0-8.3 s;\n  - send p99 is 1.47-2.59 s vs 2.45-6.42 s, and last-60 s send p90 is within +15% of base (guard G3 met).\n- Release smoke (closed loop), all four runs:\n  - reservation p99 is 1.37-2.75 s vs 17.7-30.0 s, with 0 vs 4-43 thirty-second timeouts;\n  - swarm sends are 23-54% higher.\n  - stagepar passes the soak 'WBQ drained_total advances in every 10s window' check in both orders\n    (5,176 and 5,228 soak sends). Base and stage fail it in both orders.\n  - Guard G1 (swarm send p99 <= 1.2x base in both orders) FAILS: stage is +22.6% (R1), stagepar +25% (R3).\n    The other order passes for both.\n  - Errors are of the same order as base, and the crash/integrity checks pass in all arms. Post-swarm archive\n    convergence fails in every arm, base included.\n- Paced at equal work near the swarm rate (period 2 s; both arms saturate and overrun the schedule):\n  - send p50 is 2.8-3.2 s vs 0.65-0.67 s, and p90 is 3.8-4.3 s vs 1.86-2.02 s. Rule S1 FAILS for both arms.\n  - The same work finishes 15-17% sooner (565-580 s vs 665-680 s), and reservation p99 is 1.6-2.5 s vs 14.6-15.3 s.\n  - Server database_write p99 is 9-17 ms in every arm, so there is no consistent per-write slowdown.\n  - The WBQ queue p99 is 81-86 s for stage, 2-7 s for stagepar and 13-14 s for base. Base's commit-queue p99\n    is 533-577 s.\n\nReading: below saturation sends are unaffected. At saturation the fence no longer throttles agents through\ntheir reservations, so they queue on the message send path instead: the serialized id election and insert\n(br-qbhs0 / br-sa58k). That path is now the binding constraint. Parallel staging is what keeps the archive\ndrain inside the 10 s window (staging alone does not).\n\nNext: raise send-path capacity (br-qbhs0), then rerun this A/B. Patches are kept: 13_stage_bundles_S_lib.patch\nand 13_stage_bundles_SP_lib.patch. Landing as-is is the owner's call (reservation timeouts and fence stalls\nvs send latency at saturation)."
+}
