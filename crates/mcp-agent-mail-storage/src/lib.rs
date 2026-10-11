@@ -555,6 +555,55 @@ fn fence_contention_report(
     })
 }
 
+/// Contended fence waits in progress: wait sequence number to the wait's start
+/// in µs since the epoch. The oldest start is published as
+/// `storage.archive_fence_wait_since_us`, so a timeout that is still waiting
+/// behind the fence names it instead of reporting an unattributed stall
+/// (br-9bwnb).
+static FENCE_WAITS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+static FENCE_WAIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One contended fence wait, registered until it drops.
+struct FenceWait {
+    seq: u64,
+}
+
+impl FenceWait {
+    fn begin() -> Self {
+        let seq = FENCE_WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.insert(seq, now_micros_u64());
+        publish_oldest_fence_wait(&waits);
+        Self { seq }
+    }
+}
+
+impl Drop for FenceWait {
+    fn drop(&mut self) {
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.remove(&self.seq);
+        publish_oldest_fence_wait(&waits);
+    }
+}
+
+/// The earliest start among `waits`, or zero when none. Sequence order need
+/// not match start order: a wait may take its number, then lose the race for
+/// the map to a later one.
+fn oldest_fence_wait_start(waits: &BTreeMap<u64, u64>) -> u64 {
+    waits.values().copied().min().unwrap_or(0)
+}
+
+fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_fence_wait_since_us
+        .set(oldest_fence_wait_start(waits));
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -571,9 +620,11 @@ impl FenceLease {
             Err(std::sync::TryLockError::WouldBlock) => {
                 let blocker = archive_publication_fence_holder();
                 let started = Instant::now();
+                let wait = FenceWait::begin();
                 let guard = ARCHIVE_PUBLICATION_FENCE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(wait);
                 if let Some(report) =
                     fence_contention_report(started.elapsed(), site, blocker.as_ref())
                 {
@@ -14352,6 +14403,49 @@ mod tests {
     /// a cached directory is no mutation. Neither may queue behind the global
     /// publication fence that a draining write-behind batch holds (observed:
     /// inbox reads waiting 25-30 s); a real archive mutation still waits.
+    #[test]
+    fn oldest_fence_wait_is_the_earliest_start_not_the_lowest_sequence() {
+        assert_eq!(oldest_fence_wait_start(&BTreeMap::new()), 0);
+        // Wait 7 took its number first but registered after wait 8.
+        let waits = BTreeMap::from([(7, 2_000), (8, 1_000), (9, 3_000)]);
+        assert_eq!(oldest_fence_wait_start(&waits), 1_000);
+    }
+
+    /// br-9bwnb: a thread blocked on the held fence is visible to timeout
+    /// diagnostics while it waits. Without the registration the live wait age
+    /// stays zero and a timed-out reservation reads as unattributed.
+    #[test]
+    fn a_contended_fence_wait_is_visible_to_timeout_diagnostics() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let waiter = std::thread::spawn(|| drop(ArchiveMutationGuard::begin()));
+
+        let gauge = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_fence_wait_since_us;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gauge.load() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let waiting = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(30_000_000);
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        waiter.join().expect("waiter thread");
+
+        assert!(
+            waiting.archive_fence_wait_us >= 20_000,
+            "a blocked fence wait must have a live age: {waiting:?}"
+        );
+    }
+
     #[test]
     fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();

@@ -5331,6 +5331,7 @@ mod tests {
                 archive_wbq_p99_us: 0,
                 archive_commit_queue_p99_us: 16_778_000,
                 git_commit_p99_us: 450_000,
+                archive_fence_wait_us: 0,
                 blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                     inflight: 1,
                     zombies: 0,

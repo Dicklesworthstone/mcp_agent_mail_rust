@@ -6113,20 +6113,25 @@ fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+    fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
+    let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
          client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
          database_write_p99_ms={}; archive_wbq_p99_ms={}; \
          archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
+         archive_fence_wait_ms={}; archive_fence_holder={fence_holder}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
          blocking_dispatch_zombies_expired={}; \
          blocking_dispatch_timeouts_total={}. \
-         (archive stages are off the request path since ack-fast: archive \
-         lag cannot cause a tool timeout; archive_commit_queue is \
-         enqueue-to-durable queue latency, not pure git work.)",
+         (the archive write-behind queue and commit queue are off the request \
+         path since ack-fast, and archive_commit_queue is enqueue-to-durable \
+         queue latency, not pure git work; reservation artifacts are written \
+         on the request path and wait for the archive publication fence, \
+         whose oldest live wait is archive_fence_wait_ms.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6136,6 +6141,7 @@ fn dispatch_timeout_error_text(
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
         micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
         micros_to_millis_ceil(diagnostics.git_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_fence_wait_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.zombies_expired,
@@ -6147,9 +6153,15 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
+    let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder();
     McpError::new(
         McpErrorCode::InternalError,
-        dispatch_timeout_error_text(method, dispatch_timeout_secs, &diagnostics),
+        dispatch_timeout_error_text(
+            method,
+            dispatch_timeout_secs,
+            &diagnostics,
+            fence_holder.as_ref(),
+        ),
     )
 }
 
@@ -19251,6 +19263,7 @@ mod tests {
             archive_wbq_p99_us: 2_000,
             archive_commit_queue_p99_us: 16_778_000,
             git_commit_p99_us: 450_000,
+            archive_fence_wait_us: 0,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -19260,16 +19273,64 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics);
+        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
         assert!(text.contains("archive_commit_queue_p99_ms=16778"));
         assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("archive_fence_wait_ms=0; archive_fence_holder=none;"));
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
+    }
+
+    /// br-9bwnb: a reservation that timed out behind the archive publication
+    /// fence names the fence, its live wait and its holder, and the text no
+    /// longer claims that archive work cannot cause a tool timeout.
+    #[test]
+    fn dispatch_timeout_text_names_a_live_archive_fence_wait_and_its_holder() {
+        let diagnostics = mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+            client_deadline_us: 30_000_000,
+            stage: mcp_agent_mail_core::metrics::TimeoutStage::ArchiveFence,
+            stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
+            pool_acquire_p99_us: 3_000,
+            database_write_p99_us: 6_000,
+            archive_wbq_p99_us: 0,
+            archive_commit_queue_p99_us: 1_650_000,
+            git_commit_p99_us: 630_000,
+            archive_fence_wait_us: 29_400_000,
+            blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
+                timeouts_total: 13,
+            },
+        };
+        let holder = mcp_agent_mail_storage::ArchiveFenceHolder {
+            thread: "wbq-drain (ThreadId(7))".to_string(),
+            site: "crates/mcp-agent-mail-storage/src/lib.rs:9316:20".to_string(),
+            held_for: Duration::from_millis(29_500),
+        };
+
+        let text =
+            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        assert!(text.contains("stage=archive_publication_fence"), "{text}");
+        assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
+        assert!(
+            text.contains(
+                "archive_fence_holder=wbq-drain (ThreadId(7)) at \
+                 crates/mcp-agent-mail-storage/src/lib.rs:9316:20 for 29500 ms;"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("archive lag cannot cause a tool timeout"),
+            "{text}"
+        );
     }
 
     #[test]

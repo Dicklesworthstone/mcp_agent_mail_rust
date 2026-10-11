@@ -790,6 +790,9 @@ pub enum TimeoutStage {
     DatabaseWrite,
     ArchiveWbq,
     ArchiveCommit,
+    /// A request-path archive write (a reservation artifact, a direct
+    /// fallback) waits for the process-wide archive publication fence.
+    ArchiveFence,
     BlockingDispatch,
     NoMonitoredStage,
 }
@@ -802,6 +805,7 @@ impl TimeoutStage {
             Self::DatabaseWrite => "database_write",
             Self::ArchiveWbq => "archive_wbq",
             Self::ArchiveCommit => "archive_commit",
+            Self::ArchiveFence => "archive_publication_fence",
             Self::BlockingDispatch => "blocking_dispatch_unattributed",
             Self::NoMonitoredStage => "no_monitored_stage_exceeded_budget",
         }
@@ -835,15 +839,26 @@ pub struct TimeoutDiagnosticsSnapshot {
     /// Pure git commit latency (`storage.git_commit_latency_us`), exposed so
     /// queue latency is never mistaken for git being slow (GH#245).
     pub git_commit_p99_us: u64,
+    /// Age of the oldest archive-publication-fence wait still in progress at
+    /// the snapshot (zero when no thread waits). Live, not a percentile.
+    pub archive_fence_wait_us: u64,
     pub blocking_dispatch: BlockingDispatchMetricsSnapshot,
 }
 
-/// Classify timeout evidence from p99 samples.
+/// A live archive-fence wait at least this old names the fence as the stage
+/// of a timeout that no stage's p99 explains (br-9bwnb). The archive fence
+/// reports contended waits from the same age.
+pub const ARCHIVE_FENCE_WAIT_ATTRIBUTION_US: u64 = 2_000_000;
+
+/// Classify timeout evidence from p99 samples and the live archive-fence wait.
 ///
 /// The slowest stage at or beyond the client deadline wins. If none crossed
-/// the deadline, dispatch contention is surfaced as explicitly unattributed
-/// rather than being mislabeled as DB contention.
+/// the deadline, a fence wait of [`ARCHIVE_FENCE_WAIT_ATTRIBUTION_US`] or
+/// more names the fence, without claiming it exceeded the budget. Otherwise
+/// dispatch contention is surfaced as explicitly unattributed rather than
+/// being mislabeled as DB contention.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn timeout_diagnostics_from_samples(
     client_deadline_us: u64,
     pool_acquire_p99_us: u64,
@@ -851,6 +866,7 @@ pub fn timeout_diagnostics_from_samples(
     archive_wbq_p99_us: u64,
     archive_commit_queue_p99_us: u64,
     git_commit_p99_us: u64,
+    archive_fence_wait_us: u64,
     blocking_dispatch: BlockingDispatchMetricsSnapshot,
 ) -> TimeoutDiagnosticsSnapshot {
     let mut stage = TimeoutStage::NoMonitoredStage;
@@ -861,6 +877,7 @@ pub fn timeout_diagnostics_from_samples(
             (TimeoutStage::DatabaseWrite, database_write_p99_us),
             (TimeoutStage::ArchiveWbq, archive_wbq_p99_us),
             (TimeoutStage::ArchiveCommit, archive_commit_queue_p99_us),
+            (TimeoutStage::ArchiveFence, archive_fence_wait_us),
         ] {
             if p99_us >= client_deadline_us && p99_us > slowest_p99_us {
                 stage = candidate;
@@ -869,8 +886,12 @@ pub fn timeout_diagnostics_from_samples(
         }
     }
     let stage_exceeded_budget = slowest_p99_us > 0;
-    if !stage_exceeded_budget && (blocking_dispatch.inflight > 0 || blocking_dispatch.zombies > 0) {
-        stage = TimeoutStage::BlockingDispatch;
+    if !stage_exceeded_budget {
+        if archive_fence_wait_us >= ARCHIVE_FENCE_WAIT_ATTRIBUTION_US {
+            stage = TimeoutStage::ArchiveFence;
+        } else if blocking_dispatch.inflight > 0 || blocking_dispatch.zombies > 0 {
+            stage = TimeoutStage::BlockingDispatch;
+        }
     }
 
     TimeoutDiagnosticsSnapshot {
@@ -883,6 +904,7 @@ pub fn timeout_diagnostics_from_samples(
         archive_wbq_p99_us,
         archive_commit_queue_p99_us,
         git_commit_p99_us,
+        archive_fence_wait_us,
         blocking_dispatch,
     }
 }
@@ -1208,6 +1230,12 @@ pub struct StorageMetrics {
     // -- Git/archive IO metrics --
     /// Time spent waiting to acquire the project advisory lock (`.archive.lock`).
     pub archive_lock_wait_us: Log2Histogram,
+    /// Start (µs since the epoch) of the oldest contended wait for the archive
+    /// publication fence still in progress; zero when no thread waits. A
+    /// request that timed out behind the fence has not finished the wait a
+    /// histogram would record, so timeout diagnostics read this age
+    /// (br-9bwnb).
+    pub archive_fence_wait_since_us: GaugeU64,
     /// Time spent waiting for the commit/index lock in `commit_paths_with_retry`.
     pub commit_lock_wait_us: Log2Histogram,
     /// Time spent performing `commit_paths` (git index update + commit).
@@ -2365,6 +2393,7 @@ impl Default for StorageMetrics {
             needs_reindex_total: Counter::new(),
 
             archive_lock_wait_us: Log2Histogram::new(),
+            archive_fence_wait_since_us: GaugeU64::new(),
             commit_lock_wait_us: Log2Histogram::new(),
             git_commit_latency_us: Log2Histogram::new(),
             git_index_lock_retries_total: Counter::new(),
@@ -2578,6 +2607,14 @@ pub fn global_metrics() -> &'static GlobalMetrics {
 #[must_use]
 pub fn timeout_diagnostics_snapshot(client_deadline_us: u64) -> TimeoutDiagnosticsSnapshot {
     let live = global_metrics();
+    let fence_wait_since_us = live.storage.archive_fence_wait_since_us.load();
+    let archive_fence_wait_us = if fence_wait_since_us == 0 {
+        0
+    } else {
+        u64::try_from(crate::timestamps::now_micros_raw())
+            .unwrap_or(0)
+            .saturating_sub(fence_wait_since_us)
+    };
     timeout_diagnostics_from_samples(
         client_deadline_us,
         live.db.pool_acquire_latency_us.recent_snapshot().p99,
@@ -2585,6 +2622,7 @@ pub fn timeout_diagnostics_snapshot(client_deadline_us: u64) -> TimeoutDiagnosti
         live.storage.wbq_queue_latency_us.recent_snapshot().p99,
         live.storage.commit_queue_latency_us.recent_snapshot().p99,
         live.storage.git_commit_latency_us.recent_snapshot().p99,
+        archive_fence_wait_us,
         blocking_dispatch_metrics().snapshot(),
     )
 }
@@ -2636,6 +2674,8 @@ mod tests {
             0,
             32_000_000,
             700,
+            // A live sub-budget fence wait never outranks an over-budget stage.
+            5_000_000,
             BlockingDispatchMetricsSnapshot {
                 inflight: 4,
                 zombies: 0,
@@ -2659,6 +2699,8 @@ mod tests {
             2_000,
             16_000_000,
             600,
+            // Just under the attribution age: no fence is named.
+            ARCHIVE_FENCE_WAIT_ATTRIBUTION_US - 1,
             BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -2671,6 +2713,44 @@ mod tests {
         assert_eq!(diagnostics.stage, TimeoutStage::BlockingDispatch);
         assert!(!diagnostics.stage_exceeded_budget);
         assert_eq!(diagnostics.stage.as_str(), "blocking_dispatch_unattributed");
+    }
+
+    /// br-9bwnb: a request blocked behind the archive publication fence is
+    /// still waiting when it times out, so no p99 records it. A live fence
+    /// wait names the stage; it claims the budget only once the wait itself
+    /// reaches the client deadline.
+    #[test]
+    fn timeout_diagnostics_name_a_live_archive_fence_wait() {
+        let dispatch = BlockingDispatchMetricsSnapshot {
+            inflight: 1,
+            zombies: 0,
+            zombies_expired: 0,
+            zombies_expired_total: 0,
+            timeouts_total: 1,
+        };
+        let sub_budget = timeout_diagnostics_from_samples(
+            30_000_000,
+            9_000,
+            12_000,
+            2_000,
+            16_000_000,
+            600,
+            ARCHIVE_FENCE_WAIT_ATTRIBUTION_US,
+            dispatch.clone(),
+        );
+        assert_eq!(sub_budget.stage, TimeoutStage::ArchiveFence);
+        assert!(!sub_budget.stage_exceeded_budget);
+        assert_eq!(sub_budget.stage.as_str(), "archive_publication_fence");
+        assert_eq!(
+            sub_budget.archive_fence_wait_us,
+            ARCHIVE_FENCE_WAIT_ATTRIBUTION_US
+        );
+
+        let over_budget = timeout_diagnostics_from_samples(
+            30_000_000, 9_000, 12_000, 2_000, 16_000_000, 600, 31_000_000, dispatch,
+        );
+        assert_eq!(over_budget.stage, TimeoutStage::ArchiveFence);
+        assert!(over_budget.stage_exceeded_budget);
     }
 
     #[test]
