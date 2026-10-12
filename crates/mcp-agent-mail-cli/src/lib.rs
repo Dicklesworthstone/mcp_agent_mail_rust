@@ -8759,12 +8759,18 @@ pub fn prepare_runtime_server_startup_with_takeover(
 /// that works before they run, and move staging under the storage root's
 /// gitignored `diagnostics/` when it does not (br-txx8u): a full or
 /// over-quota temp directory must neither stop the server nor be read as
-/// mailbox damage.
+/// mailbox damage. The proof is sized by this mailbox: a small tmpfs that
+/// takes the probe file but not a copy of the family crashed the server
+/// with SIGBUS (GH#347).
 fn ensure_startup_staging_root(config: &Config) -> CliResult<()> {
     use mcp_agent_mail_db::pool::SnapshotTempRootChoice;
 
     let fallback = config.storage_root.join("diagnostics").join("staging");
-    match mcp_agent_mail_db::pool::ensure_usable_snapshot_temp_root(&fallback) {
+    let required_bytes = sqlite_file_path_from_database_url(&config.database_url)
+        .map_or(0, |path| {
+            mcp_agent_mail_db::pool::health_probe_staging_bytes(&path)
+        });
+    match mcp_agent_mail_db::pool::ensure_usable_snapshot_temp_root(&fallback, required_bytes) {
         Ok(SnapshotTempRootChoice::Preferred(_)) => Ok(()),
         Ok(SnapshotTempRootChoice::Fallback {
             preferred,

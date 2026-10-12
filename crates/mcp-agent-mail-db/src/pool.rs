@@ -7132,13 +7132,17 @@ static SNAPSHOT_TEMP_ROOT_FALLBACK: OnceLock<PathBuf> = OnceLock::new();
 /// filesystem that is already full, without itself filling one.
 const SNAPSHOT_TEMP_ROOT_PROBE_BYTES: usize = 1024 * 1024;
 
+/// Free bytes on the filesystem holding a directory.
+type AvailableSpace = fn(&Path) -> std::io::Result<u64>;
+
 /// Where [`ensure_usable_snapshot_temp_root`] decided staging goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotTempRootChoice {
     /// The environment's temp directory accepted the probe.
     Preferred(PathBuf),
-    /// The environment's temp directory refused the probe; staging moved to
-    /// the fallback for the rest of the process.
+    /// The environment's temp directory refused the probe, or has no room
+    /// for a copy of the mailbox family; staging moved to the fallback for the
+    /// rest of the process.
     Fallback {
         preferred: PathBuf,
         preferred_error: String,
@@ -7177,8 +7181,14 @@ pub fn snapshot_temp_root_fallback() -> Option<PathBuf> {
 /// directory; when that fails, staging moves to `fallback` (created private)
 /// for the rest of the process. Errors only when neither location accepts
 /// the probe, naming both.
+///
+/// A temp directory that takes the probe but has less free space than
+/// `required_bytes` (see [`health_probe_staging_bytes`]) also moves staging
+/// to `fallback`, provided the fallback has the room; otherwise it stays, and
+/// each staging call refuses up front rather than filling it (GH#347).
 pub fn ensure_usable_snapshot_temp_root(
     fallback: &Path,
+    required_bytes: u64,
 ) -> std::io::Result<SnapshotTempRootChoice> {
     let preferred = environment_snapshot_temp_root();
     if let Some(chosen) = SNAPSHOT_TEMP_ROOT_FALLBACK.get() {
@@ -7188,7 +7198,12 @@ pub fn ensure_usable_snapshot_temp_root(
             fallback: chosen.clone(),
         });
     }
-    let choice = choose_snapshot_temp_root(&preferred, fallback)?;
+    let choice = choose_snapshot_temp_root(
+        &preferred,
+        fallback,
+        required_bytes,
+        mcp_agent_mail_core::disk::disk_free_bytes,
+    )?;
     if let SnapshotTempRootChoice::Fallback { fallback, .. } = &choice {
         SNAPSHOT_TEMP_ROOT_FALLBACK.get_or_init(|| fallback.clone());
     }
@@ -7200,9 +7215,29 @@ pub fn ensure_usable_snapshot_temp_root(
 fn choose_snapshot_temp_root(
     preferred: &Path,
     fallback: &Path,
+    required_bytes: u64,
+    available_space: AvailableSpace,
 ) -> std::io::Result<SnapshotTempRootChoice> {
     let preferred_error = match probe_snapshot_temp_root(preferred) {
-        Ok(()) => return Ok(SnapshotTempRootChoice::Preferred(preferred.to_path_buf())),
+        Ok(()) => {
+            let Err(too_small) = ensure_staging_room(preferred, required_bytes, available_space)
+            else {
+                return Ok(SnapshotTempRootChoice::Preferred(preferred.to_path_buf()));
+            };
+            let fallback_fits = create_private_dir_all(fallback)
+                .and_then(|()| probe_snapshot_temp_root(fallback))
+                .and_then(|()| ensure_staging_room(fallback, required_bytes, available_space));
+            if fallback_fits.is_err() {
+                // Moving would not help; staging calls refuse with the
+                // shortfall instead of filling the temp directory.
+                return Ok(SnapshotTempRootChoice::Preferred(preferred.to_path_buf()));
+            }
+            return Ok(SnapshotTempRootChoice::Fallback {
+                preferred: preferred.to_path_buf(),
+                preferred_error: too_small.to_string(),
+                fallback: fallback.to_path_buf(),
+            });
+        }
         Err(error) => error,
     };
     let fallback_result =
@@ -7259,6 +7294,36 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
         refuse_non_directory(candidate, false)?;
     }
     Ok(())
+}
+
+/// Refuse to stage `needed` bytes under `root` when its filesystem reports
+/// less free space.
+///
+/// A copy that only just fits is worse than a refusal:
+/// opening it maps a sparse `-shm`, and the engine's first store into a page
+/// the full filesystem cannot back raises SIGBUS, killing the process before
+/// any error path runs (GH#347). When free space cannot be read, the copy
+/// reports its own failure.
+fn ensure_staging_room(
+    root: &Path,
+    needed: u64,
+    available_space: AvailableSpace,
+) -> std::io::Result<()> {
+    let Ok(available) = available_space(root) else {
+        return Ok(());
+    };
+    if available >= needed {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::StorageFull,
+        format!(
+            "no space left on device for a private probe copy: {} has {} KiB free, the mailbox family needs about {} KiB",
+            root.display(),
+            available / 1024,
+            needed.div_ceil(1024)
+        ),
+    ))
 }
 
 /// Write and sync a probe file in a private directory under `root`; the
@@ -9716,6 +9781,43 @@ const HEALTH_PROBE_DIR_PREFIX: &str = ".mcp-agent-mail-health-probe-";
 /// database uses it verbatim; the sidecars append their own suffix to it.
 const HEALTH_PROBE_STAGED_STEM: &str = "health-probe.sqlite3";
 
+/// Room a staged probe keeps free beyond its family's own blocks, for the
+/// probe connection's own scratch files and other tenants of the filesystem.
+const HEALTH_PROBE_STAGING_HEADROOM_BYTES: u64 = 1024 * 1024;
+
+/// The wal-index (`-shm`) grows in 32 KiB regions. A region indexes at most
+/// 4096 frames, and the first only 4062; with the smallest page size a frame
+/// is 512 + 24 bytes. Sizing by those bounds never undercounts the `-shm` a
+/// probe's open maps for a copied WAL.
+const WAL_INDEX_REGION_BYTES: u64 = 32 * 1024;
+const WAL_INDEX_MIN_FRAMES_PER_REGION: u64 = 4062;
+const WAL_MIN_FRAME_BYTES: u64 = 512 + 24;
+
+/// Bytes a private health-probe copy of the family at `source` needs.
+///
+/// That is every present member rounded up to a 4 KiB block, the `-shm` the
+/// probe's open maps for the copied WAL, and headroom (GH#347).
+#[must_use]
+pub fn health_probe_staging_bytes(source: &Path) -> u64 {
+    const BLOCK_BYTES: u64 = 4096;
+    let mut total = 0_u64;
+    let mut wal_bytes = 0_u64;
+    for suffix in std::iter::once("").chain(SQLITE_RECOVERY_SIDECAR_SUFFIXES.iter().copied()) {
+        let len = std::fs::symlink_metadata(sqlite_sidecar_path(source, suffix))
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map_or(0, |metadata| metadata.len());
+        if suffix == "-wal" {
+            wal_bytes = len;
+        }
+        total = total.saturating_add(len.div_ceil(BLOCK_BYTES) * BLOCK_BYTES);
+    }
+    let wal_index_regions = wal_bytes / (WAL_INDEX_MIN_FRAMES_PER_REGION * WAL_MIN_FRAME_BYTES) + 1;
+    total
+        .saturating_add(wal_index_regions * WAL_INDEX_REGION_BYTES)
+        .saturating_add(HEALTH_PROBE_STAGING_HEADROOM_BYTES)
+}
+
 /// Fallback age bound for a staged probe directory whose owning PID cannot be
 /// read, or is currently held by some live process (PID reuse). Generous enough
 /// that a slow probe over a very large mailbox is never swept out from under
@@ -10182,6 +10284,15 @@ fn stage_sqlite_family_for_health_probe_with_copy_hook(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     }
+
+    // A family the staging filesystem cannot hold is refused before anything
+    // is copied, as host storage exhaustion rather than a SIGBUS (GH#347).
+    let staging_root = root.map_or_else(snapshot_temp_root, Path::to_path_buf);
+    ensure_staging_room(
+        &staging_root,
+        health_probe_staging_bytes(source),
+        mcp_agent_mail_core::disk::disk_free_bytes,
+    )?;
 
     // Closing an independently opened source descriptor can erase another
     // connection's process-wide fcntl locks. Reserve the existing namespace
@@ -29281,7 +29392,13 @@ mod tests {
             .join("diagnostics")
             .join("staging");
 
-        let choice = choose_snapshot_temp_root(&unusable, &fallback).expect("fallback accepted");
+        let choice = choose_snapshot_temp_root(
+            &unusable,
+            &fallback,
+            0,
+            mcp_agent_mail_core::disk::disk_free_bytes,
+        )
+        .expect("fallback accepted");
         let SnapshotTempRootChoice::Fallback {
             preferred,
             fallback: chosen,
@@ -29308,7 +29425,13 @@ mod tests {
         let usable = dir.path().join("usable-tmp");
         std::fs::create_dir(&usable).unwrap();
         assert_eq!(
-            choose_snapshot_temp_root(&usable, &fallback).expect("usable temp dir"),
+            choose_snapshot_temp_root(
+                &usable,
+                &fallback,
+                0,
+                mcp_agent_mail_core::disk::disk_free_bytes
+            )
+            .expect("usable temp dir"),
             SnapshotTempRootChoice::Preferred(usable)
         );
     }
@@ -29326,8 +29449,13 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, storage.join("diagnostics")).unwrap();
         let fallback = storage.join("diagnostics").join("staging");
 
-        let error = choose_snapshot_temp_root(&unusable, &fallback)
-            .expect_err("a symlinked fallback parent must be refused");
+        let error = choose_snapshot_temp_root(
+            &unusable,
+            &fallback,
+            0,
+            mcp_agent_mail_core::disk::disk_free_bytes,
+        )
+        .expect_err("a symlinked fallback parent must be refused");
         assert!(
             !elsewhere.join("staging").exists(),
             "nothing may be created through the symlink"
@@ -29337,6 +29465,160 @@ mod tests {
             text.contains("no usable staging directory")
                 && text.contains(&unusable.display().to_string())
                 && text.contains("not a real directory"),
+            "{text}"
+        );
+    }
+
+    /// GH#347: the footprint counts every present member in whole 4 KiB
+    /// blocks, a `-shm` scaled by the WAL, and headroom; absent members and
+    /// non-files count nothing.
+    #[test]
+    fn health_probe_staging_bytes_counts_blocks_wal_index_and_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("storage.sqlite3");
+        assert_eq!(
+            health_probe_staging_bytes(&source),
+            WAL_INDEX_REGION_BYTES + HEALTH_PROBE_STAGING_HEADROOM_BYTES,
+            "a missing family still reserves one wal-index region and headroom"
+        );
+
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(5_000)
+            .unwrap();
+        std::fs::File::create(sqlite_sidecar_path(&source, "-wal"))
+            .unwrap()
+            .set_len(3_000_000)
+            .unwrap();
+        std::fs::write(sqlite_sidecar_path(&source, "-wal-cert"), b"cert").unwrap();
+        std::fs::create_dir(sqlite_sidecar_path(&source, "-journal")).unwrap();
+
+        let blocks = 2 * 4096 + 3_000_000_u64.div_ceil(4096) * 4096 + 4096;
+        // 3,000,000 WAL bytes are more than one region's worth of 536-byte
+        // frames (4062 * 536 = 2,177,232), so two regions.
+        let wal_index = 2 * WAL_INDEX_REGION_BYTES;
+        assert_eq!(
+            health_probe_staging_bytes(&source),
+            blocks + wal_index + HEALTH_PROBE_STAGING_HEADROOM_BYTES
+        );
+    }
+
+    /// GH#347: a temp directory that takes the small probe but cannot hold a
+    /// copy of the mailbox family moves staging to a fallback with room, and
+    /// says why in host-storage terms.
+    #[test]
+    fn staging_root_moves_to_a_fallback_with_room_when_the_temp_directory_is_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small-tmp");
+        std::fs::create_dir(&small).unwrap();
+        let fallback = dir
+            .path()
+            .join("storage")
+            .join("diagnostics")
+            .join("staging");
+        let sixteen_mib_free_in_small_tmp: AvailableSpace = |root| {
+            Ok(if root.ends_with("small-tmp") {
+                16 << 20
+            } else {
+                1 << 40
+            })
+        };
+
+        let choice =
+            choose_snapshot_temp_root(&small, &fallback, 17 << 20, sixteen_mib_free_in_small_tmp)
+                .expect("the fallback has room");
+        let SnapshotTempRootChoice::Fallback {
+            preferred,
+            preferred_error,
+            fallback: chosen,
+        } = choice
+        else {
+            panic!("a temp directory without room must fall back: {choice:?}");
+        };
+        assert_eq!(preferred, small);
+        assert_eq!(chosen, fallback);
+        assert!(
+            preferred_error.contains(&small.display().to_string())
+                && preferred_error.contains("16384 KiB free")
+                && preferred_error.contains("17408 KiB"),
+            "{preferred_error}"
+        );
+        assert!(
+            mcp_agent_mail_core::disk::is_host_storage_exhaustion_message(&preferred_error),
+            "a temp directory that is too small is host storage, not mailbox damage: {preferred_error}"
+        );
+
+        // A family that fits keeps the temp directory.
+        assert_eq!(
+            choose_snapshot_temp_root(&small, &fallback, 15 << 20, sixteen_mib_free_in_small_tmp)
+                .expect("fits"),
+            SnapshotTempRootChoice::Preferred(small)
+        );
+    }
+
+    /// GH#347: when the fallback has no room either, the temp directory stays:
+    /// a start the probe allowed is never refused for size.
+    #[test]
+    fn staging_root_keeps_the_temp_directory_when_no_location_has_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small-tmp");
+        std::fs::create_dir(&small).unwrap();
+        let fallback = dir.path().join("storage").join("staging");
+        let everywhere_small: AvailableSpace = |_| Ok(16 << 20);
+
+        assert_eq!(
+            choose_snapshot_temp_root(&small, &fallback, 17 << 20, everywhere_small)
+                .expect("no refusal for size"),
+            SnapshotTempRootChoice::Preferred(small)
+        );
+    }
+
+    /// GH#347: staging measures the real filesystem and refuses a family
+    /// larger than its free space before copying anything, as host storage
+    /// exhaustion. The public probe reports it as undetermined health.
+    #[test]
+    fn health_probe_staging_refuses_a_family_larger_than_free_space_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("staging");
+        std::fs::create_dir(&root).unwrap();
+        let source = dir.path().join("storage.sqlite3");
+        let free = mcp_agent_mail_core::disk::disk_free_bytes(&root).unwrap();
+        // Sparse: only the logical length matters, which is what a copy writes.
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(free + (1 << 30))
+            .unwrap();
+
+        let Err(error) = stage_sqlite_family_for_health_probe_once_in(&source, Some(&root)) else {
+            panic!("a family larger than the free space must be refused");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+        assert!(
+            mcp_agent_mail_core::disk::is_host_storage_exhaustion(&error),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&root.display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing is staged before the refusal"
+        );
+
+        let temp_free = mcp_agent_mail_core::disk::disk_free_bytes(&snapshot_temp_root()).unwrap();
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(free.max(temp_free) + (1 << 30))
+            .unwrap();
+        let Err(error) = stage_sqlite_family_for_health_probe(&source) else {
+            panic!("the public probe must refuse too");
+        };
+        let text = error.to_string();
+        assert!(
+            text.contains("mailbox health could not be determined")
+                && mcp_agent_mail_core::disk::is_host_storage_exhaustion_message(&text),
             "{text}"
         );
     }
