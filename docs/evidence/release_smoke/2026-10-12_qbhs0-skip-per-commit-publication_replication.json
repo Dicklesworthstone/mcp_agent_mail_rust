@@ -320,11 +320,11 @@
       "wal_peak_median": 16803452.0
     }
   },
-  "verdict": "Perf and error conditions of nopub2_rule all hold: S1 P2 send p50 0.575x / p90 0.619x (p99 0.538x); E1 P2 errors 3 vs 5, P6 1 vs 1; E2 zero visibility-signature errors (every error payload in both arms is RESOURCE_BUSY / busy_retryable); G1 P6 p50 0.816x / p90 0.468x (p99 0.160x); G2 fetch 1.007x / 1.000x; G3 WAL peak median 0.99x / 0.97x. Correctness: C2 and C3 pass; C1 awaits the warmup-test rerun. NOT landed: per the rule this changes the cross-process publication contract, so the result goes to the owner before landing.",
+  "verdict": "Perf and error conditions of nopub2_rule all hold: S1 P2 send p50 0.575x / p90 0.619x (p99 0.538x); E1 P2 errors 3 vs 5, P6 1 vs 1; E2 zero visibility-signature errors (every error payload in both arms is RESOURCE_BUSY / busy_retryable); G1 P6 p50 0.816x / p90 0.468x (p99 0.160x); G2 fetch 1.007x / 1.000x; G3 WAL peak median 0.99x / 0.97x. Correctness: C1, C2 and C3 all pass. WIN under nopub2_rule. NOT landed: per the rule this changes the cross-process publication contract, so the result goes to the owner before landing.",
   "correctness": {
     "C3_visibility_test": "pass (commits_are_visible_to_fresh_and_canonical_readers_without_a_checkpoint)",
     "C2_tools_it": "124 passed / 0 failed",
     "C2_conformance": "83 + 3 passed / 0 failed",
-    "C1_db_lib_full": "3498 passed / 1 failed / 8 pre-existing ignores; the 1 is pool::tests::pool_warmup_opens_connections (warmup opened 1 of 5 connections inside its 10 s budget while the whole run took 5,711 s on an overloaded worker; warmup never commits). Targeted rerun: first attempt hit an openssl-sys build-script failure on worker hz4 (infrastructure, no test ran); requeued."
+    "C1_db_lib_full": "3498 passed / 1 failed / 8 pre-existing ignores; the 1 is pool::tests::pool_warmup_opens_connections (warmup opened 1 of 5 connections inside its 10 s budget while the whole run took 5,711 s on an overloaded worker; warmup never commits). Targeted rerun: first attempt hit an openssl-sys build-script failure on worker hz4 (infrastructure, no test ran); requeued. Rerun 2026-10-12 20:56Z: pool_warmup_opens_connections ok, pool_warmup_zero_is_noop ok, commits_are_visible... ok (3/0, 1.22 s). C1 holds."
   }
 }
