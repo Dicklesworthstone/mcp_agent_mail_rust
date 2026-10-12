@@ -326,5 +326,21 @@
     "C2_tools_it": "124 passed / 0 failed",
     "C2_conformance": "83 + 3 passed / 0 failed",
     "C1_db_lib_full": "3498 passed / 1 failed / 8 pre-existing ignores; the 1 is pool::tests::pool_warmup_opens_connections (warmup opened 1 of 5 connections inside its 10 s budget while the whole run took 5,711 s on an overloaded worker; warmup never commits). Targeted rerun: first attempt hit an openssl-sys build-script failure on worker hz4 (infrastructure, no test ran); requeued. Rerun 2026-10-12 20:56Z: pool_warmup_opens_connections ok, pool_warmup_zero_is_noop ok, commits_are_visible... ok (3/0, 1.22 s). C1 holds."
+  },
+  "durability_fsync_check": {
+    "method": "strace -f -y -e trace=fsync,fdatasync around each release binary; heavy_inbox.py with 30 seeded + 100 timed sends (130 commits plus setup) on a fresh mailbox",
+    "base_fsyncs": {
+      "storage.sqlite3-wal": 128,
+      "storage.sqlite3": 218,
+      "storage.sqlite3-wal-cert-head": 107,
+      "archive files (fdatasync)": 404
+    },
+    "nopub_fsyncs": {
+      "storage.sqlite3-wal": 128,
+      "storage.sqlite3": 26,
+      "storage.sqlite3-wal-cert-head": 11,
+      "archive files (fdatasync)": 404
+    },
+    "reading": "Both builds fsync the WAL once per commit, so commit durability against power loss / OS crash is unchanged. nopub drops about 2.2 main-file and cert-head fsyncs per commit, all of which came from the per-commit PASSIVE checkpoint. That is the '~26 ms of fsync per commit' br-qbhs0 was opened for."
   }
 }
