@@ -1,0 +1,266 @@
+{
+  "schema": "br-qbhs0-ab-v1",
+  "bead": "br-qbhs0",
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "lever": "create_message counts each inserted recipient row into inbox_stats (PK lookup + one UPDATE; exact recount fallback when no row) instead of DELETE + full COUNT-JOIN recount + INSERT per recipient, under MESSAGE_WRITE_SERIALIZER",
+  "decision_rule_fixed_before_the_run": "inbox-stats increment lever (br-qbhs0 slice). Written 2026-10-12 ~08:20Z, before any build or run.\n\nChange: create_message_with_recipients_tx stops recounting every recipient's whole inbox (DELETE + COUNT JOIN\nover message_recipients/messages + INSERT, O(inbox) per recipient, under MESSAGE_WRITE_SERIALIZER). It applies\none counter UPDATE per newly inserted recipient row instead. When no inbox_stats row exists, or a recipient insert\nwas a no-op, it falls back to the existing exact recount for that agent. Read/ack paths are unchanged (they still\nrecount, which re-syncs any drift).\n\nArms (release builds, same host, one invocation): base = main 2dd72851 (build19/base3), incr = 2dd72851 + patch.\n\nRuns:\n  H. Heavy inbox (the case the change targets): fresh mailbox, 3 senders + 1 recipient; seed the recipient\n     with 3000 messages, then time 400 sequential sends to it (client wall, MCP over HTTP). Order: base incr incr\n     base, each on its own fresh mailbox.\n  P. Paced, period 2 s (saturating, fresh mailboxes, small inboxes): base incr incr base, pooled.\n\nDecision:\n  H1 (primary). Pooled H send p50 for incr <= 0.85x base, and every incr run's p50 below every base run's p50.\n  G1 (guard). Pooled P send p50 and p90 for incr <= 1.05x base (no regression where inboxes are small).\n  G2 (guard). Errors in H and P for incr <= base + 3.\n  C (correctness, separate lane). db tests: after sends with to/cc/bcc, ack_required, repeated recipients, a\n     pre-existing stats row and a missing one, every touched agent's inbox_stats row equals the full recount;\n     a naive \"+1 per recipient entry\" mutant (no dedup / ignores ack_required) fails that test.\n\nWIN, so it lands, only if H1, G1, G2 and C all hold. Otherwise LOSS, reported, not landed.\n\nAmendment 2026-10-12 ~08:50Z, still before any build or run: the missing-row fallback now looks the row up by\nprimary key (SELECT) instead of reading the UPDATE's affected-row count, because the read path documents that\ncount as historically unreliable. Patch v2 (inbox_stats_incr_v2.patch); decision criteria unchanged. Mutant M2 is\nnow \"skip agents without a row\" (no recount fallback).\n",
+  "builds": {
+    "base": {
+      "source": "main 2dd72851 (build19/base3)",
+      "release_am_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a"
+    },
+    "incr": {
+      "source": "2dd72851 + inbox_stats_incr_v2.patch",
+      "release_am_sha256": "cf3885c73f53b9877d5c4ade9c447504ba4267697a487527604b4ce11ff38965",
+      "patch_sha256": "12332fba5ae6e5df25cba17a4c9a7b8960392b04f8d5c89f141b00efb69b164b"
+    }
+  },
+  "heavy_inbox_H": [
+    {
+      "run": "h1-base",
+      "seed": 3000,
+      "seed_s": 129.4,
+      "timed": 400,
+      "errors": {
+        "seed": 0,
+        "timed": 0
+      },
+      "send": {
+        "p50": 0.0725,
+        "p90": 0.0983,
+        "p99": 0.1175,
+        "max": 0.1375,
+        "mean": 0.0718
+      },
+      "loadavg_end": [
+        "5.72",
+        "4.93",
+        "4.66"
+      ]
+    },
+    {
+      "run": "h2-incr",
+      "seed": 3000,
+      "seed_s": 65.9,
+      "timed": 400,
+      "errors": {
+        "seed": 0,
+        "timed": 0
+      },
+      "send": {
+        "p50": 0.0789,
+        "p90": 0.0887,
+        "p99": 0.1023,
+        "max": 0.1716,
+        "mean": 0.0792
+      },
+      "loadavg_end": [
+        "6.14",
+        "5.72",
+        "5.01"
+      ]
+    },
+    {
+      "run": "h3-incr",
+      "seed": 3000,
+      "seed_s": 65.2,
+      "timed": 400,
+      "errors": {
+        "seed": 0,
+        "timed": 0
+      },
+      "send": {
+        "p50": 0.0786,
+        "p90": 0.087,
+        "p99": 0.0984,
+        "max": 0.1004,
+        "mean": 0.0782
+      },
+      "loadavg_end": [
+        "5.88",
+        "5.75",
+        "5.11"
+      ]
+    },
+    {
+      "run": "h4-base",
+      "seed": 3000,
+      "seed_s": 132.3,
+      "timed": 400,
+      "errors": {
+        "seed": 0,
+        "timed": 0
+      },
+      "send": {
+        "p50": 0.0693,
+        "p90": 0.0943,
+        "p99": 0.1096,
+        "max": 0.1452,
+        "mean": 0.0695
+      },
+      "loadavg_end": [
+        "5.39",
+        "5.87",
+        "5.28"
+      ]
+    }
+  ],
+  "paced_P_period_2s": {
+    "runs": [
+      {
+        "run": "5-base",
+        "loadavg_end": [
+          "9.49",
+          "10.75",
+          "8.40"
+        ],
+        "send_message": {
+          "n": 9000,
+          "p50": 0.562,
+          "p90": 1.444,
+          "p99": 3.112,
+          "max": 6.446,
+          "mean": 0.704,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.119,
+          "p90": 0.317,
+          "p99": 1.044,
+          "max": 2.549,
+          "mean": 0.167,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      {
+        "run": "6-incr",
+        "loadavg_end": [
+          "9.75",
+          "12.17",
+          "10.43"
+        ],
+        "send_message": {
+          "n": 9000,
+          "p50": 0.439,
+          "p90": 1.395,
+          "p99": 2.937,
+          "max": 5.331,
+          "mean": 0.635,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.12,
+          "p90": 0.301,
+          "p99": 0.833,
+          "max": 2.365,
+          "mean": 0.157,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      {
+        "run": "7-incr",
+        "loadavg_end": [
+          "8.44",
+          "10.45",
+          "10.20"
+        ],
+        "send_message": {
+          "n": 9000,
+          "p50": 0.35,
+          "p90": 1.192,
+          "p99": 3.16,
+          "max": 5.392,
+          "mean": 0.539,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.115,
+          "p90": 0.273,
+          "p99": 0.822,
+          "max": 1.592,
+          "mean": 0.15,
+          "outcomes": {
+            "ok": 8999,
+            "error": 1
+          }
+        }
+      },
+      {
+        "run": "8-base",
+        "loadavg_end": [
+          "8.19",
+          "9.48",
+          "9.66"
+        ],
+        "send_message": {
+          "n": 9000,
+          "p50": 0.412,
+          "p90": 1.167,
+          "p99": 3.124,
+          "max": 4.928,
+          "mean": 0.567,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.114,
+          "p90": 0.297,
+          "p99": 0.9,
+          "max": 2.487,
+          "mean": 0.156,
+          "outcomes": {
+            "ok": 8999,
+            "error": 1
+          }
+        }
+      }
+    ],
+    "pooled": {
+      "base": {
+        "send": {
+          "n": 18000,
+          "p50": 0.484,
+          "p90": 1.305,
+          "p99": 3.112
+        },
+        "fetch": {
+          "n": 18000,
+          "p50": 0.117,
+          "p90": 0.307,
+          "p99": 0.971
+        }
+      },
+      "incr": {
+        "send": {
+          "n": 18000,
+          "p50": 0.387,
+          "p90": 1.312,
+          "p99": 2.984
+        },
+        "fetch": {
+          "n": 18000,
+          "p50": 0.118,
+          "p90": 0.286,
+          "p99": 0.826
+        }
+      }
+    }
+  },
+  "correctness_C": "vinc2: db inbox_stats/create_message/mark_message_read/acknowledge 28 passed 0 failed (1 pre-existing ignore) incl create_message_counts_itself_into_inbox_stats_exactly_like_a_recount; db clippy only main's pre-existing recovery_retention.rs:1239. Planted mutants not run (stopped once the exploration showed H1 was unlikely).",
+  "verdict": "LOSS under the rule; not landed. H1 (primary) fails: heavy-inbox timed sequential send p50 0.0789/0.0786 s vs base 0.0725/0.0693 s (1.11x; rule <= 0.85x). G1 holds (paced pooled send p50 0.387 vs 0.484 s = 0.80x, p90 1.312 vs 1.305 s = 1.005x), G2 holds (errors 1 vs 1), C holds. Reported, not deciding: the untimed 3-sender seeding of 3,000 messages took 65-66 s vs 129-132 s on base (2x), and timed p90/p99 were lower (0.087-0.089/0.098-0.102 vs 0.094-0.098/0.110-0.118 s); but the two base paced runs alone differ by 36% at p50 (0.562 vs 0.412 s), so the paced gain needs a powered, pre-registered replication. The premise behind H1 was wrong: profiling (txprof) shows the recount is a fixed ~2.7 ms per recipient, not O(inbox)-dominated at realistic sizes (C-SQLite recount of 3,203 rows = 0.5 ms)."
+}
