@@ -1,0 +1,239 @@
+{
+  "schema": "br-qbhs0-ab-v1",
+  "bead": "br-qbhs0",
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "lever": "message insert COMMITs inside MESSAGE_WRITE_SERIALIZER and runs the unchanged post-commit publication (PASSIVE checkpoint, WAL reset gate, retirement) after releasing it",
+  "decision_rule_fixed_before_the_run": "publish-after-serializer lever (br-qbhs0 slice). Written 2026-10-12 ~10:55Z, before any code was written, built or run.\n\nAttribution (txprof, debug-only build of main d47b9bfb, paced 60 agents):\n- At saturation (period 2 s) the insert transaction averages 35 ms. Of that, commit_tx is 6.2 ms mean (p99 66 ms).\n- At about 10 sends/s (period 6 s) commit_tx is 13.5 ms of 27 ms mean (p90 46 ms).\n- commit_tx = COMMIT + best-effort publication (PASSIVE checkpoint, and the WAL reset gate's TRUNCATE when the\n  WAL is over journal_size_limit, which can wait up to 250 ms). All of it runs while MESSAGE_WRITE_SERIALIZER is held.\n\nChange: the message insert transaction COMMITs inside the serializer. The same connection publishes (same\ncheckpoint / WAL-reset / retire logic, unchanged) right after the serializer is released, before the writer's\npost-commit sample and the fresh-handle probe. This sender's own visibility proof is unchanged in order. Other\nwrite paths keep commit_tx as is.\n\nArms (release builds, same host, one session): base = main 2dd72851 (build19/base3, sha c5c84438), pub =\n2dd72851 + patch.\n\nRuns (paced_swarm.py, 60 agents, 300 s, fresh mailbox each):\n  P2 at period 2 s: base pub pub base base pub (3 per arm).\n  P6 at period 6 s: pub base base pub (2 per arm).\n  WAL size sampled every 5 s in every run.\n\nDecision:\n  S1 (primary). Pooled P2 send p50 and p90 for pub <= 0.90x base.\n  G1. Pooled P6 send p50 and p90 for pub <= 1.05x base.\n  G2. fetch_inbox pooled p50 at P2 and P6 for pub <= 1.10x base.\n  G3. Peak WAL bytes per run: the pub median is <= 1.5x the base median, at both periods (the WAL bound must hold).\n  G4. Errors for pub <= base + 3 at each period.\n  C (correctness lane). db create_message / serializer / probe / retire tests pass; a new test proves the\n     serializer is NOT held when publication starts, and that a mutant publishing inside the serializer fails it.\n\nWIN, so it lands, only if S1, G1-G4 and C all hold. Otherwise LOSS, reported, not landed.\n",
+  "attribution_behind_it": "debug-only tx-phase profile of d47b9bfb: commit + publication 17% of the insert tx at period 2 s, 50% (p90 46 ms) at period 6 s",
+  "builds": {
+    "base": {
+      "source": "main 2dd72851 (build19/base3)",
+      "release_am_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a"
+    },
+    "pub": {
+      "source": "2dd72851 + publish_after_serializer_v1.patch",
+      "release_am_sha256": "9fa83caee6a39be2d91686d1c6323537f63175e5eea790e70835e00443982f4b",
+      "patch_sha256": "5611a23bbdc8bcdc80b0ef455084df1dec74cc1ff6bf92a299a48f187b700265"
+    }
+  },
+  "runs": [
+    {
+      "run": "1-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.512,
+        "p90": 1.467,
+        "p99": 3.116
+      },
+      "fetch_p50": 0.119,
+      "errors": 1,
+      "wal_peak_bytes": 16912632,
+      "loadavg_end": [
+        "9.74",
+        "10.92",
+        "10.13"
+      ]
+    },
+    {
+      "run": "2-pub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.581,
+        "p90": 1.608,
+        "p99": 3.894
+      },
+      "fetch_p50": 0.125,
+      "errors": 1,
+      "wal_peak_bytes": 17073312,
+      "loadavg_end": [
+        "7.21",
+        "10.24",
+        "10.27"
+      ]
+    },
+    {
+      "run": "3-pub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.578,
+        "p90": 1.643,
+        "p99": 3.411
+      },
+      "fetch_p50": 0.124,
+      "errors": 0,
+      "wal_peak_bytes": 17069192,
+      "loadavg_end": [
+        "9.94",
+        "11.27",
+        "10.66"
+      ]
+    },
+    {
+      "run": "4-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.466,
+        "p90": 1.471,
+        "p99": 3.455
+      },
+      "fetch_p50": 0.124,
+      "errors": 0,
+      "wal_peak_bytes": 16896152,
+      "loadavg_end": [
+        "9.54",
+        "13.27",
+        "12.78"
+      ]
+    },
+    {
+      "run": "5-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.512,
+        "p90": 1.5,
+        "p99": 3.514
+      },
+      "fetch_p50": 0.12,
+      "errors": 2,
+      "wal_peak_bytes": 16978552,
+      "loadavg_end": [
+        "9.46",
+        "10.94",
+        "11.80"
+      ]
+    },
+    {
+      "run": "6-pub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.496,
+        "p90": 1.59,
+        "p99": 3.585
+      },
+      "fetch_p50": 0.118,
+      "errors": 1,
+      "wal_peak_bytes": 17093912,
+      "loadavg_end": [
+        "10.83",
+        "11.63",
+        "11.58"
+      ]
+    },
+    {
+      "run": "7-pub-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.111,
+        "p90": 0.897,
+        "p99": 5.999
+      },
+      "fetch_p50": 0.058,
+      "errors": 0,
+      "wal_peak_bytes": 16624232,
+      "loadavg_end": [
+        "5.66",
+        "7.93",
+        "9.95"
+      ]
+    },
+    {
+      "run": "8-base-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.109,
+        "p90": 0.319,
+        "p99": 2.013
+      },
+      "fetch_p50": 0.058,
+      "errors": 0,
+      "wal_peak_bytes": 16335832,
+      "loadavg_end": [
+        "8.06",
+        "7.77",
+        "9.29"
+      ]
+    },
+    {
+      "run": "9-base-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.129,
+        "p90": 0.555,
+        "p99": 2.397
+      },
+      "fetch_p50": 0.058,
+      "errors": 2,
+      "wal_peak_bytes": 16962072,
+      "loadavg_end": [
+        "8.19",
+        "8.06",
+        "8.96"
+      ]
+    },
+    {
+      "run": "10-pub-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.134,
+        "p90": 0.772,
+        "p99": 3.266
+      },
+      "fetch_p50": 0.059,
+      "errors": 1,
+      "wal_peak_bytes": 17155712,
+      "loadavg_end": [
+        "7.19",
+        "8.31",
+        "8.88"
+      ]
+    }
+  ],
+  "pooled": {
+    "base-p2": {
+      "send": {
+        "n": 27000,
+        "p50": 0.496,
+        "p90": 1.481,
+        "p99": 3.301
+      },
+      "fetch_p50": 0.121,
+      "errors": 3,
+      "wal_peak_median": 16912632
+    },
+    "pub-p2": {
+      "send": {
+        "n": 27000,
+        "p50": 0.551,
+        "p90": 1.613,
+        "p99": 3.575
+      },
+      "fetch_p50": 0.122,
+      "errors": 2,
+      "wal_peak_median": 17073312
+    },
+    "pub-p6": {
+      "send": {
+        "n": 6000,
+        "p50": 0.121,
+        "p90": 0.803,
+        "p99": 4.733
+      },
+      "fetch_p50": 0.058,
+      "errors": 1,
+      "wal_peak_median": 16889972.0
+    },
+    "base-p6": {
+      "send": {
+        "n": 6000,
+        "p50": 0.118,
+        "p90": 0.444,
+        "p99": 2.273
+      },
+      "fetch_p50": 0.058,
+      "errors": 2,
+      "wal_peak_median": 16648952.0
+    }
+  },
+  "correctness_C": "vpub1: db serializer/create_message/durability_probe/commit/retire/wal_reset/publish 58 passed 0 failed (2 pre-existing ignores) incl. the extended serializer-scope test (publication runs with the serializer free). Mutant not run (S1 failed).",
+  "verdict": "LOSS; not landed. S1 fails: pooled period-2 send p50 0.551 vs 0.496 s (1.11x; rule <= 0.90x), p90 1.09x. G1 fails: period-6 send p90 1.81x (p99 up to 6.0 s vs 2.0-2.4 s). G2 (fetch_inbox p50 1.01x / 1.00x), G3 (WAL peak median 1.01x) and G4 (errors 2/1 vs 3/2) hold. Publishing outside the serializer lets the checkpoint overlap the next sender's transaction and makes tails worse, consistent with the lock-hold profile: BEGIN waits come from the publication/checkpoint machinery, not from other lock holders."
+}
