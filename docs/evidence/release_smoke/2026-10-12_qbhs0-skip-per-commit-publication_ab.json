@@ -1,0 +1,241 @@
+{
+  "schema": "br-qbhs0-ab-v1",
+  "bead": "br-qbhs0",
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "experiment": "commit_tx publishes (PASSIVE checkpoint / WAL reset gate / retirement) only when the -wal file exceeds journal_size_limit; premise frankensqlite#411 (commits published through the shared WAL-index)",
+  "decision_rule_fixed_before_the_run": "skip-per-commit-publication experiment (br-qbhs0). Written 2026-10-12 ~14:10Z, before any code was written, built or run.\n\nPremise to test:\n- commit_tx runs a fail-fast PASSIVE checkpoint after every write commit. When that defers, it retires the\n  connection; that happens to 96% of commits under load, forcing fresh opens.\n- RetirablePooledHandle's documentation justifies this: an unpublished commit stays on the connection worker until\n  it closes.\n- That reasoning predates frankensqlite#411 (closed 2026-09-11: native commits now publish mxFrame through the\n  shared WAL-index), and main pins fsqlite 0.4.10.\n- If commits are now visible to other connections without backfill, the per-commit checkpoint and the retirement\n  are obsolete costs. Profiling attributes to them 17-50% of the message insert transaction plus the BEGIN IMMEDIATE\n  waits (the lock is held only 9-39% of wall time).\n\nChange (variant \"nopub\"): after COMMIT, commit_tx publishes only when the WAL file exceeds journal_size_limit (and\nthe 1 MiB floor). It then runs the existing PASSIVE checkpoint, the WAL reset gate, and retirement on failure.\nOtherwise it does nothing: no checkpoint, no retirement. Every write path uses commit_tx, so this applies to all\nwriters.\n\nArms: base = main 2dd72851 (build19/base3, sha c5c84438); nopub = 2dd72851 + patch.\n\nCorrectness (must all hold BEFORE any perf claim):\n  C1. db lib full suite: no new failures vs base. The base reference is 2dd72851, 3502/0 per v347d on 53e203f9,\n      whose db change is startup staging only.\n  C2. tools it messaging/reservation/contact tests and conformance pass.\n  C3. A test proves a commit is visible to a fresh FrankenSQLite connection and to a canonical (C SQLite)\n      reader with no checkpoint in between. Its negative case: the same reader does NOT see an uncommitted\n      write.\n  C4. In every A/B run, zero post-commit probe misses / compensating deletes, and no message missing from the DB:\n      errors <= base + 3.\n\nPerf (paced_swarm.py, 60 agents, 300 s, fresh mailbox each):\n  P2 at period 2 s: base nopub nopub base base nopub. P6 at period 6 s: nopub base base nopub. WAL sampled every 5 s.\n  S1 (primary). Pooled P2 send p50 and p90 <= 0.85x base.\n  G1. Pooled P6 send p50 and p90 <= 1.05x base.\n  G2. fetch_inbox pooled p50 <= 1.10x base at both periods.\n  G3. Peak WAL median <= 1.5x base at both periods (the WAL must stay bounded without per-commit checkpoints).\n\nWIN only if C1-C4, S1 and G1-G3 all hold. Because this changes a cross-process publication contract, a WIN is\npresented to the owner with the evidence before landing. Otherwise LOSS, reported, not landed.\n",
+  "builds": {
+    "base": {
+      "source": "main 2dd72851 (build19/base3)",
+      "release_am_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a"
+    },
+    "nopub": {
+      "source": "2dd72851 + nopub_v1.patch",
+      "release_am_sha256": "1401e554bb1703135a8d94e899c85c5de97d5978e16cd0dc0e3a385f1015d131",
+      "patch_sha256": "8a1848b3b7f2a07e784d6266f62cce41971a92aff49f8c1ce470705a97347362"
+    }
+  },
+  "runs": [
+    {
+      "run": "1-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.499,
+        "p90": 1.581,
+        "p99": 5.739
+      },
+      "fetch_p50": 0.121,
+      "client_errors": [],
+      "wal_peak_bytes": 16962072
+    },
+    {
+      "run": "2-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.261,
+        "p90": 0.936,
+        "p99": 1.952
+      },
+      "fetch_p50": 0.113,
+      "client_errors": [
+        [
+          "fetch_inbox",
+          127.321,
+          0.003
+        ],
+        [
+          "fetch_inbox",
+          323.779,
+          0.19
+        ]
+      ],
+      "wal_peak_bytes": 16896152
+    },
+    {
+      "run": "3-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.326,
+        "p90": 0.957,
+        "p99": 1.393
+      },
+      "fetch_p50": 0.117,
+      "client_errors": [
+        [
+          "fetch_inbox",
+          121.055,
+          0.005
+        ],
+        [
+          "fetch_inbox",
+          142.467,
+          0.004
+        ],
+        [
+          "fetch_inbox",
+          482.719,
+          0.203
+        ]
+      ],
+      "wal_peak_bytes": 16883792
+    },
+    {
+      "run": "4-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.542,
+        "p90": 1.587,
+        "p99": 3.323
+      },
+      "fetch_p50": 0.118,
+      "client_errors": [
+        [
+          "fetch_inbox",
+          193.065,
+          0.006
+        ]
+      ],
+      "wal_peak_bytes": 16789032
+    },
+    {
+      "run": "5-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.445,
+        "p90": 1.251,
+        "p99": 3.196
+      },
+      "fetch_p50": 0.115,
+      "client_errors": [],
+      "wal_peak_bytes": 16978552
+    },
+    {
+      "run": "6-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.322,
+        "p90": 0.895,
+        "p99": 1.832
+      },
+      "fetch_p50": 0.117,
+      "client_errors": [
+        [
+          "send_message",
+          131.63,
+          0.009
+        ]
+      ],
+      "wal_peak_bytes": 16900272
+    },
+    {
+      "run": "7-nopub-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.086,
+        "p90": 0.152,
+        "p99": 0.53
+      },
+      "fetch_p50": 0.057,
+      "client_errors": [
+        [
+          "fetch_inbox",
+          3.539,
+          0.004
+        ]
+      ],
+      "wal_peak_bytes": 16846712
+    },
+    {
+      "run": "8-base-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.133,
+        "p90": 0.514,
+        "p99": 1.277
+      },
+      "fetch_p50": 0.06,
+      "client_errors": [
+        [
+          "fetch_inbox",
+          33.089,
+          0.003
+        ],
+        [
+          "fetch_inbox",
+          228.797,
+          0.005
+        ]
+      ],
+      "wal_peak_bytes": 15973272
+    },
+    {
+      "run": "9-base-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.115,
+        "p90": 0.468,
+        "p99": 1.981
+      },
+      "fetch_p50": 0.058,
+      "client_errors": [],
+      "wal_peak_bytes": 16747832
+    },
+    {
+      "run": "10-nopub-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.098,
+        "p90": 0.249,
+        "p99": 1.033
+      },
+      "fetch_p50": 0.058,
+      "client_errors": [],
+      "wal_peak_bytes": 16690152
+    }
+  ],
+  "pooled": {
+    "base-p2": {
+      "send": {
+        "p50": 0.494,
+        "p90": 1.446,
+        "p99": 4.266
+      },
+      "fetch_p50": 0.118,
+      "client_errors": 1,
+      "wal_peak_median": 16962072
+    },
+    "nopub-p2": {
+      "send": {
+        "p50": 0.302,
+        "p90": 0.935,
+        "p99": 1.735
+      },
+      "fetch_p50": 0.116,
+      "client_errors": 6,
+      "wal_peak_median": 16896152
+    },
+    "nopub-p6": {
+      "send": {
+        "p50": 0.091,
+        "p90": 0.199,
+        "p99": 0.785
+      },
+      "fetch_p50": 0.058,
+      "client_errors": 1,
+      "wal_peak_median": 16768432.0
+    },
+    "base-p6": {
+      "send": {
+        "p50": 0.123,
+        "p90": 0.488,
+        "p99": 1.745
+      },
+      "fetch_p50": 0.059,
+      "client_errors": 2,
+      "wal_peak_median": 16360552.0
+    }
+  },
+  "correctness_so_far": "C3 test commits_are_visible_to_fresh_and_canonical_readers_without_a_checkpoint passes. db lib full 3498 passed / 1 failed (pool::tests::pool_warmup_opens_connections: warmup opened 1 of 5 connections inside its 10 s budget on an overloaded worker, where the run took 5,711 s vs about 223 s normally; warmup never commits; targeted rerun queued). tools it and conformance pending.",
+  "client_error_analysis": "No error in any run carries a probe-miss / compensating-delete / visibility signature. The nopub P2 client errors (5 fetch_inbox, 1 send_message; 0-0.2 s each) coincide in the server logs with archive-publication-fence contention and MVCC 'database is busy (snapshot conflict)' retries. Base shows the same transient class at lower counts (1 at P2, 2 at P6). paced_swarm.py did not record error payloads in this run; it does now.",
+  "verdict": "NOT A WIN under the rule as written. C4 fails at P2: client errors 6 vs base 1 (rule <= base + 3). Everything else that was decided holds strongly: S1 pooled P2 send p50 0.611x / p90 0.647x (p99 0.407x); G1 P6 p50 0.734x / p90 0.407x; G2 fetch p50 0.98x; G3 WAL peak median 1.00-1.02x (bounded at ~17 MB). Not landed. Next: a pre-registered replication that records error payloads to settle whether skipping per-commit publication raises transient busy errors; any win goes to the owner before landing (cross-process publication contract)."
+}
