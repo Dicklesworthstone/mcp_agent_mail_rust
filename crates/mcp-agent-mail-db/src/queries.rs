@@ -15252,23 +15252,10 @@ async fn release_reservations_by_ids_with_constraints(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         let tracked = tracked(&*conn);
+        // The release ledger is part of the schema (base schema and migration
+        // v14), and every active-reservation read already depends on it, so
+        // the release transaction runs no DDL of its own.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(
-                traw_execute(
-                    cx,
-                    &tracked,
-                    "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
-                        reservation_id INTEGER PRIMARY KEY,\
-                        released_ts INTEGER NOT NULL\
-                     )",
-                    &[],
-                )
-                .await
-            )
-        );
 
         let mut release_marker = now_micros();
         let mut released = Vec::with_capacity(ids.len());
