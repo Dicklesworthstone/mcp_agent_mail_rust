@@ -277,9 +277,7 @@ fn count_read_ack_page(
             )
         })?;
         let count = usize::try_from(integer(&row, "pending_count")?).map_err(|_| {
-            CliError::Other(
-                "overview acknowledgement count was negative or overflowed".to_string(),
-            )
+            CliError::Other("overview acknowledgement count was negative or overflowed".to_string())
         })?;
         let counts = project(projects, project_id);
         counts.ack_overdue = counts.ack_overdue.checked_add(count).ok_or_else(|| {
@@ -662,7 +660,10 @@ mod tests {
         for history in [OVERVIEW_PAGE_ROWS * 4 + 1, OVERVIEW_PAGE_ROWS * 16 + 1] {
             let (_dir, conn) = fixture();
             seed_settled_ack_history(&conn, history);
-            execute(&conn, "INSERT INTO messages VALUES (99999, 77, 'high', 1, 0)");
+            execute(
+                &conn,
+                "INSERT INTO messages VALUES (99999, 77, 'high', 1, 0)",
+            );
             execute(
                 &conn,
                 "INSERT INTO message_recipients VALUES (99999, 1, 0, NULL), (99999, 2, NULL, NULL)",
@@ -679,7 +680,10 @@ mod tests {
             assert_eq!(work.ack_message_rows, 1);
             assert_eq!(work.queries, 3);
             assert!(work.queries < old.queries);
-            execute(&conn, "UPDATE messages SET ack_required = 0 WHERE id = 99999");
+            execute(
+                &conn,
+                "UPDATE messages SET ack_required = 0 WHERE id = 99999",
+            );
             let (actual, work) = ack_phase(&conn, true);
             assert_eq!(actual, ack_phase(&conn, false).0);
             assert_eq!(work.ack_message_rows, 0);
@@ -728,7 +732,10 @@ mod tests {
         let (_dir, conn) = fixture();
         seed_history(&conn, OVERVIEW_PAGE_ROWS * 8 + 2);
         execute(&conn, "UPDATE messages SET ack_required = id % 2");
-        execute(&conn, "UPDATE message_recipients SET ack_ts = CASE WHEN message_id % 2 = 1 THEN 0 ELSE NULL END");
+        execute(
+            &conn,
+            "UPDATE message_recipients SET ack_ts = CASE WHEN message_id % 2 = 1 THEN 0 ELSE NULL END",
+        );
         indexes(&conn);
         let (expected, old) = ack_phase(&conn, false);
         let (actual, work) = ack_phase(&conn, true);
@@ -760,10 +767,22 @@ mod tests {
             ),
         );
         let mut work = ScanWork::default();
-        assert_eq!(next_unacked_id(&conn, "ack_recipients", None, &mut work).unwrap(), Some(i64::MIN));
-        assert_eq!(next_unacked_id(&conn, "ack_recipients", Some(i64::MIN), &mut work).unwrap(), Some(-1));
-        assert_eq!(next_unacked_id(&conn, "ack_recipients", Some(-1), &mut work).unwrap(), Some(i64::MAX));
-        assert_eq!(next_unacked_id(&conn, "ack_recipients", Some(i64::MAX), &mut work).unwrap(), None);
+        assert_eq!(
+            next_unacked_id(&conn, "ack_recipients", None, &mut work).unwrap(),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            next_unacked_id(&conn, "ack_recipients", Some(i64::MIN), &mut work).unwrap(),
+            Some(-1)
+        );
+        assert_eq!(
+            next_unacked_id(&conn, "ack_recipients", Some(-1), &mut work).unwrap(),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            next_unacked_id(&conn, "ack_recipients", Some(i64::MAX), &mut work).unwrap(),
+            None
+        );
         assert_eq!(ack_phase(&conn, true).0, ack_phase(&conn, false).0);
         assert!(next_unacked_id(&conn, "missing_index", None, &mut work).is_err());
     }
@@ -772,14 +791,47 @@ mod tests {
     fn earlier_reopened_obligation_is_visible_on_the_next_overview() {
         let (_dir, conn) = fixture();
         seed_settled_ack_history(&conn, OVERVIEW_PAGE_ROWS * 4);
-        execute(&conn, "INSERT INTO messages VALUES (99999, 77, 'normal', 0, 0)");
-        execute(&conn, "INSERT INTO message_recipients VALUES (99999, 1, 0, NULL)");
+        execute(
+            &conn,
+            "INSERT INTO messages VALUES (99999, 77, 'normal', 0, 0)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES (99999, 1, 0, NULL)",
+        );
         indexes(&conn);
-        assert!(build_at(&conn, NOW).unwrap().0.iter().all(|row| row.ack_overdue == 0));
-        execute(&conn, "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 1");
-        assert_eq!(build_at(&conn, NOW).unwrap().0.iter().find(|row| row.slug == "alpha").unwrap().ack_overdue, 1);
-        execute(&conn, "UPDATE message_recipients SET ack_ts = 0 WHERE message_id = 1");
-        assert!(build_at(&conn, NOW).unwrap().0.iter().all(|row| row.ack_overdue == 0));
+        assert!(
+            build_at(&conn, NOW)
+                .unwrap()
+                .0
+                .iter()
+                .all(|row| row.ack_overdue == 0)
+        );
+        execute(
+            &conn,
+            "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 1",
+        );
+        assert_eq!(
+            build_at(&conn, NOW)
+                .unwrap()
+                .0
+                .iter()
+                .find(|row| row.slug == "alpha")
+                .unwrap()
+                .ack_overdue,
+            1
+        );
+        execute(
+            &conn,
+            "UPDATE message_recipients SET ack_ts = 0 WHERE message_id = 1",
+        );
+        assert!(
+            build_at(&conn, NOW)
+                .unwrap()
+                .0
+                .iter()
+                .all(|row| row.ack_overdue == 0)
+        );
     }
 
     #[test]
@@ -787,15 +839,31 @@ mod tests {
         let (dir, conn) = fixture();
         indexes(&conn);
         execute(&conn, "PRAGMA journal_mode = WAL");
-        execute(&conn, "INSERT INTO messages VALUES (1, 1, 'high', 1, 0), (2, 77, 'high', 1, 0)");
-        execute(&conn, "INSERT INTO message_recipients VALUES (1, 1, 0, NULL), (2, 1, 0, 0)");
-        let writer = DbConn::open_file(dir.path().join("recipients.sqlite3").to_str().unwrap()).unwrap();
+        execute(
+            &conn,
+            "INSERT INTO messages VALUES (1, 1, 'high', 1, 0), (2, 77, 'high', 1, 0)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES (1, 1, 0, NULL), (2, 1, 0, 0)",
+        );
+        let writer =
+            DbConn::open_file(dir.path().join("recipients.sqlite3").to_str().unwrap()).unwrap();
         execute(&conn, "SAVEPOINT held_overview");
         let mut work = ScanWork::default();
-        assert_eq!(next_unacked_id(&conn, "ack_recipients", None, &mut work).unwrap(), Some(1));
+        assert_eq!(
+            next_unacked_id(&conn, "ack_recipients", None, &mut work).unwrap(),
+            Some(1)
+        );
         execute(&writer, "BEGIN IMMEDIATE");
-        execute(&writer, "UPDATE message_recipients SET ack_ts = 1 WHERE message_id = 1");
-        execute(&writer, "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 2");
+        execute(
+            &writer,
+            "UPDATE message_recipients SET ack_ts = 1 WHERE message_id = 1",
+        );
+        execute(
+            &writer,
+            "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 2",
+        );
         execute(&writer, "COMMIT");
         let held = ack_phase(&conn, true).0;
         assert_eq!(held["1"]["ack_overdue"], 1);
@@ -818,10 +886,19 @@ mod tests {
             seed_settled_ack_history(&conn, history);
             execute(&conn, "UPDATE messages SET project_id = id % 33 + 1");
             execute(&conn, "INSERT INTO messages VALUES (0, 1, 'normal', 0, 0)");
-            execute(&conn, "INSERT INTO message_recipients VALUES (0, 1, 0, NULL)");
+            execute(
+                &conn,
+                "INSERT INTO message_recipients VALUES (0, 1, 0, NULL)",
+            );
             let active = history + 1;
-            execute(&conn, &format!("INSERT INTO messages VALUES ({active}, 1, 'high', 1, 0)"));
-            execute(&conn, &format!("INSERT INTO message_recipients VALUES ({active}, 1, 0, NULL)"));
+            execute(
+                &conn,
+                &format!("INSERT INTO messages VALUES ({active}, 1, 'high', 1, 0)"),
+            );
+            execute(
+                &conn,
+                &format!("INSERT INTO message_recipients VALUES ({active}, 1, 0, NULL)"),
+            );
             if !settled {
                 execute(&conn, "UPDATE message_recipients SET ack_ts = NULL");
             }
@@ -845,7 +922,10 @@ mod tests {
             }
             old_times.sort_unstable();
             new_times.sort_unstable();
-            eprintln!("native ack phase; history={history}; settled={settled}; old={:?}; new={:?}", old_times[3], new_times[3]);
+            eprintln!(
+                "native ack phase; history={history}; settled={settled}; old={:?}; new={:?}",
+                old_times[3], new_times[3]
+            );
         }
     }
 

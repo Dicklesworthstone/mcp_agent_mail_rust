@@ -627,7 +627,10 @@ mod tests {
             .map(|row| row.name.as_str())
             .collect();
         assert_eq!(
-            effects.iter().map(|effect| effect.agent.as_str()).collect::<Vec<_>>(),
+            effects
+                .iter()
+                .map(|effect| effect.agent.as_str())
+                .collect::<Vec<_>>(),
             expected,
         );
         assert_eq!(actions.len(), 470);
