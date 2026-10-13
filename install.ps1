@@ -110,7 +110,7 @@ function Invoke-VersionProbeBounded {
         [string]$BinaryPath,
         [ValidateSet("--version", "version")]
         [string]$Argument,
-        [int]$TimeoutMilliseconds = 3000
+        [int]$TimeoutMilliseconds = 15000
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -949,7 +949,7 @@ function Write-BinaryTransactionPhase {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
     $marker = Join-Path $Journal "phase.$Phase"
     if ((Split-Path -Leaf $Journal) -ceq ".mcp-agent-mail-install-transaction.active") {
-        $installDir = Split-Path -LiteralPath $Journal -Parent
+        $installDir = [System.IO.Path]::GetDirectoryName($Journal)
         $pending = Join-Path $installDir (
             ".mcp-agent-mail-install-transaction.phase.$Phase.preparing." + [Guid]::NewGuid().ToString("N")
         )
@@ -1640,7 +1640,7 @@ function Displace-PythonAmExecutables {
         if (-not (Test-Path -LiteralPath $path)) {
             continue
         }
-        $parent = Split-Path -LiteralPath $path -Parent
+        $parent = [System.IO.Path]::GetDirectoryName($path)
         $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $backupName = "am.exe.bak.mcp-agent-mail-$stamp"
         $backupPath = Join-Path $parent $backupName
