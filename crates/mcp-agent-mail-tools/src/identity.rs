@@ -4498,7 +4498,7 @@ mod tests {
             .unwrap();
         let mut config = Config {
             database_url: format!("sqlite:///{}", primary.display()),
-            storage_root: root.clone(),
+            storage_root: root,
             doctor_retention_alert_bytes: 512,
             ..Config::default()
         };
@@ -4615,7 +4615,7 @@ mod tests {
         std::fs::write(&debris, [7_u8; 1_024]).unwrap();
         let config = Config {
             database_url: format!("sqlite:///{}", primary.display()),
-            storage_root: root.clone(),
+            storage_root: root,
             doctor_retention_alert_bytes: 512,
             // The effective category budget is 5 * 128 = 640 bytes, so
             // this quarantine is selected even though resident < 20 * 128.
@@ -4647,7 +4647,7 @@ mod tests {
         std::fs::write(stage.join("snapshot.sqlite3"), [7_u8; 4_096]).unwrap();
         let config = Config {
             database_url: format!("sqlite:///{}", primary.display()),
-            storage_root: root.clone(),
+            storage_root: root,
             doctor_retention_alert_bytes: 512,
             ..Config::default()
         };

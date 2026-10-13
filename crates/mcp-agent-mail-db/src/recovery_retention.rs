@@ -1272,7 +1272,7 @@ mod tests {
         let outcome = consolidate_debris(&plan, &destination).unwrap();
         assert_eq!(outcome.moved, 1);
         assert_eq!(outcome.moved_bytes, 17);
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, [] as [(PathBuf, String); 0]);
         assert!(!artifact.exists());
         assert_eq!(
             std::fs::read(destination.join("mail.corrupt1.corrupt70")).unwrap(),

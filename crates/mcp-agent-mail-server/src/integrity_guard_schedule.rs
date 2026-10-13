@@ -256,14 +256,20 @@ mod tests {
         let start = Instant::now();
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
-        let failed_at = start + VERIFIED_REFRESH_INTERVAL - Duration::from_secs(1);
+        let failed_at = (start + VERIFIED_REFRESH_INTERVAL)
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
         schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, failed_at);
         assert_eq!(
             schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL),
             None
         );
         assert_eq!(
-            schedule.next_attempt(failed_at + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)),
+            schedule.next_attempt(
+                (failed_at + BACKUP_RETRY_INITIAL)
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
+            ),
             None
         );
         assert_eq!(
@@ -308,7 +314,9 @@ mod tests {
             schedule.next_attempt(published_at),
             Some(BackupKind::Proactive)
         );
-        let before_due = published_at + VERIFIED_REFRESH_INTERVAL - Duration::from_nanos(1);
+        let before_due = (published_at + VERIFIED_REFRESH_INTERVAL)
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap();
         schedule.complete(BackupKind::Proactive, BackupCompletion::Skipped, before_due);
         assert_eq!(
             schedule.next_attempt(before_due),
