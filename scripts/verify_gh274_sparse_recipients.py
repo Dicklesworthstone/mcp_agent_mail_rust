@@ -65,10 +65,11 @@ class Work:
     peak_query_rows: int = 0
     peak_keys: int = 0
     recipient_sample_rows: int = 0
+    ack_seek_rows: int = 0
     sparse: bool = False
 
 
-def phase(db, sparse=True, now=NOW, on_unread=None):
+def phase(db, sparse=True, now=NOW, on_unread=None, ack_seek=True, on_ack_seek=None):
     """Model the production recipient phase, inside its enclosing read snapshot."""
     work = Work()
     counts = defaultdict(lambda: [0, 0, 0])
@@ -136,7 +137,40 @@ def phase(db, sparse=True, now=NOW, on_unread=None):
         if work.sparse:
             index = quoted(recipient_index)
             select = f'{CONSTANTS["ACK_MESSAGES_SQL"]} INDEXED BY {quoted(message_index)}'
-            for rows in pages(select, CONSTANTS['ACK_MESSAGES_FILTER'], 'id', (threshold,)):
+            def next_unacked(after):
+                continuation = '' if after is None else ' AND message_id > ?'
+                params = () if after is None else (after,)
+                rows = query(f'{CONSTANTS["ACK_PENDING_IDS_SQL"]} INDEXED BY {index} '
+                             f'WHERE {CONSTANTS["ACK_PENDING_FILTER"]}{continuation} '
+                             'ORDER BY message_id LIMIT 1', params)
+                assert len(rows) <= 1
+                work.ack_seek_rows += len(rows)
+                if on_ack_seek:
+                    on_ack_seek()
+                if not rows:
+                    return None
+                value = rows[0]['message_id']
+                assert isinstance(value, int) and (after is None or value > after)
+                return value
+
+            lower = next_unacked(None) if ack_seek else None
+            inclusive = ack_seek
+            seek_empty = True
+            while not ack_seek or lower is not None:
+                comparison = '>=' if inclusive else '>'
+                continuation = '' if lower is None else f' AND id {comparison} ?'
+                params = (threshold,) if lower is None else (threshold, lower)
+                rows = query(f'{select} WHERE ({CONSTANTS["ACK_MESSAGES_FILTER"]})'
+                             f'{continuation} ORDER BY id LIMIT {PAGE}', params)
+                previous = None
+                for row in rows:
+                    value = row['id']
+                    assert isinstance(value, int)
+                    assert lower is None or value > lower or (inclusive and value == lower)
+                    assert previous is None or value > previous
+                    previous = value
+                if not rows:
+                    break
                 work.ack_message_rows += len(rows)
                 messages = {row['id']: row['project_id'] for row in rows}
                 work.peak_keys = max(work.peak_keys, len(messages))
@@ -150,6 +184,17 @@ def phase(db, sparse=True, now=NOW, on_unread=None):
                     project = messages.pop(row['message_id'])
                     assert isinstance(row['pending_count'], int) and row['pending_count'] >= 0
                     counts[project][2] += row['pending_count']
+                if len(rows) < PAGE:
+                    break
+                if ack_seek and not grouped and seek_empty:
+                    seek_empty = False
+                    lower = next_unacked(rows[-1]['id'])
+                    inclusive = True
+                else:
+                    lower = rows[-1]['id']
+                    inclusive = False
+                    if grouped:
+                        seek_empty = True
         return {key: value for key, value in counts.items() if any(value)}, work
     finally:
         db.execute('RELEASE recipient_diagnostic')
@@ -184,8 +229,8 @@ def seed_history(db, size=24000, projects=33):
 class SparseRecipientTests(unittest.TestCase):
     def assert_matches(self, db, now=NOW):
         expected = reference(db, now)
-        for sparse in [False, True]:
-            actual, work = phase(db, sparse, now)
+        for sparse, ack_seek in [(False, False), (True, False), (True, True)]:
+            actual, work = phase(db, sparse, now, ack_seek=ack_seek)
             self.assertEqual(actual, expected)
             self.assertLessEqual(work.peak_query_rows, PAGE)
             self.assertLessEqual(work.peak_keys, PAGE)
@@ -328,8 +373,152 @@ class SparseRecipientTests(unittest.TestCase):
                 writer.close()
                 reader.close()
 
+    def test_settled_ack_prefix_and_non_ack_decoy_gap(self):
+        for size in [PAGE * 4 + 1, PAGE * 16 + 1, 24000]:
+            for decoy in [False, True]:
+                db = fixture()
+                self.addCleanup(db.close)
+                seed_settled(db, size, decoy)
+                old, old_work = phase(db, ack_seek=False)
+                new, work = phase(db)
+                self.assertEqual(new, old)
+                self.assertEqual(new, reference(db))
+                self.assertEqual(old_work.ack_message_rows, size + 33)
+                self.assertEqual(work.ack_message_rows, (PAGE if decoy else 0) + 33)
+                self.assertEqual(work.ack_seek_rows, 2 if decoy else 1)
+                self.assertLess(work.queries, old_work.queries)
 
-def measured(db, sparse):
+    def test_settled_suffix_ends_only_when_pending_index_is_exhausted(self):
+        db = fixture()
+        self.addCleanup(db.close)
+        seed_settled(db, 24000, True)
+        db.execute('UPDATE message_recipients SET read_ts=0,ack_ts=0 WHERE message_id>0')
+        self.assertEqual(phase(db)[0], reference(db))
+        self.assertEqual(phase(db)[1].ack_message_rows, PAGE)
+        # Move the one harmless pending key past all required messages.
+        db.execute('UPDATE message_recipients SET message_id=99999 WHERE message_id=0')
+        self.assertEqual(phase(db)[0], reference(db))
+        self.assertEqual(phase(db)[1].ack_message_rows, 0)
+
+    def test_dense_read_ack_work_adds_only_one_initial_seek(self):
+        db = fixture()
+        self.addCleanup(db.close)
+        seed_history(db, PAGE * 3 + 7)
+        db.execute('UPDATE messages SET ack_required=1')
+        db.execute('UPDATE message_recipients SET read_ts=0,ack_ts=NULL')
+        old, old_work = phase(db, ack_seek=False)
+        new, work = phase(db)
+        self.assertEqual(new, old)
+        self.assertEqual(new, reference(db))
+        self.assertEqual(work.ack_message_rows, old_work.ack_message_rows)
+        self.assertEqual(work.queries, old_work.queries + 1)
+        self.assertEqual(work.ack_seek_rows, 1)
+
+    def test_interleaved_non_ack_decoys_keep_exact_results_and_bounded_extra_queries(self):
+        db = fixture()
+        self.addCleanup(db.close)
+        seed_interleaved_decoys(db, PAGE * 4 + 1)
+        old, old_work = phase(db, ack_seek=False)
+        new, work = phase(db)
+        self.assertEqual(new, old)
+        self.assertEqual(new, reference(db))
+        # These false positives cannot be skipped. The empty streak probes
+        # only once; don't add a lookahead query to every historical page.
+        # Skipping the first settled key can also remove a partial page.
+        self.assertLessEqual(work.queries, old_work.queries + 2)
+
+    def test_seeded_settled_gaps_and_reopened_earlier_ids(self):
+        for seed in range(200):
+            rng = random.Random(seed + 500)
+            db = fixture()
+            self.addCleanup(db.close)
+            seed_settled(db, PAGE * 5 + 7, decoy=bool(seed % 2))
+            pending = rng.sample(range(1, PAGE * 5 + 8), rng.randrange(1, 9))
+            db.executemany('UPDATE message_recipients SET ack_ts=NULL WHERE message_id=?',
+                           ((mid,) for mid in pending))
+            db.executemany('UPDATE messages SET created_ts=? WHERE id=?',
+                           ((rng.choice([NOW-AGE-1, NOW-AGE, NOW-AGE+1]), mid) for mid in pending))
+            self.assert_matches(db)
+            db.execute('UPDATE message_recipients SET ack_ts=NULL WHERE message_id=1')
+            db.execute('UPDATE messages SET created_ts=0 WHERE id=1')
+            self.assert_matches(db)
+
+    def test_exact_page_gap_and_maximum_seek_key_keep_every_obligation(self):
+        for size in [PAGE, PAGE * 2 + 1]:
+            db = fixture()
+            self.addCleanup(db.close)
+            mids = [-(2**63), *range(1, size), 2**63 - 1]
+            db.executemany("INSERT INTO messages VALUES (?,77,'high',1,0)", ((mid,) for mid in mids))
+            db.executemany('INSERT INTO message_recipients VALUES (?,1,0,?)',
+                           ((mid, None if mid in (mids[0], mids[-1]) else 0) for mid in mids))
+            self.assert_matches(db)
+            self.assertEqual(phase(db)[0][77], [0, 0, 2])
+
+    def test_wal_write_after_seek_keeps_snapshot_and_next_call_refreshes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'seek.sqlite3')
+            reader = fixture(path)
+            writer = sqlite3.connect(path, isolation_level=None)
+            try:
+                reader.execute('PRAGMA journal_mode=WAL')
+                seed_settled(reader, PAGE * 8, True)
+                expected = reference(reader)
+                changed = False
+                def mutate():
+                    nonlocal changed
+                    if not changed:
+                        writer.execute('BEGIN IMMEDIATE')
+                        writer.execute('UPDATE message_recipients SET read_ts=0,ack_ts=1 WHERE message_id>1')
+                        writer.execute('UPDATE message_recipients SET ack_ts=NULL WHERE message_id=1')
+                        writer.execute('COMMIT')
+                        changed = True
+                actual, _ = phase(reader, on_ack_seek=mutate)
+                self.assertTrue(changed)
+                self.assertEqual(actual, expected)
+                fresh = phase(reader)[0]
+                self.assertEqual(fresh, reference(reader))
+                self.assertNotEqual(fresh, expected)
+            finally:
+                writer.close()
+                reader.close()
+
+    def test_seek_failure_propagates_and_releases_the_read_savepoint(self):
+        db = fixture()
+        self.addCleanup(db.close)
+        seed_settled(db, PAGE * 4, True)
+        def reject_seek(sql, params):
+            if sql.startswith(CONSTANTS['ACK_PENDING_IDS_SQL']):
+                raise sqlite3.OperationalError('injected seek execution failure')
+        class FailingConnection:
+            def execute(self, sql, params=()):
+                reject_seek(sql, params)
+                return db.execute(sql, params)
+        with self.assertRaisesRegex(sqlite3.OperationalError, 'injected seek'):
+            phase(FailingConnection())
+        with self.assertRaises(sqlite3.OperationalError):
+            db.execute('RELEASE recipient_diagnostic')
+        self.assert_matches(db)
+
+
+def seed_settled(db, size, decoy=False):
+    seed_history(db, size)
+    db.execute('UPDATE messages SET ack_required=1 WHERE id<=?', (size,))
+    db.execute('UPDATE message_recipients SET ack_ts=0 WHERE message_id<=?', (size,))
+    if decoy:
+        db.execute("INSERT INTO messages VALUES (0,1,'normal',0,0)")
+        db.execute('INSERT INTO message_recipients VALUES (0,1,0,NULL)')
+
+
+def seed_interleaved_decoys(db, size):
+    db.execute('BEGIN')
+    db.executemany("INSERT INTO messages VALUES (?,1,'normal',?,0)",
+                   ((i, i % 2) for i in range(1, 2 * size + 1)))
+    db.executemany('INSERT INTO message_recipients VALUES (?,1,0,?)',
+                   ((i, 0 if i % 2 else None) for i in range(1, 2 * size + 1)))
+    db.execute('COMMIT')
+
+
+def measured(db, sparse, ack_seek=True):
     steps = 0
     def progress():
         nonlocal steps
@@ -337,7 +526,7 @@ def measured(db, sparse):
         return 0
     db.set_progress_handler(progress, 1)
     try:
-        rows, work = phase(db, sparse)
+        rows, work = phase(db, sparse, ack_seek=ack_seek)
     finally:
         db.set_progress_handler(None, 0)
     return rows, work, steps
@@ -348,20 +537,36 @@ if __name__ == '__main__':
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise SystemExit(1)
-    for case in ['read-non-ack-history', 'all-unread-ack-required']:
+    # Both compared strategies run on the SAME connection/corpus. The
+    # incumbent is the sparse algorithm on 38c9d8a8, not the older row scanner.
+    # These are whole direct-recipient-phase VM counts, not Rust timings.
+    for case in ['settled-ack-prefix', 'settled-ack-gap', 'dense-read-ack', 'interleaved-decoys',
+                 'read-non-ack-history', 'all-unread-ack-required']:
         db = fixture()
         try:
-            seed_history(db)
+            if case.startswith('settled-ack'):
+                seed_settled(db, 24000, case == 'settled-ack-gap')
+            elif case == 'interleaved-decoys':
+                seed_interleaved_decoys(db, 24000)
+            else:
+                seed_history(db)
+            if case == 'dense-read-ack':
+                db.execute('UPDATE messages SET ack_required=1')
+                db.execute('UPDATE message_recipients SET read_ts=0,ack_ts=NULL')
             if case == 'all-unread-ack-required':
                 db.execute('UPDATE messages SET ack_required=1')
                 db.execute('UPDATE message_recipients SET read_ts=NULL,ack_ts=NULL')
-            old, old_work, old_vm = measured(db, False)
-            new, new_work, new_vm = measured(db, True)
+            old, old_work, old_vm = measured(db, True, ack_seek=False)
+            new, new_work, new_vm = measured(db, True, ack_seek=True)
             assert new == old == reference(db)
             print(json.dumps({'case': case, 'sqlite_version': sqlite3.sqlite_version,
                 'old_work': asdict(old_work), 'new_work': asdict(new_work),
                 'old_vm_instructions': old_vm, 'new_vm_instructions': new_vm,
-                'rust_parent_sha256': hashlib.sha256(PARENT.read_bytes()).hexdigest(),
+                'sql_projection_sha256': hashlib.sha256(json.dumps(
+                    {key: CONSTANTS[key] for key in ['RECIPIENTS_SQL', 'RECIPIENT_FILTER',
+                     'MESSAGES_SQL', 'UNREAD_FILTER', 'ACK_MESSAGES_SQL', 'ACK_MESSAGES_FILTER',
+                     'ACK_COUNTS_SQL', 'ACK_PENDING_IDS_SQL', 'ACK_PENDING_FILTER']},
+                    sort_keys=True).encode()).hexdigest(),
                 'rust_sparse_sha256': hashlib.sha256(MODULE.read_bytes()).hexdigest()}, sort_keys=True))
         finally:
             db.close()
