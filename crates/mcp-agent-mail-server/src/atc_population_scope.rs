@@ -9,6 +9,10 @@
 //! Names observed in multiple project identities are unresolved here. Do not
 //! choose whichever row happened to hydrate last. Fully project-scoped inference
 //! remains separate work; this gate prevents that ambiguity reaching execution.
+//! Release requests also need activity evidence no newer than the proposal.
+//! A fresh population can revoke a queued release without retracting notices
+//! about effects that already happened. Execution must still revalidate changes
+//! that arrive after this snapshot.
 
 use super::engine::{AtcEffectPlan, AtcTickAction};
 use mcp_agent_mail_db::models::AtcPopulationAgentRow;
@@ -20,11 +24,17 @@ struct ProjectIdentity {
     key: String,
 }
 
+#[derive(Debug, Clone)]
+struct AgentObservation {
+    project: ProjectIdentity,
+    last_active_ts: i64,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct PopulationScope {
     // None is an invalid or ambiguous name, not a missing project wildcard.
     // The map is replaced per successful refresh, never accumulated over time.
-    by_name: HashMap<String, Option<ProjectIdentity>>,
+    by_name: HashMap<String, Option<AgentObservation>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,7 +52,7 @@ enum ActionKey {
 
 impl PopulationScope {
     pub(super) fn from_rows(rows: &[AtcPopulationAgentRow]) -> Self {
-        let mut by_name: HashMap<String, Option<ProjectIdentity>> =
+        let mut by_name: HashMap<String, Option<AgentObservation>> =
             HashMap::with_capacity(rows.len());
         for row in rows {
             let project = row.project_key.trim();
@@ -53,14 +63,21 @@ impl PopulationScope {
                 id: row.project_id,
                 key: project.to_string(),
             });
+            let observation = identity.map(|project| AgentObservation {
+                project,
+                last_active_ts: row.last_active_ts,
+            });
             by_name
                 .entry(row.name.clone())
-                .and_modify(|previous| {
-                    if *previous != identity {
-                        *previous = None;
+                .and_modify(|previous| match (previous.as_mut(), observation.as_ref()) {
+                    (Some(previous), Some(next)) if previous.project == next.project => {
+                        // Duplicate rows are the same identity even when their
+                        // activity differs. Never let row order weaken evidence.
+                        previous.last_active_ts = previous.last_active_ts.max(next.last_active_ts);
                     }
+                    _ => *previous = None,
                 })
-                .or_insert(identity);
+                .or_insert(observation);
         }
         Self { by_name }
     }
@@ -76,7 +93,25 @@ impl PopulationScope {
         let Some(project) = project_key.map(str::trim).filter(|key| !key.is_empty()) else {
             return false;
         };
-        matches!(self.by_name.get(name), Some(Some(identity)) if identity.key == project)
+        matches!(self.by_name.get(name), Some(Some(observation)) if observation.project.key == project)
+    }
+
+    fn permits_effect(&self, effect: &AtcEffectPlan) -> bool {
+        if !self.permits(&effect.agent, effect.project_key.as_deref()) {
+            return false;
+        }
+        if effect.kind != "release_reservations_requested" {
+            // This gate revokes release requests, not completed outcome notices
+            // or unrelated proposals. Their identity scope is still required.
+            return true;
+        }
+        self.by_name
+            .get(&effect.agent)
+            .and_then(Option::as_ref)
+            .is_some_and(|observation| {
+                observation.last_active_ts > 0
+                    && observation.last_active_ts <= effect.timestamp_micros
+            })
     }
 
     pub(super) fn retain_authorized(
@@ -88,7 +123,7 @@ impl PopulationScope {
         let action_count = actions.len();
         // Scope validation is separate from optional-notification budgeting.
         // High-risk releases and future effect kinds do not bypass authority.
-        effects.retain(|effect| self.permits(&effect.agent, effect.project_key.as_deref()));
+        effects.retain(|effect| self.permits_effect(effect));
 
         let mut admitted = HashMap::new();
         for effect in effects.iter() {
@@ -400,6 +435,206 @@ mod tests {
             if generation > 0 {
                 assert!(!scope.permits(&format!("Agent{}", generation - 1), Some("/alpha")));
             }
+        }
+    }
+
+    #[test]
+    fn newer_activity_revokes_release_and_legacy_action_but_keeps_outcome_notices() {
+        let mut active = row("BlueLake", 1, "/alpha");
+        active.last_active_ts += 1;
+        let scope = PopulationScope::from_rows(&[active]);
+        let mut effects = vec![
+            effect(
+                "BlueLake",
+                Some("/alpha"),
+                "release_reservations_requested",
+                None,
+            ),
+            effect(
+                "BlueLake",
+                Some("/alpha"),
+                "send_advisory",
+                Some("released earlier"),
+            ),
+        ];
+        let mut actions = vec![
+            AtcTickAction::ReleaseReservations {
+                agent: "BlueLake".into(),
+            },
+            AtcTickAction::SendAdvisory {
+                agent: "BlueLake".into(),
+                message: "released earlier".into(),
+            },
+        ];
+        assert_eq!(
+            scope.retain_authorized(&mut effects, &mut actions),
+            ScopeDisposition {
+                effects_withheld: 1,
+                actions_withheld: 1,
+            },
+        );
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].message.as_deref(), Some("released earlier"));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], AtcTickAction::SendAdvisory { .. }));
+    }
+
+    #[test]
+    fn release_activity_boundary_is_inclusive_and_does_not_subtract_timestamps() {
+        for last_active in [1, 1_000_000, i64::MAX] {
+            let mut active = row("BlueLake", 1, "/alpha");
+            active.last_active_ts = last_active;
+            let scope = PopulationScope::from_rows(&[active]);
+            for planned_at in [i64::MIN, -1, 0, last_active - 1, last_active, i64::MAX] {
+                let mut release = effect(
+                    "BlueLake",
+                    Some("/alpha"),
+                    "release_reservations_requested",
+                    None,
+                );
+                release.timestamp_micros = planned_at;
+                assert_eq!(scope.permits_effect(&release), planned_at >= last_active);
+            }
+        }
+    }
+
+    #[test]
+    fn unobserved_activity_never_authorizes_release_but_does_not_erase_identity() {
+        for last_active in [i64::MIN, -1, 0] {
+            let mut active = row("BlueLake", 1, "/alpha");
+            active.last_active_ts = last_active;
+            let scope = PopulationScope::from_rows(&[active]);
+            assert!(scope.permits("BlueLake", Some("/alpha")));
+            assert_eq!(scope.unresolved_names(), 0);
+            let mut release = effect(
+                "BlueLake",
+                Some("/alpha"),
+                "release_reservations_requested",
+                None,
+            );
+            release.timestamp_micros = i64::MAX;
+            assert!(!scope.permits_effect(&release));
+            assert!(scope.permits_effect(&effect(
+                "BlueLake",
+                Some("/alpha"),
+                "send_advisory",
+                Some("completed outcome"),
+            )));
+        }
+    }
+
+    #[test]
+    fn duplicate_identity_keeps_newest_activity_independently_of_row_order() {
+        let old = row("BlueLake", 1, "/alpha");
+        let mut new = old.clone();
+        new.last_active_ts += 1;
+        let release = effect(
+            "BlueLake",
+            Some("/alpha"),
+            "release_reservations_requested",
+            None,
+        );
+        for rows in [
+            vec![old.clone(), new.clone(), old.clone()],
+            vec![new.clone(), old, new],
+        ] {
+            let scope = PopulationScope::from_rows(&rows);
+            assert_eq!(scope.unresolved_names(), 0);
+            assert!(scope.permits("BlueLake", Some("/alpha")));
+            assert!(!scope.permits_effect(&release));
+        }
+    }
+
+    #[test]
+    fn activity_only_refresh_revokes_old_proposals_and_preserves_scope_accounting() {
+        with_global_atc(|| {
+            let mut state = HydrationState::default();
+            let old = row("BlueLake", 1, "/alpha");
+            state.refresh_with(10, || Ok(vec![old.clone()])).unwrap();
+            finish_local_hydration(&mut state);
+            let mut original = release_report(&["BlueLake"], "/alpha");
+            state.filter_report_scope(&mut original);
+            assert_eq!(original.effects.len(), 1);
+
+            let mut new = old;
+            new.last_active_ts += 1;
+            state.refresh_with(20, || Ok(vec![new])).unwrap();
+            assert_eq!(state.progress.unchanged_agents, 0);
+            finish_local_hydration(&mut state);
+            let mut stale = release_report(&["BlueLake"], "/alpha");
+            state.filter_report_scope(&mut stale);
+            state.annotate(&mut stale.summary, 20);
+            assert!(stale.effects.is_empty() && stale.actions.is_empty());
+            assert_eq!(stale.summary.kernel.pending_effects, 0);
+            assert_eq!(state.progress.scope_effects_withheld, 1);
+            assert_eq!(state.progress.scope_actions_withheld, 1);
+            assert_eq!(state.progress.refresh_failures, 0);
+            assert_eq!(
+                stale.summary.completeness,
+                engine::SnapshotCompleteness::Partial,
+            );
+
+            let mut fresh = release_report(&["BlueLake"], "/alpha");
+            fresh.effects[0].timestamp_micros += 1;
+            state.filter_report_scope(&mut fresh);
+            assert_eq!(fresh.effects.len(), 1);
+            assert_eq!(fresh.actions.len(), 1);
+            assert_eq!(state.progress.last_scope_effects_withheld, 0);
+            assert_eq!(state.progress.scope_effects_withheld, 1);
+        });
+    }
+
+    #[test]
+    fn a_940_agent_refresh_revokes_only_superseded_release_proposals_in_order() {
+        let rows: Vec<_> = (0..940)
+            .map(|index| {
+                let mut active = row(&format!("Agent{index:04}"), 1, "/alpha");
+                if index % 2 == 0 {
+                    active.last_active_ts += 1;
+                }
+                active
+            })
+            .collect();
+        let scope = PopulationScope::from_rows(&rows);
+        let mut effects: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                effect(
+                    &row.name,
+                    Some("/alpha"),
+                    "release_reservations_requested",
+                    None,
+                )
+            })
+            .collect();
+        let mut actions: Vec<_> = rows
+            .iter()
+            .map(|row| AtcTickAction::ReleaseReservations {
+                agent: row.name.clone(),
+            })
+            .collect();
+        assert_eq!(
+            scope.retain_authorized(&mut effects, &mut actions),
+            ScopeDisposition {
+                effects_withheld: 470,
+                actions_withheld: 470,
+            },
+        );
+        let expected: Vec<_> = rows
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            effects.iter().map(|effect| effect.agent.as_str()).collect::<Vec<_>>(),
+            expected,
+        );
+        assert_eq!(actions.len(), 470);
+        for (action, expected) in actions.iter().zip(expected) {
+            assert!(
+                matches!(action, AtcTickAction::ReleaseReservations { agent } if agent == expected)
+            );
         }
     }
 
