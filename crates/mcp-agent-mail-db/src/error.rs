@@ -1184,6 +1184,7 @@ fn contains_lock_or_busy(msg: &str) -> bool {
         || lower.contains("database table is locked")
         || lower.contains("database schema is locked")
         || lower.contains("database is busy")
+        || lower.contains("write coordinator service start timed out while another launcher remained in starting state")
         || lower.contains("resource temporarily busy")
         || lower.contains("sqlite_busy")
         || lower.contains("locked by another process")
@@ -1446,6 +1447,16 @@ mod tests {
             "unexpected classification for {message:?}: {classification:?}"
         );
         classification
+    }
+
+    #[test]
+    fn write_coordinator_start_timeout_is_busy_not_engine_damage() {
+        let message = "internal error: write coordinator service start timed out while another launcher remained in Starting state";
+        let classification = assert_class(message, DbErrorClass::BusyRetryable);
+        assert!(classification.safe_to_retry);
+        assert!(!classification.repairable);
+        assert!(is_lock_error(message));
+        assert!(!is_corruption_error(message));
     }
 
     /// GH#312: a multi-form integrity probe joins every form's error into one
