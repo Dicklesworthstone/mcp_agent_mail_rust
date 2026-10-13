@@ -9356,6 +9356,32 @@ fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyClea
     let mut sidecars: HashMap<&'static str, SqliteCleanupSidecarOpen> = HashMap::new();
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let path = sqlite_sidecar_path(sqlite_path, suffix);
+        if suffix == "-shm" {
+            // Linux FrankenSQLite uses classic process-associated fcntl locks
+            // on this inode. Opening and then closing an otherwise healthy SHM
+            // from this process can release locks held by live connections.
+            // Validate the pathname without acquiring a descriptor; if the WAL
+            // is later proved damaged we open/witness SHM under cleanup admission.
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => {
+                    return Err(SqlError::Custom(format!(
+                        "refusing SQLite-family cleanup because {} sidecar {} is not a regular file",
+                        sqlite_recovery_sidecar_label(suffix),
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SqlError::Custom(format!(
+                        "failed to classify {} sidecar {} before SQLite-family cleanup: {error}",
+                        sqlite_recovery_sidecar_label(suffix),
+                        path.display()
+                    )));
+                }
+            }
+            continue;
+        }
         if let Some(opened) =
             open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label(suffix))?
         {
@@ -9376,9 +9402,13 @@ fn classify_sqlite_family_cleanup(sqlite_path: &Path) -> Result<SqliteFamilyClea
     // that this classifier has independently proved damaged. Treating an
     // empty SHM as standalone cleanup authority can rename a descriptor held
     // by the live engine and leave a healthy framed WAL sidecarless.
-    let shm = match sidecars.remove("-shm") {
-        Some(opened) if wal.is_some() => Some(seal_sqlite_cleanup_sidecar(opened)?),
-        _ => None,
+    let shm = if wal.is_some() {
+        let path = sqlite_sidecar_path(sqlite_path, "-shm");
+        open_sqlite_cleanup_sidecar(&path, sqlite_recovery_sidecar_label("-shm"))?
+            .map(seal_sqlite_cleanup_sidecar)
+            .transpose()?
+    } else {
+        None
     };
     // FrankenSQLite's WAL certificates describe the exact WAL/main generation.
     // Keeping either certificate attached after its damaged WAL is detached can
@@ -34070,6 +34100,56 @@ mod tests {
             family_before,
             "cleanup must not detach an empty SHM placeholder from a healthy Franken WAL family"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_wal_classification_does_not_open_shm() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("healthy-shm-metadata-only.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = WAL;")
+            .expect("enable WAL mode");
+        writer
+            .execute_raw("PRAGMA wal_autocheckpoint = 0;")
+            .expect("disable automatic checkpoints");
+        writer
+            .execute_raw("CREATE TABLE live_value (value INTEGER NOT NULL);")
+            .expect("create live fixture table");
+        writer
+            .execute_raw("INSERT INTO live_value (value) VALUES (9);")
+            .expect("commit live WAL frame");
+        crate::close_db_conn(writer, "close healthy SHM classifier fixture");
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert!(
+            std::fs::metadata(&wal_path)
+                .is_ok_and(|metadata| metadata.len() > SQLITE_WAL_HEADER_BYTES),
+            "fixture must retain a healthy framed WAL"
+        );
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(&shm_path, b"compatibility-shm").expect("create SHM fixture");
+        let original_mode = std::fs::metadata(&shm_path)
+            .expect("SHM metadata")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0))
+            .expect("make SHM descriptor-open hostile");
+
+        let result = classify_sqlite_family_cleanup(&db_path);
+
+        std::fs::set_permissions(
+            &shm_path,
+            std::fs::Permissions::from_mode(original_mode),
+        )
+        .expect("restore SHM permissions");
+        let plan = result.expect("healthy WAL classification must inspect SHM metadata only");
+        assert!(plan.is_empty());
+        assert!(shm_path.exists());
     }
 
     #[test]
