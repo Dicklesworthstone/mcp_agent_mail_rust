@@ -6473,6 +6473,14 @@ pub fn is_checkout_validation_failure(message: &str) -> bool {
 #[must_use]
 pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    // FrankenSQLite reports coordinator-launch contention with the generic
+    // "internal error" prefix. It is a transient busy condition, not evidence
+    // that the database family is damaged, and must never trigger recovery.
+    if lower.contains(
+        "write coordinator service start timed out while another launcher remained in starting state",
+    ) {
+        return false;
+    }
     is_corruption_error_message(message)
         || is_sqlite_snapshot_conflict_error_message(message)
         || lower.contains("out of memory")
@@ -6481,6 +6489,15 @@ pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
         || lower.contains("internal error")
         || lower.contains("cursor must be on a leaf")
         || lower.contains("wal file too small")
+}
+
+#[cfg(test)]
+#[test]
+fn coordinator_launch_timeout_never_authorizes_sqlite_recovery() {
+    let message =
+        "internal error: write coordinator service start timed out while another launcher remained in Starting state";
+    assert!(!is_sqlite_recovery_error_message(message));
+    assert!(crate::error::is_lock_error(message));
 }
 
 #[must_use]
