@@ -1,0 +1,1115 @@
+{
+  "lib": "/home/ubuntu/relwave-am-stall-0.3.39/release_smoke.py",
+  "lib_sha256": "eba8f03de2720ed3549d50b83756f1a03afd636f2a2939be5151e01cb982eb9a",
+  "order": "B",
+  "phases": [
+    "flow",
+    "storm",
+    "swarm"
+  ],
+  "swarm_agents": 60,
+  "swarm_secs": 480,
+  "arms": {
+    "A": {
+      "name": "candidate",
+      "binary": "candidate",
+      "extra_env": {}
+    },
+    "B": {
+      "name": "control",
+      "binary": "control",
+      "extra_env": {}
+    },
+    "C": {
+      "name": "candnoreset",
+      "binary": "candidate",
+      "extra_env": {
+        "DB_JOURNAL_SIZE_LIMIT_BYTES": "1099511627776"
+      }
+    }
+  },
+  "cgroup": "/sys/fs/cgroup/system.slice/relwave-am-stall-r1bb-3596150.scope",
+  "runs": [
+    {
+      "run": 1,
+      "arm": "B",
+      "name": "control",
+      "started_at": "2026-10-13T21:29:15Z",
+      "finished_at": "2026-10-13T21:43:49Z",
+      "io_some_start": {
+        "avg10": 10.47,
+        "avg60": 25.34
+      },
+      "cpu_some_start": {
+        "avg10": 0.0,
+        "avg60": 0.06
+      },
+      "io_some_end": {
+        "avg10": 53.7,
+        "avg60": 64.88
+      },
+      "pressure_during": {
+        "io_some_avg10": {
+          "n": 87,
+          "max": 94.69,
+          "mean": 64.52
+        },
+        "cpu_some_avg10": {
+          "n": 87,
+          "max": 22.9,
+          "mean": 2.56
+        },
+        "cgroup_io_some_avg10": {
+          "n": 87,
+          "max": 98.87,
+          "mean": 64.06
+        },
+        "host_io_full_avg60_max": 80.48,
+        "aborted": null,
+        "wal_bytes_max": 217585472,
+        "wal_bytes_every_10s": [
+          [
+            1791926965.1,
+            10732632
+          ],
+          [
+            1791926975.1,
+            2682152
+          ],
+          [
+            1791926985.1,
+            17341112
+          ],
+          [
+            1791926995.1,
+            1260752
+          ],
+          [
+            1791927005.1,
+            12669032
+          ],
+          [
+            1791927015.1,
+            29375632
+          ],
+          [
+            1791927025.1,
+            50923232
+          ],
+          [
+            1791927035.1,
+            72697432
+          ],
+          [
+            1791927045.1,
+            91472272
+          ],
+          [
+            1791927055.3,
+            106654472
+          ],
+          [
+            1791927065.3,
+            115075752
+          ],
+          [
+            1791927075.3,
+            118161632
+          ],
+          [
+            1791927085.3,
+            120744872
+          ],
+          [
+            1791927095.3,
+            122837832
+          ],
+          [
+            1791927105.5,
+            126797152
+          ],
+          [
+            1791927116.0,
+            132186112
+          ],
+          [
+            1791927126.4,
+            132474512
+          ],
+          [
+            1791927136.5,
+            133710512
+          ],
+          [
+            1791927146.5,
+            144640872
+          ],
+          [
+            1791927156.5,
+            153725472
+          ],
+          [
+            1791927166.5,
+            163283872
+          ],
+          [
+            1791927176.5,
+            173406712
+          ],
+          [
+            1791927186.5,
+            183822072
+          ],
+          [
+            1791927196.6,
+            190661272
+          ],
+          [
+            1791927206.6,
+            199988952
+          ],
+          [
+            1791927216.6,
+            209613272
+          ],
+          [
+            1791927226.6,
+            217292952
+          ],
+          [
+            1791927236.6,
+            217585472
+          ],
+          [
+            1791927246.6,
+            217585472
+          ],
+          [
+            1791927256.6,
+            217585472
+          ],
+          [
+            1791927266.7,
+            217585472
+          ],
+          [
+            1791927276.7,
+            217585472
+          ],
+          [
+            1791927286.7,
+            217585472
+          ],
+          [
+            1791927296.7,
+            217585472
+          ],
+          [
+            1791927306.7,
+            217585472
+          ],
+          [
+            1791927316.7,
+            217585472
+          ],
+          [
+            1791927326.7,
+            217585472
+          ],
+          [
+            1791927336.7,
+            217585472
+          ],
+          [
+            1791927346.7,
+            217585472
+          ],
+          [
+            1791927356.7,
+            217585472
+          ],
+          [
+            1791927366.7,
+            217585472
+          ],
+          [
+            1791927376.8,
+            217585472
+          ],
+          [
+            1791927386.8,
+            217585472
+          ],
+          [
+            1791927396.8,
+            217585472
+          ],
+          [
+            1791927406.8,
+            217585472
+          ],
+          [
+            1791927416.8,
+            217585472
+          ],
+          [
+            1791927426.8,
+            217585472
+          ],
+          [
+            1791927436.8,
+            217585472
+          ],
+          [
+            1791927446.8,
+            217585472
+          ],
+          [
+            1791927456.8,
+            217585472
+          ],
+          [
+            1791927466.8,
+            217585472
+          ],
+          [
+            1791927476.8,
+            217585472
+          ],
+          [
+            1791927486.8,
+            217585472
+          ],
+          [
+            1791927496.9,
+            217585472
+          ],
+          [
+            1791927506.9,
+            217585472
+          ],
+          [
+            1791927516.9,
+            217585472
+          ],
+          [
+            1791927526.9,
+            217585472
+          ],
+          [
+            1791927536.9,
+            217585472
+          ],
+          [
+            1791927546.9,
+            217585472
+          ],
+          [
+            1791927556.9,
+            217585472
+          ],
+          [
+            1791927566.9,
+            217585472
+          ],
+          [
+            1791927576.9,
+            217585472
+          ],
+          [
+            1791927586.9,
+            217585472
+          ],
+          [
+            1791927596.9,
+            217585472
+          ],
+          [
+            1791927607.0,
+            217585472
+          ],
+          [
+            1791927617.0,
+            217585472
+          ],
+          [
+            1791927627.0,
+            217585472
+          ],
+          [
+            1791927637.0,
+            217585472
+          ],
+          [
+            1791927647.0,
+            217585472
+          ],
+          [
+            1791927657.0,
+            217585472
+          ],
+          [
+            1791927667.0,
+            217585472
+          ],
+          [
+            1791927677.0,
+            217585472
+          ],
+          [
+            1791927687.0,
+            217585472
+          ],
+          [
+            1791927697.0,
+            217585472
+          ],
+          [
+            1791927707.0,
+            217585472
+          ],
+          [
+            1791927717.1,
+            217585472
+          ],
+          [
+            1791927727.1,
+            217585472
+          ],
+          [
+            1791927737.1,
+            217585472
+          ],
+          [
+            1791927747.1,
+            217585472
+          ],
+          [
+            1791927757.1,
+            217585472
+          ],
+          [
+            1791927767.1,
+            217585472
+          ],
+          [
+            1791927777.1,
+            217585472
+          ],
+          [
+            1791927787.1,
+            217585472
+          ],
+          [
+            1791927797.1,
+            217585472
+          ],
+          [
+            1791927807.1,
+            217585472
+          ],
+          [
+            1791927817.1,
+            217585472
+          ],
+          [
+            1791927827.1,
+            217585472
+          ]
+        ]
+      },
+      "root": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359",
+      "log_counts": {
+        "hard_grace_zombie_births": 88,
+        "dispatch_timeouts": 126,
+        "coordinator_start_timeouts": 0,
+        "backfill_failed": 0,
+        "pre_recovery_snapshots": 0,
+        "wal_admission_refused": 1,
+        "engine_recovery_in_progress": 7,
+        "pool_acquire_timeouts": 0
+      },
+      "zombies_max": null,
+      "wbq_samples": null,
+      "acked_sends": null,
+      "failed_checks": {
+        "flow": [],
+        "storm": [],
+        "swarm": []
+      },
+      "server_ready_secs": [
+        4.0
+      ],
+      "server_starts": [
+        {
+          "called_at": 1791926955.2,
+          "ready_secs": 4.0
+        }
+      ],
+      "zombie_birth_times": [
+        "2026-10-13T21:31:38",
+        "2026-10-13T21:31:38",
+        "2026-10-13T21:31:39",
+        "2026-10-13T21:31:39",
+        "2026-10-13T21:31:39",
+        "2026-10-13T21:31:41",
+        "2026-10-13T21:31:41",
+        "2026-10-13T21:31:41",
+        "2026-10-13T21:31:41",
+        "2026-10-13T21:31:41",
+        "2026-10-13T21:31:42",
+        "2026-10-13T21:31:43",
+        "2026-10-13T21:31:43",
+        "2026-10-13T21:31:43",
+        "2026-10-13T21:31:44",
+        "2026-10-13T21:31:44",
+        "2026-10-13T21:31:44",
+        "2026-10-13T21:31:45",
+        "2026-10-13T21:31:45",
+        "2026-10-13T21:31:45",
+        "2026-10-13T21:31:46",
+        "2026-10-13T21:31:46",
+        "2026-10-13T21:31:46",
+        "2026-10-13T21:31:46",
+        "2026-10-13T21:31:47",
+        "2026-10-13T21:31:47",
+        "2026-10-13T21:31:48",
+        "2026-10-13T21:31:48",
+        "2026-10-13T21:31:49",
+        "2026-10-13T21:31:49",
+        "2026-10-13T21:31:49",
+        "2026-10-13T21:31:50",
+        "2026-10-13T21:31:50",
+        "2026-10-13T21:31:50",
+        "2026-10-13T21:31:51",
+        "2026-10-13T21:31:51",
+        "2026-10-13T21:31:51",
+        "2026-10-13T21:31:52",
+        "2026-10-13T21:31:52",
+        "2026-10-13T21:31:53",
+        "2026-10-13T21:31:54",
+        "2026-10-13T21:31:55",
+        "2026-10-13T21:31:55",
+        "2026-10-13T21:31:56",
+        "2026-10-13T21:31:57",
+        "2026-10-13T21:31:57",
+        "2026-10-13T21:31:57",
+        "2026-10-13T21:31:57",
+        "2026-10-13T21:31:57",
+        "2026-10-13T21:31:58",
+        "2026-10-13T21:31:58",
+        "2026-10-13T21:31:58",
+        "2026-10-13T21:31:58",
+        "2026-10-13T21:31:58",
+        "2026-10-13T21:31:59",
+        "2026-10-13T21:32:00",
+        "2026-10-13T21:32:00",
+        "2026-10-13T21:32:01",
+        "2026-10-13T21:32:02",
+        "2026-10-13T21:32:02",
+        "2026-10-13T21:32:08",
+        "2026-10-13T21:32:08",
+        "2026-10-13T21:32:09",
+        "2026-10-13T21:32:10",
+        "2026-10-13T21:32:11",
+        "2026-10-13T21:32:11",
+        "2026-10-13T21:32:11",
+        "2026-10-13T21:32:11",
+        "2026-10-13T21:32:12",
+        "2026-10-13T21:32:13",
+        "2026-10-13T21:32:14",
+        "2026-10-13T21:32:15",
+        "2026-10-13T21:32:15",
+        "2026-10-13T21:32:15",
+        "2026-10-13T21:32:15",
+        "2026-10-13T21:32:16",
+        "2026-10-13T21:32:16",
+        "2026-10-13T21:32:16",
+        "2026-10-13T21:32:16",
+        "2026-10-13T21:32:16",
+        "2026-10-13T21:32:17",
+        "2026-10-13T21:32:17",
+        "2026-10-13T21:32:17",
+        "2026-10-13T21:32:18",
+        "2026-10-13T21:32:19",
+        "2026-10-13T21:32:19",
+        "2026-10-13T21:32:19",
+        "2026-10-13T21:32:19"
+      ],
+      "thread_snapshots": [
+        {
+          "why": "baseline",
+          "at": "21:30:45Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/out/threads_213045_baseline.txt",
+          "threads": 185,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              64
+            ],
+            [
+              "dispatch-blocki",
+              "ep_poll",
+              38
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              19
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              6
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              5
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "active-lease-re",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        },
+        {
+          "why": "zombies5",
+          "at": "21:31:40Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/out/threads_213140_zombies5.txt",
+          "threads": 377,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              130
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              123
+            ],
+            [
+              "dispatch-hard-g",
+              "hrtimer_nanosleep",
+              58
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              6
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              5
+            ],
+            [
+              "fsqlite-worker",
+              "-",
+              2
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        },
+        {
+          "why": "zombies18",
+          "at": "21:31:45Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/out/threads_213145_zombies18.txt",
+          "threads": 375,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              132
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              125
+            ],
+            [
+              "dispatch-hard-g",
+              "hrtimer_nanosleep",
+              54
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              6
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              5
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "active-lease-re",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        },
+        {
+          "why": "zombies33",
+          "at": "21:31:50Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/out/threads_213150_zombies33.txt",
+          "threads": 388,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              135
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              128
+            ],
+            [
+              "dispatch-hard-g",
+              "hrtimer_nanosleep",
+              60
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              6
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              5
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "active-lease-re",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        },
+        {
+          "why": "zombies43",
+          "at": "21:31:56Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/out/threads_213156_zombies43.txt",
+          "threads": 387,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              135
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              128
+            ],
+            [
+              "dispatch-hard-g",
+              "hrtimer_nanosleep",
+              59
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              5
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              5
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "active-lease-re",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        },
+        {
+          "why": "zombies57",
+          "at": "21:32:01Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/out/threads_213201_zombies57.txt",
+          "threads": 387,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              135
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              128
+            ],
+            [
+              "dispatch-hard-g",
+              "hrtimer_nanosleep",
+              60
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              6
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              5
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "active-lease-re",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        }
+      ],
+      "result": {
+        "arm": "control",
+        "binary": "/home/ubuntu/relwave-am-stall-0.3.39/control/am",
+        "binary_sha256": "0e04d2e353635c8c151e39b98c21ed69f4225349f6cf67d2e075a7ea4742aa6d",
+        "binary_target": "x86_64-static",
+        "loadavg_start": [
+          "2.68",
+          "7.72",
+          "17.97"
+        ],
+        "phases": {
+          "flow": {
+            "verdict": "PASS",
+            "checks": [
+              {
+                "name": "ensure_project",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "register two agents",
+                "ok": true,
+                "detail": "['SilentFern', 'IcyBass']"
+              },
+              {
+                "name": "invalid agent name refused",
+                "ok": true,
+                "detail": "{'error': {'type': 'INVALID_AGENT_NAME', 'message': \"Invalid agent name format: 'not a valid name!'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name.\", 'recoverable': True, 'data': {'provided': 'not a valid name!'}}}"
+              },
+              {
+                "name": "reserve src/auth/**",
+                "ok": true,
+                "detail": "{'granted': [{'id': 1, 'path_pattern': 'src/auth/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-13T22:29:20.042894Z'}], 'conflicts': []}"
+              },
+              {
+                "name": "symmetric glob conflict",
+                "ok": true,
+                "detail": "{'granted': [], 'conflicts': [{'path': 'src/auth/login.rs', 'holders': [{'agent': 'SilentFern', 'path_pattern': 'src/auth/**', 'exclusive': True, 'expires_ts': '2026-10-13T22:29:20.042894Z'}]}]}"
+              },
+              {
+                "name": "send_message",
+                "ok": true,
+                "detail": "{'deliveries': [{'project': '/home/ubuntu/relwave-am-stall-0.3.39/out-r1bb/control-20261013T172915-3596359/proj1', 'payload': {'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'body_md': 'hi', 'importance': 'normal', 'ack_required': True, 'created_ts': '2026-10-13T21:29:20.463738Z', 'attachments': [], 'from': 'SilentFern', 'to': ['IcyBass'], 'cc'"
+              },
+              {
+                "name": "fetch_inbox sees message",
+                "ok": true,
+                "detail": "[{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'SilentFern', 'created_ts': '2026-10-13T21:29:20.463738Z', 'read_ts': '2026-10-13T21:29:20.532549Z', 'kind': 'to', 'attachments': []}, {'id': 1, 'project_id': 1, 'sender_id': 1, 'thread_id': None, 'topic': None, 'subject': 'Contact approved: S"
+              },
+              {
+                "name": "acknowledge_message",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "reply_message",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "delivery receipt persisted",
+                "ok": true,
+                "detail": "{'message_id': 2, 'project_id': 1, 'persisted': True, 'persisted_at': '2026-10-13T21:29:20.463738Z', 'recipients': [{'recipient': 'IcyBass', 'kind': 'to', 'persisted': True, 'signaled': False, 'signal_receipts': [], 'acknowledged': True, 'acknowledged_at': '2026-10-13T21:29:20.582187Z'}]}"
+              },
+              {
+                "name": "search_messages finds the message",
+                "ok": true,
+                "detail": "{'result': [{'id': 2, 'subject': 'smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-13T21:29:20.463738Z', 'thread_id': 'smoke-1', 'from': 'SilentFern', 'to': ['IcyBass'], 'cc': []}, {'id': 3, 'subject': 'Re: smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-13T21:29:20.632602Z', 'thread_id': 'smoke-1', 'from': 'IcyBass', 'to': ['SilentFern'], 'cc': ["
+              },
+              {
+                "name": "summarize_thread",
+                "ok": true,
+                "detail": "{'thread_id': 'smoke-1', 'summary': {'participants': ['IcyBass', 'SilentFern'], 'key_points': [], 'action_items': [], 'total_messages': 2, 'open_actions': 0, 'done_actions': 0, 'mentions': []}, 'examples': []}"
+              },
+              {
+                "name": "resource://inbox lists the message",
+                "ok": true,
+                "detail": "{'agent': 'IcyBass', 'count': 2, 'messages': [{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'SilentFern', 'created_ts': '2026-10-13T21:29:20.463738Z', 'kind': 'to', 'attachments': [], 'commit': {'authored_ts': None, 'deletions': 0, 'diff_summary': {'excerpt': [], 'hunks': 0}, 'hexsha': Non"
+              },
+              {
+                "name": "broadcast refused",
+                "ok": true,
+                "detail": "{'code': -32000, 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'data': {'error': {'type': 'BROADCAST_DISABLED', 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'recoverable': True, 'data': {'argument': 'broadcast'}}}}"
+              },
+              {
+                "name": "idempotent replay",
+                "ok": true,
+                "detail": "{'granted': [{'id': 2, 'path_pattern': 'docs/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-13T21:39:20.945675Z'}], 'conflicts': [], 'idempotent_replay': True}"
+              },
+              {
+                "name": "idempotency key conflict",
+                "ok": true,
+                "detail": "{'error': {'type': 'IDEMPOTENCY_KEY_CONFLICT', 'message': \"idempotency_key 'smoke-k1' for tool 'file_reservation_paths' was already used with a different payload. The original request stands; do not retry a changed payload under the same key. Use a fresh idempotency_key for a genuinely new request.\", 'recoverable': False, 'data': {'tool': 'file_reservation_paths', 'idempotency_key': 'smoke-k1', 'o"
+              },
+              {
+                "name": "release",
+                "ok": true,
+                "detail": "{'released': 1, 'released_at': '2026-10-13T21:29:21.089011Z', 'released_ids': [1]}"
+              },
+              {
+                "name": "re-grant after release",
+                "ok": true,
+                "detail": "{'granted': [{'id': 3, 'path_pattern': 'src/auth/login.rs', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-13T21:39:21.093070Z'}], 'conflicts': []}"
+              },
+              {
+                "name": "inbox events cursor",
+                "ok": true,
+                "detail": "{'events': [{'cursor': 1, 'message_id': 1, 'kind': 'to', 'delivered_ts': '2026-10-13T21:29:20.437261Z', 'subject': 'Contact approved: SilentFern -> IcyBass', 'from': 'SilentFern', 'importance': 'normal', 'ack_required': False}, {'cursor': 2, 'message_id': 2, 'kind': 'to', 'delivered_ts': '2026-10-13T21:29:20.463738Z', 'subject': 'smoke', 'from': 'SilentFern', 'importance': 'normal', 'ack_required'"
+              }
+            ]
+          },
+          "storm": {
+            "verdict": "PASS",
+            "checks": [
+              {
+                "name": "all storm sends acknowledged",
+                "ok": true,
+                "detail": "240/240 errors=[]"
+              },
+              {
+                "name": "acknowledged ids distinct",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "zero RESOURCE_BUSY",
+                "ok": true,
+                "detail": "0/240"
+              }
+            ],
+            "offered": 240,
+            "p50_s": 0.4235694408416748,
+            "p99_s": 1.3675267696380615,
+            "errors": []
+          },
+          "swarm": {
+            "verdict": "NO_VERDICT",
+            "checks": [
+              {
+                "name": "register 60 swarm agents",
+                "ok": true,
+                "detail": "60/60"
+              }
+            ],
+            "error": "RuntimeError: control: server not ready within 600 s"
+          }
+        },
+        "binary_version": "am 0.3.38",
+        "server_exe_sha256": "0e04d2e353635c8c151e39b98c21ed69f4225349f6cf67d2e075a7ea4742aa6d",
+        "server_nofile_soft_hard": [
+          "65535",
+          "65535"
+        ],
+        "server_threads_start": 25,
+        "clean_shutdown": true,
+        "server_log_walfec_lines": 2,
+        "loadavg_end": [
+          "3.25",
+          "13.77",
+          "20.45"
+        ],
+        "verdict": "FAIL"
+      }
+    }
+  ],
+  "cgroup_io_max": "259:0 rbps=max wbps=2000000 riops=max wiops=200"
+}

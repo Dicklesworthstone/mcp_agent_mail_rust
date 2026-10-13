@@ -1,0 +1,794 @@
+{
+  "lib": "/home/ubuntu/relwave-am-stall-0.3.39/release_smoke.py",
+  "lib_sha256": "eba8f03de2720ed3549d50b83756f1a03afd636f2a2939be5151e01cb982eb9a",
+  "order": "A",
+  "phases": [
+    "flow",
+    "storm",
+    "swarm"
+  ],
+  "swarm_agents": 60,
+  "swarm_secs": 480,
+  "arms": {
+    "A": {
+      "name": "candidate",
+      "binary": "candidate",
+      "extra_env": {}
+    },
+    "B": {
+      "name": "control",
+      "binary": "control",
+      "extra_env": {}
+    },
+    "C": {
+      "name": "candnoreset",
+      "binary": "candidate",
+      "extra_env": {
+        "DB_JOURNAL_SIZE_LIMIT_BYTES": "1099511627776"
+      }
+    }
+  },
+  "cgroup": "/sys/fs/cgroup/system.slice/relwave-am-stall-r2a-3686867.scope",
+  "runs": [
+    {
+      "run": 1,
+      "arm": "A",
+      "name": "candidate",
+      "started_at": "2026-10-13T21:45:46Z",
+      "finished_at": "2026-10-13T21:57:43Z",
+      "io_some_start": {
+        "avg10": 0.02,
+        "avg60": 14.67
+      },
+      "cpu_some_start": {
+        "avg10": 0.01,
+        "avg60": 2.32
+      },
+      "io_some_end": {
+        "avg10": 69.91,
+        "avg60": 60.79
+      },
+      "pressure_during": {
+        "io_some_avg10": {
+          "n": 71,
+          "max": 93.63,
+          "mean": 52.55
+        },
+        "cpu_some_avg10": {
+          "n": 71,
+          "max": 7.02,
+          "mean": 0.76
+        },
+        "cgroup_io_some_avg10": {
+          "n": 71,
+          "max": 98.79,
+          "mean": 49.87
+        },
+        "host_io_full_avg60_max": 73.35,
+        "aborted": null,
+        "wal_bytes_max": 42201192,
+        "wal_bytes_every_10s": [
+          [
+            1791927956.6,
+            3625632
+          ],
+          [
+            1791927966.6,
+            8223552
+          ],
+          [
+            1791927976.6,
+            12615472
+          ],
+          [
+            1791927986.6,
+            12508352
+          ],
+          [
+            1791927996.6,
+            5417832
+          ],
+          [
+            1791928006.6,
+            16859072
+          ],
+          [
+            1791928016.6,
+            16339952
+          ],
+          [
+            1791928026.6,
+            7844512
+          ],
+          [
+            1791928036.6,
+            403792
+          ],
+          [
+            1791928046.9,
+            15590112
+          ],
+          [
+            1791928056.9,
+            29701112
+          ],
+          [
+            1791928066.9,
+            42201192
+          ],
+          [
+            1791928076.9,
+            12051032
+          ],
+          [
+            1791928086.9,
+            14193432
+          ],
+          [
+            1791928096.9,
+            15651912
+          ],
+          [
+            1791928106.9,
+            18243392
+          ],
+          [
+            1791928116.9,
+            23554072
+          ],
+          [
+            1791928126.9,
+            3506152
+          ],
+          [
+            1791928136.9,
+            4832792
+          ],
+          [
+            1791928146.9,
+            1277232
+          ],
+          [
+            1791928156.9,
+            28576352
+          ],
+          [
+            1791928166.9,
+            16999152
+          ],
+          [
+            1791928176.9,
+            14152232
+          ],
+          [
+            1791928186.9,
+            15956792
+          ],
+          [
+            1791928196.9,
+            11128152
+          ],
+          [
+            1791928206.9,
+            819912
+          ],
+          [
+            1791928216.9,
+            11614312
+          ],
+          [
+            1791928226.9,
+            11614312
+          ],
+          [
+            1791928236.9,
+            11614312
+          ],
+          [
+            1791928246.9,
+            11614312
+          ],
+          [
+            1791928256.9,
+            11614312
+          ],
+          [
+            1791928267.0,
+            11614312
+          ],
+          [
+            1791928277.0,
+            11614312
+          ],
+          [
+            1791928287.0,
+            11614312
+          ],
+          [
+            1791928297.0,
+            11614312
+          ],
+          [
+            1791928307.0,
+            11614312
+          ],
+          [
+            1791928317.0,
+            11614312
+          ],
+          [
+            1791928327.0,
+            11614312
+          ],
+          [
+            1791928337.0,
+            11614312
+          ],
+          [
+            1791928347.0,
+            11614312
+          ],
+          [
+            1791928357.0,
+            11614312
+          ],
+          [
+            1791928367.0,
+            6760952
+          ],
+          [
+            1791928377.0,
+            15054512
+          ],
+          [
+            1791928387.0,
+            4301312
+          ],
+          [
+            1791928397.0,
+            12524832
+          ],
+          [
+            1791928407.1,
+            16727232
+          ],
+          [
+            1791928417.1,
+            24724152
+          ],
+          [
+            1791928427.1,
+            28835912
+          ],
+          [
+            1791928437.1,
+            13163432
+          ],
+          [
+            1791928447.1,
+            16962072
+          ],
+          [
+            1791928457.1,
+            9368912
+          ],
+          [
+            1791928467.1,
+            9368912
+          ],
+          [
+            1791928477.1,
+            9368912
+          ],
+          [
+            1791928487.1,
+            9368912
+          ],
+          [
+            1791928497.1,
+            9368912
+          ],
+          [
+            1791928507.2,
+            9368912
+          ],
+          [
+            1791928517.2,
+            9368912
+          ],
+          [
+            1791928527.2,
+            9368912
+          ],
+          [
+            1791928537.2,
+            9368912
+          ],
+          [
+            1791928547.2,
+            9368912
+          ],
+          [
+            1791928557.2,
+            9368912
+          ],
+          [
+            1791928567.2,
+            9368912
+          ],
+          [
+            1791928577.2,
+            9368912
+          ],
+          [
+            1791928587.3,
+            9368912
+          ],
+          [
+            1791928597.3,
+            9368912
+          ],
+          [
+            1791928607.3,
+            9368912
+          ],
+          [
+            1791928617.3,
+            9368912
+          ],
+          [
+            1791928627.3,
+            9368912
+          ],
+          [
+            1791928637.3,
+            9368912
+          ],
+          [
+            1791928647.3,
+            9368912
+          ],
+          [
+            1791928657.3,
+            9368912
+          ]
+        ]
+      },
+      "root": "/home/ubuntu/relwave-am-stall-0.3.39/out-r2a/candidate-20261013T174546-3687010",
+      "log_counts": {
+        "hard_grace_zombie_births": 0,
+        "dispatch_timeouts": 68,
+        "coordinator_start_timeouts": 0,
+        "backfill_failed": 0,
+        "pre_recovery_snapshots": 0,
+        "wal_admission_refused": 2,
+        "engine_recovery_in_progress": 25,
+        "pool_acquire_timeouts": 1
+      },
+      "zombies_max": 0,
+      "wbq_samples": [
+        22,
+        9
+      ],
+      "acked_sends": 2907,
+      "failed_checks": {
+        "flow": [],
+        "storm": [],
+        "swarm": [
+          "send_message p99 <= 5.0s at 60 agents",
+          "file_reservation_paths p99 <= 5.0s at 60 agents",
+          "release_file_reservations p99 <= 5.0s at 60 agents",
+          "zero 30 s dispatch timeouts",
+          "zero tool errors",
+          "WBQ drained_total advances in every 10s window with queued work",
+          "archive converges to DB after the swarm without client reads (<= 60s)"
+        ]
+      },
+      "server_ready_secs": [
+        5.0,
+        145.2,
+        137.1
+      ],
+      "server_starts": [
+        {
+          "called_at": 1791927946.7,
+          "ready_secs": 5.0
+        },
+        {
+          "called_at": 1791928209.5,
+          "ready_secs": 145.2
+        },
+        {
+          "called_at": 1791928517.7,
+          "ready_secs": 137.1
+        }
+      ],
+      "zombie_birth_times": [],
+      "thread_snapshots": [
+        {
+          "why": "baseline",
+          "at": "21:47:16Z",
+          "file": "/home/ubuntu/relwave-am-stall-0.3.39/out-r2a/candidate-20261013T174546-3687010/out/threads_214716_baseline.txt",
+          "threads": 198,
+          "top": [
+            [
+              "asupersync-work",
+              "futex_do_wait",
+              67
+            ],
+            [
+              "dispatch-blocki",
+              "ep_poll",
+              45
+            ],
+            [
+              "commit-coalesce",
+              "futex_do_wait",
+              32
+            ],
+            [
+              "fsqlite-worker",
+              "futex_do_wait",
+              11
+            ],
+            [
+              "dispatch-blocki",
+              "futex_do_wait",
+              8
+            ],
+            [
+              "dispatch-blocki",
+              "jbd2_log_wait_commit",
+              7
+            ],
+            [
+              "asupersync-work",
+              "ep_poll",
+              6
+            ],
+            [
+              "am",
+              "futex_do_wait",
+              1
+            ],
+            [
+              "wbq-drain",
+              "folio_wait_bit_common",
+              1
+            ],
+            [
+              "atc-operator",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "retention-quota",
+              "hrtimer_nanosleep",
+              1
+            ],
+            [
+              "degraded-replay",
+              "hrtimer_nanosleep",
+              1
+            ]
+          ]
+        }
+      ],
+      "result": {
+        "arm": "candidate",
+        "binary": "/home/ubuntu/relwave-am-stall-0.3.39/candidate/am",
+        "binary_sha256": "aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805",
+        "binary_target": "x86_64-static",
+        "loadavg_start": [
+          "1.45",
+          "9.80",
+          "18.23"
+        ],
+        "phases": {
+          "flow": {
+            "verdict": "PASS",
+            "checks": [
+              {
+                "name": "ensure_project",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "register two agents",
+                "ok": true,
+                "detail": "['IndigoRiver', 'GrayHarbor']"
+              },
+              {
+                "name": "invalid agent name refused",
+                "ok": true,
+                "detail": "{'error': {'type': 'INVALID_AGENT_NAME', 'message': \"Invalid agent name format: 'not a valid name!'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name.\", 'recoverable': True, 'data': {'provided': 'not a valid name!'}}}"
+              },
+              {
+                "name": "reserve src/auth/**",
+                "ok": true,
+                "detail": "{'granted': [{'id': 1, 'path_pattern': 'src/auth/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-13T22:45:52.123808Z'}], 'conflicts': []}"
+              },
+              {
+                "name": "symmetric glob conflict",
+                "ok": true,
+                "detail": "{'granted': [], 'conflicts': [{'path': 'src/auth/login.rs', 'holders': [{'agent': 'IndigoRiver', 'path_pattern': 'src/auth/**', 'exclusive': True, 'expires_ts': '2026-10-13T22:45:52.123808Z'}]}]}"
+              },
+              {
+                "name": "send_message",
+                "ok": true,
+                "detail": "{'deliveries': [{'project': '/home/ubuntu/relwave-am-stall-0.3.39/out-r2a/candidate-20261013T174546-3687010/proj1', 'payload': {'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'body_md': 'hi', 'importance': 'normal', 'ack_required': True, 'created_ts': '2026-10-13T21:45:52.289265Z', 'attachments': [], 'from': 'IndigoRiver', 'to': ['GrayHarbor'],"
+              },
+              {
+                "name": "fetch_inbox sees message",
+                "ok": true,
+                "detail": "[{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'IndigoRiver', 'created_ts': '2026-10-13T21:45:52.289265Z', 'read_ts': '2026-10-13T21:45:52.320636Z', 'kind': 'to', 'attachments': []}, {'id': 1, 'project_id': 1, 'sender_id': 1, 'thread_id': None, 'topic': None, 'subject': 'Contact approved: "
+              },
+              {
+                "name": "acknowledge_message",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "reply_message",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "delivery receipt persisted",
+                "ok": true,
+                "detail": "{'message_id': 2, 'project_id': 1, 'persisted': True, 'persisted_at': '2026-10-13T21:45:52.289265Z', 'recipients': [{'recipient': 'GrayHarbor', 'kind': 'to', 'persisted': True, 'signaled': False, 'signal_receipts': [], 'acknowledged': True, 'acknowledged_at': '2026-10-13T21:45:52.355380Z'}]}"
+              },
+              {
+                "name": "search_messages finds the message",
+                "ok": true,
+                "detail": "{'result': [{'id': 2, 'subject': 'smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-13T21:45:52.289265Z', 'thread_id': 'smoke-1', 'from': 'IndigoRiver', 'to': ['GrayHarbor'], 'cc': []}, {'id': 3, 'subject': 'Re: smoke', 'importance': 'normal', 'ack_required': 1, 'created_ts': '2026-10-13T21:45:52.383847Z', 'thread_id': 'smoke-1', 'from': 'GrayHarbor', 'to': ['IndigoRiver'],"
+              },
+              {
+                "name": "summarize_thread",
+                "ok": true,
+                "detail": "{'thread_id': 'smoke-1', 'summary': {'participants': ['GrayHarbor', 'IndigoRiver'], 'key_points': [], 'action_items': [], 'total_messages': 2, 'open_actions': 0, 'done_actions': 0, 'mentions': []}, 'examples': []}"
+              },
+              {
+                "name": "resource://inbox lists the message",
+                "ok": true,
+                "detail": "{'agent': 'GrayHarbor', 'count': 2, 'messages': [{'id': 2, 'project_id': 1, 'sender_id': 1, 'thread_id': 'smoke-1', 'topic': None, 'subject': 'smoke', 'importance': 'normal', 'ack_required': True, 'from': 'IndigoRiver', 'created_ts': '2026-10-13T21:45:52.289265Z', 'kind': 'to', 'attachments': [], 'commit': {'authored_ts': None, 'deletions': 0, 'diff_summary': {'excerpt': [], 'hunks': 0}, 'hexsha':"
+              },
+              {
+                "name": "broadcast refused",
+                "ok": true,
+                "detail": "{'code': -32000, 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'data': {'error': {'type': 'BROADCAST_DISABLED', 'message': 'broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.', 'recoverable': True, 'data': {'argument': 'broadcast'}}}}"
+              },
+              {
+                "name": "idempotent replay",
+                "ok": true,
+                "detail": "{'granted': [{'id': 2, 'path_pattern': 'docs/**', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-13T21:55:52.661881Z'}], 'conflicts': [], 'idempotent_replay': True}"
+              },
+              {
+                "name": "idempotency key conflict",
+                "ok": true,
+                "detail": "{'error': {'type': 'IDEMPOTENCY_KEY_CONFLICT', 'message': \"idempotency_key 'smoke-k1' for tool 'file_reservation_paths' was already used with a different payload. The original request stands; do not retry a changed payload under the same key. Use a fresh idempotency_key for a genuinely new request.\", 'recoverable': False, 'data': {'tool': 'file_reservation_paths', 'idempotency_key': 'smoke-k1', 'o"
+              },
+              {
+                "name": "release",
+                "ok": true,
+                "detail": "{'released': 1, 'released_at': '2026-10-13T21:45:52.772490Z', 'released_ids': [1]}"
+              },
+              {
+                "name": "re-grant after release",
+                "ok": true,
+                "detail": "{'granted': [{'id': 3, 'path_pattern': 'src/auth/login.rs', 'exclusive': True, 'reason': '', 'expires_ts': '2026-10-13T21:55:52.776335Z'}], 'conflicts': []}"
+              },
+              {
+                "name": "inbox events cursor",
+                "ok": true,
+                "detail": "{'events': [{'cursor': 1, 'message_id': 1, 'kind': 'to', 'delivered_ts': '2026-10-13T21:45:52.255499Z', 'subject': 'Contact approved: IndigoRiver -> GrayHarbor', 'from': 'IndigoRiver', 'importance': 'normal', 'ack_required': False}, {'cursor': 2, 'message_id': 2, 'kind': 'to', 'delivered_ts': '2026-10-13T21:45:52.289265Z', 'subject': 'smoke', 'from': 'IndigoRiver', 'importance': 'normal', 'ack_req"
+              }
+            ]
+          },
+          "storm": {
+            "verdict": "PASS",
+            "checks": [
+              {
+                "name": "all storm sends acknowledged",
+                "ok": true,
+                "detail": "240/240 errors=[]"
+              },
+              {
+                "name": "acknowledged ids distinct",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "zero RESOURCE_BUSY",
+                "ok": true,
+                "detail": "0/240"
+              }
+            ],
+            "offered": 240,
+            "p50_s": 0.2807919979095459,
+            "p99_s": 0.4601571559906006,
+            "errors": []
+          },
+          "swarm": {
+            "verdict": "FAIL",
+            "checks": [
+              {
+                "name": "register 60 swarm agents",
+                "ok": true,
+                "detail": "60/60"
+              },
+              {
+                "name": "send_message p99 <= 5.0s at 60 agents",
+                "ok": false,
+                "detail": "{'n': 2941, 'p50_s': 2.4003043174743652, 'p99_s': 14.803651809692383, 'max_s': 21.773233890533447}"
+              },
+              {
+                "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+                "ok": false,
+                "detail": "{'n': 830, 'p50_s': 2.0206031799316406, 'p99_s': 30.001502752304077, 'max_s': 30.001704692840576}"
+              },
+              {
+                "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+                "ok": false,
+                "detail": "{'n': 816, 'p50_s': 2.494764566421509, 'p99_s': 30.001529216766357, 'max_s': 30.003270626068115}"
+              },
+              {
+                "name": "zero 30 s dispatch timeouts",
+                "ok": false,
+                "detail": "{'fetch_inbox': 1, 'file_reservation_paths': 26, 'release_file_reservations': 41}"
+              },
+              {
+                "name": "zero tool errors",
+                "ok": false,
+                "detail": "{'send_message': {'RESOURCE_BUSY': 3, 'DATABASE_ERROR': 31}, 'fetch_inbox': {'RESOURCE_BUSY': 1}}"
+              },
+              {
+                "name": "no connection errors outside the SIGKILL window",
+                "ok": true,
+                "detail": "{}"
+              },
+              {
+                "name": "WBQ drained_total advances in every 10s window with queued work",
+                "ok": false,
+                "detail": "samples=[22, 9] unobserved=0 stalled=[{'t': 1791928001, 'drained_total': 519, 'depth_at_open': 26, 'depth_at_close': 182}, {'t': 1791928022, 'drained_total': 687, 'depth_at_open': 81, 'depth_at_close': 123}, {'t': 1791928032, 'drained_total': 687, 'depth_at_open': 123, 'depth_at_close': 271}, {'t': 1791928052, 'drained_total': 920, 'depth_at_open': 188, 'depth_at_close': 296}, {'t': 1791928062, 'd"
+              },
+              {
+                "name": "storage.sqlite3 descriptors bounded (<= 64)",
+                "ok": true,
+                "detail": "max=3"
+              },
+              {
+                "name": "no dispatch zombies",
+                "ok": true,
+                "detail": "max=0"
+              },
+              {
+                "name": "archive converges to DB after the swarm without client reads (<= 60s)",
+                "ok": false,
+                "detail": "archive=2189 db=3660 last=sqlite is ahead of the archive by 1471 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=4, agents=62, messages=2189, db projects=4, agents=62, messages=3660"
+              },
+              {
+                "name": "zero HTTP server restarts and no EMFILE",
+                "ok": true,
+                "detail": "{'markers': [], 'emfile': False}"
+              },
+              {
+                "name": "server exits within 60 s of SIGTERM",
+                "ok": true,
+                "detail": ""
+              },
+              {
+                "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+                "ok": true,
+                "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+              },
+              {
+                "name": "all 2907 acknowledged swarm sends survive SIGKILL",
+                "ok": true,
+                "detail": "lost=[]"
+              }
+            ],
+            "agents": 60,
+            "secs": 480,
+            "agents_registered": 60,
+            "load_secs": 485.3,
+            "kill_at_s": 241.4,
+            "restart_s": 145.47,
+            "acked_sends": 2907,
+            "sends_per_s": 5.99,
+            "tools": {
+              "send_message": {
+                "n": 2941,
+                "timeouts": 0,
+                "tool_errors": {
+                  "RESOURCE_BUSY": 3,
+                  "DATABASE_ERROR": 31
+                },
+                "conn_errors": 0,
+                "kill_window": 2,
+                "p50_s": 2.4003043174743652,
+                "p99_s": 14.803651809692383,
+                "max_s": 21.773233890533447
+              },
+              "fetch_inbox": {
+                "n": 2941,
+                "timeouts": 1,
+                "tool_errors": {
+                  "RESOURCE_BUSY": 1
+                },
+                "conn_errors": 0,
+                "kill_window": 0,
+                "p50_s": 0.09514141082763672,
+                "p99_s": 2.3382856845855713,
+                "max_s": 30.002455234527588
+              },
+              "file_reservation_paths": {
+                "n": 830,
+                "timeouts": 26,
+                "tool_errors": {},
+                "conn_errors": 0,
+                "kill_window": 39,
+                "p50_s": 2.0206031799316406,
+                "p99_s": 30.001502752304077,
+                "max_s": 30.001704692840576
+              },
+              "release_file_reservations": {
+                "n": 816,
+                "timeouts": 41,
+                "tool_errors": {},
+                "conn_errors": 0,
+                "kill_window": 53,
+                "p50_s": 2.494764566421509,
+                "p99_s": 30.001529216766357,
+                "max_s": 30.003270626068115
+              },
+              "acknowledge_message": {
+                "n": 1095,
+                "timeouts": 0,
+                "tool_errors": {},
+                "conn_errors": 0,
+                "kill_window": 0,
+                "p50_s": 0.032607078552246094,
+                "p99_s": 2.42583966255188,
+                "max_s": 11.144503355026245
+              },
+              "search_messages": {
+                "n": 286,
+                "timeouts": 0,
+                "tool_errors": {},
+                "conn_errors": 0,
+                "kill_window": 8,
+                "p50_s": 0.7005746364593506,
+                "p99_s": 12.540860176086426,
+                "max_s": 13.956906080245972
+              }
+            },
+            "sqlite_fds_max": 3,
+            "zombies_max": 0,
+            "wbq_samples": [
+              22,
+              9
+            ],
+            "stalled_windows": 20
+          }
+        },
+        "binary_version": "am 0.3.39",
+        "server_exe_sha256": "aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805",
+        "server_nofile_soft_hard": [
+          "65535",
+          "65535"
+        ],
+        "server_threads_start": 25,
+        "clean_shutdown": true,
+        "server_log_walfec_lines": 3,
+        "loadavg_end": [
+          "5.34",
+          "15.08",
+          "20.53"
+        ],
+        "verdict": "FAIL"
+      }
+    }
+  ],
+  "cgroup_io_max": "259:0 rbps=max wbps=2000000 riops=max wiops=200"
+}
