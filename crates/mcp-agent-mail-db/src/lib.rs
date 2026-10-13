@@ -56,6 +56,7 @@ pub mod mail_explorer;
 pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;
+pub mod never_written_pages;
 pub mod pool;
 pub mod project_mailbox;
 pub mod queries;

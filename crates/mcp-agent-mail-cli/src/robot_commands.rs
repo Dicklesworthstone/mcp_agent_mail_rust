@@ -8075,6 +8075,19 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
         )
     };
 
+    // GH#291: an accepted full check can still carry proven never-written
+    // orphan pages. Say so; it is leaked space, not a failed probe.
+    let detail = if metrics.never_written_orphan_pages > 0
+        && !(full_check_failed || last_check_failed || runtime_failures_without_checks)
+    {
+        format!(
+            "{detail}; {} never-written orphan page(s) (leaked space, not data damage)",
+            metrics.never_written_orphan_pages
+        )
+    } else {
+        detail
+    };
+
     (
         HealthProbe {
             name: "integrity".into(),
@@ -19734,6 +19747,34 @@ mod tests {
         );
     }
 
+    /// GH#291: proven never-written orphan pages are named on a passing
+    /// probe and do not turn it into a warning.
+    #[test]
+    fn summarize_integrity_probe_names_never_written_orphan_pages() {
+        let metrics = mcp_agent_mail_db::IntegrityMetrics {
+            last_ok_ts: 2_000,
+            last_check_ts: 2_000,
+            last_full_check_ts: 2_000,
+            last_check_kind: Some(mcp_agent_mail_db::CheckKind::Full),
+            last_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+            checks_total: 5,
+            failures_total: 5,
+            failures_since_last_ok: 0,
+            never_written_orphan_pages: 425,
+        };
+        let (probe, ok) = summarize_integrity_probe(&metrics);
+        assert!(ok);
+        assert_eq!(probe.status, "ok");
+        assert!(
+            probe
+                .detail
+                .contains("425 never-written orphan page(s) (leaked space, not data damage)"),
+            "{}",
+            probe.detail
+        );
+    }
+
     #[test]
     fn summarize_integrity_probe_uses_latest_check_not_cumulative_failures() {
         let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
@@ -19746,6 +19787,7 @@ mod tests {
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 1,
+            never_written_orphan_pages: 0,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -19761,6 +19803,7 @@ mod tests {
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         });
         assert!(ok);
         assert_eq!(probe.status, "ok");
@@ -19779,6 +19822,7 @@ mod tests {
             checks_total: 0,
             failures_total: 1,
             failures_since_last_ok: 1,
+            never_written_orphan_pages: 0,
         });
         assert!(!ok);
         assert_eq!(probe.status, "warn");
@@ -19794,6 +19838,7 @@ mod tests {
             checks_total: 5,
             failures_total: 2,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         });
         assert!(
             !ok,

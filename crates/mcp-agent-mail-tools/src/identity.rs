@@ -1070,6 +1070,18 @@ fn integrity_health_verdict(
             true,
             "full integrity_check evidence changed while the current probe outcome was unavailable",
         ),
+        // GH#291: the full check is accepted, but the mailbox carries pages
+        // nothing references and nothing ever wrote. Advisory, not critical.
+        Passed if metrics.never_written_orphan_pages > 0 => HealthVerdict::new(
+            Yellow,
+            false,
+            format!(
+                "full integrity_check passed at {}; {} never-written orphan page(s) are leaked \
+                 space, not data damage (each is proven zero-filled and unreferenced); a \
+                 VACUUM-class rewrite reclaims them",
+                metrics.last_full_check_ts, metrics.never_written_orphan_pages
+            ),
+        ),
         Passed => HealthVerdict::new(
             Green,
             true,
@@ -3915,6 +3927,7 @@ mod tests {
             checks_total: 1,
             failures_total: 0,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         }
     }
 
@@ -4127,6 +4140,26 @@ mod tests {
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Full);
         let repaired = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(repaired.status, "green");
+    }
+
+    /// GH#291: an accepted full check that carries proven never-written
+    /// orphan pages is an advisory, never a critical verdict.
+    #[test]
+    fn never_written_orphan_pages_are_a_non_critical_yellow_advisory() {
+        let mut metrics = healthy_integrity_metrics();
+        metrics.never_written_orphan_pages = 425;
+
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
+        assert_eq!(verdict.status, "yellow");
+        assert!(!verdict.critical, "leaked space must not gate the roll-up");
+        assert!(verdict.detail.contains("425 never-written orphan page(s)"));
+        assert!(verdict.detail.contains("not data damage"));
+
+        // A failed full check outranks the advisory.
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        let failed = integrity_health_verdict(&Config::default(), &metrics, 0);
+        assert_eq!(failed.status, "red");
+        assert!(failed.critical);
     }
 
     #[test]

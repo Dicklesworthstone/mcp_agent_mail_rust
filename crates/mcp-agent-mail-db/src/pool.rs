@@ -5,6 +5,7 @@
 use crate::DbConn;
 use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
+use crate::never_written_pages::{self, NeverWrittenOrphanPages};
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::schema;
 use asupersync::{Cx, Outcome};
@@ -4415,18 +4416,21 @@ impl DbPool {
         phase: &str,
     ) -> DbResult<integrity::IntegrityCheckResult> {
         self.validated_sqlite_path("quick integrity canonical fallback")?;
-        reconcile_with_canonical(
+        let proven_orphans = RefCell::new(None);
+        reconcile_with_canonical_proving_orphans(
             integrity::quick_check(conn),
             integrity::CheckKind::Quick,
             phase,
             &self.sqlite_path,
             || {
-                sqlite_canonical_file_check_is_ok(
+                sqlite_canonical_file_check_proving_orphans(
                     Path::new(&self.sqlite_path),
                     integrity::CheckKind::Quick,
+                    &proven_orphans,
                 )
             },
             || canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, phase),
+            |primary_details| proven_orphans_explaining_primary(&proven_orphans, primary_details),
         )
     }
 
@@ -4509,18 +4513,21 @@ impl DbPool {
         let conn = crate::guard_db_conn(raw_conn, "full integrity check connection");
         self.validated_sqlite_path("full integrity canonical fallback")?;
 
-        reconcile_with_canonical(
+        let proven_orphans = RefCell::new(None);
+        reconcile_with_canonical_proving_orphans(
             integrity::full_check(&conn),
             integrity::CheckKind::Full,
             "full-cycle",
             &self.sqlite_path,
             || {
-                sqlite_canonical_file_check_is_ok(
+                sqlite_canonical_file_check_proving_orphans(
                     Path::new(&self.sqlite_path),
                     integrity::CheckKind::Full,
+                    &proven_orphans,
                 )
             },
             || canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, "full-cycle"),
+            |primary_details| proven_orphans_explaining_primary(&proven_orphans, primary_details),
         )
     }
 
@@ -5095,7 +5102,9 @@ impl DbPool {
         // Verify the live DB is fully clean before trusting it as a snapshot.
         let verdict =
             crate::integrity::inspect_mailbox_integrity(primary, crate::integrity::CheckKind::Full);
-        if verdict.status != crate::integrity::MailboxIntegrityStatus::Healthy {
+        if verdict.status != crate::integrity::MailboxIntegrityStatus::Healthy
+            && !live_verdict_is_proven_never_written_orphans(primary, &verdict)
+        {
             db.snapshot_verify_failures_total.inc();
             tracing::debug!(
                 path = %self.sqlite_path,
@@ -8206,9 +8215,25 @@ fn with_canonical_diagnostic_conn_raw<T>(
     context: &str,
     probe: impl FnOnce(&crate::CanonicalDbConn) -> Result<T, SqlError>,
 ) -> Result<(T, bool), SqlError> {
+    with_canonical_diagnostic_conn_inspecting(path, context, |conn, _private_copy| probe(conn))
+}
+
+/// [`with_canonical_diagnostic_conn_raw`] for a probe that also reads bytes.
+///
+/// The probe additionally receives the main file of the private staged copy
+/// when the diagnostic runs on one. That copy belongs to this call, so the
+/// probe may read its files with ordinary descriptors. It receives `None`
+/// for a direct open of the live family, whose files must never be opened
+/// that way (closing such a descriptor drops this process's POSIX locks).
+#[allow(clippy::result_large_err)]
+fn with_canonical_diagnostic_conn_inspecting<T>(
+    path: &Path,
+    context: &str,
+    probe: impl FnOnce(&crate::CanonicalDbConn, Option<&Path>) -> Result<T, SqlError>,
+) -> Result<(T, bool), SqlError> {
     if !sqlite_family_carries_franken_namespace(path) {
         let conn = open_guarded_read_only_canonical_sqlite_file(path, context)?;
-        return probe(&conn).map(|value| (value, false));
+        return probe(&conn, None).map(|value| (value, false));
     }
     let staged = stage_sqlite_family_for_health_probe(path)?.ok_or_else(|| {
         SqlError::Custom(format!(
@@ -8218,7 +8243,7 @@ fn with_canonical_diagnostic_conn_raw<T>(
     })?;
     let conn = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(staged.path())?)?;
     conn.execute_raw("PRAGMA query_only = ON;")?;
-    probe(&conn).map(|value| (value, true))
+    probe(&conn, Some(staged.path())).map(|value| (value, true))
 }
 
 /// Boolean canonical verdict on the family at `path`.
@@ -8233,7 +8258,20 @@ fn with_canonical_diagnostic_conn(
     context: &str,
     probe: impl FnOnce(&crate::CanonicalDbConn) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
-    match with_canonical_diagnostic_conn_raw(path, context, probe)? {
+    let (verdict, staged) = with_canonical_diagnostic_conn_raw(path, context, probe)?;
+    canonical_boolean_verdict(path, context, verdict, staged)
+}
+
+/// Fold a canonical probe's verdict with where it ran (see
+/// [`with_canonical_diagnostic_conn`]).
+#[allow(clippy::result_large_err)]
+fn canonical_boolean_verdict(
+    path: &Path,
+    context: &str,
+    verdict: bool,
+    staged: bool,
+) -> Result<bool, SqlError> {
+    match (verdict, staged) {
         // A direct open (no namespace authority) is authoritative either way.
         (verdict, false) => Ok(verdict),
         (true, true) => Ok(true),
@@ -8244,6 +8282,148 @@ fn with_canonical_diagnostic_conn(
             path.display()
         ))),
     }
+}
+
+/// Canonical second opinion for the live-mailbox reconcile, with one more
+/// accepted class than [`sqlite_canonical_file_check_is_ok`]: never-written
+/// orphan pages (GH#291).
+///
+/// When canonical SQLite complains about unused pages and about nothing else,
+/// the complaint is checked against the bytes: every reported page must be
+/// zero-filled in a private copy's main file and in every WAL frame that names
+/// it ([`never_written_pages::prove_pages_never_written`]). A proven set is
+/// accepted at any size and recorded in `proven_orphans`, so the caller can
+/// tell this acceptance from a clean `ok` and match it against the primary
+/// engine's complaint. Unproven unused pages keep the GH#247 row-count rule,
+/// so stranded b-tree content (which shares the same rows) is still rejected.
+#[allow(clippy::result_large_err)]
+fn sqlite_canonical_file_check_proving_orphans(
+    path: &Path,
+    kind: integrity::CheckKind,
+    proven_orphans: &RefCell<Option<NeverWrittenOrphanPages>>,
+) -> Result<bool, SqlError> {
+    const CONTEXT: &str = "canonical SQLite integrity diagnostic";
+    let (verdict, staged) =
+        with_canonical_diagnostic_conn_inspecting(path, CONTEXT, |conn, private_copy| {
+            let details = sqlite_pragma_check_details_canonical(conn, kind)?;
+            if integrity::details_indicate_ok(&details) {
+                return Ok(true);
+            }
+            if let Some(pages) = never_written_pages::never_used_page_numbers(&details) {
+                let proof = match private_copy {
+                    Some(copy) => never_written_pages::prove_pages_never_written(copy, &pages)
+                        .map_err(|refusal| refusal.to_string()),
+                    None => prove_never_written_on_private_copy(path, kind, &pages),
+                };
+                match proof {
+                    Ok(orphans) => {
+                        proven_orphans.replace(Some(orphans));
+                        return Ok(true);
+                    }
+                    Err(refusal) => {
+                        // Same dedup as the standing-defect warn (GH#288).
+                        let standing = format!("never-written proof refused: {refusal}");
+                        if both_rejected_should_warn(&path.to_string_lossy(), &standing).is_some() {
+                            tracing::warn!(
+                                path = %path.display(),
+                                check = %kind,
+                                never_used_rows = pages.len(),
+                                refusal = %refusal,
+                                "canonical SQLite reported only never-used pages, but they \
+                                 could not be proven never written; applying the row-count \
+                                 rule (GH#247)"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(integrity::integrity_details_are_suspect(&details)
+                || canonical_details_are_collated_index_disagreement(conn, &details))
+        })?;
+    canonical_boolean_verdict(path, CONTEXT, verdict, staged)
+}
+
+/// Prove never-used pages of a family that was inspected through a direct
+/// open.
+///
+/// The proof reads files with ordinary descriptors, which must never touch
+/// the inspected family itself. It therefore runs on a private staged copy:
+/// canonical SQLite must report exactly the same page set on that copy, and
+/// the copy's bytes are what the proof reads.
+fn prove_never_written_on_private_copy(
+    path: &Path,
+    kind: integrity::CheckKind,
+    pages: &[u32],
+) -> Result<NeverWrittenOrphanPages, String> {
+    let staged = stage_sqlite_family_for_health_probe(path)
+        .map_err(|error| format!("a private copy could not be staged: {error}"))?
+        .ok_or_else(|| "a private copy could not be staged".to_string())?;
+    let staged_path = sqlite_path_as_utf8(staged.path()).map_err(|error| error.to_string())?;
+    let conn = crate::CanonicalDbConn::open_file(staged_path)
+        .map_err(|error| format!("the private copy could not be opened: {error}"))?;
+    conn.execute_raw("PRAGMA query_only = ON;")
+        .map_err(|error| error.to_string())?;
+    let details =
+        sqlite_pragma_check_details_canonical(&conn, kind).map_err(|error| error.to_string())?;
+    if never_written_pages::never_used_page_numbers(&details).as_deref() != Some(pages) {
+        return Err("the private copy does not report the same never-used page set".to_string());
+    }
+    never_written_pages::prove_pages_never_written(staged.path(), pages)
+        .map_err(|refusal| refusal.to_string())
+}
+
+/// GH#291: whether a non-healthy live full-check verdict is fully accounted
+/// for by proven never-written orphan pages.
+///
+/// [`DbPool::create_verified_snapshot`] re-runs the primary engine's full
+/// check, which reports the leak again. The snapshot itself is a `VACUUM INTO`
+/// export, which carries no unreferenced pages, so a mailbox whose only finding
+/// is this proven class can still be recorded as last-known-healthy. The raw
+/// check has just stored a failed full-check outcome; an explained verdict
+/// brings it back in line with the reconciled one, or the guard would treat
+/// its own accepted mailbox as failed again on the next cycle.
+fn live_verdict_is_proven_never_written_orphans(
+    primary: &Path,
+    verdict: &integrity::MailboxIntegrityVerdict,
+) -> bool {
+    let Some(check) = verdict.check.as_ref() else {
+        return false;
+    };
+    let proven_orphans = RefCell::new(None);
+    if !matches!(
+        sqlite_canonical_file_check_proving_orphans(
+            primary,
+            integrity::CheckKind::Full,
+            &proven_orphans,
+        ),
+        Ok(true)
+    ) {
+        return false;
+    }
+    let Some(orphans) = proven_orphans_explaining_primary(&proven_orphans, &check.details) else {
+        return false;
+    };
+    integrity::record_reconciled_acceptance(
+        integrity::CheckKind::Full,
+        u64::try_from(orphans.page_count()).unwrap_or(u64::MAX),
+    );
+    true
+}
+
+/// The proven orphan set, when it accounts for the primary engine's complaint.
+///
+/// `Some` only when the canonical second opinion accepted the file through the
+/// never-written class and every verdict-carrying row of the primary engine is
+/// a never-used complaint about a page of that proven set. A primary complaint
+/// of any other kind, or about any other page, is not explained by the proof
+/// and keeps the primary verdict.
+fn proven_orphans_explaining_primary(
+    proven_orphans: &RefCell<Option<NeverWrittenOrphanPages>>,
+    primary_details: &[String],
+) -> Option<NeverWrittenOrphanPages> {
+    let orphans = proven_orphans.take()?;
+    let primary_pages = never_written_pages::never_used_page_numbers(primary_details)?;
+    orphans.contains_all(&primary_pages).then_some(orphans)
 }
 
 /// The index name a primary-probe integrity complaint refers to.
@@ -8651,6 +8831,9 @@ fn both_rejected_should_warn(path_for_log: &str, message: &str) -> Option<u64> {
     verdict
 }
 
+/// [`reconcile_with_canonical_proving_orphans`] without the never-written
+/// orphan class: no primary complaint is ever explained by a proof.
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
 fn reconcile_with_canonical(
     primary: DbResult<integrity::IntegrityCheckResult>,
@@ -8659,6 +8842,33 @@ fn reconcile_with_canonical(
     path_for_log: &str,
     canonical_probe: impl FnOnce() -> Result<bool, SqlError>,
     canonical_mailbox_is_schema_only: impl FnOnce() -> bool,
+) -> DbResult<integrity::IntegrityCheckResult> {
+    reconcile_with_canonical_proving_orphans(
+        primary,
+        kind,
+        phase,
+        path_for_log,
+        canonical_probe,
+        canonical_mailbox_is_schema_only,
+        |_primary_details| None,
+    )
+}
+
+/// Reconcile a primary integrity verdict against the canonical second opinion.
+///
+/// `proven_orphans_for_primary` is consulted only after `canonical_probe`
+/// accepted the file. It receives the primary engine's detail rows and returns
+/// the proven never-written orphan pages when they account for every one of
+/// those rows (see [`proven_orphans_explaining_primary`]).
+#[allow(clippy::result_large_err)]
+fn reconcile_with_canonical_proving_orphans(
+    primary: DbResult<integrity::IntegrityCheckResult>,
+    kind: integrity::CheckKind,
+    phase: &str,
+    path_for_log: &str,
+    canonical_probe: impl FnOnce() -> Result<bool, SqlError>,
+    canonical_mailbox_is_schema_only: impl FnOnce() -> bool,
+    proven_orphans_for_primary: impl FnOnce(&[String]) -> Option<NeverWrittenOrphanPages>,
 ) -> DbResult<integrity::IntegrityCheckResult> {
     match primary {
         Ok(res) => Ok(res),
@@ -8684,6 +8894,53 @@ fn reconcile_with_canonical(
                     });
                 let schema_only_mailbox =
                     !nocase_false_positive && canonical_mailbox_is_schema_only();
+                // GH#291: a third accepted class. The primary engine complains
+                // only about unused pages, and the canonical second opinion
+                // proved those pages never written (zero-filled in the main
+                // file and in the WAL). That is leaked space, not damage: every
+                // b-tree and index passed canonical's full walk. Stranded
+                // content (GH#247) shares the row text but fails the proof.
+                let never_written_orphans = if nocase_false_positive || schema_only_mailbox {
+                    None
+                } else {
+                    proven_orphans_for_primary(&details)
+                };
+                if let Some(orphans) = never_written_orphans {
+                    let finding = orphans.describe();
+                    // Standing finding: WARN on the transition and at the
+                    // re-warn cadence, debug in between (GH#288).
+                    if let Some(observations) = both_rejected_should_warn(path_for_log, &finding) {
+                        tracing::warn!(
+                            phase,
+                            path = %path_for_log,
+                            check = %kind,
+                            primary_error = %message,
+                            observations,
+                            "integrity probe reported unused pages; canonical SQLite found no \
+                             other defect and every reported page is proven never written \
+                             ({finding}). This is leaked space, not data damage: the check \
+                             passes and a VACUUM-class rewrite reclaims the pages (GH#291)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            phase,
+                            path = %path_for_log,
+                            check = %kind,
+                            "integrity probe reported the same proven never-written orphan \
+                             pages ({finding}); suppressed repeat warn"
+                        );
+                    }
+                    integrity::record_reconciled_acceptance(
+                        kind,
+                        u64::try_from(orphans.page_count()).unwrap_or(u64::MAX),
+                    );
+                    return Ok(integrity::IntegrityCheckResult {
+                        ok: true,
+                        details: vec![format!("ok (canonical fallback: {finding})")],
+                        duration_us: 0,
+                        kind,
+                    });
+                }
                 if !primary_canonical_disagreement_is_safe_for_schema_only_mailbox(
                     nocase_false_positive,
                     schema_only_mailbox,
@@ -8720,6 +8977,10 @@ fn reconcile_with_canonical(
                         "integrity probe rejected a schema-only mailbox but canonical SQLite accepted it; treating as healthy"
                     );
                 }
+                // The stored outcome follows the reconciled verdict, or the
+                // guard's sticky full-check gate and the health surface keep
+                // refusing a file this function has just accepted.
+                integrity::record_reconciled_acceptance(kind, 0);
                 Ok(integrity::IntegrityCheckResult {
                     ok: true,
                     details: vec!["ok (canonical fallback)".to_string()],
@@ -26175,6 +26436,339 @@ mod tests {
             "precondition: primary-built fixture is primary-ok: {details:?}"
         );
         crate::close_db_conn(conn, "nocase fixture");
+    }
+
+    /// The primary engine's complaint about one never-used page, as it reaches
+    /// [`reconcile_with_canonical_proving_orphans`].
+    fn primary_never_used_complaint(page: u32) -> DbResult<integrity::IntegrityCheckResult> {
+        let row = format!("database disk image is malformed: page {page} is never used");
+        Err(DbError::IntegrityCorruption {
+            message: format!("integrity_check detected corruption (5621us): {row}"),
+            details: vec![row],
+        })
+    }
+
+    /// Run the live-mailbox reconcile with the REAL canonical second opinion.
+    fn reconcile_proving_orphans(
+        path: &Path,
+        primary: DbResult<integrity::IntegrityCheckResult>,
+    ) -> DbResult<integrity::IntegrityCheckResult> {
+        let proven_orphans = RefCell::new(None);
+        reconcile_with_canonical_proving_orphans(
+            primary,
+            integrity::CheckKind::Full,
+            "gh291",
+            sqlite_path_as_utf8(path).unwrap(),
+            || {
+                sqlite_canonical_file_check_proving_orphans(
+                    path,
+                    integrity::CheckKind::Full,
+                    &proven_orphans,
+                )
+            },
+            || false,
+            |primary_details| proven_orphans_explaining_primary(&proven_orphans, primary_details),
+        )
+    }
+
+    /// GH#291: the live defect. A block of 425 pages that nothing references
+    /// and nothing ever wrote kept the integrity guard red for good: the
+    /// row-count rule (GH#247) refused 425 `never used` rows, so backups and
+    /// archive reconciliation stayed suspended although every row was intact.
+    /// The canonical second opinion now proves the pages never written and the
+    /// reconcile accepts the primary engine's complaint about them.
+    #[test]
+    fn never_written_orphan_pages_pass_the_reconcile_at_the_live_magnitude() {
+        use never_written_pages::fixtures::{append_never_written_pages, seed_db};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leak.sqlite3");
+        seed_db(&path);
+        let (first, last) = append_never_written_pages(&path, 425);
+
+        assert!(
+            !sqlite_canonical_file_check_is_ok(&path, integrity::CheckKind::Full)
+                .expect("row-count probe"),
+            "precondition: 425 never-used rows exceed the row-count rule"
+        );
+
+        let proven_orphans = RefCell::new(None);
+        assert!(
+            sqlite_canonical_file_check_proving_orphans(
+                &path,
+                integrity::CheckKind::Full,
+                &proven_orphans,
+            )
+            .expect("proving probe"),
+            "proven never-written pages are accepted at any count"
+        );
+        let proven = proven_orphans.take().expect("the proven set is recorded");
+        assert_eq!(proven.page_count(), 425);
+        assert_eq!(proven.runs(), vec![(first, last)]);
+
+        let out = reconcile_proving_orphans(&path, primary_never_used_complaint(first))
+            .expect("a complaint about a proven page is accepted");
+        assert!(out.ok);
+        assert!(
+            out.details[0].contains("425 never-written orphan page(s)"),
+            "the standing finding is named in the result: {:?}",
+            out.details
+        );
+
+        // The proof explains complaints about proven pages and nothing else.
+        let err = reconcile_proving_orphans(&path, primary_never_used_complaint(first - 1))
+            .expect_err("a never-used complaint about an unproven page keeps the verdict");
+        assert!(matches!(err, DbError::IntegrityCorruption { .. }));
+        let other_class = Err(DbError::IntegrityCorruption {
+            message: "integrity_check detected corruption: btreeInitPage() returns error code 11"
+                .to_string(),
+            details: vec!["btreeInitPage() returns error code 11".to_string()],
+        });
+        let err = reconcile_proving_orphans(&path, other_class)
+            .expect_err("a structural complaint is not explained by proven orphans");
+        assert!(matches!(err, DbError::IntegrityCorruption { .. }));
+    }
+
+    /// Let the primary engine run its one-time first-open pass on `path`.
+    ///
+    /// FrankenSQLite heals orphan pages once, on the first open of a database
+    /// it has not stamped yet. The live defect is a mailbox that was stamped
+    /// long ago and acquired the pages afterwards, so a fixture must be stamped
+    /// before the leak is introduced, or the engine simply repairs it.
+    fn stamp_primary_first_open(path: &Path) {
+        let conn = DbConn::open_file(sqlite_path_as_utf8(path).unwrap()).expect("first open");
+        conn.query_sync("SELECT 1", &[]).expect("first-open probe");
+        crate::close_db_conn(conn, "gh291 first open");
+        // Fold anything the engine left in the WAL back into the main file, so
+        // the main file alone is the whole database again.
+        let canonical = crate::CanonicalDbConn::open_file(sqlite_path_as_utf8(path).unwrap())
+            .expect("canonical reopen");
+        canonical
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint after first open");
+    }
+
+    /// GH#291 on the real engines: the primary engine's own full check of the
+    /// leaking file, reconciled through the real canonical proof.
+    #[test]
+    fn primary_engine_complaint_about_never_written_pages_is_reconciled() {
+        use never_written_pages::fixtures::{append_never_written_pages, seed_db};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leak-primary.sqlite3");
+        seed_db(&path);
+        stamp_primary_first_open(&path);
+        let (first, last) = append_never_written_pages(&path, 425);
+        let canonical_view = with_canonical_diagnostic_conn_raw(&path, "gh291 raw", |conn| {
+            sqlite_pragma_check_details_canonical(conn, integrity::CheckKind::Full)
+        })
+        .expect("canonical raw details")
+        .0;
+        assert_eq!(
+            never_written_pages::never_used_page_numbers(&canonical_view),
+            Some((first..=last).collect::<Vec<u32>>()),
+            "precondition: canonical SQLite sees exactly the appended block: {}",
+            integrity::first_detail_rows(&canonical_view, 3)
+        );
+
+        let conn = DbConn::open_file(sqlite_path_as_utf8(&path).unwrap()).expect("primary open");
+        let primary = integrity::full_check(&conn);
+        let primary_details = match &primary {
+            Err(DbError::IntegrityCorruption { details, .. }) => details.clone(),
+            other => panic!("the primary engine must report the unused pages: {other:?}"),
+        };
+        let primary_pages = never_written_pages::never_used_page_numbers(&primary_details)
+            .unwrap_or_else(|| {
+                panic!("the primary engine must report never-used rows only: {primary_details:?}")
+            });
+        assert!(
+            primary_pages
+                .iter()
+                .all(|page| (first..=last).contains(page)),
+            "the primary engine names pages of the appended block: {primary_pages:?}"
+        );
+
+        crate::close_db_conn(conn, "gh291 primary fixture");
+
+        let proven_orphans = RefCell::new(None);
+        let accepted = sqlite_canonical_file_check_proving_orphans(
+            &path,
+            integrity::CheckKind::Full,
+            &proven_orphans,
+        )
+        .unwrap_or_else(|error| panic!("the canonical second opinion must run: {error}"));
+        assert!(
+            accepted,
+            "the proven class is accepted on the stamped family"
+        );
+        assert!(
+            proven_orphans
+                .take()
+                .is_some_and(|proven| proven.contains_all(&primary_pages)),
+            "the proof covers every page the primary engine named: {primary_pages:?}"
+        );
+
+        let out = reconcile_proving_orphans(&path, primary)
+            .expect("the primary engine's complaint is explained by the proof");
+        assert!(out.ok);
+    }
+
+    /// GH#291 end to end on a real mailbox: a pool over a mailbox that carries
+    /// 425 never-written orphan pages passes the guard's reconciled full check
+    /// and still produces a verified snapshot, whose backup has no such pages.
+    #[test]
+    fn leaking_mailbox_passes_the_full_check_and_still_gets_a_verified_snapshot() {
+        use never_written_pages::fixtures::append_never_written_pages;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("leaking-mailbox.sqlite3");
+        let canonical = crate::CanonicalDbConn::open_file(db_path.to_str().unwrap())
+            .expect("open canonical fixture");
+        // A served mailbox is in WAL mode. That matters here: while a
+        // connection of this process holds the family, the second opinion
+        // stages its private copy through the engine's shared descriptors,
+        // which needs the family's `-shm`.
+        canonical
+            .query_sync("PRAGMA journal_mode = WAL;", &[])
+            .expect("WAL mode");
+        canonical
+            .execute_raw(&crate::schema::init_schema_sql_base())
+            .expect("initialize mailbox schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                     VALUES (1, 'leak-project', '/leak-project', 1);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, task_description,
+                      inception_ts, last_active_ts, attachments_policy, contact_policy,
+                      reaper_exempt, registration_token)
+                     VALUES
+                     (1, 1, 'BlueLake', 'codex-cli', 'test', '', 1, 1,
+                      'auto', 'auto', 0, NULL);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, importance,
+                      ack_required, created_ts, recipients_json, attachments)
+                     VALUES
+                     (1, 1, 1, 'kept', 'every row stays readable', 'normal', 0, 1, '{}', '[]');",
+            )
+            .expect("seed mailbox rows");
+        canonical
+            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+            .expect("checkpoint fixture");
+        drop(canonical);
+        stamp_primary_first_open(&db_path);
+        let (first, last) = append_never_written_pages(&db_path, 425);
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .expect("open pool");
+
+        let full = pool.run_full_integrity_check().unwrap_or_else(|error| {
+            let proven_orphans = RefCell::new(None);
+            let probe = sqlite_canonical_file_check_proving_orphans(
+                &db_path,
+                integrity::CheckKind::Full,
+                &proven_orphans,
+            );
+            let family: Vec<String> = [
+                "",
+                "-wal",
+                "-shm",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+            ]
+            .iter()
+            .map(|suffix| {
+                let present = sqlite_sidecar_path(&db_path, suffix).exists();
+                format!("{suffix:?}={present}")
+            })
+            .collect();
+            panic!(
+                "the leaking mailbox must pass the reconciled full check: {error}; \
+                 canonical probe after the check: {probe:?}; family: {family:?}"
+            )
+        });
+        assert!(full.ok);
+        // Either the acceptance rests on the proven class, or the engine got
+        // rid of the pages while opening the mailbox and the file is clean.
+        // A pass that is neither would mean the leak was waved through.
+        let accepted_as_proven_orphans = full
+            .details
+            .iter()
+            .any(|detail| detail.contains("425 never-written orphan page(s)"));
+        if !accepted_as_proven_orphans {
+            let live = with_canonical_diagnostic_conn_raw(&db_path, "gh291 live", |conn| {
+                sqlite_pragma_check_details_canonical(conn, integrity::CheckKind::Full)
+            })
+            .expect("canonical check of the live mailbox")
+            .0;
+            assert!(
+                integrity::details_indicate_ok(&live),
+                "the full check passed without the proven class (pages {first}-{last}) on a \
+                 mailbox canonical SQLite still faults: primary {:?}, canonical {}",
+                full.details,
+                integrity::first_detail_rows(&live, 3)
+            );
+        }
+
+        let verified = pool
+            .create_verified_snapshot()
+            .expect("create verified snapshot")
+            .expect("a mailbox whose only finding is proven leaked space is snapshotted");
+        assert_eq!(verified.row_counts.get("messages"), Some(&1));
+
+        let backup = crate::snapshot::snapshot_bak_path(&db_path);
+        let backup_details = with_canonical_diagnostic_conn_raw(&backup, "gh291 backup", |conn| {
+            sqlite_pragma_check_details_canonical(conn, integrity::CheckKind::Full)
+        })
+        .expect("canonical check of the backup")
+        .0;
+        assert!(
+            integrity::details_indicate_ok(&backup_details),
+            "the backup is a rewrite and carries no orphan pages: {backup_details:?}"
+        );
+    }
+
+    /// GH#247 stays closed: stranded b-tree pages produce the very same
+    /// `never used` rows at the same magnitude, hold content, and are refused
+    /// by the proof, so the row-count rule still rejects the file.
+    #[test]
+    fn stranded_btree_pages_still_fail_the_reconcile_at_the_same_magnitude() {
+        use never_written_pages::fixtures::{seed_db, strand_populated_table};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stranded.sqlite3");
+        seed_db(&path);
+        strand_populated_table(&path);
+
+        let stranded = with_canonical_diagnostic_conn_raw(&path, "gh247 raw", |conn| {
+            sqlite_pragma_check_details_canonical(conn, integrity::CheckKind::Full)
+        })
+        .expect("canonical raw details")
+        .0;
+        let pages = never_written_pages::never_used_page_numbers(&stranded)
+            .unwrap_or_else(|| panic!("only never-used rows expected: {stranded:?}"));
+        assert!(pages.len() >= 425, "fixture magnitude: {}", pages.len());
+
+        let proven_orphans = RefCell::new(None);
+        assert!(
+            !sqlite_canonical_file_check_proving_orphans(
+                &path,
+                integrity::CheckKind::Full,
+                &proven_orphans,
+            )
+            .expect("proving probe"),
+            "stranded content must not be accepted as never-written pages"
+        );
+        assert!(proven_orphans.take().is_none());
+
+        let err = reconcile_proving_orphans(&path, primary_never_used_complaint(pages[0]))
+            .expect_err("page loss keeps the primary corruption verdict");
+        assert!(matches!(err, DbError::IntegrityCorruption { .. }));
     }
 
     /// GH#293: a canonical-written NOCASE index is healthy.
