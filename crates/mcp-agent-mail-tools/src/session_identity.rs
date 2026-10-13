@@ -24,7 +24,9 @@
 //!   registration token. `register_agent` of
 //!   another existing agent is refused too, so its profile and token are not
 //!   rewritten. A session that holds no identity in the project keeps the
-//!   trusted-local behavior.
+//!   trusted-local behavior, unless its last binding there was evicted by the
+//!   session's capacity limit. Automatic eviction withdraws proof, never the
+//!   project's identity restriction.
 //! - **Contact actors.** Requests act as the requester; approvals and blocks
 //!   act as the recipient. An auto-accepting handshake preflights both actors
 //!   before creating or refreshing a link. A bound session must explicitly
@@ -34,6 +36,10 @@
 //!   letting it expire or restarting the server ends them; message history is
 //!   untouched. Retiring or deregistering an agent drops it from the calling
 //!   session.
+//! - **Capacity.** Keep at most 32 bindings and 32 evicted-project restrictions.
+//!   If eviction history exceeds that bound, disable trusted-local fallback
+//!   for the session instead of forgetting restrictions. Held identities and
+//!   verified registration tokens still work; a fresh session resets history.
 //!
 //! This is application identity context inside an already-authorized
 //! connection. It does not authenticate the model, the provider or the OS
@@ -47,11 +53,13 @@ use serde_json::json;
 
 use crate::tool_util::legacy_tool_error;
 
-/// Session-state key holding this session's bindings.
-const SESSION_IDENTITY_STATE_KEY: &str = "mcp_agent_mail.session_identity.v1";
+/// One atomic session-state value holds both proofs and eviction restrictions.
+/// This state is process-local: server restart already ends every session.
+const SESSION_IDENTITY_STATE_KEY: &str = "mcp_agent_mail.session_identity.v2";
 
 /// Most identities one session may hold; the oldest binding is dropped first.
 const MAX_SESSION_BINDINGS: usize = 32;
+const MAX_EVICTED_PROJECTS: usize = 32;
 
 // FastMCP locks individual get/set operations, but exposes no atomic update.
 // Serialize this key's two writers across their bounded read/modify/write;
@@ -69,20 +77,74 @@ pub struct SessionBinding {
     pub bound_at_us: i64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct SessionIdentityState {
+    held: Vec<SessionBinding>,
+    // Only projects whose final proof was automatically evicted need a marker.
+    // Explicit unbind keeps its existing semantics, but cannot erase a marker.
+    evicted_projects: Vec<i64>,
+    eviction_history_saturated: bool,
+}
+
+impl SessionIdentityState {
+    fn restrict_evicted_project(&mut self, project_id: i64) {
+        if self.eviction_history_saturated || self.evicted_projects.contains(&project_id) {
+            return;
+        }
+        if self.evicted_projects.len() >= MAX_EVICTED_PROJECTS {
+            // Finite memory must not turn an old constrained project into an
+            // unconstrained one. This bit is monotonic for the session lifetime.
+            self.eviction_history_saturated = true;
+            self.evicted_projects.clear();
+        } else {
+            self.evicted_projects.push(project_id);
+        }
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self.held.len() > MAX_SESSION_BINDINGS {
+            let evicted = self.held.remove(0);
+            if !self
+                .held
+                .iter()
+                .any(|binding| binding.project_id == evicted.project_id)
+            {
+                self.restrict_evicted_project(evicted.project_id);
+            }
+        }
+    }
+
+    fn eviction_restricts(&self, project_id: i64) -> bool {
+        self.eviction_history_saturated || self.evicted_projects.contains(&project_id)
+    }
+
+    fn permits_unresolved_actor(&self, project_id: Option<i64>) -> bool {
+        !self.eviction_history_saturated
+            && !self
+                .evicted_projects
+                .iter()
+                .any(|project| project_id.is_none_or(|id| *project == id))
+            && !self
+                .held
+                .iter()
+                .any(|binding| project_id.is_none_or(|id| binding.project_id == id))
+    }
+}
+
 /// Whether session-bound identity is enabled on this server.
 #[must_use]
 pub fn enabled() -> bool {
     Config::get().messaging_session_identity
 }
 
-fn bindings(ctx: &McpContext) -> Vec<SessionBinding> {
-    ctx.get_state::<Vec<SessionBinding>>(SESSION_IDENTITY_STATE_KEY)
+fn identity_state(ctx: &McpContext) -> SessionIdentityState {
+    ctx.get_state::<SessionIdentityState>(SESSION_IDENTITY_STATE_KEY)
         .unwrap_or_default()
 }
 
 fn update_bindings(
     ctx: &McpContext,
-    update: impl FnOnce(&mut Vec<SessionBinding>) -> bool,
+    update: impl FnOnce(&mut SessionIdentityState) -> bool,
 ) -> bool {
     #[cfg(test)]
     if matches!(
@@ -94,19 +156,23 @@ fn update_bindings(
     let _guard = BINDINGS_UPDATE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut held = bindings(ctx);
-    if !update(&mut held) {
+    let mut state = identity_state(ctx);
+    if !update(&mut state) {
         return true;
     }
     #[cfg(test)]
     tests::update_checkpoint(tests::UpdateCheckpoint::BeforeWrite);
-    ctx.set_state(SESSION_IDENTITY_STATE_KEY, held)
+    ctx.set_state(SESSION_IDENTITY_STATE_KEY, state)
 }
 
 /// The identities this session holds, or none when the feature is off.
 #[must_use]
 pub fn session_bindings(ctx: &McpContext) -> Vec<SessionBinding> {
-    if enabled() { bindings(ctx) } else { Vec::new() }
+    if enabled() {
+        identity_state(ctx).held
+    } else {
+        Vec::new()
+    }
 }
 
 /// Bind `agent_id` to this session. A no-op when the feature is off or the
@@ -115,18 +181,15 @@ pub fn bind(ctx: &McpContext, project_id: i64, agent_id: i64, agent_name: &str) 
     if !enabled() || !ctx.has_session_state() || agent_id <= 0 {
         return;
     }
-    let stored = update_bindings(ctx, |held| {
-        held.retain(|binding| binding.agent_id != agent_id);
-        held.push(SessionBinding {
+    let stored = update_bindings(ctx, |state| {
+        state.held.retain(|binding| binding.agent_id != agent_id);
+        state.held.push(SessionBinding {
             project_id,
             agent_id,
             agent_name: agent_name.to_string(),
             bound_at_us: mcp_agent_mail_db::now_micros(),
         });
-        if held.len() > MAX_SESSION_BINDINGS {
-            let excess = held.len() - MAX_SESSION_BINDINGS;
-            held.drain(..excess);
-        }
+        state.enforce_capacity();
         true
     });
     if !stored {
@@ -139,10 +202,10 @@ pub fn unbind(ctx: &McpContext, agent_id: i64) {
     if !enabled() || !ctx.has_session_state() {
         return;
     }
-    update_bindings(ctx, |held| {
-        let before = held.len();
-        held.retain(|binding| binding.agent_id != agent_id);
-        held.len() != before
+    update_bindings(ctx, |state| {
+        let before = state.held.len();
+        state.held.retain(|binding| binding.agent_id != agent_id);
+        state.held.len() != before
     });
 }
 
@@ -160,26 +223,27 @@ pub fn holds(ctx: &McpContext, agent_id: Option<i64>) -> bool {
 /// identity snapshot. An outage must not turn an unresolved constrained actor
 /// into a trusted-local durable intent that can run after this session ends.
 pub(crate) struct ActorAuthorizationSnapshot {
-    held: Vec<SessionBinding>,
+    state: SessionIdentityState,
 }
 
 impl ActorAuthorizationSnapshot {
     pub(crate) fn capture(ctx: &McpContext) -> McpResult<Self> {
         ctx.ensure_live()?;
-        let held = session_bindings(ctx);
+        let state = if enabled() {
+            identity_state(ctx)
+        } else {
+            SessionIdentityState::default()
+        };
         // An expired request scope makes get_state return None. Never mistake
         // that unavailable state for an intentionally unbound caller.
         ctx.ensure_live()?;
-        Ok(Self { held })
+        Ok(Self { state })
     }
 
-    /// Before resolving the project, every binding could constrain the call.
-    /// Once its ID is known, only that project's bindings matter.
+    /// Before resolving the project, any binding or eviction could constrain
+    /// the call. Unknown actors never receive proof from eviction history.
     pub(crate) fn permits_unresolved_actor(&self, project_id: Option<i64>) -> bool {
-        !self
-            .held
-            .iter()
-            .any(|binding| project_id.is_none_or(|id| binding.project_id == id))
+        self.state.permits_unresolved_actor(project_id)
     }
 
     pub(crate) fn authorize(
@@ -189,7 +253,7 @@ impl ActorAuthorizationSnapshot {
         action: &str,
     ) -> McpResult<()> {
         ctx.ensure_live()?;
-        authorize_actor_from_bindings(&self.held, agent, action)
+        authorize_actor_from_state(&self.state, agent, action)
     }
 }
 
@@ -214,16 +278,17 @@ pub fn authorize_actor(
     ActorAuthorizationSnapshot::capture(ctx)?.authorize(ctx, agent, action)
 }
 
-fn authorize_actor_from_bindings(
-    bindings: &[SessionBinding],
+fn authorize_actor_from_state(
+    state: &SessionIdentityState,
     agent: &mcp_agent_mail_db::AgentRow,
     action: &str,
 ) -> McpResult<()> {
-    let held: Vec<&SessionBinding> = bindings
+    let held: Vec<&SessionBinding> = state
+        .held
         .iter()
         .filter(|binding| binding.project_id == agent.project_id)
         .collect();
-    if held.is_empty()
+    if (held.is_empty() && !state.eviction_restricts(agent.project_id))
         || held
             .iter()
             .any(|binding| Some(binding.agent_id) == agent.id)
@@ -234,13 +299,28 @@ fn authorize_actor_from_bindings(
         .iter()
         .map(|binding| binding.agent_name.as_str())
         .collect();
+    let restriction = if state.eviction_history_saturated {
+        "eviction_history_saturated"
+    } else if names.is_empty() {
+        "binding_evicted"
+    } else {
+        "bound_to_other_agent"
+    };
+    let explanation = if names.is_empty() {
+        "This MCP session lost identity proof through capacity eviction; its project restrictions remain"
+            .to_string()
+    } else {
+        format!(
+            "This MCP session holds the identity of {} in this project",
+            names.join(", ")
+        )
+    };
     Err(legacy_tool_error(
         "SESSION_IDENTITY_MISMATCH",
         format!(
-            "This MCP session holds the identity of {} in this project, so it cannot {action} \
+            "{explanation}, so it cannot {action} \
              as '{}'. Act as your own agent, present '{}''s registration_token where the tool \
              accepts one, or use a separate session for that agent.",
-            names.join(", "),
             agent.name,
             agent.name
         ),
@@ -249,6 +329,7 @@ fn authorize_actor_from_bindings(
             "agent": agent.name,
             "session_agents": names,
             "action": action,
+            "restriction": restriction,
         }),
     ))
 }
@@ -489,7 +570,7 @@ mod tests {
             let ctx = session_ctx();
             bind(&ctx, 10, 1, "BlueLake");
             assert!(!holds(&ctx, Some(1)));
-            assert!(bindings(&ctx).is_empty(), "nothing was stored");
+            assert_eq!(identity_state(&ctx), SessionIdentityState::default());
             assert!(authorize_actor(&ctx, &agent(2, 10, "RedStone"), false, "send").is_ok());
         });
     }
@@ -505,6 +586,177 @@ mod tests {
             let held = session_bindings(&ctx);
             assert_eq!(held.len(), MAX_SESSION_BINDINGS);
             assert!(!holds(&ctx, Some(1)), "oldest binding dropped");
+        });
+    }
+
+    fn evict_first_project(ctx: &McpContext) {
+        bind(ctx, 10, 1, "BlueLake");
+        for id in 2..=i64::try_from(MAX_SESSION_BINDINGS + 1).expect("small") {
+            bind(ctx, 20, id, "RedStone");
+        }
+        assert!(!holds(ctx, Some(1)), "fixture must actually evict the proof");
+        assert_eq!(session_bindings(ctx).len(), MAX_SESSION_BINDINGS);
+    }
+
+    #[test]
+    fn capacity_eviction_cannot_authorize_the_old_project_or_a_deferred_actor() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            evict_first_project(&ctx);
+            for target in [agent(1, 10, "BlueLake"), agent(999, 10, "GreenCastle")] {
+                let error = authorize_actor(&ctx, &target, false, "send messages")
+                    .expect_err("eviction must not grant trusted-local authority");
+                assert_eq!(
+                    crate::tool_error_code(&error),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                assert!(authorize_actor(&ctx, &target, true, "send messages").is_ok());
+            }
+            assert!(authorize_actor(&ctx, &agent(2, 20, "RedStone"), false, "send").is_ok());
+            assert!(authorize_actor(&ctx, &agent(999, 30, "GreenCastle"), false, "send").is_ok());
+
+            let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            assert!(!snapshot.permits_unresolved_actor(None));
+            assert!(!snapshot.permits_unresolved_actor(Some(10)));
+            assert!(!snapshot.permits_unresolved_actor(Some(20)));
+            assert!(snapshot.permits_unresolved_actor(Some(30)));
+            assert!(snapshot.authorize(&ctx, &agent(1, 10, "BlueLake"), "ack").is_err());
+        });
+    }
+
+    #[test]
+    fn unbinding_live_proofs_cannot_erase_an_evicted_projects_restriction() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            evict_first_project(&ctx);
+            for binding in session_bindings(&ctx) {
+                unbind(&ctx, binding.agent_id);
+            }
+            unbind(&ctx, 1);
+            assert_eq!(session_bindings(&ctx), Vec::new());
+            assert_eq!(identity_state(&ctx).evicted_projects, [10]);
+            let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            assert!(!snapshot.permits_unresolved_actor(None));
+            assert!(!snapshot.permits_unresolved_actor(Some(10)));
+            assert!(snapshot.permits_unresolved_actor(Some(20)));
+            assert!(authorize_actor(&ctx, &agent(999, 10, "GreenCastle"), false, "read").is_err());
+            assert!(
+                authorize_actor(&session_ctx(), &agent(999, 10, "GreenCastle"), false, "read")
+                    .is_ok()
+            );
+        });
+    }
+
+    #[test]
+    fn eviction_history_saturates_without_forgetting_authorization_restrictions() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            let count = i64::try_from(MAX_SESSION_BINDINGS + MAX_EVICTED_PROJECTS + 1)
+                .expect("small");
+            for id in 1..=count {
+                bind(&ctx, id * 10, id, "BlueLake");
+                let state = identity_state(&ctx);
+                assert!(state.held.len() <= MAX_SESSION_BINDINGS);
+                assert!(state.evicted_projects.len() <= MAX_EVICTED_PROJECTS);
+                if id == count - 1 {
+                    assert!(!state.eviction_history_saturated);
+                    assert_eq!(state.evicted_projects.len(), MAX_EVICTED_PROJECTS);
+                }
+            }
+            let state = identity_state(&ctx);
+            assert!(state.eviction_history_saturated);
+            assert_eq!(state.evicted_projects, Vec::<i64>::new());
+            for project in [10, count * 10, 99_999] {
+                assert!(
+                    authorize_actor(&ctx, &agent(999, project, "GreenCastle"), false, "ack")
+                        .is_err()
+                );
+                assert!(
+                    authorize_actor(&ctx, &agent(999, project, "GreenCastle"), true, "ack")
+                        .is_ok()
+                );
+            }
+            for binding in &state.held {
+                let own = agent(binding.agent_id, binding.project_id, &binding.agent_name);
+                assert!(authorize_actor(&ctx, &own, false, "send").is_ok());
+            }
+            let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            for project in [None, Some(10), Some(99_999)] {
+                assert!(!snapshot.permits_unresolved_actor(project));
+            }
+            for binding in state.held {
+                unbind(&ctx, binding.agent_id);
+            }
+            assert!(identity_state(&ctx).eviction_history_saturated);
+            bind(&ctx, 99_999, 999, "GreenCastle");
+            assert!(
+                authorize_actor(&ctx, &agent(999, 99_999, "GreenCastle"), false, "send")
+                    .is_ok()
+            );
+            ctx.request_cancellation().cancel();
+            assert!(
+                authorize_actor(&ctx, &agent(999, 99_999, "GreenCastle"), true, "send")
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn rebinding_cannot_remove_eviction_history_or_change_an_accepted_snapshot() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            evict_first_project(&ctx);
+            let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            bind(&ctx, 10, 1, "BlueLake");
+            assert!(holds(&ctx, Some(1)));
+            assert!(authorize_actor(&ctx, &agent(1, 10, "BlueLake"), false, "send").is_ok());
+            assert!(snapshot.authorize(&ctx, &agent(1, 10, "BlueLake"), "ack").is_err());
+            unbind(&ctx, 1);
+            assert_eq!(identity_state(&ctx).evicted_projects, [10]);
+            assert!(authorize_actor(&ctx, &agent(999, 10, "GreenCastle"), false, "send").is_err());
+        });
+    }
+
+    #[test]
+    fn same_project_churn_does_not_invent_eviction_history_or_restrict_other_projects() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            for id in 1..=100 {
+                bind(&ctx, 10, id, "BlueLake");
+            }
+            assert_eq!(identity_state(&ctx).evicted_projects, Vec::<i64>::new());
+            assert!(!identity_state(&ctx).eviction_history_saturated);
+            assert!(authorize_actor(&ctx, &agent(999, 20, "RedStone"), false, "send").is_ok());
+            for binding in session_bindings(&ctx) {
+                unbind(&ctx, binding.agent_id);
+            }
+            assert!(authorize_actor(&ctx, &agent(999, 10, "RedStone"), false, "send").is_ok());
+        });
+    }
+
+    #[test]
+    fn concurrent_eviction_and_unbind_publish_proofs_and_restrictions_together() {
+        with_feature(true, || {
+            let state = fastmcp_core::SessionState::new();
+            let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 3, state.clone());
+            bind(&ctx, 10, 1, "BlueLake");
+            for id in 2..=i64::try_from(MAX_SESSION_BINDINGS).expect("small") {
+                bind(&ctx, 20, id, "RedStone");
+            }
+            interleave_updates(
+                state,
+                |ctx| bind(ctx, 30, 999, "GreenCastle"),
+                |ctx| unbind(ctx, 999),
+            );
+            assert!(!holds(&ctx, Some(1)));
+            assert!(!holds(&ctx, Some(999)));
+            assert_eq!(identity_state(&ctx).evicted_projects, [10]);
+            assert!(authorize_actor(&ctx, &agent(1000, 10, "GreenCastle"), false, "send").is_err());
+            assert!(
+                !ActorAuthorizationSnapshot::capture(&ctx)
+                    .unwrap()
+                    .permits_unresolved_actor(Some(10))
+            );
         });
     }
 
