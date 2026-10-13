@@ -4663,6 +4663,15 @@ impl AtcEngine {
     }
 
     fn resolve_pending_feedback_on_activity(&mut self, agent: &str, timestamp_micros: i64) {
+        // Arrival time is not event time. An observation at or before the
+        // intervention cannot be evidence about that intervention's outcome.
+        if self
+            .pending_liveness_feedback
+            .get(agent)
+            .is_none_or(|pending| timestamp_micros <= pending.issued_at_micros)
+        {
+            return;
+        }
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
@@ -5116,7 +5125,16 @@ impl AtcEngine {
         project_key: Option<&str>,
         timestamp_micros: i64,
     ) {
-        if agent == ATC_AGENT_NAME {
+        if agent == ATC_AGENT_NAME || timestamp_micros <= 0 {
+            return;
+        }
+        let Some(entry) = self.agents.get(agent) else {
+            return;
+        };
+        // AgentRhythm keeps its timestamp monotonic, but stale observations
+        // previously still consumed feedback, changed project attribution,
+        // resurrected dead agents, and churned the scheduler.
+        if timestamp_micros <= entry.rhythm.last_activity_ts {
             return;
         }
         self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
@@ -6627,6 +6645,64 @@ mod engine_tests {
             "sprt_log_lr should be cleared, got {}",
             entry.sprt_log_lr
         );
+    }
+
+    #[test]
+    fn stale_activity_is_a_complete_noop_for_liveness_state() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Phoenix", "claude-code", Some("/current"));
+        engine.observe_activity("Phoenix", Some("/current"), 5_000_000);
+        {
+            let entry = engine.agents.get_mut("Phoenix").unwrap();
+            entry.state = LivenessState::Dead;
+            entry.suspect_since = 6_000_000;
+            entry.probe_sent_at = 7_000_000;
+            entry.sprt_log_lr = 5.0;
+        }
+        engine.schedule_entry_for_push("Phoenix", i64::MAX);
+        engine.record_pending_liveness_feedback(
+            "Phoenix",
+            LivenessAction::Suspect,
+            2.0,
+            8_000_000,
+        );
+        let before = engine.agents["Phoenix"].clone();
+        let heap = engine.liveness_schedule.clone().into_sorted_vec();
+
+        for timestamp in [i64::MIN, -1, 0, 4_000_000, 5_000_000] {
+            engine.observe_activity("Phoenix", Some("/stale"), timestamp);
+        }
+
+        let after = &engine.agents["Phoenix"];
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.project_key, before.project_key);
+        assert_eq!(after.rhythm.last_activity_ts, before.rhythm.last_activity_ts);
+        assert_eq!(after.schedule_version, before.schedule_version);
+        assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
+        assert!(engine.pending_liveness_feedback.contains_key("Phoenix"));
+        assert_eq!(engine.resolved_experience_count, 0);
+    }
+
+    #[test]
+    fn pre_intervention_activity_does_not_consume_future_feedback() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("FeedbackAgent", "codex-cli", None);
+        engine.observe_activity("FeedbackAgent", None, 1_000_000);
+        engine.record_pending_liveness_feedback(
+            "FeedbackAgent",
+            LivenessAction::Suspect,
+            2.0,
+            4_000_000,
+        );
+
+        engine.observe_activity("FeedbackAgent", None, 3_000_000);
+        engine.observe_activity("FeedbackAgent", None, 4_000_000);
+        assert!(engine.pending_liveness_feedback.contains_key("FeedbackAgent"));
+        assert_eq!(engine.resolved_experience_count, 0);
+
+        engine.observe_activity("FeedbackAgent", None, 4_000_001);
+        assert!(!engine.pending_liveness_feedback.contains_key("FeedbackAgent"));
+        assert_eq!(engine.resolved_experience_count, 1);
     }
 
     #[test]
