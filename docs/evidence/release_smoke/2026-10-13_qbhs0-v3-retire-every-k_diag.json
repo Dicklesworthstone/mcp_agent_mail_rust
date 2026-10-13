@@ -1,0 +1,261 @@
+{
+  "schema": "br-qbhs0 V3 diagnostic v1",
+  "plan": "DIAGNOSTIC V3 (choosing K; no landing decision). Written 2026-10-13 ~06:25Z, before the build or any run.\nV3 = nopub + retire the writer on every K-th under-limit commit (AM_DIAG_RETIRE_EVERY=K), between\n  nopub (never retire: sends 0.58x, soak reads -20%) and\n  V2 (always retire: reads ~recovered, sends 0.85x).\nArms: K4, K16 (env wrappers around build28/v3every) and base (build19/base3).\nRuns:\n  release smoke without the swarm phase, both orders, for K4 and K16 vs base;\n  paced period 2 s: base K4 K16 base K16 K4.\nA K is a candidate only if:\n  - soak reads >= 0.90x base and fetch p99 <= 1.3x base, in both orders;\n  - pooled P2 send p50 and p90 <= 0.85x base.\nThe best candidate (the larger K if both qualify) gets a separately pre-registered confirmation A/B (paced + full\nsmoke) and the owner's decision before any landing.\n",
+  "binaries": {
+    "base": "2dd72851 build19/base3 am c5c84438...",
+    "v3": "2dd72851 + nopub + retire every K-th under-limit commit (AM_DIAG_RETIRE_EVERY), build28/v3every am 756c6171...; K via env wrappers"
+  },
+  "host": "thinkstation1, quiet (1-min load 1.4-10 at arm starts), host lock held; governor powersave",
+  "paced_p2": {
+    "runs": [
+      {
+        "run": "1-base",
+        "sends": 9000,
+        "p50": 0.5055,
+        "p90": 1.5861,
+        "p99": 3.487,
+        "tool_errors": 6,
+        "error_tools": [
+          "fetch_inbox",
+          "file_reservation_paths",
+          "release_file_reservations"
+        ],
+        "wal_peak_bytes": 17950872
+      },
+      {
+        "run": "2-k4",
+        "sends": 9000,
+        "p50": 0.353,
+        "p90": 1.1293,
+        "p99": 2.1964,
+        "tool_errors": 35,
+        "error_tools": [
+          "fetch_inbox",
+          "file_reservation_paths",
+          "release_file_reservations"
+        ],
+        "wal_peak_bytes": 17514152
+      },
+      {
+        "run": "3-k16",
+        "sends": 9000,
+        "p50": 0.2683,
+        "p90": 0.8057,
+        "p99": 1.5374,
+        "tool_errors": 3,
+        "error_tools": [
+          "fetch_inbox",
+          "file_reservation_paths"
+        ],
+        "wal_peak_bytes": 16904392
+      },
+      {
+        "run": "4-base",
+        "sends": 9000,
+        "p50": 0.5287,
+        "p90": 1.426,
+        "p99": 2.7568,
+        "tool_errors": 1,
+        "error_tools": [
+          "send_message"
+        ],
+        "wal_peak_bytes": 20587672
+      },
+      {
+        "run": "5-k16",
+        "sends": 9000,
+        "p50": 0.2941,
+        "p90": 0.9217,
+        "p99": 1.721,
+        "tool_errors": 1,
+        "error_tools": [
+          "fetch_inbox"
+        ],
+        "wal_peak_bytes": 16834352
+      },
+      {
+        "run": "6-k4",
+        "sends": 9000,
+        "p50": 0.3305,
+        "p90": 1.0208,
+        "p99": 1.8292,
+        "tool_errors": 2,
+        "error_tools": [
+          "fetch_inbox"
+        ],
+        "wal_peak_bytes": 17056832
+      }
+    ],
+    "pooled": {
+      "base": {
+        "sends": 18000,
+        "p50": 0.5186,
+        "p90": 1.4894,
+        "p99": 3.2598,
+        "p50_vs_base": 1.0,
+        "p90_vs_base": 1.0,
+        "p99_vs_base": 1.0,
+        "tool_errors": 7,
+        "wal_peak_median": 20587672
+      },
+      "k4": {
+        "sends": 18000,
+        "p50": 0.343,
+        "p90": 1.0732,
+        "p99": 2.0547,
+        "p50_vs_base": 0.661,
+        "p90_vs_base": 0.721,
+        "p99_vs_base": 0.63,
+        "tool_errors": 37,
+        "wal_peak_median": 17514152
+      },
+      "k16": {
+        "sends": 18000,
+        "p50": 0.283,
+        "p90": 0.8608,
+        "p99": 1.6381,
+        "p50_vs_base": 0.546,
+        "p90_vs_base": 0.578,
+        "p99_vs_base": 0.503,
+        "tool_errors": 4,
+        "wal_peak_median": 16904392
+      }
+    },
+    "note": "K4 run 2: 31 of 35 errors are one burst at t=239-241 s, reservation timeouts stage=archive_commit (fence held ~26 s by one archive commit, the br-kp1in.13 stall); base run 1 had 5 of the same"
+  },
+  "smokes_no_swarm": [
+    {
+      "run": "k16_vs_base",
+      "k": "K16",
+      "started_at": "2026-10-13T15:22:44Z",
+      "v3": {
+        "reads": 10911,
+        "sends": 9391,
+        "fetch_p99_s": 0.2208263874053955,
+        "crash": "PASS",
+        "loadavg_start": [
+          "1.42",
+          "2.96",
+          "4.07"
+        ]
+      },
+      "base": {
+        "reads": 13480,
+        "sends": 8830,
+        "fetch_p99_s": 0.14484214782714844,
+        "crash": "PASS",
+        "loadavg_start": [
+          "3.10",
+          "4.83",
+          "4.49"
+        ]
+      },
+      "reads_ratio": 0.809,
+      "fetch_p99_ratio": 1.52,
+      "soak_half_pass": false
+    },
+    {
+      "run": "base_vs_k16",
+      "k": "K16",
+      "started_at": "2026-10-13T15:51:51Z",
+      "v3": {
+        "reads": 10973,
+        "sends": 9376,
+        "fetch_p99_s": 0.2262420654296875,
+        "crash": "PASS",
+        "loadavg_start": [
+          "3.16",
+          "4.73",
+          "4.31"
+        ]
+      },
+      "base": {
+        "reads": 13372,
+        "sends": 8794,
+        "fetch_p99_s": 0.1469593048095703,
+        "crash": "PASS",
+        "loadavg_start": [
+          "1.66",
+          "2.45",
+          "3.60"
+        ]
+      },
+      "reads_ratio": 0.821,
+      "fetch_p99_ratio": 1.54,
+      "soak_half_pass": false
+    },
+    {
+      "run": "k4_vs_base",
+      "k": "K4",
+      "started_at": "2026-10-13T16:21:06Z",
+      "v3": {
+        "reads": 11823,
+        "sends": 9231,
+        "fetch_p99_s": 0.18565940856933594,
+        "crash": "PASS",
+        "loadavg_start": [
+          "1.93",
+          "2.62",
+          "3.52"
+        ]
+      },
+      "base": {
+        "reads": 13420,
+        "sends": 8797,
+        "fetch_p99_s": 0.1347804069519043,
+        "crash": "PASS",
+        "loadavg_start": [
+          "4.24",
+          "4.99",
+          "4.32"
+        ]
+      },
+      "reads_ratio": 0.881,
+      "fetch_p99_ratio": 1.38,
+      "soak_half_pass": false
+    },
+    {
+      "run": "base_vs_k4",
+      "k": "K4",
+      "started_at": "2026-10-13T16:49:02Z",
+      "v3": {
+        "reads": 11889,
+        "sends": 9183,
+        "fetch_p99_s": 0.21348142623901367,
+        "crash": "PASS",
+        "loadavg_start": [
+          "3.37",
+          "5.35",
+          "4.88"
+        ]
+      },
+      "base": {
+        "reads": 13843,
+        "sends": 8785,
+        "fetch_p99_s": 0.15166354179382324,
+        "crash": "PASS",
+        "loadavg_start": [
+          "1.86",
+          "2.91",
+          "3.88"
+        ]
+      },
+      "reads_ratio": 0.859,
+      "fetch_p99_ratio": 1.41,
+      "soak_half_pass": false
+    }
+  ],
+  "candidates": {
+    "K4": {
+      "paced_half": true,
+      "soak_half_both_orders": false,
+      "candidate": false
+    },
+    "K16": {
+      "paced_half": true,
+      "soak_half_both_orders": false,
+      "candidate": false
+    }
+  },
+  "verdict": "No candidate: both K pass the paced half (K4 p50/p90 0.66/0.72x, K16 0.55/0.58x) and both fail the soak half in both orders (K4 reads 0.88/0.86x, fetch p99 1.38/1.41x; K16 reads 0.81/0.82x, p99 1.52/1.54x). With V2 (retire every commit: send p90 0.88x, reads ~1.0x) this traces one trade-off curve: rarer writer retirement speeds sends and slows reads (frankensqlite#514). Not landed; lever family closed."
+}
