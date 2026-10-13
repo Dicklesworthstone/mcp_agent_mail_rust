@@ -7,6 +7,8 @@
 //! Population hydration yields between bounded slices before inference resumes.
 //! A reset invalidates in-flight reports before replacing planning state. Old
 //! reports cannot spend the new epoch's budget or publish reservation actions.
+//! Within an epoch, an older or repeated actionable report cannot follow a
+//! newer admitted tick. Empty hydration progress does not replenish mail budget.
 
 #[path = "atc_engine.rs"]
 mod engine;
@@ -52,6 +54,16 @@ impl DeliveryState {
 
     fn accepts_epoch(&self, epoch: &Arc<()>) -> bool {
         !self.reset_in_progress && Arc::ptr_eq(&self.epoch, epoch)
+    }
+
+    fn accepts_report(&self, epoch: &Arc<()>, report: &AtcTickReport) -> bool {
+        self.accepts_epoch(epoch)
+            && self.last_tick_count.is_none_or(|last| {
+                report.summary.tick_count > last
+                    || (report.summary.tick_count == last
+                        && report.effects.is_empty()
+                        && report.actions.is_empty())
+            })
     }
 }
 
@@ -138,6 +150,7 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
 /// Inference yields while a population refresh is incomplete. A concurrent reset
 /// cancels this call's publication, including critical reservation actions; their
 /// optional-mail exemption is not permission to cross a planning reset.
+/// Reports superseded at admission by a newer tick are discarded as well.
 #[must_use]
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     let epoch = capture_delivery_epoch()?;
@@ -155,8 +168,13 @@ fn admit_report_with_activity(
     now_micros: i64,
     mut last_activity: impl FnMut(&str) -> Option<i64>,
 ) -> Option<AtcTickReport> {
-    if !delivery_epoch_is_current(epoch) {
-        return None;
+    {
+        let state = delivery_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.accepts_report(epoch, &report) {
+            return None;
+        }
     }
     // Never acquire the engine mutex while owning delivery admission. Engine
     // diagnostics can themselves inspect delivery metrics. These observations
@@ -179,10 +197,19 @@ fn admit_report_with_activity(
     let mut state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !state.accepts_epoch(epoch) {
+    if !state.accepts_report(epoch, &report) {
         // Do not start a tick, consume cooldowns, move fairness, or overwrite
-        // the successor epoch's summary for a discarded planning result.
+        // a newer tick's summary. Another caller may have admitted that tick
+        // while this one sampled activity without holding the admission lock.
+        // Critical effects bypass optional-mail limits, never report ordering.
         return None;
+    }
+    if state.last_tick_count == Some(report.summary.tick_count) {
+        // Hydration can yield repeatedly without advancing the engine tick.
+        // accepts_report allows this only for empty progress, which must not
+        // refill the same tick's budget or replace its admitted effect count.
+        report.summary.kernel.pending_effects = 0;
+        return Some(report);
     }
     let before = state.admission.stats();
     state.admission.begin_tick(now_micros);
@@ -570,6 +597,205 @@ mod admission_boundary_tests {
             agent: "BlueFox".into(),
         }];
         report
+    }
+
+    #[test]
+    fn older_report_cannot_follow_a_newer_admitted_tick_or_sample_activity() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut older = passive_report(200_000_000);
+        let release = staged_report(201_000_000);
+        older.effects.extend(release.effects);
+        older.actions.extend(release.actions);
+        let newer = staged_report(202_000_000);
+        let newer_tick = newer.summary.tick_count;
+        assert!(newer_tick > older.summary.tick_count);
+        let admitted = admit_report(&epoch, newer, 202_000_000).unwrap();
+        assert_eq!(admitted.effects.len(), 1);
+        assert_eq!(admitted.actions.len(), 1);
+        let before = atc_delivery_stats();
+        assert!(
+            admit_report_with_activity(&epoch, older, 203_000_000, |_| {
+                panic!("superseded report must not query activity")
+            })
+            .is_none()
+        );
+        let state = delivery_state().lock().unwrap();
+        assert_eq!(state.last_tick_count, Some(newer_tick));
+        assert_eq!(state.last_effect_count, 1);
+        assert_eq!(state.admission.stats(), before);
+        assert!(state.last_notification_key.is_none());
+        drop(state);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn report_order_is_rechecked_after_an_unlocked_activity_observation() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut older = passive_report(200_000_000);
+        let release = staged_report(201_000_000);
+        older.effects.extend(release.effects);
+        older.actions.extend(release.actions);
+        let newer = staged_report(202_000_000);
+        let newer_tick = newer.summary.tick_count;
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let old_epoch = Arc::clone(&epoch);
+            let worker = scope.spawn(move || {
+                admit_report_with_activity(&old_epoch, older, 200_000_000, |_| {
+                    started_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Some(1_000_000)
+                })
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let admitted = admit_report(&epoch, newer, 202_000_000).unwrap();
+            assert_eq!(admitted.effects.len(), 1);
+            assert_eq!(admitted.actions.len(), 1);
+            resume_tx.send(()).unwrap();
+            assert!(worker.join().unwrap().is_none());
+        });
+        let state = delivery_state().lock().unwrap();
+        assert_eq!(state.last_tick_count, Some(newer_tick));
+        assert_eq!(state.last_effect_count, 1);
+        assert_eq!(state.admission.stats(), AtcDeliveryStats::default());
+        drop(state);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn repeated_tick_cannot_republish_effects_or_action_only_releases() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        for (keep_effects, keep_actions) in [(true, true), (true, false), (false, true)] {
+            reset_global_atc_state_for_test(&config);
+            let epoch = capture_delivery_epoch().unwrap();
+            let first = admit_report(&epoch, staged_report(200_000_000), 200_000_000).unwrap();
+            // Stage a replay of the accepted tick, including both output APIs.
+            let mut repeated = staged_report(201_000_000);
+            repeated.summary.tick_count = first.summary.tick_count;
+            if !keep_effects {
+                repeated.effects.clear();
+            }
+            if !keep_actions {
+                repeated.actions.clear();
+            }
+            assert!(admit_report(&epoch, repeated, 201_000_000).is_none());
+            let state = delivery_state().lock().unwrap();
+            assert_eq!(state.last_tick_count, Some(first.summary.tick_count));
+            assert_eq!(state.last_effect_count, 1);
+            assert_eq!(state.admission.stats(), AtcDeliveryStats::default());
+        }
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn repeated_empty_progress_does_not_refill_budget_or_erase_admitted_effects() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let admitted = admit_report(&epoch, staged_report(200_000_000), 200_000_000).unwrap();
+        {
+            let mut state = delivery_state().lock().unwrap();
+            for index in 0..delivery::MAX_NOTIFICATIONS_PER_TICK {
+                assert_eq!(
+                    state.admission.admit(
+                        Notification {
+                            key: &format!("conflict:{index}"),
+                            class: NotificationClass::Conflict,
+                            last_activity_micros: None,
+                            cooldown_micros: 1_000_000,
+                        },
+                        200_000_000,
+                    ),
+                    Admission::Admitted
+                );
+            }
+        }
+        let before = atc_delivery_stats();
+        for _ in 0..32 {
+            let mut summary = engine::atc_summary().unwrap();
+            summary.completeness = SnapshotCompleteness::Partial;
+            let progress = AtcTickReport {
+                summary,
+                effects: Vec::new(),
+                actions: Vec::new(),
+            };
+            let returned = admit_report(&epoch, progress, 201_000_000).unwrap();
+            assert_eq!(returned.summary.tick_count, admitted.summary.tick_count);
+            assert_eq!(returned.summary.kernel.pending_effects, 0);
+            assert_eq!(atc_delivery_stats(), before);
+        }
+        let mut state = delivery_state().lock().unwrap();
+        assert_eq!(state.last_effect_count, 1);
+        assert_eq!(
+            state.admission.admit(
+                Notification {
+                    key: "conflict:after-progress",
+                    class: NotificationClass::Conflict,
+                    last_activity_micros: None,
+                    cooldown_micros: 1_000_000,
+                },
+                201_000_000,
+            ),
+            Admission::Deferred,
+            "empty progress must not mint another delivery budget"
+        );
+        drop(state);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn tick_order_does_not_depend_on_wall_clock_order() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let first = admit_report(&epoch, staged_report(200_000_000), 200_000_000).unwrap();
+        let second = admit_report(&epoch, staged_report(199_000_000), 199_000_000).unwrap();
+        assert!(second.summary.tick_count > first.summary.tick_count);
+        assert_eq!(second.effects.len(), 1);
+        assert_eq!(second.actions.len(), 1);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn successive_public_empty_ticks_continue_to_make_progress() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let mut previous_tick = 0;
+        for step in 0..32 {
+            let report = atc_tick_report(200_000_000 + step).unwrap();
+            assert!(report.summary.tick_count > previous_tick);
+            previous_tick = report.summary.tick_count;
+            assert!(report.effects.is_empty() && report.actions.is_empty());
+        }
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]
