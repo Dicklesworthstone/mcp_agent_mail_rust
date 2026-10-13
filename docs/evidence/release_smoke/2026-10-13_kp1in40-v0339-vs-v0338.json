@@ -1,0 +1,1050 @@
+{
+  "schema": "br-kp1in.40 v0.3.39 vs v0.3.38 v1",
+  "arms": {
+    "A": "shipped v0.3.38 glibc artifact, am sha256 171713fa... (dist.yml, portable)",
+    "B": "v0.3.39 release commit a4ec56bc, rch cargo build --release --no-default-features --features portable, am 9404dba0..."
+  },
+  "host": "thinkstation1, 64 cores, governor powersave, host lock (no other measurement of mine running)",
+  "soak_closed_loop": {
+    "rule": "br-kp1in.40 re-measurement on the v0.3.39 candidate. Written 2026-10-13 ~08:10Z, before any run of these arms.\n\nQuestion: does the v0.3.39 release commit serve fewer fetch_inbox reads (or a worse fetch_inbox p99) than v0.3.38 in\nthe release-smoke soak?\n\nArms (same build path, so features and toolchain pins come from each tree; dist.yml's feature set):\n  A = v0.3.38 tag f9c68b4e, built from source: cargo build --release --locked -p mcp-agent-mail-cli -p mcp-agent-mail\n      --no-default-features --features portable (build29/v038)\n  B = v0.3.39 release commit a4ec56bc, same command (build29/v039)\nThe receipt records server_exe_sha256 from the running process, server threads, and loadavg per arm; the runner\nalso logs CPU governor and 1-min load before each run.\n\nRuns (one host, one session, nothing else of mine running on it): unmodified tests/e2e/lib/release_smoke.py via\nam e2e run release_smoke, swarm phase skipped (AM_RELEASE_SMOKE_SWARM_AGENTS=0; the soak is the measured phase):\n  1 B_vs_A  2 A_vs_B  3 B_vs_A  4 A_vs_B  5 B_vs_A  6 A_vs_B   (3 pairs per order)\n  7 A_vs_A (null)\n\nMetrics: soak.counts.read and soak.fetch_inbox_p99_s for each arm.\n\nValidity (decided before looking at B):\n  V1. The null's two A arms differ by <= 10% in soak reads. Otherwise the host was too noisy: INCONCLUSIVE, rerun.\n  V2. Any run whose start 1-min load exceeds 16 is reported and excluded; if fewer than 2 runs per order survive,\n      INCONCLUSIVE.\n\nDecision (the bead's own acceptance):\n  REFUTED (no regression): median of B soak reads >= 0.90 x median of A soak reads, AND median of B fetch_inbox p99\n    <= 1.5 x median of A p99. Paired ratios (B/A within each run) are reported too, by order.\n  CONFIRMED regression: either half fails. Then attribute before any code change (AM_EVIDENCE_LEDGER_PATH phase\n    ledgers, focused bench inbox_fetch_project_mailbox), and the bead stays open.\nA/A crash/flow/storm verdicts are reported; any FAIL in B that A does not show is reported separately.\n\nAMENDMENT 2026-10-13T12:36:11Z, BEFORE any kp140 run (kp140d has not started; no arm has been measured):\nArm A changes from a source build of v0.3.38 to the SHIPPED v0.3.38 glibc release artifact\n(scratchpad dl2/gnu/am, sha256 171713fa43e891f8..., built by dist.yml with --no-default-features --features portable).\nReason: the source build of f9c68b4e at -j 2 on vmi1153651 was SIGKILLed at rch's 10800 s cap (build31/v038.log);\nretrying on this fleet costs another 3+ hours.\nStated confound: A is dist's zigbuild/glibc-floor build and B is an rch cargo build. Feature set (portable) and\nversion tags match. The shipped artifact is also what users run today, so A is the live incumbent.\nArms, runs, metrics, validity and decision are otherwise unchanged.\n",
+    "arms": {
+      "A": "shipped v0.3.38 171713fa",
+      "B": "v0.3.39 a4ec56bc portable build 9404dba0"
+    },
+    "runs": [
+      {
+        "run": "1-B_vs_A",
+        "started_at": "2026-10-13T12:46:39Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "9404dba0",
+            "version": "am 0.3.39",
+            "loadavg_start": [
+              "8.08",
+              "10.00",
+              "9.89"
+            ],
+            "reads": 13465,
+            "sends": 8817,
+            "searches": 803,
+            "errors": 0,
+            "fetch_p99_s": 0.15200281143188477,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "3.50",
+              "6.26",
+              "7.98"
+            ],
+            "reads": 44027,
+            "sends": 1730,
+            "searches": 620,
+            "errors": 0,
+            "fetch_p99_s": 0.02247476577758789,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      },
+      {
+        "run": "2-A_vs_B",
+        "started_at": "2026-10-13T13:09:30Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "1.69",
+              "3.00",
+              "5.38"
+            ],
+            "reads": 43625,
+            "sends": 1734,
+            "searches": 614,
+            "errors": 0,
+            "fetch_p99_s": 0.022871971130371094,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "9404dba0",
+            "version": "am 0.3.39",
+            "loadavg_start": [
+              "6.08",
+              "5.36",
+              "5.59"
+            ],
+            "reads": 13564,
+            "sends": 8840,
+            "searches": 827,
+            "errors": 0,
+            "fetch_p99_s": 0.12681031227111816,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      },
+      {
+        "run": "3-B_vs_A",
+        "started_at": "2026-10-13T13:32:03Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "9404dba0",
+            "version": "am 0.3.39",
+            "loadavg_start": [
+              "3.26",
+              "3.48",
+              "4.58"
+            ],
+            "reads": 13440,
+            "sends": 8617,
+            "searches": 752,
+            "errors": 0,
+            "fetch_p99_s": 0.21731281280517578,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "4.54",
+              "5.94",
+              "5.43"
+            ],
+            "reads": 43643,
+            "sends": 1733,
+            "searches": 546,
+            "errors": 0,
+            "fetch_p99_s": 0.023012638092041016,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      },
+      {
+        "run": "4-A_vs_B",
+        "started_at": "2026-10-13T13:55:07Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "2.06",
+              "3.44",
+              "4.72"
+            ],
+            "reads": 41208,
+            "sends": 1869,
+            "searches": 620,
+            "errors": 0,
+            "fetch_p99_s": 0.02421712875366211,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "9404dba0",
+            "version": "am 0.3.39",
+            "loadavg_start": [
+              "7.17",
+              "6.45",
+              "5.69"
+            ],
+            "reads": 13575,
+            "sends": 8806,
+            "searches": 824,
+            "errors": 0,
+            "fetch_p99_s": 0.1393897533416748,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      },
+      {
+        "run": "5-B_vs_A",
+        "started_at": "2026-10-13T14:17:39Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "9404dba0",
+            "version": "am 0.3.39",
+            "loadavg_start": [
+              "3.15",
+              "3.53",
+              "4.56"
+            ],
+            "reads": 13434,
+            "sends": 8712,
+            "searches": 793,
+            "errors": 0,
+            "fetch_p99_s": 0.18642044067382812,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "6.70",
+              "7.83",
+              "6.44"
+            ],
+            "reads": 42717,
+            "sends": 1747,
+            "searches": 530,
+            "errors": 0,
+            "fetch_p99_s": 0.023301124572753906,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      },
+      {
+        "run": "6-A_vs_B",
+        "started_at": "2026-10-13T14:40:42Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "1.60",
+              "3.51",
+              "5.33"
+            ],
+            "reads": 44251,
+            "sends": 1758,
+            "searches": 615,
+            "errors": 0,
+            "fetch_p99_s": 0.023169279098510742,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "9404dba0",
+            "version": "am 0.3.39",
+            "loadavg_start": [
+              "6.05",
+              "5.47",
+              "5.56"
+            ],
+            "reads": 13457,
+            "sends": 8843,
+            "searches": 824,
+            "errors": 0,
+            "fetch_p99_s": 0.1343395709991455,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      },
+      {
+        "run": "7-A_vs_A",
+        "started_at": "2026-10-13T15:03:32Z",
+        "cpu_governors": [
+          "powersave"
+        ],
+        "arms": [
+          {
+            "role": "candidate",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "1.50",
+              "2.60",
+              "4.14"
+            ],
+            "reads": 44659,
+            "sends": 1751,
+            "searches": 618,
+            "errors": 0,
+            "fetch_p99_s": 0.022609472274780273,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          },
+          {
+            "role": "control",
+            "sha": "171713fa",
+            "version": "am 0.3.38",
+            "loadavg_start": [
+              "6.21",
+              "5.28",
+              "4.77"
+            ],
+            "reads": 38562,
+            "sends": 2262,
+            "searches": 657,
+            "errors": 0,
+            "fetch_p99_s": 0.026432037353515625,
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "PASS",
+              "swarm": "NO_VERDICT"
+            }
+          }
+        ]
+      }
+    ],
+    "validity": {
+      "V1_null_spread_le_10pct": false,
+      "null": {
+        "reads": [
+          44659,
+          38562
+        ],
+        "spread": 0.13652343312658144,
+        "p99": [
+          0.022609472274780273,
+          0.026432037353515625
+        ]
+      },
+      "V2_runs_per_order": {
+        "B_vs_A": 3,
+        "A_vs_B": 3
+      },
+      "V2_ok": true,
+      "excluded_for_load": []
+    },
+    "medians": {
+      "A_reads": 43634.0,
+      "B_reads": 13461.0,
+      "A_p99_s": 0.02309095859527588,
+      "B_p99_s": 0.14569628238677979,
+      "A_sends": 1740.5,
+      "B_sends": 8811.5
+    },
+    "ratios": {
+      "reads_B_over_A": 0.308,
+      "p99_B_over_A": 6.31
+    },
+    "paired": [
+      {
+        "run": "1-B_vs_A",
+        "reads_B_over_A": 0.306,
+        "p99_B_over_A": 6.76,
+        "sends_B_over_A": 5.1
+      },
+      {
+        "run": "2-A_vs_B",
+        "reads_B_over_A": 0.311,
+        "p99_B_over_A": 5.54,
+        "sends_B_over_A": 5.1
+      },
+      {
+        "run": "3-B_vs_A",
+        "reads_B_over_A": 0.308,
+        "p99_B_over_A": 9.44,
+        "sends_B_over_A": 4.97
+      },
+      {
+        "run": "4-A_vs_B",
+        "reads_B_over_A": 0.329,
+        "p99_B_over_A": 5.76,
+        "sends_B_over_A": 4.71
+      },
+      {
+        "run": "5-B_vs_A",
+        "reads_B_over_A": 0.314,
+        "p99_B_over_A": 8.0,
+        "sends_B_over_A": 4.99
+      },
+      {
+        "run": "6-A_vs_B",
+        "reads_B_over_A": 0.304,
+        "p99_B_over_A": 5.8,
+        "sends_B_over_A": 5.03
+      }
+    ],
+    "verdict": "INCONCLUSIVE (validity)"
+  },
+  "null_reruns": {
+    "procedure": "pre-registered after the first null failed: 2 more A/A, both must be <= 10%, no further reruns",
+    "runs": [
+      {
+        "run": "8-A_vs_A",
+        "reads": [
+          43976,
+          38264
+        ],
+        "spread": 0.13,
+        "fetch_p99_s": [
+          0.0229189395904541,
+          0.02611231803894043
+        ],
+        "loadavg_start": [
+          [
+            "2.89",
+            "4.60",
+            "4.52"
+          ],
+          [
+            "6.13",
+            "6.43",
+            "5.36"
+          ]
+        ]
+      },
+      {
+        "run": "9-A_vs_A",
+        "reads": [
+          43697,
+          39172
+        ],
+        "spread": 0.104,
+        "fetch_p99_s": [
+          0.022962331771850586,
+          0.02851247787475586
+        ],
+        "loadavg_start": [
+          [
+            "6.03",
+            "6.31",
+            "5.97"
+          ],
+          [
+            "7.99",
+            "8.14",
+            "6.94"
+          ]
+        ]
+      }
+    ],
+    "outcome": "both fail (13.0%, 10.4%): the soak verdict stays INCONCLUSIVE. In all three nulls the second v0.3.38 arm reads 10-14% less, so the smoke harness has an order effect for A-after-A"
+  },
+  "equal_send_rate_attribution": {
+    "rule": "br-kp1in.40 attribution (written 2026-10-13 ~13:30Z, after kp140d run 1 and before any run of this experiment).\n\nObservation that prompts it: in the closed-loop release-smoke soak, v0.3.39 (9404dba0) sends ~5x more than shipped\nv0.3.38 (171713fa) and serves ~0.31x the reads at ~6.8x the fetch p99 (run 1). Every soak send goes to reader B, so the\nfaster build grows B's inbox ~5x faster, and the inbox bench shows fetch_inbox cost grows with inbox size. The soak\ncannot tell \"reads got slower\" from \"the inbox got bigger faster\".\n\nExperiment: mixed_rate.py, soak-shaped (2 senders A->B, 2 closed-loop readers fetch_inbox(B, limit 20,\nmark_read false), 1 search loop, 1 Hz health), but the SENDERS ARE PACED at 4 sends/s total (open loop), identical for\nboth builds, so B's inbox grows identically. 300 s per run. Arms A = shipped v0.3.38 (171713fa), B = v0.3.39 candidate\n(9404dba0). Order: A B B A. Host lock; nothing else of mine on the host.\n\nValidity: every arm completes >= 95% of its scheduled sends (1,140 of 1,200), else the run is invalid (a build that\ncannot sustain 4/s is not at equal inbox size).\n\nDecision:\n  READS NOT SLOWER (the soak drop is the closed-loop confound): pooled B read count >= 0.90 x A and pooled B read p99\n    <= 1.5 x A. Then the bead's soak criterion measures send-rate-driven inbox growth; report that, keep the O(inbox)\n    fetch cost as its own issue (br-rkct2 for the shared read; the direct read gets a bead if its per-window latency\n    grows with sends_before).\n  READS SLOWER: either half fails. Then attribute inside the read (evidence-ledger phases) before any code change.\nPer-window read p50 vs sends_before is reported for both arms (cost vs inbox size).\n",
+    "harness": "mixed_rate.py (scratchpad): soak shape, senders paced at 4/s total, 2 closed-loop readers fetch_inbox(B, limit 20, mark_read false), 1 search loop, 1 Hz health, 300 s",
+    "runs": [
+      {
+        "run": "1-A",
+        "arm": "A",
+        "kinds": {
+          "send": {
+            "n_ok": 1200,
+            "n_err": 0,
+            "p50": 0.0838,
+            "p99": 0.2075,
+            "mean": 0.09611
+          },
+          "read": {
+            "n_ok": 82682,
+            "n_err": 0,
+            "p50": 0.0069,
+            "p99": 0.0136,
+            "mean": 0.00725
+          },
+          "search": {
+            "n_ok": 1073,
+            "n_err": 0,
+            "p50": 0.2694,
+            "p99": 0.5665,
+            "mean": 0.27963
+          },
+          "health": {
+            "n_ok": 276,
+            "n_err": 0,
+            "p50": 0.0741,
+            "p99": 0.3841,
+            "mean": 0.08903
+          }
+        },
+        "windows": [
+          {
+            "t": 0,
+            "sends_before": 0,
+            "read": {
+              "n": 14292,
+              "p50": 0.004,
+              "p99": 0.0054
+            }
+          },
+          {
+            "t": 30,
+            "sends_before": 120,
+            "read": {
+              "n": 11527,
+              "p50": 0.005,
+              "p99": 0.0067
+            }
+          },
+          {
+            "t": 60,
+            "sends_before": 240,
+            "read": {
+              "n": 9634,
+              "p50": 0.006,
+              "p99": 0.0084
+            }
+          },
+          {
+            "t": 90,
+            "sends_before": 360,
+            "read": {
+              "n": 8645,
+              "p50": 0.0068,
+              "p99": 0.0093
+            }
+          },
+          {
+            "t": 120,
+            "sends_before": 480,
+            "read": {
+              "n": 7805,
+              "p50": 0.0076,
+              "p99": 0.0102
+            }
+          },
+          {
+            "t": 150,
+            "sends_before": 600,
+            "read": {
+              "n": 6963,
+              "p50": 0.0085,
+              "p99": 0.0113
+            }
+          },
+          {
+            "t": 180,
+            "sends_before": 720,
+            "read": {
+              "n": 6623,
+              "p50": 0.0089,
+              "p99": 0.0122
+            }
+          },
+          {
+            "t": 210,
+            "sends_before": 840,
+            "read": {
+              "n": 6099,
+              "p50": 0.0097,
+              "p99": 0.0132
+            }
+          },
+          {
+            "t": 240,
+            "sends_before": 960,
+            "read": {
+              "n": 5794,
+              "p50": 0.0101,
+              "p99": 0.0144
+            }
+          },
+          {
+            "t": 270,
+            "sends_before": 1080,
+            "read": {
+              "n": 5300,
+              "p50": 0.011,
+              "p99": 0.0161
+            }
+          }
+        ]
+      },
+      {
+        "run": "2-B",
+        "arm": "B",
+        "kinds": {
+          "send": {
+            "n_ok": 1200,
+            "n_err": 0,
+            "p50": 0.0373,
+            "p99": 0.0935,
+            "mean": 0.03895
+          },
+          "read": {
+            "n_ok": 68656,
+            "n_err": 0,
+            "p50": 0.0082,
+            "p99": 0.0171,
+            "mean": 0.00873
+          },
+          "search": {
+            "n_ok": 1387,
+            "n_err": 0,
+            "p50": 0.2365,
+            "p99": 0.3401,
+            "mean": 0.21645
+          },
+          "health": {
+            "n_ok": 284,
+            "n_err": 0,
+            "p50": 0.0604,
+            "p99": 0.0848,
+            "mean": 0.05997
+          }
+        },
+        "windows": [
+          {
+            "t": 0,
+            "sends_before": 0,
+            "read": {
+              "n": 12256,
+              "p50": 0.0048,
+              "p99": 0.0063
+            }
+          },
+          {
+            "t": 30,
+            "sends_before": 120,
+            "read": {
+              "n": 9664,
+              "p50": 0.006,
+              "p99": 0.0082
+            }
+          },
+          {
+            "t": 60,
+            "sends_before": 240,
+            "read": {
+              "n": 8174,
+              "p50": 0.0072,
+              "p99": 0.0095
+            }
+          },
+          {
+            "t": 90,
+            "sends_before": 360,
+            "read": {
+              "n": 7125,
+              "p50": 0.0082,
+              "p99": 0.0113
+            }
+          },
+          {
+            "t": 120,
+            "sends_before": 480,
+            "read": {
+              "n": 6434,
+              "p50": 0.0091,
+              "p99": 0.0123
+            }
+          },
+          {
+            "t": 150,
+            "sends_before": 600,
+            "read": {
+              "n": 5949,
+              "p50": 0.0099,
+              "p99": 0.0136
+            }
+          },
+          {
+            "t": 180,
+            "sends_before": 720,
+            "read": {
+              "n": 5363,
+              "p50": 0.0109,
+              "p99": 0.0151
+            }
+          },
+          {
+            "t": 210,
+            "sends_before": 840,
+            "read": {
+              "n": 4920,
+              "p50": 0.0118,
+              "p99": 0.0165
+            }
+          },
+          {
+            "t": 240,
+            "sends_before": 960,
+            "read": {
+              "n": 4497,
+              "p50": 0.013,
+              "p99": 0.0183
+            }
+          },
+          {
+            "t": 270,
+            "sends_before": 1080,
+            "read": {
+              "n": 4273,
+              "p50": 0.0135,
+              "p99": 0.0194
+            }
+          }
+        ]
+      },
+      {
+        "run": "3-B",
+        "arm": "B",
+        "kinds": {
+          "send": {
+            "n_ok": 1200,
+            "n_err": 0,
+            "p50": 0.0374,
+            "p99": 0.0853,
+            "mean": 0.03876
+          },
+          "read": {
+            "n_ok": 69143,
+            "n_err": 0,
+            "p50": 0.0082,
+            "p99": 0.0168,
+            "mean": 0.00867
+          },
+          "search": {
+            "n_ok": 1340,
+            "n_err": 0,
+            "p50": 0.2409,
+            "p99": 0.3561,
+            "mean": 0.22402
+          },
+          "health": {
+            "n_ok": 283,
+            "n_err": 0,
+            "p50": 0.0612,
+            "p99": 0.0858,
+            "mean": 0.06026
+          }
+        },
+        "windows": [
+          {
+            "t": 0,
+            "sends_before": 0,
+            "read": {
+              "n": 12401,
+              "p50": 0.0047,
+              "p99": 0.0063
+            }
+          },
+          {
+            "t": 30,
+            "sends_before": 120,
+            "read": {
+              "n": 9699,
+              "p50": 0.0061,
+              "p99": 0.0079
+            }
+          },
+          {
+            "t": 60,
+            "sends_before": 240,
+            "read": {
+              "n": 8231,
+              "p50": 0.0071,
+              "p99": 0.0097
+            }
+          },
+          {
+            "t": 90,
+            "sends_before": 360,
+            "read": {
+              "n": 7232,
+              "p50": 0.0081,
+              "p99": 0.0107
+            }
+          },
+          {
+            "t": 120,
+            "sends_before": 480,
+            "read": {
+              "n": 6466,
+              "p50": 0.0091,
+              "p99": 0.0123
+            }
+          },
+          {
+            "t": 150,
+            "sends_before": 600,
+            "read": {
+              "n": 5931,
+              "p50": 0.0099,
+              "p99": 0.0134
+            }
+          },
+          {
+            "t": 180,
+            "sends_before": 720,
+            "read": {
+              "n": 5276,
+              "p50": 0.0109,
+              "p99": 0.0151
+            }
+          },
+          {
+            "t": 210,
+            "sends_before": 840,
+            "read": {
+              "n": 4970,
+              "p50": 0.0117,
+              "p99": 0.0161
+            }
+          },
+          {
+            "t": 240,
+            "sends_before": 960,
+            "read": {
+              "n": 4625,
+              "p50": 0.0124,
+              "p99": 0.018
+            }
+          },
+          {
+            "t": 270,
+            "sends_before": 1080,
+            "read": {
+              "n": 4312,
+              "p50": 0.0133,
+              "p99": 0.02
+            }
+          }
+        ]
+      },
+      {
+        "run": "4-A",
+        "arm": "A",
+        "kinds": {
+          "send": {
+            "n_ok": 1200,
+            "n_err": 0,
+            "p50": 0.0717,
+            "p99": 0.1254,
+            "mean": 0.07297
+          },
+          "read": {
+            "n_ok": 82537,
+            "n_err": 0,
+            "p50": 0.0069,
+            "p99": 0.0137,
+            "mean": 0.00726
+          },
+          "search": {
+            "n_ok": 1217,
+            "n_err": 0,
+            "p50": 0.2601,
+            "p99": 0.3906,
+            "mean": 0.2467
+          },
+          "health": {
+            "n_ok": 282,
+            "n_err": 0,
+            "p50": 0.0662,
+            "p99": 0.1048,
+            "mean": 0.06637
+          }
+        },
+        "windows": [
+          {
+            "t": 0,
+            "sends_before": 0,
+            "read": {
+              "n": 14490,
+              "p50": 0.004,
+              "p99": 0.0054
+            }
+          },
+          {
+            "t": 30,
+            "sends_before": 120,
+            "read": {
+              "n": 11661,
+              "p50": 0.005,
+              "p99": 0.0067
+            }
+          },
+          {
+            "t": 60,
+            "sends_before": 240,
+            "read": {
+              "n": 9541,
+              "p50": 0.006,
+              "p99": 0.008
+            }
+          },
+          {
+            "t": 90,
+            "sends_before": 360,
+            "read": {
+              "n": 8471,
+              "p50": 0.0069,
+              "p99": 0.0091
+            }
+          },
+          {
+            "t": 120,
+            "sends_before": 480,
+            "read": {
+              "n": 7694,
+              "p50": 0.0077,
+              "p99": 0.0098
+            }
+          },
+          {
+            "t": 150,
+            "sends_before": 600,
+            "read": {
+              "n": 7114,
+              "p50": 0.0083,
+              "p99": 0.0112
+            }
+          },
+          {
+            "t": 180,
+            "sends_before": 720,
+            "read": {
+              "n": 6480,
+              "p50": 0.0089,
+              "p99": 0.0128
+            }
+          },
+          {
+            "t": 210,
+            "sends_before": 840,
+            "read": {
+              "n": 6112,
+              "p50": 0.0096,
+              "p99": 0.0132
+            }
+          },
+          {
+            "t": 240,
+            "sends_before": 960,
+            "read": {
+              "n": 5689,
+              "p50": 0.0103,
+              "p99": 0.0143
+            }
+          },
+          {
+            "t": 270,
+            "sends_before": 1080,
+            "read": {
+              "n": 5285,
+              "p50": 0.0111,
+              "p99": 0.0153
+            }
+          }
+        ]
+      }
+    ],
+    "pooled": {
+      "reads_B_over_A": 0.834,
+      "read_p50_B_over_A": 1.185,
+      "read_p99_B_over_A": 1.24
+    },
+    "validity": "every run completed 1200/1200 scheduled sends",
+    "verdict": "READS SLOWER: at equal send rate v0.3.39 serves 0.834x the reads (p50 1.19x, p99 1.24x); the per-window ratio is ~1.2x at every inbox size, so it is a per-call overhead, not scaling"
+  },
+  "interpretation": [
+    "The soak's ~0.31x reads (6/6 pairs 0.304-0.329, p99 5.5-9.4x) is mostly the closed-loop confound: v0.3.39 sends ~5x more, every soak send lands in reader B's inbox, and fetch_inbox cost grows with the recipients table.",
+    "At an equal 4 sends/s a real per-call read slowdown remains: 0.834x reads, p50 1.19x, p99 1.24x.",
+    "Both versions' read p50 grows ~6.5 us per stored message (per-window data): FrankenSQLite plans the inbox join as SCAN message_recipients (no agent index), so fetch_inbox is O(whole recipients table). Not a v0.3.39 regression; the dominant scalability gap (own bead).",
+    "Prime suspect for the per-call ~17%: the GH#282 shared-mailbox join every fetch runs since v0.3.38 (~10% of a fetch in the inbox bench even with no deliveries); a one-row probe skips it (pending commit). Not yet measured in this harness."
+  ]
+}
