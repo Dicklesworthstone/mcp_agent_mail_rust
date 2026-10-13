@@ -151,6 +151,7 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
 /// cancels this call's publication, including critical reservation actions; their
 /// optional-mail exemption is not permission to cross a planning reset.
 /// Reports superseded at admission by a newer tick are discarded as well.
+/// Population authority is revalidated at admission, not just during planning.
 #[must_use]
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     let epoch = capture_delivery_epoch()?;
@@ -194,6 +195,10 @@ fn admit_report_with_activity(
                 .or_insert_with(|| last_activity(&effect.agent));
         }
     }
+    // Match reset's hydration -> delivery order. Keep population authority
+    // stable from revalidation through admission; a refresh alone can revoke
+    // targets even when no newer tick has reached the delivery boundary.
+    let mut population_scope = population::lock_report_scope();
     let mut state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -202,6 +207,9 @@ fn admit_report_with_activity(
         // a newer tick's summary. Another caller may have admitted that tick
         // while this one sampled activity without holding the admission lock.
         // Critical effects bypass optional-mail limits, never report ordering.
+        return None;
+    }
+    if !population_scope.revalidate(&mut report, now_micros) {
         return None;
     }
     if state.last_tick_count == Some(report.summary.tick_count) {
@@ -234,8 +242,9 @@ fn admit_report_with_activity(
     state.last_effect_count = report.effects.len();
     let after = state.admission.stats();
     drop(state);
-    // Subscribers may inspect delivery metrics. Never invoke them under the
-    // admission mutex, including the first capacity warning.
+    drop(population_scope);
+    // Subscribers may inspect delivery and population metrics. Never invoke
+    // them under either mutex, including the first capacity warning.
     if before.capacity_suppressed == 0 && after.capacity_suppressed > 0 {
         tracing::warn!(
             tracked_keys = after.tracked_keys,
