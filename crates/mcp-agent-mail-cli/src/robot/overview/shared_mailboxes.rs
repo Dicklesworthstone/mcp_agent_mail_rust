@@ -102,7 +102,10 @@ fn failed(message: &str) -> CliError {
 /// merely starts with the pair or is unique only with an additional column.
 fn pair_index(conn: &DbConn, table: &str) -> Result<Option<String>, CliError> {
     let indexes = conn
-        .query_sync(&format!("PRAGMA index_list({})", quoted_identifier(table)), &[])
+        .query_sync(
+            &format!("PRAGMA index_list({})", quoted_identifier(table)),
+            &[],
+        )
         .map_err(|error| failed(&format!("index probe failed: {error}")))?;
     for index in indexes {
         if index.get_by_name("unique").and_then(Value::as_i64) != Some(1)
@@ -114,15 +117,20 @@ fn pair_index(conn: &DbConn, table: &str) -> Result<Option<String>, CliError> {
             continue;
         };
         let columns = conn
-            .query_sync(&format!("PRAGMA index_info({})", quoted_identifier(&name)), &[])
+            .query_sync(
+                &format!("PRAGMA index_info({})", quoted_identifier(&name)),
+                &[],
+            )
             .map_err(|error| failed(&format!("index columns failed: {error}")))?;
         if columns.len() == 2
-            && [(0, "message_id"), (1, "agent_id")].iter().all(|(position, expected)| {
-                columns.iter().any(|column| {
-                    column.get_by_name("seqno").and_then(Value::as_i64) == Some(*position)
-                        && column.get_named::<String>("name").ok().as_deref() == Some(*expected)
+            && [(0, "message_id"), (1, "agent_id")]
+                .iter()
+                .all(|(position, expected)| {
+                    columns.iter().any(|column| {
+                        column.get_by_name("seqno").and_then(Value::as_i64) == Some(*position)
+                            && column.get_named::<String>("name").ok().as_deref() == Some(*expected)
+                    })
                 })
-            })
         {
             return Ok(Some(name));
         }
@@ -157,16 +165,21 @@ impl Population {
                 // A project already over the cap cannot benefit from another
                 // scan of that project. This is a lower bound from real rows,
                 // not a guess about the unvisited population.
-                let mut sizes: HashMap<_, _> = inception.iter()
-                    .map(|(id, times)| (*id, times.len())).collect();
+                let mut sizes: HashMap<_, _> = inception
+                    .iter()
+                    .map(|(id, times)| (*id, times.len()))
+                    .collect();
                 for row in &rows {
                     *sizes.entry(integer(row, "project_id")?).or_default() += 1;
                 }
-                let oversized_projects = sizes.into_iter()
+                let oversized_projects = sizes
+                    .into_iter()
                     .filter_map(|(id, size)| (size > MAX_SHARED_VIEWERS).then_some(id))
                     .collect();
                 return Ok(PopulationLoad::Overflow {
-                    direct_index, receipt_index, oversized_projects,
+                    direct_index,
+                    receipt_index,
+                    oversized_projects,
                 });
             }
             for row in &rows {
@@ -179,7 +192,10 @@ impl Population {
                     project_id: integer(row, "project_id")?,
                     inception_ts: integer(row, "inception_ts")?,
                 };
-                inception.entry(viewer.project_id).or_default().push(viewer.inception_ts);
+                inception
+                    .entry(viewer.project_id)
+                    .or_default()
+                    .push(viewer.inception_ts);
                 viewers.insert(id, viewer);
             }
             if rows.len() < OVERVIEW_PAGE_ROWS {
@@ -189,7 +205,12 @@ impl Population {
         for times in inception.values_mut() {
             times.sort_unstable();
         }
-        Ok(PopulationLoad::Ready(Self { viewers, inception, direct_index, receipt_index }))
+        Ok(PopulationLoad::Ready(Self {
+            viewers,
+            inception,
+            direct_index,
+            receipt_index,
+        }))
     }
 
     fn eligible(&self, agent_id: i64, delta: &Delta) -> bool {
@@ -210,7 +231,10 @@ impl Population {
         let mut ids = Vec::with_capacity(deliveries.len());
         for row in deliveries {
             let id = integer(row, "id")?;
-            if delivery_projects.insert(id, integer(row, "project_id")?).is_some() {
+            if delivery_projects
+                .insert(id, integer(row, "project_id")?)
+                .is_some()
+            {
                 return Err(failed("received duplicate delivery ids"));
             }
             ids.push(id);
@@ -222,24 +246,40 @@ impl Population {
         let params: Vec<_> = ids.iter().copied().map(Value::BigInt).collect();
         // One sentinel row fits in the existing page budget. Exactly a full
         // page is inconclusive, even if it happens to be the entire result.
-        let direct = bounded_query(conn, &format!(
-            "{DIRECT_SQL} INDEXED BY {} WHERE message_id IN ({marks}) \
+        let direct = bounded_query(
+            conn,
+            &format!(
+                "{DIRECT_SQL} INDEXED BY {} WHERE message_id IN ({marks}) \
              AND ({DIRECT_FILTER}) LIMIT {OVERVIEW_PAGE_ROWS}",
-            quoted_identifier(&self.direct_index),
-        ), &params, work)?;
+                quoted_identifier(&self.direct_index),
+            ),
+            &params,
+            work,
+        )?;
         if direct.len() == OVERVIEW_PAGE_ROWS {
             return Ok(None);
         }
-        let receipts = bounded_query(conn, &format!(
-            "{RECEIPTS_SQL} INDEXED BY {} WHERE message_id IN ({marks}) \
+        let receipts = bounded_query(
+            conn,
+            &format!(
+                "{RECEIPTS_SQL} INDEXED BY {} WHERE message_id IN ({marks}) \
              AND ({RECEIPTS_FILTER}) LIMIT {OVERVIEW_PAGE_ROWS}",
-            quoted_identifier(&self.receipt_index),
-        ), &params, work)?;
+                quoted_identifier(&self.receipt_index),
+            ),
+            &params,
+            work,
+        )?;
         if receipts.len() == OVERVIEW_PAGE_ROWS {
             return Ok(None);
         }
-        let metadata = lookup_ids(conn, SHARED_MESSAGES_SQL, "id",
-            &[Value::BigInt(threshold)], &ids, work)?;
+        let metadata = lookup_ids(
+            conn,
+            SHARED_MESSAGES_SQL,
+            "id",
+            &[Value::BigInt(threshold)],
+            &ids,
+            work,
+        )?;
         let mut deltas = HashMap::with_capacity(metadata.len());
         for row in metadata {
             let id = integer(&row, "id")?;
@@ -262,18 +302,26 @@ impl Population {
                 }
                 continue;
             };
-            let population = self.inception.get(&project_id)
+            let population = self
+                .inception
+                .get(&project_id)
                 .map_or(0, |times| times.partition_point(|time| *time <= created_ts));
             let mut delta = Delta {
-                project_id, sender_id, created_ts,
+                project_id,
+                sender_id,
+                created_ts,
                 urgent: integer(&row, "urgent")? != 0,
                 overdue: integer(&row, "overdue")? != 0,
-                unread: population, unacked: population,
+                unread: population,
+                unacked: population,
             };
             if self.viewers.get(&sender_id).is_some_and(|viewer| {
                 viewer.project_id == project_id && viewer.inception_ts <= created_ts
             }) {
-                delta.unread = delta.unread.checked_sub(1).ok_or_else(|| failed("sender underflow"))?;
+                delta.unread = delta
+                    .unread
+                    .checked_sub(1)
+                    .ok_or_else(|| failed("sender underflow"))?;
                 delta.unacked = delta.unread;
             }
             deltas.insert(id, delta);
@@ -284,11 +332,11 @@ impl Population {
             if !direct_pairs.insert(pair) {
                 return Err(failed("duplicate direct pair in a unique index"));
             }
-            if let Some(delta) = deltas.get_mut(&pair.0) {
-                if self.eligible(pair.1, delta) {
-                    subtract(&mut delta.unread, true)?;
-                    subtract(&mut delta.unacked, true)?;
-                }
+            if let Some(delta) = deltas.get_mut(&pair.0)
+                && self.eligible(pair.1, delta)
+            {
+                subtract(&mut delta.unread, true)?;
+                subtract(&mut delta.unacked, true)?;
             }
         }
         for row in receipts {
@@ -296,11 +344,11 @@ impl Population {
             if direct_pairs.contains(&pair) {
                 continue; // Direct delivery always wins, regardless of its state.
             }
-            if let Some(delta) = deltas.get_mut(&pair.0) {
-                if self.eligible(pair.1, delta) {
-                    subtract(&mut delta.unread, integer(&row, "read_set")? != 0)?;
-                    subtract(&mut delta.unacked, integer(&row, "ack_set")? != 0)?;
-                }
+            if let Some(delta) = deltas.get_mut(&pair.0)
+                && self.eligible(pair.1, delta)
+            {
+                subtract(&mut delta.unread, integer(&row, "read_set")? != 0)?;
+                subtract(&mut delta.unacked, integer(&row, "ack_set")? != 0)?;
             }
         }
         Ok(Some(deltas.into_values().collect()))
@@ -317,16 +365,17 @@ impl ScopedPopulation {
         if deliveries.is_empty() || deliveries.len() > OVERVIEW_PAGE_ROWS {
             return Err(failed("received an invalid scoped delivery page"));
         }
-        let scope: HashSet<_> = deliveries.iter()
+        let scope: HashSet<_> = deliveries
+            .iter()
             .map(|row| integer(row, "project_id"))
             .collect::<Result<_, _>>()?;
         if !scope.is_disjoint(&self.oversized_projects) {
             return Ok(None);
         }
-        if let Some(previous) = &self.attempted_scope {
-            if (self.population.is_some() && scope.is_subset(previous)) || scope == *previous {
-                return Ok(self.population.as_ref());
-            }
+        if let Some(previous) = &self.attempted_scope
+            && ((self.population.is_some() && scope.is_subset(previous)) || scope == *previous)
+        {
+            return Ok(self.population.as_ref());
         }
         if self.loads_left == 0 {
             return Ok(None);
@@ -375,7 +424,9 @@ impl ScopedPopulation {
                     if integer(row, "project_id")? != project_id
                         || after.is_some_and(|previous| id <= previous)
                     {
-                        return Err(failed("scoped viewer cursor did not advance within its project"));
+                        return Err(failed(
+                            "scoped viewer cursor did not advance within its project",
+                        ));
                     }
                     after = Some(id);
                     let viewer = Viewer {
@@ -385,7 +436,10 @@ impl ScopedPopulation {
                     if viewers.insert(id, viewer).is_some() {
                         return Err(failed("duplicate scoped viewer id"));
                     }
-                    inception.entry(project_id).or_default().push(viewer.inception_ts);
+                    inception
+                        .entry(project_id)
+                        .or_default()
+                        .push(viewer.inception_ts);
                 }
                 if rows.len() < OVERVIEW_PAGE_ROWS {
                     break;
@@ -396,7 +450,8 @@ impl ScopedPopulation {
             times.sort_unstable();
         }
         Ok(Some(Population {
-            viewers, inception,
+            viewers,
+            inception,
             direct_index: self.direct_index.clone(),
             receipt_index: self.receipt_index.clone(),
         }))
@@ -405,7 +460,9 @@ impl ScopedPopulation {
 
 fn subtract(total: &mut usize, settled: bool) -> Result<(), CliError> {
     if settled {
-        *total = total.checked_sub(1).ok_or_else(|| failed("correction underflow"))?;
+        *total = total
+            .checked_sub(1)
+            .ok_or_else(|| failed("correction underflow"))?;
     }
     Ok(())
 }
@@ -415,12 +472,20 @@ impl Collector {
         match Population::load(conn, work)? {
             PopulationLoad::Ready(population) => Ok(State::Ready(population)),
             PopulationLoad::Unavailable => Ok(State::Disabled),
-            PopulationLoad::Overflow { direct_index, receipt_index, oversized_projects } => {
-                let Some(agent_index) = full_index_with_prefix(conn, "agents", &["project_id"])? else {
+            PopulationLoad::Overflow {
+                direct_index,
+                receipt_index,
+                oversized_projects,
+            } => {
+                let Some(agent_index) = full_index_with_prefix(conn, "agents", &["project_id"])?
+                else {
                     return Ok(State::Disabled);
                 };
                 Ok(State::Scoped(ScopedPopulation {
-                    agent_index, direct_index, receipt_index, oversized_projects,
+                    agent_index,
+                    direct_index,
+                    receipt_index,
+                    oversized_projects,
                     attempted_scope: None,
                     population: None,
                     loads_left: MAX_SCOPED_POPULATION_LOADS,
@@ -470,7 +535,9 @@ impl Collector {
                 (&mut counts.urgent, urgent),
                 (&mut counts.ack_overdue, overdue),
             ] {
-                *total = total.checked_add(add).ok_or_else(|| failed("counter overflow"))?;
+                *total = total
+                    .checked_add(add)
+                    .ok_or_else(|| failed("counter overflow"))?;
             }
         }
         Ok(true)
@@ -513,16 +580,30 @@ mod tests {
         execute(conn, "BEGIN");
         for start in (1..=viewers).step_by(OVERVIEW_PAGE_ROWS) {
             let rows: Vec<_> = (start..=(start + OVERVIEW_PAGE_ROWS - 1).min(viewers))
-                .map(|id| format!("({id},1,0,NULL,'auto')")).collect();
-            execute(conn, &format!("INSERT INTO agents VALUES {}", rows.join(",")));
+                .map(|id| format!("({id},1,0,NULL,'auto')"))
+                .collect();
+            execute(
+                conn,
+                &format!("INSERT INTO agents VALUES {}", rows.join(",")),
+            );
         }
         for start in (1..=messages).step_by(OVERVIEW_PAGE_ROWS) {
             let end = (start + OVERVIEW_PAGE_ROWS - 1).min(messages);
             let rows: Vec<_> = (start..=end)
-                .map(|id| format!("({id},1,1,{SENT},'high',1)")).collect();
-            execute(conn, &format!("INSERT INTO messages VALUES {}", rows.join(",")));
+                .map(|id| format!("({id},1,1,{SENT},'high',1)"))
+                .collect();
+            execute(
+                conn,
+                &format!("INSERT INTO messages VALUES {}", rows.join(",")),
+            );
             let deliveries: Vec<_> = (start..=end).map(|id| format!("({id},1)")).collect();
-            execute(conn, &format!("INSERT INTO project_mailbox_deliveries VALUES {}", deliveries.join(",")));
+            execute(
+                conn,
+                &format!(
+                    "INSERT INTO project_mailbox_deliveries VALUES {}",
+                    deliveries.join(",")
+                ),
+            );
         }
         execute(conn, "COMMIT");
     }
@@ -537,21 +618,32 @@ mod tests {
                 || ("", Vec::new()),
                 |id| ("WHERE message_id > ?", vec![Value::BigInt(id)]),
             );
-            let page: Vec<_> = conn.query_sync(&format!(
-                "SELECT message_id AS id FROM project_mailbox_deliveries \
+            let page: Vec<_> = conn
+                .query_sync(
+                    &format!(
+                        "SELECT message_id AS id FROM project_mailbox_deliveries \
                  {predicate} ORDER BY message_id LIMIT {OVERVIEW_PAGE_ROWS}"
-            ), &params).unwrap().iter().map(|row| integer(row, "id").unwrap()).collect();
+                    ),
+                    &params,
+                )
+                .unwrap()
+                .iter()
+                .map(|row| integer(row, "id").unwrap())
+                .collect();
             if page.is_empty() {
                 break;
             }
             let (sql, params) = mcp_agent_mail_db::project_mailbox::overview_counts_query(
-                &page, micros_ago(NOW, ACK_OVERDUE_THRESHOLD_US),
-            ).unwrap();
+                &page,
+                micros_ago(NOW, ACK_OVERDUE_THRESHOLD_US),
+            )
+            .unwrap();
             for row in conn.query_sync(&sql, &params).unwrap() {
                 let count = project(&mut projects, integer(&row, "project_id").unwrap());
                 count.unread += usize::try_from(integer(&row, "unread").unwrap()).unwrap();
                 count.urgent += usize::try_from(integer(&row, "urgent").unwrap()).unwrap();
-                count.ack_overdue += usize::try_from(integer(&row, "ack_overdue").unwrap()).unwrap();
+                count.ack_overdue +=
+                    usize::try_from(integer(&row, "ack_overdue").unwrap()).unwrap();
             }
             if page.len() < OVERVIEW_PAGE_ROWS {
                 break;
@@ -583,37 +675,63 @@ mod tests {
         let (actual, work) = optimized(&conn);
         assert_eq!(actual, expected);
         assert_eq!(actual["1"]["unread"], 199 * (OVERVIEW_PAGE_ROWS * 2 + 1));
-        assert_eq!(work.project_mailbox_message_rows, OVERVIEW_PAGE_ROWS * 2 + 1);
-        assert!(conn.query_sync("SELECT * FROM message_recipients", &[]).unwrap().is_empty());
-        assert!(conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap().is_empty());
+        assert_eq!(
+            work.project_mailbox_message_rows,
+            OVERVIEW_PAGE_ROWS * 2 + 1
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM message_recipients", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM project_mailbox_receipts", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn shared_policy_and_receipt_corrections_match_the_canonical_visibility_query() {
         let (_dir, conn) = fixture();
         seed(&conn, 12, 3);
-        execute(&conn, "UPDATE agents SET contact_policy='BlOcK_AlL' WHERE id=3");
+        execute(
+            &conn,
+            "UPDATE agents SET contact_policy='BlOcK_AlL' WHERE id=3",
+        );
         execute(&conn, "UPDATE agents SET retired_at=0 WHERE id=4");
-        execute(&conn, &format!("UPDATE agents SET inception_ts={} WHERE id=5", SENT + 1));
-        execute(&conn, &format!("UPDATE agents SET inception_ts={SENT} WHERE id=6"));
+        execute(
+            &conn,
+            &format!("UPDATE agents SET inception_ts={} WHERE id=5", SENT + 1),
+        );
+        execute(
+            &conn,
+            &format!("UPDATE agents SET inception_ts={SENT} WHERE id=6"),
+        );
         execute(&conn, "UPDATE agents SET inception_ts=NULL WHERE id=7");
         execute(&conn, "UPDATE agents SET project_id=2 WHERE id=8");
         execute(&conn, "UPDATE agents SET contact_policy=NULL WHERE id=9");
-        execute(&conn, "INSERT INTO message_recipients VALUES (1,2,NULL,NULL), (2,2,0,0)");
-        execute(&conn, "INSERT INTO project_mailbox_receipts VALUES
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES (1,2,NULL,NULL), (2,2,0,0)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO project_mailbox_receipts VALUES
             (1,1,0,0), (1,2,0,0), (1,3,0,0), (1,4,0,0), (1,5,0,0),
             (1,8,0,0), (1,999,0,0), (1,9,0,NULL), (1,10,NULL,0),
-            (2,9,NULL,NULL), (2,10,0,0)");
+            (2,9,NULL,NULL), (2,10,0,0)",
+        );
         assert_eq!(optimized(&conn).0, canonical(&conn));
         let (full, _) = build_at(&conn, NOW).unwrap();
-        let counts: serde_json::Value = serde_json::from_str(&build_counts_output(&conn, OutputFormat::Json).unwrap()).unwrap();
+        let counts: serde_json::Value =
+            serde_json::from_str(&build_counts_output(&conn, OutputFormat::Json).unwrap()).unwrap();
         assert_eq!(counts["project_count"], full.len());
         let alpha = full.iter().find(|row| row.slug == "alpha").unwrap();
         // The direct unread row is counted once by the direct phase, not again
         // by the virtual delivery despite an independent shared receipt.
-        let shared_unread = usize::try_from(
-            optimized(&conn).0["1"]["unread"].as_u64().unwrap(),
-        ).unwrap();
+        let shared_unread =
+            usize::try_from(optimized(&conn).0["1"]["unread"].as_u64().unwrap()).unwrap();
         assert_eq!(alpha.unread, shared_unread + 1);
     }
 
@@ -621,15 +739,54 @@ mod tests {
     fn strict_send_and_overdue_boundaries_orphans_and_dangling_rows_are_preserved() {
         let (_dir, conn) = fixture();
         seed(&conn, 2, 3);
-        execute(&conn, &format!("UPDATE messages SET created_ts={} WHERE id=1", NOW - ACK_OVERDUE_THRESHOLD_US));
-        execute(&conn, "UPDATE messages SET importance='URGENT', ack_required=2 WHERE id=2");
-        execute(&conn, "UPDATE project_mailbox_deliveries SET project_id=77 WHERE message_id=3");
-        execute(&conn, "INSERT INTO project_mailbox_deliveries VALUES (999,1)");
+        execute(
+            &conn,
+            &format!(
+                "UPDATE messages SET created_ts={} WHERE id=1",
+                NOW - ACK_OVERDUE_THRESHOLD_US
+            ),
+        );
+        execute(
+            &conn,
+            "UPDATE messages SET importance='URGENT', ack_required=2 WHERE id=2",
+        );
+        execute(
+            &conn,
+            "UPDATE project_mailbox_deliveries SET project_id=77 WHERE message_id=3",
+        );
+        execute(
+            &conn,
+            "INSERT INTO project_mailbox_deliveries VALUES (999,1)",
+        );
         execute(&conn, "INSERT INTO agents VALUES (99,88,0,NULL,'auto')");
-        execute(&conn, &format!("INSERT INTO messages VALUES ({},88,999,{SENT},'urgent',1)", i64::MIN));
-        execute(&conn, &format!("INSERT INTO project_mailbox_deliveries VALUES ({},88)", i64::MIN));
-        execute(&conn, &format!("INSERT INTO messages VALUES ({},1,1,{SENT},'urgent',1)", i64::MAX));
-        execute(&conn, &format!("INSERT INTO project_mailbox_deliveries VALUES ({},1)", i64::MAX));
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO messages VALUES ({},88,999,{SENT},'urgent',1)",
+                i64::MIN
+            ),
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO project_mailbox_deliveries VALUES ({},88)",
+                i64::MIN
+            ),
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO messages VALUES ({},1,1,{SENT},'urgent',1)",
+                i64::MAX
+            ),
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO project_mailbox_deliveries VALUES ({},1)",
+                i64::MAX
+            ),
+        );
         assert_eq!(optimized(&conn).0, canonical(&conn));
         assert_eq!(optimized(&conn).0["88"]["ack_overdue"], 1);
     }
@@ -652,11 +809,34 @@ mod tests {
             let mut collector = Collector::default();
             let mut projects = HashMap::new();
             let mut work = ScanWork::default();
-            assert!(!collector.try_page(&conn, &first_page(&conn), SENT + 1, &mut projects, &mut work).unwrap());
+            assert!(
+                !collector
+                    .try_page(
+                        &conn,
+                        &first_page(&conn),
+                        SENT + 1,
+                        &mut projects,
+                        &mut work
+                    )
+                    .unwrap()
+            );
             assert!(projects.is_empty());
             let queries = work.queries;
-            assert!(!collector.try_page(&conn, &first_page(&conn), SENT + 1, &mut projects, &mut work).unwrap());
-            assert_eq!(work.queries, queries, "dense fallback must not repeat probes");
+            assert!(
+                !collector
+                    .try_page(
+                        &conn,
+                        &first_page(&conn),
+                        SENT + 1,
+                        &mut projects,
+                        &mut work
+                    )
+                    .unwrap()
+            );
+            assert_eq!(
+                work.queries, queries,
+                "dense fallback must not repeat probes"
+            );
             assert_eq!(optimized(&conn).0, canonical(&conn));
         }
     }
@@ -668,7 +848,17 @@ mod tests {
         let mut collector = Collector::default();
         let mut projects = HashMap::new();
         let mut work = ScanWork::default();
-        assert!(!collector.try_page(&conn, &first_page(&conn), SENT + 1, &mut projects, &mut work).unwrap());
+        assert!(
+            !collector
+                .try_page(
+                    &conn,
+                    &first_page(&conn),
+                    SENT + 1,
+                    &mut projects,
+                    &mut work
+                )
+                .unwrap()
+        );
         assert!(projects.is_empty());
         assert_eq!(optimized(&conn).0, canonical(&conn));
         assert_eq!(optimized(&conn).0["1"]["unread"], MAX_SHARED_VIEWERS);
@@ -682,7 +872,10 @@ mod tests {
             "CREATE UNIQUE INDEX pair ON exceptions(message_id,agent_id,other)",
         ] {
             let (_dir, conn) = fixture();
-            execute(&conn, "CREATE TABLE exceptions (message_id INTEGER, agent_id INTEGER, other INTEGER)");
+            execute(
+                &conn,
+                "CREATE TABLE exceptions (message_id INTEGER, agent_id INTEGER, other INTEGER)",
+            );
             execute(&conn, ddl);
             assert!(pair_index(&conn, "exceptions").unwrap().is_none());
         }
@@ -693,17 +886,36 @@ mod tests {
         let (_dir, conn) = fixture();
         seed(&conn, 3, 2);
         execute(&conn, "BEGIN");
-        execute(&conn, "UPDATE agents SET contact_policy='block_all' WHERE id=2");
+        execute(
+            &conn,
+            "UPDATE agents SET contact_policy='block_all' WHERE id=2",
+        );
         let inside = build_at(&conn, NOW).unwrap().0;
-        assert_eq!(inside.iter().find(|row| row.slug=="alpha").unwrap().unread, 2);
+        assert_eq!(
+            inside
+                .iter()
+                .find(|row| row.slug == "alpha")
+                .unwrap()
+                .unread,
+            2
+        );
         execute(&conn, "ROLLBACK");
         execute(&conn, "PRAGMA query_only=ON");
         assert_eq!(optimized(&conn).0, canonical(&conn));
         execute(&conn, "PRAGMA query_only=OFF");
-        execute(&conn, "ALTER TABLE project_mailbox_receipts RENAME COLUMN read_ts TO broken");
+        execute(
+            &conn,
+            "ALTER TABLE project_mailbox_receipts RENAME COLUMN read_ts TO broken",
+        );
         assert!(build_at(&conn, NOW).is_err());
-        assert!(conn.execute_sync("RELEASE robot_overview_read", &[]).is_err());
-        execute(&conn, "ALTER TABLE project_mailbox_receipts RENAME COLUMN broken TO read_ts");
+        assert!(
+            conn.execute_sync("RELEASE robot_overview_read", &[])
+                .is_err()
+        );
+        execute(
+            &conn,
+            "ALTER TABLE project_mailbox_receipts RENAME COLUMN broken TO read_ts",
+        );
         assert_eq!(optimized(&conn).0, canonical(&conn));
     }
 
@@ -713,7 +925,10 @@ mod tests {
             let (_dir, conn) = fixture();
             execute(&conn, &format!("DROP TABLE {absent}"));
             assert!(build_at(&conn, NOW).is_err());
-            assert!(conn.execute_sync("RELEASE robot_overview_read", &[]).is_err());
+            assert!(
+                conn.execute_sync("RELEASE robot_overview_read", &[])
+                    .is_err()
+            );
         }
     }
 
@@ -723,17 +938,31 @@ mod tests {
         seed(&conn, 3, 1);
         // SQLite UNIQUE pairs can contain duplicate NULLs. The canonical
         // viewer join excludes them; they cannot become receipt corrections.
-        execute(&conn, "INSERT INTO message_recipients VALUES
-            (1,NULL,NULL,NULL), (1,NULL,0,0)");
-        execute(&conn, "INSERT INTO project_mailbox_receipts VALUES
-            (1,NULL,0,0), (1,NULL,0,NULL), (NULL,2,0,0)");
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES
+            (1,NULL,NULL,NULL), (1,NULL,0,0)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO project_mailbox_receipts VALUES
+            (1,NULL,0,0), (1,NULL,0,NULL), (NULL,2,0,0)",
+        );
         assert_eq!(optimized(&conn).0, canonical(&conn));
         assert_eq!(optimized(&conn).0["1"]["unread"], 2);
         let mut projects = HashMap::new();
         let mut work = ScanWork::default();
-        assert!(Collector::default().try_page(
-            &conn, &first_page(&conn), SENT + 1, &mut projects, &mut work,
-        ).unwrap());
+        assert!(
+            Collector::default()
+                .try_page(
+                    &conn,
+                    &first_page(&conn),
+                    SENT + 1,
+                    &mut projects,
+                    &mut work,
+                )
+                .unwrap()
+        );
     }
 
     #[test]
@@ -742,16 +971,29 @@ mod tests {
         execute(&reader, "PRAGMA journal_mode=WAL");
         seed(&reader, 3, 1);
         let expected = canonical(&reader);
-        let writer = DbConn::open_file(dir.path().join("shared.sqlite3").to_str().unwrap()).unwrap();
+        let writer =
+            DbConn::open_file(dir.path().join("shared.sqlite3").to_str().unwrap()).unwrap();
         execute(&writer, "PRAGMA busy_timeout=1000");
         execute(&reader, "SAVEPOINT shared_test");
         let mut work = ScanWork::default();
         let state = Collector::prepare(&reader, &mut work).unwrap();
-        execute(&writer, "INSERT INTO project_mailbox_receipts VALUES (1,2,0,0)");
-        execute(&writer, "UPDATE agents SET contact_policy='block_all' WHERE id=3");
+        execute(
+            &writer,
+            "INSERT INTO project_mailbox_receipts VALUES (1,2,0,0)",
+        );
+        execute(
+            &writer,
+            "UPDATE agents SET contact_policy='block_all' WHERE id=3",
+        );
         let mut collector = Collector { state };
         let mut projects = HashMap::new();
-        let result = collector.try_page(&reader, &first_page(&reader), SENT + 1, &mut projects, &mut work);
+        let result = collector.try_page(
+            &reader,
+            &first_page(&reader),
+            SENT + 1,
+            &mut projects,
+            &mut work,
+        );
         execute(&reader, "RELEASE shared_test");
         assert!(result.unwrap());
         assert_eq!(serde_json::to_value(projects).unwrap(), expected);
@@ -770,7 +1012,11 @@ mod tests {
             for optimized_first in [iteration % 2 == 0, iteration % 2 != 0] {
                 execute(&conn, "SAVEPOINT shared_benchmark");
                 let started = Instant::now();
-                let actual = if optimized_first { optimized(&conn).0 } else { canonical(&conn) };
+                let actual = if optimized_first {
+                    optimized(&conn).0
+                } else {
+                    canonical(&conn)
+                };
                 let elapsed = started.elapsed();
                 execute(&conn, "RELEASE shared_benchmark");
                 assert_eq!(actual, expected);
@@ -778,7 +1024,10 @@ mod tests {
             }
         }
         times.iter_mut().for_each(|values| values.sort_unstable());
-        eprintln!("native shared phase, 1024 deliveries, 200 agents: canonical={:?}, population={:?}", times[0][3], times[1][3]);
+        eprintln!(
+            "native shared phase, 1024 deliveries, 200 agents: canonical={:?}, population={:?}",
+            times[0][3], times[1][3]
+        );
     }
 
     fn seed_unrelated(conn: &DbConn) {
@@ -786,8 +1035,12 @@ mod tests {
         for start in (1..=MAX_SHARED_VIEWERS + 1).step_by(OVERVIEW_PAGE_ROWS) {
             let end = (start + OVERVIEW_PAGE_ROWS - 1).min(MAX_SHARED_VIEWERS + 1);
             let rows: Vec<_> = (start..=end)
-                .map(|id| format!("({},999,0,NULL,'auto')", 100_000 + id)).collect();
-            execute(conn, &format!("INSERT INTO agents VALUES {}", rows.join(",")));
+                .map(|id| format!("({},999,0,NULL,'auto')", 100_000 + id))
+                .collect();
+            execute(
+                conn,
+                &format!("INSERT INTO agents VALUES {}", rows.join(",")),
+            );
         }
         execute(conn, "COMMIT");
     }
@@ -807,15 +1060,32 @@ mod tests {
         let mut collector = Collector::default();
         let mut counts = HashMap::new();
         let mut work = ScanWork::default();
-        assert!(collector.try_page(&conn, &first_page(&conn), SENT + 1, &mut counts, &mut work).unwrap());
-        let State::Scoped(scoped) = &collector.state else { panic!("expected scoped recovery") };
+        assert!(
+            collector
+                .try_page(&conn, &first_page(&conn), SENT + 1, &mut counts, &mut work)
+                .unwrap()
+        );
+        let State::Scoped(scoped) = &collector.state else {
+            panic!("expected scoped recovery")
+        };
         assert_eq!(scoped.population.as_ref().unwrap().viewers.len(), 20);
-        assert_eq!(scoped.attempted_scope.as_ref().unwrap(), &HashSet::from([1]));
+        assert_eq!(
+            scoped.attempted_scope.as_ref().unwrap(),
+            &HashSet::from([1])
+        );
         assert_eq!(scoped.loads_left, MAX_SCOPED_POPULATION_LOADS - 1);
         let queries = work.queries;
         let page = delivery_page(&conn, 257, 512);
-        assert!(collector.try_page(&conn, &page, SENT + 1, &mut counts, &mut work).unwrap());
-        assert_eq!(work.queries - queries, 3, "reuse scope; only correction and message queries");
+        assert!(
+            collector
+                .try_page(&conn, &page, SENT + 1, &mut counts, &mut work)
+                .unwrap()
+        );
+        assert_eq!(
+            work.queries - queries,
+            3,
+            "reuse scope; only correction and message queries"
+        );
         assert_eq!(optimized(&conn).0, canonical(&conn));
         assert_eq!(optimized(&conn).0["1"]["unread"], 19 * 513);
     }
@@ -825,24 +1095,83 @@ mod tests {
         let (_dir, conn) = fixture();
         seed(&conn, MAX_SHARED_VIEWERS + 1, 1);
         execute(&conn, "INSERT INTO agents VALUES (10000,77,0,NULL,'auto')");
-        execute(&conn, &format!("INSERT INTO messages VALUES (2,77,999,{SENT},'high',1), (3,88,999,{SENT},'high',1)"));
-        execute(&conn, "INSERT INTO project_mailbox_deliveries VALUES (2,77),(3,88)");
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO messages VALUES (2,77,999,{SENT},'high',1), (3,88,999,{SENT},'high',1)"
+            ),
+        );
+        execute(
+            &conn,
+            "INSERT INTO project_mailbox_deliveries VALUES (2,77),(3,88)",
+        );
         let mut work = ScanWork::default();
-        let mut collector = Collector { state: Collector::prepare(&conn, &mut work).unwrap() };
+        let mut collector = Collector {
+            state: Collector::prepare(&conn, &mut work).unwrap(),
+        };
         let mut counts = HashMap::new();
         let queries = work.queries;
-        assert!(!collector.try_page(&conn, &delivery_page(&conn,1,1), SENT + 1, &mut counts, &mut work).unwrap());
-        assert_eq!(work.queries, queries, "do not reload a proven oversized project");
+        assert!(
+            !collector
+                .try_page(
+                    &conn,
+                    &delivery_page(&conn, 1, 1),
+                    SENT + 1,
+                    &mut counts,
+                    &mut work
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            work.queries, queries,
+            "do not reload a proven oversized project"
+        );
         assert!(counts.is_empty());
-        assert!(collector.try_page(&conn, &delivery_page(&conn,2,2), SENT + 1, &mut counts, &mut work).unwrap());
+        assert!(
+            collector
+                .try_page(
+                    &conn,
+                    &delivery_page(&conn, 2, 2),
+                    SENT + 1,
+                    &mut counts,
+                    &mut work
+                )
+                .unwrap()
+        );
         assert_eq!(counts[&77].unread, 1);
-        assert!(collector.try_page(&conn, &delivery_page(&conn,3,3), SENT + 1, &mut counts, &mut work).unwrap());
+        assert!(
+            collector
+                .try_page(
+                    &conn,
+                    &delivery_page(&conn, 3, 3),
+                    SENT + 1,
+                    &mut counts,
+                    &mut work
+                )
+                .unwrap()
+        );
         assert!(!counts.contains_key(&88));
-        let State::Scoped(scoped) = &collector.state else { panic!("scope stays available") };
+        let State::Scoped(scoped) = &collector.state else {
+            panic!("scope stays available")
+        };
         assert!(scoped.population.as_ref().unwrap().viewers.is_empty());
         let queries = work.queries;
-        assert!(collector.try_page(&conn, &delivery_page(&conn,3,3), SENT + 1, &mut counts, &mut work).unwrap());
-        assert_eq!(work.queries - queries, 3, "an empty scope is a complete cached population");
+        assert!(
+            collector
+                .try_page(
+                    &conn,
+                    &delivery_page(&conn, 3, 3),
+                    SENT + 1,
+                    &mut counts,
+                    &mut work
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            work.queries - queries,
+            3,
+            "an empty scope is a complete cached population"
+        );
     }
 
     #[test]
@@ -851,19 +1180,45 @@ mod tests {
         seed(&conn, MAX_SHARED_VIEWERS + 2, 2);
         execute(&conn, "UPDATE agents SET project_id=2 WHERE id > 2049");
         execute(&conn, "UPDATE messages SET project_id=2 WHERE id=2");
-        execute(&conn, "UPDATE project_mailbox_deliveries SET project_id=2 WHERE message_id=2");
+        execute(
+            &conn,
+            "UPDATE project_mailbox_deliveries SET project_id=2 WHERE message_id=2",
+        );
         let mut collector = Collector::default();
         let mut counts = HashMap::new();
         let mut work = ScanWork::default();
         let both = first_page(&conn);
-        assert!(!collector.try_page(&conn, &both, SENT + 1, &mut counts, &mut work).unwrap());
+        assert!(
+            !collector
+                .try_page(&conn, &both, SENT + 1, &mut counts, &mut work)
+                .unwrap()
+        );
         assert!(counts.is_empty(), "no partial scope can publish counters");
         let queries = work.queries;
-        assert!(!collector.try_page(&conn, &both, SENT + 1, &mut counts, &mut work).unwrap());
-        assert_eq!(work.queries, queries, "do not retry the identical over-cap scope");
-        assert!(collector.try_page(&conn, &delivery_page(&conn,1,1), SENT + 1, &mut counts, &mut work).unwrap());
+        assert!(
+            !collector
+                .try_page(&conn, &both, SENT + 1, &mut counts, &mut work)
+                .unwrap()
+        );
+        assert_eq!(
+            work.queries, queries,
+            "do not retry the identical over-cap scope"
+        );
+        assert!(
+            collector
+                .try_page(
+                    &conn,
+                    &delivery_page(&conn, 1, 1),
+                    SENT + 1,
+                    &mut counts,
+                    &mut work
+                )
+                .unwrap()
+        );
         assert_eq!(counts[&1].unread, 2048);
-        let State::Scoped(scoped) = &collector.state else { panic!("scoped state") };
+        let State::Scoped(scoped) = &collector.state else {
+            panic!("scoped state")
+        };
         assert_eq!(scoped.population.as_ref().unwrap().viewers.len(), 2049);
     }
 
@@ -873,21 +1228,36 @@ mod tests {
         let n = MAX_SCOPED_POPULATION_LOADS + 2;
         seed(&conn, n, n * OVERVIEW_PAGE_ROWS);
         execute(&conn, "UPDATE agents SET project_id=id");
-        execute(&conn, &format!("UPDATE messages SET project_id=(id-1)/{OVERVIEW_PAGE_ROWS}+1"));
-        execute(&conn, &format!("UPDATE project_mailbox_deliveries SET project_id=(message_id-1)/{OVERVIEW_PAGE_ROWS}+1"));
+        execute(
+            &conn,
+            &format!("UPDATE messages SET project_id=(id-1)/{OVERVIEW_PAGE_ROWS}+1"),
+        );
+        execute(
+            &conn,
+            &format!(
+                "UPDATE project_mailbox_deliveries SET project_id=(message_id-1)/{OVERVIEW_PAGE_ROWS}+1"
+            ),
+        );
         seed_unrelated(&conn);
         assert_eq!(optimized(&conn).0, canonical(&conn));
-        assert_eq!(optimized(&conn).0[&n.to_string()]["ack_overdue"], OVERVIEW_PAGE_ROWS);
+        assert_eq!(
+            optimized(&conn).0[&n.to_string()]["ack_overdue"],
+            OVERVIEW_PAGE_ROWS
+        );
         let mut collector = Collector::default();
         let mut counts = HashMap::new();
         let mut work = ScanWork::default();
         for id in 1..=n {
-            let first = i64::try_from((id-1)*OVERVIEW_PAGE_ROWS+1).unwrap();
-            let page = delivery_page(&conn,first,first);
+            let first = i64::try_from((id - 1) * OVERVIEW_PAGE_ROWS + 1).unwrap();
+            let page = delivery_page(&conn, first, first);
             let before = work.queries;
-            let used = collector.try_page(&conn, &page, SENT + 1, &mut counts, &mut work).unwrap();
+            let used = collector
+                .try_page(&conn, &page, SENT + 1, &mut counts, &mut work)
+                .unwrap();
             assert_eq!(used, id <= MAX_SCOPED_POPULATION_LOADS);
-            if !used { assert_eq!(work.queries, before); }
+            if !used {
+                assert_eq!(work.queries, before);
+            }
         }
     }
 
@@ -903,9 +1273,14 @@ mod tests {
             seed(&conn, 3, 1);
             seed_unrelated(&conn);
             execute(&conn, "DROP INDEX agents_project");
-            if let Some(ddl) = ddl { execute(&conn, ddl); }
+            if let Some(ddl) = ddl {
+                execute(&conn, ddl);
+            }
             let mut work = ScanWork::default();
-            assert!(matches!(Collector::prepare(&conn, &mut work).unwrap(), State::Disabled));
+            assert!(matches!(
+                Collector::prepare(&conn, &mut work).unwrap(),
+                State::Disabled
+            ));
             assert_eq!(optimized(&conn).0, canonical(&conn));
         }
     }
@@ -915,10 +1290,34 @@ mod tests {
         let (_dir, conn) = fixture();
         seed_unrelated(&conn);
         execute(&conn, "DROP INDEX agents_project");
-        execute(&conn, "CREATE INDEX \"scope\"\"order\" ON agents(project_id DESC,inception_ts DESC)");
-        execute(&conn, &format!("INSERT INTO agents VALUES ({},{},0,NULL,'auto'), ({},{},1,NULL,'auto')", i64::MIN,i64::MIN,i64::MAX,i64::MIN));
-        execute(&conn, &format!("INSERT INTO messages VALUES (1,{},999,{SENT},'high',1)",i64::MIN));
-        execute(&conn, &format!("INSERT INTO project_mailbox_deliveries VALUES (1,{})",i64::MIN));
+        execute(
+            &conn,
+            "CREATE INDEX \"scope\"\"order\" ON agents(project_id DESC,inception_ts DESC)",
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO agents VALUES ({},{},0,NULL,'auto'), ({},{},1,NULL,'auto')",
+                i64::MIN,
+                i64::MIN,
+                i64::MAX,
+                i64::MIN
+            ),
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO messages VALUES (1,{},999,{SENT},'high',1)",
+                i64::MIN
+            ),
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO project_mailbox_deliveries VALUES (1,{})",
+                i64::MIN
+            ),
+        );
         assert_eq!(optimized(&conn).0, canonical(&conn));
         assert_eq!(optimized(&conn).0[&i64::MIN.to_string()]["unread"], 2);
     }
@@ -928,15 +1327,26 @@ mod tests {
         let (_dir, conn) = fixture();
         seed(&conn, 3, OVERVIEW_PAGE_ROWS + 1);
         seed_unrelated(&conn);
-        execute(&conn, "INSERT INTO project_mailbox_receipts SELECT message_id,2,0,0 FROM project_mailbox_deliveries");
+        execute(
+            &conn,
+            "INSERT INTO project_mailbox_receipts SELECT message_id,2,0,0 FROM project_mailbox_deliveries",
+        );
         let mut collector = Collector::default();
         let mut counts = HashMap::new();
         let mut work = ScanWork::default();
-        assert!(!collector.try_page(&conn,&first_page(&conn),SENT+1,&mut counts,&mut work).unwrap());
+        assert!(
+            !collector
+                .try_page(&conn, &first_page(&conn), SENT + 1, &mut counts, &mut work)
+                .unwrap()
+        );
         assert!(counts.is_empty());
         assert!(matches!(collector.state, State::Disabled));
         let queries = work.queries;
-        assert!(!collector.try_page(&conn,&first_page(&conn),SENT+1,&mut counts,&mut work).unwrap());
+        assert!(
+            !collector
+                .try_page(&conn, &first_page(&conn), SENT + 1, &mut counts, &mut work)
+                .unwrap()
+        );
         assert_eq!(work.queries, queries);
         assert_eq!(optimized(&conn).0, canonical(&conn));
     }
@@ -944,23 +1354,40 @@ mod tests {
     #[test]
     fn scoped_load_and_receipts_keep_the_same_wal_snapshot() {
         let (dir, reader) = fixture();
-        seed(&reader,3,1);
+        seed(&reader, 3, 1);
         seed_unrelated(&reader);
-        execute(&reader,"PRAGMA journal_mode=WAL");
+        execute(&reader, "PRAGMA journal_mode=WAL");
         let expected = canonical(&reader);
-        let writer = DbConn::open_file(dir.path().join("shared.sqlite3").to_str().unwrap()).unwrap();
-        execute(&reader,"SAVEPOINT scoped_snapshot");
+        let writer =
+            DbConn::open_file(dir.path().join("shared.sqlite3").to_str().unwrap()).unwrap();
+        execute(&reader, "SAVEPOINT scoped_snapshot");
         let mut work = ScanWork::default();
-        let state = Collector::prepare(&reader,&mut work).unwrap();
+        let state = Collector::prepare(&reader, &mut work).unwrap();
         assert!(matches!(&state, State::Scoped(_)));
-        execute(&writer,"INSERT INTO project_mailbox_receipts VALUES (1,2,0,0)");
-        execute(&writer,"UPDATE agents SET contact_policy='block_all' WHERE id=3");
+        execute(
+            &writer,
+            "INSERT INTO project_mailbox_receipts VALUES (1,2,0,0)",
+        );
+        execute(
+            &writer,
+            "UPDATE agents SET contact_policy='block_all' WHERE id=3",
+        );
         let mut collector = Collector { state };
         let mut counts = HashMap::new();
-        assert!(collector.try_page(&reader,&first_page(&reader),SENT+1,&mut counts,&mut work).unwrap());
-        assert_eq!(serde_json::to_value(counts).unwrap(),expected);
-        execute(&reader,"RELEASE scoped_snapshot");
-        assert_eq!(optimized(&reader).0,canonical(&reader));
+        assert!(
+            collector
+                .try_page(
+                    &reader,
+                    &first_page(&reader),
+                    SENT + 1,
+                    &mut counts,
+                    &mut work
+                )
+                .unwrap()
+        );
+        assert_eq!(serde_json::to_value(counts).unwrap(), expected);
+        execute(&reader, "RELEASE scoped_snapshot");
+        assert_eq!(optimized(&reader).0, canonical(&reader));
         assert!(optimized(&reader).0.as_object().unwrap().is_empty());
     }
 
@@ -970,125 +1397,169 @@ mod tests {
         seed(&conn, 3, 1);
         seed_unrelated(&conn);
         let mut work = ScanWork::default();
-        let mut collector = Collector { state: Collector::prepare(&conn, &mut work).unwrap() };
+        let mut collector = Collector {
+            state: Collector::prepare(&conn, &mut work).unwrap(),
+        };
         assert!(matches!(&collector.state, State::Scoped(_)));
         // Simulate a refused verified-index query. Production holds the schema
         // stable in a snapshot; even an unexpected engine refusal must not be
         // converted into successful zero counts or an incomplete population.
         execute(&conn, "DROP INDEX agents_project");
         let mut counts = HashMap::new();
-        assert!(collector.try_page(&conn, &first_page(&conn), SENT + 1, &mut counts, &mut work).is_err());
+        assert!(
+            collector
+                .try_page(&conn, &first_page(&conn), SENT + 1, &mut counts, &mut work)
+                .is_err()
+        );
         assert!(counts.is_empty());
     }
 
     // Frozen population preparation from 5e178010, before scoped recovery.
     // Keep its actual SQL and cap behavior in the same native invocation.
     fn incumbent_state(conn: &DbConn, work: &mut ScanWork) -> State {
-        let Some(direct_index) = pair_index(conn,"message_recipients").unwrap() else {
+        let Some(direct_index) = pair_index(conn, "message_recipients").unwrap() else {
             return State::Disabled;
         };
-        let Some(receipt_index) = pair_index(conn,"project_mailbox_receipts").unwrap() else {
+        let Some(receipt_index) = pair_index(conn, "project_mailbox_receipts").unwrap() else {
             return State::Disabled;
         };
         let mut viewers = HashMap::new();
         let mut inception: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut after = None;
         loop {
-            let (continuation,params) = after.map_or_else(
-                || ("",Vec::new()),
-                |id| (" AND id > ?",vec![Value::BigInt(id)]),
+            let (continuation, params) = after.map_or_else(
+                || ("", Vec::new()),
+                |id| (" AND id > ?", vec![Value::BigInt(id)]),
             );
             let rows = bounded_query(conn,&format!(
                 "{VIEWERS_SQL} WHERE ({VIEWERS_FILTER}){continuation} ORDER BY id LIMIT {OVERVIEW_PAGE_ROWS}"
             ),&params,work).unwrap();
-            if viewers.len()+rows.len()>MAX_SHARED_VIEWERS { return State::Disabled; }
-            for row in &rows {
-                let id = integer(row,"id").unwrap();
-                assert!(after.is_none_or(|previous| id>previous));
-                after=Some(id);
-                let viewer=Viewer {
-                    project_id: integer(row,"project_id").unwrap(),
-                    inception_ts: integer(row,"inception_ts").unwrap(),
-                };
-                inception.entry(viewer.project_id).or_default().push(viewer.inception_ts);
-                viewers.insert(id,viewer);
+            if viewers.len() + rows.len() > MAX_SHARED_VIEWERS {
+                return State::Disabled;
             }
-            if rows.len()<OVERVIEW_PAGE_ROWS { break; }
+            for row in &rows {
+                let id = integer(row, "id").unwrap();
+                assert!(after.is_none_or(|previous| id > previous));
+                after = Some(id);
+                let viewer = Viewer {
+                    project_id: integer(row, "project_id").unwrap(),
+                    inception_ts: integer(row, "inception_ts").unwrap(),
+                };
+                inception
+                    .entry(viewer.project_id)
+                    .or_default()
+                    .push(viewer.inception_ts);
+                viewers.insert(id, viewer);
+            }
+            if rows.len() < OVERVIEW_PAGE_ROWS {
+                break;
+            }
         }
-        for times in inception.values_mut() { times.sort_unstable(); }
-        State::Ready(Population { viewers,inception,direct_index,receipt_index })
+        for times in inception.values_mut() {
+            times.sort_unstable();
+        }
+        State::Ready(Population {
+            viewers,
+            inception,
+            direct_index,
+            receipt_index,
+        })
     }
 
     fn measured_shared_phase(conn: &DbConn, recover: bool) -> (serde_json::Value, ScanWork) {
-        let mut collector=Collector::default();
-        let mut counts=HashMap::new();
-        let mut work=ScanWork::default();
-        let mut after=None;
-        let mut prepared=false;
+        let mut collector = Collector::default();
+        let mut counts = HashMap::new();
+        let mut work = ScanWork::default();
+        let mut after = None;
+        let mut prepared = false;
         loop {
-            let (predicate,params)=after.map_or_else(
-                || ("",Vec::new()),
-                |id| ("WHERE message_id > ?",vec![Value::BigInt(id)]),
+            let (predicate, params) = after.map_or_else(
+                || ("", Vec::new()),
+                |id| ("WHERE message_id > ?", vec![Value::BigInt(id)]),
             );
-            let rows=bounded_query(conn,&format!(
-                "SELECT message_id AS id, project_id FROM project_mailbox_deliveries \
+            let rows = bounded_query(
+                conn,
+                &format!(
+                    "SELECT message_id AS id, project_id FROM project_mailbox_deliveries \
                  {predicate} ORDER BY message_id LIMIT {OVERVIEW_PAGE_ROWS}"
-            ),&params,&mut work).unwrap();
-            if rows.is_empty() { break; }
-            if !recover && !prepared {
-                collector.state=incumbent_state(conn,&mut work);
-                prepared=true;
+                ),
+                &params,
+                &mut work,
+            )
+            .unwrap();
+            if rows.is_empty() {
+                break;
             }
-            if !collector.try_page(conn,&rows,SENT+1,&mut counts,&mut work).unwrap() {
-                let ids: Vec<_>=rows.iter().map(|row| integer(row,"id").unwrap()).collect();
-                let (sql,params)=mcp_agent_mail_db::project_mailbox::overview_counts_query(&ids,SENT+1).unwrap();
-                for row in bounded_query(conn,&sql,&params,&mut work).unwrap() {
-                    let count=project(&mut counts,integer(&row,"project_id").unwrap());
-                    count.unread+=usize::try_from(integer(&row,"unread").unwrap()).unwrap();
-                    count.urgent+=usize::try_from(integer(&row,"urgent").unwrap()).unwrap();
-                    count.ack_overdue+=usize::try_from(integer(&row,"ack_overdue").unwrap()).unwrap();
+            if !recover && !prepared {
+                collector.state = incumbent_state(conn, &mut work);
+                prepared = true;
+            }
+            if !collector
+                .try_page(conn, &rows, SENT + 1, &mut counts, &mut work)
+                .unwrap()
+            {
+                let ids: Vec<_> = rows.iter().map(|row| integer(row, "id").unwrap()).collect();
+                let (sql, params) =
+                    mcp_agent_mail_db::project_mailbox::overview_counts_query(&ids, SENT + 1)
+                        .unwrap();
+                for row in bounded_query(conn, &sql, &params, &mut work).unwrap() {
+                    let count = project(&mut counts, integer(&row, "project_id").unwrap());
+                    count.unread += usize::try_from(integer(&row, "unread").unwrap()).unwrap();
+                    count.urgent += usize::try_from(integer(&row, "urgent").unwrap()).unwrap();
+                    count.ack_overdue +=
+                        usize::try_from(integer(&row, "ack_overdue").unwrap()).unwrap();
                 }
             }
-            if rows.len()<OVERVIEW_PAGE_ROWS { break; }
-            after=Some(integer(rows.last().unwrap(),"id").unwrap());
+            if rows.len() < OVERVIEW_PAGE_ROWS {
+                break;
+            }
+            after = Some(integer(rows.last().unwrap(), "id").unwrap());
         }
-        (serde_json::to_value(counts).unwrap(),work)
+        (serde_json::to_value(counts).unwrap(), work)
     }
 
     #[test]
     #[ignore = "native incumbent/scoped shared-phase benchmark including losing cases; not CLI startup"]
     fn benchmark_scoped_population_against_global_cap_fallback() {
-        for (name,viewers,deliveries,noise,dense) in [
-            ("small-fleet",200,513,false,false),
-            ("unrelated-fleet",200,513,true,false),
-            ("dense-fleet",200,513,true,true),
-            ("oversized-project",MAX_SHARED_VIEWERS+1,1,false,false),
+        for (name, viewers, deliveries, noise, dense) in [
+            ("small-fleet", 200, 513, false, false),
+            ("unrelated-fleet", 200, 513, true, false),
+            ("dense-fleet", 200, 513, true, true),
+            ("oversized-project", MAX_SHARED_VIEWERS + 1, 1, false, false),
         ] {
-            let (_dir,conn)=fixture();
-            seed(&conn,viewers,deliveries);
-            if noise { seed_unrelated(&conn); }
-            if dense {
-                execute(&conn,"INSERT INTO project_mailbox_receipts \
-                    SELECT d.message_id, a.id, 0, 0 FROM project_mailbox_deliveries d \
-                    JOIN agents a ON a.project_id=d.project_id WHERE a.id <> 1");
+            let (_dir, conn) = fixture();
+            seed(&conn, viewers, deliveries);
+            if noise {
+                seed_unrelated(&conn);
             }
-            let expected=canonical(&conn);
-            let mut times=[Vec::new(),Vec::new()];
+            if dense {
+                execute(
+                    &conn,
+                    "INSERT INTO project_mailbox_receipts \
+                    SELECT d.message_id, a.id, 0, 0 FROM project_mailbox_deliveries d \
+                    JOIN agents a ON a.project_id=d.project_id WHERE a.id <> 1",
+                );
+            }
+            let expected = canonical(&conn);
+            let mut times = [Vec::new(), Vec::new()];
             for iteration in 0..6 {
-                for recover in [iteration%2==0,iteration%2!=0] {
-                    execute(&conn,"SAVEPOINT scoped_benchmark");
-                    let started=Instant::now();
-                    let (actual,work)=measured_shared_phase(&conn,recover);
-                    let elapsed=started.elapsed();
-                    execute(&conn,"RELEASE scoped_benchmark");
-                    assert_eq!(actual,expected,"{name} recover={recover}");
-                    assert!(work.peak_query_rows<=OVERVIEW_PAGE_ROWS);
+                for recover in [iteration % 2 == 0, iteration % 2 != 0] {
+                    execute(&conn, "SAVEPOINT scoped_benchmark");
+                    let started = Instant::now();
+                    let (actual, work) = measured_shared_phase(&conn, recover);
+                    let elapsed = started.elapsed();
+                    execute(&conn, "RELEASE scoped_benchmark");
+                    assert_eq!(actual, expected, "{name} recover={recover}");
+                    assert!(work.peak_query_rows <= OVERVIEW_PAGE_ROWS);
                     eprintln!("{name} recover={recover} elapsed={elapsed:?} work={work:?}");
                     times[usize::from(recover)].push(elapsed);
                 }
             }
             times.iter_mut().for_each(|values| values.sort_unstable());
-            eprintln!("native shared phase {name}: incumbent={:?}, scoped={:?}",times[0][3],times[1][3]);
+            eprintln!(
+                "native shared phase {name}: incumbent={:?}, scoped={:?}",
+                times[0][3], times[1][3]
+            );
         }
     }
 }

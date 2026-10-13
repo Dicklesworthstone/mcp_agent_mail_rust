@@ -133,15 +133,11 @@ async fn stored_agent(cx: &Cx, project: &str, name: &str) -> mcp_agent_mail_db::
         .await
         .into_result()
         .expect("stored project");
-    let row = mcp_agent_mail_db::queries::get_agent(
-        cx,
-        &pool,
-        project.id.expect("project id"),
-        name,
-    )
-    .await
-    .into_result()
-    .expect("stored identity");
+    let row =
+        mcp_agent_mail_db::queries::get_agent(cx, &pool, project.id.expect("project id"), name)
+            .await
+            .into_result()
+            .expect("stored identity");
     mcp_agent_mail_db::queries::get_agent_by_id_fresh(cx, &pool, row.id.expect("agent id"))
         .await
         .into_result()
@@ -288,9 +284,14 @@ fn shared_session_with_no_remaining_proofs_keeps_its_evicted_project_restricted(
         let followup = McpContext::with_state(cx.clone(), 3, fixture.actor_state.clone());
         assert_eq!(session_identity::session_bindings(&followup), Vec::new());
         assert_eq!(
-            send_as(&followup, &fixture.first_project, &fixture.victim, &fixture.original)
-                .await
-                .expect_err("an empty proof list is not an identity reset"),
+            send_as(
+                &followup,
+                &fixture.first_project,
+                &fixture.victim,
+                &fixture.original
+            )
+            .await
+            .expect_err("an empty proof list is not an identity reset"),
             "SESSION_IDENTITY_MISMATCH"
         );
         assert_eq!(
@@ -308,9 +309,14 @@ fn shared_session_with_no_remaining_proofs_keeps_its_evicted_project_restricted(
             1
         );
         let new_owner = create_identity(&followup, &fixture.first_project).await;
-        let sent = send_as(&followup, &fixture.first_project, &new_owner, &fixture.victim)
-            .await
-            .expect("explicitly established new identity authorizes normally");
+        let sent = send_as(
+            &followup,
+            &fixture.first_project,
+            &new_owner,
+            &fixture.victim,
+        )
+        .await
+        .expect("explicitly established new identity authorizes normally");
         assert_eq!(sent["sender_verification"], "session");
     });
 }

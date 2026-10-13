@@ -321,8 +321,7 @@ fn authorize_actor_from_state(
             "{explanation}, so it cannot {action} \
              as '{}'. Act as your own agent, present '{}''s registration_token where the tool \
              accepts one, or use a separate session for that agent.",
-            agent.name,
-            agent.name
+            agent.name, agent.name
         ),
         false,
         json!({
@@ -594,7 +593,10 @@ mod tests {
         for id in 2..=i64::try_from(MAX_SESSION_BINDINGS + 1).expect("small") {
             bind(ctx, 20, id, "RedStone");
         }
-        assert!(!holds(ctx, Some(1)), "fixture must actually evict the proof");
+        assert!(
+            !holds(ctx, Some(1)),
+            "fixture must actually evict the proof"
+        );
         assert_eq!(session_bindings(ctx).len(), MAX_SESSION_BINDINGS);
     }
 
@@ -620,7 +622,11 @@ mod tests {
             assert!(!snapshot.permits_unresolved_actor(Some(10)));
             assert!(!snapshot.permits_unresolved_actor(Some(20)));
             assert!(snapshot.permits_unresolved_actor(Some(30)));
-            assert!(snapshot.authorize(&ctx, &agent(1, 10, "BlueLake"), "ack").is_err());
+            assert!(
+                snapshot
+                    .authorize(&ctx, &agent(1, 10, "BlueLake"), "ack")
+                    .is_err()
+            );
         });
     }
 
@@ -641,8 +647,13 @@ mod tests {
             assert!(snapshot.permits_unresolved_actor(Some(20)));
             assert!(authorize_actor(&ctx, &agent(999, 10, "GreenCastle"), false, "read").is_err());
             assert!(
-                authorize_actor(&session_ctx(), &agent(999, 10, "GreenCastle"), false, "read")
-                    .is_ok()
+                authorize_actor(
+                    &session_ctx(),
+                    &agent(999, 10, "GreenCastle"),
+                    false,
+                    "read"
+                )
+                .is_ok()
             );
         });
     }
@@ -651,8 +662,8 @@ mod tests {
     fn eviction_history_saturates_without_forgetting_authorization_restrictions() {
         with_feature(true, || {
             let ctx = session_ctx();
-            let count = i64::try_from(MAX_SESSION_BINDINGS + MAX_EVICTED_PROJECTS + 1)
-                .expect("small");
+            let count =
+                i64::try_from(MAX_SESSION_BINDINGS + MAX_EVICTED_PROJECTS + 1).expect("small");
             for id in 1..=count {
                 bind(&ctx, id * 10, id, "BlueLake");
                 let state = identity_state(&ctx);
@@ -672,8 +683,7 @@ mod tests {
                         .is_err()
                 );
                 assert!(
-                    authorize_actor(&ctx, &agent(999, project, "GreenCastle"), true, "ack")
-                        .is_ok()
+                    authorize_actor(&ctx, &agent(999, project, "GreenCastle"), true, "ack").is_ok()
                 );
             }
             for binding in &state.held {
@@ -690,13 +700,11 @@ mod tests {
             assert!(identity_state(&ctx).eviction_history_saturated);
             bind(&ctx, 99_999, 999, "GreenCastle");
             assert!(
-                authorize_actor(&ctx, &agent(999, 99_999, "GreenCastle"), false, "send")
-                    .is_ok()
+                authorize_actor(&ctx, &agent(999, 99_999, "GreenCastle"), false, "send").is_ok()
             );
             ctx.request_cancellation().cancel();
             assert!(
-                authorize_actor(&ctx, &agent(999, 99_999, "GreenCastle"), true, "send")
-                    .is_err()
+                authorize_actor(&ctx, &agent(999, 99_999, "GreenCastle"), true, "send").is_err()
             );
         });
     }
@@ -710,7 +718,11 @@ mod tests {
             bind(&ctx, 10, 1, "BlueLake");
             assert!(holds(&ctx, Some(1)));
             assert!(authorize_actor(&ctx, &agent(1, 10, "BlueLake"), false, "send").is_ok());
-            assert!(snapshot.authorize(&ctx, &agent(1, 10, "BlueLake"), "ack").is_err());
+            assert!(
+                snapshot
+                    .authorize(&ctx, &agent(1, 10, "BlueLake"), "ack")
+                    .is_err()
+            );
             unbind(&ctx, 1);
             assert_eq!(identity_state(&ctx).evicted_projects, [10]);
             assert!(authorize_actor(&ctx, &agent(999, 10, "GreenCastle"), false, "send").is_err());

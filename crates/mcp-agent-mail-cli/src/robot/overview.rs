@@ -602,7 +602,11 @@ fn collect_project_mailboxes(
     match (has_deliveries, has_receipts) {
         (false, false) => return Ok(()),
         (true, true) => {}
-        _ => return Err(CliError::Other("overview has an incomplete project mailbox schema".to_string())),
+        _ => {
+            return Err(CliError::Other(
+                "overview has an incomplete project mailbox schema".to_string(),
+            ));
+        }
     }
     let mut population = shared_mailboxes::Collector::default();
     let threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
@@ -640,11 +644,11 @@ fn collect_project_mailboxes(
             return Ok(());
         }
         if !population.try_page(conn, &rows, threshold, projects, work)? {
-            let (sql, params) = mcp_agent_mail_db::project_mailbox::overview_counts_query(
-                &ids,
-                threshold,
-            )
-            .map_err(|error| CliError::Other(format!("overview mailbox lookup failed: {error}")))?;
+            let (sql, params) =
+                mcp_agent_mail_db::project_mailbox::overview_counts_query(&ids, threshold)
+                    .map_err(|error| {
+                        CliError::Other(format!("overview mailbox lookup failed: {error}"))
+                    })?;
             for row in &bounded_query(conn, &sql, &params, work)? {
                 let counts = project(projects, integer(row, "project_id")?);
                 for (column, total) in [
