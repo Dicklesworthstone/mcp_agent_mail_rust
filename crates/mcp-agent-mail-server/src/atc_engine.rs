@@ -10363,12 +10363,12 @@ pub fn atc_record_outcome(
         adaptive.record_outcome(correct);
     }
 
-    // Feed liveness tuner (regret → PID → loss matrix feedback loop)
+    // Match tick/activity feedback's ENGINE -> TUNER lock order.
+    // Never wait for ENGINE while holding TUNER: that deadlocks with ticks.
     if subsystem == AtcSubsystem::Liveness
+        && let Some(engine_lock) = ATC_ENGINE.get()
         && let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
-        && let Ok(mut tuner) = tuner_lock.lock()
     {
-        let regret = (predicted_loss - actual_loss).abs();
         let action = if correct {
             LivenessAction::DeclareAlive
         } else {
@@ -10379,13 +10379,19 @@ pub fn atc_record_outcome(
         } else {
             LivenessState::Dead
         };
-        tuner.record_outcome(action, state, regret);
-
-        if let Some(engine_lock) = ATC_ENGINE.get()
-            && let Ok(mut engine) = engine_lock.lock()
-            && tuner.maybe_update(&mut engine.liveness_core)
+        if let Ok(mut engine) = engine_lock.lock()
+            && engine.enabled()
         {
-            engine.propagate_liveness_policy();
+            let changed = if let Ok(mut tuner) = tuner_lock.lock() {
+                tuner.record_outcome(action, state, (predicted_loss - actual_loss).abs());
+                tuner.maybe_update(&mut engine.liveness_core)
+            } else {
+                false
+            };
+            // Do not hold the tuner lock during policy fan-out.
+            if changed {
+                engine.propagate_liveness_policy();
+            }
         }
     }
 
