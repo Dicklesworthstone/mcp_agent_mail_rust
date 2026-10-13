@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.38"
+version = "0.3.39"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -219,7 +219,7 @@ fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 # The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# registry FrankenSQLite 0.4.10 and pinned FastMCP 0.10.0.
+# registry FrankenSQLite 0.4.10 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
 # the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).

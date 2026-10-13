@@ -608,7 +608,7 @@ send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
 #### Session-bound agent identity (opt-in)
 
-Available from the first release after v0.3.38 (see [CHANGELOG.md](CHANGELOG.md)).
+Available since v0.3.39 (see [CHANGELOG.md](CHANGELOG.md)).
 Set `MESSAGING_SESSION_IDENTITY=true` on the server to let an MCP session act as
 the identities it established without a registration token in the model-visible
 transcript:
@@ -1023,7 +1023,7 @@ sequenceDiagram
 2. **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=3600, exclusive=true)`
 3. **Communicate with threads:** `send_message(..., thread_id="FEAT-123")`, check with `fetch_inbox`, acknowledge with `acknowledge_message`
 4. **Quick reads:** `resource://inbox/{Agent}?project=<abs-path>&limit=20`
-5. **Tell the whole project once:** address the project's shared mailbox as `project:<slug>` (or `project:<human_key>`). Available from the first release after v0.3.38 (see [CHANGELOG.md](CHANGELOG.md)):
+5. **Tell the whole project once:** address the project's shared mailbox as `project:<slug>` (or `project:<human_key>`). Available since v0.3.39 (see [CHANGELOG.md](CHANGELOG.md)):
 
    ```
    send_message(project_key="/abs/path", sender_name="GreenCastle",
@@ -1901,7 +1901,7 @@ need to do anything.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
-- **Slow file reservations at swarm scale.** The release smoke's 60-agent swarm phase runs 3 projects of mixed sends, reads, acks and reservations, with a server kill midway. In it, `file_reservation_paths` and `release_file_reservations` take about 13 s at the median and about 25 s at p99, on v0.3.38 and on current `main`; the budget is 5 s. Each reservation writes its archive file with fsyncs under one process-wide archive lock ([#345](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/345)). In the same runs no acknowledged message was lost across the kill, and integrity checks passed. Receipts: [`docs/evidence/release_smoke/`](docs/evidence/release_smoke/).
+- **Slow file reservations at swarm scale.** The release smoke's 60-agent swarm phase runs 3 projects of mixed sends, reads, acks and reservations, with a server kill midway. In it, `file_reservation_paths` and `release_file_reservations` miss the 5 s p99 budget. On v0.3.38 they take about 13 s at the median and about 25 s at p99. v0.3.39 stages each reservation's archive file outside the process-wide archive lock, which brings the median to about 4.7 s; the p99 is still about 15 s, because the archive batch drain holds that lock through its fsyncs ([#344](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/344), [#345](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/345)). In the same runs no acknowledged message was lost across the kill, and integrity checks passed. Receipts: [`docs/evidence/release_smoke/`](docs/evidence/release_smoke/).
 
 ---
 
