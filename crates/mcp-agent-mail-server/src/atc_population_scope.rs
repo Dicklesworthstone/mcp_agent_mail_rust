@@ -561,16 +561,16 @@ mod tests {
             state.refresh_with(20, || Ok(vec![new])).unwrap();
             assert_eq!(state.progress.unchanged_agents, 0);
             finish_local_hydration(&mut state);
-            let mut stale = release_report(&["BlueLake"], "/alpha");
-            state.filter_report_scope(&mut stale);
-            state.annotate(&mut stale.summary, 20);
-            assert!(stale.effects.is_empty() && stale.actions.is_empty());
-            assert_eq!(stale.summary.kernel.pending_effects, 0);
+            let mut superseded = release_report(&["BlueLake"], "/alpha");
+            state.filter_report_scope(&mut superseded);
+            state.annotate(&mut superseded.summary, 20);
+            assert!(superseded.effects.is_empty() && superseded.actions.is_empty());
+            assert_eq!(superseded.summary.kernel.pending_effects, 0);
             assert_eq!(state.progress.scope_effects_withheld, 1);
             assert_eq!(state.progress.scope_actions_withheld, 1);
             assert_eq!(state.progress.refresh_failures, 0);
             assert_eq!(
-                stale.summary.completeness,
+                superseded.summary.completeness,
                 engine::SnapshotCompleteness::Partial,
             );
 
