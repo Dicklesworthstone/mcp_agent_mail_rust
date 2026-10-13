@@ -1,0 +1,1279 @@
+{
+  "schema": "br-qbhs0 publication-variant diagnostics v1",
+  "bead": "br-qbhs0",
+  "host": "thinkstation1 (64 cores), same host and session per block",
+  "background": "nopub (skip the per-commit PASSIVE checkpoint and the retirement it triggers; publish only when the WAL exceeds journal_size_limit) won the paced send A/B (pooled p2 p50 0.575x, p90 0.619x) but regressed the release-smoke soak in both orders (reads -16..-21%, fetch_inbox p99 +80%). These runs asked why.",
+  "binaries": {
+    "base": "2dd72851, build19/base3, am sha256 c5c84438...",
+    "nopub": "2dd72851 + nopub_v1.patch, build25/nopub, am 1401e554...",
+    "nopub_1mib": "the nopub binary run with DB_JOURNAL_SIZE_LIMIT_BYTES=1048576 (env wrapper)",
+    "v1_throttle": "nopub + publication throttled to at most once per 100 ms, build27/v1throttle, am 3051f56d...",
+    "v2_retire": "nopub + retire the writer connection after every commit (no checkpoint), build27/v2retire, am 0a597ca4..."
+  },
+  "rules": {
+    "diag_v1v2_plan": "DIAGNOSTIC (mechanism finding, not a landing decision). Written 2026-10-13 ~00:55Z, before builds or runs.\nQuestion: why does nopub (no per-commit checkpoint) regress the release-smoke soak?\n  Observed: reads -16..-21%, fetch_inbox p99 +80% in both orders.\n  At a 1 MiB limit it is worse: reset-gate overhead on most commits.\nV1 (throttled): nopub + publish (PASSIVE + retire-on-deferral, as base) at most every 100 ms.\n  If soak recovers, the regression comes from leaving frames un-backfilled.\nV2 (retire-only): nopub + retire the writer after every commit, with no checkpoint.\n  If soak recovers, the regression comes from long-lived connections.\nRuns: release smoke with the swarm skipped, each variant vs base (build19/base3), both orders.\nReadout: soak reads and fetch_inbox p99 vs base.\n  \"Recovers\" = within 10% of base reads and fetch p99 <= 1.2x base, in both orders.\nWhichever variant recovers (if any) gets a separate pre-registered confirmation A/B before any landing.\n",
+    "v2_confirm_rule": "V2 confirmation (br-qbhs0). Written 2026-10-13 ~04:50Z, before any confirmation run.\n\nBackground:\n- nopub (no per-commit checkpoint, no retirement) gave large paced send gains: saturated p50 0.575x, p90 0.619x.\n  But it regressed the release-smoke soak in both orders: reads -16..-21%, fetch_inbox p99 +80%.\n- Diagnostics without the swarm phase (diag_v2v1):\n  - A 1 MiB checkpoint threshold is worse.\n  - V1 (publication throttled to 100 ms) keeps the regression: reads -18%, p99 1.84x.\n  - V2 (no checkpoint, but retire the writer after every commit, as the old per-commit deferral did for 96% of\n    commits under load) mostly recovers: reads -2% / -6%, fetch p99 1.05x / 1.69x.\n- Mechanism: reads slow down on long-lived FrankenSQLite connections; writer retirement was masking that.\n\nCandidate V2 = 2dd72851 + nopub_v1.patch + diag_rc1012m.patch (build27/v2retire, sha 0a597ca4).\nBase = build19/base3 (2dd72851, sha c5c84438).\n\nRuns (same host, one session):\n  P. paced_swarm.py (error payloads recorded), 60 agents, 300 s, WAL sampled:\n     period 2 s: base v2 v2 base base v2; period 6 s: v2 base base v2.\n  R. Full release smoke (with the swarm phase), both orders: v2_vs_base, then base_vs_v2.\n\nDecision:\n  S1 (primary). Pooled P2 send p50 and p90 for v2 <= 0.85x base.\n  G1. Pooled P6 send p50 and p90 <= 1.05x base.\n  G2 (soak). In EACH smoke order, v2 soak reads >= 0.90x base and soak fetch_inbox p99 <= 1.3x base.\n  G3. Every acknowledged id survives SIGKILL (crash and swarm) for v2. Swarm 30 s timeouts for v2 <= base + 5 in each\n      order. Paced errors <= base + 5 at P2 and base + 3 at P6, with no visibility signature in the payloads.\n  G4. Paced WAL peak median <= 1.5x base.\n  C. db lib full, tools it and conformance pass on the V2 code (gated before landing; the C3 visibility test still\n     applies).\n\nWIN only if S1, G1-G4 and C hold. A win goes to the owner before landing, because the publication contract changes.\nOtherwise LOSS, reported, not landed.\n"
+  },
+  "nopub_1mib_smoke_no_swarm": [
+    {
+      "run": "nopub1m_vs_base",
+      "order": 1,
+      "started_at": "2026-10-13T00:08:57Z",
+      "swarm_agents": 0,
+      "arms": [
+        {
+          "role": "candidate",
+          "server_exe_sha256": "1401e554bb1703135a8d94e899c85c5de97d5978e16cd0dc0e3a385f1015d131",
+          "loadavg_start": [
+            "3.09",
+            "4.64",
+            "6.54"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work",
+              "health archive_lag stall verdict agrees with the WBQ counters"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 7162,
+              "read": 9051,
+              "search": 704,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.3145449161529541
+          },
+          "storm": {
+            "p50_s": 0.17503762245178223,
+            "p99_s": 0.4106576442718506,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 352,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        },
+        {
+          "role": "control",
+          "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+          "loadavg_start": [
+            "5.54",
+            "6.51",
+            "6.61"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8637,
+              "read": 12829,
+              "search": 798,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.17898130416870117
+          },
+          "storm": {
+            "p50_s": 0.32362890243530273,
+            "p99_s": 0.5112888813018799,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 292,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        }
+      ]
+    },
+    {
+      "run": "base_vs_nopub1m",
+      "order": 2,
+      "started_at": "2026-10-13T00:34:31Z",
+      "swarm_agents": 0,
+      "arms": [
+        {
+          "role": "candidate",
+          "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+          "loadavg_start": [
+            "4.99",
+            "5.69",
+            "6.49"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8849,
+              "read": 13171,
+              "search": 825,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.13749194145202637
+          },
+          "storm": {
+            "p50_s": 0.311359167098999,
+            "p99_s": 0.5545718669891357,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 292,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        },
+        {
+          "role": "control",
+          "server_exe_sha256": "1401e554bb1703135a8d94e899c85c5de97d5978e16cd0dc0e3a385f1015d131",
+          "loadavg_start": [
+            "4.52",
+            "6.87",
+            "6.94"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work",
+              "health archive_lag stall verdict agrees with the WBQ counters"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 7104,
+              "read": 9035,
+              "search": 705,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.3199760913848877
+          },
+          "storm": {
+            "p50_s": 0.17060565948486328,
+            "p99_s": 0.3543121814727783,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 358,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        }
+      ]
+    }
+  ],
+  "v1_v2_smoke_no_swarm": [
+    {
+      "run": "v2_vs_base",
+      "order": 1,
+      "started_at": "2026-10-13T03:00:59Z",
+      "swarm_agents": 0,
+      "arms": [
+        {
+          "role": "candidate",
+          "server_exe_sha256": "0a597ca467da533b8b0ec35ec76b5db14b623e03932adb947a759ea2535639f0",
+          "loadavg_start": [
+            "2.05",
+            "1.91",
+            "3.90"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8765,
+              "read": 13136,
+              "search": 807,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.13986849784851074
+          },
+          "storm": {
+            "p50_s": 0.32904744148254395,
+            "p99_s": 0.9035348892211914,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 317,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        },
+        {
+          "role": "control",
+          "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+          "loadavg_start": [
+            "10.04",
+            "8.20",
+            "6.02"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8735,
+              "read": 13408,
+              "search": 822,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.13289165496826172
+          },
+          "storm": {
+            "p50_s": 0.292374849319458,
+            "p99_s": 0.5497512817382812,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 285,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        }
+      ]
+    },
+    {
+      "run": "base_vs_v2",
+      "order": 2,
+      "started_at": "2026-10-13T03:27:28Z",
+      "swarm_agents": 0,
+      "arms": [
+        {
+          "role": "candidate",
+          "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+          "loadavg_start": [
+            "4.43",
+            "5.28",
+            "5.76"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8466,
+              "read": 12931,
+              "search": 806,
+              "health": 270,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.16175532341003418
+          },
+          "storm": {
+            "p50_s": 0.2744743824005127,
+            "p99_s": 0.5885787010192871,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 353,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        },
+        {
+          "role": "control",
+          "server_exe_sha256": "0a597ca467da533b8b0ec35ec76b5db14b623e03932adb947a759ea2535639f0",
+          "loadavg_start": [
+            "5.80",
+            "8.59",
+            "7.59"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work",
+              "health archive_lag stall verdict agrees with the WBQ counters"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 7901,
+              "read": 12133,
+              "search": 537,
+              "health": 269,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.27396082878112793
+          },
+          "storm": {
+            "p50_s": 0.3054180145263672,
+            "p99_s": 1.0029752254486084,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 331,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        }
+      ]
+    },
+    {
+      "run": "v1_vs_base",
+      "order": 3,
+      "started_at": "2026-10-13T03:55:00Z",
+      "swarm_agents": 0,
+      "arms": [
+        {
+          "role": "candidate",
+          "server_exe_sha256": "3051f56d1b8f09c4ccf64609cf9e5a7e128d5766ec36d0f1111bbe188c552d92",
+          "loadavg_start": [
+            "3.72",
+            "6.99",
+            "8.44"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8538,
+              "read": 10877,
+              "search": 664,
+              "health": 266,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.2683379650115967
+          },
+          "storm": {
+            "p50_s": 0.09506058692932129,
+            "p99_s": 0.2027597427368164,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 631,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        },
+        {
+          "role": "control",
+          "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+          "loadavg_start": [
+            "7.69",
+            "10.93",
+            "9.87"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8680,
+              "read": 13304,
+              "search": 815,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.14563798904418945
+          },
+          "storm": {
+            "p50_s": 0.2697141170501709,
+            "p99_s": 0.5615079402923584,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 268,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        }
+      ]
+    },
+    {
+      "run": "base_vs_v1",
+      "order": 4,
+      "started_at": "2026-10-13T04:24:15Z",
+      "swarm_agents": 0,
+      "arms": [
+        {
+          "role": "candidate",
+          "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+          "loadavg_start": [
+            "2.86",
+            "3.68",
+            "6.35"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 8818,
+              "read": 13275,
+              "search": 830,
+              "health": 271,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.14080095291137695
+          },
+          "storm": {
+            "p50_s": 0.2857797145843506,
+            "p99_s": 0.510575532913208,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 287,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        },
+        {
+          "role": "control",
+          "server_exe_sha256": "3051f56d1b8f09c4ccf64609cf9e5a7e128d5766ec36d0f1111bbe188c552d92",
+          "loadavg_start": [
+            "5.53",
+            "6.97",
+            "7.01"
+          ],
+          "verdict": "FAIL",
+          "phase_verdicts": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "NO_VERDICT"
+          },
+          "failed_checks": {
+            "soak": [
+              "WBQ drained_total advances in every 10s window with queued work"
+            ]
+          },
+          "soak": {
+            "counts": {
+              "send": 9094,
+              "read": 11131,
+              "search": 818,
+              "health": 270,
+              "err": 0
+            },
+            "fetch_inbox_p99_s": 0.19704389572143555
+          },
+          "storm": {
+            "p50_s": 0.09852361679077148,
+            "p99_s": 0.21222329139709473,
+            "errors": 0
+          },
+          "crash": {
+            "acked": 636,
+            "verdict": "PASS"
+          },
+          "swarm": {
+            "acked_sends": null,
+            "sends_per_s": null,
+            "tools": {},
+            "verdict": "NO_VERDICT"
+          }
+        }
+      ]
+    }
+  ],
+  "v2_confirm": {
+    "paced": {
+      "runs": [
+        {
+          "run": "1-base-p2",
+          "sends": 9000,
+          "p50": 0.5326,
+          "p90": 1.5028,
+          "p99": 4.2385,
+          "send_fetch_errors": 0,
+          "all_tool_errors": 1,
+          "error_tools": [
+            "release_file_reservations"
+          ],
+          "wal_peak_bytes": 16900272
+        },
+        {
+          "run": "2-v2-p2",
+          "sends": 9000,
+          "p50": 0.4001,
+          "p90": 1.2825,
+          "p99": 2.8512,
+          "send_fetch_errors": 3,
+          "all_tool_errors": 3,
+          "error_tools": [
+            "fetch_inbox"
+          ],
+          "wal_peak_bytes": 16850832
+        },
+        {
+          "run": "3-v2-p2",
+          "sends": 9000,
+          "p50": 0.4602,
+          "p90": 1.2994,
+          "p99": 2.8059,
+          "send_fetch_errors": 1,
+          "all_tool_errors": 1,
+          "error_tools": [
+            "fetch_inbox"
+          ],
+          "wal_peak_bytes": 17015632
+        },
+        {
+          "run": "4-base-p2",
+          "sends": 9000,
+          "p50": 0.5632,
+          "p90": 1.5624,
+          "p99": 3.0608,
+          "send_fetch_errors": 2,
+          "all_tool_errors": 3,
+          "error_tools": [
+            "fetch_inbox",
+            "file_reservation_paths",
+            "send_message"
+          ],
+          "wal_peak_bytes": 16933232
+        },
+        {
+          "run": "5-base-p2",
+          "sends": 9000,
+          "p50": 0.4331,
+          "p90": 1.3508,
+          "p99": 3.7573,
+          "send_fetch_errors": 2,
+          "all_tool_errors": 2,
+          "error_tools": [
+            "fetch_inbox"
+          ],
+          "wal_peak_bytes": 16945592
+        },
+        {
+          "run": "6-v2-p2",
+          "sends": 9000,
+          "p50": 0.4207,
+          "p90": 1.29,
+          "p99": 2.5949,
+          "send_fetch_errors": 1,
+          "all_tool_errors": 6,
+          "error_tools": [
+            "fetch_inbox",
+            "file_reservation_paths",
+            "release_file_reservations"
+          ],
+          "wal_peak_bytes": 16962072
+        },
+        {
+          "run": "7-v2-p6",
+          "sends": 3000,
+          "p50": 0.1077,
+          "p90": 0.4386,
+          "p99": 2.113,
+          "send_fetch_errors": 0,
+          "all_tool_errors": 0,
+          "error_tools": [],
+          "wal_peak_bytes": 16632472
+        },
+        {
+          "run": "8-base-p6",
+          "sends": 3000,
+          "p50": 0.1305,
+          "p90": 0.819,
+          "p99": 3.4893,
+          "send_fetch_errors": 1,
+          "all_tool_errors": 1,
+          "error_tools": [
+            "fetch_inbox"
+          ],
+          "wal_peak_bytes": 16908512
+        },
+        {
+          "run": "9-base-p6",
+          "sends": 3000,
+          "p50": 0.1167,
+          "p90": 0.4616,
+          "p99": 1.8765,
+          "send_fetch_errors": 0,
+          "all_tool_errors": 0,
+          "error_tools": [],
+          "wal_peak_bytes": 16834352
+        },
+        {
+          "run": "10-v2-p6",
+          "sends": 3000,
+          "p50": 0.1091,
+          "p90": 0.3689,
+          "p99": 1.3182,
+          "send_fetch_errors": 3,
+          "all_tool_errors": 3,
+          "error_tools": [
+            "fetch_inbox"
+          ],
+          "wal_peak_bytes": 16772552
+        }
+      ],
+      "pooled": {
+        "base-p2": {
+          "sends": 27000,
+          "p50": 0.5058,
+          "p90": 1.4714,
+          "p99": 3.5464,
+          "send_fetch_errors": 4,
+          "all_tool_errors": 6,
+          "wal_peak_bytes_median": 16933232
+        },
+        "v2-p2": {
+          "sends": 27000,
+          "p50": 0.4277,
+          "p90": 1.2911,
+          "p99": 2.712,
+          "send_fetch_errors": 5,
+          "all_tool_errors": 10,
+          "wal_peak_bytes_median": 16962072
+        },
+        "v2-p6": {
+          "sends": 6000,
+          "p50": 0.1085,
+          "p90": 0.4055,
+          "p99": 1.9344,
+          "send_fetch_errors": 3,
+          "all_tool_errors": 3,
+          "wal_peak_bytes_median": 16772552
+        },
+        "base-p6": {
+          "sends": 6000,
+          "p50": 0.1235,
+          "p90": 0.5777,
+          "p99": 2.767,
+          "send_fetch_errors": 1,
+          "all_tool_errors": 1,
+          "wal_peak_bytes_median": 16908512
+        }
+      }
+    },
+    "smoke_full": [
+      {
+        "run": "v2_vs_base",
+        "order": 1,
+        "started_at": "2026-10-13T06:20:45Z",
+        "swarm_agents": 60,
+        "arms": [
+          {
+            "role": "candidate",
+            "server_exe_sha256": "0a597ca467da533b8b0ec35ec76b5db14b623e03932adb947a759ea2535639f0",
+            "loadavg_start": [
+              "7.13",
+              "9.19",
+              "9.95"
+            ],
+            "verdict": "FAIL",
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "FAIL"
+            },
+            "failed_checks": {
+              "soak": [
+                "WBQ drained_total advances in every 10s window with queued work"
+              ],
+              "swarm": [
+                "file_reservation_paths p99 <= 5.0s at 60 agents",
+                "release_file_reservations p99 <= 5.0s at 60 agents",
+                "archive converges to DB after the swarm without client reads (<= 300s)"
+              ]
+            },
+            "soak": {
+              "counts": {
+                "send": 8538,
+                "read": 13593,
+                "search": 772,
+                "health": 270,
+                "err": 0
+              },
+              "fetch_inbox_p99_s": 0.2132720947265625
+            },
+            "storm": {
+              "p50_s": 0.2754244804382324,
+              "p99_s": 0.6457927227020264,
+              "errors": 0
+            },
+            "crash": {
+              "acked": 324,
+              "verdict": "PASS"
+            },
+            "swarm": {
+              "acked_sends": 6389,
+              "sends_per_s": 12.91,
+              "tools": {
+                "send_message": {
+                  "n": 6389,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.3449873924255371,
+                  "p99_s": 3.870231866836548
+                },
+                "fetch_inbox": {
+                  "n": 6388,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.17360186576843262,
+                  "p99_s": 0.8016617298126221
+                },
+                "acknowledge_message": {
+                  "n": 1879,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.028214693069458008,
+                  "p99_s": 0.7979280948638916
+                },
+                "search_messages": {
+                  "n": 633,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.4420168399810791,
+                  "p99_s": 0.9818096160888672
+                },
+                "file_reservation_paths": {
+                  "n": 1891,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 5.398188591003418,
+                  "p99_s": 16.354348182678223
+                },
+                "release_file_reservations": {
+                  "n": 1855,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 5.583470106124878,
+                  "p99_s": 16.558523893356323
+                }
+              },
+              "verdict": "FAIL"
+            }
+          },
+          {
+            "role": "control",
+            "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+            "loadavg_start": [
+              "5.43",
+              "7.90",
+              "9.37"
+            ],
+            "verdict": "FAIL",
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "FAIL"
+            },
+            "failed_checks": {
+              "soak": [
+                "WBQ drained_total advances in every 10s window with queued work"
+              ],
+              "swarm": [
+                "send_message p99 <= 5.0s at 60 agents",
+                "file_reservation_paths p99 <= 5.0s at 60 agents",
+                "release_file_reservations p99 <= 5.0s at 60 agents",
+                "zero tool errors",
+                "WBQ drained_total advances in every 10s window with queued work",
+                "archive converges to DB after the swarm without client reads (<= 300s)"
+              ]
+            },
+            "soak": {
+              "counts": {
+                "send": 8736,
+                "read": 13106,
+                "search": 819,
+                "health": 271,
+                "err": 0
+              },
+              "fetch_inbox_p99_s": 0.16619277000427246
+            },
+            "storm": {
+              "p50_s": 0.31288838386535645,
+              "p99_s": 0.4923839569091797,
+              "errors": 0
+            },
+            "crash": {
+              "acked": 315,
+              "verdict": "PASS"
+            },
+            "swarm": {
+              "acked_sends": 5808,
+              "sends_per_s": 11.81,
+              "tools": {
+                "send_message": {
+                  "n": 5808,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.441159725189209,
+                  "p99_s": 5.208369731903076
+                },
+                "fetch_inbox": {
+                  "n": 5798,
+                  "timeouts_30s": 0,
+                  "tool_errors": 2,
+                  "p50_s": 0.17602896690368652,
+                  "p99_s": 1.0596675872802734
+                },
+                "search_messages": {
+                  "n": 574,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.4729576110839844,
+                  "p99_s": 4.6121203899383545
+                },
+                "acknowledge_message": {
+                  "n": 1848,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.028429269790649414,
+                  "p99_s": 0.7891786098480225
+                },
+                "file_reservation_paths": {
+                  "n": 1729,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 5.597041130065918,
+                  "p99_s": 19.431031942367554
+                },
+                "release_file_reservations": {
+                  "n": 1717,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 5.134012937545776,
+                  "p99_s": 17.769108533859253
+                }
+              },
+              "verdict": "FAIL"
+            }
+          }
+        ]
+      },
+      {
+        "run": "base_vs_v2",
+        "order": 2,
+        "started_at": "2026-10-13T07:22:03Z",
+        "swarm_agents": 60,
+        "arms": [
+          {
+            "role": "candidate",
+            "server_exe_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a",
+            "loadavg_start": [
+              "3.93",
+              "4.00",
+              "6.46"
+            ],
+            "verdict": "FAIL",
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "FAIL"
+            },
+            "failed_checks": {
+              "soak": [
+                "WBQ drained_total advances in every 10s window with queued work",
+                "health archive_lag stall verdict agrees with the WBQ counters"
+              ],
+              "swarm": [
+                "file_reservation_paths p99 <= 5.0s at 60 agents",
+                "release_file_reservations p99 <= 5.0s at 60 agents",
+                "archive converges to DB after the swarm without client reads (<= 300s)"
+              ]
+            },
+            "soak": {
+              "counts": {
+                "send": 8324,
+                "read": 13326,
+                "search": 707,
+                "health": 271,
+                "err": 0
+              },
+              "fetch_inbox_p99_s": 0.22810745239257812
+            },
+            "storm": {
+              "p50_s": 0.3113107681274414,
+              "p99_s": 0.4945640563964844,
+              "errors": 0
+            },
+            "crash": {
+              "acked": 290,
+              "verdict": "PASS"
+            },
+            "swarm": {
+              "acked_sends": 6585,
+              "sends_per_s": 13.33,
+              "tools": {
+                "send_message": {
+                  "n": 6585,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.4895908832550049,
+                  "p99_s": 2.9289586544036865
+                },
+                "fetch_inbox": {
+                  "n": 6579,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.17699456214904785,
+                  "p99_s": 0.935694694519043
+                },
+                "acknowledge_message": {
+                  "n": 2098,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.028490781784057617,
+                  "p99_s": 0.8458316326141357
+                },
+                "search_messages": {
+                  "n": 652,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.43248939514160156,
+                  "p99_s": 0.8901684284210205
+                },
+                "file_reservation_paths": {
+                  "n": 1956,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 5.402767181396484,
+                  "p99_s": 16.290077686309814
+                },
+                "release_file_reservations": {
+                  "n": 1929,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 4.391522645950317,
+                  "p99_s": 13.813812255859375
+                }
+              },
+              "verdict": "FAIL"
+            }
+          },
+          {
+            "role": "control",
+            "server_exe_sha256": "0a597ca467da533b8b0ec35ec76b5db14b623e03932adb947a759ea2535639f0",
+            "loadavg_start": [
+              "2.12",
+              "5.45",
+              "7.51"
+            ],
+            "verdict": "FAIL",
+            "phase_verdicts": {
+              "flow": "PASS",
+              "cross_project": "PASS",
+              "storm": "PASS",
+              "crash": "PASS",
+              "soak": "FAIL",
+              "swarm": "FAIL"
+            },
+            "failed_checks": {
+              "soak": [
+                "WBQ drained_total advances in every 10s window with queued work"
+              ],
+              "swarm": [
+                "file_reservation_paths p99 <= 5.0s at 60 agents",
+                "release_file_reservations p99 <= 5.0s at 60 agents",
+                "zero tool errors",
+                "archive converges to DB after the swarm without client reads (<= 300s)"
+              ]
+            },
+            "soak": {
+              "counts": {
+                "send": 8786,
+                "read": 13107,
+                "search": 824,
+                "health": 271,
+                "err": 0
+              },
+              "fetch_inbox_p99_s": 0.12778639793395996
+            },
+            "storm": {
+              "p50_s": 0.2725813388824463,
+              "p99_s": 0.6199438571929932,
+              "errors": 0
+            },
+            "crash": {
+              "acked": 340,
+              "verdict": "PASS"
+            },
+            "swarm": {
+              "acked_sends": 6640,
+              "sends_per_s": 13.44,
+              "tools": {
+                "send_message": {
+                  "n": 6640,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.3937568664550781,
+                  "p99_s": 3.1666464805603027
+                },
+                "fetch_inbox": {
+                  "n": 6639,
+                  "timeouts_30s": 0,
+                  "tool_errors": 1,
+                  "p50_s": 0.17925095558166504,
+                  "p99_s": 0.9005787372589111
+                },
+                "search_messages": {
+                  "n": 653,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.42205286026000977,
+                  "p99_s": 0.8701639175415039
+                },
+                "acknowledge_message": {
+                  "n": 2032,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 0.027597665786743164,
+                  "p99_s": 0.8731975555419922
+                },
+                "file_reservation_paths": {
+                  "n": 1956,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 5.096336126327515,
+                  "p99_s": 15.63803505897522
+                },
+                "release_file_reservations": {
+                  "n": 1944,
+                  "timeouts_30s": 0,
+                  "tool_errors": 0,
+                  "p50_s": 4.757103443145752,
+                  "p99_s": 15.832558870315552
+                }
+              },
+              "verdict": "FAIL"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "v2_verdict": {
+    "ratios": {
+      "S1 p2 send p50 <= 0.85x": 0.846,
+      "S1 p2 send p90 <= 0.85x": 0.877,
+      "G1 p6 send p50 <= 1.05x": 0.879,
+      "G1 p6 send p90 <= 1.05x": 0.702,
+      "G4 p2 WAL peak median <= 1.5x": 1.002
+    },
+    "passed": {
+      "S1 p2 send p50 <= 0.85x": true,
+      "S1 p2 send p90 <= 0.85x": false,
+      "G1 p6 send p50 <= 1.05x": true,
+      "G1 p6 send p90 <= 1.05x": true,
+      "G4 p2 WAL peak median <= 1.5x": true
+    },
+    "G2_soak_per_order": [
+      {
+        "run": "v2_vs_base",
+        "reads_ratio": 1.0371585533343506,
+        "fetch_p99_ratio": 1.2832814250648794,
+        "crash_v2": "PASS",
+        "swarm_timeouts_v2": 0,
+        "swarm_timeouts_base": 0,
+        "pass": true
+      },
+      {
+        "run": "base_vs_v2",
+        "reads_ratio": 0.9835659612787033,
+        "fetch_p99_ratio": 0.5602026439453485,
+        "crash_v2": "PASS",
+        "swarm_timeouts_v2": 0,
+        "swarm_timeouts_base": 0,
+        "pass": true
+      }
+    ],
+    "G3": {
+      "paced_errors_p2": {
+        "v2": 10,
+        "base": 6,
+        "pass": true
+      },
+      "paced_errors_p6": {
+        "v2": 3,
+        "base": 1,
+        "pass": true
+      },
+      "crash_and_swarm": "see G2_soak_per_order (crash_v2, swarm timeouts)"
+    },
+    "verdict": "LOSS: S1 fails (p90 above 0.85x); every guard holds. Not landed."
+  }
+}
