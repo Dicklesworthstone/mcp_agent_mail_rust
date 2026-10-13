@@ -3229,7 +3229,8 @@ mod tests {
         let mut checked = Vec::new();
         for chunk in index.split("<script").skip(1) {
             let tag = chunk.split('>').next().unwrap_or_default();
-            let Some(src) = attr(tag, "src").and_then(|src| src.strip_prefix("./").map(String::from))
+            let Some(src) =
+                attr(tag, "src").and_then(|src| src.strip_prefix("./").map(String::from))
             else {
                 continue;
             };

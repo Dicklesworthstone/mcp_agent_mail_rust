@@ -1101,7 +1101,8 @@ fn run_db_maintenance_cycle(
             Some((policy, now_us)),
         ) {
             Ok(stats) => {
-                let resident_attention = stats.resident_attention(config.doctor_retention_alert_bytes);
+                let resident_attention =
+                    stats.resident_attention(config.doctor_retention_alert_bytes);
                 let reclaimable_attention =
                     stats.reclaimable_attention(config.doctor_retention_alert_bytes);
                 if resident_attention || reclaimable_attention {

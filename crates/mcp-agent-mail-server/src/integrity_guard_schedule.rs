@@ -223,7 +223,10 @@ mod tests {
                 Some(BackupKind::Verified),
                 "no scheduled live full check is needed to request a verified restore point"
             );
-            assert!(!schedule.verification_pending, "deadline selected the route");
+            assert!(
+                !schedule.verification_pending,
+                "deadline selected the route"
+            );
         }
     }
 
@@ -255,7 +258,10 @@ mod tests {
         schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
         let failed_at = start + VERIFIED_REFRESH_INTERVAL - Duration::from_secs(1);
         schedule.complete(BackupKind::Proactive, BackupCompletion::Failed, failed_at);
-        assert_eq!(schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL), None);
+        assert_eq!(
+            schedule.next_attempt(start + VERIFIED_REFRESH_INTERVAL),
+            None
+        );
         assert_eq!(
             schedule.next_attempt(failed_at + BACKUP_RETRY_INITIAL - Duration::from_nanos(1)),
             None
@@ -292,7 +298,11 @@ mod tests {
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.complete(BackupKind::Proactive, BackupCompletion::Published, start);
         let published_at = start + VERIFIED_REFRESH_INTERVAL + Duration::from_secs(120);
-        schedule.complete(BackupKind::Verified, BackupCompletion::Published, published_at);
+        schedule.complete(
+            BackupKind::Verified,
+            BackupCompletion::Published,
+            published_at,
+        );
         assert_eq!(schedule.verified_refresh_anchor, Some(published_at));
         assert_eq!(
             schedule.next_attempt(published_at),
@@ -300,7 +310,10 @@ mod tests {
         );
         let before_due = published_at + VERIFIED_REFRESH_INTERVAL - Duration::from_nanos(1);
         schedule.complete(BackupKind::Proactive, BackupCompletion::Skipped, before_due);
-        assert_eq!(schedule.next_attempt(before_due), Some(BackupKind::Proactive));
+        assert_eq!(
+            schedule.next_attempt(before_due),
+            Some(BackupKind::Proactive)
+        );
         assert_eq!(
             schedule.next_attempt(published_at + VERIFIED_REFRESH_INTERVAL),
             Some(BackupKind::Verified)

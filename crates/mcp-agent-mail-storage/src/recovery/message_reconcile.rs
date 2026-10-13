@@ -1267,7 +1267,12 @@ mod tests {
                     bytes.as_bytes()
                 );
             }
-            assert!(!archive.root.join("agents/project:reconcile-project").exists());
+            assert!(
+                !archive
+                    .root
+                    .join("agents/project:reconcile-project")
+                    .exists()
+            );
             assert!(!archive.root.join("agents/GreenStone/inbox").exists());
             let before = repo.head().unwrap().target().unwrap();
             assert_eq!(
@@ -1300,7 +1305,12 @@ mod tests {
             assert_eq!(observed["bcc"], json!([]));
             assert_eq!(body, entry(&message, &recipients).body_md);
         }
-        assert!(!archive.root.join("agents/project:reconcile-project").exists());
+        assert!(
+            !archive
+                .root
+                .join("agents/project:reconcile-project")
+                .exists()
+        );
     }
 
     #[test]
@@ -1330,9 +1340,14 @@ mod tests {
         assert!(reconcile_message_bundle(&archive, &config, entry(&message, &[])).is_err());
         message["cc"] = json!([]);
         for phantom in ["project:reconcile-project", "GreenStone"] {
-            assert!(reconcile_message_bundle(
-                &archive, &config, entry(&message, &[phantom.to_string()])
-            ).is_err());
+            assert!(
+                reconcile_message_bundle(
+                    &archive,
+                    &config,
+                    entry(&message, &[phantom.to_string()])
+                )
+                .is_err()
+            );
         }
         assert_eq!(repo.head().ok().and_then(|head| head.target()), before);
         assert!(!archive.root.join("agents/BlueLake/outbox").exists());
@@ -1447,7 +1462,9 @@ mod tests {
             })
             .unwrap();
             let cx = Cx::for_testing();
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             for sql in [
                 "INSERT INTO projects(id, slug, human_key, created_at) VALUES(101, 'reconcile-project', '/test/reconcile', 1)",
                 "INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(101, 101, 'BlueLake', 'test', 'test', 1, 1), (102, 101, 'GreenStone', 'test', 'test', 1, 1), (103, 101, 'RedFox', 'test', 'test', 1, 1)",
@@ -1460,11 +1477,20 @@ mod tests {
             drop(conn);
             let mut cursor = database::ReconcileCursor::default();
             let report = database::reconcile_message_batch(
-                &cx, &pool, &config, &mut cursor, &AtomicBool::new(false),
+                &cx,
+                &pool,
+                &config,
+                &mut cursor,
+                &AtomicBool::new(false),
             )
             .unwrap();
-            assert_eq!((report.repaired, report.files_created, report.deferred), (1, 2, 0));
-            let archive = crate::open_archive(&config, "reconcile-project").unwrap().unwrap();
+            assert_eq!(
+                (report.repaired, report.files_created, report.deferred),
+                (1, 2, 0)
+            );
+            let archive = crate::open_archive(&config, "reconcile-project")
+                .unwrap()
+                .unwrap();
             let message = json!({
                 "id": 901, "from": "BlueLake", "to": ["project:reconcile-project"],
                 "cc": [], "bcc": [], "subject": "shared recovery", "thread_id": null,
@@ -1473,24 +1499,37 @@ mod tests {
                 "importance": "normal", "ack_required": true, "attachments": [],
             });
             let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &[])
-                .unwrap().0;
+                .unwrap()
+                .0;
             for path in [&paths.canonical, &paths.outbox] {
                 assert_eq!(
                     read_surviving_message(path).unwrap().unwrap(),
                     (message.clone(), "body".to_string())
                 );
             }
-            let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let conn = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             for (table, expected) in [
-                ("messages", 1), ("message_recipients", 0),
-                ("project_mailbox_deliveries", 1), ("project_mailbox_receipts", 1),
+                ("messages", 1),
+                ("message_recipients", 0),
+                ("project_mailbox_deliveries", 1),
+                ("project_mailbox_receipts", 1),
             ] {
-                assert_eq!(conn.query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
-                    .unwrap()[0].get_named::<i64>("n").unwrap(), expected);
+                assert_eq!(
+                    conn.query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("n")
+                        .unwrap(),
+                    expected
+                );
             }
-            let rows = conn.query_sync(
-                "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts", &[],
-            ).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 102);
             assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 15);
             assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 17);

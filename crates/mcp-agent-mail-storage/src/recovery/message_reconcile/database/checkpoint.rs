@@ -232,9 +232,7 @@ fn invalid(message: &str) -> io::Error {
 }
 
 fn check_sidecar(path: &Path) -> io::Result<()> {
-    if crate::path_existing_prefix_has_symlink(path)
-        .map_err(|error| invalid(&error.to_string()))?
-    {
+    if crate::path_existing_prefix_has_symlink(path).map_err(|error| invalid(&error.to_string()))? {
         return Err(invalid("checkpoint path has a symlinked component"));
     }
     match std::fs::symlink_metadata(path) {
@@ -499,7 +497,11 @@ mod tests {
         assert!(cursor.next_lane_is_history);
         assert!(cursor.next_lane_is_retry);
         assert_eq!(
-            cursor.retries.iter().map(|retry| retry.id).collect::<Vec<_>>(),
+            cursor
+                .retries
+                .iter()
+                .map(|retry| retry.id)
+                .collect::<Vec<_>>(),
             [7, 80_000]
         );
         assert_eq!(cursor.retries[0].ready_at, now);
@@ -539,7 +541,14 @@ mod tests {
         let (_temp, database, archive) = fixture();
         let binding = Binding::at(&database, &archive).unwrap();
         let now = Instant::now();
-        for change in ["version", "negative", "duplicate", "cross_lane", "delay", "count"] {
+        for change in [
+            "version",
+            "negative",
+            "duplicate",
+            "cross_lane",
+            "delay",
+            "count",
+        ] {
             let mut snapshot = Snapshot::capture(
                 Binding::at(&database, &archive).unwrap(),
                 &debt(now),
@@ -644,7 +653,11 @@ mod tests {
         let saved = restarted.load().unwrap().unwrap();
         assert_eq!(saved.tail_after, Some(90_000));
         assert_eq!(
-            saved.retries.iter().map(|retry| retry.id).collect::<Vec<_>>(),
+            saved
+                .retries
+                .iter()
+                .map(|retry| retry.id)
+                .collect::<Vec<_>>(),
             [7, 80_000]
         );
     }

@@ -367,10 +367,7 @@ impl AutomaticBackupLease {
         self.file.read_exact(&mut bytes[..length])?;
         let (slots, _) = bytes.as_chunks::<SLOT_BYTES>();
         for slot in slots {
-            if slot.starts_with(b"AMBACK")
-                && &slot[..8] != MAGIC
-                && &slot[..8] != LEGACY_MAGIC
-            {
+            if slot.starts_with(b"AMBACK") && &slot[..8] != MAGIC && &slot[..8] != LEGACY_MAGIC {
                 return Err(invalid(
                     "automatic backup journal uses an unsupported version",
                 ));
@@ -472,7 +469,9 @@ mod tests {
         let verified = begin(&database, BackupKind::Proactive, due);
         assert_eq!(verified.kind(), BackupKind::Verified);
         assert_eq!(verified.state.verification_anchor, NOW);
-        verified.finish_at(BackupCompletion::Published, due).unwrap();
+        verified
+            .finish_at(BackupCompletion::Published, due)
+            .unwrap();
         let next = begin(&database, BackupKind::Proactive, due + 1);
         assert_eq!(next.kind(), BackupKind::Proactive);
         assert_eq!(next.state.verification_anchor, due);
@@ -666,7 +665,11 @@ mod tests {
         assert!(State::decode(&invalid_legacy).is_none());
 
         let (_directory, database) = fixture();
-        let mut future = State { sequence: 3, ..state }.encode();
+        let mut future = State {
+            sequence: 3,
+            ..state
+        }
+        .encode();
         future[..8].copy_from_slice(b"AMBACK99");
         let digest = Sha256::digest(&future[..PAYLOAD_BYTES]);
         future[PAYLOAD_BYTES..].copy_from_slice(&digest);

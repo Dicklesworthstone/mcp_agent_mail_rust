@@ -1017,7 +1017,11 @@ mod tests {
             (2_500, 100, true),
         ] {
             stats.resident_bytes = resident;
-            assert_eq!(stats.resident_attention(alert), expected, "{resident}/{alert}");
+            assert_eq!(
+                stats.resident_attention(alert),
+                expected,
+                "{resident}/{alert}"
+            );
             assert!(!stats.reclaimable_attention(alert));
         }
     }
@@ -1117,7 +1121,17 @@ mod tests {
     fn numbered_quarantines_require_exact_ascii_ordinals_and_database_families() {
         use std::ffi::OsStr;
         for database in ["mail.db", "mail.corrupt1"] {
-            for companion in ["", "-wal", "-shm", "-journal", "-wal-cert", "-wal-cert-head", "-fsqlite-ns-gate", "-fsqlite-ns-use", ".lock"] {
+            for companion in [
+                "",
+                "-wal",
+                "-shm",
+                "-journal",
+                "-wal-cert",
+                "-wal-cert-head",
+                "-fsqlite-ns-gate",
+                "-fsqlite-ns-use",
+                ".lock",
+            ] {
                 for ordinal in ["0", "1", "70", "18446744073709551615"] {
                     let name = format!("{database}{companion}.corrupt{ordinal}");
                     assert_eq!(
@@ -1162,7 +1176,11 @@ mod tests {
                 None,
                 "unowned or incomplete: {name}"
             );
-            assert_eq!(classify_backup_file(OsStr::new("mail.db"), OsStr::new(name)), None, "{name}");
+            assert_eq!(
+                classify_backup_file(OsStr::new("mail.db"), OsStr::new(name)),
+                None,
+                "{name}"
+            );
         }
     }
 
@@ -1191,15 +1209,29 @@ mod tests {
         let stats = retention_resident_stats(
             &archive,
             &primary,
-            Some((RetentionPolicy { keep_min: 0, max_age_secs: 0, max_total_bytes_per_category: None }, i64::MAX)),
-        ).unwrap();
+            Some((
+                RetentionPolicy {
+                    keep_min: 0,
+                    max_age_secs: 0,
+                    max_total_bytes_per_category: None,
+                },
+                i64::MAX,
+            )),
+        )
+        .unwrap();
         assert_eq!(stats.recovery_debris_artifacts, 3);
         assert_eq!(stats.direct_backup_only_artifacts, 1);
         assert_eq!(stats.resident_bytes, 60);
         assert_eq!(stats.reclaimable_bytes, 41);
         assert_eq!(stats.live_database_bytes, Some(7));
-        assert_eq!(stats.resident_bytes_by_category.get("corrupt_quarantine"), Some(&41));
-        assert_eq!(stats.resident_bytes_by_category.get("direct_backup"), Some(&19));
+        assert_eq!(
+            stats.resident_bytes_by_category.get("corrupt_quarantine"),
+            Some(&41)
+        );
+        assert_eq!(
+            stats.resident_bytes_by_category.get("direct_backup"),
+            Some(&19)
+        );
         let inventory = inspect_storage_backups(&primary).unwrap();
         assert_eq!(inventory.artifact_count, 4);
         assert_eq!(inventory.resident_bytes, 60);
@@ -1229,7 +1261,11 @@ mod tests {
         assert_eq!(debris.len(), 1, "{debris:?}");
         let plan = select_recovery_debris_to_reclaim(
             debris,
-            RetentionPolicy { keep_min: 0, max_age_secs: 0, max_total_bytes_per_category: Some(0) },
+            RetentionPolicy {
+                keep_min: 0,
+                max_age_secs: 0,
+                max_total_bytes_per_category: Some(0),
+            },
             i64::MAX,
         );
         let destination = root.join("doctor/reclaimable/numbered-run");
@@ -1238,7 +1274,10 @@ mod tests {
         assert_eq!(outcome.moved_bytes, 17);
         assert!(outcome.failures.is_empty());
         assert!(!artifact.exists());
-        assert_eq!(std::fs::read(destination.join("mail.corrupt1.corrupt70")).unwrap(), b"incident evidence");
+        assert_eq!(
+            std::fs::read(destination.join("mail.corrupt1.corrupt70")).unwrap(),
+            b"incident evidence"
+        );
         assert_eq!(reclaimable_staging_bytes(&root), 17);
         for path in protected {
             assert_eq!(std::fs::read(path).unwrap(), b"protected");
@@ -1253,8 +1292,14 @@ mod tests {
         let database = std::ffi::OsString::from_vec(b"mail-\xff.db".to_vec());
         let mut numbered = database.clone();
         numbered.push("-wal.corrupt7");
-        assert_eq!(classify_recovery_debris_file(&database, &numbered), Some(DebrisCategory::CorruptQuarantine));
-        assert_eq!(classify_backup_file(&database, &numbered), Some(BackupKind::Corrupt));
+        assert_eq!(
+            classify_recovery_debris_file(&database, &numbered),
+            Some(DebrisCategory::CorruptQuarantine)
+        );
+        assert_eq!(
+            classify_backup_file(&database, &numbered),
+            Some(BackupKind::Corrupt)
+        );
         let alias = std::ffi::OsStr::new("mail-�.db-wal.corrupt7");
         assert_eq!(classify_recovery_debris_file(&database, alias), None);
         assert_eq!(classify_backup_file(&database, alias), None);
@@ -2423,8 +2468,7 @@ mod tests {
         // Simulate an explicit operator relocation. The footprint must not
         // disappear or double-count merely because evidence changed category.
         std::fs::rename(&stages[0], reclaim.join("relocated-stage")).unwrap();
-        let after =
-            retention_resident_stats(&archive, &primary, Some((policy, i64::MAX))).unwrap();
+        let after = retention_resident_stats(&archive, &primary, Some((policy, i64::MAX))).unwrap();
         assert_eq!(after.resident_bytes, before.resident_bytes);
         assert_eq!(after.reclaimable_staging_bytes, 60);
         assert_eq!(after.reclaimable_bytes, 23);
@@ -2532,11 +2576,7 @@ mod tests {
                 let stage = proactive_stage_fixture(&root, 1);
                 symlink(&outside, stage.join("linked")).unwrap();
             } else {
-                symlink(
-                    &outside,
-                    root.join(".mcp-agent-mail-proactive-backup-link"),
-                )
-                .unwrap();
+                symlink(&outside, root.join(".mcp-agent-mail-proactive-backup-link")).unwrap();
             }
             assert!(inspect_proactive_backup_staging(&primary).is_err());
             assert_eq!(std::fs::read(&primary).unwrap(), b"live");
@@ -2558,9 +2598,7 @@ mod tests {
             b"outside evidence"
         );
         symlink(&root, outside.join("database-alias")).unwrap();
-        assert!(
-            inspect_proactive_backup_staging(&outside.join("database-alias/mail.db")).is_err()
-        );
+        assert!(inspect_proactive_backup_staging(&outside.join("database-alias/mail.db")).is_err());
     }
 
     #[cfg(unix)]

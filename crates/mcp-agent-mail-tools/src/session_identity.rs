@@ -395,8 +395,7 @@ mod tests {
     fn cancelling_one_request_preserves_other_requests_session_authority() {
         with_feature(true, || {
             let state = fastmcp_core::SessionState::new();
-            let cancelled =
-                McpContext::with_state(asupersync::Cx::for_testing(), 1, state.clone());
+            let cancelled = McpContext::with_state(asupersync::Cx::for_testing(), 1, state.clone());
             let live = McpContext::with_state(asupersync::Cx::for_testing(), 2, state);
             let own = agent(1, 10, "BlueLake");
             let other = agent(2, 10, "RedStone");

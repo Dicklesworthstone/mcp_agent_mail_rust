@@ -575,9 +575,8 @@ fn health_check_retention_block(
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         return Ok(None);
     }
-    let resolved =
-        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
-            .map_err(|error| format!("resolving retention mailbox: {error}"))?;
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(|error| format!("resolving retention mailbox: {error}"))?;
     let database_path = Path::new(&resolved.canonical_path);
     let live_database_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
     // Same policy shape as the integrity guard's observe-and-alert sweep
@@ -4475,7 +4474,10 @@ mod tests {
         assert!(response.resident_attention);
         assert!(!response.reclaimable_attention);
         assert_eq!(response.resident_bytes, 4_096);
-        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Yellow);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["resident_attention"], true);
 
@@ -4553,10 +4555,16 @@ mod tests {
         let after = result.as_ref().unwrap().as_ref().unwrap();
         assert_eq!(after.resident_bytes, before.resident_bytes);
         assert_eq!(after.reclaimable_staging_bytes, 4_096);
-        assert_eq!(after.resident_bytes_by_category["reclaimable_staging"], 4_096);
+        assert_eq!(
+            after.resident_bytes_by_category["reclaimable_staging"],
+            4_096
+        );
         assert!(after.resident_attention);
         assert!(!after.reclaimable_attention);
-        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Yellow);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
         assert_eq!(
             std::fs::read(destination.join("snapshot.sqlite3")).unwrap(),
             evidence
@@ -4587,7 +4595,10 @@ mod tests {
         assert_eq!(response.reclaimable_bytes, 1_024);
         assert!(!response.resident_attention);
         assert!(response.reclaimable_attention);
-        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Yellow);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
         assert_eq!(std::fs::read(&debris).unwrap(), [7_u8; 1_024]);
         assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
     }
@@ -4612,7 +4623,10 @@ mod tests {
         assert_eq!(response.resident_bytes, 4_096);
         assert!(!response.resident_attention);
         assert!(!response.reclaimable_attention);
-        assert_eq!(retention_health_verdict(&result).level(), HealthLevel::Green);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Green
+        );
         assert_eq!(
             std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
             [7_u8; 4_096]
@@ -4671,7 +4685,10 @@ mod tests {
                 let response = health_check(&ctx).expect("health response");
                 let value: serde_json::Value = serde_json::from_str(&response).unwrap();
                 assert_eq!(value["retention"]["resident_attention"], true, "{value}");
-                assert_eq!(value["retention"]["reclaimable_attention"], false, "{value}");
+                assert_eq!(
+                    value["retention"]["reclaimable_attention"], false,
+                    "{value}"
+                );
                 assert_eq!(
                     value["retention"]["resident_bytes_by_category"]["proactive_backup_staging"],
                     bytes,
@@ -4700,7 +4717,9 @@ mod tests {
             },
         );
         assert_eq!(
-            std::fs::metadata(stage.join("snapshot.sqlite3")).unwrap().len(),
+            std::fs::metadata(stage.join("snapshot.sqlite3"))
+                .unwrap()
+                .len(),
             bytes
         );
     }

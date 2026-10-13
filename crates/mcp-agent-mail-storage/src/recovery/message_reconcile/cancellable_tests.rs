@@ -431,9 +431,7 @@ impl StopOnScan {
         SCAN_HOOK.with(|slot| {
             assert!(slot.borrow().is_none(), "nested scan observer");
             *slot.borrow_mut() = Some(Box::new(move |observed| {
-                if observed == stage
-                    && hook_visits.fetch_add(1, Ordering::AcqRel) + 1 >= after
-                {
+                if observed == stage && hook_visits.fetch_add(1, Ordering::AcqRel) + 1 >= after {
                     hook_stop.store(true, Ordering::Release);
                 }
             }));

@@ -141,7 +141,11 @@ fn date_trees(
     Ok(entries)
 }
 
-fn read_id(repo: &Repository, oid: Oid, budget: &mut CanonicalScanBudget<'_>) -> crate::Result<i64> {
+fn read_id(
+    repo: &Repository,
+    oid: Oid,
+    budget: &mut CanonicalScanBudget<'_>,
+) -> crate::Result<i64> {
     // libgit2 materializes blobs. Bound and charge the entire object before
     // loading it, even though only its frontmatter is decoded. Never trust a
     // filename's embedded ID or treat an unreadable object as an absent message.
