@@ -10,6 +10,8 @@
 //! a direct delivery already acknowledged by this viewer. Shared obligations
 //! use the inbox's visibility predicate and the viewer's own lazy receipt; a
 //! grant never materializes per-agent deliveries or marks a message read.
+//! A new grant is read back before commit: an ignored or altered insert must
+//! never authorize an archive artifact for a reservation that was not stored.
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
@@ -280,7 +282,11 @@ async fn apply_claim(
     let started = crate::tracking::query_timer();
     let inserted = tx.execute(cx, INSERT_SQL, &params).await;
     crate::tracking::record_query(INSERT_SQL, crate::tracking::elapsed_us(started));
-    take_sql!(inserted);
+    if take_sql!(inserted) != 1 {
+        return Outcome::Err(DbError::Internal(
+            "ACK grant insert did not create exactly one reservation".into(),
+        ));
+    }
     let rows = take_sql!(query(tx, cx, "SELECT last_insert_rowid() AS id", &[]).await);
     let id = match rows.first().and_then(|row| row.get_named::<i64>("id").ok()) {
         Some(id) if id > 0 => id,
@@ -290,6 +296,32 @@ async fn apply_claim(
             ));
         }
     };
+    // A positive last_insert_rowid is connection history, not proof that this
+    // INSERT stored our grant. Counts alone also miss AFTER-trigger changes.
+    // Verify the exact proposed fields and canonical release-ledger state in
+    // this transaction before allowing Granted to authorize archive publication.
+    // This is a primary-key lookup, not another scan of the active population.
+    let verify_sql = format!(
+        "SELECT id FROM file_reservations \
+         WHERE project_id = ?1 AND agent_id = ?2 \
+           AND path_pattern = ?3 COLLATE BINARY AND \"exclusive\" = ?4 \
+           AND reason = ?5 COLLATE BINARY AND created_ts = ?6 \
+           AND expires_ts = ?7 AND id = ?8 AND released_ts IS NULL \
+           AND ({ACTIVE_RESERVATION_PREDICATE})"
+    );
+    let mut verify_params = params.to_vec();
+    verify_params.push(id.into());
+    let verified = take_sql!(query(tx, cx, &verify_sql, &verify_params).await);
+    if verified.len() != 1
+        || verified
+            .first()
+            .and_then(|row| row.get_named::<i64>("id").ok())
+            != Some(id)
+    {
+        return Outcome::Err(DbError::Internal(
+            "ACK grant did not persist the requested active reservation".into(),
+        ));
+    }
     reservation.id = Some(id);
     Outcome::Ok(AckEscalationOutcome::Granted(reservation))
 }
@@ -1075,6 +1107,159 @@ mod tests {
             stale(run(grant_ack_escalation(cx, pool, &request)));
             request.overdue_before_ts = i64::MAX;
             granted(run(grant_ack_escalation(cx, pool, &request)));
+        });
+    }
+
+    fn connection_scalar(conn: &DbConn, sql: &str) -> i64 {
+        conn.query_sync(sql, &[]).unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
+    }
+
+    fn assert_failed_grant_rolled_back(conn: &DbConn) {
+        assert_eq!(connection_scalar(conn, "SELECT COUNT(*) FROM file_reservations"), 0);
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        conn.execute_raw("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn ignored_insert_cannot_publish_a_previous_connection_rowid_as_a_grant() {
+        fixture(|pool, cx, generation, observed| {
+            let conn = run(pool.acquire(cx)).expect("checkout");
+            conn.execute_raw("CREATE TABLE ack_grant_audit (id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute_raw("INSERT INTO ack_grant_audit VALUES (700)")
+                .unwrap();
+            assert_eq!(connection_scalar(&conn, "SELECT last_insert_rowid()"), 700);
+            conn.execute_raw(
+                "CREATE TRIGGER ignore_ack_grant BEFORE INSERT ON file_reservations \
+                 BEGIN SELECT RAISE(IGNORE); END",
+            )
+            .unwrap();
+            let request = request(generation, observed);
+            let pattern = claim_pattern(&request).unwrap();
+            let result = run(grant_on_connection(cx, &conn, &request, &pattern));
+            assert!(
+                matches!(&result, Outcome::Err(DbError::Internal(detail))
+                    if detail == "ACK grant insert did not create exactly one reservation"),
+                "{result:?}"
+            );
+            assert_failed_grant_rolled_back(&conn);
+            assert_eq!(connection_scalar(&conn, "SELECT id FROM ack_grant_audit"), 700);
+            conn.execute_raw("DROP TRIGGER ignore_ack_grant").unwrap();
+            let committed = granted(run(grant_on_connection(cx, &conn, &request, &pattern)));
+            assert_eq!(
+                Some(connection_scalar(&conn, "SELECT id FROM file_reservations")),
+                committed.id
+            );
+        });
+    }
+
+    #[test]
+    fn altered_inserted_grant_fields_refuse_publication_and_roll_back() {
+        for assignment in [
+            "id = NEW.id + 1000",
+            "project_id = 201",
+            "agent_id = 101",
+            "path_pattern = 'agents/bluebear/inbox/1970/01/*.md'",
+            "\"exclusive\" = 0",
+            "reason = 'ACK-OVERDUE'",
+            "created_ts = NEW.created_ts + 1",
+            "expires_ts = NEW.expires_ts - 1",
+            "released_ts = 0",
+            "released_ts = NEW.created_ts",
+        ] {
+            fixture(|pool, cx, generation, observed| {
+                let conn = run(pool.acquire(cx)).expect("checkout");
+                conn.execute_raw(&format!(
+                    "CREATE TRIGGER alter_ack_grant AFTER INSERT ON file_reservations \
+                     BEGIN UPDATE file_reservations SET {assignment} WHERE id = NEW.id; END"
+                ))
+                .unwrap();
+                let request = request(generation, observed);
+                let result = run(grant_on_connection(
+                    cx,
+                    &conn,
+                    &request,
+                    &claim_pattern(&request).unwrap(),
+                ));
+                assert!(
+                    matches!(&result, Outcome::Err(DbError::Internal(detail))
+                        if detail == "ACK grant did not persist the requested active reservation"),
+                    "assignment={assignment}: {result:?}"
+                );
+                assert_failed_grant_rolled_back(&conn);
+            });
+        }
+    }
+
+    #[test]
+    fn release_ledger_written_during_insert_cannot_certify_an_active_grant() {
+        fixture(|pool, cx, generation, observed| {
+            let conn = run(pool.acquire(cx)).expect("checkout");
+            conn.execute_raw(
+                "CREATE TRIGGER release_ack_grant AFTER INSERT ON file_reservations \
+                 BEGIN INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+                       VALUES (NEW.id, NEW.created_ts); END",
+            )
+            .unwrap();
+            let request = request(generation, observed);
+            let result = run(grant_on_connection(
+                cx,
+                &conn,
+                &request,
+                &claim_pattern(&request).unwrap(),
+            ));
+            assert!(
+                matches!(&result, Outcome::Err(DbError::Internal(detail))
+                    if detail == "ACK grant did not persist the requested active reservation"),
+                "{result:?}"
+            );
+            assert_failed_grant_rolled_back(&conn);
+            assert_eq!(
+                connection_scalar(&conn, "SELECT COUNT(*) FROM file_reservation_releases"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn harmless_insert_trigger_preserves_the_exact_committed_grant() {
+        fixture(|pool, cx, generation, observed| {
+            let conn = run(pool.acquire(cx)).expect("checkout");
+            conn.execute_raw(
+                "CREATE TABLE ack_grant_audit (id INTEGER PRIMARY KEY, reservation_id INTEGER)",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "CREATE TRIGGER audit_ack_grant AFTER INSERT ON file_reservations \
+                 BEGIN INSERT INTO ack_grant_audit VALUES (700, NEW.id); END",
+            )
+            .unwrap();
+            let request = request(generation, observed);
+            let committed = granted(run(grant_on_connection(
+                cx,
+                &conn,
+                &request,
+                &claim_pattern(&request).unwrap(),
+            )));
+            let stored = conn.query_sync("SELECT * FROM file_reservations", &[]).unwrap();
+            assert_eq!(stored.len(), 1);
+            let stored = &stored[0];
+            assert_eq!(stored.get_named::<i64>("id").unwrap(), committed.id.unwrap());
+            assert_eq!(stored.get_named::<i64>("project_id").unwrap(), committed.project_id);
+            assert_eq!(stored.get_named::<i64>("agent_id").unwrap(), committed.agent_id);
+            assert_eq!(stored.get_named::<String>("path_pattern").unwrap(), committed.path_pattern);
+            assert_eq!(stored.get_named::<i64>("exclusive").unwrap(), committed.exclusive);
+            assert_eq!(stored.get_named::<String>("reason").unwrap(), committed.reason);
+            assert_eq!(stored.get_named::<i64>("created_ts").unwrap(), committed.created_ts);
+            assert_eq!(stored.get_named::<i64>("expires_ts").unwrap(), committed.expires_ts);
+            assert_eq!(stored.get_named::<Option<i64>>("released_ts").unwrap(), None);
+            assert_eq!(
+                Some(connection_scalar(&conn, "SELECT reservation_id FROM ack_grant_audit")),
+                committed.id
+            );
+            assert_eq!(connection_scalar(&conn, "SELECT id FROM ack_grant_audit"), 700);
         });
     }
 }
