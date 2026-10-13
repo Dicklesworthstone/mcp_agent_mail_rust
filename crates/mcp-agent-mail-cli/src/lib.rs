@@ -41315,10 +41315,17 @@ async fn agents_reap_payload(
 
     let mut candidates: Vec<ReapCandidate> = Vec::new();
     let mut candidate_ids: Vec<i64> = Vec::new();
+    // GH#348: a deregistered agent keeps its row (and a NULL `retired_at`),
+    // but its retirement state can no longer change. It is not a reap
+    // candidate, and it must not abort the sweep for everyone after it.
+    let mut skipped_deregistered = 0usize;
     for project in &projects {
         let project_id = project.id.unwrap_or(0);
         let agents =
             outcome_to_result(mcp_agent_mail_db::queries::list_agents(cx, pool, project_id).await)?;
+        let deregistered = outcome_to_result(
+            mcp_agent_mail_db::queries::list_deregistered_agent_ids(cx, pool, project_id).await,
+        )?;
         for agent in agents {
             let stale = agent.last_active_ts < cutoff_us;
             let eligible = stale && agent.retired_at.is_none() && agent.reaper_exempt == 0;
@@ -41326,6 +41333,10 @@ async fn agents_reap_payload(
                 continue;
             }
             let Some(agent_id) = agent.id else { continue };
+            if deregistered.contains(&agent_id) {
+                skipped_deregistered += 1;
+                continue;
+            }
             candidate_ids.push(agent_id);
             candidates.push(ReapCandidate {
                 agent_id,
@@ -41342,11 +41353,25 @@ async fn agents_reap_payload(
     let mut reaped = 0usize;
     if !dry_run {
         for agent_id in &candidate_ids {
-            outcome_to_result(
-                mcp_agent_mail_db::queries::set_agent_retired_at(cx, pool, *agent_id, Some(now_us))
-                    .await,
-            )?;
-            reaped += 1;
+            match mcp_agent_mail_db::queries::set_agent_retired_at(
+                cx,
+                pool,
+                *agent_id,
+                Some(now_us),
+            )
+            .await
+            {
+                // The agent was deregistered between the listing above and
+                // this write. Same outcome as the listing-time skip.
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::InvalidArgument {
+                    field: "agent_deregistered",
+                    ..
+                }) => skipped_deregistered += 1,
+                other => {
+                    outcome_to_result(other)?;
+                    reaped += 1;
+                }
+            }
         }
     }
 
@@ -41358,6 +41383,7 @@ async fn agents_reap_payload(
         "project": project_key,
         "candidate_count": candidates.len(),
         "reaped_count": reaped,
+        "skipped_deregistered_count": skipped_deregistered,
         "candidates": candidates,
     }))
 }
@@ -41377,11 +41403,23 @@ fn render_agents_reap_payload(
         .get("reaped_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let skipped_deregistered = payload
+        .get("skipped_deregistered_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let note_skipped = || {
+        if skipped_deregistered > 0 {
+            output::info(&format!(
+                "Skipped {skipped_deregistered} deregistered agent(s): their retirement state cannot change."
+            ));
+        }
+    };
     output::emit_output(payload, fmt, || {
         if candidates.is_empty() {
             output::success(&format!(
                 "No agents idle for more than {stale_days} day(s); nothing to reap."
             ));
+            note_skipped();
             return;
         }
         let mut table = output::CliTable::new(vec![
@@ -41418,6 +41456,7 @@ fn render_agents_reap_payload(
         } else {
             output::success(&format!("Soft-retired {reaped} agent(s)."));
         }
+        note_skipped();
     });
 }
 
@@ -49003,6 +49042,100 @@ http_headers = { Authorization = "Bearer secret" }
                 ]
             );
         });
+    }
+
+    /// GH#348: one deregistered stale agent must not abort the sweep. The
+    /// planted control is the same seed without the deregistration, where
+    /// both agents are ordinary candidates.
+    #[test]
+    fn agents_reap_skips_a_deregistered_agent_and_still_retires_the_rest() {
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        for deregister_one in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("agents-reap-deregistered.sqlite3");
+            let db_path_str = db_path.display().to_string();
+            init_schema_sqlite_canonical(&db_path_str).expect("init canonical schema");
+
+            let now_us = mcp_agent_mail_db::now_micros();
+            let idle_40d = now_us - 40 * 86_400_000_000;
+
+            let conn =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_str).expect("open db");
+            conn.execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'reap-proj', '/tmp/reap-proj', ?)",
+                &[Value::BigInt(now_us)],
+            )
+            .expect("seed project");
+            for (id, name) in [(1i64, "GoneAgent"), (2, "StaleAgent")] {
+                conn.execute_sync(
+                    "INSERT INTO agents (\
+                        id, project_id, name, program, model, task_description, \
+                        inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                        reaper_exempt, retired_at\
+                    ) VALUES (?, 1, ?, 'test', 'test', '', ?, ?, 'auto', 'auto', 0, NULL)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(name.to_string()),
+                        Value::BigInt(idle_40d),
+                        Value::BigInt(idle_40d),
+                    ],
+                )
+                .expect("seed agent");
+            }
+            if deregister_one {
+                conn.execute_sync(
+                    "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (1, ?)",
+                    &[Value::BigInt(now_us)],
+                )
+                .expect("deregister GoneAgent");
+            }
+            drop(conn);
+
+            let cfg = mcp_agent_mail_db::DbPoolConfig {
+                database_url: format!("sqlite:///{db_path_str}"),
+                ..Default::default()
+            };
+            let pool = mcp_agent_mail_db::get_or_create_pool(&cfg).expect("pool");
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            let cx = asupersync::Cx::for_testing();
+
+            let (candidates, reaped, skipped): (i64, i64, i64) =
+                if deregister_one { (1, 1, 1) } else { (2, 2, 0) };
+            rt.block_on(async {
+                let dry = agents_reap_payload(&cx, &pool, 30, None, true)
+                    .await
+                    .expect("dry run");
+                assert_eq!(dry["candidate_count"], candidates);
+                assert_eq!(dry["reaped_count"], 0);
+                assert_eq!(dry["skipped_deregistered_count"], skipped);
+
+                let real = agents_reap_payload(&cx, &pool, 30, None, false)
+                    .await
+                    .expect("a deregistered agent must not abort the sweep");
+                assert_eq!(real["candidate_count"], candidates);
+                assert_eq!(real["reaped_count"], reaped);
+                assert_eq!(real["skipped_deregistered_count"], skipped);
+
+                let mut agents =
+                    outcome_to_result(mcp_agent_mail_db::queries::list_agents(&cx, &pool, 1).await)
+                        .expect("list agents for verification");
+                agents.sort_by_key(|agent| agent.id);
+                let retired: Vec<(String, bool)> = agents
+                    .into_iter()
+                    .map(|agent| (agent.name, agent.retired_at.is_some()))
+                    .collect();
+                // The deregistered row is left exactly as it was.
+                assert_eq!(
+                    retired,
+                    vec![
+                        ("GoneAgent".to_string(), !deregister_one),
+                        ("StaleAgent".to_string(), true),
+                    ]
+                );
+            });
+        }
     }
 
     #[test]
