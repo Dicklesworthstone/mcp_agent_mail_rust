@@ -4842,13 +4842,15 @@ impl AtcEngine {
     }
 
     fn compact_liveness_schedule_if_needed(&mut self) {
-        let live_scheduled = self.scheduled_agent_count();
-        let max_heap_entries = live_scheduled.saturating_mul(4).max(64);
+        // This check runs for every activity and hydration reschedule while the
+        // engine mutex is held. Use tracked population as an O(1) upper bound
+        // instead of scanning the whole roster just to decide whether to rebuild.
+        let max_heap_entries = self.agents.len().saturating_mul(4).max(64);
         if self.liveness_schedule.len() <= max_heap_entries {
             return;
         }
 
-        let mut rebuilt = BinaryHeap::new();
+        let mut rebuilt = Vec::with_capacity(self.agents.len());
         for entry in self.agents.values() {
             if entry.next_review_micros == i64::MAX {
                 continue;
@@ -4859,7 +4861,8 @@ impl AtcEngine {
                 agent: entry.name.clone(),
             }));
         }
-        self.liveness_schedule = rebuilt;
+        // Heapify once instead of performing one logarithmic push per live entry.
+        self.liveness_schedule = BinaryHeap::from(rebuilt);
     }
 
     fn effective_threshold(base_k: f64, adaptive_k: Option<f64>, fallback_active: bool) -> f64 {
@@ -12043,6 +12046,39 @@ mod alien_enhancement_tests {
             "compaction should keep only the latest schedule entry per agent"
         );
         assert_eq!(engine.scheduled_agent_count(), 1);
+    }
+
+    #[test]
+    fn schedule_compaction_keeps_large_population_bounded_without_roster_scans() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("HeapAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            engine.schedule_entry_for_push(&agent, 1_000_000);
+        }
+
+        let bound = POPULATION * 4;
+        for generation in 1_i64..=8 {
+            for index in 0..POPULATION {
+                let agent = format!("HeapAgent{index:04}");
+                engine.schedule_entry_for_push(&agent, 1_000_000 + generation);
+                assert!(engine.liveness_schedule.len() <= bound);
+            }
+        }
+
+        // Force one final rebuild and verify exactly one current entry survives
+        // for each live scheduled agent.
+        while engine.liveness_schedule.len() <= bound {
+            engine.liveness_schedule.push(Reverse(ScheduledAgentReview {
+                review_at_micros: 1,
+                schedule_version: 0,
+                agent: "obsolete".to_string(),
+            }));
+        }
+        engine.compact_liveness_schedule_if_needed();
+        assert_eq!(engine.liveness_schedule.len(), POPULATION);
+        assert_eq!(engine.scheduled_agent_count(), POPULATION);
     }
 
     #[test]
