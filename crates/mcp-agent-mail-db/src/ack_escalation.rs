@@ -12,6 +12,9 @@
 //! grant never materializes per-agent deliveries or marks a message read.
 //! A new grant is read back before commit: an ignored or altered insert must
 //! never authorize an archive artifact for a reservation that was not stored.
+//! Both the recipient and chosen holder must still be active. Retired or
+//! permanently deregistered identities keep their history, not authority for
+//! the background worker to create another reservation on their behalf.
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
@@ -52,6 +55,11 @@ pub enum AckEscalationOutcome {
     NoLongerOverdue,
 }
 
+// Lifecycle checks belong in the same transaction as delivery authorization,
+// before even returning AlreadyCovered. A retained direct recipient is not a
+// live identity, and an explicitly chosen inactive holder must not be replaced.
+// Bind the system-owned legacy prefix rather than duplicating its spelling or
+// trying to parse a possibly malformed tombstone as permission to reactivate.
 const AUTHORIZED_SQL: &str = concat!(
     "\
 SELECT 1 AS authorized \
@@ -63,6 +71,11 @@ WHERE m.id = ?1 AND m.project_id = ?2 AND m.created_ts = ?3 \
   AND m.ack_required = 1 \
   AND viewer.project_id = ?2 AND viewer.name = ?6 COLLATE BINARY \
   AND holder.project_id = ?2 AND holder.name = ?7 COLLATE BINARY \
+  AND viewer.retired_at IS NULL AND holder.retired_at IS NULL \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = viewer.id) \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = holder.id) \
+  AND substr(viewer.task_description, 1, length(?12)) <> ?12 COLLATE BINARY \
+  AND substr(holder.task_description, 1, length(?12)) <> ?12 COLLATE BINARY \
   AND p.slug = ?8 COLLATE BINARY AND p.human_key = ?9 COLLATE BINARY \
   AND (SELECT generation_id FROM db_identity WHERE singleton = 0) IS ?10 \
   AND (EXISTS (SELECT 1 FROM message_recipients mr \
@@ -173,6 +186,7 @@ async fn apply_claim(
                     .generation_id
                     .map_or(Value::Null, |value| Value::Text(value.to_string())),
                 request.overdue_before_ts.into(),
+                crate::models::DEREGISTERED_TASK_PREFIX.into(),
             ],
         )
         .await
@@ -1117,7 +1131,10 @@ mod tests {
     }
 
     fn assert_failed_grant_rolled_back(conn: &DbConn) {
-        assert_eq!(connection_scalar(conn, "SELECT COUNT(*) FROM file_reservations"), 0);
+        assert_eq!(
+            connection_scalar(conn, "SELECT COUNT(*) FROM file_reservations"),
+            0
+        );
         conn.execute_raw("BEGIN IMMEDIATE").unwrap();
         conn.execute_raw("ROLLBACK").unwrap();
     }
@@ -1243,23 +1260,187 @@ mod tests {
                 &request,
                 &claim_pattern(&request).unwrap(),
             )));
-            let stored = conn.query_sync("SELECT * FROM file_reservations", &[]).unwrap();
+            let stored = conn
+                .query_sync("SELECT * FROM file_reservations", &[])
+                .unwrap();
             assert_eq!(stored.len(), 1);
             let stored = &stored[0];
             assert_eq!(stored.get_named::<i64>("id").unwrap(), committed.id.unwrap());
-            assert_eq!(stored.get_named::<i64>("project_id").unwrap(), committed.project_id);
-            assert_eq!(stored.get_named::<i64>("agent_id").unwrap(), committed.agent_id);
-            assert_eq!(stored.get_named::<String>("path_pattern").unwrap(), committed.path_pattern);
-            assert_eq!(stored.get_named::<i64>("exclusive").unwrap(), committed.exclusive);
+            assert_eq!(
+                stored.get_named::<i64>("project_id").unwrap(),
+                committed.project_id
+            );
+            assert_eq!(
+                stored.get_named::<i64>("agent_id").unwrap(),
+                committed.agent_id
+            );
+            assert_eq!(
+                stored.get_named::<String>("path_pattern").unwrap(),
+                committed.path_pattern
+            );
+            assert_eq!(
+                stored.get_named::<i64>("exclusive").unwrap(),
+                committed.exclusive
+            );
             assert_eq!(stored.get_named::<String>("reason").unwrap(), committed.reason);
-            assert_eq!(stored.get_named::<i64>("created_ts").unwrap(), committed.created_ts);
-            assert_eq!(stored.get_named::<i64>("expires_ts").unwrap(), committed.expires_ts);
+            assert_eq!(
+                stored.get_named::<i64>("created_ts").unwrap(),
+                committed.created_ts
+            );
+            assert_eq!(
+                stored.get_named::<i64>("expires_ts").unwrap(),
+                committed.expires_ts
+            );
             assert_eq!(stored.get_named::<Option<i64>>("released_ts").unwrap(), None);
             assert_eq!(
-                Some(connection_scalar(&conn, "SELECT reservation_id FROM ack_grant_audit")),
+                Some(connection_scalar(
+                    &conn,
+                    "SELECT reservation_id FROM ack_grant_audit"
+                )),
                 committed.id
             );
             assert_eq!(connection_scalar(&conn, "SELECT id FROM ack_grant_audit"), 700);
         });
+    }
+
+    #[test]
+    fn inactive_recipient_or_holder_cannot_receive_a_direct_or_shared_automatic_grant() {
+        for shared in [false, true] {
+            for actor in [101, 102] {
+                for mutation in [
+                    format!("UPDATE agents SET retired_at = 0 WHERE id = {actor}"),
+                    format!("UPDATE agents SET retired_at = 42 WHERE id = {actor}"),
+                    format!(
+                        "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES ({actor}, 0)"
+                    ),
+                    format!(
+                        "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES ({actor}, 42)"
+                    ),
+                    format!(
+                        "UPDATE agents SET task_description = '[DEREGISTERED 2026-01-01T00:00:00Z] old' WHERE id = {actor}"
+                    ),
+                    format!(
+                        "UPDATE agents SET task_description = '[DEREGISTERED at 2026-01-01 00:00:00] old' WHERE id = {actor}"
+                    ),
+                    format!(
+                        "UPDATE agents SET task_description = '[DEREGISTERED malformed] old' WHERE id = {actor}"
+                    ),
+                ] {
+                    fixture(|pool, cx, generation, observed| {
+                        if shared {
+                            use_shared_delivery(pool, cx);
+                        }
+                        let mut request = request(generation, observed);
+                        request.holder_id = 101;
+                        request.holder_name = "RedFox";
+                        // This transition occurs after the worker's observation.
+                        // Both names and project IDs still match that proposal.
+                        execute(pool, cx, &mutation);
+                        stale(run(grant_ack_escalation(cx, pool, &request)));
+                        assert_eq!(
+                            scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                            0,
+                            "shared={shared}, mutation={mutation}"
+                        );
+                        assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM messages"), 1);
+                        assert_eq!(
+                            scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                            0
+                        );
+                        assert_eq!(
+                            scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                            i64::from(!shared)
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unretirement_restores_eligibility_but_cannot_clear_permanent_deregistration() {
+        fixture(|pool, cx, generation, observed| {
+            let request = request(generation, observed);
+            execute(pool, cx, "UPDATE agents SET retired_at = 42 WHERE id = 102");
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            execute(pool, cx, "UPDATE agents SET retired_at = NULL WHERE id = 102");
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            execute(
+                pool,
+                cx,
+                "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (102, 42)",
+            );
+            // Even existing coverage cannot bypass the lifecycle check. This
+            // does not mutate a prior lease or delete historical obligations.
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT deregistered_at FROM agent_deregistrations"),
+                42
+            );
+        });
+    }
+
+    #[test]
+    fn missing_deregistration_authority_is_an_error_not_an_active_identity() {
+        fixture(|pool, cx, generation, observed| {
+            execute(
+                pool,
+                cx,
+                "ALTER TABLE agent_deregistrations RENAME TO unavailable_deregistrations",
+            );
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request(generation, observed))),
+                Outcome::Err(_)
+            ));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                0
+            );
+            let conn = run(pool.acquire(cx)).expect("checkout after lifecycle failure");
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("ROLLBACK").unwrap();
+            drop(conn);
+            execute(
+                pool,
+                cx,
+                "ALTER TABLE unavailable_deregistrations RENAME TO agent_deregistrations",
+            );
+            granted(run(grant_ack_escalation(cx, pool, &request(generation, observed))));
+        });
+    }
+
+    #[test]
+    fn ordinary_task_text_does_not_become_a_deregistration_marker() {
+        for task in [
+            "",
+            "normal task",
+            "mentions [DEREGISTERED old] without using the reserved prefix",
+            "[deregistered lowercase-is-not-the-system-marker]",
+        ] {
+            assert!(!crate::models::task_description_uses_reserved_deregistered_prefix(task));
+            fixture(|pool, cx, generation, observed| {
+                let conn = run(pool.acquire(cx)).expect("checkout");
+                conn.execute_sync(
+                    "UPDATE agents SET task_description = ? WHERE id IN (101, 102)",
+                    &[Value::Text(task.to_string())],
+                )
+                .unwrap();
+                drop(conn);
+                let mut request = request(generation, observed);
+                request.holder_id = 101;
+                request.holder_name = "RedFox";
+                let granted = granted(run(grant_ack_escalation(cx, pool, &request)));
+                assert_eq!(granted.agent_id, 101);
+                assert_eq!(granted.path_pattern, "agents/BlueBear/inbox/1970/01/*.md");
+            });
+        }
     }
 }
