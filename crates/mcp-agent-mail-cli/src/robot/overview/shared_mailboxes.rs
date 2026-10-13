@@ -22,11 +22,13 @@ const SHARED_MESSAGES_SQL: &str = "SELECT id, project_id, sender_id, created_ts,
     CASE WHEN ack_required = 1 AND created_ts < ? THEN 1 ELSE 0 END AS overdue
     FROM messages";
 const DIRECT_SQL: &str = "SELECT message_id, agent_id FROM message_recipients";
+const DIRECT_FILTER: &str = "agent_id IS NOT NULL";
 const RECEIPTS_SQL: &str = "SELECT message_id, agent_id,
     CASE WHEN read_ts IS NOT NULL THEN 1 ELSE 0 END AS read_set,
     CASE WHEN ack_ts IS NOT NULL THEN 1 ELSE 0 END AS ack_set
     FROM project_mailbox_receipts";
-const RECEIPTS_FILTER: &str = "read_ts IS NOT NULL OR ack_ts IS NOT NULL";
+const RECEIPTS_FILTER: &str = "agent_id IS NOT NULL
+    AND (read_ts IS NOT NULL OR ack_ts IS NOT NULL)";
 
 #[derive(Clone, Copy)]
 struct Viewer {
@@ -42,10 +44,17 @@ struct Population {
 }
 
 /// One collector per read snapshot, never a process-local or persistent cache.
-/// Outer None is unprepared; inner None disables this strategy for this call.
 #[derive(Default)]
 pub(super) struct Collector {
-    population: Option<Option<Population>>,
+    state: State,
+}
+
+#[derive(Default)]
+enum State {
+    #[default]
+    Unprepared,
+    Disabled,
+    Ready(Population),
 }
 
 struct Delta {
@@ -174,7 +183,8 @@ impl Population {
         // One sentinel row fits in the existing page budget. Exactly a full
         // page is inconclusive, even if it happens to be the entire result.
         let direct = bounded_query(conn, &format!(
-            "{DIRECT_SQL} INDEXED BY {} WHERE message_id IN ({marks}) LIMIT {OVERVIEW_PAGE_ROWS}",
+            "{DIRECT_SQL} INDEXED BY {} WHERE message_id IN ({marks}) \
+             AND ({DIRECT_FILTER}) LIMIT {OVERVIEW_PAGE_ROWS}",
             quoted_identifier(&self.direct_index),
         ), &params, work)?;
         if direct.len() == OVERVIEW_PAGE_ROWS {
@@ -276,14 +286,14 @@ impl Collector {
         projects: &mut HashMap<i64, OverviewProject>,
         work: &mut ScanWork,
     ) -> Result<bool, CliError> {
-        if self.population.is_none() {
-            self.population = Some(Population::load(conn, work)?);
+        if matches!(self.state, State::Unprepared) {
+            self.state = Population::load(conn, work)?.map_or(State::Disabled, State::Ready);
         }
-        let Some(Some(population)) = &self.population else {
+        let State::Ready(population) = &self.state else {
             return Ok(false);
         };
         let Some(deltas) = population.page(conn, deliveries, threshold, work)? else {
-            self.population = Some(None);
+            self.state = State::Disabled;
             return Ok(false);
         };
         // Both correction sets were complete before any counters are published.
@@ -360,12 +370,21 @@ mod tests {
     // message-by-viewer expansion. Do not replace the incumbent with a stub.
     fn canonical(conn: &DbConn) -> serde_json::Value {
         let mut projects = HashMap::new();
-        let ids: Vec<_> = conn.query_sync(
-            "SELECT message_id AS id FROM project_mailbox_deliveries ORDER BY message_id", &[],
-        ).unwrap().iter().map(|row| integer(row, "id").unwrap()).collect();
-        for page in ids.chunks(OVERVIEW_PAGE_ROWS) {
+        let mut after = None;
+        loop {
+            let (predicate, params) = after.map_or_else(
+                || ("", Vec::new()),
+                |id| ("WHERE message_id > ?", vec![Value::BigInt(id)]),
+            );
+            let page: Vec<_> = conn.query_sync(&format!(
+                "SELECT message_id AS id FROM project_mailbox_deliveries \
+                 {predicate} ORDER BY message_id LIMIT {OVERVIEW_PAGE_ROWS}"
+            ), &params).unwrap().iter().map(|row| integer(row, "id").unwrap()).collect();
+            if page.is_empty() {
+                break;
+            }
             let (sql, params) = mcp_agent_mail_db::project_mailbox::overview_counts_query(
-                page, micros_ago(NOW, ACK_OVERDUE_THRESHOLD_US),
+                &page, micros_ago(NOW, ACK_OVERDUE_THRESHOLD_US),
             ).unwrap();
             for row in conn.query_sync(&sql, &params).unwrap() {
                 let count = project(&mut projects, integer(&row, "project_id").unwrap());
@@ -373,6 +392,10 @@ mod tests {
                 count.urgent += usize::try_from(integer(&row, "urgent").unwrap()).unwrap();
                 count.ack_overdue += usize::try_from(integer(&row, "ack_overdue").unwrap()).unwrap();
             }
+            if page.len() < OVERVIEW_PAGE_ROWS {
+                break;
+            }
+            after = page.last().copied();
         }
         serde_json::to_value(projects).unwrap()
     }
@@ -534,6 +557,25 @@ mod tests {
     }
 
     #[test]
+    fn nullable_legacy_pairs_never_settle_an_agents_obligation() {
+        let (_dir, conn) = fixture();
+        seed(&conn, 3, 1);
+        // SQLite UNIQUE pairs can contain duplicate NULLs. The canonical
+        // viewer join excludes them; they cannot become receipt corrections.
+        execute(&conn, "INSERT INTO message_recipients VALUES
+            (1,NULL,NULL,NULL), (1,NULL,0,0)");
+        execute(&conn, "INSERT INTO project_mailbox_receipts VALUES
+            (1,NULL,0,0), (1,NULL,0,NULL), (NULL,2,0,0)");
+        assert_eq!(optimized(&conn).0, canonical(&conn));
+        assert_eq!(optimized(&conn).0["1"]["unread"], 2);
+        let mut projects = HashMap::new();
+        let mut work = ScanWork::default();
+        assert!(Collector::default().try_page(
+            &conn, &first_page(&conn), SENT + 1, &mut projects, &mut work,
+        ).unwrap());
+    }
+
+    #[test]
     fn population_and_receipts_stay_in_one_wal_snapshot_and_refresh_next_time() {
         let (dir, reader) = fixture();
         execute(&reader, "PRAGMA journal_mode=WAL");
@@ -546,7 +588,9 @@ mod tests {
         let population = Population::load(&reader, &mut work).unwrap();
         execute(&writer, "INSERT INTO project_mailbox_receipts VALUES (1,2,0,0)");
         execute(&writer, "UPDATE agents SET contact_policy='block_all' WHERE id=3");
-        let mut collector = Collector { population: Some(population) };
+        let mut collector = Collector {
+            state: population.map_or(State::Disabled, State::Ready),
+        };
         let mut projects = HashMap::new();
         let result = collector.try_page(&reader, &first_page(&reader), SENT + 1, &mut projects, &mut work);
         execute(&reader, "RELEASE shared_test");
