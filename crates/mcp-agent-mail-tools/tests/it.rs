@@ -21,6 +21,7 @@ mod registration_proof_gate;
 mod reservation_error_parity;
 mod reservation_regression_fixtures;
 mod session_identity;
+mod session_identity_eviction;
 mod system_error_parity;
 mod tool_input_proptest;
 mod transcript_safe_identity;
