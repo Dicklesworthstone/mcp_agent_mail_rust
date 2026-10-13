@@ -26,6 +26,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 ```
 
 <p><em>Works on Linux and macOS (x86_64 and aarch64). Auto-detects your platform, downloads the right binary, and configures detected coding agents for HTTP MCP.</em></p>
+<p><em>Needs <code>minisign</code> on <code>PATH</code> to verify the release (and <code>xz</code> on minimal Linux images); see <a href="#one-liner-recommended">One-Liner</a>.</em></p>
 </div>
 
 ---
@@ -295,6 +296,8 @@ The stress tests live in `crates/mcp-agent-mail-storage/tests/stress_pipeline.rs
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
 ```
+
+**Prerequisites:** the installer verifies the release with `minisign` and refuses to install without it, and minimal Linux images also lack `xz`. macOS: `brew install minisign`. Debian 12+ and Ubuntu 24.04+: `apt install minisign xz-utils`. Ubuntu 22.04 and Debian 10 have no `minisign` package: use the static binary from the [minisign releases](https://github.com/jedisct1/minisign/releases).
 
 Downloads the right binary for your platform, installs to `~/.local/bin`, optionally updates your `PATH`, and auto-configures detected Codex CLI configs for HTTP MCP URL mode. Downloaded release archives are verified **before extraction by default**. The requested version is normalized to the release tag `vX.Y.Z` (or `vX.Y.Z-prerelease`), and the trust model depends on the release generation:
 
