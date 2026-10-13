@@ -13,6 +13,10 @@
 //! Direct and visible project-mailbox obligations share one ordered stream.
 //! A shared obligation is observed, never materialized as a per-agent delivery
 //! or receipt; direct deliveries take precedence even when already ACKed.
+//! Only active recipients in the message's project enter the automatic work
+//! queue. Retirement and permanent deregistration suspend scanning, not erase
+//! delivery history. Lifecycle is observed afresh on every page; escalation
+//! still revalidates it transactionally before granting a reservation.
 //! This is a bounded observation, not a transaction authorizing a later mutation
 //! or a query execution deadline.
 
@@ -57,8 +61,13 @@ SELECT 0 AS row_kind, generation_id, upper_id, before_ts, after_message, after_a
        0 AS message_id, 0 AS project_id, 0 AS created_ts, 0 AS agent_id FROM bounds \
 UNION ALL \
 SELECT 1, NULL, NULL, NULL, NULL, NULL, m.id, m.project_id, m.created_ts, mr.agent_id \
-FROM messages m JOIN message_recipients mr ON mr.message_id = m.id CROSS JOIN bounds b \
+FROM messages m JOIN message_recipients mr ON mr.message_id = m.id \
+JOIN agents recipient ON recipient.id = mr.agent_id AND recipient.project_id = m.project_id \
+CROSS JOIN bounds b \
 WHERE m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts <= b.before_ts \
+  AND recipient.retired_at IS NULL \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = recipient.id) \
+  AND substr(recipient.task_description, 1, length(?8)) <> ?8 COLLATE BINARY \
   AND m.id <= b.upper_id \
   AND (m.id > b.after_message OR (m.id = b.after_message AND mr.agent_id > b.after_agent)) \
 UNION ALL \
@@ -68,6 +77,8 @@ JOIN agents viewer ON viewer.project_id = d.project_id \
 LEFT JOIN project_mailbox_receipts pr \
   ON pr.message_id = d.message_id AND pr.agent_id = viewer.id CROSS JOIN bounds b \
 WHERE m.ack_required = 1 AND pr.ack_ts IS NULL AND m.created_ts <= b.before_ts \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = viewer.id) \
+  AND substr(viewer.task_description, 1, length(?8)) <> ?8 COLLATE BINARY \
   AND m.id <= b.upper_id \
   AND (m.id > b.after_message OR (m.id = b.after_message AND viewer.id > b.after_agent)) \
   AND ",
@@ -167,6 +178,7 @@ fn page_query(
         overdue_before_ts.into(),
         cursor.map_or(0, |cursor| cursor.after_message).into(),
         cursor.map_or(0, |cursor| cursor.after_agent).into(),
+        crate::models::DEREGISTERED_TASK_PREFIX.into(),
     ];
     Ok((sql, params))
 }
@@ -292,7 +304,8 @@ mod tests {
         for sql in [
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, ack_required INTEGER NOT NULL, sender_id INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, ack_ts INTEGER, PRIMARY KEY (message_id, agent_id))",
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, inception_ts INTEGER NOT NULL DEFAULT 1, retired_at INTEGER, contact_policy TEXT DEFAULT 'auto')",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, inception_ts INTEGER NOT NULL DEFAULT 1, retired_at INTEGER, contact_policy TEXT DEFAULT 'auto', task_description TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER)",
             "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
             "CREATE TABLE project_mailbox_receipts (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
             "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL)",
@@ -310,6 +323,14 @@ mod tests {
         )
         .unwrap();
         for recipient in recipients {
+            // Direct-delivery fixtures need a real recipient just as the
+            // migrated runtime schema does. Never reactivate an existing one.
+            conn.execute_sync(
+                "INSERT INTO agents(id, project_id) SELECT ?1, 1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1)",
+                &[(*recipient).into()],
+            )
+            .unwrap();
             conn.execute_sync(
                 "INSERT INTO message_recipients VALUES (?, ?, NULL)",
                 &[message.into(), (*recipient).into()],
@@ -695,6 +716,7 @@ mod tests {
         fixture(|conn| {
             seed(conn, 1, &[1, 2, 3], 10);
             let first = page(conn, "db", None, 10, 1);
+            assert_eq!(keys(&first), vec![(1, 1)]);
             let cursor = first.continuation_after(1).unwrap().unwrap();
             conn.execute_sync(
                 "UPDATE db_identity SET generation_id = 'generation-two' WHERE singleton = 0",
@@ -771,7 +793,11 @@ mod tests {
     fn compound_limit_is_internal_and_all_data_bindings_are_explicit() {
         for size in 1..=MAX_ACK_SCAN_PAGE_SIZE {
             let (sql, params) = page_query("db", None, i64::MIN, size).unwrap();
-            assert_eq!(params.len(), 7);
+            assert_eq!(params.len(), 8);
+            assert_eq!(
+                params[7],
+                Value::Text(crate::models::DEREGISTERED_TASK_PREFIX.into())
+            );
             assert_eq!(
                 sql.strip_prefix(PAGE_SQL_PREFIX),
                 Some((size + 2).to_string().as_str())
@@ -818,13 +844,220 @@ mod tests {
             let cursor = first.continuation_after(1).unwrap().unwrap();
             let (sql, params) = page_query("mailbox", Some(&cursor), 29, 1).unwrap();
             assert!(!sql.contains(generation));
-            assert_eq!(params.len(), 7);
+            assert_eq!(params.len(), 8);
             let next =
                 decode_page("mailbox".into(), conn.query_sync(&sql, &params).unwrap(), 1).unwrap();
             assert_eq!(keys(&next), vec![(7, 13)]);
             assert_eq!(next.generation_id(), Some(generation));
             assert_eq!(next.overdue_before_ts(), 23);
             assert_eq!(next.window.upper_id, 7);
+        });
+    }
+
+    #[test]
+    fn inactive_direct_and_shared_recipients_keep_history_not_automatic_work() {
+        for mutation in [
+            "UPDATE agents SET retired_at = 0 WHERE id = 2",
+            "UPDATE agents SET retired_at = 42 WHERE id = 2",
+            "INSERT INTO agent_deregistrations VALUES(2, 0)",
+            "INSERT INTO agent_deregistrations VALUES(2, 42)",
+            "UPDATE agents SET task_description = '[DEREGISTERED 2026-01-01T00:00:00Z] old' WHERE id = 2",
+            "UPDATE agents SET task_description = '[DEREGISTERED at 2026-01-01 00:00:00] old' WHERE id = 2",
+            "UPDATE agents SET task_description = '[DEREGISTERED malformed] old' WHERE id = 2",
+        ] {
+            fixture(|conn| {
+                viewers(conn, &[1, 2, 3]);
+                shared(conn, 10, 100);
+                seed(conn, 11, &[2, 3], 100);
+                conn.execute_raw(mutation).unwrap();
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                let observed = page(conn, "db", None, 100, 128);
+                assert_eq!(keys(&observed), vec![(10, 3), (11, 3)], "{mutation}");
+                assert!(observed.continuation_after(2).unwrap().is_none());
+                assert_eq!(count(conn, "SELECT COUNT(*) FROM messages"), 2);
+                assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 2);
+                assert_eq!(
+                    count(conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                    2
+                );
+                assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+                assert_eq!(
+                    count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                    1
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn direct_scope_is_required_without_reapplying_shared_subscription_rules() {
+        fixture(|conn| {
+            viewers(conn, &[1, 2, 3, 4, 5]);
+            shared(conn, 10, 100);
+            seed(conn, 11, &[2, 3, 4, 5], 100);
+            for sql in [
+                "UPDATE agents SET project_id = 2 WHERE id = 3",
+                "UPDATE agents SET id = 99 WHERE id = 4",
+                "UPDATE agents SET contact_policy = 'BLOCK_ALL', inception_ts = 101 WHERE id = 2",
+                "UPDATE agents SET task_description = 'mentions [DEREGISTERED old] in ordinary text' WHERE id = 2",
+                "UPDATE agents SET task_description = '[deregistered lowercase is not reserved]' WHERE id = 5",
+                // A direct ACK wins over a still-unacknowledged shared receipt.
+                "INSERT INTO message_recipients VALUES(10, 5, 42)",
+            ] {
+                conn.execute_raw(sql).unwrap();
+            }
+            assert_eq!(
+                keys(&page(conn, "db", None, 100, 128)),
+                vec![(10, 99), (11, 2), (11, 5)]
+            );
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 5);
+            assert_eq!(
+                count(conn, "SELECT ack_ts FROM message_recipients WHERE message_id = 10"),
+                42
+            );
+        });
+    }
+
+    #[test]
+    fn lifecycle_changes_between_pages_preserve_the_cursor_and_reactivate_next_lap() {
+        fixture(|conn| {
+            seed(conn, 1, &[1, 2, 3, 4, 5], 10);
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 1")
+                .unwrap();
+            let first = page(conn, "db", None, 10, 1);
+            assert_eq!(keys(&first), vec![(1, 2)]);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 1")
+                .unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 3")
+                .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations VALUES(4, 42)")
+                .unwrap();
+            seed(conn, 2, &[5], 10);
+            let next = page(conn, "db", Some(&cursor), 999, 1);
+            assert_eq!(keys(&next), vec![(1, 5)]);
+            assert_eq!(next.overdue_before_ts(), 10);
+            assert!(next.continuation_after(1).unwrap().is_none());
+            assert_eq!(
+                keys(&page(conn, "db", None, 999, 128)),
+                vec![(1, 1), (1, 2), (1, 5), (2, 5)]
+            );
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                6
+            );
+        });
+    }
+
+    #[test]
+    fn retired_backlog_does_not_consume_the_active_recipients_page() {
+        fixture(|conn| {
+            viewers(conn, &(1..=941).collect::<Vec<_>>());
+            shared(conn, 1, 10);
+            seed(conn, 2, &(2..=941).collect::<Vec<_>>(), 10);
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id <= 940")
+                .unwrap();
+            let observed = page(conn, "db", None, 10, MAX_ACK_SCAN_PAGE_SIZE);
+            assert_eq!(keys(&observed), vec![(1, 941), (2, 941)]);
+            assert!(!observed.has_more);
+            assert!(observed.continuation_after(2).unwrap().is_none());
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 940);
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+        });
+    }
+
+    #[test]
+    fn missing_lifecycle_authority_refuses_the_page_and_recovers_without_cursor_loss() {
+        fixture(|conn| {
+            seed(conn, 1, &[1, 2, 3], 10);
+            let first = page(conn, "db", None, 10, 1);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            conn.execute_raw("ALTER TABLE agent_deregistrations RENAME TO unavailable_lifecycle")
+                .unwrap();
+            let (sql, params) = page_query("db", Some(&cursor), 999, 128).unwrap();
+            assert!(conn.query_sync(&sql, &params).is_err());
+            conn.execute_raw("ALTER TABLE unavailable_lifecycle RENAME TO agent_deregistrations")
+                .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations VALUES(2, 42)")
+                .unwrap();
+            assert_eq!(
+                keys(&page(conn, "db", Some(&cursor), 999, 128)),
+                vec![(1, 3)]
+            );
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 3);
+        });
+    }
+
+    #[test]
+    fn runtime_lifecycle_scan_and_grant_revalidation_agree_without_erasing_obligations() {
+        shared_pool(|pool, cx| {
+            // The production startup stamps this identity; retain one stable
+            // generation across all observations and the grant transaction.
+            let generation = run(crate::queries::db_generation_id(cx, pool))
+                .into_result()
+                .unwrap();
+            assert!(generation.is_some());
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 102")
+                .unwrap();
+            conn.execute_raw("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 102, 'to')")
+                .unwrap();
+            drop(conn);
+            let observed = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&observed), vec![(901, 103)]);
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 102")
+                .unwrap();
+            conn.execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(103, 42)")
+                .unwrap();
+            drop(conn);
+            let request = AckEscalationRequest {
+                observed: &observed.rows[0],
+                overdue_before_ts: observed.overdue_before_ts(),
+                generation_id: observed.generation_id(),
+                project_slug: "project",
+                project_key: "/project",
+                recipient_name: "GreenHill",
+                holder_id: 103,
+                holder_name: "GreenHill",
+                ttl_seconds: 3600,
+                exclusive: true,
+            };
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::NoLongerOverdue)
+            ));
+            let fresh = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&fresh), vec![(901, 102)]);
+            let request = AckEscalationRequest {
+                observed: &fresh.rows[0],
+                overdue_before_ts: fresh.overdue_before_ts(),
+                generation_id: fresh.generation_id(),
+                recipient_name: "BlueBear",
+                holder_id: 102,
+                holder_name: "BlueBear",
+                ..request
+            };
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::Granted(_))
+            ));
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 102);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                1
+            );
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
         });
     }
 }
