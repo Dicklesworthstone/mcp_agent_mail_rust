@@ -13,6 +13,8 @@ const UNREAD_FILTER: &str = "read_ts IS NULL";
 const ACK_MESSAGES_SQL: &str = "SELECT id, project_id FROM messages";
 const ACK_MESSAGES_FILTER: &str = "ack_required = 1 AND created_ts < ?";
 const ACK_COUNTS_SQL: &str = "SELECT message_id, COUNT(*) AS pending_count FROM message_recipients";
+const ACK_PENDING_IDS_SQL: &str = "SELECT message_id FROM message_recipients";
+const ACK_PENDING_FILTER: &str = "ack_ts IS NULL AND message_id IS NOT NULL";
 
 /// Return false without modifying project counters when indexes are absent or
 /// a bounded sample is unread-heavy. Work includes the strategy sample, which
@@ -117,72 +119,174 @@ pub(super) fn try_collect(
         },
     )?;
 
-    // The sample proved that read-but-unacknowledged mail exists in this same
-    // snapshot. No separate unbounded existence scan is necessary here.
-    let recipients = quoted_identifier(&recipient_index);
-
-    let select = format!(
-        "{ACK_MESSAGES_SQL} INDEXED BY {}",
-        quoted_identifier(&message_index)
-    );
-    let mut ack_work = ScanWork::default();
-    scan_pages(
+    collect_read_ack_counts(
         conn,
-        &mut ack_work,
-        Scan {
-            select: &select,
-            predicate: ACK_MESSAGES_FILTER,
-            key: "id",
-            params: &[Value::BigInt(threshold)],
-            slot: 2,
-        },
-        |rows, work| {
-            let mut message_projects = HashMap::with_capacity(rows.len());
-            let mut params = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id = integer(row, "id")?;
-                message_projects.insert(id, integer(row, "project_id")?);
-                params.push(Value::BigInt(id));
-            }
-            work.peak_message_keys = work.peak_message_keys.max(message_projects.len());
-            let placeholders = vec!["?"; params.len()].join(",");
-            // Both WHERE columns are the verified index's leading columns. There
-            // is no JOIN, subquery, per-project query, or unbounded IN parameter list.
-            // At most params.len() groups can be returned, even for huge fanout.
-            // Do not LIMIT away unexpected groups: bounded_query rejects them.
-            let sql = format!(
-                "{ACK_COUNTS_SQL} INDEXED BY {recipients} \
-             WHERE ack_ts IS NULL AND read_ts IS NOT NULL \
-             AND message_id IN ({placeholders}) GROUP BY message_id",
-            );
-            let counts = bounded_query(conn, &sql, &params, work)?;
-            work.ack_count_rows += counts.len();
-            for row in counts {
-                let id = integer(&row, "message_id")?;
-                let project_id = message_projects.remove(&id).ok_or_else(|| {
-                    CliError::Other(
-                        "overview acknowledgement group was duplicate or unrequested".to_string(),
-                    )
-                })?;
-                let count = usize::try_from(integer(&row, "pending_count")?).map_err(|_| {
-                    CliError::Other(
-                        "overview acknowledgement count was negative or overflowed".to_string(),
-                    )
-                })?;
-                let counts = project(projects, project_id);
-                counts.ack_overdue = counts.ack_overdue.checked_add(count).ok_or_else(|| {
-                    CliError::Other("overview acknowledgement total overflowed".to_string())
-                })?;
-            }
-            Ok(())
-        },
+        threshold,
+        &message_index,
+        &recipient_index,
+        projects,
+        work,
     )?;
-    work.queries += ack_work.queries;
-    work.ack_message_rows += ack_work.rows[2];
-    work.ack_count_rows += ack_work.ack_count_rows;
-    work.peak_query_rows = work.peak_query_rows.max(ack_work.peak_query_rows);
-    work.peak_message_keys = work.peak_message_keys.max(ack_work.peak_message_keys);
     Ok(true)
+}
+
+/// Seek a covering (ack_ts, message_id) index rather than walking settled mail.
+/// Do NOT filter read_ts here: that would require visiting recipient payloads
+/// and could scan arbitrarily large unread fanout just to find the next key.
+/// Unread, non-ack-required and dangling recipients are safe false positives;
+/// the normal message predicate and grouped count still decide what counts.
+fn next_unacked_id(
+    conn: &DbConn,
+    recipient_index: &str,
+    after: Option<i64>,
+    work: &mut ScanWork,
+) -> Result<Option<i64>, CliError> {
+    let (continuation, params) = after.map_or_else(
+        || ("", Vec::new()),
+        |id| (" AND message_id > ?", vec![Value::BigInt(id)]),
+    );
+    let sql = format!(
+        "{ACK_PENDING_IDS_SQL} INDEXED BY {} WHERE {ACK_PENDING_FILTER}\
+         {continuation} ORDER BY message_id LIMIT 1",
+        quoted_identifier(recipient_index),
+    );
+    let rows = bounded_query(conn, &sql, &params, work)?;
+    if rows.len() > 1 {
+        return Err(CliError::Other(
+            "overview acknowledgement seek exceeded one row".to_string(),
+        ));
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let id = integer(row, "message_id")?;
+    if after.is_some_and(|previous| id <= previous) {
+        return Err(CliError::Other(
+            "overview acknowledgement seek did not advance".to_string(),
+        ));
+    }
+    Ok(Some(id))
+}
+
+/// Skip settled prefixes, suffixes and gaps without sampling away obligations.
+/// The caller verified both indexes and holds one read snapshot for all phases.
+/// Seek initially and once per streak of full pages with no read-ack groups.
+/// Repeated non-ack decoys must not add a query to every historical page;
+/// another nonempty count page re-arms the lookahead. Dense pending pages keep
+/// the previous two-query batching plan. No seek uses id + 1, so i64::MIN/MAX
+/// and an obligation exactly at the seek key are safe.
+fn collect_read_ack_counts(
+    conn: &DbConn,
+    threshold: i64,
+    message_index: &str,
+    recipient_index: &str,
+    projects: &mut HashMap<i64, OverviewProject>,
+    work: &mut ScanWork,
+) -> Result<(), CliError> {
+    let Some(mut lower) = next_unacked_id(conn, recipient_index, None, work)? else {
+        return Ok(());
+    };
+    let mut inclusive = true;
+    let mut seek_empty = true;
+    loop {
+        let comparison = if inclusive { ">=" } else { ">" };
+        let sql = format!(
+            "{ACK_MESSAGES_SQL} INDEXED BY {} WHERE ({ACK_MESSAGES_FILTER}) \
+             AND id {comparison} ? ORDER BY id LIMIT {OVERVIEW_PAGE_ROWS}",
+            quoted_identifier(message_index),
+        );
+        let rows = bounded_query(
+            conn,
+            &sql,
+            &[Value::BigInt(threshold), Value::BigInt(lower)],
+            work,
+        )?;
+        work.ack_message_rows += rows.len();
+        let mut last = None;
+        for row in &rows {
+            let id = integer(row, "id")?;
+            if id < lower
+                || (!inclusive && id == lower)
+                || last.is_some_and(|previous| id <= previous)
+            {
+                return Err(CliError::Other(
+                    "overview acknowledgement message cursor did not advance".to_string(),
+                ));
+            }
+            last = Some(id);
+        }
+        let Some(last) = last else {
+            return Ok(());
+        };
+        let had_counts = count_read_ack_page(conn, recipient_index, &rows, projects, work)?;
+        if rows.len() < OVERVIEW_PAGE_ROWS {
+            return Ok(());
+        }
+        if !had_counts && seek_empty {
+            seek_empty = false;
+            // An empty result alone proves nothing about later messages.
+            // Advance only as far as the exact next unacknowledged index key.
+            let Some(next) = next_unacked_id(conn, recipient_index, Some(last), work)? else {
+                return Ok(());
+            };
+            lower = next;
+            inclusive = true;
+        } else {
+            lower = last;
+            inclusive = false;
+            if had_counts {
+                seek_empty = true;
+            }
+        }
+    }
+}
+
+fn count_read_ack_page(
+    conn: &DbConn,
+    recipient_index: &str,
+    rows: &[Row],
+    projects: &mut HashMap<i64, OverviewProject>,
+    work: &mut ScanWork,
+) -> Result<bool, CliError> {
+    let mut message_projects = HashMap::with_capacity(rows.len());
+    let mut params = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = integer(row, "id")?;
+        message_projects.insert(id, integer(row, "project_id")?);
+        params.push(Value::BigInt(id));
+    }
+    work.peak_message_keys = work.peak_message_keys.max(message_projects.len());
+    let placeholders = vec!["?"; params.len()].join(",");
+    // Same grouped lookup as before the seek optimization: the index key
+    // does not decide visibility or multiplicity. Exclude unread recipients
+    // already counted in the first pass. Do not LIMIT away unexpected groups.
+    let sql = format!(
+        "{ACK_COUNTS_SQL} INDEXED BY {} \
+         WHERE ack_ts IS NULL AND read_ts IS NOT NULL \
+         AND message_id IN ({placeholders}) GROUP BY message_id",
+        quoted_identifier(recipient_index),
+    );
+    let counts = bounded_query(conn, &sql, &params, work)?;
+    let had_counts = !counts.is_empty();
+    work.ack_count_rows += counts.len();
+    for row in counts {
+        let id = integer(&row, "message_id")?;
+        let project_id = message_projects.remove(&id).ok_or_else(|| {
+            CliError::Other(
+                "overview acknowledgement group was duplicate or unrequested".to_string(),
+            )
+        })?;
+        let count = usize::try_from(integer(&row, "pending_count")?).map_err(|_| {
+            CliError::Other(
+                "overview acknowledgement count was negative or overflowed".to_string(),
+            )
+        })?;
+        let counts = project(projects, project_id);
+        counts.ack_overdue = counts.ack_overdue.checked_add(count).ok_or_else(|| {
+            CliError::Other("overview acknowledgement total overflowed".to_string())
+        })?;
+    }
+    Ok(had_counts)
 }
 
 #[cfg(test)]
@@ -429,7 +533,7 @@ mod tests {
             execute(&conn, ddl);
             execute(
                 &conn,
-                "CREATE INDEX ack_recipients ON message_recipients(ack_ts, message_id)",
+                "CREATE INDEX ack_recipients ON message_recipients(ack_ts,message_id)",
             );
             seed_history(&conn, 1);
             let mut projects = HashMap::new();
@@ -463,7 +567,7 @@ mod tests {
         );
         execute(
             &conn,
-            "CREATE INDEX \"ack\"\"recipients\" ON message_recipients(ack_ts, message_id)",
+            "CREATE INDEX \"ack\"\"recipients\" ON message_recipients(ack_ts,message_id)",
         );
         execute(&conn, "INSERT INTO messages VALUES (1, 1, 'urgent', 1, 0)");
         execute(
@@ -506,6 +610,243 @@ mod tests {
             (after[0].unread, after[0].urgent, after[0].ack_overdue),
             (0, 0, 0)
         );
+    }
+
+    // The incumbent acknowledgement page walk from 38c9d8a8. Keep its real
+    // native query plan beside the new path, not a wall-clock estimate or a
+    // source-text assertion. The grouped count helper is unchanged.
+    fn ack_phase(conn: &DbConn, seek: bool) -> (serde_json::Value, ScanWork) {
+        let mut projects = HashMap::new();
+        let mut work = ScanWork::default();
+        let threshold = micros_ago(NOW, ACK_OVERDUE_THRESHOLD_US);
+        if seek {
+            collect_read_ack_counts(
+                conn,
+                threshold,
+                "ack_messages",
+                "ack_recipients",
+                &mut projects,
+                &mut work,
+            )
+            .expect("seek acknowledgement phase");
+        } else {
+            scan_pages(
+                conn,
+                &mut work,
+                Scan {
+                    select: "SELECT id, project_id FROM messages INDEXED BY ack_messages",
+                    predicate: ACK_MESSAGES_FILTER,
+                    key: "id",
+                    params: &[Value::BigInt(threshold)],
+                    slot: 2,
+                },
+                |rows, work| {
+                    count_read_ack_page(conn, "ack_recipients", rows, &mut projects, work)?;
+                    Ok(())
+                },
+            )
+            .expect("incumbent acknowledgement phase");
+            work.ack_message_rows = work.rows[2];
+        }
+        (serde_json::to_value(projects).unwrap(), work)
+    }
+
+    fn seed_settled_ack_history(conn: &DbConn, size: usize) {
+        seed_history(conn, size);
+        execute(conn, "UPDATE messages SET ack_required = 1");
+        execute(conn, "UPDATE message_recipients SET ack_ts = 0");
+    }
+
+    #[test]
+    fn settled_ack_prefix_is_skipped_even_with_pending_non_ack_mail() {
+        for history in [OVERVIEW_PAGE_ROWS * 4 + 1, OVERVIEW_PAGE_ROWS * 16 + 1] {
+            let (_dir, conn) = fixture();
+            seed_settled_ack_history(&conn, history);
+            execute(&conn, "INSERT INTO messages VALUES (99999, 77, 'high', 1, 0)");
+            execute(
+                &conn,
+                "INSERT INTO message_recipients VALUES (99999, 1, 0, NULL), (99999, 2, NULL, NULL)",
+            );
+            // Fallback vs optimized *full* overview also covers the unread
+            // contribution. The sought ID is inclusive and its fanout is exact.
+            let (_, new) = compare_before_and_after_indexes(&conn);
+            assert_eq!(new.ack_message_rows, 1);
+            let (expected, old) = ack_phase(&conn, false);
+            let (actual, work) = ack_phase(&conn, true);
+            assert_eq!(actual, expected);
+            assert_eq!(actual["77"]["ack_overdue"], 1);
+            assert_eq!(old.ack_message_rows, history + 1);
+            assert_eq!(work.ack_message_rows, 1);
+            assert_eq!(work.queries, 3);
+            assert!(work.queries < old.queries);
+            execute(&conn, "UPDATE messages SET ack_required = 0 WHERE id = 99999");
+            let (actual, work) = ack_phase(&conn, true);
+            assert_eq!(actual, ack_phase(&conn, false).0);
+            assert_eq!(work.ack_message_rows, 0);
+            assert_eq!(work.queries, 2);
+        }
+    }
+
+    #[test]
+    fn non_ack_decoy_does_not_force_a_complete_settled_gap_walk() {
+        let (_dir, conn) = fixture();
+        seed_settled_ack_history(&conn, OVERVIEW_PAGE_ROWS * 16 + 1);
+        execute(
+            &conn,
+            "INSERT INTO messages VALUES (0, 1, 'normal', 0, 0), (99999, 77, 'high', 1, 0)",
+        );
+        execute(
+            &conn,
+            "INSERT INTO message_recipients VALUES (0, 1, 0, NULL), (99999, 1, 0, NULL)",
+        );
+        let (_, work) = compare_before_and_after_indexes(&conn);
+        assert_eq!(work.ack_message_rows, OVERVIEW_PAGE_ROWS + 1);
+        let (actual, work) = ack_phase(&conn, true);
+        assert_eq!(actual, ack_phase(&conn, false).0);
+        assert_eq!(actual["77"]["ack_overdue"], 1);
+        assert_eq!(work.queries, 6);
+        assert!(work.peak_query_rows <= OVERVIEW_PAGE_ROWS);
+    }
+
+    #[test]
+    fn dense_read_ack_pages_pay_one_initial_seek_not_one_per_page() {
+        let (_dir, conn) = fixture();
+        let size = OVERVIEW_PAGE_ROWS * 3 + 7;
+        seed_history(&conn, size);
+        execute(&conn, "UPDATE messages SET ack_required = 1");
+        indexes(&conn);
+        let (expected, old) = ack_phase(&conn, false);
+        let (actual, work) = ack_phase(&conn, true);
+        assert_eq!(actual, expected);
+        assert_eq!(actual["1"]["ack_overdue"], size);
+        assert_eq!(work.ack_message_rows, size);
+        assert_eq!(work.queries, old.queries + 1);
+    }
+
+    #[test]
+    fn interleaved_non_ack_decoys_do_not_add_a_seek_to_every_empty_page() {
+        let (_dir, conn) = fixture();
+        seed_history(&conn, OVERVIEW_PAGE_ROWS * 8 + 2);
+        execute(&conn, "UPDATE messages SET ack_required = id % 2");
+        execute(&conn, "UPDATE message_recipients SET ack_ts = CASE WHEN message_id % 2 = 1 THEN 0 ELSE NULL END");
+        indexes(&conn);
+        let (expected, old) = ack_phase(&conn, false);
+        let (actual, work) = ack_phase(&conn, true);
+        assert_eq!(actual, expected);
+        assert_eq!(actual, serde_json::json!({}));
+        // Skipping the first settled key can also remove a partial page.
+        assert!(work.queries <= old.queries + 2);
+    }
+
+    #[test]
+    fn seek_keeps_signed_endpoints_and_unread_dangling_false_positives() {
+        let (_dir, conn) = fixture();
+        indexes(&conn);
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO messages VALUES ({}, 1, 'high', 1, 0), ({}, 77, 'normal', 1, 0)",
+                i64::MIN,
+                i64::MAX
+            ),
+        );
+        execute(
+            &conn,
+            &format!(
+                "INSERT INTO message_recipients VALUES ({}, 1, 0, NULL), \
+                 (-1, 1, NULL, NULL), (0, 1, 0, 0), ({}, 1, 0, NULL)",
+                i64::MIN,
+                i64::MAX
+            ),
+        );
+        let mut work = ScanWork::default();
+        assert_eq!(next_unacked_id(&conn, "ack_recipients", None, &mut work).unwrap(), Some(i64::MIN));
+        assert_eq!(next_unacked_id(&conn, "ack_recipients", Some(i64::MIN), &mut work).unwrap(), Some(-1));
+        assert_eq!(next_unacked_id(&conn, "ack_recipients", Some(-1), &mut work).unwrap(), Some(i64::MAX));
+        assert_eq!(next_unacked_id(&conn, "ack_recipients", Some(i64::MAX), &mut work).unwrap(), None);
+        assert_eq!(ack_phase(&conn, true).0, ack_phase(&conn, false).0);
+        assert!(next_unacked_id(&conn, "missing_index", None, &mut work).is_err());
+    }
+
+    #[test]
+    fn earlier_reopened_obligation_is_visible_on_the_next_overview() {
+        let (_dir, conn) = fixture();
+        seed_settled_ack_history(&conn, OVERVIEW_PAGE_ROWS * 4);
+        execute(&conn, "INSERT INTO messages VALUES (99999, 77, 'normal', 0, 0)");
+        execute(&conn, "INSERT INTO message_recipients VALUES (99999, 1, 0, NULL)");
+        indexes(&conn);
+        assert!(build_at(&conn, NOW).unwrap().0.iter().all(|row| row.ack_overdue == 0));
+        execute(&conn, "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 1");
+        assert_eq!(build_at(&conn, NOW).unwrap().0.iter().find(|row| row.slug == "alpha").unwrap().ack_overdue, 1);
+        execute(&conn, "UPDATE message_recipients SET ack_ts = 0 WHERE message_id = 1");
+        assert!(build_at(&conn, NOW).unwrap().0.iter().all(|row| row.ack_overdue == 0));
+    }
+
+    #[test]
+    fn seek_and_count_share_the_native_wal_read_snapshot() {
+        let (dir, conn) = fixture();
+        indexes(&conn);
+        execute(&conn, "PRAGMA journal_mode = WAL");
+        execute(&conn, "INSERT INTO messages VALUES (1, 1, 'high', 1, 0), (2, 77, 'high', 1, 0)");
+        execute(&conn, "INSERT INTO message_recipients VALUES (1, 1, 0, NULL), (2, 1, 0, 0)");
+        let writer = DbConn::open_file(dir.path().join("recipients.sqlite3").to_str().unwrap()).unwrap();
+        execute(&conn, "SAVEPOINT held_overview");
+        let mut work = ScanWork::default();
+        assert_eq!(next_unacked_id(&conn, "ack_recipients", None, &mut work).unwrap(), Some(1));
+        execute(&writer, "BEGIN IMMEDIATE");
+        execute(&writer, "UPDATE message_recipients SET ack_ts = 1 WHERE message_id = 1");
+        execute(&writer, "UPDATE message_recipients SET ack_ts = NULL WHERE message_id = 2");
+        execute(&writer, "COMMIT");
+        let held = ack_phase(&conn, true).0;
+        assert_eq!(held["1"]["ack_overdue"], 1);
+        assert!(held.get("77").is_none());
+        execute(&conn, "RELEASE held_overview");
+        let fresh = ack_phase(&conn, true).0;
+        assert!(fresh.get("1").is_none());
+        assert_eq!(fresh["77"]["ack_overdue"], 1);
+    }
+
+    #[test]
+    #[ignore = "native acknowledgement-phase comparison, including dense adverse case"]
+    fn benchmark_ack_seek_against_current_page_walk() {
+        let history = std::env::var("AM_OVERVIEW_ACK_HISTORY").map_or(24_000, |value| {
+            value.parse().expect("positive history size")
+        });
+        assert!(history > 0);
+        for settled in [true, false] {
+            let (_dir, conn) = fixture();
+            seed_settled_ack_history(&conn, history);
+            execute(&conn, "UPDATE messages SET project_id = id % 33 + 1");
+            execute(&conn, "INSERT INTO messages VALUES (0, 1, 'normal', 0, 0)");
+            execute(&conn, "INSERT INTO message_recipients VALUES (0, 1, 0, NULL)");
+            let active = history + 1;
+            execute(&conn, &format!("INSERT INTO messages VALUES ({active}, 1, 'high', 1, 0)"));
+            execute(&conn, &format!("INSERT INTO message_recipients VALUES ({active}, 1, 0, NULL)"));
+            if !settled {
+                execute(&conn, "UPDATE message_recipients SET ack_ts = NULL");
+            }
+            indexes(&conn);
+            let expected = ack_phase(&conn, false).0;
+            let mut old_times = Vec::new();
+            let mut new_times = Vec::new();
+            for iteration in 0..6 {
+                for seek in [iteration % 2 == 0, iteration % 2 != 0] {
+                    let start = Instant::now();
+                    let (actual, work) = ack_phase(&conn, seek);
+                    let elapsed = start.elapsed();
+                    assert_eq!(actual, expected);
+                    eprintln!("settled={settled} seek={seek} elapsed={elapsed:?} work={work:?}");
+                    if seek {
+                        new_times.push(elapsed);
+                    } else {
+                        old_times.push(elapsed);
+                    }
+                }
+            }
+            old_times.sort_unstable();
+            new_times.sort_unstable();
+            eprintln!("native ack phase; history={history}; settled={settled}; old={:?}; new={:?}", old_times[3], new_times[3]);
+        }
     }
 
     #[test]
