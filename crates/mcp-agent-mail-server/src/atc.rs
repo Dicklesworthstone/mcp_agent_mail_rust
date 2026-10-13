@@ -308,11 +308,13 @@ fn notification_class(kind: &str, family: &str, high_risk: bool) -> Option<Notif
 enum ActionKey {
     Probe(String),
     Advisory(String, String),
+    Release(String),
 }
 
 fn effect_action_key(effect: &AtcEffectPlan) -> Option<ActionKey> {
     match effect.kind.as_str() {
         "probe_agent" => Some(ActionKey::Probe(effect.agent.clone())),
+        "release_reservations_requested" => Some(ActionKey::Release(effect.agent.clone())),
         "send_advisory" => effect
             .message
             .as_ref()
@@ -328,11 +330,13 @@ fn retain_actions(actions: &mut Vec<AtcTickAction>, retained: &mut HashMap<Actio
             AtcTickAction::SendAdvisory { agent, message } => {
                 ActionKey::Advisory(agent.clone(), message.clone())
             }
-            AtcTickAction::ReleaseReservations { .. } => return true,
+            AtcTickAction::ReleaseReservations { agent } => ActionKey::Release(agent.clone()),
         };
         // An action can outlive the bounded ledger entry needed to construct
         // its effect. Without a retained effect it has no delivery entitlement:
-        // otherwise the action-only API could bypass the passive policy.
+        // otherwise the action-only API could bypass the admission boundary.
+        // Releases bypass optional-mail limits, not the need for a matching
+        // retained release proposal. One proposal authorizes only one action.
         let Some(remaining) = retained.get_mut(&key) else {
             return false;
         };
@@ -1012,7 +1016,8 @@ mod admission_boundary_tests {
             },
         ];
         let key = ActionKey::Advisory("BlueFox".into(), "released".into());
-        retain_actions(&mut actions, &mut HashMap::from([(key, 1)]));
+        let release = ActionKey::Release("BlueFox".into());
+        retain_actions(&mut actions, &mut HashMap::from([(key, 1), (release, 1)]));
         assert_eq!(actions.len(), 2);
         assert!(matches!(
             actions[0],
@@ -1064,6 +1069,125 @@ mod admission_boundary_tests {
         ];
         retain_actions(&mut actions, &mut HashMap::new());
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn orphaned_release_is_withheld_without_an_installed_population_scope() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut report = staged_report(200_000_000);
+        // No DB population was installed. The delivery boundary itself must
+        // protect the action-only API when proposal construction lost evidence.
+        report.effects.clear();
+        assert_eq!(report.actions.len(), 1);
+        let admitted = admit_report(&epoch, report, 200_000_000).unwrap();
+        assert!(admitted.effects.is_empty() && admitted.actions.is_empty());
+        assert_eq!(admitted.summary.kernel.pending_effects, 0);
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn unrelated_or_unknown_effect_cannot_authorize_a_release_action() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        for (kind, agent) in [
+            ("release_reservations_requested", "RedFox"),
+            ("send_advisory", "BlueFox"),
+            ("future_mutation", "BlueFox"),
+        ] {
+            let mut report = staged_report(200_000_000);
+            report.effects[0].kind = kind.into();
+            report.effects[0].agent = agent.into();
+            report.effects[0].message = Some("outcome notice".into());
+            let admitted = admit_report(&epoch, report, 200_000_000).unwrap();
+            assert_eq!(admitted.effects.len(), 1, "critical effects remain exempt");
+            assert!(admitted.actions.is_empty(), "kind={kind}, agent={agent}");
+        }
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn retained_release_proposals_bound_action_multiplicity() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        for expected in [1, 2] {
+            reset_global_atc_state_for_test(&config);
+            let epoch = capture_delivery_epoch().unwrap();
+            let mut report = staged_report(200_000_000);
+            if expected == 2 {
+                report.effects.extend(staged_report(201_000_000).effects);
+            }
+            report.actions = vec![
+                AtcTickAction::ReleaseReservations {
+                    agent: "BlueFox".into(),
+                };
+                10_000
+            ];
+            report.actions.push(AtcTickAction::ReleaseReservations {
+                agent: "RedFox".into(),
+            });
+            let admitted = admit_report(&epoch, report, 202_000_000).unwrap();
+            assert_eq!(admitted.effects.len(), expected);
+            assert_eq!(admitted.actions.len(), expected);
+            assert!(admitted.actions.iter().all(|action| matches!(
+                action,
+                AtcTickAction::ReleaseReservations { agent } if agent == "BlueFox"
+            )));
+        }
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn release_pair_survives_zero_optional_budget_while_conflict_is_deferred() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let mut report = staged_report(200_000_000);
+        let mut conflict = staged_report(201_000_000);
+        let effect = &mut conflict.effects[0];
+        effect.kind = "send_advisory".into();
+        effect.message = Some("resolve conflict".into());
+        effect.semantics.family = "deadlock_remediation".into();
+        effect.semantics.high_risk_intervention = false;
+        report.effects.extend(conflict.effects);
+        report.actions.push(AtcTickAction::SendAdvisory {
+            agent: "BlueFox".into(),
+            message: "resolve conflict".into(),
+        });
+        let mut admission = NotificationAdmission::new(0);
+        let mut cursor = None;
+        // Without begin_tick, the optional budget is zero. Matching a release
+        // to its proposal must not turn it into an optional notification.
+        admit_effects(
+            &mut report.effects,
+            &mut report.actions,
+            &mut admission,
+            &mut cursor,
+            202_000_000,
+            |_| panic!("critical release must not consult passive activity"),
+        );
+        assert_eq!(report.effects.len(), 1);
+        assert_eq!(report.effects[0].kind, "release_reservations_requested");
+        assert_eq!(report.actions.len(), 1);
+        assert!(matches!(report.actions[0], AtcTickAction::ReleaseReservations { .. }));
+        assert_eq!(admission.stats().admitted, 0);
+        assert_eq!(admission.stats().deferred, 1);
+        assert!(cursor.is_none());
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]
