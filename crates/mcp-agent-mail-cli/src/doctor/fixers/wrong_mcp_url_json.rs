@@ -23,8 +23,11 @@
 //!    - `mcpServers.<server-name>.serverUrl`
 //!    - `mcpServers.<server-name>.endpoint`
 //!      Where `<server-name>` matches `*agent*mail*` (case-insensitive).
+//!      Scan these containers both at the root and inside each
+//!      `projects.<project-path>` object, as in local Claude configs.
 //! 3. Compare each found URL to the canonical. Emit a finding per
-//!    mismatch.
+//!    mismatch. Scoped locations use escaped JSON Pointer tokens so
+//!    project paths and server names cannot be confused with separators.
 //!
 //! ## Fix (Op::WriteFile)
 //!
@@ -45,7 +48,7 @@ use super::{FindingRemediation, FixOutcome};
 use crate::doctor::mutate::transform_file;
 use serde::Serialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const FM_ID: &str = "fm-mcp-config-files-wrong-http-url-or-scheme";
 const FM_SEVERITY: &str = "P1";
@@ -60,8 +63,10 @@ const SERVERS_CONTAINER_KEYS: &[&str] = &["mcpServers", "mcp_servers"];
 #[derive(Debug, Clone, Serialize)]
 pub struct WrongMcpUrlFinding {
     pub config_path: PathBuf,
-    /// JSON-pointer-like path of the field with wrong URL, e.g.
-    /// `mcpServers.agent-mail.url`.
+    /// Legacy dotted path for root entries, e.g. `mcpServers.agent-mail.url`.
+    /// Project-scoped entries use an escaped JSON Pointer, e.g.
+    /// `/projects/~1repo/mcpServers/agent-mail/url`. Retaining the legacy
+    /// form at the root preserves existing serialized findings and callers.
     pub json_pointer: String,
     pub current_url: String,
     pub canonical_url: String,
@@ -106,44 +111,141 @@ pub fn detect(canonical_url: &str, candidate_configs: &[PathBuf]) -> Vec<WrongMc
             Ok(s) => s,
             Err(_) => continue,
         };
-        let v: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
             Err(_) => continue, // malformed JSON — skip
         };
-        for container_key in SERVERS_CONTAINER_KEYS {
-            let Some(servers) = v.get(container_key).and_then(|x| x.as_object()) else {
-                continue;
-            };
-            for (server_name, server_val) in servers {
-                if !is_agent_mail_server_name(server_name) {
-                    continue;
-                }
-                let Some(server_obj) = server_val.as_object() else {
-                    continue;
-                };
-                for field in URL_FIELD_NAMES {
-                    let Some(url_val) = server_obj.get(*field).and_then(|x| x.as_str()) else {
-                        continue;
-                    };
-                    if url_val != canonical_url {
-                        out.push(WrongMcpUrlFinding {
-                            config_path: path.clone(),
-                            json_pointer: format!("{container_key}.{server_name}.{field}"),
-                            current_url: url_val.to_string(),
-                            canonical_url: canonical_url.to_string(),
-                        });
-                    }
-                }
+        scan_value_containers(path, None, &value, canonical_url, &mut out);
+        if let Some(projects) = value.get("projects").and_then(serde_json::Value::as_object) {
+            for (project_path, scoped) in projects {
+                scan_value_containers(
+                    path,
+                    Some(project_path.as_str()),
+                    scoped,
+                    canonical_url,
+                    &mut out,
+                );
             }
         }
     }
     out
 }
 
+fn scan_value_containers(
+    path: &Path,
+    project_path: Option<&str>,
+    parent: &serde_json::Value,
+    canonical_url: &str,
+    out: &mut Vec<WrongMcpUrlFinding>,
+) {
+    for container_key in SERVERS_CONTAINER_KEYS {
+        let Some(servers) = parent.get(container_key).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (server_name, server_val) in servers {
+            if !is_agent_mail_server_name(server_name) {
+                continue;
+            }
+            let Some(server_obj) = server_val.as_object() else {
+                continue;
+            };
+            for field in URL_FIELD_NAMES {
+                let Some(url) = server_obj.get(*field).and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if url == canonical_url {
+                    continue;
+                }
+                let json_pointer = match project_path {
+                    None => format!("{container_key}.{server_name}.{field}"),
+                    Some(project) => format!(
+                        "/projects/{}/{container_key}/{}/{field}",
+                        escape_pointer_token(project),
+                        escape_pointer_token(server_name),
+                    ),
+                };
+                out.push(WrongMcpUrlFinding {
+                    config_path: path.to_path_buf(),
+                    json_pointer,
+                    current_url: url.to_string(),
+                    canonical_url: canonical_url.to_string(),
+                });
+            }
+        }
+    }
+}
+
 fn is_agent_mail_server_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     // Match "agent-mail", "agent_mail", "mcp_agent_mail", etc.
     lower.contains("agent") && lower.contains("mail")
+}
+
+fn escape_pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
+fn decode_pointer_token(token: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(ch) = chars.next() {
+        decoded.push(match ch {
+            '~' => match chars.next()? {
+                '0' => '~',
+                '1' => '/',
+                _ => return None,
+            },
+            ch => ch,
+        });
+    }
+    Some(decoded)
+}
+
+/// Resolve only supported URL locations and existing object members. Do not
+/// treat a finding as an arbitrary JSON write pointer or create missing
+/// containers. Dots in legacy server names remain literal; scoped tokens
+/// are decoded exactly once so a literal `~1` cannot become a slash.
+fn url_slot_mut<'a>(
+    value: &'a mut serde_json::Value,
+    pointer: &str,
+) -> Option<&'a mut serde_json::Value> {
+    let (project, container, server, field) = if pointer.starts_with('/') {
+        let parts: Vec<_> = pointer.splitn(7, '/').collect();
+        let ["", "projects", project, container, server, field] = parts.as_slice() else {
+            return None;
+        };
+        (
+            Some(decode_pointer_token(project)?),
+            decode_pointer_token(container)?,
+            decode_pointer_token(server)?,
+            decode_pointer_token(field)?,
+        )
+    } else {
+        let (container, rest) = pointer.split_once('.')?;
+        let (server, field) = rest.rsplit_once('.')?;
+        (None, container.to_string(), server.to_string(), field.to_string())
+    };
+    if !SERVERS_CONTAINER_KEYS.contains(&container.as_str())
+        || !URL_FIELD_NAMES.contains(&field.as_str())
+        || !is_agent_mail_server_name(&server)
+    {
+        return None;
+    }
+    let root = value.as_object_mut()?;
+    let parent = match project {
+        None => root,
+        Some(project) => root
+            .get_mut("projects")?
+            .as_object_mut()?
+            .get_mut(&project)?
+            .as_object_mut()?,
+    };
+    parent
+        .get_mut(&container)?
+        .as_object_mut()?
+        .get_mut(&server)?
+        .as_object_mut()?
+        .get_mut(&field)
 }
 
 /// Repair only the detected field in the snapshot supplied by the mutation
@@ -155,39 +257,18 @@ pub fn fix(
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
     let result = transform_file(ctx, &finding.config_path, 0o600, |source| {
         let mut value: serde_json::Value = serde_json::from_slice(source)?;
-        // Server keys may themselves contain dots: split only at the
-        // outer separators, not at every dot in the pseudo JSON pointer.
-        let Some((container, rest)) = finding.json_pointer.split_once('.') else {
-            return Ok(None);
-        };
-        let Some((server, field)) = rest.rsplit_once('.') else {
-            return Ok(None);
-        };
-        if !SERVERS_CONTAINER_KEYS.contains(&container)
-            || !URL_FIELD_NAMES.contains(&field)
-            || !is_agent_mail_server_name(server)
-        {
-            return Ok(None);
-        }
-        let Some(server_obj) = value
-            .get_mut(container)
-            .and_then(|servers| servers.get_mut(server))
-            .and_then(serde_json::Value::as_object_mut)
-        else {
+        let Some(slot) = url_slot_mut(&mut value, &finding.json_pointer) else {
             return Ok(None);
         };
         // Do not overwrite an operator's newer URL or recreate a field
         // that disappeared after detection. Already repaired is a no-op.
-        let Some(current) = server_obj.get(field).and_then(serde_json::Value::as_str) else {
+        let Some(current) = slot.as_str() else {
             return Ok(None);
         };
         if current != finding.current_url || current == finding.canonical_url {
             return Ok(None);
         }
-        server_obj.insert(
-            field.to_string(),
-            serde_json::Value::String(finding.canonical_url.clone()),
-        );
+        *slot = serde_json::Value::String(finding.canonical_url.clone());
         let mut bytes = serde_json::to_vec_pretty(&value)?;
         bytes.push(b'\n');
         Ok(Some(bytes))
@@ -546,5 +627,187 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn detector_finds_root_and_scoped_url_aliases_without_other_servers() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("claude.json");
+        let config = serde_json::json!({
+            "mcpServers": { "agent-mail": { "url": "http://old-root/" } },
+            "projects": {
+                "/repo": {
+                    "mcp_servers": {
+                        "agent-mail.prod": {
+                            "url": "http://old-project/",
+                            "serverUrl": "http://old-project/",
+                            "endpoint": "http://old-project/"
+                        },
+                        "unrelated": { "url": "http://leave-alone/" }
+                    }
+                },
+                "/healthy": {
+                    "mcpServers": { "agent-mail": { "url": CANONICAL } }
+                },
+                "/malformed": null
+            }
+        });
+        fs::write(&path, config.to_string()).unwrap();
+        let findings = detect(CANONICAL, std::slice::from_ref(&path));
+        assert_eq!(findings.len(), 4);
+        assert_eq!(findings[0].json_pointer, "mcpServers.agent-mail.url");
+        for field in URL_FIELD_NAMES {
+            let expected = format!("/projects/~1repo/mcp_servers/agent-mail.prod/{field}");
+            assert!(findings.iter().any(|finding| finding.json_pointer == expected));
+        }
+    }
+
+    #[test]
+    fn scoped_url_repair_round_trips_escaped_keys_and_verbatim_undo() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("claude.json");
+        let project = "/work/agent.v2~1/root";
+        let server = "agent/mail.prod~beta";
+        let original = serde_json::json!({
+            "preferences": { "keep": true },
+            "projects": {
+                (project): {
+                    "mcp_servers": {
+                        (server): { "url": "http://wrong/", "headers": { "X-Keep": "yes" } }
+                    }
+                },
+                "/other": {
+                    "mcpServers": { "agent-mail": { "url": CANONICAL } }
+                }
+            }
+        })
+        .to_string();
+        fs::write(&path, &original).unwrap();
+        let findings = detect(CANONICAL, std::slice::from_ref(&path));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].json_pointer,
+            "/projects/~1work~1agent.v2~01~1root/mcp_servers/agent~1mail.prod~0beta/url"
+        );
+        let run_id = "2026-10-14T00-03-00Z__scoped_url_undo";
+        let ctx = ctx_for(&td, run_id);
+        assert_eq!(fix(&ctx, &findings[0]).unwrap().actions_taken, 1);
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired["projects"][project]["mcp_servers"][server]["url"], CANONICAL);
+        assert_eq!(
+            repaired["projects"][project]["mcp_servers"][server]["headers"]["X-Keep"],
+            "yes"
+        );
+        assert_eq!(repaired["preferences"]["keep"], true);
+        assert_eq!(
+            repaired["projects"]["/other"]["mcpServers"]["agent-mail"]["url"],
+            CANONICAL
+        );
+        assert!(detect(CANONICAL, std::slice::from_ref(&path)).is_empty());
+        drop(ctx);
+        let restored = crate::doctor::undo::run_undo_with_scopes(
+            td.path(),
+            run_id,
+            false,
+            true,
+            &[td.path().to_path_buf()],
+        )
+        .unwrap();
+        assert!(restored.failures.is_empty(), "{:?}", restored.failures);
+        assert_eq!(restored.actions_replayed, 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn scoped_url_repair_skips_removed_or_changed_targets() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("claude.json");
+        fs::write(
+            &path,
+            r#"{"projects":{"/repo":{"mcpServers":{"agent-mail":{"url":"http://old/"}}}}}"#,
+        )
+        .unwrap();
+        let findings = detect(CANONICAL, std::slice::from_ref(&path));
+        assert_eq!(findings.len(), 1);
+        let ctx = ctx_for(&td, "2026-10-14T00-03-01Z__scoped_url_removed");
+        for edited in [
+            r#"{"projects":{}}"#,
+            r#"{"projects":{"/repo":{"mcpServers":{"agent-mail":{}}}}}"#,
+            r#"{"projects":{"/repo":{"mcpServers":{"agent-mail":{"url":42}}}}}"#,
+            r#"{"projects":{"/repo":{"mcpServers":{"agent-mail":{"url":"http://operator/"}}}}}"#,
+        ] {
+            fs::write(&path, edited).unwrap();
+            let result = fix(&ctx, &findings[0]).unwrap();
+            assert_eq!(result.actions_taken, 0);
+            assert_eq!(result.actions_skipped, 1);
+            assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        }
+        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn multiple_url_findings_repair_current_snapshot_without_losing_prior_fixes() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("claude.json");
+        let mut config = serde_json::json!({
+            "mcpServers": { "agent-mail": { "url": "http://old-root/" } },
+            "projects": {
+                "/one": { "mcpServers": { "agent-mail": { "url": "http://old-one/" } } },
+                "/two": { "mcp_servers": { "agent-mail": { "endpoint": "http://old-two/" } } }
+            }
+        });
+        fs::write(&path, config.to_string()).unwrap();
+        let findings = detect(CANONICAL, std::slice::from_ref(&path));
+        assert_eq!(findings.len(), 3);
+        // All findings predate this unrelated edit and every actual repair.
+        config["operator_setting"] = serde_json::json!("preserve-me");
+        fs::write(&path, config.to_string()).unwrap();
+        let ctx = ctx_for(&td, "2026-10-14T00-03-02Z__scoped_url_multiple");
+        for finding in &findings {
+            assert_eq!(fix(&ctx, finding).unwrap().actions_taken, 1);
+        }
+        assert!(detect(CANONICAL, std::slice::from_ref(&path)).is_empty());
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired["operator_setting"], "preserve-me");
+        for finding in &findings {
+            assert_eq!(fix(&ctx, finding).unwrap().actions_skipped, 1);
+        }
+        assert_eq!(
+            fs::read_to_string(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn url_locations_refuse_invalid_escapes_and_non_url_targets() {
+        let mut config = serde_json::json!({
+            "projects": {
+                "/repo": {
+                    "mcpServers": {
+                        "agent-mail": { "url": "old", "token": "keep-secret" },
+                        "unrelated": { "url": "keep-url" }
+                    }
+                }
+            }
+        });
+        let original = config.clone();
+        for pointer in [
+            "/projects/~2repo/mcpServers/agent-mail/url",
+            "/projects/~1repo~/mcpServers/agent-mail/url",
+            "/projects/~1repo/mcpServers/agent-mail/token",
+            "/projects/~1repo/mcpServers/unrelated/url",
+            "/projects/~1repo/mcpServers/agent-mail/url/extra",
+        ] {
+            assert!(url_slot_mut(&mut config, pointer).is_none(), "{pointer}");
+        }
+        assert_eq!(config, original);
+        for token in ["/repo.v2", "~1", "agent/mail.prod~", "漢字/~/path"] {
+            assert_eq!(decode_pointer_token(&escape_pointer_token(token)).as_deref(), Some(token));
+        }
     }
 }
