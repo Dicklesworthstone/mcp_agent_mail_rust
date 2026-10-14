@@ -217,6 +217,58 @@ mod tests {
     }
 
     #[test]
+    fn direct_writer_refuses_busy_fence_without_waiting_for_owner() {
+        if isolated() {
+            return;
+        }
+        let root = archive_root();
+        let config = mcp_agent_mail_core::Config {
+            storage_root: root.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            crate::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5))
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let op = crate::WriteOp::FileReservation {
+            project_slug: "fence-repair".to_string(),
+            config,
+            reservations: Vec::new(),
+        };
+        let started = Instant::now();
+        let outcome = crate::write_op_sync_direct(&op);
+        let elapsed = started.elapsed();
+        let still_held = crate::archive_publication_fence_holder().is_some();
+
+        let _ = release_tx.send(());
+        let explicitly_released = owner.join().unwrap();
+        assert!(
+            explicitly_released.is_ok(),
+            "direct writer waited for the owner's cleanup timeout"
+        );
+        assert!(
+            matches!(
+                outcome,
+                crate::DirectArchiveWrite::Failed(crate::StorageError::LockContention {
+                    ref message
+                }) if message.contains("publication fence busy")
+            ),
+            "busy direct writer must fail with publication-fence contention"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "busy direct writer blocked for {elapsed:?}"
+        );
+        assert!(still_held, "writer returned only after the owner released");
+    }
+
+    #[test]
     fn admitted_and_nested_windows_use_the_native_epoch_and_holder_protocol() {
         if isolated() {
             return;
