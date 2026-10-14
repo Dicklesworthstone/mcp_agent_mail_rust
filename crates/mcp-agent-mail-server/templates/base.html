@@ -6,10 +6,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}Agent Mail{% endblock %}</title>
 
-    <!-- Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Fonts: Inter from the published @fontsource package (static files, so
+         each stylesheet carries SRI; Google Fonts CSS varies by user agent). -->
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@5.3.0/300.css" integrity="sha384-QkNswVZ+V1Z+z4Lz/WfPToZnFdUiYCmY6xPeNQb8uel2DSLRLpYj/5B7Ie/D/MO8" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@5.3.0/400.css" integrity="sha384-xIqhvN2Z/Umq7Ox8y6t3uFHhjyQo0knjgs1wcj13JjTuHOGIaXBHO7eal9RhNMdd" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@5.3.0/500.css" integrity="sha384-V0O4X1tN0UwvdYzAEJQFmI91MWdJS28KYainePiRQIAtDyKH5cZxjVuoOPp/0v9g" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@5.3.0/600.css" integrity="sha384-zZdQWz6lweHJ9ZIJxqSYDpVJzhjcCKCxfftjlgIC/g3Ok/FynI4BfyMWG5/0mJt9" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@5.3.0/700.css" integrity="sha384-ABwFxKIeYuLxwfO9KnWKaJWmYGG07Ug5PUbvSA8+tyO6Mu3ceWIGYbq+DW5ktdGH" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/inter@5.3.0/800.css" integrity="sha384-3cPs4JJs1BZJaofPBViYLnJ19d9PukSSzhJVcd+D+o0alUa5zVFRGvZqHcwYRAgd" crossorigin="anonymous" />
 
     <script>
       (function () {
@@ -301,11 +306,11 @@
     <script src="https://unpkg.com/splitting@1.0.6/dist/splitting.min.js" integrity="sha384-taxnKSnzdVS5gZB4jZcieFZlmBPQMFqhdEmCScZsrIFCxX8Zizq4fKJJH5kBwMXT" crossorigin="anonymous"></script>
     <link rel="stylesheet" href="https://unpkg.com/splitting@1.0.6/dist/splitting.css" integrity="sha384-6z/M4zCNHzM59q8BnJ1btvx5I7ArdKNNBgb/V4m7ZTUPI4e2SVF0o5IQAGCO414a" crossorigin="anonymous" />
 
-    <!-- Mermaid.js for git graphs and diagrams. A module import cannot carry
-         SRI, so the version is pinned exactly instead. -->
+    <!-- Mermaid.js for git graphs and diagrams. The single-file build (it sets
+         window.mermaid) carries SRI; a module import could not. Deferred and
+         module scripts run in document order, so it is defined below. -->
+    <script defer src="https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.min.js" integrity="sha384-EOXBFmc3gx5mb+vn0vPvvGqACToJD24hhacX5Yx+8NUUQrHIle/Qi5Bg9o3zKwW2" crossorigin="anonymous"></script>
     <script type="module">
-      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.esm.min.mjs';
-      window.mermaid = mermaid;
       mermaid.initialize({
         startOnLoad: false,
         theme: 'base',

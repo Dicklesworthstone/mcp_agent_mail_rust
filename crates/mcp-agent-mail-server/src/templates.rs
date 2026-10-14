@@ -363,12 +363,8 @@ mod tests {
     /// render the mailbox (lucide@latest resolved to a same-day release).
     #[test]
     fn third_party_assets_are_version_pinned_with_sri() {
-        // The Tailwind play CDN sends no CORS headers and Google Fonts CSS
-        // varies by user agent: neither can carry SRI.
-        const NO_SRI: [&str; 2] = [
-            "https://cdn.tailwindcss.com/",
-            "https://fonts.googleapis.com/",
-        ];
+        // The Tailwind play CDN sends no CORS headers, so it cannot carry SRI.
+        const NO_SRI: [&str; 1] = ["https://cdn.tailwindcss.com/"];
         let mut with_sri = 0;
         for file in TEMPLATE_DIR.files() {
             let Some(html) = file.contents_utf8() else {
@@ -395,7 +391,7 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    version_pinned(url) || url.starts_with("https://fonts.googleapis.com/"),
+                    version_pinned(url),
                     "{name}: {url} is not pinned to an exact version"
                 );
                 if NO_SRI.iter().any(|host| url.starts_with(host)) {
@@ -408,12 +404,12 @@ mod tests {
                 );
                 with_sri += 1;
             }
-            // A module import cannot carry SRI; it must still be pinned.
-            for import in html.split("from 'https://").skip(1) {
-                let url = format!("https://{}", import.split('\'').next().unwrap_or_default());
+            // A module import cannot carry SRI, so none may load from a CDN.
+            for quote in ['\'', '"'] {
                 assert!(
-                    version_pinned(&url),
-                    "{name}: module import {url} is not pinned"
+                    !html.contains(&format!("from {quote}https://"))
+                        && !html.contains(&format!("import({quote}https://")),
+                    "{name}: a module import loads a CDN URL without SRI"
                 );
             }
         }
