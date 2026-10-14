@@ -59,7 +59,29 @@ fn run_with(
         if batches > 1 && elapsed() >= MAX_TURN_ACTIVE_TIME {
             return Ok(true);
         }
-        let report = repair()?;
+        let report = match repair() {
+            Ok(report) => report,
+            Err(error)
+                if error
+                    == "reservation reconciliation deferred: recovery promotion or admission contention" =>
+            {
+                // No source read or release was admitted. Retain the healthy
+                // pool/cursor and yield to the short worker pause, rather than
+                // sending this refusal through the pool-retirement path. An
+                // observed generation/source failure remains an error below.
+                if cancelled() {
+                    return Ok(false);
+                }
+                tracing::warn!(
+                    target: "maintenance",
+                    event = "reservation_archive_reconcile_admission_deferred",
+                    reason = %error,
+                    "reservation archive admission busy; retaining source pool and retrying next short cycle"
+                );
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
         // Health/progress observations must describe each actual storage pass,
         // not an aggregate that appears to exceed storage's per-pass bounds.
         // Include observer I/O in the cooperative active-time target.
@@ -189,6 +211,95 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 1, "never retry a contended archive inside the turn");
         assert!(backlog);
+    }
+
+    #[test]
+    fn admission_refusal_yields_without_a_fake_report_and_keeps_short_polling() {
+        let mut calls = 0;
+        let mut observed = 0;
+        let backlog = run_with(
+            || {
+                calls += 1;
+                Err("reservation reconciliation deferred: recovery promotion or admission contention"
+                    .to_string())
+            },
+            |_| observed += 1,
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap();
+        assert_eq!((calls, observed), (1, 0));
+        let poll = super::super::maintenance_poll_interval(Duration::from_secs(3600), true);
+        assert_eq!(
+            super::super::next_poll_interval(poll, backlog),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn admission_after_progress_preserves_observations_and_recovers_next_turn() {
+        let mut calls = 0;
+        let mut observed = Vec::new();
+        let backlog = run_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(busy_report())
+                } else {
+                    Err("reservation reconciliation deferred: recovery promotion or admission contention"
+                        .to_string())
+                }
+            },
+            |report| observed.push(report.repaired),
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap();
+        assert!(backlog);
+        assert_eq!(calls, 2);
+        assert_eq!(observed, [4]);
+        assert!(!run_with(
+            || Ok(ReservationReconcileReport::default()),
+            |_| {},
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn cancellation_during_admission_refusal_does_not_schedule_another_turn() {
+        let stop = Cell::new(false);
+        let backlog = run_with(
+            || {
+                stop.set(true);
+                Err("reservation reconciliation deferred: recovery promotion or admission contention"
+                    .to_string())
+            },
+            |_| panic!("refusal must not fabricate a report"),
+            || Duration::ZERO,
+            || stop.get(),
+        )
+        .unwrap();
+        assert!(!backlog);
+    }
+
+    #[test]
+    fn admission_classifier_does_not_hide_unrelated_source_failures() {
+        for error in [
+            "source generation changed",
+            "source corruption breaker is open",
+            "permission denied",
+            "source error: reservation reconciliation deferred: recovery promotion or admission contention",
+        ] {
+            let result = run_with(
+                || Err(error.to_string()),
+                |_| panic!("failed storage has no report"),
+                || Duration::ZERO,
+                || false,
+            );
+            assert_eq!(result.unwrap_err(), error);
+        }
     }
 
     #[test]
