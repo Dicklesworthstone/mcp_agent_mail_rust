@@ -15296,12 +15296,14 @@ mod tests {
         }
         let id_artifact = reservation_dir.join("id-7.json");
         let published_while_held = id_artifact.exists();
+        let released_at = Instant::now();
         release_tx.send(()).expect("release the fence");
         holder.join().expect("holder thread");
         writer
             .join()
             .expect("writer thread")
             .expect("reservation write");
+        let after_release = released_at.elapsed();
 
         assert_eq!(
             staged.len(),
@@ -15311,6 +15313,13 @@ mod tests {
         assert!(
             !published_while_held,
             "publication must wait for the held fence"
+        );
+        // The grant's latency under a held archive commit is the hold plus its
+        // renames: the syncs already ran, and the git commit is queued, not
+        // awaited. Its slow part never starts after the fence frees.
+        assert!(
+            after_release < Duration::from_secs(1),
+            "the write took {after_release:?} after the fence was released"
         );
         let id_json = fs::read_to_string(&id_artifact).unwrap();
         let written: serde_json::Value = serde_json::from_str(&id_json).unwrap();
