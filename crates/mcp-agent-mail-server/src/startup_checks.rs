@@ -1852,6 +1852,13 @@ fn format_recovery_context() -> Option<String> {
     let db_path = PathBuf::from(&resolved.canonical_path);
     let storage_root = &config.storage_root;
 
+    // No directory, no mailbox: nothing is in recovery. The primary issue
+    // already names the missing path; "corrupt, run doctor repair" would
+    // send the operator the wrong way.
+    if db_path.parent().is_some_and(|parent| !parent.exists()) {
+        return None;
+    }
+
     let recovery_lock = inspect_mailbox_recovery_lock(&db_path);
     let ownership = inspect_mailbox_ownership(&db_path, storage_root.as_path());
 
@@ -5623,6 +5630,45 @@ second body
         );
 
         file.unlock().unwrap();
+    }
+
+    // ── Recovery context ─────────────────────────────────────────────────
+
+    #[test]
+    fn recovery_context_is_silent_when_the_database_directory_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("missing");
+        let db_url = format!("sqlite:///{}", storage.join("storage.sqlite3").display());
+        let storage_str = storage.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_str.as_str()),
+            ],
+            || {
+                assert_eq!(super::format_recovery_context(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn recovery_context_still_reports_an_unreadable_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"not a sqlite database, just bytes").unwrap();
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_str = dir.path().to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_str.as_str()),
+            ],
+            || {
+                let context = super::format_recovery_context()
+                    .expect("an unreadable database file still gets recovery context");
+                assert!(context.contains("Mode:"), "{context}");
+            },
+        );
     }
 
     // ── Recovery elapsed formatting tests (br-rqv3i.7) ──────────────────
