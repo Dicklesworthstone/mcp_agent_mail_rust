@@ -19,10 +19,11 @@
 //! br-8j6cb adds non-destructive message archive healing on this same worker.
 //! File-backed mailboxes enable it by default; set
 //! `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED=false` to disable it. Bounded recent
-//! catch-up and rotating history passes run once per minute in steady state;
-//! while a pass exhausts its repair budget the next pass follows after one
-//! second until the backlog clears. Neither accelerates the configured
-//! reporting/pruning cadence. Repair never sends
+//! catch-up and rotating history passes run once per minute in steady state.
+//! Successful, uncontended catch-up batches run in finite bursts before the
+//! one-second backlog pause; each batch retains its original limits and
+//! checkpoint. Neither accelerates the configured reporting/pruning cadence.
+//! Repair never sends
 //! another message or changes read/ack state. Its per-pass result is not a
 //! whole-mailbox or attachment-durability certificate.
 //!
@@ -34,6 +35,8 @@
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
 
 #![forbid(unsafe_code)]
+
+mod catch_up;
 
 use asupersync::Cx;
 use fastmcp_core::block_on;
@@ -261,15 +264,13 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             let mut retire_pool = false;
             if let Some(live_pool) = pool.as_ref() {
                 let cx = worker_cx();
-                match message_archive_reconcile::reconcile_message_batch(
+                match catch_up::run(
                     &cx,
                     live_pool,
                     config,
                     &mut cursor,
                     &SHUTDOWN,
-                ) {
-                    Ok(report) => {
-                        message_repair_backlog = report.budget_exhausted;
+                    |report| {
                         if report.scanned > 0 || report.interrupted {
                             info!(
                                 target: "maintenance",
@@ -288,7 +289,9 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                                 "bounded message archive reconciliation pass completed"
                             );
                         }
-                    }
+                    },
+                ) {
+                    Ok(backlog) => message_repair_backlog = backlog,
                     Err(error) => {
                         warn!(
                             target: "maintenance",

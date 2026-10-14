@@ -1,0 +1,239 @@
+//! Bounded message-repair turns above the existing four-repair storage batches.
+//!
+//! A busy mailbox must not pay a one-second sleep after every four recovered
+//! messages. Each batch still owns its ordinary source checks, retry fairness,
+//! payload limit and durable checkpoint. This scheduler only removes sleeps
+//! between a small number of successful, uncontended batches.
+
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+
+use asupersync::Cx;
+use mcp_agent_mail_core::Config;
+use mcp_agent_mail_db::DbPool;
+use mcp_agent_mail_storage::recovery::message_reconcile::database::{
+    ReconcileCursor, ReconcileReport, reconcile_message_batch,
+};
+
+const MAX_BATCHES_PER_TURN: usize = 8;
+const MAX_TURN_ACTIVE_TIME: Duration = Duration::from_millis(250);
+// Admission target, checked BETWEEN batches. A final batch retains storage's
+// independent 16 MiB bound, so a turn admits less than 32 MiB in total. This is
+// not a resident-memory allocation or permission to enlarge a storage batch.
+const TURN_PAYLOAD_TARGET: usize = 16 * 1024 * 1024;
+
+/// Run one finite repair turn, observing each real storage report separately.
+/// The returned backlog hint controls only the worker's next sleep, never
+/// reporting/pruning cadence or authority to publish an archive artifact.
+/// The time target is cooperative: a single filesystem/SQL/Git call can exceed
+/// it, but no further batch is started once it has elapsed.
+pub(super) fn run(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+    observe: impl FnMut(&ReconcileReport),
+) -> Result<bool, String> {
+    let started = Instant::now();
+    run_with(
+        || reconcile_message_batch(cx, pool, config, cursor, stop),
+        observe,
+        || started.elapsed(),
+    )
+}
+
+fn needs_follow_up(report: &ReconcileReport) -> bool {
+    report.budget_exhausted
+}
+
+fn continue_turn(
+    batches: usize,
+    payload_bytes: usize,
+    elapsed: Duration,
+    report: &ReconcileReport,
+) -> bool {
+    batches < MAX_BATCHES_PER_TURN
+        && payload_bytes < TURN_PAYLOAD_TARGET
+        && elapsed < MAX_TURN_ACTIVE_TIME
+        && report.budget_exhausted
+        && report.repaired > 0
+        && report.deferred_transient == 0
+        && !report.interrupted
+}
+
+fn run_with(
+    mut repair: impl FnMut() -> Result<ReconcileReport, String>,
+    mut observe: impl FnMut(&ReconcileReport),
+    mut elapsed: impl FnMut() -> Duration,
+) -> Result<bool, String> {
+    let mut payload_bytes = 0usize;
+    for batches in 1..=MAX_BATCHES_PER_TURN {
+        let report = repair()?;
+        payload_bytes = payload_bytes.saturating_add(report.payload_bytes);
+        // Preserve the existing per-batch diagnostics and checkpoint counts;
+        // aggregating them into a single ReconcileReport would misrepresent
+        // storage's per-pass limits. Observer time counts against this turn.
+        observe(&report);
+        if !continue_turn(batches, payload_bytes, elapsed(), &report) {
+            return Ok(needs_follow_up(&report));
+        }
+    }
+    // The finite batch bound above always ends the turn on its final report.
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    fn busy_report() -> ReconcileReport {
+        ReconcileReport {
+            scanned: 4,
+            repaired: 4,
+            budget_exhausted: true,
+            ..ReconcileReport::default()
+        }
+    }
+
+    #[test]
+    fn drains_multiple_successful_batches_before_sleeping() {
+        let mut reports = VecDeque::from([
+            busy_report(),
+            ReconcileReport {
+                scanned: 2,
+                repaired: 2,
+                ..ReconcileReport::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        let backlog = run_with(
+            || Ok(reports.pop_front().expect("unexpected extra batch")),
+            |report| observed.push(report.repaired),
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(observed, [4, 2]);
+        assert!(!backlog);
+        assert!(reports.is_empty(), "both repair batches must execute");
+    }
+
+    #[test]
+    fn continuously_growing_backlog_yields_at_the_batch_bound() {
+        let calls = Cell::new(0);
+        let mut observed = 0;
+        let backlog = run_with(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(busy_report())
+            },
+            |_| observed += 1,
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(backlog);
+        assert_eq!(calls.get(), MAX_BATCHES_PER_TURN);
+        assert_eq!(observed, MAX_BATCHES_PER_TURN);
+    }
+
+    #[test]
+    fn observer_and_batch_time_are_included_before_another_batch() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let calls = Cell::new(0);
+        let backlog = run_with(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(busy_report())
+            },
+            |_| elapsed.set(MAX_TURN_ACTIVE_TIME),
+            || elapsed.get(),
+        )
+        .unwrap();
+        assert!(backlog);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn large_payloads_yield_between_original_bounded_batches() {
+        let mut calls = 0;
+        let backlog = run_with(
+            || {
+                calls += 1;
+                let mut report = busy_report();
+                report.payload_bytes = TURN_PAYLOAD_TARGET / 2;
+                Ok(report)
+            },
+            |_| {},
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(backlog);
+        assert_eq!(calls, 2);
+        assert!(!continue_turn(
+            1,
+            usize::MAX,
+            Duration::ZERO,
+            &busy_report()
+        ));
+    }
+
+    #[test]
+    fn interruption_contention_and_no_repair_never_spin_in_a_turn() {
+        for mode in ["interrupted", "contended", "unchanged", "complete"] {
+            let mut calls = 0;
+            run_with(
+                || {
+                    calls += 1;
+                    let mut report = busy_report();
+                    match mode {
+                        "interrupted" => report.interrupted = true,
+                        "contended" => report.deferred_transient = 1,
+                        "unchanged" => {
+                            report.repaired = 0;
+                            report.unchanged = report.scanned;
+                        }
+                        _ => report.budget_exhausted = false,
+                    }
+                    Ok(report)
+                },
+                |_| {},
+                || Duration::ZERO,
+            )
+            .unwrap();
+            assert_eq!(calls, 1, "{mode}");
+        }
+    }
+
+    #[test]
+    fn source_errors_stop_the_turn_without_hiding_prior_reports() {
+        let mut calls = 0;
+        let mut observed = Vec::new();
+        let error = run_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(busy_report())
+                } else {
+                    Err("source generation changed".to_string())
+                }
+            },
+            |report| observed.push(report.repaired),
+            || Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error, "source generation changed");
+        assert_eq!(calls, 2);
+        assert_eq!(observed, [4]);
+    }
+
+    #[test]
+    fn cooperative_targets_do_not_expand_a_storage_batch() {
+        let report = busy_report();
+        assert!(continue_turn(1, 0, Duration::ZERO, &report));
+        assert!(!continue_turn(MAX_BATCHES_PER_TURN, 0, Duration::ZERO, &report));
+        assert!(!continue_turn(1, TURN_PAYLOAD_TARGET, Duration::ZERO, &report));
+        assert!(!continue_turn(1, 0, MAX_TURN_ACTIVE_TIME, &report));
+    }
+}
