@@ -57,7 +57,10 @@ pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;
 pub mod never_written_pages;
+#[path = "pool_registry.rs"]
 pub mod pool;
+#[path = "pool.rs"]
+mod pool_impl;
 pub mod project_mailbox;
 pub mod queries;
 pub mod query_assistance;
