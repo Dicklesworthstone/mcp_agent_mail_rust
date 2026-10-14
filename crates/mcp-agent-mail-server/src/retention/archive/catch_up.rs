@@ -6,6 +6,9 @@
 //! This scheduler removes sleeps only while bounded repair or scan progress is
 //! reported. Storage ends startup catch-up after the current history round.
 
+#[cfg(test)]
+mod integration_tests;
+
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -45,7 +48,14 @@ pub(super) fn run(
 }
 
 fn needs_follow_up(report: &ReconcileReport) -> bool {
-    report.budget_exhausted
+    // A deferred ID can be the only item in a pass: no work budget need be
+    // exhausted. Sleeping a full minute in that case defeats the retry lane's
+    // immediate first retry. Keep polling, but do not force another same-turn
+    // batch or bypass storage's per-ID backoff. Conflict-only scans stay idle.
+    if report.interrupted {
+        return false;
+    }
+    report.budget_exhausted || report.retry_len > 0 || report.deferred_transient > 0
 }
 
 fn continue_turn(
@@ -310,5 +320,123 @@ mod tests {
         assert!(!continue_turn(1, TURN_PAYLOAD_TARGET, Duration::ZERO, &report));
         assert!(!continue_turn(1, 0, MAX_TURN_ACTIVE_TIME, &report));
         assert!(!continue_turn(MAX_BATCHES_PER_TURN, 0, Duration::ZERO, &report));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn follow_up_distinguishes_retry_debt_from_conflicts_and_shutdown() {
+        for (mode, expected) in [
+            ("idle", false),
+            ("budget", true),
+            ("retained", true),
+            ("transient", true),
+            ("conflict", false),
+            ("interrupted", false),
+        ] {
+            let mut report = ReconcileReport::default();
+            match mode {
+                "budget" => report.budget_exhausted = true,
+                "retained" => report.retry_len = 1,
+                "transient" => report.deferred_transient = 1,
+                "conflict" => {
+                    report.deferred = 1;
+                    report.deferred_conflict = 1;
+                }
+                "interrupted" => {
+                    report.interrupted = true;
+                    report.budget_exhausted = true;
+                    report.retry_len = 1;
+                    report.deferred_transient = 1;
+                }
+                _ => {}
+            }
+            assert_eq!(needs_follow_up(&report), expected, "{mode}");
+        }
+    }
+
+    #[test]
+    fn one_deferred_orphan_requests_follow_up_without_a_same_turn_retry() {
+        let mut calls = 0;
+        let backlog = run_with(
+            || {
+                calls += 1;
+                Ok(ReconcileReport {
+                    scanned: 1,
+                    deferred: 1,
+                    deferred_transient: 1,
+                    retry_len: 1,
+                    ..ReconcileReport::default()
+                })
+            },
+            |_| {},
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(backlog, "a non-exhausted pass still has known repair debt");
+        assert_eq!(calls, 1, "retry backoff belongs to the next worker turn");
+    }
+
+    #[test]
+    fn cooling_retry_ids_keep_follow_up_alive_without_hot_looping() {
+        let mut calls = 0;
+        let backlog = run_with(
+            || {
+                calls += 1;
+                Ok(ReconcileReport {
+                    retry_len: 3,
+                    ..ReconcileReport::default()
+                })
+            },
+            |_| {},
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(backlog, "zero scanned is not proof that retained debt vanished");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn recovered_last_retry_returns_to_steady_state() {
+        let backlog = run_with(
+            || {
+                Ok(ReconcileReport {
+                    scanned: 1,
+                    repaired: 1,
+                    ..ReconcileReport::default()
+                })
+            },
+            |_| {},
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(!backlog);
+    }
+
+    #[test]
+    fn productive_but_contended_batch_yields_with_retry_debt_visible() {
+        let mut calls = 0;
+        let backlog = run_with(
+            || {
+                calls += 1;
+                Ok(ReconcileReport {
+                    scanned: 5,
+                    repaired: 4,
+                    deferred: 1,
+                    deferred_transient: 1,
+                    retry_len: 1,
+                    budget_exhausted: true,
+                    ..ReconcileReport::default()
+                })
+            },
+            |_| {},
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(backlog);
+        assert_eq!(calls, 1, "do not hammer a contended publication fence");
     }
 }
