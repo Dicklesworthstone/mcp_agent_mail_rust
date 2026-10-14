@@ -9,7 +9,7 @@
 #[cfg(test)]
 mod integration_tests;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -40,11 +40,46 @@ pub(super) fn run(
     observe: impl FnMut(&ReconcileReport),
 ) -> Result<bool, String> {
     let started = Instant::now();
-    run_with(
+    let result = run_with(
         || reconcile_message_batch(cx, pool, config, cursor, stop),
         observe,
         || started.elapsed(),
-    )
+    );
+    finish_turn(result, || {
+        stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
+    })
+}
+
+/// Admission refusal is not a broken source pool. Let the worker retain its
+/// pool and cursor and use the ordinary one-second follow-up instead of
+/// retiring the pool and sleeping for the full idle interval. Do not retry
+/// inside this turn, synthesize a successful storage report, or hide source,
+/// generation, corruption, or checkpoint-I/O failures behind this hint.
+fn finish_turn(
+    result: Result<bool, String>,
+    interrupted: impl FnOnce() -> bool,
+) -> Result<bool, String> {
+    match result {
+        Err(error)
+            if matches!(
+                error.as_str(),
+                "message reconciliation deferred: recovery promotion or admission contention"
+                    | "message reconciliation deferred: checkpoint is owned by another worker"
+            ) =>
+        {
+            if interrupted() {
+                return Ok(false);
+            }
+            tracing::warn!(
+                target: "maintenance",
+                event = "message_archive_reconcile_admission_deferred",
+                reason = %error,
+                "message archive admission busy; retaining source pool and retrying next short cycle"
+            );
+            Ok(true)
+        }
+        outcome => outcome,
+    }
 }
 
 fn needs_follow_up(report: &ReconcileReport) -> bool {
@@ -247,6 +282,79 @@ mod tests {
         assert_eq!(error, "source generation changed");
         assert_eq!(calls, 2);
         assert_eq!(observed, [4]);
+    }
+
+    #[test]
+    fn admission_refusal_preserves_follow_up_without_fabricating_reports() {
+        for error in [
+            "message reconciliation deferred: recovery promotion or admission contention",
+            "message reconciliation deferred: checkpoint is owned by another worker",
+        ] {
+            let mut calls = 0;
+            let mut observed = 0;
+            let result = run_with(
+                || {
+                    calls += 1;
+                    Err(error.to_string())
+                },
+                |_| observed += 1,
+                || Duration::ZERO,
+            );
+            assert!(finish_turn(result, || false).unwrap());
+            assert_eq!(calls, 1, "admission must not be retried inside a turn");
+            assert_eq!(observed, 0, "a refusal is not a completed storage batch");
+            assert!(!finish_turn(Err(error.to_string()), || true).unwrap());
+        }
+    }
+
+    #[test]
+    fn admission_after_progress_preserves_reports_and_next_turn_recovers() {
+        let mut calls = 0;
+        let mut observed = Vec::new();
+        let result = run_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok(busy_report())
+                } else {
+                    Err("message reconciliation deferred: checkpoint is owned by another worker"
+                        .to_string())
+                }
+            },
+            |report| observed.push(report.repaired),
+            || Duration::ZERO,
+        );
+        assert!(finish_turn(result, || false).unwrap());
+        assert_eq!(calls, 2);
+        assert_eq!(observed, [4]);
+        let recovered = run_with(
+            || Ok(ReconcileReport::default()),
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(!finish_turn(recovered, || false).unwrap());
+    }
+
+    #[test]
+    fn only_exact_admission_refusals_are_rescheduled() {
+        for error in [
+            "message reconciliation source changed after selection; rescan required",
+            "message reconciliation refused: source corruption breaker is open",
+            "permission denied",
+            "checkpoint source changed during reconciliation",
+            "source error: message reconciliation deferred: recovery promotion or admission contention",
+        ] {
+            let result = finish_turn(Err(error.to_string()), || {
+                panic!("source failures must not be mistaken for admission contention")
+            });
+            assert_eq!(result.unwrap_err(), error);
+        }
+        for backlog in [false, true] {
+            assert_eq!(
+                finish_turn(Ok(backlog), || panic!("successful turn needs no refusal check")),
+                Ok(backlog)
+            );
+        }
     }
 
     #[test]
