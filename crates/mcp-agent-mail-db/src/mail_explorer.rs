@@ -12,6 +12,8 @@
 #[cfg(test)]
 #[path = "mail_explorer_regression_tests.rs"]
 mod regression_tests;
+#[path = "mail_explorer_shared.rs"]
+mod shared;
 
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +98,7 @@ pub struct ExplorerEntry {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: i64,
-    /// For inbound messages: "to", "cc", or "bcc".
+    /// For inbound messages: "to", "cc", "bcc", or "project".
     pub kind: Option<String>,
     /// Whether the recipient has read this message.
     pub read_ts: Option<i64>,
@@ -205,11 +207,27 @@ pub async fn fetch_explorer_page(
         });
     }
 
+    // Use one schema decision for counts, incoming rows and outgoing address
+    // display. A partial upgrade is an error, not a silently empty shared inbox.
+    // Release the checkout before the existing count/fetch helpers acquire it.
+    let shared_mailbox = {
+        let conn = match map_pool_outcome(pool.acquire(cx).await) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match shared::schema_available(&*conn) {
+            Ok(available) => available,
+            Err(error) => return Outcome::Err(error),
+        }
+    };
+
     // Compute total counts independently of `limit` so pagination metadata is stable.
     let total_inbound = if query.direction == Direction::Outbound {
         0
     } else {
-        match count_inbound(cx, pool, &agent_ids, query).await {
+        match count_inbound(cx, pool, &agent_ids, query, shared_mailbox).await {
             Outcome::Ok(v) => v,
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
@@ -239,7 +257,7 @@ pub async fn fetch_explorer_page(
     let mut all_entries = Vec::new();
 
     if query.direction != Direction::Outbound {
-        match fetch_inbound(cx, pool, &agent_ids, query).await {
+        match fetch_inbound(cx, pool, &agent_ids, query, shared_mailbox).await {
             Outcome::Ok(entries) => all_entries.extend(entries),
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
@@ -248,7 +266,7 @@ pub async fn fetch_explorer_page(
     }
 
     if query.direction != Direction::Inbound {
-        match fetch_outbound(cx, pool, &agent_ids, query).await {
+        match fetch_outbound(cx, pool, &agent_ids, query, shared_mailbox).await {
             Outcome::Ok(entries) => all_entries.extend(entries),
             Outcome::Err(e) => return Outcome::Err(e),
             Outcome::Cancelled(r) => return Outcome::Cancelled(r),
@@ -354,6 +372,7 @@ async fn count_inbound(
     pool: &DbPool,
     agent_ids: &AgentIds,
     query: &ExplorerQuery,
+    shared_mailbox: bool,
 ) -> Outcome<usize, DbError> {
     if agent_ids.is_empty() {
         return Outcome::Ok(0);
@@ -366,6 +385,7 @@ async fn count_inbound(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let source = shared::inbound_source(shared_mailbox);
     let mut total: usize = 0;
     for &(pid, aid) in agent_ids {
         let mut conditions = vec![
@@ -378,8 +398,7 @@ async fn count_inbound(
 
         let sql = format!(
             "SELECT COUNT(DISTINCT m.id) AS cnt \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
+             FROM {source} \
              WHERE {where_clause}"
         );
         let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
@@ -469,6 +488,7 @@ async fn fetch_inbound(
     pool: &DbPool,
     agent_ids: &AgentIds,
     query: &ExplorerQuery,
+    shared_mailbox: bool,
 ) -> Outcome<Vec<ExplorerEntry>, DbError> {
     if agent_ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -481,6 +501,9 @@ async fn fetch_inbound(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let source = shared::inbound_source(shared_mailbox);
+    let recipient_join = shared::recipient_join(shared_mailbox);
+    let to_agents = shared::recipient_projection(shared_mailbox, true);
     let mut all_entries = Vec::new();
 
     for &(pid, aid) in agent_ids {
@@ -500,11 +523,11 @@ async fn fetch_inbound(
              r.kind, r.read_ts, r.ack_ts, \
              COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
              COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(a_recip.name), ''), '[unknown-agent-' || mr2.agent_id || ']')), '') AS to_agents \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
+             {to_agents} AS to_agents \
+             FROM {source} \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
+             {recipient_join} \
              LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id AND mr2.kind IN ('to', 'cc') \
              LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id \
              WHERE {where_clause} \
@@ -545,6 +568,7 @@ async fn fetch_outbound(
     pool: &DbPool,
     agent_ids: &AgentIds,
     query: &ExplorerQuery,
+    shared_mailbox: bool,
 ) -> Outcome<Vec<ExplorerEntry>, DbError> {
     if agent_ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -557,6 +581,8 @@ async fn fetch_outbound(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let recipient_join = shared::recipient_join(shared_mailbox);
+    let to_agents = shared::recipient_projection(shared_mailbox, false);
     let mut all_entries = Vec::new();
 
     for &(pid, aid) in agent_ids {
@@ -575,10 +601,11 @@ async fn fetch_outbound(
              m.importance, m.ack_required, m.created_ts, \
              COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
              COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(a_recip.name), ''), '[unknown-agent-' || mr.agent_id || ']')), '') AS to_agents \
+             {to_agents} AS to_agents \
              FROM messages m \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
+             {recipient_join} \
              LEFT JOIN message_recipients mr ON mr.message_id = m.id \
              LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
              WHERE {where_clause} \
@@ -952,7 +979,9 @@ fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
 fn collect_agent_names(agents: &mut std::collections::HashSet<String>, names_csv: &str) {
     for raw in names_csv.split(',') {
         let name = raw.trim();
-        if !name.is_empty() {
+        if !name.is_empty()
+            && crate::project_mailbox::parse_project_mailbox_address(name).is_none()
+        {
             agents.insert(name.to_string());
         }
     }
