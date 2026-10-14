@@ -36,11 +36,15 @@
 //!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
+//! Unwinding runs restart on that same owned thread after bounded backoff.
+//! Pools and recovery cursors are recreated; only the original process-start
+//! anchor and reporting/pruning cadence survive the failed run.
 
 #![forbid(unsafe_code)]
 
 mod catch_up;
 mod reservation_catch_up;
+mod supervisor;
 
 use asupersync::Cx;
 use fastmcp_core::block_on;
@@ -154,7 +158,16 @@ pub fn start(config: &Config) {
             .name("retention-quota".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
-                retention_loop(&config, settled_before_us);
+                supervisor::run(
+                    &SHUTDOWN,
+                    |last_report| retention_loop(&config, settled_before_us, last_report),
+                    sleep_with_shutdown,
+                    |restart| {
+                        warn!(target: "maintenance", event = "archive_maintenance_restarted",
+                            panicked = restart.panicked, retry_in_secs = restart.delay.as_secs(),
+                            "archive maintenance exited unexpectedly; restarting from authoritative storage");
+                    },
+                );
             }) {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -204,7 +217,11 @@ fn retention_pool_config(config: &Config) -> DbPoolConfig {
     pool_config
 }
 
-fn retention_loop(config: &Config, settled_before_us: i64) {
+fn retention_loop(
+    config: &Config,
+    settled_before_us: i64,
+    last_report: &mut Option<Instant>,
+) {
     let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
     let message_repair_enabled = message_archive_reconcile::enabled(config);
     let reservation_repair_enabled = reservation_reconcile::enabled(config);
@@ -219,7 +236,6 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
     let mut reservation_last_repair_us: Option<i64> = None;
     let mut reservation_progress_warned = false;
     let mut prune_cursor = ArchivePruneCursor::default();
-    let mut last_report: Option<Instant> = None;
 
     info!(
         interval_secs = interval.as_secs(),
@@ -408,7 +424,11 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
 
         // Archive catch-up does not turn a long-interval filesystem inventory
         // or destructive retention sweep into a once-per-minute operation.
-        if report_is_due(last_report.map(|last| last.elapsed()), interval) {
+        if report_is_due(last_report.as_ref().map(Instant::elapsed), interval) {
+            // The clock belongs to the supervisor, not this run. Record the
+            // sweep's completion on both normal exit and unwind; restarting
+            // archive repair must not accelerate opted-in destructive retention.
+            let _report_attempt = supervisor::ReportAttempt::begin(last_report);
             if config.retention_report_enabled || config.quota_enabled {
                 match run_retention_cycle(config) {
                     Ok(report) => {
@@ -433,7 +453,6 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             if let Some(pool) = pool.as_ref() {
                 run_message_retention_phase(config, pool, &mut prune_cursor);
             }
-            last_report = Some(Instant::now());
         }
 
         if sleep_with_shutdown(next_poll_interval(poll_interval, repair_backlog)) {
