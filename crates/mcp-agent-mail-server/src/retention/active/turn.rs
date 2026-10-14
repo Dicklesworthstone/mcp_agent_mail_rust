@@ -14,6 +14,8 @@ const MAX_BATCHES_PER_TURN: usize = 8;
 const MAX_ACTIVE_TIME: Duration = Duration::from_millis(250);
 const ADMISSION_REFUSAL: &str =
     "active reservation repair deferred: recovery promotion or admission contention";
+const CHECKPOINT_ADMISSION_REFUSAL: &str =
+    "active reservation repair deferred: checkpoint is owned by another worker";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Turn {
@@ -61,7 +63,7 @@ fn run_with(
         }
         let report = match repair() {
             Ok(report) => report,
-            Err(error) if error == ADMISSION_REFUSAL => {
+            Err(error) if error == ADMISSION_REFUSAL || error == CHECKPOINT_ADMISSION_REFUSAL => {
                 if cancelled() {
                     return Ok(stopped());
                 }
@@ -278,24 +280,28 @@ mod tests {
 
     #[test]
     fn admission_refusal_is_not_an_empty_pass_or_a_failed_source_pool() {
-        let mut calls = 0;
-        let turn = run_with(
-            || {
-                calls += 1;
-                Err(ADMISSION_REFUSAL.to_string())
-            },
-            |_| panic!("refusal cannot produce a storage report"),
-            || Duration::ZERO,
-            || false,
-        )
-        .unwrap();
-        assert_eq!(calls, 1);
-        assert_eq!(turn, pending());
+        for refusal in [ADMISSION_REFUSAL, CHECKPOINT_ADMISSION_REFUSAL] {
+            let mut calls = 0;
+            let turn = run_with(
+                || {
+                    calls += 1;
+                    Err(refusal.to_string())
+                },
+                |_| panic!("refusal cannot produce a storage report"),
+                || Duration::ZERO,
+                || false,
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(turn, pending());
+        }
         for error in [
             "active reservation source changed after selection; rescan required",
             "active reservation repair refused: corruption breaker open",
             "permission denied",
             "source error: active reservation repair deferred: recovery promotion or admission contention",
+            "source error: active reservation repair deferred: checkpoint is owned by another worker",
+            "active reservation checkpoint: permission denied",
         ] {
             let failed = run_with(
                 || Err(error.to_string()),
@@ -304,6 +310,29 @@ mod tests {
                 || false,
             );
             assert_eq!(failed.unwrap_err(), error);
+        }
+    }
+
+    #[test]
+    fn checkpoint_contention_after_progress_preserves_reports_and_respects_shutdown() {
+        for cancel in [false, true] {
+            let stop = Cell::new(false);
+            let mut calls = 0;
+            let mut observed = Vec::new();
+            let turn = run_with(
+                || {
+                    calls += 1;
+                    if calls == 1 { return Ok(busy()); }
+                    stop.set(cancel);
+                    Err(CHECKPOINT_ADMISSION_REFUSAL.to_string())
+                },
+                |report| observed.push(report.repaired),
+                || Duration::ZERO,
+                || stop.get(),
+            ).unwrap();
+            assert_eq!(calls, 2);
+            assert_eq!(observed, [4]);
+            assert_eq!(turn, if cancel { stopped() } else { pending() });
         }
     }
 

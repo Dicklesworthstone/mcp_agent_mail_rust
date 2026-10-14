@@ -6,6 +6,8 @@
 //! database pool and scan cursor are dropped before a fresh run is admitted.
 //! Productive passes run in finite catch-up turns; transient retry debt keeps
 //! the short poll without bypassing storage cooldown or spinning on contention.
+//! Each pass checkpoints source-bound scheduling hints beside SQLite. Restart
+//! restores pending IDs, not captured lease state or a failed DB transaction.
 
 mod turn;
 
@@ -17,7 +19,7 @@ use asupersync::Cx;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use mcp_agent_mail_storage::recovery::active_reservations::{
-    ActiveReservationCursor, ActiveReservationReport, reconcile_active_reservations,
+    ActiveReservationCursor, ActiveReservationReport,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -120,6 +122,8 @@ fn supervise(config: &Config, stop: &AtomicBool) {
 /// connection. The production closure captures only immutable configuration and
 /// the stop flag; all mutable recovery state belongs to `run` and unwinds before
 /// this boundary returns. No failed transaction is resumed or marked successful.
+/// A fresh cursor may restore validated scheduling hints from its own source's
+/// checkpoint; every pending lease is still reread from the live database.
 ///
 /// This handles unwinding/early exit, not a blocked syscall or process abort.
 /// The original thread remains owned and joined; retries never spawn or detach
@@ -175,7 +179,7 @@ fn run(config: &Config, stop: &AtomicBool) {
                 || Err("active lease repair has no runtime context".to_string()),
                 |cx| {
                     turn::run(
-                        || reconcile_active_reservations(&cx, live, config, &mut cursor, stop),
+                        || cursor.reconcile_checkpointed(&cx, live, config, stop),
                         |report| {
                             if report.repaired > 0 || report.deferred > 0 || report.interrupted {
                                 tracing::info!(target: "maintenance", event = "active_reservation_reconcile",
@@ -432,20 +436,110 @@ mod tests {
 
     #[test]
     fn worker_restores_an_active_guard_artifact_without_another_client_request() {
-        assert_worker_restores_artifact(false, 1);
+        assert_worker_restores_artifact(false, 1, false);
     }
 
     #[test]
     fn failed_worker_restarts_and_restores_the_real_guard_artifact() {
-        assert_worker_restores_artifact(true, 1);
+        assert_worker_restores_artifact(true, 1, false);
     }
 
     #[test]
     fn worker_commits_a_multi_batch_active_backlog_without_client_requests() {
-        assert_worker_restores_artifact(false, 13);
+        assert_worker_restores_artifact(false, 13, false);
     }
 
-    fn assert_worker_restores_artifact(fail_first: bool, count: usize) {
+    #[test]
+    fn worker_restart_restores_checkpointed_backlog_without_client_requests() {
+        // Hold the actual global archive fence in an isolated libtest process,
+        // not alongside unrelated tests trying to publish their own archives.
+        const CHILD: &str = "AM_TEST_ACTIVE_WORKER_CHECKPOINT_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().unwrap();
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, name)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut expired = false;
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    expired = true;
+                    let _ = child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(!expired && output.status.success(), "{name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        assert_worker_restores_artifact(false, 13, true);
+    }
+
+    fn checkpoint_debt_before_restart(config: &Config, parent: &std::path::Path, count: usize) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(20))
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let worker = TestWorker::spawn(config.clone(), false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let observed = loop {
+            let path = std::fs::read_dir(parent).ok().and_then(|entries| {
+                entries.filter_map(Result::ok).map(|entry| entry.path()).find(|path| {
+                    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                        name.starts_with(".am-active-reservation-reconcile-") && name.ends_with(".json")
+                    })
+                })
+            });
+            if let Some(path) = path {
+                let snapshot = std::fs::read(&path).ok().and_then(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                });
+                if snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot["retries"].as_array().is_some_and(|ids| ids.len() == count)
+                }) {
+                    break Some(path);
+                }
+            }
+            if Instant::now() >= deadline { break None; }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        // Join while publication is still refused. The next worker must not
+        // inherit either this run's cursor or its lifetime checkpoint lock.
+        drop(worker);
+        let _ = release_tx.send(());
+        assert!(owner.join().unwrap().is_ok(), "worker waited for fence-owner expiry");
+        let path = observed.expect("worker never checkpointed its deferred active leases");
+        let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut ids = snapshot["retries"].as_array().unwrap().iter()
+            .map(|entry| entry["id"].as_i64().unwrap()).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, (401..=400 + i64::try_from(count).unwrap()).collect::<Vec<_>>());
+        assert_eq!(snapshot["binding"]["generation"], "aabb");
+        assert_eq!(snapshot["version"], 1);
+        let lock = std::fs::OpenOptions::new().read(true).write(true)
+            .open(path.with_extension("json.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).expect("stopped worker retained checkpoint ownership");
+        drop(lock);
+        for id in ids {
+            assert!(!config.storage_root.join(format!(
+                "projects/project/file_reservations/id-{id}-gaabb.json"
+            )).exists(), "a held publication fence must not be bypassed");
+        }
+    }
+
+    fn assert_worker_restores_artifact(fail_first: bool, count: usize, restart_with_debt: bool) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let config = Config {
@@ -480,6 +574,9 @@ mod tests {
             }
             drop(conn);
             drop(pool);
+            if restart_with_debt {
+                checkpoint_debt_before_restart(&config, temp.path(), count);
+            }
             let last_relative =
                 format!("projects/project/file_reservations/id-{last_id}-gaabb.json");
             assert!(!config.storage_root.join(&last_relative).exists());
