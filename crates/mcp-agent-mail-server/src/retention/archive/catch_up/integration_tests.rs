@@ -1,6 +1,6 @@
 //! Exercise the turn executor with the real live-DB/archive reconciler.
-//! The injected clock removes machine-speed dependence; these are correctness
-//! tests, not a throughput benchmark or the release-smoke swarm verdict.
+//! The injected clocks remove machine-speed dependence where needed; these are
+//! correctness tests, not a throughput benchmark or release-smoke swarm verdict.
 
 use super::*;
 use asupersync::Outcome;
@@ -223,4 +223,98 @@ fn shutdown_between_real_batches_leaves_remaining_source_mail_untouched() {
     assert_eq!(observed, [(4, false), (0, true)]);
     assert_source_untouched(&fixture);
     assert_committed_bundles(&fixture, 4);
+}
+
+#[test]
+fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_cursor() {
+    let fixture = fixture();
+    let stop = AtomicBool::new(false);
+    let mut cursor = ReconcileCursor::settled_before(now_micros());
+    let first = reconcile_message_batch(
+        &fixture.cx,
+        &fixture.pool,
+        &fixture.config,
+        &mut cursor,
+        &stop,
+    )
+    .unwrap();
+    assert_eq!(first.repaired, 4);
+    assert_eq!(first.checkpoint_saved, Some(true));
+    assert_committed_bundles(&fixture, 4);
+
+    // Use the checkpoint actually created by the production storage pass,
+    // rather than duplicating its source/root binding or filename algorithm.
+    let database = std::path::Path::new(fixture.pool.sqlite_path());
+    let lock_paths = std::fs::read_dir(database.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(".am-message-reconcile-") && name.ends_with(".json.lock")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lock_paths.len(), 1, "one source-bound checkpoint lock");
+    let lock_path = &lock_paths[0];
+    let checkpoint_path = lock_path.with_extension("");
+    let before_checkpoint = std::fs::read(&checkpoint_path).unwrap();
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&owner).unwrap();
+
+    // The real OS lock must become a short follow-up, not a source failure.
+    // No storage pass completed, so neither a report nor checkpoint progress
+    // may be invented. The same live pool must remain usable afterwards.
+    let mut reports = 0;
+    let backlog = super::run(
+        &fixture.cx,
+        &fixture.pool,
+        &fixture.config,
+        &mut cursor,
+        &stop,
+        |_| reports += 1,
+    )
+    .expect("checkpoint contention must not retire the live source pool");
+    assert!(backlog);
+    assert_eq!(reports, 0);
+    assert_eq!(std::fs::read(&checkpoint_path).unwrap(), before_checkpoint);
+    assert_source_untouched(&fixture);
+    assert_committed_bundles(&fixture, 4);
+    drop(owner);
+
+    // Use the production entry point again, retaining this pool and cursor.
+    // A slow machine may yield after each batch; the finite turn count is a
+    // correctness bound for nine rows, not an elapsed-time performance gate.
+    let mut finished = false;
+    let mut repaired = 0;
+    for _ in 0..32 {
+        let backlog = super::run(
+            &fixture.cx,
+            &fixture.pool,
+            &fixture.config,
+            &mut cursor,
+            &stop,
+            |report| {
+                assert!(!report.interrupted);
+                assert_eq!(report.deferred, 0);
+                assert_eq!(report.checkpoint_saved, Some(true));
+                assert!(report.repaired <= 4);
+                repaired += report.repaired;
+            },
+        )
+        .unwrap();
+        if !backlog {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "released checkpoint ownership must not pin catch-up");
+    assert_eq!(repaired, 5, "do not replay the four completed repairs");
+    assert_source_untouched(&fixture);
+    assert_committed_bundles(&fixture, 9);
 }
