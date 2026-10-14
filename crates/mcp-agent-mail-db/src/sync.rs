@@ -1069,7 +1069,11 @@ fn mark_messages_read_batch_sync_conn(
                 .map_err(|e| DbError::Sqlite(e.to_string()))?;
         }
 
-        rebuild_agent_inbox_stats_sync(conn, agent_id)?;
+        // Counts change only when a receipt flipped; a no-op batch must not
+        // pay the recount inside the write transaction.
+        if !updated_message_ids.is_empty() {
+            rebuild_agent_inbox_stats_sync(conn, agent_id)?;
+        }
         // Successful SQL execution is not proof of a receipt. Verify after
         // ALL chunks and stats writes: a late trigger must not undo earlier
         // reads, alter ACK state, or change an already-read requested row.
@@ -2997,11 +3001,40 @@ mod tests {
             ],
         )
         .expect("insert already-read recipient row");
+        // Deliberately not what a recount would produce: a no-op batch must
+        // leave the counters alone instead of recounting under the write lock.
+        conn.execute_sync(
+            "INSERT OR REPLACE INTO inbox_stats \
+             (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+             VALUES (?1, 7, 7, 7, 7)",
+            &[Value::BigInt(recipient_id)],
+        )
+        .expect("insert sentinel inbox stats");
 
         let read_ts = mark_messages_read_batch_sync_conn(&conn, recipient_id, &[message_id])
             .expect("already-read rows should remain a successful no-op");
 
         assert_eq!(read_ts, None);
+        let stats = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count, last_message_ts \
+                 FROM inbox_stats WHERE agent_id = ?1",
+                &[Value::BigInt(recipient_id)],
+            )
+            .expect("read inbox stats");
+        let stats = stats.first().expect("sentinel inbox stats row");
+        for column in [
+            "total_count",
+            "unread_count",
+            "ack_pending_count",
+            "last_message_ts",
+        ] {
+            assert_eq!(
+                stats.get_named::<i64>(column).unwrap(),
+                7,
+                "{column} was recounted by a batch that changed nothing"
+            );
+        }
         let stored_read_ts = conn
             .query_sync(
                 "SELECT read_ts FROM message_recipients WHERE message_id = ?1 AND agent_id = ?2",

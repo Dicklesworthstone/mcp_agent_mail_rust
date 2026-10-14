@@ -5231,17 +5231,7 @@ pub async fn fetch_inbox(
     // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
     // must leave read state untouched.
     if mark_read.unwrap_or(true) && !messages.is_empty() {
-        // GH#282: shared-mailbox rows record this agent's own lazy receipt;
-        // direct rows update their recipient row.
-        let mut ids: Vec<i64> = Vec::with_capacity(messages.len());
-        let mut shared_ids: Vec<i64> = Vec::new();
-        for message in &messages {
-            if message.via.is_some() {
-                shared_ids.push(message.id);
-            } else {
-                ids.push(message.id);
-            }
-        }
+        let (ids, shared_ids) = unread_receipt_targets(&messages);
         if let Some(live_sqlite_path) = read_pool.live_sqlite_path()
             && !shared_ids.is_empty()
         {
@@ -5652,6 +5642,24 @@ pub async fn get_message_delivery_receipt(
     }
     serde_json::to_string(&response)
         .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+}
+
+/// The fetched rows that still need this agent's read receipt, as
+/// `(direct, shared)` message IDs. GH#282: shared-mailbox rows record the
+/// agent's own lazy receipt; direct rows update their recipient row. A row
+/// that already carries a receipt needs no write, so re-reading an
+/// already-read inbox never opens a write transaction.
+fn unread_receipt_targets(messages: &[InboxMessage]) -> (Vec<i64>, Vec<i64>) {
+    let mut direct = Vec::with_capacity(messages.len());
+    let mut shared = Vec::new();
+    for message in messages.iter().filter(|message| message.read_ts.is_none()) {
+        if message.via.is_some() {
+            shared.push(message.id);
+        } else {
+            direct.push(message.id);
+        }
+    }
+    (direct, shared)
 }
 
 fn apply_auto_read_timestamp(
@@ -9272,6 +9280,57 @@ mod tests {
         assert_eq!(messages[0].read_ts.as_deref(), Some(batch_read_at.as_str()));
         assert_eq!(messages[1].read_ts.as_deref(), Some(old_read_at.as_str()));
         assert_eq!(messages[2].read_ts, None);
+    }
+
+    #[test]
+    fn unread_receipt_targets_skip_rows_that_are_already_read() {
+        let unread = InboxMessage {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: None,
+            topic: None,
+            subject: "unread".into(),
+            importance: "normal".into(),
+            ack_required: false,
+            from: "BlueLake".into(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
+            kind: "to".into(),
+            via: None,
+            attachments: vec![],
+            body_md: None,
+        };
+        let read = InboxMessage {
+            id: 2,
+            read_ts: Some("2026-02-06T00:30:00Z".into()),
+            ..unread.clone()
+        };
+        let shared_unread = InboxMessage {
+            id: 3,
+            kind: mcp_agent_mail_db::project_mailbox::PROJECT_MAILBOX_KIND.into(),
+            via: inbox_via(mcp_agent_mail_db::project_mailbox::PROJECT_MAILBOX_KIND),
+            ..unread.clone()
+        };
+        let shared_read = InboxMessage {
+            id: 4,
+            read_ts: Some("2026-02-06T00:30:00Z".into()),
+            ..shared_unread.clone()
+        };
+
+        let (direct, shared) =
+            unread_receipt_targets(&[unread, read.clone(), shared_unread, shared_read.clone()]);
+        assert_eq!(direct, vec![1]);
+        assert_eq!(shared, vec![3]);
+        assert_eq!(
+            unread_receipt_targets(&[read, shared_read]),
+            (vec![], vec![]),
+            "an already-read inbox must not ask for a write"
+        );
     }
 
     #[test]
