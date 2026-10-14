@@ -4,6 +4,8 @@
 //! source and repeat create-only publication checks. A full queue refuses new
 //! debt rather than evicting an older contended lease behind the scan cursor.
 
+mod checkpoint;
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,9 @@ struct Entry {
 #[derive(Debug, Default)]
 pub(super) struct RetryQueue {
     entries: VecDeque<Entry>,
+    // The checkpointed API keeps ownership and restore state with this source's
+    // queue. A cursor rebind drops both; the in-memory API needs no sidecars.
+    persistence: checkpoint::Persistence,
 }
 
 impl RetryQueue {
