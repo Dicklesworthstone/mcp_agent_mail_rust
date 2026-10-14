@@ -30,6 +30,9 @@
 //! Terminal reservation releases also converge without another client read.
 //! Set `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED=false` to disable this separate
 //! default-on pass. It preserves foreign-generation and conflicting artifacts.
+//! Reservation retry debt also requests the short follow-up, independently of
+//! message repair. Successful release batches run in bounded turns; contention
+//! yields immediately without bypassing per-ID cooldown or publication locks.
 //!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
@@ -37,6 +40,7 @@
 #![forbid(unsafe_code)]
 
 mod catch_up;
+mod reservation_catch_up;
 
 use asupersync::Cx;
 use fastmcp_core::block_on;
@@ -259,7 +263,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             }
         }
 
-        let mut message_repair_backlog = false;
+        let mut repair_backlog = false;
         if message_repair_enabled {
             let mut retire_pool = false;
             if let Some(live_pool) = pool.as_ref() {
@@ -291,7 +295,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                         }
                     },
                 ) {
-                    Ok(backlog) => message_repair_backlog = backlog,
+                    Ok(backlog) => repair_backlog = backlog,
                     Err(error) => {
                         warn!(
                             target: "maintenance",
@@ -347,18 +351,18 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
 
         if reservation_repair_enabled && let Some(live_pool) = pool.as_ref() {
             let cx = worker_cx();
-            match reservation_reconcile::reconcile_reservation_releases(
+            match reservation_catch_up::run(
                 &cx,
                 live_pool,
                 config,
                 &mut reservation_cursor,
                 &SHUTDOWN,
-            ) {
-                Ok(report) => {
-                    if report.scanned > 0 || report.interrupted {
+                |report| {
+                    if report.scanned > 0 || report.interrupted || report.retry_len > 0 {
                         info!(target: "maintenance", event = "reservation_release_archive_reconcile",
                             scanned = report.scanned, unchanged = report.unchanged,
                             attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
+                            deferred_transient = report.deferred_transient, retry_len = report.retry_len,
                             interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
                             "bounded terminal reservation release reconciliation pass completed");
                     }
@@ -387,7 +391,9 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                             Err(_) => {}
                         }
                     }
-                }
+                },
+            ) {
+                Ok(backlog) => repair_backlog |= backlog,
                 Err(error) => {
                     warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
                         error = %error, "reservation release reconciliation refused; retrying next cycle");
@@ -430,7 +436,7 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             last_report = Some(Instant::now());
         }
 
-        if sleep_with_shutdown(next_poll_interval(poll_interval, message_repair_backlog)) {
+        if sleep_with_shutdown(next_poll_interval(poll_interval, repair_backlog)) {
             return;
         }
     }
