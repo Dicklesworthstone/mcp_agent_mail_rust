@@ -187,6 +187,13 @@ pub mod search_v3 {
     ) -> Result<(usize, usize), String> {
         Ok((0, 0))
     }
+
+    /// Tantivy is disabled, so no other process can hold an index writer
+    /// this one contends for (br-kp1in.18).
+    #[must_use]
+    pub fn is_writer_held_elsewhere(_error: &str) -> bool {
+        false
+    }
 }
 
 // Semantic/hybrid search modules (feature-gated)
