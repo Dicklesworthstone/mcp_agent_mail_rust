@@ -291,7 +291,11 @@ fn validate_conflict_check_paths(paths: &[String]) -> McpResult<()> {
 /// artifact (wrong holder until TTL), so active ops are dropped and healed by
 /// reconcile-on-read instead (the same convergence path as the disk-critical
 /// skip).
-fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
+fn dispatch_reservation_archive_write_inner(
+    op: mcp_agent_mail_storage::WriteOp,
+    context: &str,
+    cx: Option<&asupersync::Cx>,
+) {
     // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
     // return because the pre-commit guard reads it directly; a stale artifact
     // yields the *wrong holder* (GH#112). The previous implementation enqueued
@@ -309,7 +313,11 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
     // durability guarantee the guard depends on is strictly stronger: the
     // artifact is proven on disk on return (or a hard error is surfaced), rather
     // than merely warned about on a 30s flush timeout.
-    match mcp_agent_mail_storage::write_op_sync_direct(&op) {
+    let outcome = cx.map_or_else(
+        || mcp_agent_mail_storage::write_op_sync_direct(&op),
+        |cx| mcp_agent_mail_storage::write_op_sync_direct_cancellable(cx, &op),
+    );
+    match outcome {
         // Written: the guard-visible artifact is durable. SkippedDiskCritical:
         // intended disk-pressure behavior — DB stays authoritative and
         // reconcile-on-read heals the archive once pressure clears (the WBQ
@@ -347,6 +355,18 @@ fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, conte
             }
         }
     }
+}
+
+fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
+    dispatch_reservation_archive_write_inner(op, context, None);
+}
+
+fn dispatch_reservation_archive_write_cancellable(
+    ctx: &McpContext,
+    op: mcp_agent_mail_storage::WriteOp,
+    context: &str,
+) {
+    dispatch_reservation_archive_write_inner(op, context, Some(ctx.cx()));
 }
 
 /// Is every record in this archive op a TERMINAL release artifact (`released_ts`
@@ -1059,6 +1079,7 @@ fn mcp_error_supports_release_intent(error: &McpError) -> bool {
 }
 
 fn dispatch_release_archive_write(
+    ctx: &McpContext,
     project: &mcp_agent_mail_db::ProjectRow,
     agent: &mcp_agent_mail_db::AgentRow,
     released_rows: &[mcp_agent_mail_db::FileReservationRow],
@@ -1080,7 +1101,8 @@ fn dispatch_release_archive_write(
         config: config.clone(),
         reservations: res_jsons,
     };
-    dispatch_reservation_archive_write(
+    dispatch_reservation_archive_write_cancellable(
+        ctx,
         op,
         &format!("reservation release archive write project={}", project.slug),
     );
@@ -1174,6 +1196,7 @@ async fn replay_single_release_intent(
     };
     let db_generation = fetch_db_generation(ctx, pool).await;
     dispatch_release_archive_write(
+        ctx,
         &project,
         &agent,
         &released_rows,
@@ -2255,7 +2278,8 @@ pub async fn file_reservation_paths(
             config: config.clone(),
             reservations: res_jsons,
         };
-        dispatch_reservation_archive_write(
+        dispatch_reservation_archive_write_cancellable(
+            ctx,
             op,
             &format!("reservation archive write project={}", project.slug),
         );
@@ -2484,6 +2508,7 @@ pub async fn release_file_reservations(
     // Update archive artifacts for the released items
     let db_generation = fetch_db_generation(ctx, &pool).await;
     dispatch_release_archive_write(
+        ctx,
         &project,
         &agent,
         &released_rows,
@@ -2661,7 +2686,8 @@ pub async fn renew_file_reservations(
             config: Config::get(),
             reservations: res_jsons,
         };
-        dispatch_reservation_archive_write(
+        dispatch_reservation_archive_write_cancellable(
+            ctx,
             op,
             &format!("reservation renewal archive write project={}", project.slug),
         );
@@ -2969,7 +2995,8 @@ pub async fn force_release_file_reservation(
             config: Config::get(),
             reservations: vec![res_json],
         };
-        dispatch_reservation_archive_write(
+        dispatch_reservation_archive_write_cancellable(
+            ctx,
             op,
             &format!(
                 "forced reservation release archive write project={}",
