@@ -57,6 +57,10 @@ pub struct PreparedThread {
     pub summary: ThreadSummary,
     pub examples: Vec<ExampleMessage>,
     pub total_messages: i64,
+    /// True when the summary was refined with the conformance fixture's
+    /// canned text instead of a model (test harness only; br-kp1in.21).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_stub: bool,
 }
 
 /// File reservation cycle response
@@ -425,6 +429,7 @@ pub async fn macro_prepare_thread(
 
     // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
     let config = &mcp_agent_mail_core::Config::get();
+    let mut llm_stub = false;
     if use_llm && config.llm_enabled {
         let start_idx = messages.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
         let msg_tuples: Vec<(i64, String, String, String)> = messages[start_idx..]
@@ -440,6 +445,7 @@ pub async fn macro_prepare_thread(
             Ok(output) => {
                 if let Some(parsed) = llm::parse_json_safely(&output.content) {
                     summary = llm::merge_single_thread_summary(&summary, &parsed);
+                    llm_stub = output.is_conformance_fixture();
                 } else {
                     tracing::debug!(
                         "macro_prepare_thread.llm_skipped: could not parse LLM response"
@@ -471,6 +477,7 @@ pub async fn macro_prepare_thread(
         total_messages,
         summary,
         examples,
+        llm_stub,
     };
 
     let inbox_json = crate::messaging::fetch_inbox(
@@ -1268,13 +1275,24 @@ mod tests {
                 created_ts: "2026-01-01T00:00:00Z".into(),
             }],
             total_messages: 5,
+            llm_stub: false,
         };
         let json = serde_json::to_string(&thread).unwrap();
+        // A model-refined or heuristic summary carries no stub marker.
+        assert!(!json.contains("llm_stub"), "{json}");
         let parsed: PreparedThread = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.thread_id, "TKT-42");
         assert_eq!(parsed.total_messages, 5);
         assert_eq!(parsed.examples.len(), 1);
         assert_eq!(parsed.summary.participants, vec!["Alice"]);
+        assert!(!parsed.llm_stub);
+
+        let stubbed = PreparedThread {
+            llm_stub: true,
+            ..parsed
+        };
+        let json = serde_json::to_string(&stubbed).unwrap();
+        assert!(json.contains("\"llm_stub\":true"), "{json}");
     }
 
     // -----------------------------------------------------------------------
@@ -1323,6 +1341,7 @@ mod tests {
                 },
                 examples: Vec::new(),
                 total_messages: 0,
+                llm_stub: false,
             },
             inbox: Vec::new(),
         };
@@ -1623,6 +1642,7 @@ mod tests {
                 },
                 examples: Vec::new(),
                 total_messages: 0,
+                llm_stub: false,
             },
             inbox: Vec::new(),
         };

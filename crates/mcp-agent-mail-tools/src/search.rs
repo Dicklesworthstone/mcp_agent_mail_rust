@@ -214,6 +214,10 @@ pub struct SingleThreadResponse {
     pub thread_id: String,
     pub summary: ThreadSummary,
     pub examples: Vec<ExampleMessage>,
+    /// True when the summary was refined with the conformance fixture's
+    /// canned text instead of a model (test harness only; br-kp1in.21).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_stub: bool,
 }
 
 /// Multi-thread aggregate response
@@ -221,6 +225,10 @@ pub struct SingleThreadResponse {
 pub struct MultiThreadResponse {
     pub threads: Vec<ThreadEntry>,
     pub aggregate: AggregateSummary,
+    /// True when the digest was refined with the conformance fixture's
+    /// canned text instead of a model (test harness only; br-kp1in.21).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_stub: bool,
 }
 
 /// Thread entry in multi-thread response
@@ -1194,6 +1202,7 @@ pub async fn summarize_thread(
                 key_points: Vec::new(),
                 action_items: Vec::new(),
             },
+            llm_stub: false,
         };
         return serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
@@ -1264,6 +1273,7 @@ pub async fn summarize_thread(
 
         // LLM refinement for multi-thread (if enabled)
         let config = &mcp_agent_mail_core::Config::get();
+        let mut llm_stub = false;
         if use_llm && config.llm_enabled {
             let thread_context: Vec<(String, Vec<String>, Vec<String>)> = threads
                 .iter()
@@ -1297,6 +1307,7 @@ pub async fn summarize_thread(
                     if let Some(parsed) = llm::parse_json_safely(&output.content) {
                         llm::apply_multi_thread_thread_revisions(&mut threads, &parsed);
                         aggregate = llm::merge_multi_thread_aggregate(&aggregate, &parsed);
+                        llm_stub = output.is_conformance_fixture();
                     } else {
                         tracing::debug!(
                             "summarize_thread.llm_skipped: could not parse LLM response"
@@ -1309,7 +1320,11 @@ pub async fn summarize_thread(
             }
         }
 
-        let response = MultiThreadResponse { threads, aggregate };
+        let response = MultiThreadResponse {
+            threads,
+            aggregate,
+            llm_stub,
+        };
 
         tracing::debug!(
             "Summarized {} threads in project {} (llm: {}, limit: {})",
@@ -1341,6 +1356,7 @@ pub async fn summarize_thread(
 
         // LLM refinement (if enabled)
         let config = &mcp_agent_mail_core::Config::get();
+        let mut llm_stub = false;
         if use_llm && config.llm_enabled {
             let start_idx = messages.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
             let msg_tuples: Vec<(i64, String, String, String)> = messages[start_idx..]
@@ -1357,6 +1373,7 @@ pub async fn summarize_thread(
                 Ok(output) => {
                     if let Some(parsed) = llm::parse_json_safely(&output.content) {
                         summary = llm::merge_single_thread_summary(&summary, &parsed);
+                        llm_stub = output.is_conformance_fixture();
                     } else {
                         tracing::debug!("thread_summary.llm_skipped: could not parse LLM response");
                     }
@@ -1386,6 +1403,7 @@ pub async fn summarize_thread(
             thread_id: tid.clone(),
             summary,
             examples,
+            llm_stub,
         };
 
         tracing::debug!(

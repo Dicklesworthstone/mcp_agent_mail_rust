@@ -221,6 +221,20 @@ pub struct LlmOutput {
     pub estimated_cost_usd: Option<f64>,
 }
 
+/// [`LlmOutput::provider`] of the conformance fixture completion (see the
+/// block comment near EOF): canned text, never model output.
+const CONFORMANCE_FIXTURE_PROVIDER: &str = "conformance-fixture";
+
+impl LlmOutput {
+    /// Whether this is the conformance fixture's canned text rather than a
+    /// model result. Tool responses refined with it carry `llm_stub: true`
+    /// (br-kp1in.21).
+    #[must_use]
+    pub fn is_conformance_fixture(&self) -> bool {
+        self.provider.as_deref() == Some(CONFORMANCE_FIXTURE_PROVIDER)
+    }
+}
+
 /// LLM completion error.
 #[derive(Debug)]
 pub enum LlmError {
@@ -318,7 +332,7 @@ pub async fn complete_system_user(
         return Ok(LlmOutput {
             content: conformance_fixture_completion(system, user),
             model: resolved,
-            provider: Some("conformance-fixture".to_string()),
+            provider: Some(CONFORMANCE_FIXTURE_PROVIDER.to_string()),
             estimated_cost_usd: Some(0.0),
         });
     }
@@ -893,10 +907,12 @@ pub fn multi_thread_user_prompt(
 //
 // Activation: requires `MCP_AGENT_MAIL_LLM_STUB=1` AND `AM_TEST_MODE=1`
 // (the process-wide "this is a test harness" signal), as set by
-// conformance.rs and test_llm.sh. The fixture text is byte-identical to the
-// Python reference, so responses cannot carry a marker; the second gate is
-// what keeps a stray MCP_AGENT_MAIL_LLM_STUB (copied shell, service unit) from
-// silently replacing model output in a real deployment (br-kp1in.21).
+// conformance.rs and test_llm.sh. The second gate is what keeps a stray
+// MCP_AGENT_MAIL_LLM_STUB (copied shell, service unit) from silently replacing
+// model output in a real deployment (br-kp1in.21). The fixture text stays
+// byte-identical to the Python reference; a tool response refined with it
+// carries an additive `llm_stub: true` (legacy fixtures are compared as
+// contracts, so the extra field does not break parity).
 // ---------------------------------------------------------------------------
 
 fn conformance_fixture_mode_enabled() -> bool {

@@ -532,6 +532,10 @@ pub struct ProductThreadSummaryResponse {
     pub diagnostics: Option<crate::search::SearchDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partial_failures: Vec<ProductPartialFailure>,
+    /// True when the summary was refined with the conformance fixture's
+    /// canned text instead of a model (test harness only; br-kp1in.21).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_stub: bool,
 }
 
 /// Search across all projects linked to a product.
@@ -966,6 +970,7 @@ pub async fn summarize_thread_product(
     let mut summary = crate::search::summarize_messages(&rows);
 
     // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
+    let mut llm_stub = false;
     if use_llm && config.llm_enabled {
         let start_idx = rows.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
         let msg_tuples: Vec<(i64, String, String, String)> = rows[start_idx..]
@@ -981,6 +986,7 @@ pub async fn summarize_thread_product(
             Ok(output) => {
                 if let Some(parsed) = llm::parse_json_safely(&output.content) {
                     summary = llm::merge_single_thread_summary(&summary, &parsed);
+                    llm_stub = output.is_conformance_fixture();
                 } else {
                     tracing::debug!(
                         "summarize_thread_product.llm_skipped: could not parse LLM response"
@@ -1018,6 +1024,7 @@ pub async fn summarize_thread_product(
         examples,
         diagnostics,
         partial_failures,
+        llm_stub,
     };
 
     serde_json::to_string(&response)
