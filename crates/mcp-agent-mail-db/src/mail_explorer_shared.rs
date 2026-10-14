@@ -100,6 +100,28 @@ pub(super) fn recipient_projection(shared: bool, inbound: bool) -> String {
     )
 }
 
+impl super::ExplorerQuery {
+    /// Inspect shared-mailbox schema for connection-based explorer readers.
+    /// Uses the same complete/legacy/partial distinction as the pooled API.
+    ///
+    /// # Errors
+    /// Returns a database error for an unreadable or incomplete shared schema.
+    pub fn shared_mailbox_schema_available(conn: &impl SyncQuery) -> Result<bool, DbError> {
+        schema_available(conn)
+    }
+
+    /// Canonical eligibility for a read-only shared-delivery projection.
+    ///
+    /// The caller joins `project_mailbox_deliveries d`, `messages m`, and
+    /// `agents viewer`, and separately bounds candidate IDs and viewers using
+    /// bound parameters. This predicate includes direct-delivery precedence;
+    /// it must be applied before receipt filtering or status aggregation.
+    #[must_use]
+    pub const fn shared_delivery_visibility_sql() -> &'static str {
+        crate::project_mailbox::visible_to_viewer_sql!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::*;

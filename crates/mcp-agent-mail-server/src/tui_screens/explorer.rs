@@ -5,6 +5,8 @@
 //! definitions from [`mcp_agent_mail_db::mail_explorer`] for consistency
 //! with the MCP tool surface.
 
+mod deliveries;
+
 use asupersync::Outcome;
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Text};
@@ -166,8 +168,8 @@ const fn group_label(g: GroupMode) -> &'static str {
     }
 }
 
-/// SQL predicates over `messages m` joined to `message_recipients r` for an
-/// ack filter. Shared by the inbound and outbound queries.
+/// SQL predicates over `messages m` joined to effective delivery rows `r`.
+/// Shared by the inbound and outbound queries, including shared receipts.
 const fn recipient_state_predicates(filter: AckFilter) -> &'static [&'static str] {
     match filter {
         AckFilter::PendingAck => &["m.ack_required = 1", "r.ack_ts IS NULL"],
@@ -955,6 +957,12 @@ impl MailExplorerScreen {
                 .iter()
                 .map(ToString::to_string),
         );
+        let source = deliveries::source(
+            conn,
+            candidate_ids,
+            recipient_agent_ids.as_ref(),
+            &mut params,
+        )?;
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -966,7 +974,7 @@ impl MailExplorerScreen {
             "SELECT DISTINCT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, \
              m.created_ts, m.thread_id, m.sender_id AS raw_sender_id, \
              m.project_id AS raw_project_id, s.name AS sender_name, p.slug AS project_slug \
-             FROM message_recipients r \
+             FROM {source} r \
              JOIN messages m ON m.id = r.message_id \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
@@ -980,7 +988,7 @@ impl MailExplorerScreen {
             .map_err(|e| format!("Inbound query: {e}"))?;
 
         let message_ids = collect_message_ids(&rows);
-        let recipient_map = recipient_names_by_message(conn, &message_ids)?;
+        let recipient_map = deliveries::recipient_names(conn, &message_ids, false)?;
         let status_map =
             self.inbound_status_by_message(conn, &message_ids, recipient_agent_ids.as_ref())?;
 
@@ -1029,11 +1037,12 @@ impl MailExplorerScreen {
         // ack). Joined rather than a correlated EXISTS, like the inbound query.
         let recipient_state = recipient_state_predicates(self.ack_filter);
         let (recipient_join, distinct) = if recipient_state.is_empty() {
-            ("", "")
+            (String::new(), "")
         } else {
             conditions.extend(recipient_state.iter().map(ToString::to_string));
+            let source = deliveries::source(conn, candidate_ids, None, &mut params)?;
             (
-                " JOIN message_recipients r ON r.message_id = m.id",
+                format!(" JOIN {source} r ON r.message_id = m.id"),
                 "DISTINCT ",
             )
         };
@@ -1172,6 +1181,13 @@ impl MailExplorerScreen {
             }
             AckFilter::All => {}
         }
+        let candidates = message_ids.iter().copied().collect();
+        let source = deliveries::source(
+            conn,
+            Some(&candidates),
+            recipient_agent_ids,
+            &mut params,
+        )?;
 
         let where_clause = format!(" WHERE {}", conditions.join(" AND "));
         let sql = format!(
@@ -1180,7 +1196,7 @@ impl MailExplorerScreen {
              SUM(CASE WHEN ack_ts IS NULL THEN 1 ELSE 0 END) AS pending_ack_count, \
              MAX(read_ts) AS latest_read_ts, \
              MAX(ack_ts) AS latest_ack_ts \
-             FROM message_recipients{where_clause} \
+             FROM {source}{where_clause} \
              GROUP BY message_id"
         );
 
@@ -1265,7 +1281,11 @@ fn append_message_id_slice_filter_for_column(
         return false;
     }
 
-    let placeholders = vec!["?"; ids.len()].join(", ");
+    let first = params.len() + 1;
+    let placeholders = (first..first + ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     conditions.push(format!("{column} IN ({placeholders})"));
     params.extend(ids.iter().copied().map(Value::BigInt));
     true
@@ -1285,10 +1305,7 @@ fn append_agent_id_filter_for_column(
     }
 
     let ids: Vec<i64> = agent_ids.iter().copied().collect();
-    let placeholders = vec!["?"; ids.len()].join(", ");
-    conditions.push(format!("{column} IN ({placeholders})"));
-    params.extend(ids.into_iter().map(Value::BigInt));
-    true
+    append_message_id_slice_filter_for_column(column, conditions, params, &ids)
 }
 
 fn resolve_agent_ids_by_name(
@@ -1330,50 +1347,7 @@ fn recipient_names_by_message(
     conn: &DbConn,
     message_ids: &[i64],
 ) -> Result<std::collections::HashMap<i64, String>, String> {
-    if message_ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let mut conditions = Vec::new();
-    let mut params = Vec::new();
-    if !append_message_id_slice_filter_for_column(
-        "mr.message_id",
-        &mut conditions,
-        &mut params,
-        message_ids,
-    ) {
-        return Ok(std::collections::HashMap::new());
-    }
-    let where_clause = format!(" WHERE {}", conditions.join(" AND "));
-    let sql = format!(
-        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
-         FROM message_recipients mr \
-         LEFT JOIN agents a ON a.id = mr.agent_id{where_clause} \
-         ORDER BY mr.message_id ASC, \
-         CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END ASC, \
-         mr.agent_id ASC"
-    );
-
-    conn.query_sync(&sql, &params)
-        .map_err(|e| format!("Recipient lookup query: {e}"))
-        .map(|rows| {
-            let mut grouped: std::collections::HashMap<i64, Vec<String>> =
-                std::collections::HashMap::new();
-            for row in rows {
-                let Ok(message_id) = row.get_named::<i64>("message_id") else {
-                    continue;
-                };
-                let agent_name = read_agent_label(&row, "agent_name", "raw_agent_id");
-                let names = grouped.entry(message_id).or_default();
-                if !names.iter().any(|existing| existing == &agent_name) {
-                    names.push(agent_name);
-                }
-            }
-            grouped
-                .into_iter()
-                .map(|(message_id, names)| (message_id, names.join(", ")))
-                .collect()
-        })
+    deliveries::recipient_names(conn, message_ids, true)
 }
 
 impl Default for MailExplorerScreen {
@@ -1965,7 +1939,9 @@ fn compute_stats(entries: &[DisplayEntry]) -> ExplorerStats {
 fn collect_agent_names<'a>(agents: &mut std::collections::HashSet<&'a str>, names_csv: &'a str) {
     for raw in names_csv.split(',') {
         let name = raw.trim();
-        if !name.is_empty() {
+        if !name.is_empty()
+            && mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_none()
+        {
             agents.insert(name);
         }
     }
