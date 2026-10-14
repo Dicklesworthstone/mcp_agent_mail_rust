@@ -24814,9 +24814,21 @@ first body
             &[
                 ("MESSAGING_SESSION_IDENTITY", "true"),
                 ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+                // The project lives in a `.tmpXXXXXX` tempdir, which the
+                // ephemeral-root guard refuses by default (GH#349).
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ],
             |project_key| {
-                let mut state = build_state(mcp_agent_mail_core::Config::from_env());
+                // Sessions, not HTTP auth, are under test (GH#349): without
+                // these the first tools/call got RBAC's 403 (no loopback peer),
+                // or initialize got 401 from a host's user-level config.env
+                // bearer token, and the session code never ran.
+                let mut state = build_state(mcp_agent_mail_core::Config {
+                    http_rbac_enabled: false,
+                    http_bearer_token: None,
+                    http_jwt_enabled: false,
+                    ..mcp_agent_mail_core::Config::from_env()
+                });
                 Arc::get_mut(&mut state.router)
                     .expect("test owns the router")
                     .add_tool(SessionStateProbeTool)
@@ -24845,12 +24857,13 @@ first body
                             serde_json::from_slice(&resp.body).expect("json-rpc body");
                         let result = body["result"].clone();
                         let text = result["content"][0]["text"].as_str().unwrap_or_default();
-                        (
-                            body.get("error").is_some()
-                                || result["isError"].as_bool().unwrap_or(false),
-                            serde_json::from_str::<serde_json::Value>(text)
-                                .unwrap_or(serde_json::Value::Null),
-                        )
+                        let failed = body.get("error").is_some()
+                            || result["isError"].as_bool().unwrap_or(false);
+                        // A JSON-RPC error has no tool text; keep the whole body
+                        // so a failed assertion shows why.
+                        let payload = serde_json::from_str::<serde_json::Value>(text)
+                            .unwrap_or_else(|_| body.clone());
+                        (failed, payload)
                     };
 
                 let init = post(
@@ -24879,13 +24892,13 @@ first body
                     assert_eq!(presence["has_session_state"], expected);
                 }
 
-                let (failed, _) = tool(
+                let (failed, project) = tool(
                     "ensure_project",
                     serde_json::json!({"human_key": project_key}),
                     2,
                     Some(&session),
                 );
-                assert!(!failed);
+                assert!(!failed, "{project}");
                 let identity = serde_json::json!({
                     "project_key": project_key,
                     "program": "codex-cli",
@@ -24899,13 +24912,13 @@ first body
                 let (failed, bob) = tool("create_agent_identity", identity, 4, None);
                 assert!(!failed, "{bob}");
                 let bob = bob["name"].as_str().expect("bob").to_string();
-                let (failed, _) = tool(
+                let (failed, policy) = tool(
                     "set_contact_policy",
                     serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
                     5,
                     None,
                 );
-                assert!(!failed);
+                assert!(!failed, "{policy}");
 
                 let (failed, refusal) = tool(
                     "set_contact_policy",

@@ -59792,7 +59792,8 @@ url = "http://127.0.0.1:9999/mcp/"
             std::process::Command::new("git")
                 .arg("-C")
                 .arg(dir.path())
-                .args(["add", "--", ".codex/config.toml"])
+                // -f: a host's global gitignore may ignore `.codex` (GH#349).
+                .args(["add", "-f", "--", ".codex/config.toml"])
                 .status()
                 .unwrap()
                 .success()
