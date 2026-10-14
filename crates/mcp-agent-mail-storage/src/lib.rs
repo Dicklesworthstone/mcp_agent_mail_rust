@@ -1525,8 +1525,20 @@ pub enum DirectArchiveWrite {
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-#[must_use]
-pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+fn write_op_storage_root(op: &WriteOp) -> &Path {
+    match op {
+        WriteOp::MessageBundle { config, .. }
+        | WriteOp::AgentProfile { config, .. }
+        | WriteOp::FileReservation { config, .. }
+        | WriteOp::NotificationSignal { config, .. }
+        | WriteOp::ClearSignal { config, .. } => &config.storage_root,
+    }
+}
+
+fn write_op_sync_direct_with_cancel(
+    op: &WriteOp,
+    mut cancelled: impl FnMut() -> bool,
+) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     let disk_pressure = metrics.system.disk_pressure_level.load();
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
@@ -1538,6 +1550,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             .add(1);
         return DirectArchiveWrite::SkippedDiskCritical;
     }
+
+    // GH#351: direct request-path publication must never enter the blocking
+    // ARCHIVE_PUBLICATION_FENCE.lock() path. Admit through the same native
+    // mutation guard used by recovery: try_lock first, preserve the existing
+    // fence -> epoch -> filesystem ordering, and refuse contention before any
+    // mutation bookkeeping changes. wbq_execute_op's guards are then nested on
+    // this thread and therefore reuse this already-held publication window.
+    let _publication =
+        match ArchiveMutationGuard::try_begin_repair(write_op_storage_root(op), &mut cancelled) {
+            Ok(guard) => guard,
+            Err(error) => return DirectArchiveWrite::Failed(error),
+        };
+
     let started = Instant::now();
     let result = wbq_execute_op(op, "archive-direct");
     metrics.storage.archive_direct_writes_total.add(1);
@@ -1553,6 +1578,22 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             DirectArchiveWrite::Failed(error)
         }
     }
+}
+
+/// Cancellation-aware direct writer for request paths with an asupersync
+/// context. Cancellation racing fence admission exits before any archive
+/// mutation bookkeeping or filesystem publication begins.
+#[must_use]
+pub fn write_op_sync_direct_cancellable(
+    cx: &asupersync::Cx,
+    op: &WriteOp,
+) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || cx.checkpoint().is_err())
+}
+
+#[must_use]
+pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || false)
 }
 
 // ---------------------------------------------------------------------------
