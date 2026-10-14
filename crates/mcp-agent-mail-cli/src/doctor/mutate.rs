@@ -179,9 +179,10 @@ pub enum MutateError {
     #[error("backup verify failed (cmp-strict) for {0}")]
     BackupVerify(PathBuf),
     /// The live file's hash changed between step 4 (before_hash) and step 5
-    /// (post-backup re-hash). Concurrent writer detected; refusing to
-    /// proceed because our backup wouldn't faithfully represent the
-    /// pre-mutation state. Maps to exit 5 (`concurrency_lost`).
+    /// (post-backup re-hash), including while a transform was rendering.
+    /// Concurrent writer detected; refusing to proceed because our backup
+    /// wouldn't faithfully represent the transform's source state.
+    /// Maps to exit 5 (`concurrency_lost`).
     #[error("file {0} was modified between hash and backup (concurrent writer)")]
     TamperedBeforeMutate(PathBuf),
     /// `Op::Rename` would clobber an existing file at the destination.
@@ -784,16 +785,72 @@ fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Transform an existing file using the snapshot observed under the same
+/// per-path and subsystem locks as backup, publication, and action logging.
+///
+/// The callback must be a pure transformation of the supplied bytes, not
+/// a renderer of an earlier detector snapshot. Returning `None` or the
+/// original bytes skips the write, backup, and action records. Missing
+/// files are skipped rather than recreated. Dry runs evaluate the transform
+/// without creating lock files or other mutation artifacts.
+///
+/// Both the bytes read by the callback and the live file after rendering
+/// must match the chokepoint's `before_hash`. The existing post-backup
+/// check then witnesses that same snapshot. This closes the read/render
+/// window that `mutate(Op::WriteFile)` cannot protect for its callers.
+/// Advisory locks do not exclude arbitrary non-cooperating writers; this
+/// API does not claim directory-pinned publication or a filesystem CAS.
+pub fn transform_file(
+    ctx: &MutateContext,
+    path: &Path,
+    mode: u32,
+    transform: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, MutateError>,
+) -> Result<Option<ActionResult>, MutateError> {
+    ensure_in_scope(&ctx.capabilities, path)?;
+    let op = Op::WriteFile {
+        content: Vec::new(),
+        mode,
+    };
+    reject_unexpected_symlink(path, &op)?;
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    mutate_prepared(ctx, path, op, |_, before_hash| {
+        let mut file = open_regular_file_no_follow(path)?;
+        let mut source = Vec::new();
+        file.read_to_end(&mut source)?;
+        if sha256_bytes(&source) != before_hash {
+            return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
+        }
+        let content = transform(&source)?;
+        // Refuse before backup/pending records: rolling back here would
+        // itself clobber the concurrent writer we are trying to protect.
+        reject_unexpected_symlink(path, &Op::WriteFile {
+            content: Vec::new(),
+            mode,
+        })?;
+        ensure_in_scope(&ctx.capabilities, path)?;
+        if sha256_of_path(path)? != before_hash {
+            return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
+        }
+        Ok(content
+            .filter(|bytes| bytes != &source)
+            .map(|content| Op::WriteFile { content, mode }))
+    })
+}
+
 /// THE chokepoint. Every fixer-driven mutation flows through this.
 ///
 /// Steps in order:
 /// 1. Validate preconditions (path in scope, rename destination in scope).
 /// 2. For dry-run, compute `before_hash` and return without write artifacts.
 /// 3. Per-path advisory lock (`fs2::FileExt::try_lock_exclusive`).
-/// 4. Compute `before_hash`.
+/// 4. Compute `before_hash` and prepare any snapshot-dependent operation.
 /// 5. Write verbatim backup; verify with `cmp_strict`; verify
 ///    `sha256(live) == before_hash` (TOCTOU defense; if mismatch, refuse).
-/// 6. Plan the mutation in memory.
+/// 6. Record pending intent.
 /// 7. Execute atomically.
 /// 8. On exec failure: ATOMIC rollback from backup; record truthful
 ///    `rolled_back` value.
@@ -808,6 +865,16 @@ fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
 ///   longer matches the backup's right after we copied it (TOCTOU
 ///   detected).
 pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, MutateError> {
+    mutate_prepared(ctx, path, op, |op, _| Ok(Some(op)))?
+        .ok_or(MutateError::Unsupported("unconditional mutation unexpectedly skipped"))
+}
+
+fn mutate_prepared(
+    ctx: &MutateContext,
+    path: &Path,
+    op: Op,
+    prepare: impl FnOnce(Op, &str) -> Result<Option<Op>, MutateError>,
+) -> Result<Option<ActionResult>, MutateError> {
     let started_at_ns = elapsed_ns(ctx.start);
 
     // 1. Preconditions: path in scope + Rename destination in scope. This
@@ -824,17 +891,20 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 
     if ctx.dry_run {
         let before_hash = sha256_for_path_before_op(path, &op)?;
+        let Some(op) = prepare(op, &before_hash)? else {
+            return Ok(None);
+        };
         eprintln!(
             "[dry-run] would mutate {} via {}",
             path.display(),
             op.op_kind()
         );
-        return Ok(ActionResult {
+        return Ok(Some(ActionResult {
             ok: true,
             before_hash: before_hash.clone(),
             after_hash: before_hash,
             error: None,
-        });
+        }));
     }
 
     // 3. Per-path advisory lock. Lock file lives next to target, distinct name.
@@ -876,6 +946,11 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         None
     } else {
         fs::metadata(path).ok().map(|m| recorded_mode(&m))
+    };
+    // Snapshot-dependent read/parse/render belongs inside the lock and
+    // before the backup, not in the fixer before it calls the chokepoint.
+    let Some(op) = prepare(op, &before_hash)? else {
+        return Ok(None);
     };
 
     // 5. Verbatim backup (only if file exists). Also re-verifies that the
@@ -1189,12 +1264,12 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         });
     }
 
-    Ok(ActionResult {
+    Ok(Some(ActionResult {
         ok: true,
         before_hash,
         after_hash,
         error: None,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -2142,5 +2217,141 @@ mod tests {
         // Target file untouched.
         assert_eq!(fs::read_to_string(&target).unwrap(), "original");
         FileExt::unlock(&competitor).unwrap();
+    }
+
+    #[test]
+    fn transform_file_holds_path_and_subsystem_locks_while_rendering() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.json");
+        fs::write(&target, b"original").unwrap();
+        let mut ctx = make_ctx(&td, "2026-10-14T00-00-00Z__transform_locks");
+        let extra = td.path().join("subsystem.lock");
+        ctx.extra_locks.push(extra.clone());
+        let result = transform_file(&ctx, &target, 0o600, |source| {
+            assert_eq!(source, b"original");
+            for lock_path in [td.path().join(".config.json.doctor-lock"), extra] {
+                let competitor = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                    .unwrap();
+                assert!(competitor.try_lock_exclusive().is_err());
+            }
+            Ok(Some(b"replacement".to_vec()))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(result.ok);
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(result.before_hash, sha256_bytes(b"original"));
+        assert_eq!(result.after_hash, sha256_bytes(b"replacement"));
+    }
+
+    #[test]
+    fn transform_file_refuses_changes_during_render_without_rollback() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.json");
+        fs::write(&target, b"original").unwrap();
+        let ctx = make_ctx(&td, "2026-10-14T00-00-01Z__transform_race");
+        // Deterministically inject a non-cooperating writer in the exact
+        // read/render gap, without timing-dependent sleeps or threads.
+        let err = transform_file(&ctx, &target, 0o600, |source| {
+            assert_eq!(source, b"original");
+            fs::write(&target, b"concurrent operator edit")?;
+            Ok(Some(b"stale rendered replacement".to_vec()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, MutateError::TamperedBeforeMutate(p) if p == target));
+        assert_eq!(fs::read(&target).unwrap(), b"concurrent operator edit");
+        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert_eq!(fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(), 0);
+        // The error must also release the lock.
+        assert!(transform_file(&ctx, &target, 0o600, |_| Ok(None)).unwrap().is_none());
+    }
+
+    #[test]
+    fn transform_file_preserves_verbatim_backup_and_undo_contract() {
+        use crate::doctor::undo::run_undo_with_scopes;
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.json");
+        let original = b"{ \"keep\": true, \"url\": \"old\" }\n";
+        fs::write(&target, original).unwrap();
+        let run_id = "2026-10-14T00-00-02Z__transform_undo";
+        let ctx = make_ctx(&td, run_id);
+        transform_file(&ctx, &target, 0o600, |source| {
+            let mut value: serde_json::Value = serde_json::from_slice(source)?;
+            value["url"] = serde_json::json!("new");
+            Ok(Some(serde_json::to_vec_pretty(&value)?))
+        })
+        .unwrap()
+        .unwrap();
+        let actions = fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = actions
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["phase"], "pending");
+        assert_eq!(records[1]["phase"], "completed");
+        assert_eq!(records[1]["op"], "WriteFile");
+        assert_eq!(records[1]["before_hash"], sha256_bytes(original));
+        assert_eq!(records[1]["after_mode"], 0o600);
+        let backups: Vec<_> = fs::read_dir(ctx.run_dir.join("backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("config.json"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+        let restored = run_undo_with_scopes(
+            td.path(), run_id, false, true, &[td.path().to_path_buf()],
+        )
+        .unwrap();
+        assert!(restored.failures.is_empty(), "{:?}", restored.failures);
+        assert_eq!(fs::read(&target).unwrap(), original);
+    }
+
+    #[test]
+    fn transform_file_noops_and_errors_have_no_mutation_receipts() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.json");
+        fs::write(&target, b"not-json").unwrap();
+        let ctx = make_ctx(&td, "2026-10-14T00-00-03Z__transform_skip");
+        assert!(transform_file(&ctx, &target, 0o600, |_| Ok(None)).unwrap().is_none());
+        assert!(transform_file(&ctx, &target, 0o600, |source| Ok(Some(source.to_vec())))
+            .unwrap()
+            .is_none());
+        let err = transform_file(&ctx, &target, 0o600, |source| {
+            let value: serde_json::Value = serde_json::from_slice(source)?;
+            Ok(Some(serde_json::to_vec(&value)?))
+        })
+        .unwrap_err();
+        assert!(matches!(err, MutateError::Serde(_)));
+        assert_eq!(fs::read(&target).unwrap(), b"not-json");
+        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert_eq!(fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn transform_file_dry_run_and_missing_source_do_not_create_artifacts() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("config.json");
+        fs::write(&target, b"original").unwrap();
+        let mut ctx = make_ctx(&td, "2026-10-14T00-00-04Z__transform_dry");
+        ctx.dry_run = true;
+        assert!(transform_file(&ctx, &target, 0o600, |_| Ok(Some(b"new".to_vec())))
+            .unwrap()
+            .is_some());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(!td.path().join(".config.json.doctor-lock").exists());
+        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert_eq!(fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(), 0);
+        ctx.dry_run = false;
+        let missing = td.path().join("missing-parent/config.json");
+        let skipped = transform_file(&ctx, &missing, 0o600, |_| {
+            panic!("missing sources must not invoke the renderer");
+        })
+        .unwrap();
+        assert!(skipped.is_none());
+        assert!(!missing.parent().unwrap().exists());
     }
 }
