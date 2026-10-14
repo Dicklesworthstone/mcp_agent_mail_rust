@@ -28,13 +28,11 @@
 //!
 //! ## Fix (Op::WriteFile)
 //!
-//! Parse JSON → mutate the URL field → serialize back with
-//! `serde_json::to_string_pretty` → write via `mutate(ctx, path,
-//! Op::WriteFile { content, mode: 0o600 })`. The chokepoint handles
-//! backup + atomic rename + hash recording.
-//!
-//! Demonstrates the canonical Op::WriteFile FM pattern alongside
-//! passes 8-12's other patterns (Op::Rename, detect-only, Op::Chmod).
+//! `transform_file` acquires the mutation locks before reading, parsing,
+//! and rendering the current JSON. It routes the resulting `WriteFile`
+//! through the canonical backup, hash verification, and action log.
+//! A detector snapshot is only a field-level precondition, never the
+//! source of a whole-file replacement.
 //!
 //! ## Reversibility
 //!
@@ -44,7 +42,7 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{Op, mutate};
+use crate::doctor::mutate::transform_file;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -148,114 +146,56 @@ fn is_agent_mail_server_name(name: &str) -> bool {
     lower.contains("agent") && lower.contains("mail")
 }
 
-/// Fixer. Routes through `mutate()` with `Op::WriteFile`.
-///
-/// The function re-parses the file (don't trust the detector's
-/// snapshot — defensive against concurrent writers), mutates the
-/// single field at the recorded JSON pointer, serializes back with
-/// indented JSON (preserves operator-readable layout), and calls
-/// `mutate(... Op::WriteFile ...)`.
+/// Repair only the detected field in the snapshot supplied by the mutation
+/// chokepoint. Read, parse, and render happen after its locks are acquired;
+/// changes during rendering are refused before backup or action logging.
 pub fn fix(
     ctx: &crate::doctor::mutate::MutateContext,
     finding: &WrongMcpUrlFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
-    if !finding.config_path.exists() {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-
-    let body =
-        fs::read_to_string(&finding.config_path).map_err(crate::doctor::mutate::MutateError::Io)?;
-    let mut v: serde_json::Value =
-        serde_json::from_str(&body).map_err(crate::doctor::mutate::MutateError::Serde)?;
-
-    // Walk the pseudo JSON pointer: container.server.field. Server keys
-    // may themselves contain dots, so split only at the outer separators.
-    let Some((container, rest)) = finding.json_pointer.split_once('.') else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    let Some((server, field)) = rest.rsplit_once('.') else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    if container.is_empty() || server.is_empty() || field.is_empty() {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-
-    let Some(obj) = v.as_object_mut() else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    let Some(servers) = obj.get_mut(container).and_then(|x| x.as_object_mut()) else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    let Some(server_obj) = servers.get_mut(server).and_then(|x| x.as_object_mut()) else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    // Verify current value matches what the detector recorded — if a
-    // concurrent writer changed it to something else (not stale, not
-    // canonical), refuse rather than clobber. The chokepoint's H3
-    // (post-backup re-hash) catches the same class of race for the
-    // file as a whole; this catches it at the field level.
-    let cur = server_obj.get(field).and_then(|x| x.as_str()).unwrap_or("");
-    if cur != finding.current_url {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-    server_obj.insert(
-        field.to_string(),
-        serde_json::Value::String(finding.canonical_url.clone()),
-    );
-
-    let new_body =
-        serde_json::to_string_pretty(&v).map_err(crate::doctor::mutate::MutateError::Serde)?;
-    // Append trailing newline to match common JSON style.
-    let mut new_bytes = new_body.into_bytes();
-    if !new_bytes.ends_with(b"\n") {
-        new_bytes.push(b'\n');
-    }
-
-    mutate(
-        ctx,
-        &finding.config_path,
-        Op::WriteFile {
-            content: new_bytes,
-            // 0o600 — bearer tokens may be nearby in the same file.
-            mode: 0o600,
-        },
-    )?;
-
+    let result = transform_file(ctx, &finding.config_path, 0o600, |source| {
+        let mut value: serde_json::Value = serde_json::from_slice(source)?;
+        // Server keys may themselves contain dots: split only at the
+        // outer separators, not at every dot in the pseudo JSON pointer.
+        let Some((container, rest)) = finding.json_pointer.split_once('.') else {
+            return Ok(None);
+        };
+        let Some((server, field)) = rest.rsplit_once('.') else {
+            return Ok(None);
+        };
+        if !SERVERS_CONTAINER_KEYS.contains(&container)
+            || !URL_FIELD_NAMES.contains(&field)
+            || !is_agent_mail_server_name(server)
+        {
+            return Ok(None);
+        }
+        let Some(server_obj) = value
+            .get_mut(container)
+            .and_then(|servers| servers.get_mut(server))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return Ok(None);
+        };
+        // Do not overwrite an operator's newer URL or recreate a field
+        // that disappeared after detection. Already repaired is a no-op.
+        let Some(current) = server_obj.get(field).and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        if current != finding.current_url || current == finding.canonical_url {
+            return Ok(None);
+        }
+        server_obj.insert(
+            field.to_string(),
+            serde_json::Value::String(finding.canonical_url.clone()),
+        );
+        let mut bytes = serde_json::to_vec_pretty(&value)?;
+        bytes.push(b'\n');
+        Ok(Some(bytes))
+    })?;
+    let (actions_taken, actions_skipped) = if result.is_some() { (1, 0) } else { (0, 1) };
     Ok(FixOutcome {
-        actions_taken: 1,
-        actions_skipped: 0,
+        actions_taken,
+        actions_skipped,
         quarantined_paths: Vec::new(),
     })
 }
@@ -540,5 +480,71 @@ mod tests {
         assert!(s.contains(FM_ID));
         assert!(s.contains("\"severity\":\"P1\""));
         assert!(s.contains("mcpServers.agent-mail.url"));
+    }
+
+    #[test]
+    fn fixer_acquires_mutation_lock_before_parsing_current_config() {
+        use fs2::FileExt;
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"agent-mail":{"url":"http://wrong/"}}}"#,
+        )
+        .unwrap();
+        let findings = detect(CANONICAL, std::slice::from_ref(&path));
+        let ctx = ctx_for(&td, "2026-10-14T00-01-00Z__url_lock");
+        let writer = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(td.path().join(".config.json.doctor-lock"))
+            .unwrap();
+        writer.try_lock_exclusive().unwrap();
+        // A cooperating writer may be halfway through updating its JSON.
+        // The fixer must respect its lock before attempting to parse it.
+        fs::write(&path, b"{operator write in progress").unwrap();
+        let error = fix(&ctx, &findings[0]).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::doctor::mutate::MutateError::LockHeld(_)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"{operator write in progress");
+        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fixer_preserves_later_unrelated_edits_and_skips_repeated_findings() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("config.json");
+        let mut config = serde_json::json!({
+            "preferences": { "theme": "light" },
+            "mcpServers": { "agent-mail": { "url": "http://wrong/" } }
+        });
+        fs::write(&path, config.to_string()).unwrap();
+        let findings = detect(CANONICAL, std::slice::from_ref(&path));
+        config["preferences"]["theme"] = serde_json::json!("dark");
+        config["mcpServers"]["unrelated"] = serde_json::json!({ "command": "keep-me" });
+        fs::write(&path, config.to_string()).unwrap();
+        let ctx = ctx_for(&td, "2026-10-14T00-01-01Z__url_preserve");
+        assert_eq!(fix(&ctx, &findings[0]).unwrap().actions_taken, 1);
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired["preferences"]["theme"], "dark");
+        assert_eq!(repaired["mcpServers"]["unrelated"]["command"], "keep-me");
+        assert_eq!(repaired["mcpServers"]["agent-mail"]["url"], CANONICAL);
+        let before_repeat = fs::read(&path).unwrap();
+        let skipped = fix(&ctx, &findings[0]).unwrap();
+        assert_eq!(skipped.actions_taken, 0);
+        assert_eq!(skipped.actions_skipped, 1);
+        assert_eq!(fs::read(&path).unwrap(), before_repeat);
+        assert_eq!(
+            fs::read_to_string(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 }
