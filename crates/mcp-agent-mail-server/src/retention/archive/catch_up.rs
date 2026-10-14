@@ -1,9 +1,10 @@
 //! Bounded message-repair turns above the existing four-repair storage batches.
 //!
 //! A busy mailbox must not pay a one-second sleep after every four recovered
-//! messages. Each batch still owns its ordinary source checks, retry fairness,
-//! payload limit and durable checkpoint. This scheduler only removes sleeps
-//! between a small number of successful, uncontended batches.
+//! messages or every healthy page hiding an older crash orphan. Each batch still
+//! owns its source checks, retry fairness, payload limit and durable checkpoint.
+//! This scheduler removes sleeps only while bounded repair or scan progress is
+//! reported. Storage ends startup catch-up after the current history round.
 
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -53,11 +54,16 @@ fn continue_turn(
     elapsed: Duration,
     report: &ReconcileReport,
 ) -> bool {
+    // A healthy page advances the history cursor even when nothing needed a
+    // repair. Requiring repaired > 0 would repeatedly sleep before reaching
+    // old orphans. Only count a fully non-deferred scan as that progress;
+    // errors, conflict-only pages and empty/cooldown-only passes still yield.
+    let progressed = report.repaired > 0 || (report.unchanged > 0 && report.deferred == 0);
     batches < MAX_BATCHES_PER_TURN
         && payload_bytes < TURN_PAYLOAD_TARGET
         && elapsed < MAX_TURN_ACTIVE_TIME
         && report.budget_exhausted
-        && report.repaired > 0
+        && progressed
         && report.deferred_transient == 0
         && !report.interrupted
 }
@@ -180,8 +186,8 @@ mod tests {
     }
 
     #[test]
-    fn interruption_contention_and_no_repair_never_spin_in_a_turn() {
-        for mode in ["interrupted", "contended", "unchanged", "complete"] {
+    fn interruption_contention_and_no_scan_progress_never_spin_in_a_turn() {
+        for mode in ["interrupted", "contended", "conflict_only", "empty", "complete"] {
             let mut calls = 0;
             run_with(
                 || {
@@ -190,9 +196,14 @@ mod tests {
                     match mode {
                         "interrupted" => report.interrupted = true,
                         "contended" => report.deferred_transient = 1,
-                        "unchanged" => {
+                        "conflict_only" => {
                             report.repaired = 0;
-                            report.unchanged = report.scanned;
+                            report.deferred = report.scanned;
+                            report.deferred_conflict = report.scanned;
+                        }
+                        "empty" => {
+                            report.repaired = 0;
+                            report.scanned = 0;
                         }
                         _ => report.budget_exhausted = false,
                     }
@@ -235,5 +246,69 @@ mod tests {
         assert!(!continue_turn(MAX_BATCHES_PER_TURN, 0, Duration::ZERO, &report));
         assert!(!continue_turn(1, TURN_PAYLOAD_TARGET, Duration::ZERO, &report));
         assert!(!continue_turn(1, 0, MAX_TURN_ACTIVE_TIME, &report));
+    }
+
+    fn healthy_page() -> ReconcileReport {
+        ReconcileReport {
+            scanned: 16,
+            unchanged: 16,
+            budget_exhausted: true,
+            ..ReconcileReport::default()
+        }
+    }
+
+    #[test]
+    fn healthy_startup_pages_reach_older_repairs_and_yield_when_the_round_finishes() {
+        let mut reports = VecDeque::from([
+            healthy_page(),
+            healthy_page(),
+            ReconcileReport {
+                scanned: 8,
+                unchanged: 7,
+                repaired: 1,
+                budget_exhausted: true,
+                ..ReconcileReport::default()
+            },
+            ReconcileReport::default(),
+        ]);
+        let mut observed = Vec::new();
+        let backlog = run_with(
+            || Ok(reports.pop_front().expect("finished round must yield")),
+            |report| observed.push((report.scanned, report.repaired)),
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(observed, [(16, 0), (16, 0), (8, 1), (0, 0)]);
+        assert!(reports.is_empty());
+        assert!(!backlog);
+        let mut idle = healthy_page();
+        idle.budget_exhausted = false;
+        assert!(!continue_turn(1, 0, Duration::ZERO, &idle));
+        let mut conflicting = healthy_page();
+        conflicting.deferred = 1;
+        conflicting.deferred_conflict = 1;
+        assert!(!continue_turn(1, 0, Duration::ZERO, &conflicting));
+    }
+
+    #[test]
+    fn healthy_scan_progress_obeys_the_same_time_payload_and_batch_targets() {
+        let calls = Cell::new(0);
+        let mut observed = 0;
+        let backlog = run_with(
+            || {
+                calls.set(calls.get() + 1);
+                Ok(healthy_page())
+            },
+            |_| observed += 1,
+            || Duration::ZERO,
+        )
+        .unwrap();
+        assert!(backlog);
+        assert_eq!(calls.get(), MAX_BATCHES_PER_TURN);
+        assert_eq!(observed, MAX_BATCHES_PER_TURN);
+        let report = healthy_page();
+        assert!(!continue_turn(1, TURN_PAYLOAD_TARGET, Duration::ZERO, &report));
+        assert!(!continue_turn(1, 0, MAX_TURN_ACTIVE_TIME, &report));
+        assert!(!continue_turn(MAX_BATCHES_PER_TURN, 0, Duration::ZERO, &report));
     }
 }
