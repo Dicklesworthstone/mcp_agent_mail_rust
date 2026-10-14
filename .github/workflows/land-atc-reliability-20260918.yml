@@ -1,8 +1,8 @@
-name: Land reviewed ATC reliability fixes
+name: Land reviewed reliability fixes
 
-# One-shot application of the reviewed September 18 patch series. No PR or
-# arbitrary patch inputs are accepted; both source and patch blobs are pinned.
-# Ordinary pushes, including the three resulting commits, cannot run this job.
+# One-shot applications of reviewed patch series. No PR or arbitrary patch
+# inputs are accepted; source and patch blobs are pinned. Ordinary source
+# pushes, including the resulting fix commits, cannot run these jobs.
 on:
   push:
     branches: [main]
@@ -108,3 +108,101 @@ jobs:
       - name: Check formatting
         if: always() && steps.publish.outcome == 'success'
         run: cargo fmt --all -- --check
+
+  archive-readiness:
+    if: >-
+      github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' &&
+      contains(github.event.head_commit.message, '[land-archive-readiness-20261014]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          clean: false
+
+      - name: Retrieve and verify the two reviewed patch objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          source=crates/mcp-agent-mail-tools/src/identity.rs
+          test "$(git hash-object "$source")" = 61a1d2691723d9e145e9db2f10871823e7a0df0f
+          test ! -e crates/mcp-agent-mail-tools/src/identity/archive_inventory.rs
+          for sha in 9726ab7b967e4c0f22333ad398ecda180b763e6c 8a63e8b1f30a6120ef50b7c73cd635b1a459a8bf; do
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$sha" --jq .content | base64 --decode > "$RUNNER_TEMP/$sha.patch"
+            test "$(git hash-object "$RUNNER_TEMP/$sha.patch")" = "$sha"
+          done
+
+      - name: Install pinned Rust tools
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+
+      - name: Apply and publish each archive-readiness fix directly to main
+        id: publish_archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          source=crates/mcp-agent-mail-tools/src/identity.rs
+          helper=crates/mcp-agent-mail-tools/src/identity/archive_inventory.rs
+          patches=(9726ab7b967e4c0f22333ad398ecda180b763e6c 8a63e8b1f30a6120ef50b7c73cd635b1a459a8bf)
+          subjects=(
+            'fix(health): surface unverified DB-to-archive convergence (br-kp1in.35)'
+            'fix(health): fail closed on unavailable inventory evidence (br-kp1in.35)'
+          )
+          # Compile the actual dependency-free production helper as a module,
+          # not a rewritten implementation. This is not the full tool-path gate.
+          printf '#[path = "%s/%s"]\nmod archive_inventory;\n' "$GITHUB_WORKSPACE" "$helper" > "$RUNNER_TEMP/archive_inventory_tests.rs"
+          for index in 0 1; do
+            patch="$RUNNER_TEMP/${patches[$index]}.patch"
+            git apply --check "$patch"
+            git apply --index "$patch"
+            # Parse the complete Rust file before either commit. Defer formatting
+            # until patch two, whose reviewed context is the unformatted first
+            # patch; final formatting covers both fixes without fuzzy application.
+            rustfmt +nightly-2026-08-31 --edition 2024 --config skip_children=true --emit stdout "$source" > "$RUNNER_TEMP/identity-formatted-$index.rs"
+            rustc +nightly-2026-08-31 --edition 2024 --test "$RUNNER_TEMP/archive_inventory_tests.rs" -o "$RUNNER_TEMP/archive_inventory_tests"
+            "$RUNNER_TEMP/archive_inventory_tests"
+            if test "$index" = 1; then
+              rustfmt +nightly-2026-08-31 --edition 2024 --config skip_children=true "$source" "$helper"
+              git add -- "$source" "$helper"
+            fi
+            git diff --cached --check
+            actual=$(git diff --cached --name-only | LC_ALL=C sort)
+            expected=$(printf '%s\n' "$source" "$helper" | LC_ALL=C sort)
+            test "$actual" = "$expected"
+            git commit -m "${subjects[$index]}" -m 'Reviewed source and patch hashes, full-file Rust parsing, and the production inventory helper tests are checked before publishing. Integrated tool tests and workspace checks run next; no claim of full validation or swarm convergence closure.'
+            git push origin HEAD:refs/heads/main
+            printf '%s %s\n' "$(git rev-parse HEAD)" "${subjects[$index]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Run integrated identity regression tests
+        if: steps.publish_archive.outcome == 'success'
+        run: cargo +nightly-2026-08-31 test --locked -p mcp-agent-mail-tools --lib identity:: -- --test-threads=1
+
+      - name: Check production feature graph
+        if: always() && steps.publish_archive.outcome == 'success'
+        run: cargo +nightly-2026-08-31 check --locked --workspace --lib --bins
+
+      - name: Check all workspace targets
+        if: always() && steps.publish_archive.outcome == 'success'
+        run: cargo +nightly-2026-08-31 check --locked --workspace --all-targets
+
+      - name: Check workspace Clippy
+        if: always() && steps.publish_archive.outcome == 'success'
+        run: cargo +nightly-2026-08-31 clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Verify final source formatting
+        if: always() && steps.publish_archive.outcome == 'success'
+        run: rustfmt +nightly-2026-08-31 --edition 2024 --config skip_children=true --check crates/mcp-agent-mail-tools/src/identity.rs crates/mcp-agent-mail-tools/src/identity/archive_inventory.rs
