@@ -113,6 +113,11 @@ pub struct ReconcileCursor {
     // own write-behind queue, so they cannot still be in flight there and need
     // no grace period. 0 = always apply the grace.
     settled_before_us: i64,
+    // Finish the current descending history round at catch-up cadence after
+    // worker startup, even when its first pages are already archived. This is
+    // process-local: checkpoint restore keeps its scan position and retry debt,
+    // but cannot claim that this worker has already completed that round.
+    startup_backfill_complete: bool,
     // Only IDs are retained. Every retry rereads the current live source and
     // repeats the ordinary authority/no-clobber checks before publication.
     retries: VecDeque<DeferredRetry>,
@@ -132,6 +137,8 @@ impl ReconcileCursor {
     /// Scan positions and retry debt are checkpointed together beside the live
     /// database. Restoring them never restores the old process's grace anchor
     /// or grants authority to repair a message without rereading its source.
+    /// Until the current history round reaches its end, consumed pages request
+    /// the worker's bounded catch-up cadence, not its once-per-minute idle poll.
     #[must_use]
     pub fn settled_before(settled_before_us: i64) -> Self {
         Self {
@@ -202,6 +209,9 @@ pub struct ReconcileReport {
     /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
     pub interrupted: bool,
+    /// More bounded work should follow at catch-up cadence: an execution limit
+    /// was reached, or a consumed startup history page has not yet proved the
+    /// end of its round. This is not a count of missing archive messages.
     pub budget_exhausted: bool,
     /// Scheduling hints were restored, not archive authority or read/ack state.
     pub checkpoint_restored: bool,
@@ -363,6 +373,7 @@ fn select_ids(
         cursor.tail_after = None;
         cursor.backfill_ceiling = None;
         cursor.next_lane_is_history = false;
+        cursor.startup_backfill_complete = false;
     }
     let mut tail = if let Some(after) = cursor.tail_after {
         conn.query_sync(
@@ -395,6 +406,9 @@ fn select_ids(
         .collect::<Result<Vec<_>, _>>()?;
     if history.is_empty() {
         cursor.backfill_ceiling = None;
+        // The descending round is finite even while new IDs keep arriving.
+        // Keep its next ordinary wrap, but stop startup-only acceleration.
+        cursor.startup_backfill_complete = true;
     }
     // Interleave within a pass AND retain lane priority across budget-limited
     // passes. Fixed tail-first ordering starves history at one payload per pass.
@@ -808,6 +822,10 @@ impl CommittedMessages {
 /// Startup-aware cursors atomically checkpoint scan positions and retry debt.
 /// A checkpoint is source-generation scoped scheduling metadata, never archive
 /// authority. Unavailable checkpoint storage leaves repair enabled in memory.
+/// The first descending history round requests catch-up after each consumed
+/// page, including already-archived pages. It resumes the checkpoint's position
+/// rather than restarting at the newest ID. Once that round reaches its end,
+/// subsequent healthy history rounds return to the ordinary polling cadence.
 ///
 /// # Errors
 ///
@@ -994,6 +1012,18 @@ fn reconcile_message_batch_inner(
             cursor.advance(id, tail);
         }
     }
+    // Finding no missing files on the newest page does not establish that a
+    // crash left no older orphans. Continue this finite startup history round
+    // using the worker's existing one-second catch-up poll. No loop, SQL page,
+    // repair count, payload bound, retry cooldown, or publication guard changes.
+    // A cancelled or wholly blocked pass does not request extra polling here.
+    if cursor.persist_progress
+        && !cursor.startup_backfill_complete
+        && report.scanned > 0
+        && !report.interrupted
+    {
+        report.budget_exhausted = true;
+    }
     report.retry_len = cursor.retries.len();
     Ok(report)
 }
@@ -1170,8 +1200,7 @@ fn prune_retention_candidate(
 /// Each pass inspects at most 32 IDs and admits 16 MiB of prepared DB payload
 /// plus 64 MiB of unique archive bundle content. Raw SQL projections have a
 /// separate per-candidate bound; invalid projections still count toward the ID
-/// limit. Some objects are read repeatedly for Git and disk validation.
-/// Missing, conflicting or oversized evidence leaves the
+/// limit. Missing, conflicting or oversized evidence leaves the
 /// DB row intact for the repair worker. The deletion transaction rechecks the
 /// exact source projection and settlement observed before archive I/O.
 /// Connections are released during archive reads. One write-activity lease
@@ -2351,6 +2380,113 @@ mod tests {
                 std::fs::read(&other).unwrap(),
                 b"preserve other database bytes"
             );
+        });
+    }
+
+    fn archive_fixture_range(cx: &Cx, pool: &DbPool, config: &Config, ids: std::ops::Range<i64>) {
+        for id in ids {
+            let prepared = prepare_message(cx, pool, id).unwrap();
+            reconcile_prepared(config, &prepared).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_backfill_reaches_old_orphan_behind_healthy_pages_then_returns_to_idle() {
+        retention_fixture(40, |cx, pool, config| {
+            // The newest pages are completely healthy, but the oldest accepted
+            // message never reached Git. No retry record knows about it yet.
+            archive_fixture_range(cx, pool, config, 902..941);
+            let stop = AtomicBool::new(false);
+            let mut ordinary = ReconcileCursor::default();
+            let ordinary_page =
+                reconcile_message_batch(cx, pool, config, &mut ordinary, &stop).unwrap();
+            assert_eq!(ordinary_page.unchanged, 16);
+            assert!(!ordinary_page.budget_exhausted);
+
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            for pass in 0..2 {
+                let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(report.unchanged, 16, "pass {pass}: {report:?}");
+                assert_eq!(report.repaired, 0);
+                assert_eq!(report.deferred, 0);
+                assert!(report.budget_exhausted, "healthy pages must not hide an older orphan");
+                assert_eq!(report.checkpoint_saved, Some(true));
+            }
+            let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(repaired.scanned, 8);
+            assert_eq!(repaired.repaired, 1);
+            assert_eq!(repaired.files_created, 4);
+            assert_eq!(repaired.deferred, 0);
+            assert!(repaired.scanned <= MAX_IDS_PER_PASS);
+            assert!(repaired.repaired <= MAX_REPAIRS_PER_BATCH);
+            assert!(repaired.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(reconcile_prepared(config, &original).unwrap(), ReconcileResult::default());
+            assert!(verify_retention_archive(&crate::open_archive(config, "project").unwrap().unwrap(), &original, &mut 0).unwrap().is_some());
+
+            let end = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(end.scanned, 0);
+            assert!(!end.budget_exhausted);
+            assert!(cursor.startup_backfill_complete);
+            // Ordinary rotating history continues, but does not keep the
+            // worker on the fast startup cadence forever.
+            let wrapped = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(wrapped.unchanged, 16);
+            assert!(!wrapped.budget_exhausted);
+            assert!(cursor.startup_backfill_complete);
+            assert_eq!(retained_message_ids(cx, pool), (901..941).collect::<Vec<_>>());
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let receipts = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901", &[]).unwrap();
+            assert_eq!(receipts.len(), 2);
+            for receipt in receipts {
+                assert_eq!(receipt.get_named::<i64>("read_ts").unwrap(), 2_000_000);
+                assert_eq!(receipt.get_named::<i64>("ack_ts").unwrap(), 2_500_000);
+            }
+        });
+    }
+
+    #[test]
+    fn startup_backfill_resumes_persisted_position_instead_of_restarting_recent_pages() {
+        retention_fixture(40, |cx, pool, config| {
+            archive_fixture_range(cx, pool, config, 902..941);
+            let stop = AtomicBool::new(false);
+            let mut before_restart = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let first = reconcile_message_batch(cx, pool, config, &mut before_restart, &stop).unwrap();
+            assert_eq!(first.unchanged, 16);
+            assert_eq!(before_restart.backfill_ceiling, Some(924));
+            assert_eq!(first.checkpoint_saved, Some(true));
+
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let resumed = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(resumed.checkpoint_restored);
+            assert_eq!(resumed.unchanged, 16);
+            assert_eq!(restarted.backfill_ceiling, Some(908));
+            assert!(resumed.budget_exhausted);
+            assert!(!restarted.startup_backfill_complete);
+            let next = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert_eq!(next.repaired, 1);
+            assert_eq!(next.scanned, 8);
+            assert_eq!(next.deferred, 0);
+            let end = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(!end.budget_exhausted);
+            assert!(restarted.startup_backfill_complete);
+        });
+    }
+
+    #[test]
+    fn empty_and_stopped_startup_backfill_do_not_request_busy_polling() {
+        retention_fixture(0, |cx, pool, config| {
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let stopped = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(true)).unwrap();
+            assert!(stopped.interrupted);
+            assert!(!stopped.budget_exhausted);
+            assert!(!cursor.startup_backfill_complete);
+            for _ in 0..3 {
+                let empty = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+                assert_eq!(empty.scanned, 0);
+                assert!(!empty.budget_exhausted);
+                assert!(cursor.startup_backfill_complete);
+            }
         });
     }
 }
