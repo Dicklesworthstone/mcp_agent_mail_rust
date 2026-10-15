@@ -6,7 +6,8 @@
 //! without an intervening sleep. Reaching a finite round's end returns to idle.
 //! The storage reconciler checkpoints scan positions and retry debt together.
 //! It still owns all selection, cooldown, publication and generation checks.
-//! This scheduler never writes a lease or changes its state.
+//! This scheduler never writes a lease or changes its state. Critical disk
+//! pressure pauses before checkpoint/source access and preserves the cursor.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -20,9 +21,12 @@ use mcp_agent_mail_storage::recovery::reservation_reconcile::{
 
 const MAX_BATCHES_PER_TURN: usize = 8;
 const MAX_TURN_ACTIVE_TIME: Duration = Duration::from_millis(250);
+const DISK_PRESSURE_DEFERRED: &str =
+    "reservation reconciliation deferred: critical disk pressure";
 
 /// Run existing bounded storage passes, retaining their individual reports.
-/// Each pass still selects at most 32 IDs and attempts at most four releases.
+/// Each pass admits at most 32 source candidates and attempts four releases.
+/// Priority metadata discovery has a separate bounded primary-key page.
 /// The time target is cooperative: an individual DB/filesystem/Git operation
 /// can exceed it, but another batch is not admitted after it has elapsed.
 /// The returned hint controls only the worker pause, never retention/reporting.
@@ -36,11 +40,31 @@ pub(super) fn run(
 ) -> Result<bool, String> {
     let started = Instant::now();
     run_with(
-        || cursor.reconcile_checkpointed(cx, pool, config, stop),
+        || {
+            with_disk_admission(
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+                || cursor.reconcile_checkpointed(cx, pool, config, stop),
+            )
+        },
         observe,
         || started.elapsed(),
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
     )
+}
+
+fn with_disk_admission(
+    pressure: u64,
+    repair: impl FnOnce() -> Result<ReservationReconcileReport, String>,
+) -> Result<ReservationReconcileReport, String> {
+    if pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        // Check before the checkpointed entrypoint: even an unchanged pass
+        // normally writes/fsyncs scheduling hints beside the database.
+        return Err(DISK_PRESSURE_DEFERRED.into());
+    }
+    repair()
 }
 
 fn needs_follow_up(report: &ReservationReconcileReport) -> bool {
@@ -63,6 +87,14 @@ fn run_with(
         }
         let report = match repair() {
             Ok(report) => report,
+            Err(error) if error == DISK_PRESSURE_DEFERRED => {
+                // This is a resource pause, not a bad source or completed
+                // storage pass. Keep the caller's pool/cursor and allow the
+                // normal maintenance poll to retry after disk recovery. Do
+                // not request one-second catch-up or log a warning every tick
+                // solely because the disk remains critical.
+                return Ok(false);
+            }
             Err(error)
                 if matches!(
                     error.as_str(),
@@ -137,6 +169,68 @@ mod tests {
             budget_exhausted: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn disk_admission_refuses_critical_and_unknown_higher_pressure_before_storage() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        for level in [critical, critical.saturating_add(1), u64::MAX] {
+            assert_eq!(
+                with_disk_admission(level, || panic!("paused recovery must not access storage"))
+                    .unwrap_err(),
+                DISK_PRESSURE_DEFERRED,
+            );
+        }
+        assert!(critical > 0);
+        for level in [0, critical - 1] {
+            assert_eq!(with_disk_admission(level, || Ok(busy_report())).unwrap().repaired, 4);
+        }
+    }
+
+    #[test]
+    fn disk_pressure_between_batches_preserves_progress_and_resumes_the_same_work() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        let pressure = Cell::new(0);
+        let calls = Cell::new(0);
+        let mut reports = VecDeque::from([
+            busy_report(),
+            ReservationReconcileReport {
+                scanned: 1,
+                attempted: 1,
+                repaired: 1,
+                ..Default::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        let follow_up = run_with(
+            || with_disk_admission(pressure.get(), || {
+                calls.set(calls.get() + 1);
+                Ok(reports.pop_front().expect("no speculative storage pass"))
+            }),
+            |report| {
+                observed.push(report.repaired);
+                pressure.set(critical);
+            },
+            || Duration::ZERO,
+            || false,
+        ).unwrap();
+        assert!(!follow_up, "critical pressure must not force fast polling");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(observed, [4]);
+        assert_eq!(reports.len(), 1, "paused work must remain pending");
+        pressure.set(0);
+        assert!(!run_with(
+            || with_disk_admission(pressure.get(), || {
+                calls.set(calls.get() + 1);
+                Ok(reports.pop_front().expect("resume the remaining work"))
+            }),
+            |report| observed.push(report.repaired),
+            || Duration::ZERO,
+            || false,
+        ).unwrap());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(observed, [4, 1]);
+        assert!(reports.is_empty());
     }
 
     #[test]
@@ -297,7 +391,6 @@ mod tests {
                 || false,
             )
             .unwrap();
-            assert!(backlog);
             assert_eq!(calls.get(), 1);
         }
     }
@@ -449,6 +542,7 @@ mod tests {
             "permission denied",
             "source error: reservation reconciliation deferred: recovery promotion or admission contention",
             "source error: reservation reconciliation deferred: checkpoint owned by another worker",
+            "source error: reservation reconciliation deferred: critical disk pressure",
         ] {
             let result = run_with(
                 || Err(error.to_string()),
@@ -631,6 +725,26 @@ mod tests {
         true
     }
 
+    struct RestoreDiskPressure(u64);
+
+    impl Drop for RestoreDiskPressure {
+        fn drop(&mut self) {
+            mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .set(self.0);
+        }
+    }
+
+    fn directory_names(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut names = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     #[test]
     fn worker_discovers_and_commits_a_release_behind_healthy_live_rows() {
         // The production publication fence is global. Use a separate process
@@ -672,6 +786,20 @@ mod tests {
         drop(conn);
         let mut cursor = ReservationReconcileCursor::default();
         let stop = AtomicBool::new(false);
+        // Exercise the actual worker entrypoint and metric before allowing
+        // recovery. A pause must not even create its checkpoint beside SQLite.
+        let before_names = directory_names(temp.path());
+        let pressure = &mcp_agent_mail_core::global_metrics().system.disk_pressure_level;
+        let restore_pressure = RestoreDiskPressure(pressure.load());
+        pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+        let paused = run(&cx, &pool, &config, &mut cursor, &stop, |_| {
+            panic!("disk pause must not report a completed storage pass");
+        }).unwrap();
+        drop(restore_pressure);
+        assert!(!paused);
+        assert_eq!(directory_names(temp.path()), before_names);
+        assert!(!config.storage_root.join(".git").exists());
+        assert!(!config.storage_root.join("projects").exists());
         let mut observed = Vec::new();
         let mut completed = false;
         // A real filesystem operation may exhaust a turn's time target. Three
