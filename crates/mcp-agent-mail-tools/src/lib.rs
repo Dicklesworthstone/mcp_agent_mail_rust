@@ -67,7 +67,10 @@ mod issue353_bootstrap_tests {
         let (_scratch, config) = mailbox();
         let initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
         let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
-        let error = get_db_pool_for_config(&config).unwrap_err();
+        // `WriteDbPool` is not `Debug`, so `unwrap_err()` does not compile.
+        let Err(error) = get_db_pool_for_config(&config) else {
+            panic!("a losing cold initializer must be refused, not handed a pool");
+        };
         let after = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
         drop(initializer);
         assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
