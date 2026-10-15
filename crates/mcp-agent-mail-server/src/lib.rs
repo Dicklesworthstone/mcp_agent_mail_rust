@@ -12027,6 +12027,11 @@ impl HttpState {
                 // archive or diagnostic scans and make a live listener look
                 // dead under contention.
                 body["durability_state"] = serde_json::json!("not_probed");
+                // The write-back latch is one atomic load, so it is cheap enough here.
+                // Still 200: a restart would not recover the lost write-back.
+                if mcp_agent_mail_storage::durability_degraded() {
+                    body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
+                }
                 return Some(self.health_json_response(req, 200, &body));
             }
             "/health/durability" => {
@@ -12042,7 +12047,7 @@ impl HttpState {
                     &self.config.database_url,
                     self.config.storage_root.as_path(),
                 );
-                let body = durability.map_or_else(
+                let mut body = durability.map_or_else(
                     || {
                         serde_json::json!({
                             "durability_state": "unknown",
@@ -12057,6 +12062,11 @@ impl HttpState {
                             "allows_writes": state.allows_writes(),
                         })
                     },
+                );
+                apply_wbq_write_gate(
+                    &mut body,
+                    mcp_agent_mail_storage::durability_degraded()
+                        .then(mcp_agent_mail_storage::wbq_stats),
                 );
                 return Some(self.health_json_response(req, 200, &body));
             }
@@ -16773,6 +16783,28 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
              the DB may have been recreated or left stale without archive restore/reconcile"
         );
     }
+}
+
+/// The mailbox verdict cannot see the write-back latch (#122), which refuses
+/// every send with `DURABILITY_DEGRADED` until `am doctor repair`. Without this,
+/// `/health/durability` said "healthy", `allows_writes: true` on a mailbox that
+/// had refused all sends for hours (mac studio, 2026-10-14 after ENOSPC).
+fn apply_wbq_write_gate(
+    body: &mut serde_json::Value,
+    latched: Option<mcp_agent_mail_storage::WbqStats>,
+) {
+    let Some(stats) = latched else {
+        return;
+    };
+    body["durability_state"] =
+        serde_json::json!(mcp_agent_mail_db::DurabilityState::DegradedReadOnly.to_string());
+    body["allows_writes"] = serde_json::json!(false);
+    body["write_gate"] = serde_json::json!({
+        "error_code": "DURABILITY_DEGRADED",
+        "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+        "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+        "recovery": "am doctor repair",
+    });
 }
 
 /// Fast-path mailbox-verdict probe used by `/health/durability` (#94). Returns
@@ -30286,6 +30318,42 @@ first body
                 .and_then(|v| v.as_bool())
                 .is_some(),
             "body must include allows_writes bool: {body}"
+        );
+    }
+
+    #[test]
+    fn health_durability_reports_the_wbq_write_latch() {
+        let healthy = || {
+            serde_json::json!({
+                "durability_state": "healthy",
+                "allows_reads": true,
+                "allows_writes": true,
+            })
+        };
+        let mut unlatched = healthy();
+        apply_wbq_write_gate(&mut unlatched, None);
+        assert_eq!(unlatched, healthy());
+
+        let mut latched = healthy();
+        apply_wbq_write_gate(
+            &mut latched,
+            Some(mcp_agent_mail_storage::WbqStats {
+                enqueued: 1188,
+                drained: 1188,
+                errors: 1,
+                fallbacks: 0,
+                unrecoverable_errors: 1,
+                last_unrecoverable_error_us: 1_792_012_964_761_918,
+            }),
+        );
+        assert_eq!(latched["durability_state"], "degraded_read_only");
+        assert_eq!(latched["allows_reads"], true);
+        assert_eq!(latched["allows_writes"], false);
+        assert_eq!(latched["write_gate"]["error_code"], "DURABILITY_DEGRADED");
+        assert_eq!(latched["write_gate"]["wbq_unrecoverable_errors_total"], 1);
+        assert_eq!(
+            latched["write_gate"]["wbq_last_unrecoverable_error_us"],
+            1_792_012_964_761_918_u64
         );
     }
 
