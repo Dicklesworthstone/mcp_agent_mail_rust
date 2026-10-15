@@ -2,7 +2,8 @@
 //!
 //! Retaining a contended ID is insufficient if the maintenance worker ignores
 //! that debt and sleeps a minute. Keep pending retries on the short worker
-//! cadence, and drain successful release batches without an intervening sleep.
+//! cadence, and drain successful releases or healthy unfinished history pages
+//! without an intervening sleep. Reaching a finite round's end returns to idle.
 //! The storage reconciler still owns all selection, cooldown, publication and
 //! generation checks. This scheduler never writes a lease or changes its state.
 
@@ -90,10 +91,16 @@ fn run_with(
             return Ok(false);
         }
         let backlog = needs_follow_up(&report);
+        // A healthy page can advance towards a missing release without
+        // publishing anything itself. Storage alone decides whether its
+        // captured round remains unfinished; an empty or completed round
+        // must never be turned into speculative work by this scheduler.
+        let progressed = report.repaired > 0 || report.unchanged > 0;
         if !backlog
-            || report.repaired == 0
+            || !progressed
             || report.deferred > 0
             || report.deferred_transient > 0
+            || report.retry_len > 0
             || batches == MAX_BATCHES_PER_TURN
             || elapsed() >= MAX_TURN_ACTIVE_TIME
         {
@@ -117,6 +124,107 @@ mod tests {
             budget_exhausted: true,
             ..Default::default()
         }
+    }
+
+    fn healthy_page() -> ReservationReconcileReport {
+        ReservationReconcileReport {
+            scanned: 32,
+            unchanged: 32,
+            budget_exhausted: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn healthy_pages_reach_missing_releases_in_the_same_bounded_turn() {
+        let mut reports = VecDeque::from([
+            healthy_page(),
+            healthy_page(),
+            ReservationReconcileReport {
+                scanned: 18,
+                unchanged: 17,
+                attempted: 1,
+                repaired: 1,
+                ..Default::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        assert!(!run_with(
+            || Ok(reports.pop_front().expect("a completed round must yield")),
+            |report| observed.push((report.scanned, report.unchanged, report.repaired)),
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap());
+        assert_eq!(observed, [(32, 32, 0), (32, 32, 0), (18, 17, 1)]);
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn healthy_discovery_obeys_batch_and_active_time_bounds() {
+        let mut observed = 0;
+        assert!(run_with(
+            || Ok(healthy_page()),
+            |_| observed += 1,
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap());
+        assert_eq!(observed, MAX_BATCHES_PER_TURN);
+        for observer_is_slow in [false, true] {
+            let time = Cell::new(Duration::ZERO);
+            let calls = Cell::new(0);
+            assert!(run_with(
+                || {
+                    calls.set(calls.get() + 1);
+                    if !observer_is_slow {
+                        time.set(MAX_TURN_ACTIVE_TIME);
+                    }
+                    Ok(healthy_page())
+                },
+                |_| {
+                    if observer_is_slow {
+                        time.set(MAX_TURN_ACTIVE_TIME);
+                    }
+                },
+                || time.get(),
+                || false,
+            )
+            .unwrap());
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn healthy_work_cannot_spin_on_cooling_debt_or_ignore_cancellation() {
+        let mut calls = 0;
+        assert!(run_with(
+            || {
+                calls += 1;
+                Ok(ReservationReconcileReport {
+                    retry_len: 1,
+                    ..healthy_page()
+                })
+            },
+            |_| {},
+            || Duration::ZERO,
+            || false,
+        )
+        .unwrap());
+        assert_eq!(calls, 1);
+        let stop = Cell::new(false);
+        let mut observed = 0;
+        assert!(!run_with(
+            || Ok(healthy_page()),
+            |_| {
+                observed += 1;
+                stop.set(true);
+            },
+            || Duration::ZERO,
+            || stop.get(),
+        )
+        .unwrap());
+        assert_eq!(observed, 1);
     }
 
     #[test]
@@ -433,5 +541,135 @@ mod tests {
             Some(Duration::from_secs(1)),
             Duration::from_secs(3600)
         ));
+    }
+
+    fn isolated() -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+
+        const CHILD: &str = "AM_TEST_RESERVATION_DISCOVERY_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let mut log = tempfile::tempfile().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log.try_clone().unwrap())
+            .spawn()
+            .expect("spawn isolated reservation discovery test");
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut expired = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                expired = true;
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = child.wait().unwrap();
+        log.seek(SeekFrom::Start(0)).unwrap();
+        let mut output = String::new();
+        log.read_to_string(&mut output).unwrap();
+        assert!(
+            !expired && status.success() && output.contains("1 passed; 0 failed"),
+            "isolated {name} failed (timeout={expired}): {output}"
+        );
+        true
+    }
+
+    #[test]
+    fn worker_discovers_and_commits_a_release_behind_healthy_live_rows() {
+        // The production publication fence is global. Use a separate process
+        // rather than weakening assertions when unrelated libtests hold it.
+        if isolated() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &temp.path().join("mail.sqlite3"),
+            ),
+            storage_root: temp.path().join("archive"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.storage_root).unwrap();
+        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let cx = Cx::for_testing();
+        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+        conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'project', '/project', 1)").unwrap();
+        conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
+        conn.execute_raw("INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')").unwrap();
+        for id in 401..483 {
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'worker/{id}.rs', 1, 'unchanged', 1000000, 9000000, NULL)"
+            )).unwrap();
+        }
+        // Only the durable release ledger changes. Recovery must not rewrite
+        // the hot row or manufacture active artifacts for the preceding rows.
+        conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(482, 5000000)").unwrap();
+        drop(conn);
+        let mut cursor = ReservationReconcileCursor::default();
+        let stop = AtomicBool::new(false);
+        let mut observed = Vec::new();
+        let mut completed = false;
+        // A real filesystem operation may exhaust a turn's time target. Three
+        // finite pages fit in at most three turns without altering that target.
+        for _ in 0..3 {
+            let backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
+                assert!(report.scanned <= 32);
+                assert!(report.attempted <= 4);
+                assert_eq!((report.deferred, report.retry_len), (0, 0));
+                observed.push((report.scanned, report.unchanged, report.repaired));
+            })
+            .unwrap();
+            if !backlog {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "finite discovery never returned to idle");
+        assert_eq!(observed, [(32, 32, 0), (32, 32, 0), (18, 17, 1)]);
+        let relative = "projects/project/file_reservations/id-482-gaabb.json";
+        let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(artifact["id"], 482);
+        assert_eq!(artifact["db_generation"], "aabb");
+        assert_eq!(artifact["path_pattern"], "worker/482.rs");
+        assert_eq!(
+            mcp_agent_mail_core::iso_to_micros(artifact["released_ts"].as_str().unwrap()),
+            Some(5_000_000),
+        );
+        let repo = git2::Repository::open(&config.storage_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
+        assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+        assert!(!config.storage_root.join("projects/project/file_reservations/id-401-gaabb.json").exists());
+        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT COUNT(*) FROM file_reservations WHERE released_ts IS NULL", &[])
+                .unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            82,
+        );
+        assert_eq!(
+            conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=482", &[])
+                .unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            5_000_000,
+        );
     }
 }
