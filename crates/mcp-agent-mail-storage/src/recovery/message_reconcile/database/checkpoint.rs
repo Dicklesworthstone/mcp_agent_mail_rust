@@ -25,7 +25,10 @@ use super::{
     reconcile_message_batch_inner, source_error, validate_pool_binding,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+// Version 1 bound hints only to the inode. In-place restore/reconstruction can
+// change the mailbox generation without replacing that file. Such hints must
+// be ignored rather than attached to the restored mailbox's reused row IDs.
+const SCHEMA_VERSION: u32 = 2;
 const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -36,20 +39,28 @@ struct Binding {
     // The file identity, not its length/mtime: ordinary commits must not
     // invalidate a checkpoint. Replacement databases must start a fresh scan.
     generation: String,
+    database_generation: String,
 }
 
 impl Binding {
-    fn capture(pool: &DbPool, config: &Config) -> io::Result<Self> {
-        let database = std::fs::canonicalize(pool.sqlite_path())?;
-        Self::at(&database, &config.storage_root)
+    fn capture(cx: &Cx, pool: &DbPool, config: &Config) -> Result<Self, String> {
+        let generation = source_generation(cx, pool)?;
+        Self::at(Path::new(pool.sqlite_path()), &config.storage_root, &generation)
+            .map_err(|error| error.to_string())
     }
 
-    fn at(database: &Path, archive: &Path) -> io::Result<Self> {
+    fn at(database: &Path, archive: &Path, database_generation: &str) -> io::Result<Self> {
+        if database_generation.is_empty()
+            || database_generation.len() > 128
+            || !database_generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid("checkpoint database generation is invalid"));
+        }
         let database = std::fs::canonicalize(database)?;
         let archive = std::fs::canonicalize(archive)?;
         let metadata = std::fs::metadata(&database)?;
-        if !metadata.is_file() {
-            return Err(invalid("checkpoint source is not a regular database file"));
+        if !metadata.is_file() || !archive.is_dir() {
+            return Err(invalid("checkpoint source or archive has an invalid file type"));
         }
         let created = metadata
             .created()
@@ -70,6 +81,7 @@ impl Binding {
             database,
             archive,
             generation,
+            database_generation: database_generation.to_string(),
         })
     }
 
@@ -89,6 +101,26 @@ impl Binding {
             hex::encode(digest.finalize())
         )))
     }
+}
+
+/// The caller holds nonblocking database-promotion admission. Query-only
+/// sources must refuse before even a checkpoint lock file is created. Read the
+/// generation from the same connection, then release it before filesystem I/O.
+fn source_generation(cx: &Cx, pool: &DbPool) -> Result<String, String> {
+    let conn = outcome(block_on(pool.acquire(cx)))?;
+    let rows = conn
+        .query_sync("PRAGMA query_only", &[])
+        .map_err(source_error)?;
+    if rows.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
+        return Err("query-only snapshots cannot authorize message archive repair".into());
+    }
+    let rows = conn
+        .query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
+        .map_err(source_error)?;
+    let [row] = rows.as_slice() else {
+        return Err("message checkpoint requires one database generation".into());
+    };
+    row.get_named::<String>("generation_id").map_err(source_error)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -308,7 +340,11 @@ impl Store {
     fn save(&self, cursor: &ReconcileCursor) -> io::Result<()> {
         // Promotion is not held through filesystem I/O. Refuse to attach old
         // progress to a replacement database that appeared during the pass.
-        let current = Binding::at(&self.binding.database, &self.binding.archive)?;
+        let current = Binding::at(
+            &self.binding.database,
+            &self.binding.archive,
+            &self.binding.database_generation,
+        )?;
         if current != self.binding {
             return Err(invalid("checkpoint source changed during reconciliation"));
         }
@@ -349,6 +385,40 @@ fn warn_unavailable(error: &io::Error) {
     );
 }
 
+/// Recheck the live logical generation before publishing progress. Do not
+/// retain promotion admission across checkpoint fsync: a later replacement is
+/// safe because this snapshot still names the OLD generation, not the new one.
+fn save_current(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+    store: &Store,
+) -> Result<(), String> {
+    if stop.load(Ordering::Acquire)
+        || cx.checkpoint().is_err()
+        || corruption_circuit_breaker().is_tripped()
+    {
+        return Err("message checkpoint publication interrupted".into());
+    }
+    {
+        let _admission = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("message checkpoint publication deferred by recovery admission")?;
+        validate_pool_binding(pool, config)?;
+        if pool.sqlite_identity_key() != cursor.source_identity
+            || Binding::capture(cx, pool, config)? != store.binding
+        {
+            // The next pass must not reuse this generation's in-memory
+            // watermarks either. Its ordinary source reset clears old hints;
+            // no current-generation row or archive artifact is changed here.
+            cursor.source_identity.clear();
+            return Err("checkpoint source changed during reconciliation".into());
+        }
+    }
+    store.save(cursor).map_err(|error| error.to_string())
+}
+
 pub(super) fn run(
     cx: &Cx,
     pool: &DbPool,
@@ -367,15 +437,7 @@ pub(super) fn run(
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
         validate_pool_binding(pool, config)?;
-        // A query-only pool must not create or update even a hint sidecar.
-        let conn = outcome(block_on(pool.acquire(cx)))?;
-        let rows = conn
-            .query_sync("PRAGMA query_only", &[])
-            .map_err(source_error)?;
-        if rows.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-            return Err("query-only snapshots cannot authorize message archive repair".into());
-        }
-        drop(conn);
+        let generation = source_generation(cx, pool)?;
         scope = pool.sqlite_identity_key();
         if cursor.source_identity != scope {
             *cursor = ReconcileCursor {
@@ -385,7 +447,9 @@ pub(super) fn run(
                 ..Default::default()
             };
         }
-        match Binding::capture(pool, config).and_then(Store::open) {
+        match Binding::at(Path::new(pool.sqlite_path()), &config.storage_root, &generation)
+            .and_then(Store::open)
+        {
             Ok(store) => Some(store),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 return Err(
@@ -415,13 +479,13 @@ pub(super) fn run(
     cursor.checkpoint_dirty = true;
     let saved = if let Some(store) = &store {
         if pool.sqlite_identity_key() == scope && cursor.source_identity == scope {
-            match store.save(cursor) {
+            match save_current(cx, pool, config, cursor, stop, store) {
                 Ok(()) => {
                     cursor.checkpoint_dirty = false;
                     true
                 }
                 Err(error) => {
-                    warn_unavailable(&error);
+                    warn_unavailable(&invalid(&error));
                     false
                 }
             }
@@ -445,6 +509,133 @@ pub(super) fn run(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    const GENERATION: &str = "aabbccdd";
+
+    #[test]
+    fn logical_generation_changes_invalidate_hints_without_replacing_the_file() {
+        let (_temp, database, archive) = fixture();
+        let before = Binding::at(&database, &archive, GENERATION).unwrap();
+        let after = Binding::at(&database, &archive, "11223344").unwrap();
+        assert_eq!(before.generation, after.generation, "same physical file");
+        assert_eq!(before.path().unwrap(), after.path().unwrap());
+        let mut snapshot = Snapshot::capture(before, &debt(Instant::now()), Instant::now(), 1);
+        assert!(snapshot.validate(&after).is_err());
+        snapshot.binding.database_generation = after.database_generation.clone();
+        snapshot.validate(&after).unwrap();
+        snapshot.version = 1;
+        assert!(snapshot.validate(&after).is_err(), "old format has no logical authority");
+        for generation in ["", "not-hex", " ", &"a".repeat(129)] {
+            assert!(Binding::at(&database, &archive, generation).is_err());
+        }
+    }
+
+    fn seed_obsolete_progress(cx: &Cx, pool: &DbPool, config: &Config) -> (Store, ReconcileCursor) {
+        let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+        cursor.source_identity = pool.sqlite_identity_key();
+        cursor.tail_after = Some(940);
+        cursor.backfill_ceiling = Some(0);
+        let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+        store.save(&cursor).unwrap();
+        (store, cursor)
+    }
+
+    fn change_logical_generation(cx: &Cx, pool: &DbPool, old: &str) {
+        // This models the generation change performed by in-place recovery,
+        // without deleting/replacing the fixture or changing its message rows.
+        let replacement = if old == "aabbccdd" { "11223344" } else { "aabbccdd" };
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_sync(
+            "UPDATE db_identity SET generation_id = ? WHERE singleton = 0",
+            &[replacement.into()],
+        ).unwrap();
+    }
+
+    fn assert_message_committed(cx: &Cx, pool: &DbPool, config: &Config, id: i64) {
+        let prepared = super::super::prepare_message(cx, pool, id).unwrap();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &prepared.message, &prepared.sender, &prepared.recipients,
+        ).unwrap().0;
+        let repo = git2::Repository::open(&config.storage_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let root = std::fs::canonicalize(&config.storage_root).unwrap();
+        for path in std::iter::once(&paths.canonical)
+            .chain(std::iter::once(&paths.outbox))
+            .chain(paths.inbox.iter())
+        {
+            let absolute = std::fs::canonicalize(path).unwrap();
+            let relative = absolute.strip_prefix(&root).unwrap();
+            let entry = tree.get_path(relative).unwrap();
+            assert_eq!(repo.find_blob(entry.id()).unwrap().content(), std::fs::read(path).unwrap());
+        }
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        let rows = conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[]).unwrap();
+        assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 40);
+        let rows = conn.query_sync(
+            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = ?", &[id.into()],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.get_named::<i64>("read_ts").unwrap(), 2_000_000);
+            assert_eq!(row.get_named::<i64>("ack_ts").unwrap(), 2_500_000);
+        }
+    }
+
+    #[test]
+    fn in_place_recovery_does_not_restore_the_previous_mailbox_watermarks() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (store, _) = seed_obsolete_progress(cx, pool, config);
+            change_logical_generation(cx, pool, &store.binding.database_generation);
+            let current = Binding::capture(cx, pool, config).unwrap();
+            assert_eq!(store.binding.generation, current.generation);
+            assert_ne!(store.binding.database_generation, current.database_generation);
+            drop(store);
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let report = run(cx, pool, config, &mut restarted, &AtomicBool::new(false)).unwrap();
+            assert!(!report.checkpoint_restored, "old logical-generation hints are invalid");
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            // A restored tail=940/history=0 cursor would inspect no messages
+            // in this pass, delaying repair until the next history round.
+            assert_message_committed(cx, pool, config, 940);
+        });
+    }
+
+    #[test]
+    fn generation_change_before_publication_preserves_disk_and_resets_live_watermarks() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (store, mut cursor) = seed_obsolete_progress(cx, pool, config);
+            let before = std::fs::read(&store.path).unwrap();
+            change_logical_generation(cx, pool, &store.binding.database_generation);
+            let stop = AtomicBool::new(false);
+            let error = save_current(cx, pool, config, &mut cursor, &stop, &store).unwrap_err();
+            assert!(error.contains("source changed"), "{error}");
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+            assert!(cursor.source_identity.is_empty(), "next pass must rescan");
+            drop(store);
+            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_message_committed(cx, pool, config, 940);
+        });
+    }
+
+    #[test]
+    fn cancelled_publication_does_not_advance_the_durable_watermark() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (store, mut cursor) = seed_obsolete_progress(cx, pool, config);
+            let before = std::fs::read(&store.path).unwrap();
+            cursor.tail_after = Some(999);
+            let scope = cursor.source_identity.clone();
+            assert!(save_current(
+                cx, pool, config, &mut cursor, &AtomicBool::new(true), &store,
+            ).is_err());
+            assert_eq!(cursor.source_identity, scope, "cancellation is not source replacement");
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+            assert_eq!(store.load().unwrap().unwrap().tail_after, Some(940));
+        });
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -482,12 +673,12 @@ mod tests {
     fn checkpoint_restores_low_and_high_retry_debt_and_lane_turns_together() {
         let (_temp, database, archive) = fixture();
         let now = Instant::now();
-        let binding = Binding::at(&database, &archive).unwrap();
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
         let snapshot = Snapshot::capture(binding, &debt(now), now, 1_000_000);
         let bytes = serde_json::to_vec(&snapshot).unwrap();
         let restored: Snapshot = serde_json::from_slice(&bytes).unwrap();
         restored
-            .validate(&Binding::at(&database, &archive).unwrap())
+            .validate(&Binding::at(&database, &archive, GENERATION).unwrap())
             .unwrap();
         let mut cursor = ReconcileCursor::settled_before(999);
         cursor.source_identity = "new process pool".into();
@@ -519,7 +710,7 @@ mod tests {
         let now = Instant::now();
         for wall_us in [1, 2_000_000, i64::MAX] {
             let snapshot = Snapshot::capture(
-                Binding::at(&database, &archive).unwrap(),
+                Binding::at(&database, &archive, GENERATION).unwrap(),
                 &debt(now),
                 now,
                 2_000_000,
@@ -539,7 +730,7 @@ mod tests {
     #[test]
     fn checkpoint_bounds_and_duplicate_ids_fail_closed() {
         let (_temp, database, archive) = fixture();
-        let binding = Binding::at(&database, &archive).unwrap();
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
         let now = Instant::now();
         for change in [
             "version",
@@ -550,7 +741,7 @@ mod tests {
             "count",
         ] {
             let mut snapshot = Snapshot::capture(
-                Binding::at(&database, &archive).unwrap(),
+                Binding::at(&database, &archive, GENERATION).unwrap(),
                 &debt(now),
                 now,
                 1_000_000,
@@ -578,29 +769,29 @@ mod tests {
     #[test]
     fn checkpoint_is_source_generation_and_archive_root_scoped() {
         let (_temp, database, archive) = fixture();
-        let before = Binding::at(&database, &archive).unwrap();
+        let before = Binding::at(&database, &archive, GENERATION).unwrap();
         std::fs::write(&database, b"an ordinary database write changes its length").unwrap();
-        assert_eq!(before, Binding::at(&database, &archive).unwrap());
+        assert_eq!(before, Binding::at(&database, &archive, GENERATION).unwrap());
         let other = archive.with_file_name("other-archive");
         std::fs::create_dir(&other).unwrap();
         assert_ne!(
             before.path().unwrap(),
-            Binding::at(&database, &other).unwrap().path().unwrap()
+            Binding::at(&database, &other, GENERATION).unwrap().path().unwrap()
         );
         std::fs::rename(&database, database.with_extension("held")).unwrap();
         std::fs::write(&database, b"replacement generation").unwrap();
-        assert_ne!(before, Binding::at(&database, &archive).unwrap());
+        assert_ne!(before, Binding::at(&database, &archive, GENERATION).unwrap());
     }
 
     #[test]
     fn checkpoint_publish_survives_reopening_and_rejects_stale_source() {
         let (_temp, database, archive) = fixture();
-        let store = Store::open(Binding::at(&database, &archive).unwrap()).unwrap();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
         assert!(store.load().unwrap().is_none());
         store.save(&debt(Instant::now())).unwrap();
         let bytes = std::fs::read(&store.path).unwrap();
         drop(store);
-        let reopened = Store::open(Binding::at(&database, &archive).unwrap()).unwrap();
+        let reopened = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
         let snapshot = reopened.load().unwrap().unwrap();
         assert_eq!(snapshot.tail_after, Some(90_000));
         assert_eq!(snapshot.retries.len(), 2);
@@ -613,22 +804,22 @@ mod tests {
     #[test]
     fn checkpoint_lock_contention_is_nonblocking_and_preserves_progress() {
         let (_temp, database, archive) = fixture();
-        let first = Store::open(Binding::at(&database, &archive).unwrap()).unwrap();
+        let first = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
         first.save(&debt(Instant::now())).unwrap();
         let bytes = std::fs::read(&first.path).unwrap();
-        let error = Store::open(Binding::at(&database, &archive).unwrap())
+        let error = Store::open(Binding::at(&database, &archive, GENERATION).unwrap())
             .err()
             .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(std::fs::read(&first.path).unwrap(), bytes);
         drop(first);
-        assert!(Store::open(Binding::at(&database, &archive).unwrap()).is_ok());
+        assert!(Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).is_ok());
     }
 
     #[test]
     fn checkpoint_reads_reject_malformed_and_oversized_records() {
         let (_temp, database, archive) = fixture();
-        let store = Store::open(Binding::at(&database, &archive).unwrap()).unwrap();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
         for bytes in [
             b"{partial".to_vec(),
             vec![b' '; MAX_CHECKPOINT_BYTES as usize + 1],
@@ -641,7 +832,7 @@ mod tests {
     #[test]
     fn unpublished_progress_replays_the_last_atomic_checkpoint() {
         let (_temp, database, archive) = fixture();
-        let store = Store::open(Binding::at(&database, &archive).unwrap()).unwrap();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
         let mut cursor = debt(Instant::now());
         store.save(&cursor).unwrap();
         // Simulate a crash between advancing the in-memory scan and publishing
@@ -649,7 +840,7 @@ mod tests {
         cursor.tail_after = Some(100_000);
         cursor.retries.clear();
         drop(store);
-        let restarted = Store::open(Binding::at(&database, &archive).unwrap()).unwrap();
+        let restarted = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
         let saved = restarted.load().unwrap().unwrap();
         assert_eq!(saved.tail_after, Some(90_000));
         assert_eq!(
@@ -671,7 +862,7 @@ mod tests {
             cursor.backfill_ceiling = Some(920);
             cursor.next_lane_is_retry = true;
             cursor.defer_transient(901, Instant::now());
-            let store = Store::open(Binding::capture(pool, config).unwrap()).unwrap();
+            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
             store.save(&cursor).unwrap();
             drop(store);
 
@@ -724,7 +915,7 @@ mod tests {
     #[test]
     fn stopped_worker_does_not_create_a_progress_sidecar() {
         super::super::tests::retention_fixture(1, |cx, pool, config| {
-            let path = Binding::capture(pool, config).unwrap().path().unwrap();
+            let path = Binding::capture(cx, pool, config).unwrap().path().unwrap();
             let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
             let report = super::super::reconcile_message_batch(
                 cx,
@@ -746,7 +937,7 @@ mod tests {
     #[test]
     fn checkpoint_never_follows_symlinked_or_hardlinked_sidecars() {
         let (_temp, database, archive) = fixture();
-        let binding = Binding::at(&database, &archive).unwrap();
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
         let path = binding.path().unwrap();
         let evidence = archive.join("preserved-evidence");
         std::fs::write(&evidence, b"do not replace").unwrap();
@@ -755,7 +946,7 @@ mod tests {
         assert_eq!(std::fs::read(&evidence).unwrap(), b"do not replace");
         std::fs::rename(&path, path.with_extension("held-symlink")).unwrap();
         std::fs::hard_link(&evidence, &path).unwrap();
-        assert!(Store::open(Binding::at(&database, &archive).unwrap()).is_err());
+        assert!(Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).is_err());
         assert_eq!(std::fs::read(&evidence).unwrap(), b"do not replace");
     }
 }
