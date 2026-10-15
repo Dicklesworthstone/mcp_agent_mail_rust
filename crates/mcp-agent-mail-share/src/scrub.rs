@@ -612,7 +612,7 @@ pub fn scrub_snapshot_redacting(
             // viewer data. Full bundle rebuilding already omits these fields;
             // the public scrub API must also remove them when handed a raw
             // snapshot directly. Remove them in this same transaction.
-            clear_private_runtime_state(&conn)?;
+            clear_private_runtime_state(&conn, cfg.drop_recipient_metadata)?;
         }
 
         // Generate a stable salt for pseudonymization reproducibility (matches Python).
@@ -653,12 +653,25 @@ pub fn scrub_snapshot_redacting(
 /// Remove operational payloads when directly scrubbing a raw sharing snapshot.
 /// The caller owns the transaction. Archive scrubbing preserves these values;
 /// this does not change the separate bundle rebuild's known-table projection.
-fn clear_private_runtime_state(conn: &Conn) -> Result<(), ShareError> {
+fn clear_private_runtime_state(
+    conn: &Conn,
+    drop_recipient_metadata: bool,
+) -> Result<(), ShareError> {
+    // Shared receipts are created lazily on reader activity. Even a receipt
+    // whose timestamps are NULL discloses which agent accessed the mailbox,
+    // so sharing presets must remove the rows, not merely clear read/ack times.
+    // Standard retains the shared TO/CC address; strict removes that authority
+    // too. Keep events and receipts before delivery parents for FK safety.
     for table in [
         "idempotency_keys",
         "proof_gate_consumed_nonces",
         "inbox_delivery_events",
+        "project_mailbox_receipts",
+        "project_mailbox_deliveries",
     ] {
+        if table == "project_mailbox_deliveries" && !drop_recipient_metadata {
+            continue;
+        }
         if !private_export_table_exists(conn, table)? {
             continue;
         }
@@ -1445,6 +1458,153 @@ mod tests {
         .unwrap();
         conn.execute_raw("INSERT INTO inbox_delivery_events VALUES (1, 1, 1, 1, 'bcc', 1)")
             .unwrap();
+    }
+
+    fn seed_shared_mailbox_scrub_state(db: &Path) {
+        seed_private_runtime_state(db);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        for sql in [
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'SharedReader')",
+            "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
+            "CREATE TABLE project_mailbox_receipts (message_id INTEGER NOT NULL REFERENCES project_mailbox_deliveries(message_id), agent_id INTEGER NOT NULL REFERENCES agents(id), read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+            "INSERT INTO project_mailbox_deliveries VALUES (1, 1, 'cc', 100)",
+            "INSERT INTO project_mailbox_receipts VALUES (1, 1, 17, 19), (1, 2, NULL, NULL)",
+            "UPDATE message_recipients SET read_ts = 'read-before', ack_ts = 'ack-before'",
+            "UPDATE messages SET ack_required = 1, recipients_json = '{\"to\":[\"TestAgent\"],\"cc\":[\"project:test\"],\"bcc\":[]}' WHERE id = 1",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_mailbox_scrub_preserves_routing_but_not_reader_activity() {
+        for preset in [ScrubPreset::Standard, ScrubPreset::Strict, ScrubPreset::Archive] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_shared_mailbox_scrub_state(&db);
+            let archive = preset == ScrubPreset::Archive;
+            let strict = preset == ScrubPreset::Strict;
+            // Repeat to prove that clearing lazy receipts is idempotent and
+            // cannot re-create them from the preserved delivery or roster.
+            for _ in 0..2 {
+                scrub_snapshot(&db, preset).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                for (table, expected) in [
+                    ("message_recipients", i64::from(!strict)),
+                    ("project_mailbox_deliveries", i64::from(!strict)),
+                    ("project_mailbox_receipts", if archive { 2 } else { 0 }),
+                    ("inbox_delivery_events", i64::from(archive)),
+                ] {
+                    assert_eq!(
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),
+                        expected,
+                        "preset={preset:?}, table={table}"
+                    );
+                }
+                let routing: Value = serde_json::from_str(
+                    &message_text(&conn, "recipients_json"),
+                ).unwrap();
+                let expected = if strict {
+                    serde_json::json!({"to": [], "cc": [], "bcc": []})
+                } else {
+                    serde_json::json!({"to": ["TestAgent"], "cc": ["project:test"], "bcc": []})
+                };
+                assert_eq!(routing, expected);
+                if !strict {
+                    let rows = conn.query_sync(
+                        "SELECT kind, delivered_ts FROM project_mailbox_deliveries WHERE message_id = 1", &[],
+                    ).unwrap();
+                    assert_eq!(rows[0].get_named::<String>("kind").unwrap(), "cc");
+                    assert_eq!(rows[0].get_named::<i64>("delivered_ts").unwrap(), 100);
+                    let rows = conn.query_sync(
+                        "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1", &[],
+                    ).unwrap();
+                    assert_eq!(rows[0].get_named::<Option<String>>("read_ts").unwrap().as_deref(),
+                        if archive { Some("read-before") } else { None });
+                    assert_eq!(rows[0].get_named::<Option<String>>("ack_ts").unwrap().as_deref(),
+                        if archive { Some("ack-before") } else { None });
+                }
+                if archive {
+                    let rows = conn.query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts ORDER BY agent_id", &[],
+                    ).unwrap();
+                    assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 1);
+                    assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 17);
+                    assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 19);
+                    assert_eq!(rows[1].get_named::<i64>("agent_id").unwrap(), 2);
+                    assert_eq!(rows[1].get_named::<Option<i64>>("read_ts").unwrap(), None);
+                    assert_eq!(rows[1].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                    assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+                }
+                assert!(conn.query_sync("PRAGMA foreign_key_check", &[]).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_mailbox_cleanup_refusal_rolls_back_all_scrub_mutations() {
+        for (preset, table) in [
+            (ScrubPreset::Standard, "project_mailbox_receipts"),
+            (ScrubPreset::Strict, "project_mailbox_receipts"),
+            (ScrubPreset::Strict, "project_mailbox_deliveries"),
+        ] {
+            for ignored_delete in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                seed_shared_mailbox_scrub_state(&db);
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                if ignored_delete {
+                    conn.execute_raw(&format!(
+                        "CREATE TRIGGER ignore_shared_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(IGNORE); END",
+                    )).unwrap();
+                } else {
+                    conn.execute_raw(&format!("ALTER TABLE {table} RENAME TO private_original"))
+                        .unwrap();
+                    conn.execute_raw(&format!("CREATE VIEW {table} AS SELECT * FROM private_original"))
+                        .unwrap();
+                }
+                drop(conn);
+                let error = scrub_snapshot(&db, preset).unwrap_err();
+                assert!(matches!(error, ShareError::Validation { .. }));
+                assert!(error.to_string().contains(if ignored_delete {
+                    "was not cleared"
+                } else {
+                    "must be a table"
+                }));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                for (table, expected) in [
+                    ("message_recipients", 1),
+                    ("project_mailbox_deliveries", 1),
+                    ("project_mailbox_receipts", 2),
+                    ("idempotency_keys", 2),
+                    ("proof_gate_consumed_nonces", 1),
+                    ("inbox_delivery_events", 1),
+                ] {
+                    assert_eq!(
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),
+                        expected,
+                        "rollback preset={preset:?}, table={table}"
+                    );
+                }
+                assert_eq!(message_text(&conn, "body_md"), "Hello world");
+                assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+                assert_eq!(serde_json::from_str::<Value>(&message_text(&conn, "recipients_json")).unwrap(),
+                    serde_json::json!({"to": ["TestAgent"], "cc": ["project:test"], "bcc": []}));
+                assert_eq!(conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                    .unwrap()[0].get_named::<i64>("ack_required").unwrap(), 1);
+                assert_eq!(conn.query_sync("SELECT human_key FROM projects WHERE id = 1", &[])
+                    .unwrap()[0].get_named::<String>("human_key").unwrap(), "/test");
+                let rows = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[]).unwrap();
+                assert_eq!(rows[0].get_named::<String>("read_ts").unwrap(), "read-before");
+                assert_eq!(rows[0].get_named::<String>("ack_ts").unwrap(), "ack-before");
+                let rows = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE agent_id = 1", &[],
+                ).unwrap();
+                assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 17);
+                assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 19);
+            }
+        }
     }
 
     #[test]
