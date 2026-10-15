@@ -23,6 +23,8 @@
 //! Successful, uncontended catch-up batches run in finite bursts before the
 //! one-second backlog pause; each batch retains its original limits and
 //! checkpoint. Neither accelerates the configured reporting/pruning cadence.
+//! Each repair lane keeps its own deadline: a retry or backlog in one lane
+//! must not turn healthy peer lanes into once-per-second database scans.
 //! Repair never sends
 //! another message or changes read/ack state. Its per-pass result is not a
 //! whole-mailbox or attachment-durability certificate.
@@ -45,6 +47,7 @@
 mod agent_catch_up;
 mod catch_up;
 mod reservation_catch_up;
+mod schedule;
 mod supervisor;
 
 use asupersync::Cx;
@@ -111,7 +114,7 @@ fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
 /// queued when the process was killed).
 const REPAIR_CATCH_UP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Sleep before the next worker pass. A pass that exhausted its repair budget
+/// Delay before this lane's next pass. A pass that exhausted its repair budget
 /// left known work behind, so the next one follows after
 /// [`REPAIR_CATCH_UP_POLL_INTERVAL`] instead of the steady-state poll: at 4
 /// repairs per pass, a once-per-minute cadence healed ~20 messages in five
@@ -228,6 +231,11 @@ fn retention_loop(
     let reservation_repair_enabled = reservation_reconcile::enabled(config);
     let repair_enabled = message_repair_enabled || reservation_repair_enabled;
     let poll_interval = maintenance_poll_interval(interval, repair_enabled);
+    let mut repair_schedule = schedule::RepairSchedule::new(
+        poll_interval,
+        message_repair_enabled,
+        reservation_repair_enabled,
+    );
     let startup_delay = poll_interval.min(Duration::from_secs(10));
     let needs_db = message_retention_needs_db(config) || repair_enabled;
     let mut pool: Option<DbPool> = None;
@@ -280,12 +288,20 @@ fn retention_loop(
             }
         }
 
-        let mut repair_backlog = false;
-        if message_repair_enabled {
-            let mut retire_pool = false;
-            if let Some(live_pool) = pool.as_ref() {
+        // A busy lane wakes this thread, not every other lane. Check its
+        // deadline before borrowing the pool, creating a Cx or reading SQL.
+        // Missing pools and errors get the normal retry delay, without a
+        // fabricated successful storage report or a discarded repair cursor.
+        if let Some(Err(error)) = repair_schedule.run_if_due(
+            schedule::Lane::Messages,
+            Instant::now,
+            || {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return None;
+                }
+                let live_pool = pool.as_ref()?;
                 let cx = worker_cx();
-                match catch_up::run(
+                Some(catch_up::run(
                     &cx,
                     live_pool,
                     config,
@@ -311,22 +327,30 @@ fn retention_loop(
                             );
                         }
                     },
-                ) {
-                    Ok(backlog) => repair_backlog = backlog,
-                    Err(error) => {
-                        warn!(
-                            target: "maintenance",
-                            event = "message_archive_reconcile_source_unavailable",
-                            error = %error,
-                            "message archive reconciliation refused; preserving source and retrying next cycle"
-                        );
-                        retire_pool = true;
-                    }
+                ))
+            },
+        ) {
+            warn!(
+                target: "maintenance",
+                event = "message_archive_reconcile_source_unavailable",
+                error = %error,
+                "message archive reconciliation refused; preserving source and retrying next cycle"
+            );
+            // A verified recovery may have replaced the live generation.
+            // Reacquire through ordinary pool admission on the next tick.
+            pool = None;
+        }
+
+        if let Some(Err(error)) = repair_schedule.run_if_due(
+            schedule::Lane::Agents,
+            Instant::now,
+            || {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return None;
                 }
-            }
-            if !retire_pool && let Some(live_pool) = pool.as_ref() {
+                let live_pool = pool.as_ref()?;
                 let cx = worker_cx();
-                match agent_catch_up::run(
+                Some(agent_catch_up::run(
                     &cx,
                     live_pool,
                     config,
@@ -347,77 +371,74 @@ fn retention_loop(
                             );
                         }
                     },
-                ) {
-                    Ok(backlog) => repair_backlog |= backlog,
-                    Err(error) => {
-                        warn!(
-                            target: "maintenance",
-                            event = "agent_archive_reconcile_source_unavailable",
-                            error = %error,
-                            "agent profile reconciliation refused; retrying next cycle"
-                        );
-                        retire_pool = true;
-                    }
-                }
-            }
-            if retire_pool {
-                // A verified recovery may have replaced the live generation.
-                // Reacquire through ordinary pool admission on the next tick.
-                pool = None;
-            }
+                ))
+            },
+        ) {
+            warn!(
+                target: "maintenance",
+                event = "agent_archive_reconcile_source_unavailable",
+                error = %error,
+                "agent profile reconciliation refused; retrying next cycle"
+            );
+            pool = None;
         }
 
-        if reservation_repair_enabled && let Some(live_pool) = pool.as_ref() {
-            let cx = worker_cx();
-            match reservation_catch_up::run(
-                &cx,
-                live_pool,
-                config,
-                &mut reservation_cursor,
-                &SHUTDOWN,
-                |report| {
-                    if report.scanned > 0 || report.interrupted || report.retry_len > 0 {
-                        info!(target: "maintenance", event = "reservation_release_archive_reconcile",
-                            scanned = report.scanned, unchanged = report.unchanged,
-                            attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
-                            deferred_transient = report.deferred_transient, retry_len = report.retry_len,
-                            interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
-                            "bounded terminal reservation release reconciliation pass completed");
-                    }
-                    // `am doctor health` reads this to tell drift that is
-                    // converging from a reconciler that stopped repairing it.
-                    if !report.interrupted {
-                        let pass_us = now_micros();
-                        if report.repaired > 0 {
-                            reservation_last_repair_us = Some(pass_us);
-                        }
-                        let progress = reservation_reconcile::ReservationReconcileProgress {
-                            pid: std::process::id(),
-                            pass_us,
-                            last_repair_us: reservation_last_repair_us,
-                        };
-                        match reservation_reconcile::record_progress(
-                            &config.storage_root,
-                            &progress,
-                        ) {
-                            Ok(()) => reservation_progress_warned = false,
-                            Err(error) if !reservation_progress_warned => {
-                                reservation_progress_warned = true;
-                                warn!(target: "maintenance", event = "reservation_reconcile_progress_unrecorded",
-                                    error = %error, "could not record reservation reconciliation progress for doctor health");
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                },
-            ) {
-                Ok(backlog) => repair_backlog |= backlog,
-                Err(error) => {
-                    warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
-                        error = %error, "reservation release reconciliation refused; retrying next cycle");
-                    pool = None;
+        if let Some(Err(error)) = repair_schedule.run_if_due(
+            schedule::Lane::Reservations,
+            Instant::now,
+            || {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return None;
                 }
-            }
+                let live_pool = pool.as_ref()?;
+                let cx = worker_cx();
+                Some(reservation_catch_up::run(
+                    &cx,
+                    live_pool,
+                    config,
+                    &mut reservation_cursor,
+                    &SHUTDOWN,
+                    |report| {
+                        if report.scanned > 0 || report.interrupted || report.retry_len > 0 {
+                            info!(target: "maintenance", event = "reservation_release_archive_reconcile",
+                                scanned = report.scanned, unchanged = report.unchanged,
+                                attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
+                                deferred_transient = report.deferred_transient, retry_len = report.retry_len,
+                                interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
+                                "bounded terminal reservation release reconciliation pass completed");
+                        }
+                        // `am doctor health` reads this to tell drift that is
+                        // converging from a reconciler that stopped repairing it.
+                        if !report.interrupted {
+                            let pass_us = now_micros();
+                            if report.repaired > 0 {
+                                reservation_last_repair_us = Some(pass_us);
+                            }
+                            let progress = reservation_reconcile::ReservationReconcileProgress {
+                                pid: std::process::id(),
+                                pass_us,
+                                last_repair_us: reservation_last_repair_us,
+                            };
+                            match reservation_reconcile::record_progress(
+                                &config.storage_root,
+                                &progress,
+                            ) {
+                                Ok(()) => reservation_progress_warned = false,
+                                Err(error) if !reservation_progress_warned => {
+                                    reservation_progress_warned = true;
+                                    warn!(target: "maintenance", event = "reservation_reconcile_progress_unrecorded",
+                                        error = %error, "could not record reservation reconciliation progress for doctor health");
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    },
+                ))
+            },
+        ) {
+            warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
+                error = %error, "reservation release reconciliation refused; retrying next cycle");
+            pool = None;
         }
 
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -457,7 +478,7 @@ fn retention_loop(
             }
         }
 
-        if sleep_with_shutdown(next_poll_interval(poll_interval, repair_backlog)) {
+        if sleep_with_shutdown(repair_schedule.next_delay(Instant::now())) {
             return;
         }
     }
