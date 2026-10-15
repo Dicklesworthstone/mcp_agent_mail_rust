@@ -272,14 +272,14 @@ pub(super) fn run(
     }
     // Consuming a healthy page is discovery progress, not proof that the
     // mailbox is settled. A lost release can lie behind thousands of already
-    // archived or still-active rows. Continue this finite round at catch-up
-    // cadence instead of sleeping a minute after every unchanged page.
-    // Conflicts alone do not accelerate scanning, and reaching the captured
-    // ceiling (or an empty final page) returns to the normal idle cadence.
-    if report.deferred == 0
-        && report.scanned > 0
-        && (cursor.priority.ceiling.is_some() || cursor.history.ceiling.is_some())
-    {
+    // archived or still-active rows. Continue this finite history round at
+    // catch-up cadence instead of sleeping a minute after each unchanged page.
+    // History covers every reservation. Priority can finish on a different
+    // pass; waiting for both cursors to finish together can keep restarting
+    // one round while the other ends, hot-scanning a fully healthy mailbox.
+    // Conflicts do not accelerate discovery, and history completion returns
+    // to idle unless actual publication limits or retry debt require more work.
+    if report.deferred == 0 && report.scanned > 0 && cursor.history.ceiling.is_some() {
         report.budget_exhausted = true;
     }
     Ok(finish(report, &cursor.retries))
@@ -414,6 +414,43 @@ mod tests {
                     .unwrap(),
                 5_000_000,
             );
+        });
+    }
+
+    #[test]
+    fn completed_history_does_not_wait_for_a_separate_priority_round() {
+        super::super::tests::fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let future = mcp_agent_mail_db::now_micros() + 86_400_000_000;
+            conn.execute_raw(&format!(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(433, 71, 81, 'priority.rs', 1, 'released', 1000000, {future}, 5000000), (434, 71, 81, 'active.rs', 1, 'active', 1000000, {future}, NULL)"
+            )).unwrap();
+            drop(conn);
+            let source = read_source(cx, pool, 433).unwrap().unwrap();
+            assert!(publish_release(
+                cx,
+                pool,
+                config,
+                &source,
+                ReleaseTargets::WithOwnedAliases,
+                &mut false,
+            )
+            .unwrap());
+            // Both cursors captured the same upper bound, but priority has
+            // one already-archived row to revisit while history finishes.
+            let mut cursor = ReservationReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                priority: ScanPosition { after: 432, ceiling: Some(434) },
+                history: ScanPosition { after: 433, ceiling: Some(434) },
+                ..Default::default()
+            };
+            let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            assert_eq!((report.scanned, report.unchanged, report.repaired), (2, 2, 0));
+            assert_eq!((report.attempted, report.deferred, report.retry_len), (0, 0, 0));
+            assert_eq!(cursor.history.ceiling, None);
+            assert_eq!(cursor.priority.ceiling, Some(434));
+            assert!(!report.budget_exhausted, "finished history must leave fast catch-up");
+            assert!(!config.storage_root.join("projects/project/file_reservations/id-434-gaabb.json").exists());
         });
     }
 
