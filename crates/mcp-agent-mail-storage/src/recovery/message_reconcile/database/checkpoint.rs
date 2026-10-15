@@ -30,6 +30,8 @@ use super::{
 // be ignored rather than attached to the restored mailbox's reused row IDs.
 const SCHEMA_VERSION: u32 = 2;
 const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024;
+const CHECKPOINT_OWNED: &str =
+    "message reconciliation deferred: checkpoint is owned by another worker";
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -86,21 +88,68 @@ impl Binding {
     }
 
     fn path(&self) -> io::Result<PathBuf> {
-        let parent = self
-            .database
-            .parent()
-            .ok_or_else(|| invalid("checkpoint source has no parent directory"))?;
-        let mut digest = Sha256::new();
-        digest.update(self.database.as_os_str().as_encoded_bytes());
-        digest.update([0]);
-        digest.update(self.archive.as_os_str().as_encoded_bytes());
-        // Keep maintenance hints beside SQLite, not inside an archive Git tree.
-        // Different archive roots for the same database cannot share progress.
-        Ok(parent.join(format!(
-            ".am-message-reconcile-{}.json",
-            hex::encode(digest.finalize())
-        )))
+        checkpoint_path(&self.database, &self.archive)
     }
+}
+
+/// The namespace depends only on the canonical paths, not a logical generation.
+/// Computing it is not source authorization and must not query the database.
+fn checkpoint_path(database: &Path, archive: &Path) -> io::Result<PathBuf> {
+    let parent = database
+        .parent()
+        .ok_or_else(|| invalid("checkpoint source has no parent directory"))?;
+    let mut digest = Sha256::new();
+    digest.update(database.as_os_str().as_encoded_bytes());
+    digest.update([0]);
+    digest.update(archive.as_os_str().as_encoded_bytes());
+    // Keep maintenance hints beside SQLite, not inside an archive Git tree.
+    // Different archive roots for the same database cannot share progress.
+    Ok(parent.join(format!(
+        ".am-message-reconcile-{}.json",
+        hex::encode(digest.finalize())
+    )))
+}
+
+/// Best-effort negative admission only. Never create/truncate a sidecar here.
+/// A successful probe releases its descriptor before source work: the original
+/// Store::open still acquires and validates the authoritative lock afterwards.
+fn probe_existing_checkpoint_lock(database: &Path, archive: &Path) -> io::Result<()> {
+    let database = std::fs::canonicalize(database)?;
+    let archive = std::fs::canonicalize(archive)?;
+    let path = checkpoint_path(&database, &archive)?;
+    check_sidecar(&path)?;
+    let lock_path = path.with_extension("json.lock");
+    check_sidecar(&lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(false).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let lock = options.open(&lock_path)?;
+    if !lock.metadata()?.is_file() {
+        return Err(invalid("checkpoint lock is not a regular file"));
+    }
+    FileExt::try_lock_exclusive(&lock)
+}
+
+/// GH#354: refuse known checkpoint contention BEFORE pool acquisition and the
+/// query-only/generation probes. Missing/unsafe/unavailable metadata is not a
+/// positive verdict; the existing source authorization and Store checks still
+/// run and own all errors/fallback decisions. A racing new owner is checked
+/// again by Store::open; this hint never grants publication authority.
+fn with_available_checkpoint<T>(
+    database: &Path,
+    archive: &Path,
+    source: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if probe_existing_checkpoint_lock(database, archive)
+        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+    {
+        return Err(CHECKPOINT_OWNED.into());
+    }
+    source()
 }
 
 /// The caller holds nonblocking database-promotion admission. Query-only
@@ -505,7 +554,11 @@ pub(super) fn run(
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
         validate_pool_binding(pool, config)?;
-        let generation = source_generation(cx, pool)?;
+        let generation = with_available_checkpoint(
+            Path::new(pool.sqlite_path()),
+            &config.storage_root,
+            || source_generation(cx, pool),
+        )?;
         scope = pool.sqlite_identity_key();
         if cursor.source_identity != scope {
             *cursor = ReconcileCursor {
@@ -573,6 +626,197 @@ mod tests {
     use std::collections::VecDeque;
 
     const GENERATION: &str = "aabbccdd";
+
+    #[test]
+    fn gh354_occupied_checkpoint_skips_source_probes_and_preserves_bytes() {
+        let (_temp, database, archive) = fixture();
+        let owner = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        owner.save(&debt(Instant::now())).unwrap();
+        let checkpoint = std::fs::read(&owner.path).unwrap();
+        let lock_bytes = std::fs::read(&owner.lock_path).unwrap();
+        let mut probes = 0;
+        for _ in 0..60 {
+            let result = with_available_checkpoint(&database, &archive, || {
+                probes += 1;
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err(), CHECKPOINT_OWNED);
+        }
+        assert_eq!(probes, 0, "a refused checkpoint must not acquire/query the pool");
+        assert_eq!(std::fs::read(&owner.path).unwrap(), checkpoint);
+        assert_eq!(std::fs::read(&owner.lock_path).unwrap(), lock_bytes);
+        drop(owner);
+        with_available_checkpoint(&database, &archive, || {
+            probes += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(probes, 1, "release must admit the next source probe");
+        let reopened = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        assert_eq!(std::fs::read(&reopened.path).unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn gh354_missing_checkpoint_probe_never_creates_a_sidecar() {
+        let (_temp, database, archive) = fixture();
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
+        let path = binding.path().unwrap();
+        let lock_path = path.with_extension("json.lock");
+        let result = with_available_checkpoint::<()>(&database, &archive, || {
+            Err("query-only source".into())
+        });
+        assert_eq!(result.unwrap_err(), "query-only source");
+        assert!(!path.exists());
+        assert!(!lock_path.exists(), "refusal must not create even a lock file");
+        with_available_checkpoint(&database, &archive, || Ok(())).unwrap();
+        assert!(!path.exists());
+        assert!(!lock_path.exists(), "the hint never creates publication authority");
+        let store = Store::open(binding).unwrap();
+        assert!(store.lock_path.exists(), "only authorized Store::open creates the lock");
+        assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn gh354_successful_probe_does_not_bypass_a_racing_authoritative_owner() {
+        let (_temp, database, archive) = fixture();
+        drop(Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap());
+        let mut competitor = None;
+        let generation = with_available_checkpoint(&database, &archive, || {
+            // The probe must have released its descriptor. Source authorization
+            // may take time; another worker can win the real checkpoint now.
+            competitor = Some(
+                Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap(),
+            );
+            Ok(GENERATION)
+        })
+        .unwrap();
+        let refused = Store::open(Binding::at(&database, &archive, generation).unwrap())
+            .err()
+            .expect("the original authoritative acquisition must still run");
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        assert!(!competitor.as_ref().unwrap().path.exists());
+        drop(competitor);
+        assert!(Store::open(Binding::at(&database, &archive, generation).unwrap()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh354_unsafe_probe_never_bypasses_source_or_store_validation() {
+        for hardlink in [false, true] {
+            let (_temp, database, archive) = fixture();
+            let path = Binding::at(&database, &archive, GENERATION).unwrap().path().unwrap();
+            let lock_path = path.with_extension("json.lock");
+            let evidence = archive.join("preserved-evidence");
+            std::fs::write(&evidence, b"do not replace").unwrap();
+            if hardlink {
+                std::fs::hard_link(&evidence, &lock_path).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&evidence, &lock_path).unwrap();
+            }
+            let mut probes = 0;
+            let result = with_available_checkpoint::<()>(&database, &archive, || {
+                probes += 1;
+                Err("source authorization refused".into())
+            });
+            assert_eq!(result.unwrap_err(), "source authorization refused");
+            assert_eq!(probes, 1, "unavailable hints do not authorize source access");
+            // A successful source check still cannot legitimize an unsafe lock.
+            with_available_checkpoint(&database, &archive, || Ok(())).unwrap();
+            assert!(Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).is_err());
+            assert_eq!(std::fs::read(&evidence).unwrap(), b"do not replace");
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn gh354_probe_uses_the_canonical_source_and_archive_namespace() {
+        let (_temp, database, archive) = fixture();
+        let owner = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        let alias = database.parent().unwrap().join(".").join("mail.sqlite3");
+        let result = with_available_checkpoint::<()>(&alias, &archive.join("."), || {
+            panic!("an alias must not bypass the occupied checkpoint")
+        });
+        assert_eq!(result.unwrap_err(), CHECKPOINT_OWNED);
+        let other_archive = archive.with_file_name("other-archive");
+        std::fs::create_dir(&other_archive).unwrap();
+        with_available_checkpoint(&database, &other_archive, || Ok(())).unwrap();
+        owner.check_lock().unwrap();
+    }
+
+    #[test]
+    fn gh354_real_query_only_source_cannot_create_or_modify_checkpoint_files() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            let path = Binding::capture(cx, pool, config).unwrap().path().unwrap();
+            let lock_path = path.with_extension("json.lock");
+            let readonly = DbPool::new_query_only(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: config.database_url.clone(),
+                storage_root: Some(config.storage_root.clone()),
+                min_connections: 1,
+                max_connections: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            for existing in [false, true] {
+                if existing {
+                    let owner = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+                    owner.save(&debt(Instant::now())).unwrap();
+                }
+                let checkpoint = std::fs::read(&path).ok();
+                let lock_bytes = std::fs::read(&lock_path).ok();
+                let mut cursor = debt(Instant::now());
+                let before = format!("{cursor:?}");
+                let error = run(cx, &readonly, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap_err();
+                assert!(error.contains("query-only snapshots"), "{error}");
+                assert_eq!(format!("{cursor:?}"), before);
+                assert_eq!(std::fs::read(&path).ok(), checkpoint);
+                assert_eq!(std::fs::read(&lock_path).ok(), lock_bytes);
+                if !existing {
+                    assert!(!path.exists());
+                    assert!(!lock_path.exists());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn gh354_real_contention_refuses_before_pool_wait_then_recovers_committed_mail() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(930);
+            cursor.backfill_ceiling = Some(920);
+            cursor.next_lane_is_retry = true;
+            cursor.defer_transient(901, Instant::now());
+            let owner = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            owner.save(&cursor).unwrap();
+            let checkpoint = std::fs::read(&owner.path).unwrap();
+            let before = format!("{cursor:?}");
+            let stop = AtomicBool::new(false);
+
+            // This fixture has ONE connection. The refusal must not wait for
+            // the held borrower or turn into an acquire timeout/source failure.
+            let borrower = outcome(block_on(pool.acquire(cx))).unwrap();
+            let refused = run(cx, pool, config, &mut cursor, &stop);
+            drop(borrower);
+            assert_eq!(refused.unwrap_err(), CHECKPOINT_OWNED);
+            for _ in 0..60 {
+                assert_eq!(run(cx, pool, config, &mut cursor, &stop).unwrap_err(), CHECKPOINT_OWNED);
+            }
+            assert_eq!(format!("{cursor:?}"), before, "refusal cannot reset retry debt");
+            assert_eq!(std::fs::read(&owner.path).unwrap(), checkpoint);
+            drop(owner);
+
+            let report = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert!(cursor.retries.is_empty());
+            // Uses real committed Git blobs and verifies the source row count
+            // and both recipients' read/ACK values, not just created files.
+            assert_message_committed(cx, pool, config, 901);
+        });
+    }
 
     #[test]
     fn same_live_cursor_rescans_after_between_pass_logical_generation_change() {
