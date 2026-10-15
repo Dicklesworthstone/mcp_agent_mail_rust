@@ -5,6 +5,8 @@
 //! can change before the next attempt. Every scheduled ID is read afresh by
 //! the ordinary source and publication checks in the parent module.
 
+mod checkpoint;
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -76,6 +78,9 @@ struct Entry {
 #[derive(Debug, Default)]
 pub(super) struct RetryQueue {
     entries: VecDeque<Entry>,
+    // The roster watermark and retry debt are one atomic scheduling snapshot.
+    // Keep its lifetime lock and restore-once state with the private queue.
+    persistence: checkpoint::Persistence,
 }
 
 impl RetryQueue {
