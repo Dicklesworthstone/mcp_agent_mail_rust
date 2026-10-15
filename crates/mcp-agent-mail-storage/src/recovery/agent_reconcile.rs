@@ -6,10 +6,14 @@
 //! maintenance pass repairs those profiles without changing mailbox rows or
 //! relying on another registration, message, or client read.
 
+mod retry;
+
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
@@ -19,6 +23,7 @@ use mcp_agent_mail_db::{DbConn, DbError, DbPool, corruption_circuit_breaker};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use self::retry::{Candidate, Failure, RetryQueue};
 use crate::{ProjectArchive, StorageError};
 
 const IDS_PER_BATCH: i64 = 32;
@@ -27,12 +32,24 @@ const MAX_PROFILE_BYTES: usize = 128 * 1024;
 
 /// A finite round prevents continuously registered identities from starving
 /// old lifecycle changes. Restarting or changing the live pool starts a new
-/// round; cursors never authorize a write or a deletion.
+/// round; cursors never authorize a write or a deletion. Transient failures
+/// retain only IDs in a bounded retry lane instead of waiting for a full round.
 #[derive(Debug, Default)]
 pub struct AgentReconcileCursor {
     source_identity: String,
     after: i64,
     ceiling: Option<i64>,
+    retries: RetryQueue,
+    next_lane_is_retry: bool,
+}
+
+impl AgentReconcileCursor {
+    fn advance(&mut self, id: i64) {
+        self.after = id;
+        if self.ceiling == Some(id) {
+            self.ceiling = None;
+        }
+    }
 }
 
 /// Counts describe one bounded pass, not whole-mailbox durability.
@@ -42,7 +59,11 @@ pub struct AgentReconcileReport {
     pub unchanged: usize,
     pub repaired: usize,
     pub deferred: usize,
+    pub deferred_transient: usize,
+    pub retry_len: usize,
     pub interrupted: bool,
+    /// An execution limit or an unfinished, productive finite scan needs a
+    /// bounded follow-up. This is not a count of missing lifecycle artifacts.
     pub budget_exhausted: bool,
 }
 
@@ -95,7 +116,7 @@ fn select_ids(
     cx: &Cx,
     pool: &DbPool,
     cursor: &mut AgentReconcileCursor,
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<Candidate>, String> {
     let identity = pool.sqlite_identity_key();
     if cursor.source_identity != identity {
         *cursor = AgentReconcileCursor {
@@ -128,22 +149,28 @@ fn select_ids(
         );
         cursor.after = 0;
     }
+    // Snapshot the ready lane once. A first deferral in this batch cannot be
+    // attempted again until the next call, and selection never removes debt.
+    let retries = cursor.retries.ready_ids(Instant::now());
+    let scan_limit = IDS_PER_BATCH - i64::try_from(retries.len()).expect("bounded retry count");
     let rows = conn
         .query_sync(
             "SELECT id FROM agents WHERE id > ? AND id <= ? ORDER BY id ASC LIMIT ?",
             &[
                 cursor.after.into(),
                 cursor.ceiling.unwrap_or(0).into(),
-                IDS_PER_BATCH.into(),
+                scan_limit.into(),
             ],
         )
         .map_err(source_error)?;
     if rows.is_empty() {
         cursor.ceiling = None;
     }
-    rows.into_iter()
+    let scan = rows
+        .into_iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(retry::interleave(scan, retries, cursor.next_lane_is_retry))
 }
 
 fn timestamp(value: i64) -> Result<String, String> {
@@ -153,12 +180,19 @@ fn timestamp(value: i64) -> Result<String, String> {
     Ok(mcp_agent_mail_db::micros_to_iso(value))
 }
 
-fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    read_source_connection(&conn, id)
+fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<AgentSource, Failure> {
+    let conn = outcome(block_on(pool.acquire(cx))).map_err(Failure::transient)?;
+    let result = read_source_connection(&conn, id);
+    if result.as_ref().is_err_and(|error| error.transient) {
+        // A failed pager must not be returned to the worker's single idle
+        // slot. Conflicting metadata from a successful query is not such a
+        // failure and must not cause engine churn.
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed agent archive source read");
+    }
+    result
 }
 
-fn read_source_connection(conn: &DbConn, id: i64) -> Result<AgentSource, String> {
+fn read_source_connection(conn: &DbConn, id: i64) -> Result<AgentSource, Failure> {
     // One statement observes identity, lifecycle ledger and project together.
     // Do not select registration_token, even temporarily. The raw text bound
     // precedes materialization; serialization has its own bound below.
@@ -177,7 +211,7 @@ fn read_source_connection(conn: &DbConn, id: i64) -> Result<AgentSource, String>
                AND NOT EXISTS (SELECT 1 FROM agents other WHERE other.project_id = a.project_id \
                    AND other.id != a.id AND other.name = a.name COLLATE NOCASE)",
         &[id.into(), (MAX_PROFILE_BYTES as i64).into()],
-    ).map_err(source_error)?;
+    ).map_err(Failure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "agent missing, oversized, or lacking unambiguous project/name authority".into(),
@@ -440,8 +474,8 @@ fn reconcile_agent(
     config: &Config,
     original: &AgentSource,
     stop: &AtomicBool,
-) -> Result<bool, String> {
-    checkpoint(cx, stop).map_err(|error| error.to_string())?;
+) -> Result<bool, Failure> {
+    checkpoint(cx, stop)?;
     // Checkout can wait for pool capacity, validation, or database startup.
     // None of those waits may retain the global archive publication fence.
     // Keep the connection until the source is reread under both archive locks,
@@ -449,23 +483,42 @@ fn reconcile_agent(
     let checkout = pool.acquire(cx);
     #[cfg(test)]
     let checkout = tests::observe_checkout_pending(checkout);
-    let conn = outcome(block_on(checkout))?;
+    let conn = outcome(block_on(checkout)).map_err(Failure::transient)?;
     // Profile recovery shares the archive-maintenance worker with messages
     // and release history. Never retain its source lease behind an unrelated
     // archive publisher, or bypass that publisher to restore a tombstone.
     let _mutation = crate::ArchiveMutationGuard::try_begin_repair(&config.storage_root, || {
         stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
-    })
-    .map_err(|error| error.to_string())?;
-    let archive =
-        crate::ensure_archive(config, &original.project_slug).map_err(|error| error.to_string())?;
+    })?;
+    let archive = crate::ensure_archive(config, &original.project_slug)?;
+    let mut source_failure = None;
     let publish = || {
         checkpoint(cx, stop)?;
         // Lock waits must not publish an already-obsolete snapshot. Release
         // the SQL connection before profile/Git publication. A later lifecycle
         // mutation is intentionally reconciled on the next finite round.
-        let source = read_source_connection(&conn, original.id).map_err(invalid)?;
-        drop(conn);
+        let source = match read_source_connection(&conn, original.id) {
+            Ok(source) => {
+                drop(conn);
+                source
+            }
+            Err(error) => {
+                if error.transient {
+                    mcp_agent_mail_db::close_db_conn(
+                        conn.detach(),
+                        "failed agent archive publication source read",
+                    );
+                } else {
+                    drop(conn);
+                }
+                // with_repair_lock returns StorageError. Preserve the typed
+                // source classification outside that closure rather than
+                // guessing whether its rendered InvalidPath text was SQL.
+                let detail = error.detail.clone();
+                source_failure = Some(error);
+                return Err(invalid(detail));
+            }
+        };
         if source.project_slug != original.project_slug
             || source.project_key != original.project_key
             || source.profile["name"] != original.profile["name"]
@@ -482,7 +535,7 @@ fn reconcile_agent(
             || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
             publish,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| source_failure.unwrap_or_else(|| error.into()))
 }
 
 fn publish_profile(
@@ -619,14 +672,15 @@ fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
 /// successful repair verifies its exact bytes in Git HEAD. A concurrent later
 /// lifecycle change can require a later pass; this is eventual convergence.
 /// Database admission is nonblocking and precedes selection and each source
-/// read. Archive contention defers a profile within the finite round rather
-/// than pinning other projects; cancellation retains the unconsumed candidate.
+/// read. Transient archive/source failures retain ID-only retry obligations
+/// with bounded backoff. Retry and roster work share the original batch budget;
+/// a full retry queue never discards debt or advances past unadmitted scan work.
 /// Publication uses the native repair fence and bounded project-lock admission.
 /// Filesystem, SQL and Git operations after admission have no hard deadline.
 ///
 /// # Errors
 ///
-/// Refuses foreign or query-only sources, source errors and open corruption
+/// Refuses foreign or query-only sources, selection errors and open corruption
 /// breakers. Per-identity failures retain evidence and count as deferred.
 pub fn reconcile_agent_batch(
     cx: &Cx,
@@ -638,25 +692,46 @@ pub fn reconcile_agent_batch(
     let mut report = AgentReconcileReport::default();
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
+        report.retry_len = cursor.retries.len();
         return Ok(report);
     }
     if corruption_circuit_breaker().is_tripped() {
         return Err("agent reconciliation refused: source corruption breaker is open".into());
     }
-    let ids = {
+    let candidates = {
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("agent reconciliation deferred: recovery promotion or admission contention")?;
         validate_source(pool, config)?;
         select_ids(cx, pool, cursor)?
     };
     let selected_identity = cursor.source_identity.clone();
-    for id in ids {
+    let mut attempted = HashSet::new();
+    let mut scan_blocked = false;
+    for candidate in candidates {
+        let id = candidate.id;
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             report.interrupted = true;
             break;
         }
         if corruption_circuit_breaker().is_tripped() {
             return Err("agent reconciliation stopped: source corruption observed".into());
+        }
+        if !candidate.retry {
+            if scan_blocked {
+                continue;
+            }
+            // The retry obligation already owns this ID, including during its
+            // cooldown. Advancing the scan cannot lose it. Do not reread a
+            // profile twice when it appeared in both selected lanes.
+            if cursor.retries.contains(id) || attempted.contains(&id) {
+                cursor.advance(id);
+                continue;
+            }
+            if !cursor.retries.can_admit(id) {
+                scan_blocked = true;
+                report.budget_exhausted = true;
+                continue;
+            }
         }
         if report.repaired >= MAX_REPAIRS_PER_BATCH {
             report.budget_exhausted = true;
@@ -679,24 +754,45 @@ pub fn reconcile_agent_batch(
             report.interrupted = true;
             break;
         }
+        attempted.insert(id);
+        cursor.next_lane_is_retry = !candidate.retry;
         report.scanned += 1;
         match result {
-            Ok(true) => report.repaired += 1,
-            Ok(false) => report.unchanged += 1,
+            Ok(repaired) => {
+                cursor.retries.forget(id);
+                if repaired {
+                    report.repaired += 1;
+                } else {
+                    report.unchanged += 1;
+                }
+            }
             Err(reason) => {
                 report.deferred += 1;
+                if reason.transient {
+                    cursor.retries.defer(id, Instant::now());
+                    report.deferred_transient += 1;
+                } else {
+                    // Permanent/conflicting evidence remains on the finite
+                    // roster scan, never the fast retry lane.
+                    cursor.retries.forget(id);
+                }
                 tracing::warn!(
                     target: "maintenance", event = "agent_archive_reconcile_deferred",
-                    agent_id = id, reason = %reason,
+                    agent_id = id, reason = %reason.detail, transient = reason.transient,
                     "agent profile repair deferred; mailbox and conflicting evidence retained"
                 );
             }
         }
-        cursor.after = id;
-        if cursor.ceiling == Some(id) {
-            cursor.ceiling = None;
+        if !candidate.retry {
+            cursor.advance(id);
         }
     }
+    report.retry_len = cursor.retries.len();
+    // A full healthy page can hide a much older lifecycle change. Continue
+    // this finite round at catch-up cadence rather than sleeping a minute per
+    // page. A conflicting-only pass does not manufacture productive progress.
+    report.budget_exhausted |=
+        cursor.ceiling.is_some() && report.scanned > 0 && report.deferred == 0;
     Ok(report)
 }
 
@@ -1276,6 +1372,7 @@ mod tests {
                     source_identity: "previous round".into(),
                     after: 17,
                     ceiling: Some(101),
+                    ..Default::default()
                 };
                 let result =
                     reconcile_agent_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false));
@@ -1617,6 +1714,7 @@ mod tests {
                 source_identity: pool.sqlite_identity_key(),
                 after: 100,
                 ceiling: Some(101),
+                ..Default::default()
             };
             let result = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
             assert!(result.interrupted);
@@ -1692,6 +1790,82 @@ mod tests {
             assert_eq!(profile["extension"], "survives failed publication");
             assert_eq!(read_source(cx, pool, 101).unwrap(), latest);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn transient_profile_retry_repairs_latest_tombstone_before_roster_wraparound() {
+        with_mailbox(|cx, pool, config, _| {
+            assert_eq!(reconcile(cx, pool, config).repaired, 1);
+            let before = fs::read(profile_path(config)).unwrap();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(102, 'other', '/other', 1)").unwrap();
+            for id in 102..182 {
+                conn.execute_sync(
+                    "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(?, 102, ?, 'test', 'test', '', 1000000, 2000000)",
+                    &[id.into(), format!("Agent{id}").into()],
+                ).unwrap();
+            }
+            drop(conn);
+            outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
+                cx, pool, 101, Some(123_456_789),
+            ))).unwrap();
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            crate::flush_async_commits();
+            let process = crate::archive_process_lock(&archive).unwrap();
+            let held = process.lock().unwrap();
+            let mut cursor = AgentReconcileCursor::default();
+            let stop = AtomicBool::new(false);
+            let first = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((first.deferred_transient, first.retry_len, first.repaired), (1, 1, 4));
+            assert_eq!(cursor.after, 105);
+            assert_eq!(cursor.ceiling, Some(181));
+            assert_eq!(fs::read(profile_path(config)).unwrap(), before);
+            outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
+                cx, pool, 101, 345_678_901,
+            ))).unwrap();
+            let latest = read_source(cx, pool, 101).unwrap();
+            drop(held);
+            let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((resumed.repaired, resumed.deferred, resumed.retry_len), (4, 0, 0));
+            assert!(cursor.after > 105 && cursor.after < 181, "history must also advance without wrapping");
+            assert_eq!(cursor.ceiling, Some(181));
+            let profile = assert_profile_committed(config);
+            assert_eq!(profile["deregistered_at"], timestamp(345_678_901).unwrap());
+            assert_eq!(profile["contact_policy"], "block_all");
+            assert_eq!(read_source(cx, pool, 101).unwrap(), latest);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
+    #[test]
+    fn full_retry_queue_does_not_advance_past_unadmitted_roster_work() {
+        with_mailbox(|cx, pool, config, _| {
+            let mut cursor = AgentReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                ..Default::default()
+            };
+            let future = Instant::now() + std::time::Duration::from_secs(3600);
+            for id in 10_000..11_024 {
+                cursor.retries.defer(id, future);
+            }
+            let stop = AtomicBool::new(false);
+            let report = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((report.scanned, report.retry_len), (0, 1024));
+            assert!(report.budget_exhausted);
+            assert_eq!((cursor.after, cursor.ceiling), (0, Some(101)));
+            assert!(!profile_path(config).exists());
+            stop.store(true, Ordering::Release);
+            let cancelled = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert!(cancelled.interrupted);
+            assert_eq!(cancelled.retry_len, 1024);
+            assert_eq!(cursor.after, 0);
+            cursor.retries.forget(10_000);
+            stop.store(false, Ordering::Release);
+            let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(resumed.repaired, 1);
+            assert_eq!(resumed.retry_len, 1023);
+            assert_profile_committed(config);
         });
     }
 }

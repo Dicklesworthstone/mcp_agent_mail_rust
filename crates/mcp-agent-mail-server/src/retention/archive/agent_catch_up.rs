@@ -39,7 +39,12 @@ fn finish(
         Ok(report) => {
             // Preserve storage's four-repair/32-candidate bounds. Conflicts
             // alone must not turn into repeated whole-root scans every second.
-            let follow_up = report.budget_exhausted && !report.interrupted;
+            // Retained transient debt needs short polls even when no repair
+            // budget was exhausted; storage still owns every per-ID cooldown.
+            let follow_up = !report.interrupted
+                && (report.budget_exhausted
+                    || report.retry_len > 0
+                    || report.deferred_transient > 0);
             observe(&report);
             Ok(follow_up)
         }
@@ -142,6 +147,26 @@ mod tests {
                 expected,
             );
             assert_eq!(observed.get(), 1);
+        }
+    }
+
+    #[test]
+    fn retry_debt_follows_up_without_repair_budget_exhaustion() {
+        for interrupted in [false, true] {
+            for retained in [false, true] {
+                let report = AgentReconcileReport {
+                    deferred_transient: usize::from(!retained),
+                    retry_len: usize::from(retained),
+                    interrupted,
+                    ..Default::default()
+                };
+                let observed = Cell::new(0);
+                assert_eq!(
+                    finish(Ok(report), || false, |_| observed.set(observed.get() + 1)).unwrap(),
+                    !interrupted,
+                );
+                assert_eq!(observed.get(), 1);
+            }
         }
     }
 
