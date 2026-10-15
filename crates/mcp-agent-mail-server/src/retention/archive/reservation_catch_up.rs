@@ -391,6 +391,7 @@ mod tests {
                 || false,
             )
             .unwrap();
+            assert!(backlog);
             assert_eq!(calls.get(), 1);
         }
     }
@@ -834,6 +835,23 @@ mod tests {
         let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
         assert!(!config.storage_root.join("projects/project/file_reservations/id-401-gaabb.json").exists());
+        // A later pressure pause must also keep an already-owned checkpoint.
+        // No DB reader is held while the competing cursor checks admission.
+        let owned_names = directory_names(temp.path());
+        let head_before_pause = repo.head().unwrap().target();
+        let restore_pressure = RestoreDiskPressure(pressure.load());
+        pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+        assert!(!run(&cx, &pool, &config, &mut cursor, &stop, |_| {
+            panic!("an owned checkpoint pause is not a completed pass");
+        }).unwrap());
+        drop(restore_pressure);
+        assert_eq!(directory_names(temp.path()), owned_names);
+        assert_eq!(repo.head().unwrap().target(), head_before_pause);
+        let mut contender = ReservationReconcileCursor::default();
+        assert_eq!(
+            contender.reconcile_checkpointed(&cx, &pool, &config, &stop).unwrap_err(),
+            "reservation reconciliation deferred: checkpoint owned by another worker",
+        );
         let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
         assert_eq!(
             conn.query_sync("SELECT COUNT(*) FROM file_reservations WHERE released_ts IS NULL", &[])
