@@ -42,6 +42,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agent_catch_up;
 mod catch_up;
 mod reservation_catch_up;
 mod supervisor;
@@ -52,7 +53,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, now_micros, queries::count_prunable_messages,
 };
-use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCursor};
+use mcp_agent_mail_storage::recovery::agent_reconcile::AgentReconcileCursor;
 use mcp_agent_mail_storage::recovery::message_reconcile::database::{
     self as message_archive_reconcile, ArchivePruneCursor, ArchivePruneReport, ReconcileCursor,
 };
@@ -325,14 +326,13 @@ fn retention_loop(
             }
             if !retire_pool && let Some(live_pool) = pool.as_ref() {
                 let cx = worker_cx();
-                match agent_reconcile::reconcile_agent_batch(
+                match agent_catch_up::run(
                     &cx,
                     live_pool,
                     config,
                     &mut agent_cursor,
                     &SHUTDOWN,
-                ) {
-                    Ok(report) => {
+                    |report| {
                         if report.scanned > 0 || report.interrupted {
                             info!(
                                 target: "maintenance",
@@ -346,7 +346,9 @@ fn retention_loop(
                                 "bounded agent profile reconciliation pass completed"
                             );
                         }
-                    }
+                    },
+                ) {
+                    Ok(backlog) => repair_backlog |= backlog,
                     Err(error) => {
                         warn!(
                             target: "maintenance",
