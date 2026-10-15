@@ -26,6 +26,122 @@
 
 mod archive_read;
 
+#[cfg(test)]
+mod issue353_bootstrap_tests {
+    use super::tool_util::{
+        DB_POOL_BOOTSTRAP_GATE, DB_POOL_BOOTSTRAP_PROMOTIONS, get_db_pool_for_config,
+    };
+    use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_db::DbPoolConfig;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn mailbox() -> (tempfile::TempDir, DbPoolConfig) {
+        let scratch = tempfile::tempdir().unwrap();
+        let storage_root = scratch.path().join("archive");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &scratch.path().join("mail.sqlite3"),
+            ),
+            storage_root,
+            ..Default::default()
+        };
+        let pool = DbPoolConfig {
+            database_url: config.database_url,
+            storage_root: Some(config.storage_root),
+            min_connections: 1,
+            max_connections: 4,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        (scratch, pool)
+    }
+
+    #[test]
+    fn gh353_cold_loser_returns_retryable_busy_before_promotion() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let (_scratch, config) = mailbox();
+        let initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let error = get_db_pool_for_config(&config).unwrap_err();
+        let after = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        drop(initializer);
+        assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+        assert_eq!(before, after, "losing initializer attempted promotion");
+    }
+
+    #[test]
+    fn gh353_hot_requests_bypass_initializer_gate() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let (_scratch, config) = mailbox();
+        let first = get_db_pool_for_config(&config).unwrap();
+        let engine = first.engine_identity_key();
+        drop(first);
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let _initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
+        for _ in 0..64 {
+            let request = get_db_pool_for_config(&config).unwrap();
+            assert_eq!(request.engine_identity_key(), engine);
+        }
+        assert_eq!(
+            DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed),
+            before
+        );
+    }
+
+    #[test]
+    fn gh353_concurrent_cold_callers_converge_on_one_engine() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let (_scratch, config) = mailbox();
+        let start = Arc::new(Barrier::new(8));
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let identities = std::thread::scope(|scope| {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let start = Arc::clone(&start);
+                let config = config.clone();
+                tasks.push(scope.spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    start.wait();
+                    loop {
+                        match get_db_pool_for_config(&config) {
+                            Ok(pool) => return pool.engine_identity_key(),
+                            Err(error) => {
+                                assert_eq!(
+                                    crate::tool_error_code(&error),
+                                    Some("RESOURCE_BUSY")
+                                );
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "initializer never completed"
+                                );
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        }
+                    }
+                }));
+            }
+            tasks
+                .into_iter()
+                .map(std::thread::ScopedJoinHandle::join)
+                .collect::<Vec<_>>()
+        });
+        let identities = identities
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed) - before,
+            1
+        );
+    }
+}
+
 pub mod build_slots;
 pub mod contacts;
 pub mod degraded_intents;
