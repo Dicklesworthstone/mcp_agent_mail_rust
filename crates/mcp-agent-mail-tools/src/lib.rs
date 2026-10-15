@@ -823,11 +823,43 @@ pub mod tool_util {
         }
     }
 
-    fn bootstrap_db_pool_with_barrier_handoff(
+    // Only one genuinely cold caller may enter pool initialization. A loser
+    // must not queue another recovery-style promotion behind the winner: that
+    // was the GH#353 path that repeatedly closed maintenance write admission.
+    // Hot callers never touch this gate because get_db_pool_for_config returns
+    // from the cache before entering this helper.
+    pub(super) static DB_POOL_BOOTSTRAP_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(test)]
+    pub(super) static DB_POOL_BOOTSTRAP_PROMOTIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    pub(super) fn bootstrap_db_pool_with_barrier_handoff(
         cfg: &DbPoolConfig,
         storage_root: &Path,
         sqlite_path: Option<&Path>,
     ) -> McpResult<(DbPool, crate::archive_read::WriteGuard)> {
+        let _initializer = match DB_POOL_BOOTSTRAP_GATE.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(db_error_to_mcp_error(DbError::ResourceBusy(
+                    "database pool initialization is already in progress; retry the operation".into(),
+                )));
+            }
+        };
+
+        // Another caller may have published a pool after our initial cache
+        // miss but before we acquired initializer ownership. Recheck while
+        // counted as an ordinary writer; if it is now hot, return it without
+        // ever closing admission behind the recovery-promotion barrier.
+        let guard = crate::archive_read::WriteGuard::begin(storage_root, sqlite_path);
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
+            return Ok((pool, guard));
+        }
+        drop(guard);
+
+        #[cfg(test)]
+        DB_POOL_BOOTSTRAP_PROMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (barrier, outcome) =
             mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
                 mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
@@ -852,7 +884,10 @@ pub mod tool_util {
     }
 
     pub fn get_db_pool() -> McpResult<WriteDbPool> {
-        let cfg = DbPoolConfig::from_env();
+        get_db_pool_for_config(&DbPoolConfig::from_env())
+    }
+
+    pub(crate) fn get_db_pool_for_config(cfg: &DbPoolConfig) -> McpResult<WriteDbPool> {
         let sqlite_path =
             if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
                 None
@@ -871,7 +906,7 @@ pub mod tool_util {
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
         );
-        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
             return Ok(WriteDbPool {
                 pool,
                 _guard: guard,
@@ -882,7 +917,7 @@ pub mod tool_util {
         // explicit barrier-to-writer handoff in the helper.
         drop(guard);
         let (pool, guard) = bootstrap_db_pool_with_barrier_handoff(
-            &cfg,
+            cfg,
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
         )?;
