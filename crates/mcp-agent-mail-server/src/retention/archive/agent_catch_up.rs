@@ -2,18 +2,22 @@
 //! Admission refusal is scheduling backpressure, not a failed source generation.
 //! Productive finite scans catch up in bounded bursts; contention yields without
 //! bypassing storage's per-ID backoff or delaying other maintenance phases.
+//! Roster progress and retry IDs survive worker/server restarts through the
+//! storage cursor's generation-bound checkpoint, never through cached profiles.
 
 use asupersync::Cx;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbPool;
 use mcp_agent_mail_storage::recovery::agent_reconcile::{
-    AgentReconcileCursor, AgentReconcileReport, reconcile_agent_batch,
+    AgentReconcileCursor, AgentReconcileReport,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const ADMISSION_DEFERRED: &str =
     "agent reconciliation deferred: recovery promotion or admission contention";
+const CHECKPOINT_OWNED: &str =
+    "agent reconciliation deferred: checkpoint is owned by another worker";
 const MAX_BATCHES_PER_TURN: usize = 8;
 const MAX_ACTIVE_PER_TURN: Duration = Duration::from_millis(250);
 
@@ -33,7 +37,7 @@ pub(super) fn run(
 ) -> Result<bool, String> {
     let started = Instant::now();
     run_with(
-        || reconcile_agent_batch(cx, pool, config, cursor, stop),
+        || cursor.reconcile_checkpointed(cx, pool, config, stop),
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
         || started.elapsed(),
         observe,
@@ -95,7 +99,7 @@ fn finish(
             observe(&report);
             Ok(follow_up)
         }
-        Err(error) if error == ADMISSION_DEFERRED => {
+        Err(error) if error == ADMISSION_DEFERRED || error == CHECKPOINT_OWNED => {
             if interrupted() {
                 return Ok(false);
             }
@@ -117,6 +121,80 @@ mod tests {
     use std::cell::Cell;
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn checkpoint_ownership_refusal_yields_without_fabricating_a_batch() {
+        for interrupted in [false, true] {
+            assert_eq!(
+                finish(
+                    Err(CHECKPOINT_OWNED.into()),
+                    || interrupted,
+                    |_| panic!("a refused checkpoint has no completed storage report"),
+                ).unwrap(),
+                !interrupted,
+            );
+        }
+        let mut calls = 0;
+        let mut reports = Vec::new();
+        assert!(run_with(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Ok(AgentReconcileReport {
+                        repaired: 4,
+                        budget_exhausted: true,
+                        ..Default::default()
+                    }),
+                    2 => Err(CHECKPOINT_OWNED.into()),
+                    _ => panic!("checkpoint admission must not spin inside one turn"),
+                }
+            },
+            || false,
+            || Duration::ZERO,
+            |report| reports.push(report.repaired),
+        ).unwrap());
+        assert_eq!(calls, 2);
+        assert_eq!(reports, [4]);
+        let reason = "agent checkpoint ownership changed; rescan required";
+        assert_eq!(
+            finish(Err(reason.into()), || false, |_| panic!("no report")),
+            Err(reason.into()),
+        );
+    }
+
+    #[test]
+    fn real_worker_keeps_its_pool_on_checkpoint_contention_and_resumes_the_saved_scan() {
+        if isolated() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (config, _, pool) = mailbox(temp.path());
+        let engine = pool.engine_identity_key();
+        let cx = Cx::for_testing();
+        let stop = AtomicBool::new(false);
+        let mut owner = AgentReconcileCursor::default();
+        let first = owner.reconcile_checkpointed(&cx, &pool, &config, &stop).unwrap();
+        assert_eq!((first.repaired, first.deferred), (4, 0));
+        assert!(first.budget_exhausted);
+        let mut contender = AgentReconcileCursor::default();
+        assert!(run(
+            &cx, &pool, &config, &mut contender, &stop,
+            |_| panic!("another owner must refuse before any storage report"),
+        ).unwrap());
+        assert_eq!(pool.engine_identity_key(), engine);
+        assert!(!config.storage_root.join("projects/gh353/agents/SilverCloud/profile.json").exists());
+        drop(owner);
+        let mut reports = Vec::new();
+        assert!(!run(
+            &cx, &pool, &config, &mut contender, &stop,
+            |report| reports.push((report.scanned, report.repaired)),
+        ).unwrap());
+        // A reset-to-zero scan would report five inspected profiles, not one.
+        assert_eq!(reports, [(1, 1)]);
+        assert_eq!(pool.engine_identity_key(), engine);
+        assert_profiles_match_source_and_git(&cx, &pool, &config);
+        assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+    }
 
     #[test]
     fn exact_admission_refusal_never_fabricates_a_storage_report() {
