@@ -4,8 +4,9 @@
 //! that debt and sleeps a minute. Keep pending retries on the short worker
 //! cadence, and drain successful releases or healthy unfinished history pages
 //! without an intervening sleep. Reaching a finite round's end returns to idle.
-//! The storage reconciler still owns all selection, cooldown, publication and
-//! generation checks. This scheduler never writes a lease or changes its state.
+//! The storage reconciler checkpoints scan positions and retry debt together.
+//! It still owns all selection, cooldown, publication and generation checks.
+//! This scheduler never writes a lease or changes its state.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use asupersync::Cx;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::DbPool;
 use mcp_agent_mail_storage::recovery::reservation_reconcile::{
-    ReservationReconcileCursor, ReservationReconcileReport, reconcile_reservation_releases,
+    ReservationReconcileCursor, ReservationReconcileReport,
 };
 
 const MAX_BATCHES_PER_TURN: usize = 8;
@@ -35,7 +36,7 @@ pub(super) fn run(
 ) -> Result<bool, String> {
     let started = Instant::now();
     run_with(
-        || reconcile_reservation_releases(cx, pool, config, cursor, stop),
+        || cursor.reconcile_checkpointed(cx, pool, config, stop),
         observe,
         || started.elapsed(),
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
@@ -63,13 +64,16 @@ fn run_with(
         let report = match repair() {
             Ok(report) => report,
             Err(error)
-                if error
-                    == "reservation reconciliation deferred: recovery promotion or admission contention" =>
+                if matches!(
+                    error.as_str(),
+                    "reservation reconciliation deferred: recovery promotion or admission contention"
+                        | "reservation reconciliation deferred: checkpoint owned by another worker"
+                ) =>
             {
-                // No source read or release was admitted. Retain the healthy
-                // pool/cursor and yield to the short worker pause, rather than
-                // sending this refusal through the pool-retirement path. An
-                // observed generation/source failure remains an error below.
+                // No reservation scan or release was admitted. Retain the
+                // healthy pool/cursor and yield to the short worker pause,
+                // rather than retiring the pool or discarding checkpoint
+                // ownership. Source/generation failures remain errors below.
                 if cancelled() {
                     return Ok(false);
                 }
@@ -345,6 +349,51 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_owner_refusal_preserves_completed_reports_and_yields() {
+        for completed_first in [false, true] {
+            let mut calls = 0;
+            let mut observed = Vec::new();
+            let backlog = run_with(
+                || {
+                    calls += 1;
+                    if completed_first && calls == 1 {
+                        Ok(healthy_page())
+                    } else {
+                        Err("reservation reconciliation deferred: checkpoint owned by another worker".into())
+                    }
+                },
+                |report| observed.push(report.scanned),
+                || Duration::ZERO,
+                || false,
+            ).unwrap();
+            assert_eq!(calls, if completed_first { 2 } else { 1 });
+            assert_eq!(observed, if completed_first { vec![32] } else { vec![] });
+            assert!(backlog);
+            assert_eq!(
+                super::super::next_poll_interval(Duration::from_secs(60), backlog),
+                Duration::from_secs(1)
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_during_checkpoint_owner_refusal_does_not_rearm_worker() {
+        let stop = Cell::new(false);
+        let mut observed = 0;
+        let backlog = run_with(
+            || {
+                stop.set(true);
+                Err("reservation reconciliation deferred: checkpoint owned by another worker".into())
+            },
+            |_| observed += 1,
+            || Duration::ZERO,
+            || stop.get(),
+        ).unwrap();
+        assert!(!backlog);
+        assert_eq!(observed, 0);
+    }
+
+    #[test]
     fn admission_after_progress_preserves_observations_and_recovers_next_turn() {
         let mut calls = 0;
         let mut observed = Vec::new();
@@ -399,6 +448,7 @@ mod tests {
             "source corruption breaker is open",
             "permission denied",
             "source error: reservation reconciliation deferred: recovery promotion or admission contention",
+            "source error: reservation reconciliation deferred: checkpoint owned by another worker",
         ] {
             let result = run_with(
                 || Err(error.to_string()),
