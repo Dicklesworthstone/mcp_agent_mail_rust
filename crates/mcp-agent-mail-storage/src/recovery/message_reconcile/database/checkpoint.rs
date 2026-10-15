@@ -289,9 +289,10 @@ fn check_sidecar(path: &Path) -> io::Result<()> {
 struct Store {
     binding: Binding,
     path: PathBuf,
+    lock_path: PathBuf,
     // A nonblocking, per-source lock serializes checkpoint read/run/publish.
     // Keep the descriptor until the pass finishes; never wait on another server.
-    _lock: File,
+    lock: File,
 }
 
 impl Store {
@@ -310,19 +311,41 @@ impl Store {
                 .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
         let lock = options.open(&lock_path)?;
-        if !lock.metadata()?.is_file() {
-            return Err(invalid("checkpoint lock is not a regular file"));
-        }
-        check_sidecar(&lock_path)?;
         FileExt::try_lock_exclusive(&lock)?;
-        Ok(Self {
+        let store = Self {
             binding,
             path,
-            _lock: lock,
-        })
+            lock_path,
+            lock,
+        };
+        store.check_lock()?;
+        Ok(store)
     }
 
-    fn load(&self) -> io::Result<Option<Snapshot>> {
+    fn check_lock(&self) -> io::Result<()> {
+        check_sidecar(&self.lock_path)?;
+        let opened = self.lock.metadata()?;
+        let named = std::fs::symlink_metadata(&self.lock_path)?;
+        if !opened.is_file() || !named.is_file() {
+            return Err(invalid("checkpoint lock is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened.nlink() != 1 || (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+                return Err(invalid("checkpoint lock identity changed"));
+            }
+        }
+        #[cfg(not(unix))]
+        if opened.created()? != named.created()? {
+            return Err(invalid("checkpoint lock identity changed"));
+        }
+        Ok(())
+    }
+
+    fn read_snapshot(&self) -> io::Result<Option<Snapshot>> {
+        self.check_lock()?;
+        check_sidecar(&self.path)?;
         let bytes = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
             &self.path,
             MAX_CHECKPOINT_BYTES,
@@ -333,11 +356,51 @@ impl Store {
         };
         let snapshot: Snapshot = serde_json::from_slice(&bytes)
             .map_err(|error| invalid(&format!("checkpoint cannot be decoded: {error}")))?;
+        self.check_lock()?;
+        check_sidecar(&self.path)?;
+        snapshot.validate(&snapshot.binding)?;
+        Ok(Some(snapshot))
+    }
+
+    #[cfg(test)]
+    fn load(&self) -> io::Result<Option<Snapshot>> {
+        let Some(snapshot) = self.read_snapshot()? else { return Ok(None) };
         snapshot.validate(&self.binding)?;
         Ok(Some(snapshot))
     }
 
+    fn restore(&self, cursor: &mut ReconcileCursor) -> io::Result<bool> {
+        let Some(snapshot) = self.read_snapshot()? else { return Ok(false) };
+        if snapshot.binding != self.binding {
+            // A generation can change BETWEEN passes, while the same pool and
+            // cursor survive. Reject its disk watermarks and reset the live
+            // scan too. Preserve all memory-only retry IDs on a failed save;
+            // every ID still requires an authoritative current-source read.
+            cursor.tail_after = None;
+            cursor.backfill_ceiling = None;
+            cursor.next_lane_is_history = false;
+            cursor.startup_backfill_complete = false;
+            return Err(invalid("checkpoint source/archive generation does not match"));
+        }
+        if cursor.checkpoint_dirty {
+            return Ok(false);
+        }
+        snapshot.restore(cursor, Instant::now(), mcp_agent_mail_db::now_micros());
+        Ok(true)
+    }
+
     fn save(&self, cursor: &ReconcileCursor) -> io::Result<()> {
+        self.save_with(cursor, || Ok(()))
+    }
+
+    // The callback is a private deterministic test seam between real staging
+    // and publication. Production passes a no-op, never an environment hook.
+    fn save_with(
+        &self,
+        cursor: &ReconcileCursor,
+        before_publish: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.check_lock()?;
         // Promotion is not held through filesystem I/O. Refuse to attach old
         // progress to a replacement database that appeared during the pass.
         let current = Binding::at(
@@ -370,6 +433,11 @@ impl Store {
             .tempfile_in(parent)?;
         candidate.write_all(&bytes)?;
         candidate.as_file().sync_all()?;
+        before_publish()?;
+        // A flock on an old inode grants no ownership of a replacement path.
+        // Recheck after slow staging I/O, before replacing the paired hints.
+        self.check_lock()?;
+        check_sidecar(&self.path)?;
         candidate.persist(&self.path).map_err(|error| error.error)?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
@@ -463,15 +531,9 @@ pub(super) fn run(
         }
     };
     let mut restored = false;
-    if !cursor.checkpoint_dirty
-        && let Some(store) = &store
-    {
-        match store.load() {
-            Ok(Some(snapshot)) => {
-                snapshot.restore(cursor, Instant::now(), mcp_agent_mail_db::now_micros());
-                restored = true;
-            }
-            Ok(None) => {}
+    if let Some(store) = &store {
+        match store.restore(cursor) {
+            Ok(did_restore) => restored = did_restore,
             Err(error) => warn_unavailable(&error),
         }
     }
@@ -511,6 +573,113 @@ mod tests {
     use std::collections::VecDeque;
 
     const GENERATION: &str = "aabbccdd";
+
+    #[test]
+    fn same_live_cursor_rescans_after_between_pass_logical_generation_change() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let (store, mut cursor) = seed_obsolete_progress(cx, pool, config);
+            change_logical_generation(cx, pool, &store.binding.database_generation);
+            assert_eq!(cursor.source_identity, pool.sqlite_identity_key());
+            drop(store);
+            let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!(report.repaired, super::super::MAX_REPAIRS_PER_BATCH);
+            assert_message_committed(cx, pool, config, 940);
+        });
+    }
+
+    #[test]
+    fn obsolete_checkpoint_resets_scan_but_cannot_discard_memory_only_retry_debt() {
+        let (_temp, database, archive) = fixture();
+        let old = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        let now = Instant::now();
+        old.save(&debt(now)).unwrap();
+        drop(old);
+        let current = Store::open(Binding::at(&database, &archive, "11223344").unwrap()).unwrap();
+        let mut cursor = ReconcileCursor::settled_before(999);
+        cursor.source_identity = "live pool".into();
+        cursor.tail_after = Some(100_000);
+        cursor.backfill_ceiling = Some(100);
+        cursor.startup_backfill_complete = true;
+        cursor.checkpoint_dirty = true;
+        cursor.defer_transient(77, now);
+        assert!(current.restore(&mut cursor).is_err());
+        assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (None, None));
+        assert!(!cursor.startup_backfill_complete);
+        assert_eq!(cursor.retries.len(), 1);
+        assert_eq!(cursor.retries[0].id, 77);
+        assert_eq!(cursor.retries[0].ready_at, now);
+        assert!(cursor.checkpoint_dirty);
+        assert_eq!(cursor.source_identity, "live pool");
+        assert_eq!(cursor.settled_before_us, 999);
+        current.save(&cursor).unwrap();
+        let saved = current.load().unwrap().unwrap();
+        assert_eq!(saved.binding.database_generation, "11223344");
+        assert_eq!(saved.retries.len(), 1);
+        assert_eq!(saved.retries[0].id, 77);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_lock_refuses_old_owner_reads_and_writes() {
+        let (_temp, database, archive) = fixture();
+        let old = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        old.save(&debt(Instant::now())).unwrap();
+        let before = std::fs::read(&old.path).unwrap();
+        std::fs::rename(&old.lock_path, old.lock_path.with_extension("retained-lock")).unwrap();
+        let current = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        assert!(old.load().is_err(), "old flock is not ownership of the new path");
+        assert!(old.save(&ReconcileCursor::default()).is_err());
+        assert_eq!(std::fs::read(&old.path).unwrap(), before);
+        assert_eq!(current.load().unwrap().unwrap().tail_after, Some(90_000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_replacement_during_real_staging_prevents_stale_checkpoint_publication() {
+        let (_temp, database, archive) = fixture();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        store.save(&debt(Instant::now())).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        let mut replacement = None;
+        let result = store.save_with(&ReconcileCursor::default(), || {
+            std::fs::rename(&store.lock_path, store.lock_path.with_extension("retained-lock"))?;
+            replacement = Some(Store::open(Binding::at(&database, &archive, GENERATION)?)?);
+            Ok(())
+        });
+        assert!(result.is_err(), "publication must recheck ownership after fsync");
+        assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        assert_eq!(replacement.unwrap().load().unwrap().unwrap().retries.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_links_installed_after_staging_are_preserved_not_replaced() {
+        for hardlink in [false, true] {
+            let (_temp, database, archive) = fixture();
+            let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+            store.save(&debt(Instant::now())).unwrap();
+            let original = std::fs::read(&store.path).unwrap();
+            let retained = store.path.with_extension("retained-checkpoint");
+            let foreign = archive.join("foreign-evidence");
+            std::fs::write(&foreign, b"preserve foreign evidence").unwrap();
+            let result = store.save_with(&ReconcileCursor::default(), || {
+                std::fs::rename(&store.path, &retained)?;
+                if hardlink {
+                    std::fs::hard_link(&foreign, &store.path)?;
+                } else {
+                    std::os::unix::fs::symlink(&foreign, &store.path)?;
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "unsafe destination must be checked after fsync");
+            assert_eq!(std::fs::read(&retained).unwrap(), original);
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"preserve foreign evidence");
+            assert_eq!(std::fs::read(&store.path).unwrap(), b"preserve foreign evidence");
+            assert!(store.load().is_err(), "no reading through substituted links");
+        }
+    }
 
     #[test]
     fn logical_generation_changes_invalidate_hints_without_replacing_the_file() {
