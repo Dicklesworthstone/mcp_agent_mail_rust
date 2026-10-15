@@ -155,6 +155,19 @@ fn supervise_with(
     }
 }
 
+fn apply_successful_turn_pool_policy(pool: &mut Option<DbPool>, turn: &turn::Turn) {
+    if turn.idle && pool.is_some() {
+        // Empty is healthy, not a generation failure. Keep the worker's
+        // one-connection source pool across the normal idle interval. The
+        // error path below still retires it after source/generation failures.
+        tracing::debug!(
+            target: "maintenance",
+            event = "active_reservation_reconcile_idle",
+            "active lease repair is idle; retaining its source pool"
+        );
+    }
+}
+
 fn run(config: &Config, stop: &AtomicBool) {
     let mut pool: Option<DbPool> = None;
     let mut cursor = ActiveReservationCursor::default();
@@ -199,9 +212,7 @@ fn run(config: &Config, stop: &AtomicBool) {
             match result {
                 Ok(turn) => {
                     delay = turn.delay;
-                    if turn.idle {
-                        pool = None;
-                    }
+                    apply_successful_turn_pool_policy(&mut pool, &turn);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "active lease repair deferred; source and archive preserved");
@@ -352,6 +363,36 @@ mod tests {
             clean_during_backoff.get(),
             "backoff retained failed run resources"
         );
+    }
+
+    #[test]
+    fn empty_successful_turn_keeps_the_healthy_source_pool() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let temp = tempfile::tempdir().unwrap();
+            let config = Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("mail.sqlite3"),
+                ),
+                storage_root: temp.path().join("archive"),
+                ..Default::default()
+            };
+            std::fs::create_dir_all(&config.storage_root).unwrap();
+            let mut selected = selected_pool(&config);
+            selected.run_migrations = true;
+            let source = DbPool::new(&selected).unwrap();
+            let engine = source.engine_identity_key();
+            let mut pool = Some(source);
+            let turn = turn::Turn {
+                delay: POLL_INTERVAL,
+                idle: true,
+            };
+
+            apply_successful_turn_pool_policy(&mut pool, &turn);
+
+            let retained = pool.as_ref().expect("healthy idle turn retired source pool");
+            assert_eq!(retained.engine_identity_key(), engine);
+            assert!(!retained.pool.is_closed());
+        });
     }
 
     #[test]
