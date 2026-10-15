@@ -15,6 +15,7 @@ const MAX_RETRY_IDS: usize = 1024;
 const RETRY_IDS_PER_BATCH: usize = 8;
 const RETRY_REPAIRS_PER_BATCH: usize = 2;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const PRIORITY_ROWS_PER_PAGE: usize = 128;
 
 #[derive(Debug)]
 struct DeferredRelease {
@@ -93,6 +94,90 @@ fn advance(position: &mut ScanPosition, id: i64) {
     if position.ceiling == Some(id) {
         position.ceiling = None;
     }
+}
+
+// History already walks a bounded primary-key page. Priority must bound the
+// metadata walk BEFORE filtering, too: LIMIT on matching releases alone can
+// examine every reservation in a healthy mailbox on every maintenance pass.
+fn select_ids(
+    cx: &Cx,
+    pool: &DbPool,
+    position: &mut ScanPosition,
+    limit: i64,
+    priority: bool,
+) -> Result<Vec<i64>, String> {
+    if !priority {
+        return super::select_ids(cx, pool, position, limit, false);
+    }
+    let limit = usize::try_from(limit)
+        .ok()
+        .filter(|limit| *limit > 0 && *limit <= PRIORITY_ROWS_PER_PAGE)
+        .ok_or("invalid reservation priority candidate budget")?;
+    let conn = outcome(block_on(pool.acquire(cx)))?;
+    let mode = conn
+        .query_sync("PRAGMA query_only", &[])
+        .map_err(source_error)?;
+    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
+        return Err("query-only snapshots cannot authorize reservation archive repair".into());
+    }
+    if position.ceiling.is_none() {
+        let rows = conn
+            .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
+            .map_err(source_error)?;
+        let ceiling = rows
+            .first()
+            .ok_or("reservation ID aggregate is missing")?
+            .get_as::<i64>(0)
+            .map_err(source_error)?;
+        position.ceiling = Some(ceiling);
+        position.after = 0;
+    }
+    let ceiling = position.ceiling.unwrap_or(0);
+    // Eligibility is a projection, not a WHERE predicate. One SQL snapshot
+    // supplies the bounded IDs and both hot-row/ledger release evidence.
+    // No unbounded path/reason strings are materialized during discovery.
+    let sql = format!(
+        "SELECT fr.id, CASE WHEN fr.expires_ts > ?3 AND \
+         (fr.released_ts IS NOT NULL OR EXISTS \
+          (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = fr.id)) \
+         THEN 1 ELSE 0 END AS eligible \
+         FROM file_reservations fr WHERE fr.id > ?1 AND fr.id <= ?2 \
+         ORDER BY fr.id LIMIT {PRIORITY_ROWS_PER_PAGE}"
+    );
+    let rows = conn
+        .query_sync(
+            &sql,
+            &[
+                position.after.into(),
+                ceiling.into(),
+                mcp_agent_mail_db::now_micros().into(),
+            ],
+        )
+        .map_err(source_error)?;
+    if rows.is_empty() {
+        position.ceiling = None;
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    let mut last = position.after;
+    for row in &rows {
+        let id = row.get_named::<i64>("id").map_err(source_error)?;
+        let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
+        if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
+            return Err("reservation priority page contains invalid selection evidence".into());
+        }
+        last = id;
+        if eligible == 1 && ids.len() < limit {
+            ids.push(id);
+        }
+    }
+    // An entirely nonmatching page has no publication/retry debt to retain.
+    // Otherwise leave advancement to the existing per-ID execution loop:
+    // even a two-write budget break cannot consume the unprocessed page tail.
+    if ids.is_empty() && !cx.checkpoint().is_err() {
+        advance(position, last);
+    }
+    Ok(ids)
 }
 
 /// Return false on cancellation, without consuming the candidate or its debt.
@@ -306,6 +391,57 @@ fn run_admitted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_discovery_is_bounded_and_reaches_sparse_ledger_releases() {
+        super::super::tests::fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let future = mcp_agent_mail_db::now_micros() + 86_400_000_000;
+            for id in (1..=260).chain(std::iter::once(9_000_000)) {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'bounded/{id}.rs', 1, 'active', 1000000, {future}, NULL)")).unwrap();
+            }
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(9000000, 5000000)").unwrap();
+            drop(conn);
+            let mut position = ScanPosition::default();
+            for expected in [128, 256] {
+                assert!(select_ids(cx, pool, &mut position, 16, true).unwrap().is_empty());
+                assert_eq!(position.after, expected);
+                assert_eq!(position.ceiling, Some(9_000_000));
+            }
+            assert_eq!(select_ids(cx, pool, &mut position, 16, true).unwrap(), [9_000_000]);
+            assert_eq!(position.after, 256, "selection cannot consume a release");
+            advance(&mut position, 9_000_000);
+            assert_eq!(position.ceiling, None);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 262);
+            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=9000000", &[]).unwrap()[0].get_as::<Option<i64>>(0).unwrap(), None);
+            assert!(!config.storage_root.join("projects").exists());
+        });
+    }
+
+    #[test]
+    fn priority_discovery_does_not_consume_candidates_beyond_the_write_budget() {
+        super::super::tests::fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let future = mcp_agent_mail_db::now_micros() + 86_400_000_000;
+            for id in 402..=421 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'bounded/{id}.rs', 1, 'released', 1000000, {future}, 5000000)")).unwrap();
+            }
+            drop(conn);
+            let mut position = ScanPosition::default();
+            let first = select_ids(cx, pool, &mut position, 16, true).unwrap();
+            assert_eq!(first, (402..=417).collect::<Vec<_>>());
+            assert_eq!(position.after, 0);
+            // Only two of sixteen selected releases fit the ordinary priority
+            // publication budget. The next pass must begin at the third.
+            advance(&mut position, 402);
+            advance(&mut position, 403);
+            let next = select_ids(cx, pool, &mut position, 16, true).unwrap();
+            assert_eq!(next, (404..=419).collect::<Vec<_>>());
+            assert_eq!(position.after, 403);
+            assert!(!config.storage_root.join("projects").exists());
+        });
+    }
 
     #[test]
     fn first_deferral_is_due_next_pass_and_repeated_contention_backs_off() {
