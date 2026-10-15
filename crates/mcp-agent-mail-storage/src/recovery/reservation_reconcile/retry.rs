@@ -270,6 +270,18 @@ pub(super) fn run(
             advance(position, id);
         }
     }
+    // Consuming a healthy page is discovery progress, not proof that the
+    // mailbox is settled. A lost release can lie behind thousands of already
+    // archived or still-active rows. Continue this finite round at catch-up
+    // cadence instead of sleeping a minute after every unchanged page.
+    // Conflicts alone do not accelerate scanning, and reaching the captured
+    // ceiling (or an empty final page) returns to the normal idle cadence.
+    if report.deferred == 0
+        && report.scanned > 0
+        && (cursor.priority.ceiling.is_some() || cursor.history.ceiling.is_some())
+    {
+        report.budget_exhausted = true;
+    }
     Ok(finish(report, &cursor.retries))
 }
 
@@ -326,6 +338,106 @@ mod tests {
         assert!(!transient(&invalid("foreign generation")));
         assert!(!transient(&std::io::Error::from(std::io::ErrorKind::Interrupted).into()));
         assert!(!transient(&std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()));
+    }
+
+    #[test]
+    fn healthy_history_pages_find_a_lost_release_without_idle_pauses() {
+        super::super::tests::fixture(|cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let initial = run(
+                cx,
+                pool,
+                config,
+                &mut ReservationReconcileCursor::default(),
+                &stop,
+            )
+            .unwrap();
+            assert_eq!(initial.repaired, 1);
+            assert!(!initial.budget_exhausted);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..482 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'healthy/{id}.rs', 1, 'unchanged', 1000000, 9000000, NULL)"
+                )).unwrap();
+            }
+            conn.execute_raw(
+                "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(482, 71, 81, 'lost/release.rs', 1, 'released', 1000000, 9000000, 5000000)"
+            ).unwrap();
+            drop(conn);
+            let mut cursor = ReservationReconcileCursor::default();
+            let path = config
+                .storage_root
+                .join("projects/project/file_reservations/id-482-gaabb.json");
+            for after in [432, 464] {
+                let page = run(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!((page.scanned, page.unchanged, page.repaired), (32, 32, 0));
+                assert_eq!((page.attempted, page.deferred, page.retry_len), (0, 0, 0));
+                assert!(page.budget_exhausted, "unfinished healthy page needs catch-up");
+                assert_eq!(cursor.history.after, after);
+                assert_eq!(cursor.history.ceiling, Some(482));
+                assert!(!path.exists());
+            }
+            let final_page = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((final_page.scanned, final_page.unchanged, final_page.repaired), (18, 17, 1));
+            assert_eq!(final_page.attempted, 1);
+            assert!(!final_page.budget_exhausted, "do not spin into another history round");
+            assert_eq!(cursor.history.ceiling, None);
+            let artifact = read_artifact(&path).unwrap().unwrap();
+            assert_eq!(artifact.value["id"], 482);
+            assert_eq!(artifact.value["db_generation"], "aabb");
+            assert_eq!(timestamp(&artifact.value["released_ts"]), Some(5_000_000));
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-482-gaabb.json",
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
+                artifact.bytes,
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                82,
+            );
+            assert_eq!(
+                conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=482", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                5_000_000,
+            );
+        });
+    }
+
+    #[test]
+    fn conflicting_history_page_does_not_gain_fast_discovery_cadence() {
+        super::super::tests::fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let (path, before) = super::super::tests::seed_artifact(config, &source, "aabb", true);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..482 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'healthy/{id}.rs', 1, 'unchanged', 1000000, 9000000, NULL)"
+                )).unwrap();
+            }
+            drop(conn);
+            let mut cursor = ReservationReconcileCursor::default();
+            let page = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            assert_eq!((page.scanned, page.unchanged, page.deferred), (32, 31, 1));
+            assert_eq!((page.attempted, page.repaired, page.retry_len), (0, 0, 0));
+            assert!(!page.budget_exhausted);
+            assert_eq!(cursor.history.after, 432);
+            assert_eq!(cursor.history.ceiling, Some(481));
+            assert_eq!(fs::read(path).unwrap(), before);
+        });
     }
 
     #[test]
