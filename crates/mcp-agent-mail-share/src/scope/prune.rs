@@ -265,7 +265,7 @@ mod tests {
             .unwrap()
     }
 
-    fn assert_kept_scope(path: &Path) {
+    fn assert_kept_scope(path: &Path, shared: bool) {
         let conn = Conn::open_file(path.display().to_string()).unwrap();
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 1);
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agents"), 1);
@@ -314,9 +314,10 @@ mod tests {
             .unwrap();
         let routing: serde_json::Value =
             serde_json::from_str(&rows[0].get_named::<String>("recipients_json").unwrap()).unwrap();
+        let cc: &[&str] = if shared { &["project:keep"] } else { &[] };
         assert_eq!(
             routing,
-            serde_json::json!({"to": ["BlueLake"], "cc": [], "bcc": []})
+            serde_json::json!({"to": ["BlueLake"], "cc": cc, "bcc": []})
         );
     }
 
@@ -348,7 +349,7 @@ mod tests {
         let path = fixture(dir.path());
         let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
         assert_eq!(result.removed_count, 2);
-        assert_kept_scope(&path);
+        assert_kept_scope(&path, false);
     }
 
     #[test]
@@ -381,7 +382,7 @@ mod tests {
         assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 33003);
         drop(conn);
         apply_project_scope(&path, &["keep".to_string()]).unwrap();
-        assert_kept_scope(&path);
+        assert_kept_scope(&path, false);
     }
 
     #[test]
@@ -404,7 +405,7 @@ mod tests {
         drop(conn);
         let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
         assert_eq!(result.removed_count, 398);
-        assert_kept_scope(&path);
+        assert_kept_scope(&path, false);
     }
 
     #[test]
@@ -451,7 +452,7 @@ mod tests {
         let path = fixture(dir.path());
         add_project_mailbox_state(&path);
         apply_project_scope(&path, &["keep".to_string()]).unwrap();
-        assert_kept_scope(&path);
+        assert_kept_scope(&path, true);
         let conn = Conn::open_file(path.display().to_string()).unwrap();
         assert_eq!(
             scalar(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
