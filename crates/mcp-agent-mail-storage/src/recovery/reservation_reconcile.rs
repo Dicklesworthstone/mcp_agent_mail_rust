@@ -13,7 +13,7 @@ use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use git2::{ObjectType, Oid, Repository};
 use mcp_agent_mail_core::{Config, reservation_artifact::reservation_artifact_filename};
-use mcp_agent_mail_db::{DbError, DbPool, FileReservationRow, corruption_circuit_breaker};
+use mcp_agent_mail_db::{DbConn, DbError, DbPool, FileReservationRow, corruption_circuit_breaker};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest as _, Sha1};
@@ -263,6 +263,10 @@ fn select_ids(
 
 fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<ReleaseSource>, String> {
     let conn = outcome(block_on(pool.acquire(cx)))?;
+    read_source_connection(&conn, id)
+}
+
+fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<ReleaseSource>, String> {
     // Identity, effective release and generation belong to one SQL snapshot.
     // Bound raw strings before materializing them; never seed a generation.
     let rows = conn.query_sync(
@@ -492,12 +496,21 @@ fn publish_release(
     targets: ReleaseTargets,
     attempted: &mut bool,
 ) -> crate::Result<bool> {
+    // Pool checkout may wait for capacity or connection validation. Never
+    // retain the global archive fence while waiting: a current borrower may
+    // itself need that fence before it can return the only source connection.
+    let checkout = pool.acquire(cx);
+    #[cfg(test)]
+    let checkout = tests::observe_checkout_pending(checkout);
+    let conn = outcome(block_on(checkout)).map_err(invalid)?;
     // Keep typed admission failures until the scheduler has distinguished
     // retryable contention from conflicting source/archive evidence.
     let _mutation = repair_lock::try_begin_at(cx, &config.storage_root)?;
     let archive = crate::ensure_archive(config, &original.project_slug)?;
     repair_lock::with_repair_lock(cx, &archive, || {
-        let source = read_source(cx, pool, original.id).map_err(invalid)?;
+        // A source captured before checkout or lock admission is not enough:
+        // re-read the current generation and release under the archive locks.
+        let source = read_source_connection(&conn, original.id).map_err(invalid)?;
         if source.as_ref() != Some(original) {
             return Err(invalid(
                 "reservation source/generation changed before publication; deferred",
@@ -564,7 +577,7 @@ fn publish_release(
         // Recheck both live source and exact working bytes immediately before
         // replacing anything. The outer source lease prevents DB promotion;
         // terminal release is monotone within that generation.
-        if read_source(cx, pool, original.id)
+        if read_source_connection(&conn, original.id)
             .map_err(invalid)?
             .as_ref()
             != Some(original)
@@ -573,6 +586,10 @@ fn publish_release(
                 "reservation source changed during artifact verification; deferred",
             ));
         }
+        // Both authoritative observations are complete. Return this reader
+        // before file publication and Git I/O, without another pool checkout
+        // inside the publication window.
+        drop(conn);
         for target in &targets {
             if read_artifact(&target.path)?
                 .as_ref()
@@ -725,8 +742,9 @@ pub fn reconcile_released_reservation(
 /// Generation/identity conflicts, oversized artifacts and symlinks remain on
 /// finite history for manual review, not the contention retry lane. Retry debt
 /// is process-local; restarting safely starts new finite source scans.
-/// Source connections are released before Git I/O; a write-activity lease
-/// prevents recovery promotion from replacing the source during the pass.
+/// Source connections are acquired before archive locks and released before
+/// Git I/O; a write-activity lease prevents recovery promotion from replacing
+/// the source during the pass.
 /// Closed or contended admission defers without advancing cursors or retries.
 pub fn reconcile_reservation_releases(
     cx: &Cx,
@@ -741,6 +759,98 @@ pub fn reconcile_reservation_releases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        static CHECKOUT_PENDING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // Observe an actual pending pool checkout without injecting an error or
+    // changing its completion. Only the current test thread can arm the probe.
+    pub(super) async fn observe_checkout_pending<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|context| {
+            let result = std::future::Future::poll(future.as_mut(), context);
+            if result.is_pending() {
+                CHECKOUT_PENDING.with(|slot| {
+                    if let Some(sender) = slot.borrow_mut().take() {
+                        let _ = sender.send(());
+                    }
+                });
+            }
+            result
+        })
+        .await
+    }
+
+    fn exercise_checkout_wait(changed_generation: bool) {
+        fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let held = outcome(block_on(pool.acquire(cx))).unwrap();
+            let worker_pool = pool.clone();
+            let worker_config = config.clone();
+            let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                CHECKOUT_PENDING.with(|slot| {
+                    *slot.borrow_mut() = Some(pending_tx);
+                });
+                let _activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+                    .expect("uncontended source admission");
+                publish_release(
+                    &Cx::for_testing(),
+                    &worker_pool,
+                    &worker_config,
+                    &source,
+                    ReleaseTargets::WithOwnedAliases,
+                    &mut false,
+                )
+            });
+            let pending = pending_rx.recv_timeout(std::time::Duration::from_secs(5));
+            // These observations precede releasing the actual sole DB reader.
+            // The old lock order retained the archive fence during this wait.
+            let fence_available = crate::ARCHIVE_PUBLICATION_FENCE.try_lock().is_ok();
+            let archive_absent = !config.storage_root.join(".git").exists();
+            if changed_generation {
+                held.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0")
+                    .unwrap();
+            }
+            drop(held);
+            let result = worker.join().unwrap();
+            pending.expect("observe an actual pending single-connection checkout");
+            assert!(fence_available, "DB checkout retained the global archive fence");
+            assert!(archive_absent, "archive initialized before source checkout completed");
+            let relative = "projects/project/file_reservations/id-401-gaabb.json";
+            if changed_generation {
+                assert!(result.unwrap_err().to_string().contains("source/generation changed"));
+                assert!(!config.storage_root.join(relative).exists());
+            } else {
+                assert!(result.unwrap());
+                let bytes = fs::read(config.storage_root.join(relative)).unwrap();
+                let artifact: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(timestamp(&artifact["released_ts"]), Some(5_000_000));
+                assert_eq!(artifact["db_generation"], "aabb");
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let tree = head_tree(&repo).unwrap().unwrap();
+                assert_eq!(
+                    committed_artifact(&repo, Some(&tree), relative)
+                        .unwrap()
+                        .unwrap()
+                        .bytes,
+                    bytes,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn source_checkout_wait_does_not_block_unrelated_archive_publication() {
+        exercise_checkout_wait(false);
+    }
+
+    #[test]
+    fn source_changed_during_checkout_cannot_publish_captured_release() {
+        exercise_checkout_wait(true);
+    }
 
     #[test]
     fn progress_round_trips_and_keeps_the_latest_repair_across_owners() {
