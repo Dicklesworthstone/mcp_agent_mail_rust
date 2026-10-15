@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+mod checkpoint;
+
 const MAX_RETRY_IDS: usize = 1024;
 const RETRY_IDS_PER_BATCH: usize = 8;
 const RETRY_REPAIRS_PER_BATCH: usize = 2;
@@ -24,6 +26,7 @@ struct DeferredRelease {
 #[derive(Debug, Default)]
 pub(super) struct RetryQueue {
     pending: VecDeque<DeferredRelease>,
+    checkpoint: checkpoint::State,
 }
 
 impl RetryQueue {
@@ -194,11 +197,26 @@ pub(super) fn run(
     }
     let identity = pool.sqlite_identity_key();
     if identity != cursor.source_identity {
+        let checkpoint_enabled = cursor.retries.checkpoint.enabled;
         *cursor = ReservationReconcileCursor {
             source_identity: identity,
             ..Default::default()
         };
+        cursor.retries.checkpoint.enabled = checkpoint_enabled;
     }
+    // This admission lease also brackets checkpoint load/save. The admitted
+    // scanner must not reacquire admission after a promotion begins draining us.
+    checkpoint::run_admitted(cx, pool, config, cursor, stop)
+}
+
+fn run_admitted(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReservationReconcileCursor,
+    stop: &AtomicBool,
+) -> Result<ReservationReconcileReport, String> {
+    let mut report = ReservationReconcileReport::default();
     let due = cursor.retries.due(Instant::now());
     let mut selected_count = i64::try_from(due.len()).expect("bounded retry selection");
     let mut seen = HashSet::new();
