@@ -1,0 +1,101 @@
+[
+  {
+    "name": "ensure project",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": {
+        "name": "ensure_project",
+        "arguments": {
+          "human_key": "/tmp/agent-mail-idle-fixture"
+        }
+      }
+    },
+    "expect_contains": [
+      "/tmp/agent-mail-idle-fixture"
+    ]
+  },
+  {
+    "name": "register agent",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "tools/call",
+      "params": {
+        "name": "register_agent",
+        "arguments": {
+          "project_key": "/tmp/agent-mail-idle-fixture",
+          "name": "BlueLake",
+          "program": "idle-cpu-regression",
+          "model": "test"
+        }
+      }
+    },
+    "expect_contains": [
+      "BlueLake"
+    ]
+  },
+  {
+    "name": "send message",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "method": "tools/call",
+      "params": {
+        "name": "send_message",
+        "arguments": {
+          "project_key": "/tmp/agent-mail-idle-fixture",
+          "sender_name": "BlueLake",
+          "to": [
+            "BlueLake"
+          ],
+          "subject": "{{RUN_TOKEN}}",
+          "body_md": "{{RUN_TOKEN}} normal workload responsiveness"
+        }
+      }
+    },
+    "expect_contains": [
+      "{{RUN_TOKEN}}"
+    ]
+  },
+  {
+    "name": "fetch inbox",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "method": "tools/call",
+      "params": {
+        "name": "fetch_inbox",
+        "arguments": {
+          "project_key": "/tmp/agent-mail-idle-fixture",
+          "agent_name": "BlueLake",
+          "include_bodies": true,
+          "limit": 10
+        }
+      }
+    },
+    "expect_contains": [
+      "{{RUN_TOKEN}}"
+    ]
+  },
+  {
+    "name": "search message",
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 5,
+      "method": "tools/call",
+      "params": {
+        "name": "search_messages",
+        "arguments": {
+          "project_key": "/tmp/agent-mail-idle-fixture",
+          "query": "{{RUN_TOKEN}}",
+          "limit": 10
+        }
+      }
+    },
+    "expect_contains": [
+      "{{RUN_TOKEN}}"
+    ]
+  }
+]
