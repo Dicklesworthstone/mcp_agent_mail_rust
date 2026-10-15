@@ -84,6 +84,10 @@ impl QueryClass {
 }
 
 /// Tunables for candidate budget derivation.
+///
+/// A zero mode-specific multiplier or lane maximum disables that lane.
+/// Reallocation only boosts a lane that was already enabled. Hard maxima win
+/// over minima, including when a caller supplies inverted bounds.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CandidateBudgetConfig {
     /// Base lexical multiplier in explicit hybrid mode, scaled by 100.
@@ -104,7 +108,8 @@ pub struct CandidateBudgetConfig {
     pub max_lexical: usize,
     /// Maximum semantic candidate request cap.
     pub max_semantic: usize,
-    /// Maximum combined candidate set size before fusion.
+    /// Maximum combined candidate set size before fusion. Zero disables retrieval.
+    /// Positive values cap the merged output, not each source's overfetch.
     pub max_combined: usize,
 }
 
@@ -232,6 +237,9 @@ impl CandidateBudget {
     }
 
     /// Derive stage budgets and an explainable decision payload.
+    ///
+    /// Reallocation never revives a disabled lane or shrinks a healthy lane.
+    /// Lexical fallback and empty queries cannot allocate semantic candidates.
     #[must_use]
     pub fn derive_with_decision(
         requested_limit: usize,
@@ -242,6 +250,16 @@ impl CandidateBudget {
         const SCALE: u64 = 100;
         let requested_limit = requested_limit.clamp(1, 100_000);
         let decision = derive_budget_decision(mode, query_class);
+        if config.max_combined == 0 {
+            return CandidateBudgetDerivation {
+                budget: Self {
+                    lexical_limit: 0,
+                    semantic_limit: 0,
+                    combined_limit: 0,
+                },
+                decision,
+            };
+        }
 
         let (base_lexical_bps, base_semantic_bps) = match mode {
             CandidateMode::Hybrid => (config.hybrid_lexical_bps, config.hybrid_semantic_bps),
@@ -256,71 +274,64 @@ impl CandidateBudget {
             QueryClass::Empty => (100_u32, 0_u32),
         };
 
-        let lexical_limit = {
-            let lim =
-                scaled_ceil_limit(requested_limit, base_lexical_bps, class_lexical_bps, SCALE);
-            if lim == 0 {
-                0
-            } else {
-                lim.clamp(config.min_lexical, config.max_lexical)
-            }
-        };
+        let mut lexical_limit = clamp_candidate_limit(
+            scaled_ceil_limit(requested_limit, base_lexical_bps, class_lexical_bps, SCALE),
+            config.min_lexical,
+            config.max_lexical,
+        );
+        let mut semantic_limit = clamp_candidate_limit(
+            scaled_ceil_limit(requested_limit, base_semantic_bps, class_semantic_bps, SCALE),
+            config.min_semantic,
+            config.max_semantic,
+        );
 
-        let semantic_limit = {
-            let lim = scaled_ceil_limit(
-                requested_limit,
-                base_semantic_bps,
-                class_semantic_bps,
-                SCALE,
-            );
-            if lim == 0 {
-                0
-            } else {
-                lim.clamp(config.min_semantic, config.max_semantic)
-            }
-        };
-
-        let final_lexical = if semantic_limit == 0 {
-            // Re-allocate full budget to lexical if semantic is effectively bypassed
-            let lim = scaled_ceil_limit(
-                requested_limit,
-                config.lexical_fallback_bps,
-                class_lexical_bps,
-                SCALE,
-            );
-            if lim == 0 {
-                0
-            } else {
-                lim.clamp(config.min_lexical, config.max_lexical)
-            }
-        } else {
-            lexical_limit
-        };
-
-        let final_semantic = if final_lexical == 0 {
-            // Re-allocate full budget to semantic if lexical is effectively bypassed
-            let lim = scaled_ceil_limit(
-                requested_limit,
-                config.hybrid_semantic_bps,
-                class_semantic_bps,
-                SCALE,
-            );
-            if lim == 0 {
-                0
-            } else {
-                lim.clamp(config.min_semantic, config.max_semantic)
-            }
-        } else {
-            semantic_limit
-        };
+        // A single healthy lane may use its fallback multiplier for extra
+        // recall. Neither a zero multiplier nor a zero cap is permission to
+        // turn on a different lane, and a smaller fallback cannot shrink it.
+        if semantic_limit == 0 && lexical_limit > 0 {
+            lexical_limit = lexical_limit.max(clamp_candidate_limit(
+                scaled_ceil_limit(
+                    requested_limit,
+                    config.lexical_fallback_bps,
+                    class_lexical_bps,
+                    SCALE,
+                ),
+                config.min_lexical,
+                config.max_lexical,
+            ));
+        }
+        if lexical_limit == 0 && semantic_limit > 0 {
+            semantic_limit = semantic_limit.max(clamp_candidate_limit(
+                scaled_ceil_limit(
+                    requested_limit,
+                    config.hybrid_semantic_bps,
+                    class_semantic_bps,
+                    SCALE,
+                ),
+                config.min_semantic,
+                config.max_semantic,
+            ));
+        }
 
         let budget = Self {
-            lexical_limit: final_lexical,
-            semantic_limit: final_semantic,
-            combined_limit: (final_lexical.saturating_add(final_semantic)).min(config.max_combined),
+            lexical_limit,
+            semantic_limit,
+            combined_limit: lexical_limit
+                .saturating_add(semantic_limit)
+                .min(config.max_combined),
         };
 
         CandidateBudgetDerivation { budget, decision }
+    }
+}
+
+/// Hard caps take precedence over minima; zero work stays zero. Normalizing
+/// the lower bound also prevents user-supplied inverted bounds from panicking.
+fn clamp_candidate_limit(limit: usize, minimum: usize, maximum: usize) -> usize {
+    if limit == 0 || maximum == 0 {
+        0
+    } else {
+        limit.clamp(minimum.min(maximum), maximum)
     }
 }
 
@@ -644,7 +655,8 @@ fn prepared_candidate_cmp(left: &PreparedCandidate, right: &PreparedCandidate) -
 }
 
 #[cfg(test)]
-mod tests;
-
+mod budget_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod tests;
