@@ -1,5 +1,7 @@
 //! Agent repair shares the message/reservation worker's source pool (GH#353).
 //! Admission refusal is scheduling backpressure, not a failed source generation.
+//! Productive finite scans catch up in bounded bursts; contention yields without
+//! bypassing storage's per-ID backoff or delaying other maintenance phases.
 
 use asupersync::Cx;
 use mcp_agent_mail_core::Config;
@@ -8,26 +10,71 @@ use mcp_agent_mail_storage::recovery::agent_reconcile::{
     AgentReconcileCursor, AgentReconcileReport, reconcile_agent_batch,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const ADMISSION_DEFERRED: &str =
     "agent reconciliation deferred: recovery promotion or admission contention";
+const MAX_BATCHES_PER_TURN: usize = 8;
+const MAX_ACTIVE_PER_TURN: Duration = Duration::from_millis(250);
 
-/// Run one original, bounded storage batch. Only a real source failure asks
-/// the owning worker to retire the pool also used by message/release repair.
-/// A refused attempt neither reports success nor retries inside this turn.
+/// Run productive storage batches in a bounded turn. Every batch retains its
+/// original four-repair/32-candidate bounds. The time target is checked between
+/// batches, not a hard deadline on a filesystem, SQL, or Git operation.
+///
+/// A refusal neither reports success nor retries inside this turn. Only a real
+/// source failure asks the owner to retire the shared message/release pool.
 pub(super) fn run(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
     cursor: &mut AgentReconcileCursor,
     stop: &AtomicBool,
-    observe: impl FnOnce(&AgentReconcileReport),
+    observe: impl FnMut(&AgentReconcileReport),
 ) -> Result<bool, String> {
-    finish(
-        reconcile_agent_batch(cx, pool, config, cursor, stop),
+    let started = Instant::now();
+    run_with(
+        || reconcile_agent_batch(cx, pool, config, cursor, stop),
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
+        || started.elapsed(),
         observe,
     )
+}
+
+fn run_with(
+    mut batch: impl FnMut() -> Result<AgentReconcileReport, String>,
+    mut interrupted: impl FnMut() -> bool,
+    mut elapsed: impl FnMut() -> Duration,
+    mut observe: impl FnMut(&AgentReconcileReport),
+) -> Result<bool, String> {
+    let mut batches = 0;
+    loop {
+        if interrupted() {
+            return Ok(false);
+        }
+        let mut continue_turn = false;
+        let follow_up = finish(batch(), &mut interrupted, |report| {
+            batches += 1;
+            // Healthy pages matter as well as repairs: a lost retirement may
+            // sit beyond thousands of already-correct profiles. A transient,
+            // conflicting, or zero-progress pass always hands back the thread.
+            continue_turn = !report.interrupted
+                && report.budget_exhausted
+                && report.deferred == 0
+                && report.deferred_transient == 0
+                && report.retry_len == 0
+                && (report.repaired > 0 || report.unchanged > 0);
+            observe(report);
+        })?;
+        if interrupted() || !follow_up {
+            return Ok(false);
+        }
+        if !continue_turn
+            || batches >= MAX_BATCHES_PER_TURN
+            || elapsed() >= MAX_ACTIVE_PER_TURN
+        {
+            return Ok(true);
+        }
+    }
 }
 
 fn finish(
@@ -168,6 +215,164 @@ mod tests {
                 assert_eq!(observed.get(), 1);
             }
         }
+    }
+
+    #[test]
+    fn healthy_roster_pages_continue_without_requiring_a_repair() {
+        let mut calls = 0;
+        let mut reports = Vec::new();
+        let follow_up = run_with(
+            || {
+                calls += 1;
+                Ok(match calls {
+                    1 => AgentReconcileReport {
+                        scanned: 32,
+                        unchanged: 32,
+                        budget_exhausted: true,
+                        ..Default::default()
+                    },
+                    2 => AgentReconcileReport {
+                        scanned: 1,
+                        repaired: 1,
+                        ..Default::default()
+                    },
+                    _ => panic!("a completed finite scan must end the turn"),
+                })
+            },
+            || false,
+            || Duration::ZERO,
+            |report| reports.push((report.scanned, report.repaired)),
+        )
+        .unwrap();
+        assert!(!follow_up);
+        assert_eq!(calls, 2);
+        assert_eq!(reports, [(32, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn catch_up_turn_has_independent_batch_and_elapsed_limits() {
+        for (elapsed, expected_calls) in [(Duration::ZERO, 8), (Duration::from_millis(250), 1)] {
+            let mut calls = 0;
+            let mut observed = 0;
+            assert!(
+                run_with(
+                    || {
+                        calls += 1;
+                        Ok(AgentReconcileReport {
+                            scanned: 4,
+                            repaired: 4,
+                            budget_exhausted: true,
+                            ..Default::default()
+                        })
+                    },
+                    || false,
+                    || elapsed,
+                    |_| observed += 1,
+                )
+                .unwrap()
+            );
+            assert_eq!(calls, expected_calls);
+            assert_eq!(observed, expected_calls);
+        }
+    }
+
+    #[test]
+    fn transient_conflicting_and_zero_progress_batches_yield_the_shared_worker() {
+        for report in [
+            AgentReconcileReport {
+                scanned: 32,
+                unchanged: 31,
+                deferred: 1,
+                deferred_transient: 1,
+                retry_len: 1,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+            AgentReconcileReport {
+                scanned: 32,
+                unchanged: 31,
+                deferred: 1,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+            AgentReconcileReport {
+                retry_len: 1024,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+        ] {
+            let mut pending = Some(report);
+            let mut observed = 0;
+            assert!(
+                run_with(
+                    || Ok(pending.take().expect("a refusing pass must not be retried in this turn")),
+                    || false,
+                    || Duration::ZERO,
+                    |_| observed += 1,
+                )
+                .unwrap()
+            );
+            assert_eq!(observed, 1);
+        }
+    }
+
+    #[test]
+    fn admission_refusal_after_progress_is_not_reported_as_a_completed_batch() {
+        let mut calls = 0;
+        let mut observed = 0;
+        assert!(
+            run_with(
+                || {
+                    calls += 1;
+                    match calls {
+                        1 => Ok(AgentReconcileReport {
+                            repaired: 4,
+                            budget_exhausted: true,
+                            ..Default::default()
+                        }),
+                        2 => Err(ADMISSION_DEFERRED.into()),
+                        _ => panic!("no repeated admission in a single turn"),
+                    }
+                },
+                || false,
+                || Duration::ZERO,
+                |_| observed += 1,
+            )
+            .unwrap()
+        );
+        assert_eq!((calls, observed), (2, 1));
+    }
+
+    #[test]
+    fn cancellation_between_batches_stops_without_rearming() {
+        let stopped = Cell::new(false);
+        let mut calls = 0;
+        assert!(
+            !run_with(
+                || {
+                    calls += 1;
+                    Ok(AgentReconcileReport {
+                        repaired: 4,
+                        budget_exhausted: true,
+                        ..Default::default()
+                    })
+                },
+                || stopped.get(),
+                || Duration::ZERO,
+                |_| stopped.set(true),
+            )
+            .unwrap()
+        );
+        assert_eq!(calls, 1);
+        assert!(
+            !run_with(
+                || panic!("cancelled work must not touch storage"),
+                || true,
+                || Duration::ZERO,
+                |_| panic!("cancelled work has no report"),
+            )
+            .unwrap()
+        );
     }
 
     // Isolate the real process-global promotion gate from unrelated libtests.
@@ -343,32 +548,32 @@ mod tests {
         assert_eq!(format!("{cursor:?}"), position);
         drop(promotion);
 
-        // Ordinary writers do not exclude archive repair. Keep one counted
-        // throughout the two bounded batches, then inspect actual Git blobs.
+        // Ordinary writers do not exclude archive repair. The exact same two
+        // bounded batches may fit in one turn or require a second time slice.
         let writer = write_barrier::begin_write_activity();
         let mut repaired = Vec::new();
-        assert!(
-            run(
-                &cx,
-                &pool,
-                &config,
-                &mut cursor,
-                &AtomicBool::new(false),
-                |report| repaired.push(report.repaired),
-            )
-            .unwrap()
-        );
-        assert!(
-            !run(
-                &cx,
-                &pool,
-                &config,
-                &mut cursor,
-                &AtomicBool::new(false),
-                |report| repaired.push(report.repaired),
-            )
-            .unwrap()
-        );
+        let follow_up = run(
+            &cx,
+            &pool,
+            &config,
+            &mut cursor,
+            &AtomicBool::new(false),
+            |report| repaired.push(report.repaired),
+        )
+        .unwrap();
+        if follow_up {
+            assert!(
+                !run(
+                    &cx,
+                    &pool,
+                    &config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                    |report| repaired.push(report.repaired),
+                )
+                .unwrap()
+            );
+        }
         drop(writer);
         assert_eq!(repaired, [4, 1]);
         assert_eq!(pool.engine_identity_key(), engine);
@@ -394,5 +599,67 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn real_worker_reaches_lost_retirement_beyond_a_full_healthy_roster_page() {
+        if isolated() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (config, _, pool) = mailbox(temp.path());
+        let cx = Cx::for_testing();
+        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+        for id in 706..=734 {
+            conn.execute_sync(
+                "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(?, 701, ?, 'test', 'test', '', 1000000, 2000000)",
+                &[id.into(), format!("Agent{id}").into()],
+            ).unwrap();
+        }
+        drop(conn);
+        let mut cursor = AgentReconcileCursor::default();
+        let stop = AtomicBool::new(false);
+        let mut initial_repairs = 0;
+        let mut backlog = true;
+        for _ in 0..16 {
+            if !backlog {
+                break;
+            }
+            backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
+                assert_eq!(report.deferred, 0);
+                initial_repairs += report.repaired;
+            }).unwrap();
+        }
+        assert!(!backlog, "initial profile materialization did not converge");
+        assert_eq!(initial_repairs, 34);
+        let relative = "projects/gh353/agents/Agent734/profile.json";
+        let before = std::fs::read(config.storage_root.join(relative)).unwrap();
+        fastmcp_core::block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
+            &cx, &pool, 734, Some(345_678_901),
+        )).into_result().unwrap();
+        // Deliberately no lifecycle archive enqueue, client read, or resend.
+        assert_eq!(std::fs::read(config.storage_root.join(relative)).unwrap(), before);
+        let mut reports = Vec::new();
+        let mut backlog = true;
+        for _ in 0..2 {
+            if !backlog {
+                break;
+            }
+            backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
+                assert_eq!(report.deferred, 0);
+                reports.push((report.scanned, report.repaired));
+            }).unwrap();
+        }
+        assert!(!backlog);
+        assert_eq!(reports, [(32, 0), (2, 1)]);
+        let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
+        let profile: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(profile["retired_at"], mcp_agent_mail_db::micros_to_iso(345_678_901));
+        assert!(profile.get("registration_token").is_none());
+        let repo = git2::Repository::open(&config.storage_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
+        assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+        assert_profiles_match_source_and_git(&cx, &pool, &config);
     }
 }
