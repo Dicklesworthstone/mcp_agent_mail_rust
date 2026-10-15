@@ -2856,7 +2856,14 @@ pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
 fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Result<()> {
     let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
-            let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
+            // br-r6psd: this server process normally already holds live
+            // FrankenSQLite pool connections on `path`. Hashing the main inode
+            // through an ad-hoc descriptor would, on close, release every
+            // classic `fcntl` lock they hold (Linux), and its raw format can
+            // never match the lock-neutral record the pool writes (br-oyget).
+            // Use the pool's own descriptor-neutral fingerprint instead.
+            let fingerprint =
+                mcp_agent_mail_db::pool::recovery_breaker_fingerprint(path, Some(&state));
             state.applies_to(&fingerprint).then(|| {
                 format!(
                     "durable recovery-breaker state records {} failed attempt(s) for this recovery lineage{}",
@@ -31224,8 +31231,8 @@ first body
     /// br-r6psd regression (Linux): the raw TUI/metrics/observability open
     /// guard runs inside the server process, beside live FrankenSQLite pool
     /// connections. With nonclean durable breaker authority on disk it must
-    /// compare fingerprints without opening the live main inode; on origin/main
-    /// `recovery_breaker::fingerprint_db` opens, hashes and closes it, which
+    /// compare fingerprints without opening the live main inode. The raw
+    /// `recovery_breaker::fingerprint_db` it used to call opens, hashes and closes it, which
     /// releases every classic `fcntl` lock this process holds there, so a
     /// separate process stops seeing the parent's RESERVED/SHARED locks.
     #[cfg(target_os = "linux")]

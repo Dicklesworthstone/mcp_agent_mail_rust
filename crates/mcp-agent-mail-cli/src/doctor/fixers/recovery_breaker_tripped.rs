@@ -127,8 +127,13 @@ fn detect_one(db_path: &Path) -> Option<RecoveryBreakerTrippedFinding> {
     if !state.tripped {
         return None;
     }
-    if !state.applies_to(&mcp_agent_mail_db::recovery_breaker::fingerprint_db(
+    // Compare with the pool's descriptor-neutral fingerprint: a raw content
+    // hash never matches the lock-neutral record written for a Franken-managed
+    // family (br-oyget), and opening the live main inode is lock-hazardous in
+    // any process that also holds a FrankenSQLite connection on it (br-r6psd).
+    if !state.applies_to(&mcp_agent_mail_db::pool::recovery_breaker_fingerprint(
         db_path,
+        Some(&state),
     )) {
         // Changed content after a completed attempt starts a new lineage.
         return None;
@@ -206,6 +211,40 @@ mod tests {
         assert_eq!(findings[0].db_path, db);
         assert_eq!(findings[0].consecutive_failures, 3);
         assert_eq!(findings[0].last_failure_reason, "boom again");
+        assert!(findings[0].authority_error.is_none());
+    }
+
+    #[test]
+    fn detector_flags_tripped_breaker_on_franken_managed_family() {
+        // br-r6psd / br-oyget: the pool records a lock-neutral fingerprint for
+        // a Franken-managed family (namespace sidecars present). A raw content
+        // hash never equals it, so a detector comparing against
+        // `fingerprint_db` silently missed every tripped breaker there.
+        let td = TempDir::new().unwrap();
+        let db = td.path().join("storage.sqlite3");
+        std::fs::write(&db, b"stuck-content").unwrap();
+        let mut namespace_gate = db.clone().into_os_string();
+        namespace_gate.push("-fsqlite-ns-gate");
+        std::fs::write(&namespace_gate, b"").unwrap();
+        let fingerprint = mcp_agent_mail_db::pool::recovery_breaker_fingerprint(&db, None);
+        assert_ne!(
+            fingerprint,
+            fingerprint_db(&db),
+            "precondition: a Franken-managed family records the lock-neutral format"
+        );
+        let mut state = record_failure(None, &fingerprint, "boom", CFG, 10);
+        state = record_failure(Some(&state), &fingerprint, "boom", CFG, 20);
+        state = record_failure(Some(&state), &fingerprint, "boom again", CFG, 30);
+        assert!(state.tripped);
+        store(&db, &state).unwrap();
+
+        let findings = detect(std::slice::from_ref(&db));
+        assert_eq!(
+            findings.len(),
+            1,
+            "a tripped Franken-managed breaker must flag"
+        );
+        assert_eq!(findings[0].consecutive_failures, 3);
         assert!(findings[0].authority_error.is_none());
     }
 

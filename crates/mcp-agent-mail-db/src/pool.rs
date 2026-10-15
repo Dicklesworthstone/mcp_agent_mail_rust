@@ -1284,8 +1284,17 @@ fn lock_neutral_sqlite_generation_fingerprint(path: &Path) -> String {
 
 /// Recovery-breaker fingerprint that never independently opens a live
 /// FrankenSQLite main inode.
+///
+/// Every consumer that compares durable breaker authority against the current
+/// generation (pool admission, the server's raw observability guard, doctor
+/// detection) must use this helper rather than
+/// [`crate::recovery_breaker::fingerprint_db`]: the latter opens, hashes and
+/// closes the main inode, which on Linux releases every classic `fcntl` lock
+/// held by this process's live FrankenSQLite connections, and its raw
+/// `len:sha256` format never equals the lock-neutral record written here for a
+/// Franken-managed family.
 #[must_use]
-fn recovery_breaker_fingerprint(
+pub fn recovery_breaker_fingerprint(
     primary_path: &Path,
     prior: Option<&crate::recovery_breaker::RecoveryBreakerState>,
 ) -> String {
