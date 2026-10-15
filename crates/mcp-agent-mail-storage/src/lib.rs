@@ -1525,16 +1525,6 @@ pub enum DirectArchiveWrite {
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-fn write_op_storage_root(op: &WriteOp) -> &Path {
-    match op {
-        WriteOp::MessageBundle { config, .. }
-        | WriteOp::AgentProfile { config, .. }
-        | WriteOp::FileReservation { config, .. }
-        | WriteOp::NotificationSignal { config, .. }
-        | WriteOp::ClearSignal { config, .. } => &config.storage_root,
-    }
-}
-
 fn write_op_sync_direct_with_cancel(
     op: &WriteOp,
     mut cancelled: impl FnMut() -> bool,
