@@ -5,7 +5,7 @@
 //! deferred ID behind a newer high-water mark. Nothing in this file is archive
 //! authority: every restored ID still traverses the normal live-source checks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -312,6 +312,99 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreState {
+    Absent,
+    Restored,
+    Merged,
+    CapacityBlocked,
+}
+
+/// Merge obligations, not authority or old scan positions. The per-pass flock
+/// permits another cursor to publish while this cursor has an unsaved pass.
+/// Ignoring that newer checkpoint would overwrite its deferred IDs on save;
+/// replacing this cursor would instead discard its memory-only obligations.
+/// Build both bounded queues before changing either, so saturation preserves
+/// the in-memory cursor AND the on-disk checkpoint for a later pass.
+fn merge_unsaved_debt(
+    cursor: &mut ReconcileCursor,
+    snapshot: Snapshot,
+    now: Instant,
+    wall_us: i64,
+) -> bool {
+    let clock_reversed = wall_us < snapshot.saved_at_us;
+    let mut durable = ReconcileCursor::default();
+    snapshot.restore(&mut durable, now, wall_us);
+    if clock_reversed {
+        // Reimporting the same future-dated snapshot must not restart its
+        // relative delay on every failed save. Keep this cursor's monotonic
+        // backoff below; newly discovered disk IDs can be inspected now.
+        for retry in &mut durable.retries {
+            retry.ready_at = now;
+        }
+        durable.conflict_backoff.clear();
+    }
+    let mut retries: VecDeque<DeferredRetry> = VecDeque::new();
+    let mut retry_indices = HashMap::new();
+    for retry in cursor.retries.iter().chain(&durable.retries) {
+        if let Some(&index) = retry_indices.get(&retry.id) {
+            let retained: &mut DeferredRetry = &mut retries[index];
+            // An equal/older observation must not renew a local monotonic
+            // deadline. A higher failure count is incorporated only once.
+            if retry.attempts > retained.attempts {
+                retained.attempts = retry.attempts;
+                retained.ready_at = retained.ready_at.max(retry.ready_at);
+            }
+        } else {
+            if retries.len() == MAX_RETRY_IDS {
+                return false;
+            }
+            retry_indices.insert(retry.id, retries.len());
+            retries.push_back(DeferredRetry {
+                id: retry.id,
+                attempts: retry.attempts,
+                ready_at: retry.ready_at,
+            });
+        }
+    }
+    let mut conflicts: VecDeque<(i64, Instant)> = VecDeque::new();
+    let mut conflict_indices = HashMap::new();
+    for (local, id, until) in cursor.conflict_backoff.iter().map(|&(id, until)| (true, id, until))
+        .chain(durable.conflict_backoff.iter().map(|&(id, until)| (false, id, until)))
+    {
+        // A conflicting observation must not discard a separately retained
+        // retry obligation. The next actual source/publication check decides
+        // whether it is still transient. Expired cooldowns are not work debt.
+        if until <= now {
+            continue;
+        }
+        if let Some(&index) = retry_indices.get(&id) {
+            if local {
+                retries[index].ready_at = retries[index].ready_at.max(until);
+            }
+            continue;
+        }
+        if let Some(&index) = conflict_indices.get(&id) {
+            if local {
+                let retained: &mut (i64, Instant) = &mut conflicts[index];
+                retained.1 = retained.1.max(until);
+            }
+        } else {
+            if conflicts.len() == MAX_RETRY_IDS {
+                return false;
+            }
+            conflict_indices.insert(id, conflicts.len());
+            conflicts.push_back((id, until));
+        }
+    }
+    cursor.retries = retries;
+    cursor.conflict_backoff = conflicts;
+    // Keep the live scan position and lane turns: reverting them on every
+    // failed save can pin memory-only repair to its first healthy page. The
+    // ordinary retry lane fairly rotates the union and rereads every source.
+    true
+}
+
 fn check_sidecar(path: &Path) -> io::Result<()> {
     if crate::path_existing_prefix_has_symlink(path).map_err(|error| invalid(&error.to_string()))? {
         return Err(invalid("checkpoint path has a symlinked component"));
@@ -418,8 +511,8 @@ impl Store {
         Ok(Some(snapshot))
     }
 
-    fn restore(&self, cursor: &mut ReconcileCursor) -> io::Result<bool> {
-        let Some(snapshot) = self.read_snapshot()? else { return Ok(false) };
+    fn restore(&self, cursor: &mut ReconcileCursor) -> io::Result<RestoreState> {
+        let Some(snapshot) = self.read_snapshot()? else { return Ok(RestoreState::Absent) };
         if snapshot.binding != self.binding {
             // A generation can change BETWEEN passes, while the same pool and
             // cursor survive. Reject its disk watermarks and reset the live
@@ -432,10 +525,19 @@ impl Store {
             return Err(invalid("checkpoint source/archive generation does not match"));
         }
         if cursor.checkpoint_dirty {
-            return Ok(false);
+            return Ok(if merge_unsaved_debt(
+                cursor,
+                snapshot,
+                Instant::now(),
+                mcp_agent_mail_db::now_micros(),
+            ) {
+                RestoreState::Merged
+            } else {
+                RestoreState::CapacityBlocked
+            });
         }
         snapshot.restore(cursor, Instant::now(), mcp_agent_mail_db::now_micros());
-        Ok(true)
+        Ok(RestoreState::Restored)
     }
 
     fn save(&self, cursor: &ReconcileCursor) -> io::Result<()> {
@@ -584,15 +686,24 @@ pub(super) fn run(
         }
     };
     let mut restored = false;
+    let mut save_permitted = true;
     if let Some(store) = &store {
         match store.restore(cursor) {
-            Ok(did_restore) => restored = did_restore,
+            Ok(RestoreState::Restored | RestoreState::Merged) => restored = true,
+            Ok(RestoreState::Absent) => {}
+            Ok(RestoreState::CapacityBlocked) => {
+                // Still run the original bounded repair pass: it may free
+                // enough capacity to merge next time. Neither cursor may
+                // overwrite obligations that the union could not retain.
+                save_permitted = false;
+                warn_unavailable(&invalid("combined checkpoint retry debt exceeds its bound"));
+            }
             Err(error) => warn_unavailable(&error),
         }
     }
     let mut result = reconcile_message_batch_inner(cx, pool, config, cursor, stop);
     cursor.checkpoint_dirty = true;
-    let saved = if let Some(store) = &store {
+    let saved = if save_permitted && let Some(store) = &store {
         if pool.sqlite_identity_key() == scope && cursor.source_identity == scope {
             match save_current(cx, pool, config, cursor, stop, store) {
                 Ok(()) => {
@@ -626,6 +737,234 @@ mod tests {
     use std::collections::VecDeque;
 
     const GENERATION: &str = "aabbccdd";
+
+    #[test]
+    fn unsaved_debt_merges_without_rewinding_the_live_scan_or_shortening_cooldowns() {
+        let (_temp, database, archive) = fixture();
+        let now = Instant::now();
+        let mut durable = debt(now);
+        durable.defer_transient(77, now);
+        durable.conflict_backoff.push_back((88, now + Duration::from_secs(20)));
+        let snapshot = Snapshot::capture(
+            Binding::at(&database, &archive, GENERATION).unwrap(),
+            &durable,
+            now,
+            1_000_000,
+        );
+        let mut cursor = ReconcileCursor::settled_before(999);
+        cursor.source_identity = "current live pool".into();
+        cursor.tail_after = Some(100_000);
+        cursor.backfill_ceiling = Some(50);
+        cursor.next_lane_is_history = true;
+        cursor.next_lane_is_retry = true;
+        cursor.startup_backfill_complete = true;
+        cursor.checkpoint_dirty = true;
+        cursor.defer_transient(80_000, now);
+        cursor.defer_transient(88, now);
+        cursor.conflict_backoff.push_back((77, now + Duration::from_secs(40)));
+        cursor.conflict_backoff.push_back((91, now));
+        assert!(merge_unsaved_debt(&mut cursor, snapshot, now, 11_000_000));
+        assert_eq!(
+            cursor.retries.iter().map(|retry| retry.id).collect::<Vec<_>>(),
+            [80_000, 88, 7, 77],
+        );
+        assert_eq!(cursor.retries[0].attempts, 6);
+        assert_eq!(cursor.retries[0].ready_at, now + Duration::from_secs(20));
+        assert_eq!(cursor.retries[1].ready_at, now);
+        assert_eq!(cursor.retries[3].ready_at, now + Duration::from_secs(40));
+        assert_eq!(cursor.conflict_backoff.iter().copied().collect::<Vec<_>>(), [(19, now + Duration::from_secs(50))]);
+        assert_eq!((cursor.tail_after, cursor.backfill_ceiling), (Some(100_000), Some(50)));
+        assert!(cursor.next_lane_is_history && cursor.next_lane_is_retry);
+        assert!(cursor.startup_backfill_complete && cursor.checkpoint_dirty);
+        assert_eq!(cursor.source_identity, "current live pool");
+        assert_eq!(cursor.settled_before_us, 999);
+    }
+
+    #[test]
+    fn dirty_cursor_retains_both_owners_after_a_real_failed_checkpoint_publication() {
+        let (_temp, database, archive) = fixture();
+        let binding = Binding::at(&database, &archive, GENERATION).unwrap();
+        let first = Store::open(binding).unwrap();
+        let mut cursor = debt(Instant::now());
+        first.save(&cursor).unwrap();
+        let original = std::fs::read(&first.path).unwrap();
+        cursor.defer_transient(77, Instant::now());
+        assert!(first.save_with(&cursor, || Err(io::Error::other("checkpoint publication failed"))).is_err());
+        assert_eq!(std::fs::read(&first.path).unwrap(), original);
+        cursor.checkpoint_dirty = true;
+        drop(first);
+
+        let second = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        let mut other = ReconcileCursor::default();
+        other.defer_transient(88, Instant::now());
+        second.save(&other).unwrap();
+        let newer = std::fs::read(&second.path).unwrap();
+        drop(second);
+
+        let resumed = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        assert_eq!(resumed.restore(&mut cursor).unwrap(), RestoreState::Merged);
+        assert_eq!(std::fs::read(&resumed.path).unwrap(), newer, "merge is memory-only until publication");
+        resumed.save(&cursor).unwrap();
+        let saved = resumed.load().unwrap().unwrap();
+        assert_eq!(saved.retries.iter().map(|retry| retry.id).collect::<Vec<_>>(), [7, 80_000, 77, 88]);
+        assert_eq!(saved.tail_after, Some(90_000));
+    }
+
+    #[test]
+    fn saturated_union_changes_neither_queue_and_retries_after_capacity_is_freed() {
+        let (_temp, database, archive) = fixture();
+        let store = Store::open(Binding::at(&database, &archive, GENERATION).unwrap()).unwrap();
+        let now = Instant::now();
+        let mut other = ReconcileCursor::default();
+        other.defer_transient(90_000, now);
+        store.save(&other).unwrap();
+        let original = std::fs::read(&store.path).unwrap();
+        let mut cursor = ReconcileCursor::default();
+        cursor.checkpoint_dirty = true;
+        for id in 1..=i64::try_from(MAX_RETRY_IDS).unwrap() {
+            cursor.defer_transient(id, now);
+        }
+        let before = format!("{cursor:?}");
+        assert_eq!(store.restore(&mut cursor).unwrap(), RestoreState::CapacityBlocked);
+        assert_eq!(format!("{cursor:?}"), before);
+        assert_eq!(std::fs::read(&store.path).unwrap(), original);
+        cursor.forget_retry(1);
+        assert_eq!(store.restore(&mut cursor).unwrap(), RestoreState::Merged);
+        assert_eq!(cursor.retries.len(), MAX_RETRY_IDS);
+        assert_eq!(cursor.retries.front().unwrap().id, 2);
+        assert_eq!(cursor.retries.back().unwrap().id, 90_000);
+        store.save(&cursor).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().retries.len(), MAX_RETRY_IDS);
+    }
+
+    #[test]
+    fn conflict_capacity_is_atomic_and_expiration_releases_the_union() {
+        let (_temp, database, archive) = fixture();
+        let now = Instant::now();
+        let mut other = ReconcileCursor::default();
+        other.defer_transient(90_000, now);
+        other.conflict_backoff.push_back((80_000, now + MAX_RETRY_BACKOFF));
+        let mut cursor = ReconcileCursor::default();
+        cursor.checkpoint_dirty = true;
+        for id in 1..=i64::try_from(MAX_RETRY_IDS).unwrap() {
+            cursor.conflict_backoff.push_back((id, now + Duration::from_secs(1)));
+        }
+        let make_snapshot = || Snapshot::capture(
+            Binding::at(&database, &archive, GENERATION).unwrap(), &other, now, 1_000_000,
+        );
+        let before = format!("{cursor:?}");
+        assert!(!merge_unsaved_debt(&mut cursor, make_snapshot(), now, 1_000_000));
+        assert_eq!(format!("{cursor:?}"), before, "retry merge must roll back too");
+        assert!(merge_unsaved_debt(
+            &mut cursor, make_snapshot(), now + Duration::from_secs(1), 2_000_000,
+        ));
+        assert_eq!(cursor.retries.len(), 1);
+        assert_eq!(cursor.retries[0].id, 90_000);
+        assert_eq!(cursor.conflict_backoff.iter().copied().collect::<Vec<_>>(), [(80_000, now + MAX_RETRY_BACKOFF)]);
+    }
+
+    #[test]
+    fn repeated_dirty_imports_do_not_renew_retry_deadlines_after_clock_reversal() {
+        let (_temp, database, archive) = fixture();
+        let now = Instant::now();
+        let mut durable = ReconcileCursor::default();
+        durable.defer_transient(7, now);
+        durable.defer_transient(7, now);
+        durable.conflict_backoff.push_back((19, now + MAX_RETRY_BACKOFF));
+        let make_snapshot = || Snapshot::capture(
+            Binding::at(&database, &archive, GENERATION).unwrap(), &durable, now, 9_000_000,
+        );
+        let mut cursor = ReconcileCursor::default();
+        cursor.defer_transient(7, now);
+        cursor.defer_transient(7, now);
+        let deadline = cursor.retries[0].ready_at;
+        for seconds in 0..=5 {
+            assert!(merge_unsaved_debt(
+                &mut cursor, make_snapshot(), now + Duration::from_secs(seconds), 1_000_000,
+            ));
+            assert_eq!(cursor.retries[0].ready_at, deadline);
+            assert_eq!(cursor.retries[0].attempts, 1);
+            assert!(cursor.conflict_backoff.is_empty());
+        }
+        assert!(deadline < now + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resumed_worker_repairs_both_cursors_debt_before_history_wrap() {
+        super::super::tests::retention_fixture(40, |cx, pool, config| {
+            let now = Instant::now();
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(940);
+            cursor.backfill_ceiling = Some(0);
+            cursor.defer_transient(901, now);
+            let first = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            first.save(&cursor).unwrap();
+            cursor.defer_transient(903, now);
+            assert!(first.save_with(&cursor, || Err(io::Error::other("checkpoint publication failed"))).is_err());
+            cursor.checkpoint_dirty = true;
+            drop(first);
+
+            let second = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            let mut other = ReconcileCursor::default();
+            other.tail_after = Some(940);
+            other.backfill_ceiling = Some(0);
+            other.defer_transient(902, now);
+            second.save(&other).unwrap();
+            drop(second);
+
+            let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            assert!(report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(true));
+            assert_eq!((report.scanned, report.repaired, report.deferred), (3, 3, 0));
+            assert!(cursor.retries.is_empty());
+            for id in [901, 902, 903] {
+                assert_message_committed(cx, pool, config, id);
+            }
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let rows = conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 40);
+            let rows = conn.query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id IN (901, 902, 903)", &[],
+            ).unwrap();
+            assert_eq!(rows.len(), 6);
+            for row in rows {
+                assert_eq!(row.get_named::<i64>("read_ts").unwrap(), 2_000_000);
+                assert_eq!(row.get_named::<i64>("ack_ts").unwrap(), 2_500_000);
+            }
+        });
+    }
+
+    #[test]
+    fn worker_at_union_capacity_repairs_without_overwriting_the_other_checkpoint() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            let now = Instant::now();
+            let store = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            let mut other = ReconcileCursor::default();
+            other.defer_transient(901, now);
+            store.save(&other).unwrap();
+            let path = store.path.clone();
+            let before = std::fs::read(&path).unwrap();
+            drop(store);
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(901);
+            cursor.backfill_ceiling = Some(0);
+            cursor.checkpoint_dirty = true;
+            for id in 10_000..10_000 + i64::try_from(MAX_RETRY_IDS).unwrap() {
+                cursor.defer_transient(id, now);
+            }
+            let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            assert!(!report.checkpoint_restored);
+            assert_eq!(report.checkpoint_saved, Some(false));
+            assert!(report.scanned > 0, "bounded repair must still run at checkpoint saturation");
+            assert!(report.scanned <= super::super::MAX_IDS_PER_PASS);
+            assert!(cursor.checkpoint_dirty);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let reopened = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
+            assert_eq!(reopened.load().unwrap().unwrap().retries[0].id, 901);
+        });
+    }
 
     #[test]
     fn gh354_occupied_checkpoint_skips_source_probes_and_preserves_bytes() {
