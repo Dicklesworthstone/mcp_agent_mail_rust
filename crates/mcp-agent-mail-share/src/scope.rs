@@ -54,13 +54,15 @@ pub struct RemainingCounts {
 /// Apply project scoping to a snapshot database.
 ///
 /// If `identifiers` is empty, all projects are kept and no deletions occur.
-/// Otherwise, only projects matching the given slugs or `human_keys` (case-insensitive,
-/// trimmed) are retained; all other project data is deleted.
+/// Otherwise, every identifier must be nonblank and match exactly one project
+/// by slug or `human_key` (case-insensitive, trimmed). All other project data is
+/// deleted. Ambiguous aliases never select a project by inventory order.
 ///
 /// # Errors
 ///
 /// - [`ShareError::ScopeNoProjects`] if the database has no discoverable project identities.
-/// - [`ShareError::ScopeIdentifierNotFound`] if any identifier doesn't match.
+/// - [`ShareError::ScopeIdentifierNotFound`] if any identifier is blank or doesn't match.
+/// - [`ShareError::Validation`] if an identifier matches multiple project identities.
 /// - [`ShareError::Sqlite`] on any SQLite error.
 pub fn apply_project_scope(
     snapshot_path: &Path,
@@ -83,7 +85,8 @@ pub fn apply_project_scope(
         return Err(ShareError::ScopeNoProjects);
     }
 
-    // If no identifiers, keep everything
+    // Only an absent scope authorizes exporting every project. An explicitly
+    // supplied but empty selector must never widen the requested disclosure.
     if identifiers.is_empty() {
         let remaining = count_remaining(&conn)?;
         return Ok(ProjectScopeResult {
@@ -94,29 +97,46 @@ pub fn apply_project_scope(
         });
     }
 
-    // Build lookup: slug.lower() -> record, human_key.lower() -> record
-    let mut lookup: HashMap<String, &ProjectRecord> = HashMap::new();
-    for p in &all_projects {
-        lookup.insert(p.slug.to_ascii_lowercase(), p);
-        lookup.insert(p.human_key.to_ascii_lowercase(), p);
+    // Slugs and human keys share a case-insensitive namespace. Preserve an
+    // ambiguity witness rather than letting the last inventory row win.
+    // Two aliases belonging to the same project are not ambiguous.
+    let mut lookup: HashMap<String, Option<&ProjectRecord>> = HashMap::new();
+    for project in &all_projects {
+        for alias in [&project.slug, &project.human_key] {
+            lookup
+                .entry(alias.to_ascii_lowercase())
+                .and_modify(|known| {
+                    if known.as_ref().is_some_and(|known| known.id != project.id) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(project));
+        }
     }
 
-    // Match identifiers (case-insensitive, trimmed)
+    // Resolve the entire request before beginning any deletion transaction.
     let mut matched: Vec<ProjectRecord> = Vec::new();
-    let mut matched_ids: Vec<i64> = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
     for ident in identifiers {
         let key = ident.trim().to_ascii_lowercase();
         if key.is_empty() {
-            continue;
+            return Err(ShareError::ScopeIdentifierNotFound {
+                identifier: ident.clone(),
+            });
         }
         match lookup.get(&key) {
-            Some(p) => {
-                if seen_ids.insert(p.id) {
-                    matched.push((*p).clone());
-                    matched_ids.push(p.id);
+            Some(Some(project)) => {
+                if seen_ids.insert(project.id) {
+                    matched.push((*project).clone());
                 }
+            }
+            Some(None) => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "ambiguous project scope identifier {ident:?}; use an unambiguous slug or human_key"
+                    ),
+                });
             }
             None => {
                 return Err(ShareError::ScopeIdentifierNotFound {
@@ -124,17 +144,6 @@ pub fn apply_project_scope(
                 });
             }
         }
-    }
-
-    // If all provided identifiers were empty/whitespace, treat as no-op scope.
-    if matched_ids.is_empty() {
-        let remaining = count_remaining(&conn)?;
-        return Ok(ProjectScopeResult {
-            identifiers: identifiers.to_vec(),
-            projects: all_projects,
-            removed_count: 0,
-            remaining,
-        });
     }
 
     // Compute disallowed IDs
@@ -821,28 +830,91 @@ mod tests {
     }
 
     #[test]
-    fn scope_ignores_empty_identifiers() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = create_test_db(dir.path());
-        let result = apply_project_scope(
-            &db,
-            &[String::new(), "   ".to_string(), "proj-alpha".to_string()],
-        )
-        .unwrap();
-        assert_eq!(result.removed_count, 1);
-        assert_eq!(result.projects.len(), 1);
-        assert_eq!(result.projects[0].slug, "proj-alpha");
+    fn scope_rejects_blank_identifiers_without_mutation() {
+        for identifiers in [
+            vec![String::new()],
+            vec!["   \t\n".to_string()],
+            vec!["\u{2003}".to_string()],
+            vec!["proj-alpha".to_string(), String::new()],
+            vec![String::new(), "proj-alpha".to_string()],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_test_db(dir.path());
+            let error = apply_project_scope(&db, &identifiers).unwrap_err();
+            assert!(matches!(error, ShareError::ScopeIdentifierNotFound { .. }));
+            let unchanged = apply_project_scope(&db, &[]).unwrap();
+            assert_eq!(unchanged.remaining.projects, 2);
+            assert_eq!(unchanged.remaining.messages, 3);
+            assert_eq!(unchanged.remaining.recipients, 3);
+        }
     }
 
     #[test]
-    fn scope_only_empty_identifiers_keeps_all() {
+    fn scope_rejects_ambiguous_aliases_before_any_deletion() {
+        for (sql, identifier) in [
+            ("UPDATE projects SET slug = 'PROJ-ALPHA' WHERE id = 2", "proj-alpha"),
+            ("UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 2", "proj-alpha"),
+            ("UPDATE projects SET human_key = '/DATA/PROJECTS/ALPHA' WHERE id = 2", "/data/projects/alpha"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_test_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(sql).unwrap();
+            drop(conn);
+            // An earlier valid selection must not permit a partial scope.
+            let error = apply_project_scope(
+                &db,
+                &["proj-beta".to_string(), identifier.to_string()],
+            );
+            // The slug-collision case changes proj-beta, so use its unique
+            // human key to reach the ambiguous selection in that case.
+            let error = if matches!(error, Err(ShareError::ScopeIdentifierNotFound { .. })) {
+                apply_project_scope(
+                    &db,
+                    &["/data/projects/beta".to_string(), identifier.to_string()],
+                )
+            } else {
+                error
+            }
+            .unwrap_err();
+            assert!(matches!(error, ShareError::Validation { .. }));
+            assert!(error.to_string().contains("ambiguous project scope"));
+            let unchanged = apply_project_scope(&db, &[]).unwrap();
+            assert_eq!(unchanged.remaining.projects, 2);
+            assert_eq!(unchanged.remaining.messages, 3);
+        }
+    }
+
+    #[test]
+    fn scope_can_use_unique_alias_despite_an_unrelated_collision() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let result = apply_project_scope(&db, &[String::new(), "   ".to_string()]).unwrap();
-        assert_eq!(result.removed_count, 0);
-        assert_eq!(result.projects.len(), 2);
-        assert_eq!(result.remaining.projects, 2);
-        assert_eq!(result.remaining.messages, 3);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE projects SET slug = 'PROJ-ALPHA' WHERE id = 2")
+            .unwrap();
+        drop(conn);
+        let result = apply_project_scope(&db, &[" /data/projects/alpha ".to_string()]).unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].id, 1);
+        assert_eq!(result.remaining.messages, 2);
+    }
+
+    #[test]
+    fn scope_identical_aliases_of_one_project_are_not_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 1")
+            .unwrap();
+        drop(conn);
+        let result = apply_project_scope(
+            &db,
+            &["proj-alpha".to_string(), "PROJ-ALPHA".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].id, 1);
+        assert_eq!(result.remaining.messages, 2);
     }
 
     #[test]
