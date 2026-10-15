@@ -5485,6 +5485,7 @@ dependencies = [
  "ftui-runtime",
  "ftui-tty",
  "ftui-widgets",
+ "git2",
  "glob",
  "include_dir",
  "jsonwebtoken",

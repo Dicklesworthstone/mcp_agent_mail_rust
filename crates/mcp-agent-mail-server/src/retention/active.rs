@@ -391,7 +391,7 @@ mod tests {
 
             let retained = pool.as_ref().expect("healthy idle turn retired source pool");
             assert_eq!(retained.engine_identity_key(), engine);
-            assert!(!retained.pool.is_closed());
+            assert!(!retained.is_closed());
         });
     }
 

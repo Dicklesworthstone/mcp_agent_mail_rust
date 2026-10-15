@@ -56,7 +56,8 @@ fn fixture() -> Fixture {
     }
     let conn = match block_on(pool.acquire(&cx)) {
         Outcome::Ok(conn) => conn,
-        other => panic!("acquire failed: {other:?}"),
+        Outcome::Err(error) => panic!("acquire failed: {error}"),
+        _ => panic!("acquire was cancelled or panicked"),
     };
     // These rows model mail accepted just before a crash: inside the ordinary
     // 30-second grace, but before the restarted worker's settled-write anchor.
@@ -94,7 +95,8 @@ fn fixture() -> Fixture {
 fn assert_source_untouched(fixture: &Fixture) {
     let conn = match block_on(fixture.pool.acquire(&fixture.cx)) {
         Outcome::Ok(conn) => conn,
-        other => panic!("acquire failed: {other:?}"),
+        Outcome::Err(error) => panic!("acquire failed: {error}"),
+        _ => panic!("acquire was cancelled or panicked"),
     };
     let rows = conn
         .query_sync("SELECT id, subject, body_md FROM messages ORDER BY id", &[])

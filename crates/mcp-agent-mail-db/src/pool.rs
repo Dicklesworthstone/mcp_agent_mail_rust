@@ -3717,6 +3717,12 @@ impl DbPool {
     /// engine pool. Memos of facts about the database file itself (not about
     /// rows a write may change) use this key, so they are computed once per
     /// engine pool instead of once per live read.
+    /// Whether the underlying connection pool has been closed (retired).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
     #[must_use]
     pub fn engine_identity_key(&self) -> String {
         let identity = self.cache_identity_namespace();
