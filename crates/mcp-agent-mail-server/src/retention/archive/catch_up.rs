@@ -25,6 +25,8 @@ const MAX_TURN_ACTIVE_TIME: Duration = Duration::from_millis(250);
 // independent 16 MiB bound, so a turn admits less than 32 MiB in total. This is
 // not a resident-memory allocation or permission to enlarge a storage batch.
 const TURN_PAYLOAD_TARGET: usize = 16 * 1024 * 1024;
+const DISK_PRESSURE_DEFERRED: &str =
+    "message reconciliation deferred: critical disk pressure";
 
 /// Run one finite repair turn, observing each real storage report separately.
 /// The returned backlog hint controls only the worker's next sleep, never
@@ -41,13 +43,35 @@ pub(super) fn run(
 ) -> Result<bool, String> {
     let started = Instant::now();
     let result = run_with(
-        || reconcile_message_batch(cx, pool, config, cursor, stop),
+        || {
+            with_disk_admission(
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+                || reconcile_message_batch(cx, pool, config, cursor, stop),
+            )
+        },
         observe,
         || started.elapsed(),
     );
     finish_turn(result, || {
         stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
     })
+}
+
+fn with_disk_admission(
+    pressure: u64,
+    repair: impl FnOnce() -> Result<ReconcileReport, String>,
+) -> Result<ReconcileReport, String> {
+    if pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        // Check before the checkpointed entrypoint: even an unchanged pass
+        // writes/fsyncs scheduling hints beside the database. On a critically
+        // full disk, preserve the cursor and source rather than competing for
+        // the remaining space with the mailbox's foreground recovery path.
+        return Err(DISK_PRESSURE_DEFERRED.into());
+    }
+    repair()
 }
 
 /// Admission refusal is not a broken source pool. Let the worker retain its
@@ -60,6 +84,13 @@ fn finish_turn(
     interrupted: impl FnOnce() -> bool,
 ) -> Result<bool, String> {
     match result {
+        Err(error) if error == DISK_PRESSURE_DEFERRED => {
+            // Resource pressure is neither a completed pass nor a bad source.
+            // Retain the live pool/cursor and use the normal maintenance poll;
+            // do not manufacture a report or create a one-second retry loop
+            // while the filesystem is still critically full.
+            Ok(false)
+        }
         Err(error)
             if matches!(
                 error.as_str(),
@@ -147,6 +178,70 @@ mod tests {
             budget_exhausted: true,
             ..ReconcileReport::default()
         }
+    }
+
+    #[test]
+    fn disk_admission_stops_before_checkpoint_or_archive_work() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        for pressure in [critical, critical.saturating_add(1), u64::MAX] {
+            assert_eq!(
+                with_disk_admission(pressure, || {
+                    panic!("critical pressure must not enter message reconciliation")
+                })
+                .unwrap_err(),
+                DISK_PRESSURE_DEFERRED,
+            );
+        }
+        assert!(critical > 0);
+        for pressure in [0, critical - 1] {
+            assert_eq!(
+                with_disk_admission(pressure, || Ok(busy_report()))
+                    .unwrap()
+                    .repaired,
+                4,
+            );
+        }
+    }
+
+    #[test]
+    fn critical_pressure_after_progress_yields_without_fabricating_a_pass() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        let pressure = Cell::new(0_u64);
+        let calls = Cell::new(0_usize);
+        let mut observed = Vec::new();
+        let result = run_with(
+            || {
+                with_disk_admission(pressure.get(), || {
+                    calls.set(calls.get() + 1);
+                    Ok(busy_report())
+                })
+            },
+            |report| {
+                observed.push(report.repaired);
+                pressure.set(critical);
+            },
+            || Duration::ZERO,
+        );
+        assert!(!finish_turn(result, || false).unwrap());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(observed, [4]);
+        pressure.set(0);
+        let resumed = run_with(
+            || {
+                with_disk_admission(pressure.get(), || {
+                    calls.set(calls.get() + 1);
+                    Ok(ReconcileReport {
+                        scanned: 1,
+                        repaired: 1,
+                        ..ReconcileReport::default()
+                    })
+                })
+            },
+            |_| {},
+            || Duration::ZERO,
+        );
+        assert!(!finish_turn(resumed, || false).unwrap());
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]
@@ -343,6 +438,7 @@ mod tests {
             "permission denied",
             "checkpoint source changed during reconciliation",
             "source error: message reconciliation deferred: recovery promotion or admission contention",
+            "source error: message reconciliation deferred: critical disk pressure",
         ] {
             let result = finish_turn(Err(error.to_string()), || {
                 panic!("source failures must not be mistaken for admission contention")
