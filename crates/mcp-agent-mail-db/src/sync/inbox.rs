@@ -42,7 +42,7 @@ impl<C: SyncQuery> Drop for ReadSnapshot<'_, C> {
     }
 }
 
-pub(super) fn with_snapshot<C: SyncQuery, T>(
+pub fn with_snapshot<C: SyncQuery, T>(
     conn: &C,
     read: impl FnOnce() -> Result<T, DbError>,
 ) -> Result<T, DbError> {
@@ -266,6 +266,267 @@ fn hydrate(
     }
     out.sort_unstable_by_key(|row| std::cmp::Reverse((row.message.created_ts, row.message.id)));
     Ok(out)
+}
+
+const SHARED_PAGE_SIZE: usize = 128;
+
+/// Page authoritative message timestamps, not the denormalized delivery time.
+/// Ordering on a second column disables the pinned engine's timestamp index.
+/// Within the same read snapshot, skip only the already visited part of the
+/// boundary timestamp's index run. Never assume IDs track creation time or
+/// that equal-timestamp rows arrive in any particular ID order.
+#[must_use]
+pub fn shared_page_query(
+    project_id: i64,
+    ceiling: Option<i64>,
+    skip_at_ceiling: i64,
+) -> (String, Vec<Value>) {
+    let mut sql = format!("SELECT {HEADER_COLUMNS} FROM messages WHERE project_id = ?");
+    let mut params = vec![Value::BigInt(project_id)];
+    if let Some(ts) = ceiling {
+        sql.push_str(" AND created_ts <= ?");
+        params.push(Value::BigInt(ts));
+    }
+    sql.push_str(" ORDER BY created_ts DESC LIMIT 128 OFFSET ?");
+    params.push(Value::BigInt(skip_at_ceiling));
+    (sql, params)
+}
+
+fn shared_lookup_query(
+    table: &str,
+    columns: &str,
+    ids: &[i64],
+    agent_id: Option<i64>,
+) -> (String, Vec<Value>) {
+    debug_assert!(!ids.is_empty() && ids.len() <= SHARED_PAGE_SIZE);
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut sql = format!("SELECT {columns} FROM {table} WHERE message_id IN ({placeholders})");
+    let mut params: Vec<Value> = ids.iter().copied().map(Value::BigInt).collect();
+    if let Some(agent_id) = agent_id {
+        sql.push_str(" AND agent_id = ?");
+        params.push(Value::BigInt(agent_id));
+    }
+    (sql, params)
+}
+
+/// Bound composite IN keys scan the pinned engine's entire receipt table;
+/// large literal lists also lose the composite-index path. Small batches of
+/// typed i64 keys preserve indexed lookups without interpolating user text.
+fn shared_receipt_rows(
+    conn: &impl SyncQuery,
+    table: &str,
+    columns: &str,
+    ids: &[i64],
+    agent_id: i64,
+) -> Result<Vec<Row>, DbError> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(8) {
+        let keys = chunk
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT {columns} FROM {table} WHERE message_id IN ({keys}) AND agent_id = ?");
+        let rows = query(conn, &sql, &[Value::BigInt(agent_id)])?;
+        if rows.len() > chunk.len() {
+            return Err(DbError::Internal(
+                "shared inbox receipt batch returned duplicate keys".into(),
+            ));
+        }
+        out.extend(rows);
+    }
+    Ok(out)
+}
+
+/// The public shared-mailbox reader checks schema authority and supplies a
+/// read snapshot. All joins here are bounded primary-key probes. Sparse or
+/// heavily filtered mail may inspect more candidates; no fixed scan budget
+/// is allowed to turn unseen mail into a successful empty inbox.
+pub fn fetch_shared(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<Vec<InboxRow>, DbError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let viewer = query(
+        conn,
+        "SELECT project_id, inception_ts, retired_at, contact_policy FROM agents WHERE id = ?",
+        &[Value::BigInt(agent_id)],
+    )?;
+    let Some(viewer) = viewer.first() else {
+        return Ok(Vec::new());
+    };
+    if viewer.get_named::<i64>("project_id").map_err(db_error)? != project_id
+        || viewer
+            .get_named::<Option<i64>>("retired_at")
+            .map_err(db_error)?
+            .is_some()
+        || viewer
+            .get_named::<Option<String>>("contact_policy")
+            .map_err(db_error)?
+            .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all"))
+    {
+        return Ok(Vec::new());
+    }
+    let inception = viewer.get_named::<i64>("inception_ts").map_err(db_error)?;
+    let mut newest: BTreeMap<(i64, i64), Receipt> = BTreeMap::new();
+    let mut ceiling = None;
+    let mut skip_at_ceiling = 0_i64;
+    loop {
+        let (sql, params) = shared_page_query(project_id, ceiling, skip_at_ceiling);
+        let rows = query(conn, &sql, &params)?;
+        if rows.len() > SHARED_PAGE_SIZE {
+            return Err(DbError::Internal(
+                "shared inbox page exceeded its bound".into(),
+            ));
+        }
+        let finished = rows.len() < SHARED_PAGE_SIZE;
+        let mut last_ts = ceiling;
+        let mut trailing_count = skip_at_ceiling;
+        let mut headers = HashMap::new();
+        let mut lower_bound_reached = false;
+        for row in rows {
+            let id = row.get_named::<i64>("id").map_err(db_error)?;
+            let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
+            if last_ts.is_some_and(|previous| created > previous) {
+                return Err(DbError::Internal(
+                    "shared inbox timestamps are not descending".into(),
+                ));
+            }
+            if last_ts == Some(created) {
+                trailing_count = trailing_count.checked_add(1).ok_or_else(|| {
+                    DbError::Internal("shared inbox timestamp offset overflow".into())
+                })?;
+            } else {
+                last_ts = Some(created);
+                trailing_count = 1;
+            }
+            if created < inception || since_ts.is_some_and(|ts| created <= ts) {
+                lower_bound_reached = true;
+                continue;
+            }
+            if row.get_named::<i64>("project_id").map_err(db_error)? != project_id {
+                return Err(DbError::Internal(
+                    "shared inbox returned a foreign project header".into(),
+                ));
+            }
+            if row.get_named::<i64>("sender_id").map_err(db_error)? == agent_id {
+                continue;
+            }
+            let ack = row.get_named::<i64>("ack_required").map_err(db_error)?;
+            let importance = row.get_named::<String>("importance").map_err(db_error)?;
+            let topic = row.get_named::<Option<String>>("topic").map_err(db_error)?;
+            if (options.urgent_only && !matches!(importance.as_str(), "high" | "urgent"))
+                || (options.ack_required_only && ack != 1)
+                || options
+                    .ack_overdue_before
+                    .is_some_and(|ts| ack != 1 || created >= ts)
+                || options.topic.is_some_and(|wanted| {
+                    !topic
+                        .as_deref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
+                })
+            {
+                continue;
+            }
+            if headers.insert(id, created).is_some() {
+                return Err(DbError::Internal("duplicate shared inbox candidate".into()));
+            }
+        }
+        if !headers.is_empty() {
+            let ids: Vec<i64> = headers.keys().copied().collect();
+            let (sql, params) = shared_lookup_query(
+                "project_mailbox_deliveries",
+                "message_id, project_id",
+                &ids,
+                None,
+            );
+            let mut deliveries = HashMap::new();
+            for row in query(conn, &sql, &params)? {
+                let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+                let created = headers
+                    .get(&id)
+                    .ok_or_else(|| DbError::Internal("unrequested shared inbox delivery".into()))?;
+                if row.get_named::<i64>("project_id").map_err(db_error)? == project_id {
+                    deliveries.insert(id, *created);
+                }
+            }
+            if !deliveries.is_empty() {
+                let ids: Vec<i64> = deliveries.keys().copied().collect();
+                for row in
+                    shared_receipt_rows(conn, "message_recipients", "message_id", &ids, agent_id)?
+                {
+                    deliveries.remove(&row.get_named::<i64>("message_id").map_err(db_error)?);
+                }
+                if !deliveries.is_empty() {
+                    let ids: Vec<i64> = deliveries.keys().copied().collect();
+                    let mut receipts = HashMap::new();
+                    for row in shared_receipt_rows(
+                        conn,
+                        "project_mailbox_receipts",
+                        "message_id, read_ts, ack_ts",
+                        &ids,
+                        agent_id,
+                    )? {
+                        let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+                        if !deliveries.contains_key(&id) {
+                            return Err(DbError::Internal(
+                                "unrequested shared inbox receipt".into(),
+                            ));
+                        }
+                        let read_ts = row.get_named::<Option<i64>>("read_ts").map_err(db_error)?;
+                        let ack_ts = row.get_named::<Option<i64>>("ack_ts").map_err(db_error)?;
+                        receipts.insert(id, (read_ts, ack_ts));
+                    }
+                    for (id, created) in deliveries {
+                        let (read_ts, ack_ts) = receipts.remove(&id).unwrap_or((None, None));
+                        if (options.unread_only && read_ts.is_some())
+                            || ((options.ack_required_only || options.ack_overdue_before.is_some())
+                                && ack_ts.is_some())
+                        {
+                            continue;
+                        }
+                        let key = (created, id);
+                        if newest.len() < limit
+                            || newest.first_key_value().is_some_and(|(old, _)| key > *old)
+                        {
+                            newest.insert(
+                                key,
+                                Receipt {
+                                    kind: crate::project_mailbox::PROJECT_MAILBOX_KIND.into(),
+                                    read_ts,
+                                    ack_ts,
+                                },
+                            );
+                            if newest.len() > limit {
+                                newest.pop_first();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Finish the boundary timestamp even after collecting `limit` rows.
+        // Otherwise a later page could contain a larger ID at the same time.
+        let window_complete = newest.len() == limit
+            && newest
+                .first_key_value()
+                .is_some_and(|((oldest, _), _)| last_ts.is_some_and(|last| last < *oldest));
+        if finished || lower_bound_reached || window_complete {
+            break;
+        }
+        ceiling = last_ts;
+        skip_at_ceiling = trailing_count;
+    }
+    hydrate(conn, project_id, newest, options.body_policy)
 }
 
 #[cfg(test)]

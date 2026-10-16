@@ -39,9 +39,14 @@
 
 use crate::DbConn;
 use crate::error::DbError;
+#[cfg(test)]
 use crate::models::MessageRow;
-use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
-use crate::sync::{InboxBodyPolicy, InboxFetchOptions};
+use crate::queries::InboxRow;
+#[cfg(test)]
+use crate::queries::UNKNOWN_SENDER_DISPLAY;
+#[cfg(test)]
+use crate::sync::InboxBodyPolicy;
+use crate::sync::InboxFetchOptions;
 use sqlmodel_core::Value;
 
 /// Recipient `kind` reported for a project mailbox delivery. It never appears
@@ -179,6 +184,30 @@ fn has_project_deliveries(
 /// filter set as the direct inbox. Each row carries
 /// [`PROJECT_MAILBOX_KIND`] and the agent's own lazily-recorded read/ack state.
 pub fn fetch_project_mailbox_rows_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<Vec<InboxRow>, DbError> {
+    crate::sync::inbox::with_snapshot(conn, || {
+        i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
+        if !has_project_deliveries(conn, project_id)? {
+            return Ok(Vec::new());
+        }
+        if let Err(error) = conn.query_sync(
+            "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0",
+            &[],
+        ) {
+            allow_absent_shared_schema(conn, &error.to_string())?;
+        }
+        crate::sync::inbox::fetch_shared(conn, project_id, agent_id, since_ts, limit, options)
+    })
+}
+
+#[cfg(test)]
+fn reference_project_mailbox_rows_from_conn(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
@@ -1558,6 +1587,437 @@ mod tests {
             .unwrap()
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn paged_shared_inbox_matches_join_for_every_filter_and_body_policy() {
+        let conn = shared_reader_fixture(32);
+        for flags in 0..8 {
+            for since in [None, Some(16_000)] {
+                for overdue in [None, Some(24_000)] {
+                    for topic in [None, Some("HANDOFFS"), Some("É"), Some("missing")] {
+                        for limit in [0, 1, 7, 100] {
+                            for body_policy in
+                                [InboxBodyPolicy::Full, InboxBodyPolicy::MetadataOnly]
+                            {
+                                let filters = InboxFetchOptions {
+                                    urgent_only: flags & 1 != 0,
+                                    unread_only: flags & 2 != 0,
+                                    ack_required_only: flags & 4 != 0,
+                                    ack_overdue_before: overdue,
+                                    topic,
+                                    body_policy,
+                                };
+                                let expected = reference_project_mailbox_rows_from_conn(
+                                    &conn, 1, 2, since, limit, filters,
+                                )
+                                .unwrap();
+                                let actual = fetch_project_mailbox_rows_from_conn(
+                                    &conn, 1, 2, since, limit, filters,
+                                )
+                                .unwrap();
+                                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn shared_reader_fixture(count: i64) -> DbConn {
+        let conn = test_conn();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key,created_at) VALUES
+            (1,'shared-one','/shared-one',0),(2,'shared-two','/shared-two',0);
+            INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES
+            (1,1,'BlueLake','test','test',0,0),(2,1,'GreenStone','test','test',0,0),
+            (3,1,'RedFox','test','test',0,0)",
+        )
+        .unwrap();
+        seed_shared_reader(&conn, 1, count);
+        conn
+    }
+
+    fn seed_shared_reader(conn: &DbConn, first: i64, last: i64) {
+        conn.execute_raw("BEGIN").unwrap();
+        for start in (first..=last).step_by(128) {
+            let end = (start + 127).min(last);
+            let messages = (start..=end)
+                .map(|id| {
+                    format!(
+                        "({id},1,{},'subject-{id}','body-{id}',{},'{}',{},'{}')",
+                        if id % 5 == 0 { 2 } else { 1 },
+                        id * 1000,
+                        ["normal", "high", "urgent", "low"][(id % 4) as usize],
+                        i64::from(id % 3 != 0),
+                        ["Handoffs", "other", "é", "É"][(id % 4) as usize]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,
+                created_ts,importance,ack_required,topic) VALUES {messages}"
+            ))
+            .unwrap();
+            // Deliberately different delivery timestamps: message creation is
+            // the inbox ordering authority, including reconstructed mailboxes.
+            let deliveries = (start..=end)
+                .map(|id| format!("({id},1,'to',{})", 1_000_000 - id))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO project_mailbox_deliveries
+                (message_id,project_id,kind,delivered_ts) VALUES {deliveries}"
+            ))
+            .unwrap();
+            let receipts = (start..=end)
+                .map(|id| {
+                    format!(
+                        "({id},2,{},{})",
+                        if id % 3 == 0 { "2000" } else { "NULL" },
+                        if id % 4 == 0 { "3000" } else { "NULL" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO project_mailbox_receipts
+                (message_id,agent_id,read_ts,ack_ts) VALUES {receipts}"
+            ))
+            .unwrap();
+            let direct = (start..=end)
+                .filter(|id| id % 7 == 0)
+                .map(|id| format!("({id},2,'bcc')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            if !direct.is_empty() {
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients(message_id,agent_id,kind)
+                    VALUES {direct}"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute_raw("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn shared_inbox_finishes_large_timestamp_ties_and_skips_invisible_pages() {
+        let conn = shared_reader_fixture(600);
+        conn.execute_raw(
+            "UPDATE messages SET created_ts=1000;
+            UPDATE project_mailbox_deliveries SET project_id=2 WHERE message_id=599;
+            UPDATE messages SET project_id=2 WHERE id=598;
+            UPDATE project_mailbox_receipts SET read_ts=1 WHERE message_id>300;
+            UPDATE agents SET inception_ts=1000 WHERE id=2",
+        )
+        .unwrap();
+        for filters in [
+            options(),
+            InboxFetchOptions {
+                unread_only: true,
+                ..options()
+            },
+        ] {
+            let expected =
+                reference_project_mailbox_rows_from_conn(&conn, 1, 2, None, 50, filters).unwrap();
+            let actual =
+                fetch_project_mailbox_rows_from_conn(&conn, 1, 2, None, 50, filters).unwrap();
+            assert_eq!(actual.len(), 50);
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+    }
+
+    #[test]
+    fn shared_inbox_pages_ten_thousand_deliveries_without_materializing_history() {
+        struct Observed<'a> {
+            conn: &'a DbConn,
+            calls: std::cell::RefCell<Vec<(String, Vec<Value>, usize)>>,
+        }
+        impl crate::pool::SyncQuery for Observed<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.conn.query_sync(sql, params)?;
+                if sql.contains("FROM project_mailbox_receipts WHERE message_id IN")
+                    || sql.contains("FROM message_recipients WHERE message_id IN")
+                {
+                    let plans = self
+                        .conn
+                        .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), params)?;
+                    let details = plans
+                        .iter()
+                        .map(|row| row.get_as::<String>(3).unwrap())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        details.contains("USING INDEX sqlite_autoindex_"),
+                        "{details}: {sql}"
+                    );
+                    // The pinned EXPLAIN QUERY PLAN labels a covering IN
+                    // lookup as SCAN despite emitting one SeekGE per key.
+                    // Check the actual program: no rewind/history walk, and
+                    // one composite-index seek for every bounded literal ID.
+                    let program = self.conn.query_sync(&format!("EXPLAIN {sql}"), params)?;
+                    let opcodes = program
+                        .iter()
+                        .map(|row| row.get_as::<String>(1).unwrap())
+                        .collect::<Vec<_>>();
+                    let key_count = sql
+                        .split_once("message_id IN (")
+                        .unwrap()
+                        .1
+                        .split(')')
+                        .next()
+                        .unwrap()
+                        .split(',')
+                        .count();
+                    assert!((1..=8).contains(&key_count));
+                    assert_eq!(
+                        opcodes
+                            .iter()
+                            .filter(|opcode| opcode.as_str() == "SeekGE")
+                            .count(),
+                        key_count,
+                        "every requested key must drive its own index seek: {details}"
+                    );
+                    assert!(
+                        opcodes
+                            .iter()
+                            .all(|opcode| !matches!(opcode.as_str(), "Rewind" | "Last")),
+                        "receipt lookup must not start a table/index history walk: {details}"
+                    );
+                    assert!(rows.len() <= 8);
+                }
+                self.calls
+                    .borrow_mut()
+                    .push((sql.into(), params.to_vec(), rows.len()));
+                Ok(rows)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        let conn = shared_reader_fixture(10_000);
+        let observed = Observed {
+            conn: &conn,
+            calls: std::cell::RefCell::new(Vec::new()),
+        };
+        let actual =
+            fetch_project_mailbox_rows_from_conn(&observed, 1, 2, None, 50, options()).unwrap();
+        let expected =
+            reference_project_mailbox_rows_from_conn(&conn, 1, 2, None, 50, options()).unwrap();
+        assert_eq!(actual.len(), 50);
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        let calls = observed.calls.borrow();
+        assert!(calls.iter().all(|(sql, params, rows)| !sql.contains("JOIN")
+            && params.len() <= 129
+            && *rows <= 128));
+        let pages: Vec<_> = calls
+            .iter()
+            .filter(|(sql, _, _)| sql.contains("ORDER BY created_ts DESC LIMIT 128"))
+            .collect();
+        assert_eq!(
+            pages.len(),
+            1,
+            "a dense newest window must not walk historical deliveries"
+        );
+        for (sql, params, _) in pages {
+            let plans = conn
+                .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), params)
+                .unwrap();
+            let details = plans
+                .iter()
+                .map(|row| row.get_as::<String>(3).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                details.contains("SEARCH messages USING INDEX idx_messages_project_created"),
+                "{details}"
+            );
+            assert!(!details.contains("TEMP B-TREE"), "{details}");
+        }
+    }
+
+    #[test]
+    fn mixed_direct_and_shared_inbox_preserves_one_ranked_window() {
+        let conn = shared_reader_fixture(100);
+        conn.execute_raw("UPDATE messages SET created_ts=((id * 17) % 101)*1000")
+            .unwrap();
+        let actual =
+            crate::sync::fetch_inbox_rows_from_conn(&conn, 1, 2, false, false, false, None, 20)
+                .unwrap();
+        let mut expected: Vec<i64> = (1..=100).filter(|id| id % 5 != 0 || id % 7 == 0).collect();
+        expected.sort_by_key(|id| std::cmp::Reverse(((id * 17) % 101, *id)));
+        expected.truncate(20);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.message.id.unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for row in actual {
+            assert_eq!(
+                row.kind,
+                if row.message.id.unwrap() % 7 == 0 {
+                    "bcc"
+                } else {
+                    PROJECT_MAILBOX_KIND
+                }
+            );
+            assert_eq!(
+                row.message.body_md,
+                format!("body-{}", row.message.id.unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn shared_inbox_snapshot_keeps_membership_body_and_receipts_consistent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shared-snapshot.sqlite3");
+        let reader = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "shared reader",
+        );
+        reader.execute_raw(schema::PRAGMA_DB_INIT_SQL).unwrap();
+        let cx = asupersync::Cx::for_testing();
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            schema::migrate_to_latest_base(&cx, &*reader)
+                .await
+                .into_result()
+                .unwrap();
+        });
+        reader
+            .execute_raw(
+                "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'one','/one',0);
+            INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES
+            (1,1,'BlueLake','test','test',0,0),(2,1,'GreenStone','test','test',0,0)",
+            )
+            .unwrap();
+        seed_shared_reader(&reader, 1, 1);
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "shared peer",
+        );
+        struct Racing<'a> {
+            reader: &'a DbConn,
+            writer: &'a DbConn,
+            committed: std::cell::Cell<bool>,
+        }
+        impl crate::pool::SyncQuery for Racing<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.reader.query_sync(sql, params)?;
+                if sql.contains("ORDER BY created_ts DESC LIMIT 128")
+                    && !self.committed.replace(true)
+                {
+                    self.writer.execute_raw("BEGIN IMMEDIATE;
+                        UPDATE agents SET retired_at=99 WHERE id=2;
+                        UPDATE messages SET body_md='changed body' WHERE id=1;
+                        UPDATE project_mailbox_receipts SET read_ts=100,ack_ts=101 WHERE message_id=1;
+                        COMMIT")?;
+                }
+                Ok(rows)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.reader.execute_raw(sql)
+            }
+        }
+        let race = Racing {
+            reader: &reader,
+            writer: &writer,
+            committed: std::cell::Cell::new(false),
+        };
+        let filters = InboxFetchOptions {
+            body_policy: InboxBodyPolicy::Full,
+            ..options()
+        };
+        let old = fetch_project_mailbox_rows_from_conn(&race, 1, 2, None, 20, filters).unwrap();
+        assert!(race.committed.get());
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].message.body_md, "body-1");
+        assert_eq!((old[0].read_ts, old[0].ack_ts), (None, None));
+        assert!(
+            fetch_project_mailbox_rows_from_conn(&*reader, 1, 2, None, 20, filters)
+                .unwrap()
+                .is_empty()
+        );
+        writer
+            .execute_raw("UPDATE agents SET retired_at=NULL WHERE id=2")
+            .unwrap();
+        let current =
+            fetch_project_mailbox_rows_from_conn(&*reader, 1, 2, None, 20, filters).unwrap();
+        assert_eq!(current[0].message.body_md, "changed body");
+        assert_eq!(
+            (current[0].read_ts, current[0].ack_ts),
+            (Some(100), Some(101))
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit same-invocation shared inbox 1k/10k scaling measurement"]
+    fn shared_inbox_scaling_compares_live_join_at_both_history_sizes() {
+        let conn = shared_reader_fixture(1_000);
+        let mut medians = Vec::new();
+        for count in [1_000, 10_000] {
+            if count > 1_000 {
+                seed_shared_reader(&conn, 1_001, count);
+            }
+            let mut candidate = Vec::new();
+            let mut reference = Vec::new();
+            for round in 0..5 {
+                let new = || {
+                    let start = std::time::Instant::now();
+                    let rows =
+                        fetch_project_mailbox_rows_from_conn(&conn, 1, 2, None, 50, options())
+                            .unwrap();
+                    (rows, start.elapsed().as_micros())
+                };
+                let old = || {
+                    let start = std::time::Instant::now();
+                    let rows =
+                        reference_project_mailbox_rows_from_conn(&conn, 1, 2, None, 50, options())
+                            .unwrap();
+                    (rows, start.elapsed().as_micros())
+                };
+                let (actual, expected) = if round % 2 == 0 {
+                    let a = new();
+                    (a, old())
+                } else {
+                    let e = old();
+                    (new(), e)
+                };
+                assert_eq!(format!("{:?}", actual.0), format!("{:?}", expected.0));
+                candidate.push(actual.1);
+                reference.push(expected.1);
+            }
+            candidate.sort_unstable();
+            reference.sort_unstable();
+            println!(
+                "shared_deliveries={count} candidate_us={candidate:?} reference_us={reference:?}"
+            );
+            assert!(
+                candidate[2] < reference[2],
+                "new reader must beat the live join"
+            );
+            medians.push(candidate[2]);
+        }
+        assert!(
+            medians[1] <= 2 * medians[0],
+            "shared history still dominates page cost: {medians:?}"
         );
     }
 
