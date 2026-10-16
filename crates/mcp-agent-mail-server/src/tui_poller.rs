@@ -402,9 +402,8 @@ struct PollerConnectionState {
     _snapshot_dir: Option<crate::SnapshotDirGuard>,
     last_data_version: Option<i64>,
     last_reservation_snapshot_gap_refresh_micros: i64,
-    /// Tracks last full snapshot time for the fallback path when
-    /// `PRAGMA data_version` is unavailable.  Prevents running expensive
-    /// aggregate queries on every 2-second poll cycle.
+    /// Completion time of the last full projection, including detail fallback.
+    /// Bounds unknown-version polling and repeated unchanged detail gaps.
     last_full_snapshot_micros: i64,
 }
 
@@ -796,7 +795,26 @@ fn fetch_db_stats_with_connection(
     state: &mut PollerConnectionState,
     previous: &DbStatSnapshot,
 ) -> Option<DbPollSnapshotUpdate> {
-    let now = now_micros();
+    fetch_db_stats_with_clock(state, previous, now_micros)
+}
+
+/// An unresolved detail gap is not evidence of a new database revision. For
+/// example, the aggregate agent count includes retired identities whereas the
+/// visible agent list deliberately excludes them. Retry the full projection at
+/// the fallback cadence, not on every poll forever (GH#354). A backward clock
+/// jump permits one refresh; its completion establishes the new clock anchor.
+const fn full_snapshot_retry_due(now: i64, last_completed: i64) -> bool {
+    last_completed <= 0
+        || now < last_completed
+        || now.saturating_sub(last_completed) >= NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS
+}
+
+fn fetch_db_stats_with_clock(
+    state: &mut PollerConnectionState,
+    previous: &DbStatSnapshot,
+    mut clock: impl FnMut() -> i64,
+) -> Option<DbPollSnapshotUpdate> {
+    let now = clock();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
     let must_refresh_for_expiry = reservation_expiry_requires_time_refresh(previous, now);
     let must_refresh_for_snapshot_gap = reservation_snapshot_gap_requires_refresh(
@@ -804,17 +822,20 @@ fn fetch_db_stats_with_connection(
         now,
         state.last_reservation_snapshot_gap_refresh_micros,
     );
-    let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous);
-    // When `PRAGMA data_version` is available, use it to skip full snapshots
-    // when nothing has changed.
+    let full_retry_due = full_snapshot_retry_due(now, state.last_full_snapshot_micros);
+    let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous) && full_retry_due;
+    // A changed or newly available version still refreshes immediately. Only
+    // repeated attempts against unchanged/unknown revisions use the retry gate.
     let version_unchanged = match (data_version, state.last_data_version) {
         (Some(current), Some(prev)) => current == prev,
         _ => false,
     };
     if version_unchanged && previous.timestamp_micros > 0 {
         let update = if must_refresh_for_detail_gap {
-            DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
-                .fetch_snapshot(Some(previous))
+            let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
+                .fetch_snapshot(Some(previous));
+            state.last_full_snapshot_micros = clock();
+            snapshot
         } else if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
             refresh_reservation_time_sensitive_snapshot(state, previous, now)
         } else {
@@ -836,21 +857,23 @@ fn fetch_db_stats_with_connection(
         );
         return Some(DbPollSnapshotUpdate::Snapshot(update));
     }
-    // When data_version is unavailable (e.g. FrankenSQLite), throttle
-    // expensive full snapshots to once every 30 seconds to avoid burning
-    // CPU on repeated no-op poll cycles.
+    // Unknown versions use the same completion-based budget. A detail gap
+    // cannot override it, but reservation expiry and gap recovery retain their
+    // independent time-sensitive refresh behavior.
     if data_version.is_none()
         && previous.timestamp_micros > 0
         && !must_refresh_for_detail_gap
         && !must_refresh_for_expiry
         && !must_refresh_for_snapshot_gap
-        && (now - state.last_full_snapshot_micros) < NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS
+        && !full_retry_due
     {
         return Some(DbPollSnapshotUpdate::TimestampOnly(now));
     }
     let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
         .fetch_snapshot(Some(previous));
-    state.last_full_snapshot_micros = now;
+    // Include query and fallback-connection work in the attempt. Slow work
+    // must not consume its own pause and immediately schedule another scan.
+    state.last_full_snapshot_micros = clock();
     if snapshot_is_empty(&snapshot)
         && required_mail_schema_state(&state.conn) != RequiredMailSchemaState::Present
     {
@@ -6727,5 +6750,234 @@ first body
         assert_eq!(input.reservation_active_count, 0);
         assert_eq!(input.contact_policy_respected_count, None);
         assert!(input.last_active_age_micros.is_some());
+    }
+
+    // GH#354: the clock is injected, but database/version probes and the
+    // lifecycle-filtered projections use the actual file-backed engine.
+    fn retired_poller_fixture() -> (tempfile::TempDir, PollerConnectionState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("retired-poller.sqlite3");
+        let sqlite_path = path.to_string_lossy().into_owned();
+        let conn = DbConn::open_file(&sqlite_path).expect("open database");
+        create_empty_mail_schema(&conn);
+        conn.execute_sync("ALTER TABLE agents ADD COLUMN retired_at INTEGER", &[])
+            .expect("add retirement column");
+        conn.execute_sync(
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create lifecycle ledger");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'quiet', '/quiet', 1)",
+            &[],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts, retired_at) VALUES (1, 1, 'BlueLake', 'test', 1, 2), (2, 1, 'GreenStone', 'test', 1, NULL)",
+            &[],
+        )
+        .expect("insert retired and deregistered agents");
+        conn.execute_sync(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (2, 2)",
+            &[],
+        )
+        .expect("deregister second agent");
+        (
+            dir,
+            PollerConnectionState {
+                conn,
+                sqlite_path,
+                _snapshot_dir: None,
+                last_data_version: None,
+                last_reservation_snapshot_gap_refresh_micros: 0,
+                last_full_snapshot_micros: 0,
+            },
+        )
+    }
+
+    fn require_full_update(update: Option<DbPollSnapshotUpdate>) -> DbStatSnapshot {
+        match update {
+            Some(DbPollSnapshotUpdate::Snapshot(snapshot)) => snapshot,
+            _ => panic!("expected a real full snapshot"),
+        }
+    }
+
+    #[test]
+    fn gh354_retired_only_mailbox_does_not_repeat_full_projection_each_poll() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let start = now_micros();
+        let mut previous = DbStatSnapshot::default();
+        let mut full_refreshes = Vec::new();
+        for second in 0_i64..=120 {
+            let now = start + second * 1_000_000;
+            match fetch_db_stats_with_clock(&mut state, &previous, || now) {
+                Some(DbPollSnapshotUpdate::Snapshot(snapshot)) => {
+                    full_refreshes.push(second);
+                    assert_eq!(snapshot.agents, 2, "do not hide historical identities");
+                    assert!(
+                        snapshot.agents_list.is_empty(),
+                        "do not resurrect retired identities"
+                    );
+                    assert_eq!(snapshot.projects, 1);
+                    previous = snapshot;
+                }
+                Some(DbPollSnapshotUpdate::TimestampOnly(timestamp)) => {
+                    assert_eq!(timestamp, now);
+                    previous.timestamp_micros = timestamp;
+                }
+                None => panic!("healthy mailbox lost its observable state"),
+            }
+        }
+        assert_eq!(full_refreshes, [0, 30, 60, 90, 120]);
+        let rows = state
+            .conn
+            .query_sync("SELECT COUNT(*) AS n FROM agents", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 2);
+    }
+
+    #[test]
+    fn gh354_slow_detail_projection_keeps_a_completion_based_pause() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let start = now_micros();
+        let completed = start + 120_000_000;
+        let mut ticks = [start, completed].into_iter();
+        let previous = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || ticks.next().expect("unexpected clock read"),
+        ));
+        assert!(ticks.next().is_none());
+        assert_eq!(state.last_full_snapshot_micros, completed);
+        for now in [completed, completed + 1, completed + 29_999_999] {
+            assert!(matches!(
+                fetch_db_stats_with_clock(&mut state, &previous, || now),
+                Some(DbPollSnapshotUpdate::TimestampOnly(_)),
+            ));
+        }
+        let next = completed + 30_000_000;
+        let refreshed = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &previous,
+            || next,
+        ));
+        assert_eq!(refreshed.agents, 2);
+        assert!(refreshed.agents_list.is_empty());
+    }
+
+    #[test]
+    fn gh354_first_snapshot_and_recovered_version_bypass_detail_retry_pause() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let now = now_micros();
+        state.last_full_snapshot_micros = now;
+        let previous = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || now,
+        ));
+        assert_eq!(previous.agents, 2);
+        // Simulate loss of the prior version observation, not the next probe.
+        // The actual engine still owns its version-availability behavior.
+        let available_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+        state.last_data_version = None;
+        let update = fetch_db_stats_with_clock(&mut state, &previous, || now + 1);
+        if available_version.is_some() {
+            assert!(matches!(update, Some(DbPollSnapshotUpdate::Snapshot(_))));
+        } else {
+            assert!(matches!(update, Some(DbPollSnapshotUpdate::TimestampOnly(_))));
+        }
+    }
+
+    #[test]
+    fn gh354_new_agent_becomes_visible_without_waiting_for_an_unrelated_gap_retry() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let (_dir, mut state) = retired_poller_fixture();
+            let now = now_micros();
+            let previous = require_full_update(fetch_db_stats_with_clock(
+                &mut state,
+                &DbStatSnapshot::default(),
+                || now,
+            ));
+            let before_version = state.last_data_version;
+            let writer = DbConn::open_file(&state.sqlite_path).expect("open independent writer");
+            writer.execute_sync(
+                "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES (3, 1, 'RedFox', 'test', 3)",
+                &[],
+            )
+            .expect("register visible agent");
+            let after_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+            let changed_version = matches!(
+                (before_version, after_version),
+                (Some(a), Some(b)) if a != b
+            );
+            // Without an engine change notification the existing 30s fallback
+            // remains the freshness contract; do not claim event-driven reads.
+            let observed_at = if changed_version { now + 1 } else { now + 30_000_000 };
+            let refreshed = require_full_update(fetch_db_stats_with_clock(
+                &mut state,
+                &previous,
+                || observed_at,
+            ));
+            assert_eq!(refreshed.agents, 3);
+            assert_eq!(refreshed.agents_list.len(), 1);
+            assert_eq!(refreshed.agents_list[0].name, "RedFox");
+            assert!(matches!(
+                fetch_db_stats_with_clock(&mut state, &refreshed, || observed_at + 1),
+                Some(DbPollSnapshotUpdate::TimestampOnly(_)),
+            ));
+        });
+    }
+
+    #[test]
+    fn gh354_detail_gap_cooldown_does_not_block_reservation_expiry() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let now = now_micros();
+        let mut previous = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || now,
+        ));
+        state.conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts) VALUES (1, 1, 1, 'src/**', 1, 1, 2)",
+            &[],
+        )
+        .unwrap();
+        state.last_data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+        previous.file_reservations = 1;
+        previous.projects_list[0].reservation_count = 1;
+        previous.reservation_snapshots = vec![ReservationSnapshot {
+            id: 1,
+            project_slug: "quiet".into(),
+            agent_name: "BlueLake".into(),
+            path_pattern: "src/**".into(),
+            exclusive: true,
+            granted_ts: 1,
+            expires_ts: 2,
+            released_ts: None,
+        }];
+        let refreshed = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &previous,
+            || now + 1,
+        ));
+        assert_eq!(refreshed.file_reservations, 0);
+        assert_eq!(refreshed.projects_list[0].reservation_count, 0);
+        assert!(refreshed.reservation_snapshots.is_empty());
+        assert_eq!(refreshed.agents, 2);
+        assert!(refreshed.agents_list.is_empty());
+        let rows = state.conn.query_sync("SELECT id FROM file_reservations", &[]).unwrap();
+        assert_eq!(rows.len(), 1, "observability must not delete the expired lease");
+    }
+
+    #[test]
+    fn gh354_full_snapshot_retry_clock_boundaries_are_safe() {
+        let start = 1_000_000;
+        assert!(full_snapshot_retry_due(start, 0));
+        assert!(!full_snapshot_retry_due(start, start));
+        assert!(!full_snapshot_retry_due(start + 29_999_999, start));
+        assert!(full_snapshot_retry_due(start + 30_000_000, start));
+        assert!(full_snapshot_retry_due(start - 1, start));
+        assert!(full_snapshot_retry_due(i64::MAX, 1));
+        assert!(full_snapshot_retry_due(i64::MIN, i64::MAX));
     }
 }
