@@ -5,9 +5,12 @@
 
 use crate::DbConn;
 use crate::error::DbError;
+#[cfg(test)]
 use crate::models::MessageRow;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 use sqlmodel_core::Value;
+
+pub(crate) mod inbox;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
@@ -413,6 +416,27 @@ pub fn fetch_inbox_filtered_rows_from_conn(
 }
 
 fn fetch_inbox_rows_from_conn_impl(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<Vec<InboxRow>, DbError> {
+    let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
+    inbox::with_snapshot(conn, || {
+        let direct = inbox::fetch_direct(conn, project_id, agent_id, since_ts, limit, options)?;
+        let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+            conn, project_id, agent_id, since_ts, limit, options,
+        )?;
+        Ok(crate::project_mailbox::merge_inbox_rows(
+            direct, shared, limit,
+        ))
+    })
+}
+
+#[cfg(test)]
+fn reference_inbox_rows_from_conn_impl(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
@@ -935,7 +959,7 @@ fn mark_messages_read_batch_sync_conn(
                 .map_err(|e| DbError::Sqlite(e.to_string()))?
             {
                 let message_id = row
-                    .get_named::<i64>("message_id")
+                    .get_named("message_id")
                     .map_err(|e| DbError::Sqlite(e.to_string()))?;
                 updated_message_ids.push(message_id);
             }
@@ -1301,7 +1325,7 @@ mod tests {
     }
 
     /// Helper: open an in-memory DB with the full schema applied.
-    fn test_conn() -> DbConn {
+    pub(super) fn test_conn() -> DbConn {
         let conn = DbConn::open_memory().expect("open in-memory db");
         conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
             .expect("apply PRAGMAs");

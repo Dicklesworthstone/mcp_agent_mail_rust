@@ -45,6 +45,8 @@ struct HotQuerySpec {
     path: HotQueryPath,
     sql: String,
     params: Vec<Value>,
+    // Multi-statement hot paths must explain their real lookup stages too.
+    extra_queries: Vec<(String, Vec<Value>)>,
     expected_indexes: Vec<IndexExpectation>,
     scan_sensitive_sources: &'static [&'static str],
 }
@@ -139,34 +141,37 @@ fn explain_query_plan(
     conn: &DbConn,
     spec: &HotQuerySpec,
 ) -> Result<QueryPlanDiagnostic, QueryPlanError> {
-    let explain_sql = format!("EXPLAIN QUERY PLAN {}", spec.sql);
-    let rows = conn
-        .query_sync(&explain_sql, &spec.params)
-        .map_err(|source| QueryPlanError::Explain {
-            path: spec.path.as_str(),
-            source,
-        })?;
-
-    let mut steps = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id = row
-            .get_as(0)
-            .map_err(|error| decode_error(spec.path, error))?;
-        let parent = row
-            .get_as(1)
-            .map_err(|error| decode_error(spec.path, error))?;
-        let notused = row
-            .get_as(2)
-            .map_err(|error| decode_error(spec.path, error))?;
-        let detail = row
-            .get_as(3)
-            .map_err(|error| decode_error(spec.path, error))?;
-        steps.push(QueryPlanStep {
-            id,
-            parent,
-            notused,
-            detail,
-        });
+    let mut steps = Vec::new();
+    for (sql, params) in std::iter::once((&spec.sql, &spec.params))
+        .chain(spec.extra_queries.iter().map(|(sql, params)| (sql, params)))
+    {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let rows =
+            conn.query_sync(&explain_sql, params)
+                .map_err(|source| QueryPlanError::Explain {
+                    path: spec.path.as_str(),
+                    source,
+                })?;
+        for row in rows {
+            let id = row
+                .get_as(0)
+                .map_err(|error| decode_error(spec.path, error))?;
+            let parent = row
+                .get_as(1)
+                .map_err(|error| decode_error(spec.path, error))?;
+            let notused = row
+                .get_as(2)
+                .map_err(|error| decode_error(spec.path, error))?;
+            let detail = row
+                .get_as(3)
+                .map_err(|error| decode_error(spec.path, error))?;
+            steps.push(QueryPlanStep {
+                id,
+                parent,
+                notused,
+                detail,
+            });
+        }
     }
 
     let missing_expected_indexes = missing_expected_indexes(&steps, &spec.expected_indexes);
@@ -296,22 +301,19 @@ fn plan_hash(path: HotQueryPath, steps: &[QueryPlanStep]) -> String {
 }
 
 fn inbox_spec() -> HotQuerySpec {
+    use crate::sync::inbox;
+
     HotQuerySpec {
         path: HotQueryPath::Inbox,
-        sql: format!(
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, '' AS body_md, \
-                    m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-                    r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             LEFT JOIN agents s ON s.id = m.sender_id \
-             WHERE r.agent_id = ? AND m.project_id = ? \
-             ORDER BY m.created_ts DESC LIMIT ?"
-        ),
-        params: vec![
-            Value::BigInt(1),
-            Value::BigInt(1),
-            Value::BigInt(DEFAULT_LIMIT),
+        sql: inbox::RECIPIENT_PAGE_SQL.to_string(),
+        params: vec![Value::BigInt(1)],
+        extra_queries: vec![
+            (
+                inbox::RECIPIENT_NEXT_SQL.to_string(),
+                vec![1_i64.into(), 0_i64.into()],
+            ),
+            inbox::lookup_query("messages", inbox::HEADER_COLUMNS, &[1, 2, 3]),
+            inbox::lookup_query("agents", "id, name", &[1, 2, 3]),
         ],
         expected_indexes: vec![
             IndexExpectation {
@@ -334,6 +336,7 @@ fn inbox_spec() -> HotQuerySpec {
 fn product_inbox_spec() -> HotQuerySpec {
     HotQuerySpec {
         path: HotQueryPath::ProductInbox,
+        extra_queries: Vec::new(),
         sql: "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, '' AS body_md, \
                     m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                     r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
@@ -389,6 +392,7 @@ fn active_reservations_spec() -> HotQuerySpec {
     let active_predicate = crate::queries::active_reservation_predicate_for("fr");
     HotQuerySpec {
         path: HotQueryPath::ActiveReservations,
+        extra_queries: Vec::new(),
         sql: format!(
             "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                     fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
@@ -416,6 +420,7 @@ fn search_fallback_spec(query: &SearchQuery) -> HotQuerySpec {
     let plan = plan_search(&query);
     HotQuerySpec {
         path: HotQueryPath::SearchFallback,
+        extra_queries: Vec::new(),
         sql: plan.sql,
         params: plan.params.into_iter().map(plan_param_to_value).collect(),
         expected_indexes: vec![IndexExpectation {
@@ -475,6 +480,16 @@ mod tests {
     fn hot_query_diagnostics_cover_named_paths() {
         let conn = test_conn();
         let summary = summarize_hot_query_plans(&conn).expect("summarize hot plans");
+        let inbox = summary
+            .diagnostics
+            .iter()
+            .find(|item| item.path == "inbox")
+            .unwrap();
+        assert_eq!(inbox.status, "ok", "{inbox:?}");
+        assert!(
+            inbox.steps.len() >= 4,
+            "every production lookup stage must be explained"
+        );
 
         assert_eq!(summary.diagnostics.len(), 4);
         assert_eq!(
@@ -505,10 +520,29 @@ mod tests {
     }
 
     #[test]
+    fn former_inbox_join_is_reported_as_a_scan_regression() {
+        let conn = test_conn();
+        let mut old = inbox_spec();
+        old.sql = "SELECT m.id, r.kind, s.name FROM message_recipients r \
+            JOIN messages m ON m.id = r.message_id \
+            LEFT JOIN agents s ON s.id = m.sender_id \
+            WHERE r.agent_id = ? AND m.project_id = ? \
+            ORDER BY m.created_ts DESC LIMIT ?"
+            .into();
+        old.params = vec![1_i64.into(), 1_i64.into(), DEFAULT_LIMIT.into()];
+        old.extra_queries.clear();
+        let diagnostic = explain_query_plan(&conn, &old).unwrap();
+        assert_eq!(diagnostic.status, "warn");
+        assert!(!diagnostic.warnings.is_empty());
+        assert!(!diagnostic.missing_expected_indexes.is_empty());
+    }
+
+    #[test]
     fn scan_regression_is_reported_for_unindexed_message_body_query() {
         let conn = test_conn();
         let spec = HotQuerySpec {
             path: HotQueryPath::SearchFallback,
+            extra_queries: Vec::new(),
             sql: "SELECT m.id FROM messages m WHERE m.body_md LIKE ? ORDER BY m.created_ts DESC LIMIT ?"
                 .to_string(),
             params: vec![
@@ -600,6 +634,7 @@ mod tests {
         let indexed = explain_query_plan(&conn, &inbox_spec()).expect("indexed inbox plan");
         let scan_spec = HotQuerySpec {
             path: HotQueryPath::Inbox,
+            extra_queries: Vec::new(),
             sql: "SELECT m.id FROM messages m WHERE m.body_md LIKE ? LIMIT ?".to_string(),
             params: vec![
                 Value::Text("%needle%".to_string()),
