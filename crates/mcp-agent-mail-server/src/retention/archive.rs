@@ -221,6 +221,21 @@ fn retention_pool_config(config: &Config) -> DbPoolConfig {
     pool_config
 }
 
+/// Pool construction can create SQLite sidecars before a repair lane reaches
+/// its own disk-pressure check. Refuse that first write boundary as well.
+/// `None` is a resource pause, not a failed source or an empty successful scan.
+/// Existing pools remain owned by the worker; each repair lane still checks
+/// pressure immediately before its checkpointed batch.
+fn create_retention_pool_if_admitted(
+    config: &Config,
+    pressure: u64,
+) -> Option<mcp_agent_mail_db::DbResult<DbPool>> {
+    if pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return None;
+    }
+    Some(create_pool(&retention_pool_config(config)))
+}
+
 fn retention_loop(
     config: &Config,
     settled_before_us: i64,
@@ -276,8 +291,19 @@ fn retention_loop(
 
         // Retry admission on a later tick instead of permanently disabling
         // healing after a transient startup failure or a retired pool.
-        if needs_db && pool.is_none() {
-            match create_pool(&retention_pool_config(config)) {
+        // Resource pressure is checked before opening the source, not only
+        // inside a repair batch after SQLite has already created sidecars.
+        if needs_db
+            && pool.is_none()
+            && let Some(result) = create_retention_pool_if_admitted(
+                config,
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+            )
+        {
+            match result {
                 Ok(created) => pool = Some(created),
                 Err(error) => {
                     warn!(
@@ -2088,5 +2114,94 @@ mod tests {
         assert_eq!(report.largest_roots.len(), 1);
         assert_eq!(report.largest_roots[0].name, "refactor_artifacts");
         assert_eq!(report.largest_roots[0].bytes, 9);
+    }
+}
+
+#[cfg(test)]
+mod source_admission_tests {
+    use super::*;
+
+    fn config(root: &Path) -> Config {
+        Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &root.join("mail.sqlite3"),
+            ),
+            storage_root: root.join("archive"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn critical_pressure_never_opens_the_maintenance_source() {
+        let scratch = tempfile::tempdir().expect("isolated source");
+        let config = config(scratch.path());
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        for pressure in [critical, critical.saturating_add(1), u64::MAX] {
+            for _ in 0..3 {
+                assert!(create_retention_pool_if_admitted(&config, pressure).is_none());
+                assert_eq!(
+                    std::fs::read_dir(scratch.path())
+                        .expect("source directory")
+                        .count(),
+                    0,
+                    "a pressure pause must not create a database, sidecar, or archive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_source_admission_resumes_after_pressure_clears() {
+        let scratch = tempfile::tempdir().expect("isolated source");
+        let config = config(scratch.path());
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        assert!(critical > 0);
+        // Production initializes the schema before starting maintenance.
+        // Exercise real checkout and SQL, not only a lazy pool constructor.
+        let startup_config = DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            run_migrations: true,
+            ..Default::default()
+        };
+        let startup = create_pool(&startup_config).expect("runtime source");
+        let cx = Cx::for_testing();
+        let initialized = block_on(startup.acquire(&cx))
+            .into_result()
+            .expect("initialize runtime source");
+        initialized
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("startup migrations completed");
+        drop(initialized);
+
+        assert!(create_retention_pool_if_admitted(&config, critical).is_none());
+        for pressure in [critical - 1, 0] {
+            let admitted = create_retention_pool_if_admitted(&config, pressure)
+                .expect("noncritical pressure admits a source attempt")
+                .expect("ordinary maintenance source opens after recovery");
+            let connection = block_on(admitted.acquire(&cx))
+                .into_result()
+                .expect("maintenance checkout after pressure clears");
+            let rows = connection
+                .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+                .expect("maintenance reads initialized source");
+            assert_eq!(rows[0].get_named::<i64>("c").unwrap(), 0);
+            assert!(scratch.path().join("mail.sqlite3").is_file());
+        }
+    }
+
+    #[test]
+    fn admitted_source_errors_are_not_reported_as_resource_pauses() {
+        let scratch = tempfile::tempdir().expect("isolated source");
+        let obstruction = scratch.path().join("not-a-directory");
+        std::fs::write(&obstruction, b"preserve this file").expect("source obstruction");
+        let config = config(&obstruction);
+        let result = create_retention_pool_if_admitted(&config, 0)
+            .expect("noncritical pressure must attempt ordinary source admission");
+        assert!(result.is_err(), "an invalid source must remain a real error");
+        assert_eq!(std::fs::read(&obstruction).unwrap(), b"preserve this file");
     }
 }
