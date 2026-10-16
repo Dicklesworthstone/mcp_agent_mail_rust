@@ -146,6 +146,35 @@ fn allow_absent_shared_schema(
     Ok(())
 }
 
+/// A join-free absence proof avoids materializing unrelated message history
+/// for the common direct-mail-only project. Receipt authority must still be
+/// readable: an incomplete schema is never a successfully empty mailbox.
+fn has_project_deliveries(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+) -> Result<bool, DbError> {
+    let rows = match conn.query_sync(
+        "SELECT message_id FROM project_mailbox_deliveries WHERE project_id = ? LIMIT 1",
+        &[Value::BigInt(project_id)],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            allow_absent_shared_schema(conn, &error.to_string())?;
+            return Ok(false);
+        }
+    };
+    if !rows.is_empty() {
+        return Ok(true);
+    }
+    if let Err(error) = conn.query_sync(
+        "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0",
+        &[],
+    ) {
+        allow_absent_shared_schema(conn, &error.to_string())?;
+    }
+    Ok(false)
+}
+
 /// Shared-mailbox inbox rows for one agent, newest first, with the same
 /// filter set as the direct inbox. Each row carries
 /// [`PROJECT_MAILBOX_KIND`] and the agent's own lazily-recorded read/ack state.
@@ -157,6 +186,11 @@ pub fn fetch_project_mailbox_rows_from_conn(
     limit: usize,
     options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
+    if !has_project_deliveries(conn, project_id)? {
+        // Retain the public limit contract even when no delivery is present.
+        i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
+        return Ok(Vec::new());
+    }
     let body_select = match options.body_policy {
         InboxBodyPolicy::Full => "m.body_md",
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
@@ -1458,6 +1492,73 @@ mod tests {
         );
         let direct_only = merge_inbox_rows(vec![row(1, 10, "to")], Vec::new(), 3);
         assert_eq!(direct_only.len(), 1);
+    }
+
+    #[test]
+    fn empty_shared_project_uses_only_bounded_delivery_and_receipt_probes() {
+        struct Observed<'a> {
+            conn: &'a DbConn,
+            statements: std::cell::RefCell<Vec<String>>,
+        }
+        impl crate::pool::SyncQuery for Observed<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                self.statements.borrow_mut().push(sql.to_string());
+                self.conn.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.conn.execute_raw(sql)
+            }
+        }
+        let conn = test_conn();
+        let observed = Observed {
+            conn: &conn,
+            statements: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(
+            fetch_project_mailbox_rows_from_conn(&observed, 1, 2, None, 20, options())
+                .unwrap()
+                .is_empty()
+        );
+        let statements = observed.statements.borrow();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("WHERE project_id = ? LIMIT 1"));
+        assert!(statements[1].contains("project_mailbox_receipts LIMIT 0"));
+        assert!(statements.iter().all(|sql| !sql.contains("JOIN")));
+        drop(statements);
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            fetch_project_mailbox_rows_from_conn(&observed, 1, 2, None, usize::MAX, options())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn empty_delivery_probe_still_refuses_missing_receipt_authority() {
+        let conn = test_conn();
+        conn.execute_raw(
+            "ALTER TABLE project_mailbox_receipts RENAME TO retained_project_receipts",
+        )
+        .unwrap();
+        let error =
+            fetch_project_mailbox_rows_from_conn(&conn, 1, 2, None, 20, options()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete project mailbox schema")
+        );
+        assert_eq!(
+            conn.query_sync(
+                "SELECT name FROM sqlite_master WHERE name = 'retained_project_receipts'",
+                &[]
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[test]
