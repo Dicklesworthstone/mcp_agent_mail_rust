@@ -269,6 +269,14 @@ impl Ledger {
         else {
             return false;
         };
+        // A collector can publish its last witness before finish releases its
+        // registration. Consuming that proof now would leave an empty ledger
+        // with a nonzero refusal timestamp and no ID for the next pass to retry.
+        // Keep the obligation until collection is complete; the normal bounded
+        // retry lane must verify it again before clearing, never finish itself.
+        if self.pending_registrations != 0 {
+            return false;
+        }
         self.entries.remove(index);
         self.entries.is_empty() && !self.unknown_failure && self.pending_registrations == 0
     }
@@ -632,7 +640,11 @@ mod tests {
                     crate::durability_degraded(),
                     "a pending failure has no proof yet"
                 );
-                assert!(ledger().entries.is_empty());
+                assert_eq!(
+                    ledger().entries.len(),
+                    1,
+                    "proof remains retryable until collection finishes"
+                );
                 &failed
             }));
 
@@ -844,6 +856,28 @@ mod tests {
             id,
             digest: [17; 32],
         }
+    }
+
+    #[test]
+    fn verified_ticket_survives_an_in_flight_registration() {
+        let mut state = Ledger {
+            pending_registrations: 1,
+            ..Default::default()
+        };
+        state.record(Some(witness(901)), Instant::now());
+        let ticket = state.entries[0].clone();
+        assert!(!state.complete(&ticket));
+        assert_eq!(
+            state.entries.len(),
+            1,
+            "a blocked clear must not discard its retry obligation"
+        );
+        state.pending_registrations = 0;
+        assert!(
+            state.complete(&ticket),
+            "a later verified attempt must finish recovery"
+        );
+        assert!(state.entries.is_empty());
     }
 
     #[test]
@@ -1089,6 +1123,35 @@ mod tests {
             }
             assert_eq!(message, expected, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn repair_during_collection_remains_retryable_after_registration_finishes() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            clear_by_operator();
+            let prepared = prepare_message_classified(cx, pool, 901).unwrap();
+            let registration = Registration::begin();
+            registration.record(Witness::from_op(&op(config, &prepared)));
+            let repaired = drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert_eq!(repaired.repaired, 1);
+            assert_committed(config, &prepared);
+            assert!(
+                crate::durability_degraded(),
+                "collection still owns an exclusion"
+            );
+            assert_eq!(ledger().entries.len(), 1);
+            registration.finish();
+            assert_eq!(ledger().pending_registrations, 0);
+            assert!(
+                crate::durability_degraded(),
+                "finish cannot manufacture an archive proof"
+            );
+            let verified = drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert_eq!(verified.unchanged, 1);
+            assert!(!crate::durability_degraded());
+            assert!(ledger().entries.is_empty());
+            assert_committed(config, &prepared);
+        });
     }
 
     #[test]
