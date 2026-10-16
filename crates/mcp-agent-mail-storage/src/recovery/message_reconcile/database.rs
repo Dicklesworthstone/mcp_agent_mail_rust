@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod admission_tests;
 mod checkpoint;
+pub(crate) mod durability;
 mod source;
 mod staged;
 
@@ -871,7 +872,12 @@ fn reconcile_message_batch_inner(
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
             .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
         validate_pool_binding(pool, config)?;
-        select_ids(cx, pool, cursor, cutoff)?
+        let selected = select_ids(cx, pool, cursor, cutoff)?;
+        // Selection already bound and validated the writable source. Inject
+        // known failed IDs into the ordinary bounded retry lane, not a second
+        // worker or a larger publication batch.
+        durability::seed_retries(config, cursor);
+        selected
     };
     let selected_identity = cursor.source_identity.clone();
     let now = Instant::now();
@@ -968,7 +974,15 @@ fn reconcile_message_batch_inner(
                         report.interrupted = true;
                         break;
                     }
-                    reconcile_prepared_inner(config, &prepared, Some(RepairControl { cx, stop }))
+                    let ticket = durability::ticket_for(config, &prepared);
+                    let result =
+                        reconcile_prepared_inner(config, &prepared, Some(RepairControl { cx, stop }));
+                    if result.is_ok() {
+                        durability::confirm_repaired(
+                            cx, pool, config, &selected_identity, stop, ticket.as_ref(),
+                        );
+                    }
+                    result
                 }
             },
             Err(error) => Err(error),

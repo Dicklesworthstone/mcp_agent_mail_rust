@@ -2871,11 +2871,11 @@ pub fn wbq_stats() -> WbqStats {
     }
 }
 
-/// Returns true when WBQ has experienced at least one retry-exhausted
-/// failure since the last operator clear. While true, the API layer
-/// must refuse new writes — accepting them would issue IDs from the
-/// in-memory allocator that the storage layer has already proven it
-/// can't persist. See #122.
+/// Returns true while a retry-exhausted WBQ failure remains unverified.
+/// The API must refuse new writes while this latch is set. Exact failed
+/// message witnesses can be discharged by verified DB-to-Git reconciliation;
+/// unknown or unsupported failures still require an explicit operator clear.
+/// Lifetime error counters remain unchanged by either recovery path. See #122.
 #[must_use]
 pub fn durability_degraded() -> bool {
     mcp_agent_mail_core::global_metrics()
@@ -2895,10 +2895,7 @@ pub fn durability_degraded() -> bool {
 /// semantics). Calling this without those preconditions just re-enables
 /// the bug.
 pub fn clear_durability_degraded() {
-    mcp_agent_mail_core::global_metrics()
-        .storage
-        .wbq_last_unrecoverable_error_us
-        .set(0);
+    recovery::message_reconcile::database::durability::clear_by_operator();
 }
 
 // ---------------------------------------------------------------------------
@@ -3440,10 +3437,9 @@ fn wbq_drain_loop(
                     .storage
                     .wbq_unrecoverable_errors_total
                     .add(unrecoverable);
-                metrics
-                    .storage
-                    .wbq_last_unrecoverable_error_us
-                    .set(now_micros_u64());
+                recovery::message_reconcile::database::durability::record_failures(
+                    envelopes.iter().map(|envelope| envelope.op.as_ref()),
+                );
                 if envelopes.len() > 1 {
                     tracing::error!(
                         "[wbq-drain] batched message-bundle run failed after retries ({} ops): {error} — durability degraded, refusing further writes until operator intervention",
@@ -3538,10 +3534,9 @@ fn wbq_drain_loop(
                     // accepted but never persisted. #122.
                     metrics.storage.wbq_errors_total.inc();
                     metrics.storage.wbq_unrecoverable_errors_total.inc();
-                    metrics
-                        .storage
-                        .wbq_last_unrecoverable_error_us
-                        .set(now_micros_u64());
+                    recovery::message_reconcile::database::durability::record_failures(
+                        std::iter::once(envelope.op.as_ref()),
+                    );
                     tracing::error!(
                         "[wbq-drain post-shutdown] op failed after retries: {error} — row will not persist"
                     );
