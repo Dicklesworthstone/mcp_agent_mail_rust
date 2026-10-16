@@ -286,7 +286,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     // A transient source-open failure must not permanently remove periodic
     // integrity checks and backups. Retry inside this owned thread; construct
     // the verification and maintenance schedules only once admission succeeds.
-    let Some(pool) = pool_admission::open(config, &SHUTDOWN, wait_for_next_cycle) else {
+    let Some(mut pool) = pool_admission::open(config, &SHUTDOWN, wait_for_next_cycle) else {
         return;
     };
 
@@ -346,6 +346,20 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             return;
         }
 
+        // A recovery closes every old pool shape. Re-admit this worker's
+        // source without restarting its verification, backup or maintenance
+        // schedules. No previous-generation startup skip can authorize it.
+        if !pool_admission::ensure_current(
+            config,
+            &SHUTDOWN,
+            &mut pool,
+            &mut verification_gate,
+            &mut skip_first_quick_cycle,
+            wait_for_next_cycle,
+        ) {
+            return;
+        }
+
         let skipped_quick_cycle = skip_first_quick_cycle;
         let quick_cycle_passed = if skip_first_quick_cycle {
             skip_first_quick_cycle = false;
@@ -370,7 +384,8 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
             || mcp_agent_mail_db::integrity::integrity_metrics().last_full_check_outcome
                 == mcp_agent_mail_db::integrity::IntegrityCheckOutcome::Failed;
-        let probes_passed = run_integrity_followups(
+        let probes_passed = run_live_integrity_followups(
+            &pool,
             quick_cycle_passed,
             full_due,
             &mut verification_gate,
@@ -413,6 +428,7 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
                 }
                 run_archive_drift_cycle(sqlite_path, &storage_root, full_completed);
                 if SHUTDOWN.load(Ordering::Acquire)
+                    || pool.is_closed()
                     || mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
                 {
                     return false;
@@ -469,6 +485,33 @@ fn wait_for_next_cycle(mut remaining: Duration) -> bool {
         remaining = remaining.saturating_sub(chunk);
     }
     !SHUTDOWN.load(Ordering::Acquire)
+}
+
+/// A probe's result belongs to the engine that produced it. A recovery can
+/// retire that engine between phases; never turn its old result (including a
+/// skipped quick probe) into permission for backup or maintenance work.
+fn run_live_integrity_followups<F, M, C>(
+    pool: &DbPool,
+    quick_cycle_passed: bool,
+    full_due: bool,
+    gate: &mut FullVerificationGate,
+    clock: C,
+    run_full: F,
+    run_followups: M,
+) -> bool
+where
+    F: FnOnce() -> bool,
+    M: FnOnce(bool) -> bool,
+    C: Fn() -> Instant,
+{
+    run_integrity_followups(
+        quick_cycle_passed && !pool.is_closed(),
+        full_due,
+        gate,
+        clock,
+        || !pool.is_closed() && run_full() && !pool.is_closed(),
+        |full_completed| !pool.is_closed() && run_followups(full_completed),
+    )
 }
 
 /// Run mutating followups only after all required integrity verdicts pass.
@@ -631,9 +674,9 @@ fn run_full_cycle(
             }
             standing_defects.clear("index_table_cross_count_probe");
             standing_defects.clear("index_table_cross_count");
-            if !recovery_check.reset_if_unchanged() {
+            if pool.is_closed() || !recovery_check.reset_if_unchanged() {
                 tracing::warn!(
-                    "integrity guard: newer corruption invalidated full-check evidence; retaining write refusal and skipping maintenance"
+                    "integrity guard: source retirement or newer corruption invalidated full-check evidence; retaining write refusal and skipping maintenance"
                 );
                 return false;
             }

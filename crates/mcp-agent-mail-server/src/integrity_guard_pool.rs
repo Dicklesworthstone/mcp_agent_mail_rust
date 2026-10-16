@@ -1,4 +1,4 @@
-//! Startup admission for the integrity worker's resolved mailbox.
+//! Startup and retired-engine admission for the integrity worker's mailbox.
 //!
 //! A failed pool open is not a reason to permanently lose integrity checks and
 //! backups. Retry on the existing owned worker thread, without restarting the
@@ -55,6 +55,99 @@ pub(super) fn open(
             );
         },
     )
+}
+
+/// Replace only an explicitly retired engine, never a merely busy live pool.
+/// Re-admission is not an integrity verdict. Withdraw old probe authority
+/// BEFORE waiting, without resetting the gate's retry history or any of the
+/// caller's backup/maintenance clocks. False means shutdown, not healthy idle.
+pub(super) fn ensure_current(
+    config: &Config,
+    stop: &AtomicBool,
+    pool: &mut DbPool,
+    verification: &mut super::schedule::FullVerificationGate,
+    skip_startup_probe: &mut bool,
+    wait: impl FnMut(Duration) -> bool,
+) -> bool {
+    if !pool.is_closed() {
+        return !stop.load(Ordering::Acquire);
+    }
+    verification.require();
+    *skip_startup_probe = false;
+    let selected = pool_config(config);
+    let replacement = retry(
+        || runtime_candidate(&selected),
+        || stop.load(Ordering::Acquire),
+        wait,
+        |error, failures, delay| {
+            tracing::warn!(
+                target: "maintenance",
+                event = "integrity_guard_runtime_readmission_deferred",
+                error = %error,
+                failures,
+                retry_in_secs = delay.as_secs(),
+                "integrity guard pool retired; preserving verification state while awaiting its live source"
+            );
+        },
+    );
+    let Some(replacement) = replacement else {
+        return false;
+    };
+    *pool = replacement;
+    tracing::info!(
+        target: "maintenance",
+        event = "integrity_guard_runtime_readmitted",
+        "integrity guard resumed on a live pool; fresh full verification is still required"
+    );
+    true
+}
+
+fn readmission_deferred(reason: &str) -> mcp_agent_mail_db::DbError {
+    mcp_agent_mail_db::DbError::ResourceBusy(format!(
+        "integrity guard source re-admission deferred: {reason}"
+    ))
+}
+
+fn critical_disk_pressure() -> bool {
+    mcp_agent_mail_core::global_metrics()
+        .system
+        .disk_pressure_level
+        .load()
+        >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
+}
+
+fn runtime_candidate(selected: &DbPoolConfig) -> mcp_agent_mail_db::DbResult<DbPool> {
+    use mcp_agent_mail_db::write_barrier::{self, DrainOutcome};
+
+    // Recovery may have closed the old pool BEFORE promoting the replacement.
+    // Do not even borrow a cached successor through that closed admission.
+    // This guard has no promotion-owner exemption, including in nested calls.
+    let activity = write_barrier::try_begin_write_activity()
+        .ok_or_else(|| readmission_deferred("recovery promotion or admission contention"))?;
+    if let Some(pool) = mcp_agent_mail_db::get_cached_pool(selected) {
+        return Ok(pool);
+    }
+    drop(activity);
+
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&selected.database_url) {
+        return Err(readmission_deferred("cannot recreate a retired in-memory mailbox"));
+    }
+    if critical_disk_pressure() {
+        return Err(readmission_deferred("critical disk pressure"));
+    }
+
+    // Only a genuinely cold replacement needs bootstrap exclusion. Bound the
+    // drain separately from retry pacing: an idle-only check could starve this
+    // worker forever under continuous ordinary writes. No guard spans backoff.
+    let (_promotion, outcome) =
+        write_barrier::acquire_promotion_barrier_draining(Duration::from_secs(1));
+    if matches!(outcome, DrainOutcome::TimedOut { .. }) {
+        return Err(readmission_deferred("writers did not drain within the re-admission budget"));
+    }
+    if critical_disk_pressure() {
+        return Err(readmission_deferred("critical disk pressure"));
+    }
+    mcp_agent_mail_db::create_pool(selected)
 }
 
 fn retry<T, E>(
@@ -260,3 +353,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "integrity_guard_pool_runtime_tests.rs"]
+mod runtime_tests;
