@@ -3,6 +3,7 @@
 //! Storage owns all source, generation, expiry, conflict and publication checks.
 //! This scheduler only removes intervening sleeps while bounded passes make
 //! progress. It never manufactures a storage report for refused admission.
+//! Critical disk pressure yields without consuming a lease or its checkpoint.
 
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,28 @@ const ADMISSION_REFUSAL: &str =
     "active reservation repair deferred: recovery promotion or admission contention";
 const CHECKPOINT_ADMISSION_REFUSAL: &str =
     "active reservation repair deferred: checkpoint is owned by another worker";
+const DISK_PRESSURE_REFUSAL: &str =
+    "active reservation repair deferred: critical disk pressure";
+
+pub(super) fn disk_is_critical() -> bool {
+    pressure_is_critical(
+        mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load(),
+    )
+}
+
+fn pressure_is_critical(pressure: u64) -> bool {
+    pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
+}
+
+fn with_disk_admission(
+    pressure: u64,
+    repair: impl FnOnce() -> Result<ActiveReservationReport, String>,
+) -> Result<ActiveReservationReport, String> {
+    if pressure_is_critical(pressure) {
+        return Err(DISK_PRESSURE_REFUSAL.into());
+    }
+    repair()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Turn {
@@ -40,12 +63,20 @@ fn pending() -> Turn {
 }
 
 pub(super) fn run(
-    repair: impl FnMut() -> Result<ActiveReservationReport, String>,
+    mut repair: impl FnMut() -> Result<ActiveReservationReport, String>,
     observe: impl FnMut(&ActiveReservationReport),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Turn, String> {
     let started = Instant::now();
-    run_with(repair, observe, || started.elapsed(), cancelled)
+    run_with(
+        || with_disk_admission(
+            mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load(),
+            &mut repair,
+        ),
+        observe,
+        || started.elapsed(),
+        cancelled,
+    )
 }
 
 fn run_with(
@@ -63,6 +94,12 @@ fn run_with(
         }
         let report = match repair() {
             Ok(report) => report,
+            Err(error) if error == DISK_PRESSURE_REFUSAL => {
+                // No source or checkpoint was admitted. This is not empty
+                // storage, nor a failed source family: retain the pool and
+                // cursor and wait on the ordinary poll, without a hot retry.
+                return Ok(stopped());
+            }
             Err(error) if error == ADMISSION_REFUSAL || error == CHECKPOINT_ADMISSION_REFUSAL => {
                 if cancelled() {
                     return Ok(stopped());
@@ -107,6 +144,108 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::collections::VecDeque;
+
+    #[test]
+    fn critical_disk_refusal_never_enters_storage_or_reports_idle_success() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        assert!(critical > 0);
+        for pressure in [critical, critical.saturating_add(1), u64::MAX] {
+            assert_eq!(
+                with_disk_admission(pressure, || panic!("no source or checkpoint access"))
+                    .unwrap_err(),
+                DISK_PRESSURE_REFUSAL,
+            );
+            let turn = run_with(
+                || with_disk_admission(pressure, || panic!("no repair")),
+                |_| panic!("pressure has no storage report"),
+                || Duration::ZERO,
+                || false,
+            ).unwrap();
+            assert_eq!(turn, stopped());
+            assert!(!turn.idle);
+        }
+        for pressure in [0, critical - 1] {
+            assert_eq!(
+                with_disk_admission(pressure, || Ok(busy())).unwrap().repaired,
+                4,
+            );
+            assert_eq!(
+                with_disk_admission(pressure, || Err("source unavailable".into()))
+                    .unwrap_err(),
+                "source unavailable",
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_after_progress_preserves_the_remaining_lease_batch_until_resume() {
+        let pressure = Cell::new(0);
+        let mut reports = VecDeque::from([
+            busy(),
+            ActiveReservationReport {
+                scanned: 1,
+                attempted: 1,
+                repaired: 1,
+                ..Default::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        let paused = run_with(
+            || with_disk_admission(pressure.get(), || {
+                Ok(reports.pop_front().expect("only pending work may be consumed"))
+            }),
+            |report| {
+                observed.push(report.repaired);
+                pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+            },
+            || Duration::ZERO,
+            || false,
+        ).unwrap();
+        assert_eq!(paused, stopped());
+        assert_eq!(observed, [4]);
+        assert_eq!(reports.len(), 1);
+        for _ in 0..60 {
+            assert_eq!(run_with(
+                || with_disk_admission(pressure.get(), || panic!("no storage while critical")),
+                |_| panic!("no fabricated batch"),
+                || Duration::ZERO,
+                || false,
+            ).unwrap(), stopped());
+        }
+        pressure.set(0);
+        let resumed = run_with(
+            || with_disk_admission(pressure.get(), || {
+                Ok(reports.pop_front().expect("resume, not replay"))
+            }),
+            |report| observed.push(report.repaired),
+            || Duration::ZERO,
+            || false,
+        ).unwrap();
+        assert_eq!(resumed.delay, POLL_INTERVAL);
+        assert!(!resumed.idle);
+        assert_eq!(observed, [4, 1]);
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn pressure_does_not_swallow_other_failures_or_override_shutdown() {
+        let other = format!("{DISK_PRESSURE_REFUSAL}: unexpected source error");
+        let result = run_with(
+            || Err(other.clone()),
+            |_| panic!("failed source has no report"),
+            || Duration::ZERO,
+            || false,
+        );
+        assert_eq!(result.unwrap_err(), other);
+        let stopped = run_with(
+            || panic!("shutdown precedes pressure and source admission"),
+            |_| panic!("no report"),
+            || Duration::ZERO,
+            || true,
+        ).unwrap();
+        assert_eq!(stopped.delay, POLL_INTERVAL);
+        assert!(!stopped.idle);
+    }
 
     fn busy() -> ActiveReservationReport {
         ActiveReservationReport {

@@ -8,6 +8,8 @@
 //! the short poll without bypassing storage cooldown or spinning on contention.
 //! Each pass checkpoints source-bound scheduling hints beside SQLite. Restart
 //! restores pending IDs, not captured lease state or a failed DB transaction.
+//! Critical disk pressure pauses before initial pool creation and before each
+//! storage batch. The same pool/cursor survive the pause without extra retries.
 
 mod turn;
 
@@ -169,14 +171,32 @@ fn apply_successful_turn_pool_policy(pool: &mut Option<DbPool>, turn: &turn::Tur
 }
 
 fn run(config: &Config, stop: &AtomicBool) {
+    run_with(config, stop, turn::disk_is_critical, |delay| pause(delay, stop));
+}
+
+fn run_with(
+    config: &Config,
+    stop: &AtomicBool,
+    mut disk_critical: impl FnMut() -> bool,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
     let mut pool: Option<DbPool> = None;
     let mut cursor = ActiveReservationCursor::default();
-    if pause(CATCH_UP_INTERVAL, stop) {
+    if wait(CATCH_UP_INTERVAL) {
         return;
     }
     loop {
         if stop.load(Ordering::Acquire) {
             return;
+        }
+        // Pool creation itself can open/create SQLite sidecars. Do not wait
+        // until turn admission to guard the first run after startup/recovery.
+        // A pressure pause neither drops a healthy source nor resets its debt.
+        if disk_critical() {
+            if wait(POLL_INTERVAL) {
+                return;
+            }
+            continue;
         }
         if pool.is_none() {
             match mcp_agent_mail_db::create_pool(&selected_pool(config)) {
@@ -221,7 +241,7 @@ fn run(config: &Config, stop: &AtomicBool) {
                 }
             }
         }
-        if pause(delay, stop) {
+        if wait(delay) {
             return;
         }
     }
@@ -231,6 +251,74 @@ fn run(config: &Config, stop: &AtomicBool) {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn pressure_paused_worker_does_not_create_a_source_or_checkpoint_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("mail.sqlite3");
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&database),
+            storage_root: temp.path().join("archive"),
+            ..Default::default()
+        };
+        let probes = Cell::new(0);
+        let mut delays = Vec::new();
+        // Run the actual worker loop with a deterministic pressure observation
+        // and wait. Neither callback substitutes the pool or storage code.
+        run_with(
+            &config,
+            &AtomicBool::new(false),
+            || {
+                probes.set(probes.get() + 1);
+                true
+            },
+            |delay| {
+                delays.push(delay);
+                delays.len() == 4
+            },
+        );
+        assert_eq!(probes.get(), 3);
+        assert_eq!(delays, [CATCH_UP_INTERVAL, POLL_INTERVAL, POLL_INTERVAL, POLL_INTERVAL]);
+        assert!(!database.exists());
+        assert!(!config.storage_root.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn shutdown_during_pressure_wait_prevents_any_later_source_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &temp.path().join("mail.sqlite3"),
+            ),
+            storage_root: temp.path().join("archive"),
+            ..Default::default()
+        };
+        let stop = AtomicBool::new(false);
+        let probes = Cell::new(0);
+        let mut waits = 0;
+        run_with(
+            &config,
+            &stop,
+            || {
+                probes.set(probes.get() + 1);
+                assert_eq!(probes.get(), 1, "shutdown must precede the next disk/source probe");
+                true
+            },
+            |delay| {
+                waits += 1;
+                if waits == 2 {
+                    assert_eq!(delay, POLL_INTERVAL);
+                    stop.store(true, Ordering::Release);
+                }
+                // Even a completed wait must respect the now-set stop flag.
+                false
+            },
+        );
+        assert_eq!(waits, 2);
+        assert_eq!(probes.get(), 1);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn restart_backoff_is_bounded_and_recovers_after_a_stable_run() {
