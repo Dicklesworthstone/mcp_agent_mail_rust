@@ -22,8 +22,6 @@ use super::{
     MAX_DB_PAYLOAD_BYTES, MAX_RETRIES_PER_PASS, MAX_RETRY_IDS, PreparedMessage, ReconcileCursor,
     outcome, prepare_message_classified, source_error, validate_pool_binding,
 };
-#[cfg(test)]
-use super::{RepairControl, reconcile_prepared_inner};
 use crate::WriteOp;
 
 const MAX_FAILURES: usize = 1024;
@@ -39,9 +37,8 @@ struct Scope {
 
 impl Scope {
     fn capture(config: &Config) -> Option<Self> {
-        let database = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(
-            &config.database_url,
-        )?;
+        let database =
+            mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url)?;
         let database = std::fs::canonicalize(database).ok()?;
         let archive = std::fs::canonicalize(&config.storage_root).ok()?;
         if database.as_os_str().as_encoded_bytes().len()
@@ -54,7 +51,9 @@ impl Scope {
         if !metadata.is_file() || !archive.is_dir() {
             return None;
         }
-        let created = metadata.created().ok()
+        let created = metadata
+            .created()
+            .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|time| (time.as_secs(), time.subsec_nanos()));
         #[cfg(unix)]
@@ -64,7 +63,11 @@ impl Scope {
         };
         #[cfg(not(unix))]
         let file_identity = format!("{:?}", created?);
-        Some(Self { database, archive, file_identity })
+        Some(Self {
+            database,
+            archive,
+            file_identity,
+        })
     }
 }
 
@@ -140,7 +143,12 @@ impl Fingerprint {
     }
 }
 
-fn fingerprint(message: &Value, body: &str, sender: &str, recipients: &[String]) -> Option<[u8; 32]> {
+fn fingerprint(
+    message: &Value,
+    body: &str,
+    sender: &str,
+    recipients: &[String],
+) -> Option<[u8; 32]> {
     if recipients.len() > 1024 || body.len() > usize::try_from(MAX_DB_PAYLOAD_BYTES).ok()? {
         return None;
     }
@@ -167,8 +175,15 @@ fn fingerprint(message: &Value, body: &str, sender: &str, recipients: &[String])
 impl Witness {
     fn from_op(op: &WriteOp) -> Option<Self> {
         let WriteOp::MessageBundle {
-            config, project_slug, message_json, body_md, sender, recipients, extra_paths,
-        } = op else {
+            config,
+            project_slug,
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            extra_paths,
+        } = op
+        else {
             return None;
         };
         // The normal reconciler cannot authorize arbitrary extra commit paths.
@@ -193,8 +208,12 @@ impl Witness {
     fn matches(&self, prepared: &PreparedMessage) -> bool {
         prepared.project_slug == self.project
             && prepared.message.get("id").and_then(Value::as_i64) == Some(self.id)
-            && fingerprint(&prepared.message, &prepared.body, &prepared.sender, &prepared.recipients)
-                == Some(self.digest)
+            && fingerprint(
+                &prepared.message,
+                &prepared.body,
+                &prepared.sender,
+                &prepared.recipients,
+            ) == Some(self.digest)
     }
 }
 
@@ -225,19 +244,29 @@ impl Ledger {
             return;
         };
         self.next_sequence = sequence;
-        if let Some(index) = self.entries.iter().position(|entry| entry.witness == witness) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.witness == witness)
+        {
             self.entries.remove(index);
         } else if self.entries.len() == MAX_FAILURES {
             self.unknown_failure = true;
             return;
         }
-        self.entries.push_back(Ticket { sequence, witness, ready_at: now });
+        self.entries.push_back(Ticket {
+            sequence,
+            witness,
+            ready_at: now,
+        });
     }
 
     fn complete(&mut self, ticket: &Ticket) -> bool {
-        let Some(index) = self.entries.iter().position(|entry| {
-            entry.sequence == ticket.sequence && entry.witness == ticket.witness
-        }) else {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.sequence == ticket.sequence && entry.witness == ticket.witness)
+        else {
             return false;
         };
         self.entries.remove(index);
@@ -245,7 +274,10 @@ impl Ledger {
     }
 
     fn postpone(&mut self, ticket: &Ticket, now: Instant) {
-        if let Some(index) = self.entries.iter().position(|entry| entry.sequence == ticket.sequence)
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.sequence == ticket.sequence)
             && let Some(mut entry) = self.entries.remove(index)
         {
             entry.ready_at = now + RETRY_DELAY;
@@ -278,7 +310,9 @@ fn ledger() -> MutexGuard<'static, Ledger> {
 }
 
 fn arm_refusal(state: &mut Ledger) {
-    let metric = &mcp_agent_mail_core::global_metrics().storage.wbq_last_unrecoverable_error_us;
+    let metric = &mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_last_unrecoverable_error_us;
     if metric.load() != state.timestamp {
         // A legacy/untracked latch cannot be discharged by newer tracked work.
         state.unknown_failure = true;
@@ -308,7 +342,10 @@ impl Registration {
             state.unknown_failure = true;
             false
         };
-        Self { counted, finished: false }
+        Self {
+            counted,
+            finished: false,
+        }
     }
 
     fn record(&self, witness: Option<Witness>) {
@@ -367,14 +404,19 @@ pub(crate) fn record_failures<'a>(ops: impl IntoIterator<Item = &'a WriteOp>) {
 pub(crate) fn clear_by_operator() {
     let mut ledger = ledger();
     ledger.operator_clear();
-    mcp_agent_mail_core::global_metrics().storage.wbq_last_unrecoverable_error_us.set(0);
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_last_unrecoverable_error_us
+        .set(0);
     // An explicit operator clear is the only authority to forgive a poisoned
     // failure ledger. Without this, every later lock would rearm unknown debt.
     LEDGER.clear_poison();
 }
 
 fn complete(ticket: &Ticket) {
-    let metric = &mcp_agent_mail_core::global_metrics().storage.wbq_last_unrecoverable_error_us;
+    let metric = &mcp_agent_mail_core::global_metrics()
+        .storage
+        .wbq_last_unrecoverable_error_us;
     let mut ledger = ledger();
     if metric.load() != ledger.timestamp {
         ledger.unknown_failure = true;
@@ -398,7 +440,9 @@ fn check_source(cx: &Cx, pool: &DbPool, config: &Config, ticket: &Ticket) -> Res
         return Err("failed-message source identity changed; operator review required".into());
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    let rows = conn.query_sync("PRAGMA query_only", &[]).map_err(source_error)?;
+    let rows = conn
+        .query_sync("PRAGMA query_only", &[])
+        .map_err(source_error)?;
     if rows.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
         return Err("query-only snapshots cannot discharge a WBQ durability refusal".into());
     }
@@ -406,7 +450,10 @@ fn check_source(cx: &Cx, pool: &DbPool, config: &Config, ticket: &Ticket) -> Res
 }
 
 fn disk_is_critical() -> bool {
-    mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load()
+    mcp_agent_mail_core::global_metrics()
+        .system
+        .disk_pressure_level
+        .load()
         >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
 }
 
@@ -429,9 +476,13 @@ fn ready_tickets(
         // cooling IDs must not prevent later failed messages from being admitted.
         // Multiple failed versions of one ID retain distinct proof obligations,
         // but only need one source read on this pass.
-        if &entry.witness.scope != scope || entry.ready_at > now
+        if &entry.witness.scope != scope
+            || entry.ready_at > now
             || cursor.retries.iter().any(|retry| retry.id == id)
-            || cursor.conflict_backoff.iter().any(|(known, until)| *known == id && *until > now)
+            || cursor
+                .conflict_backoff
+                .iter()
+                .any(|(known, until)| *known == id && *until > now)
             || ready.iter().any(|ticket| ticket.witness.id == id)
         {
             continue;
@@ -448,7 +499,9 @@ pub(super) fn seed_retries(config: &Config, cursor: &mut ReconcileCursor) {
     if !crate::durability_degraded() || disk_is_critical() {
         return;
     }
-    let Some(scope) = Scope::capture(config) else { return };
+    let Some(scope) = Scope::capture(config) else {
+        return;
+    };
     let now = Instant::now();
     let mut ledger = ledger();
     let ready = ready_tickets(&ledger, &scope, cursor, now);
@@ -458,7 +511,10 @@ pub(super) fn seed_retries(config: &Config, cursor: &mut ReconcileCursor) {
             break;
         }
         if cursor.retries.iter().any(|retry| retry.id == id)
-            || cursor.conflict_backoff.iter().any(|(known, until)| *known == id && *until > now)
+            || cursor
+                .conflict_backoff
+                .iter()
+                .any(|(known, until)| *known == id && *until > now)
         {
             continue;
         }
@@ -483,11 +539,22 @@ pub(super) fn ticket_for(config: &Config, prepared: &PreparedMessage) -> Option<
         return None;
     }
     let scope = Scope::capture(config)?;
-    let digest = fingerprint(&prepared.message, &prepared.body, &prepared.sender, &prepared.recipients)?;
-    ledger().entries.iter().find(|entry| {
-        entry.witness.scope == scope && entry.witness.id == id
-            && entry.witness.project == prepared.project_slug && entry.witness.digest == digest
-    }).cloned()
+    let digest = fingerprint(
+        &prepared.message,
+        &prepared.body,
+        &prepared.sender,
+        &prepared.recipients,
+    )?;
+    ledger()
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.witness.scope == scope
+                && entry.witness.id == id
+                && entry.witness.project == prepared.project_slug
+                && entry.witness.digest == digest
+        })
+        .cloned()
 }
 
 /// Called only after reconcile_prepared_inner returns verified Git success,
@@ -495,12 +562,18 @@ pub(super) fn ticket_for(config: &Config, prepared: &PreparedMessage) -> Option<
 /// Failed confirmation retains the independent latch obligation; it does not
 /// misreport a real archive publication as a new send or change any DB row.
 pub(super) fn confirm_repaired(
-    cx: &Cx, pool: &DbPool, config: &Config, source_identity: &str,
-    stop: &AtomicBool, ticket: Option<&Ticket>,
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    source_identity: &str,
+    stop: &AtomicBool,
+    ticket: Option<&Ticket>,
 ) {
     let Some(ticket) = ticket else { return };
     let verified = (|| -> Result<(), String> {
-        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() || disk_is_critical()
+        if stop.load(Ordering::Acquire)
+            || cx.checkpoint().is_err()
+            || disk_is_critical()
             || corruption_circuit_breaker().is_tripped()
         {
             return Err("durability proof completion interrupted".into());
@@ -511,7 +584,9 @@ pub(super) fn confirm_repaired(
         if pool.sqlite_identity_key() != source_identity || !ticket.witness.matches(&latest) {
             return Err("failed-message source changed during archive repair".into());
         }
-        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() || disk_is_critical()
+        if stop.load(Ordering::Acquire)
+            || cx.checkpoint().is_err()
+            || disk_is_critical()
             || corruption_circuit_breaker().is_tripped()
         {
             return Err("durability proof completion interrupted".into());
@@ -553,7 +628,10 @@ mod tests {
                 assert_eq!(state.pending_registrations, 1);
                 drop(state);
                 complete(&old);
-                assert!(crate::durability_degraded(), "a pending failure has no proof yet");
+                assert!(
+                    crate::durability_degraded(),
+                    "a pending failure has no proof yet"
+                );
                 assert!(ledger().entries.is_empty());
                 &failed
             }));
@@ -653,12 +731,17 @@ mod tests {
                 &prepared[0].message,
                 &prepared[0].sender,
                 &prepared[0].recipients,
-            ).unwrap().0;
+            )
+            .unwrap()
+            .0;
             // A directory where the canonical regular file must go forces
             // the production archive writer to fail; nothing fakes its Result.
             std::fs::create_dir_all(&paths.canonical).unwrap();
             let before = crate::wbq_stats();
-            let mut ops = prepared.iter().map(|message| op(config, message)).collect::<Vec<_>>();
+            let mut ops = prepared
+                .iter()
+                .map(|message| op(config, message))
+                .collect::<Vec<_>>();
             let expected_failures = if shutdown_first {
                 // Shutdown is received first; a healthy 902 consumes the
                 // one-op main batch. Failed 901 is then executed by the actual
@@ -669,33 +752,64 @@ mod tests {
             } else {
                 u64::try_from(count).unwrap()
             };
-            drain_ops(ops, shutdown_first, if shutdown_first { 1 } else { usize::try_from(count).unwrap() });
+            drain_ops(
+                ops,
+                shutdown_first,
+                if shutdown_first {
+                    1
+                } else {
+                    usize::try_from(count).unwrap()
+                },
+            );
             let failed = crate::wbq_stats();
-            assert_eq!(failed.unrecoverable_errors - before.unrecoverable_errors, expected_failures);
+            assert_eq!(
+                failed.unrecoverable_errors - before.unrecoverable_errors,
+                expected_failures
+            );
             assert_eq!(failed.errors - before.errors, expected_failures);
-            assert_eq!(failed.drained - before.drained, u64::try_from(count).unwrap());
-            assert!(crate::durability_degraded(), "the drain must register its failure itself");
-            assert_eq!(ledger().entries.len(), usize::try_from(expected_failures).unwrap());
+            assert_eq!(
+                failed.drained - before.drained,
+                u64::try_from(count).unwrap()
+            );
+            assert!(
+                crate::durability_degraded(),
+                "the drain must register its failure itself"
+            );
+            assert_eq!(
+                ledger().entries.len(),
+                usize::try_from(expected_failures).unwrap()
+            );
             assert_eq!(ledger().pending_registrations, 0);
             assert!(!ledger().unknown_failure);
 
             std::fs::rename(
                 &paths.canonical,
                 config.storage_root.join("retained-wbq-obstruction"),
-            ).unwrap();
+            )
+            .unwrap();
             drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
-            assert!(!crate::durability_degraded(), "verified repair must clear the real drain failure");
-            assert_eq!(crate::wbq_stats().unrecoverable_errors, failed.unrecoverable_errors);
+            assert!(
+                !crate::durability_degraded(),
+                "verified repair must clear the real drain failure"
+            );
+            assert_eq!(
+                crate::wbq_stats().unrecoverable_errors,
+                failed.unrecoverable_errors
+            );
             for message in &prepared {
                 assert_committed(config, message);
             }
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            let rows = conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<i64>("n").unwrap(), count);
-            let rows = conn.query_sync(
-                "SELECT read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id",
-                &[],
-            ).unwrap();
+            let rows = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(rows.len(), usize::try_from(count * 2).unwrap());
             for row in rows {
                 assert_eq!(row.get_named::<i64>("read_ts").unwrap(), 2_000_000);
@@ -823,7 +937,10 @@ mod tests {
 
     #[test]
     fn ticket_sequence_exhaustion_pins_manual_recovery() {
-        let mut state = Ledger { next_sequence: u64::MAX, ..Default::default() };
+        let mut state = Ledger {
+            next_sequence: u64::MAX,
+            ..Default::default()
+        };
         state.record(Some(witness(1)), Instant::now());
         assert!(state.unknown_failure);
         assert!(state.entries.is_empty());
@@ -844,7 +961,10 @@ mod tests {
         }
         let ready = ready_tickets(&state, &witness(1).scope, &cursor, now);
         assert_eq!(
-            ready.iter().map(|ticket| ticket.witness.id).collect::<Vec<_>>(),
+            ready
+                .iter()
+                .map(|ticket| ticket.witness.id)
+                .collect::<Vec<_>>(),
             (33..=40).collect::<Vec<_>>(),
         );
         assert_eq!(state.entries.len(), 40, "selection never discharges debt");
@@ -873,21 +993,41 @@ mod tests {
 
     #[test]
     fn digest_is_key_order_independent_but_binds_body_identity_and_private_routing() {
-        let left: Value = serde_json::from_str(r#"{"id":1,"nested":{"a":1,"b":2},"bcc":["RedFox"]}"#).unwrap();
-        let right: Value = serde_json::from_str(r#"{"bcc":["RedFox"],"nested":{"b":2,"a":1},"id":1}"#).unwrap();
+        let left: Value =
+            serde_json::from_str(r#"{"id":1,"nested":{"a":1,"b":2},"bcc":["RedFox"]}"#).unwrap();
+        let right: Value =
+            serde_json::from_str(r#"{"bcc":["RedFox"],"nested":{"b":2,"a":1},"id":1}"#).unwrap();
         let recipients = vec!["BlueLake".into(), "RedFox".into()];
         let original = fingerprint(&left, "body", "GoldFox", &recipients).unwrap();
-        assert_eq!(Some(original), fingerprint(&right, "body", "GoldFox", &recipients));
-        assert_ne!(Some(original), fingerprint(&left, "changed", "GoldFox", &recipients));
-        assert_ne!(Some(original), fingerprint(&left, "body", "SilverCloud", &recipients));
+        assert_eq!(
+            Some(original),
+            fingerprint(&right, "body", "GoldFox", &recipients)
+        );
+        assert_ne!(
+            Some(original),
+            fingerprint(&left, "changed", "GoldFox", &recipients)
+        );
+        assert_ne!(
+            Some(original),
+            fingerprint(&left, "body", "SilverCloud", &recipients)
+        );
         let mut changed = left.clone();
         changed["bcc"] = json!([]);
-        assert_ne!(Some(original), fingerprint(&changed, "body", "GoldFox", &recipients));
-        assert_ne!(Some(original), fingerprint(&left, "body", "GoldFox", &recipients[..1]));
+        assert_ne!(
+            Some(original),
+            fingerprint(&changed, "body", "GoldFox", &recipients)
+        );
+        assert_ne!(
+            Some(original),
+            fingerprint(&left, "body", "GoldFox", &recipients[..1])
+        );
         let mut reversed = recipients.clone();
         reversed.reverse();
         reversed.push(recipients[0].clone());
-        assert_eq!(Some(original), fingerprint(&left, "body", "GoldFox", &reversed));
+        assert_eq!(
+            Some(original),
+            fingerprint(&left, "body", "GoldFox", &reversed)
+        );
         let oversized = "x".repeat(usize::try_from(MAX_DB_PAYLOAD_BYTES).unwrap() + 1);
         assert!(fingerprint(&left, &oversized, "GoldFox", &recipients).is_none());
     }
@@ -899,3 +1039,112 @@ mod tests {
         WriteOp::MessageBundle {
             config: config.clone(),
             project_slug: prepared.project_slug.clone(),
+            message_json: prepared.message.clone(),
+            body_md: prepared.body.clone(),
+            sender: prepared.sender.clone(),
+            recipients: prepared.recipients.clone(),
+            extra_paths: Vec::new(),
+        }
+    }
+
+    fn drive(
+        cx: &Cx,
+        pool: &DbPool,
+        config: &Config,
+        stop: &AtomicBool,
+    ) -> Result<super::super::ReconcileReport, String> {
+        // Exercise the same bounded selection, promotion exclusion, publication,
+        // and confirmation path as maintenance. Never clear the latch directly.
+        super::super::reconcile_message_batch(
+            cx,
+            pool,
+            config,
+            &mut ReconcileCursor::default(),
+            stop,
+        )
+    }
+
+    fn assert_committed(config: &Config, prepared: &PreparedMessage) {
+        let archive = crate::ensure_archive(config, &prepared.project_slug).unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let committed = super::super::CommittedMessages::open(&archive).unwrap();
+        for path in std::iter::once(&paths.canonical)
+            .chain(std::iter::once(&paths.outbox))
+            .chain(paths.inbox.iter())
+        {
+            let (message, body) = committed.read(&archive, path).unwrap().unwrap();
+            let on_disk = super::super::read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(on_disk, (message.clone(), body.clone()));
+            assert_eq!(body, prepared.body);
+            let mut expected = prepared.message.clone();
+            if paths.inbox.contains(path) {
+                expected["bcc"] = json!([]);
+            }
+            assert_eq!(message, expected, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn missing_source_row_cannot_clear_a_tracked_write_failure() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            clear_by_operator();
+            let prepared = prepare_message_classified(cx, pool, 901).unwrap();
+            record_failures(std::iter::once(&op(config, &prepared)));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("DELETE FROM message_recipients WHERE message_id = 901")
+                .unwrap();
+            conn.execute_raw("DELETE FROM messages WHERE id = 901")
+                .unwrap();
+            drop(conn);
+            let report = drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert_eq!(report.repaired, 0);
+            assert!(crate::durability_degraded());
+            assert_eq!(ledger().entries.len(), 1);
+            clear_by_operator();
+        });
+    }
+
+    #[test]
+    fn changed_source_content_cannot_discharge_the_original_write_failure() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            clear_by_operator();
+            let prepared = prepare_message_classified(cx, pool, 901).unwrap();
+            record_failures(std::iter::once(&op(config, &prepared)));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET body_md = 'Different content' WHERE id = 901")
+                .unwrap();
+            drop(conn);
+            drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert!(
+                crate::durability_degraded(),
+                "repairing different content is not proof of the failed write"
+            );
+            assert_eq!(ledger().entries.len(), 1);
+            clear_by_operator();
+        });
+    }
+
+    #[test]
+    fn cancelled_pass_preserves_failure_until_a_later_verified_repair() {
+        super::super::tests::retention_fixture(1, |cx, pool, config| {
+            clear_by_operator();
+            let prepared = prepare_message_classified(cx, pool, 901).unwrap();
+            record_failures(std::iter::once(&op(config, &prepared)));
+            let stopped = drive(cx, pool, config, &AtomicBool::new(true)).unwrap();
+            assert!(stopped.interrupted);
+            assert!(crate::durability_degraded());
+            assert_eq!(ledger().entries.len(), 1);
+            let repaired = drive(cx, pool, config, &AtomicBool::new(false)).unwrap();
+            assert_eq!(repaired.repaired, 1);
+            assert!(!crate::durability_degraded());
+            assert_committed(config, &prepared);
+        });
+    }
+}
