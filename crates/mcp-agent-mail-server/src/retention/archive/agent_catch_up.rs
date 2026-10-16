@@ -4,6 +4,8 @@
 //! bypassing storage's per-ID backoff or delaying other maintenance phases.
 //! Roster progress and retry IDs survive worker/server restarts through the
 //! storage cursor's generation-bound checkpoint, never through cached profiles.
+//! Critical disk pressure pauses before source/checkpoint admission. A paused
+//! turn retains the same cursor and pool and resumes on the normal worker poll.
 
 use asupersync::Cx;
 use mcp_agent_mail_core::Config;
@@ -18,6 +20,8 @@ const ADMISSION_DEFERRED: &str =
     "agent reconciliation deferred: recovery promotion or admission contention";
 const CHECKPOINT_OWNED: &str =
     "agent reconciliation deferred: checkpoint is owned by another worker";
+const DISK_PRESSURE_DEFERRED: &str =
+    "agent reconciliation deferred: critical disk pressure";
 const MAX_BATCHES_PER_TURN: usize = 8;
 const MAX_ACTIVE_PER_TURN: Duration = Duration::from_millis(250);
 
@@ -37,11 +41,32 @@ pub(super) fn run(
 ) -> Result<bool, String> {
     let started = Instant::now();
     run_with(
-        || cursor.reconcile_checkpointed(cx, pool, config, stop),
+        || {
+            with_disk_admission(
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+                || cursor.reconcile_checkpointed(cx, pool, config, stop),
+            )
+        },
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
         || started.elapsed(),
         observe,
     )
+}
+
+fn with_disk_admission(
+    pressure: u64,
+    repair: impl FnOnce() -> Result<AgentReconcileReport, String>,
+) -> Result<AgentReconcileReport, String> {
+    if pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        // Even an unchanged checkpointed batch can create a lock sidecar and
+        // stage/fsync new hints. Refuse before checkout as well as publication,
+        // not after the source has already competed for the remaining space.
+        return Err(DISK_PRESSURE_DEFERRED.into());
+    }
+    repair()
 }
 
 fn run_with(
@@ -99,6 +124,13 @@ fn finish(
             observe(&report);
             Ok(follow_up)
         }
+        Err(error) if error == DISK_PRESSURE_DEFERRED => {
+            // A resource pause is neither a source failure nor a completed
+            // batch. Leave the pool, durable checkpoint and in-memory debt
+            // alone. The normal lane deadline retries after disk recovery;
+            // no one-second catch-up or repeated warning solely for pressure.
+            Ok(false)
+        }
         Err(error) if error == ADMISSION_DEFERRED || error == CHECKPOINT_OWNED => {
             if interrupted() {
                 return Ok(false);
@@ -121,6 +153,210 @@ mod tests {
     use std::cell::Cell;
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn disk_pressure_refuses_before_storage_and_does_not_mask_source_errors() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        assert!(critical > 0);
+        for level in [critical, critical.saturating_add(1), u64::MAX] {
+            let refused = with_disk_admission(level, || {
+                panic!("critical pressure must not enter the checkpointed reconciler")
+            });
+            assert_eq!(refused.unwrap_err(), DISK_PRESSURE_DEFERRED);
+        }
+        for level in [0, critical - 1] {
+            let mut calls = 0;
+            let result = with_disk_admission(level, || {
+                calls += 1;
+                Err("source unavailable".into())
+            });
+            assert_eq!(result.unwrap_err(), "source unavailable");
+            assert_eq!(calls, 1);
+        }
+        for interrupted in [false, true] {
+            assert!(!finish(
+                Err(DISK_PRESSURE_DEFERRED.into()),
+                || interrupted,
+                |_| panic!("pressure refusal is not a completed storage report"),
+            ).unwrap());
+        }
+        let other = format!("{DISK_PRESSURE_DEFERRED}: source also failed");
+        assert_eq!(
+            finish(Err(other.clone()), || false, |_| panic!("no report")),
+            Err(other),
+        );
+    }
+
+    #[test]
+    fn pressure_between_batches_keeps_pending_work_and_resumes_without_replay() {
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        let pressure = Cell::new(0);
+        let mut pending = std::collections::VecDeque::from([
+            AgentReconcileReport {
+                scanned: 4,
+                repaired: 4,
+                budget_exhausted: true,
+                ..Default::default()
+            },
+            AgentReconcileReport {
+                scanned: 1,
+                repaired: 1,
+                ..Default::default()
+            },
+        ]);
+        let mut observed = Vec::new();
+        assert!(!run_with(
+            || with_disk_admission(pressure.get(), || {
+                Ok(pending.pop_front().expect("no speculative storage batch"))
+            }),
+            || false,
+            || Duration::ZERO,
+            |report| {
+                observed.push(report.repaired);
+                pressure.set(critical);
+            },
+        ).unwrap());
+        assert_eq!(observed, [4]);
+        assert_eq!(pending.len(), 1, "a pressure refusal cannot consume work");
+        for _ in 0..60 {
+            assert!(!run_with(
+                || with_disk_admission(pressure.get(), || {
+                    panic!("sustained pressure cannot execute storage")
+                }),
+                || false,
+                || Duration::ZERO,
+                |_| panic!("no report for a paused turn"),
+            ).unwrap());
+        }
+        pressure.set(0);
+        assert!(!run_with(
+            || with_disk_admission(pressure.get(), || {
+                Ok(pending.pop_front().expect("the remaining batch, not a replay"))
+            }),
+            || false,
+            || Duration::ZERO,
+            |report| observed.push(report.repaired),
+        ).unwrap());
+        assert_eq!(observed, [4, 1]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_a_pressure_turn_skips_even_the_batch_callback() {
+        assert!(!run_with(
+            || panic!("cancelled work must not enter disk or source admission"),
+            || true,
+            || Duration::ZERO,
+            |_| panic!("cancelled work has no report"),
+        ).unwrap());
+    }
+
+    // Used only in isolated children, never concurrently with another test's
+    // metrics. Restore on unwind too, rather than leaking pressure to teardown.
+    struct RestoreDiskPressure(u64);
+
+    impl Drop for RestoreDiskPressure {
+        fn drop(&mut self) {
+            mcp_agent_mail_core::global_metrics()
+                .system.disk_pressure_level.set(self.0);
+        }
+    }
+
+    fn tree_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        let mut entries = std::collections::BTreeMap::new();
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink(), "owned fixture must not follow a foreign path");
+                let value = if kind.is_dir() {
+                    directories.push(path.clone());
+                    None
+                } else {
+                    assert!(kind.is_file());
+                    Some(std::fs::read(&path).unwrap())
+                };
+                entries.insert(path.strip_prefix(root).unwrap().to_path_buf(), value);
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn real_pressure_pause_preserves_source_checkpoint_and_lost_retirement_until_resume() {
+        if isolated() {
+            return;
+        }
+        let metric = &mcp_agent_mail_core::global_metrics().system.disk_pressure_level;
+        let _restore = RestoreDiskPressure(metric.load());
+        metric.set(0);
+        let temp = tempfile::tempdir().unwrap();
+        let (config, _, pool) = mailbox(temp.path());
+        let engine = pool.engine_identity_key();
+        let cx = Cx::for_testing();
+        let stop = AtomicBool::new(false);
+        let mut cursor = AgentReconcileCursor::default();
+
+        // First a never-started cursor, then a completed checkpoint whose
+        // first agent has a lost retirement write. Both must be byte-neutral
+        // under pressure, including SQLite sidecars and checkpoint namespace.
+        for existing in [false, true] {
+            if existing {
+                fastmcp_core::block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
+                    &cx, &pool, 701, Some(345_678_901),
+                )).into_result().unwrap();
+            }
+            mcp_agent_mail_storage::flush_async_commits();
+            let borrower = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let before = tree_bytes(temp.path());
+            let position = format!("{cursor:?}");
+            metric.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+            for _ in 0..3 {
+                assert!(!run(
+                    &cx, &pool, &config, &mut cursor, &stop,
+                    |_| panic!("disk refusal cannot report a completed repair"),
+                ).unwrap());
+            }
+            // With this one-connection pool exhausted, the old path waits or
+            // errors at checkout. The pressure gate must return without it.
+            assert_eq!(tree_bytes(temp.path()), before);
+            assert_eq!(format!("{cursor:?}"), position);
+            assert_eq!(pool.engine_identity_key(), engine);
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+            drop(borrower);
+            if !existing {
+                assert!(!config.storage_root.join(".git").exists());
+            }
+            metric.set(0);
+            let mut repaired = 0;
+            let mut backlog = true;
+            for _ in 0..4 {
+                if !backlog {
+                    break;
+                }
+                backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
+                    assert_eq!(report.deferred, 0);
+                    repaired += report.repaired;
+                }).unwrap();
+            }
+            assert!(!backlog, "disk recovery must resume the original finite scan");
+            assert_eq!(repaired, if existing { 1 } else { 5 });
+            assert_eq!(pool.engine_identity_key(), engine);
+            if existing {
+                let relative = "projects/gh353/agents/BlueLake/profile.json";
+                let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
+                let profile: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(profile["retired_at"], mcp_agent_mail_db::micros_to_iso(345_678_901));
+                assert!(profile.get("registration_token").is_none());
+                let repo = git2::Repository::open(&config.storage_root).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
+                assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+            }
+        }
+    }
 
     #[test]
     fn checkpoint_ownership_refusal_yields_without_fabricating_a_batch() {
