@@ -15,6 +15,8 @@ mod backup_budget;
 #[cfg(unix)]
 #[path = "integrity_guard_backup_journal.rs"]
 mod backup_journal;
+#[path = "integrity_guard_pool.rs"]
+mod pool_admission;
 #[path = "integrity_guard_schedule.rs"]
 mod schedule;
 
@@ -22,9 +24,9 @@ use schedule::{AutomaticBackupSchedule, BackupCompletion, BackupKind, FullVerifi
 
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::is_sqlite_memory_database_url;
-use mcp_agent_mail_db::{
-    DbPool, DbPoolConfig, is_corruption_error_message, is_sqlite_recovery_error_message,
-};
+#[cfg(test)]
+use mcp_agent_mail_db::DbPoolConfig;
+use mcp_agent_mail_db::{DbPool, is_corruption_error_message, is_sqlite_recovery_error_message};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -281,22 +283,11 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     let full_every = full_check_interval(config);
     let storage_root = config.storage_root.clone();
 
-    let mut pool_config = DbPoolConfig::from_env();
-    pool_config.database_url.clone_from(&config.database_url);
-    pool_config.min_connections = 1;
-    pool_config.max_connections = 1;
-    pool_config.warmup_connections = 0;
-    // Keep migrations enabled here: this worker can be the first component to
-    // acquire a pooled connection (e.g. proactive backup checkpointing in
-    // stdio mode), and that first-acquire path must remain schema-safe.
-    pool_config.run_migrations = true;
-
-    let pool = match mcp_agent_mail_db::create_pool(&pool_config) {
-        Ok(pool) => pool,
-        Err(err) => {
-            tracing::warn!(error = %err, "integrity guard: failed to create DB pool, exiting");
-            return;
-        }
+    // A transient source-open failure must not permanently remove periodic
+    // integrity checks and backups. Retry inside this owned thread; construct
+    // the verification and maintenance schedules only once admission succeeds.
+    let Some(pool) = pool_admission::open(config, &SHUTDOWN, wait_for_next_cycle) else {
+        return;
     };
 
     tracing::info!(
