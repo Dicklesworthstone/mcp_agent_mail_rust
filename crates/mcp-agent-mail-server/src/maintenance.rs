@@ -9,6 +9,9 @@
 //! - `AM_ARCHIVE_MAINTENANCE_DISABLED=1` — disables the worker entirely
 //! - `AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS` — override the 1800s default
 
+#[path = "maintenance_midx.rs"]
+mod midx_recovery;
+
 use mcp_agent_mail_core::Config;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1250,6 +1253,10 @@ fn terminate_maintenance_child(
 /// Run the maintenance tasks on a given archive git directory.
 /// This is the core function used by both the background worker and the CLI.
 pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
+    midx_recovery::run_with_recovery(git_dir, &SHUTDOWN, run_maintenance_once)
+}
+
+fn run_maintenance_once(git_dir: &Path) -> MaintenanceReport {
     let work_tree = git_dir.parent().unwrap_or(git_dir);
     let mut notes: Vec<String> = Vec::new();
     let loose_before = count_loose_objects(git_dir);
