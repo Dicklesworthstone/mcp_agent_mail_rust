@@ -76,6 +76,50 @@ pub struct VerifiedSnapshotMetadata {
     pub binary_version: String,
 }
 
+/// The exact unversioned record emitted by v0.3.30 (GH#355). It is recognized
+/// only so a freshly verified snapshot can supersede it without losing the old
+/// evidence. These claims never authorize a restore or identify backup bytes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySnapshotMetadata {
+    created_us: i64,
+    integrity_verified: bool,
+    integrity_kind: String,
+    schema_version: i64,
+    row_counts: BTreeMap<String, i64>,
+    source_path: String,
+    snapshot_path: String,
+    binary_version: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotMetadataAuthority {
+    Missing,
+    Current(Vec<u8>),
+    Legacy(Vec<u8>),
+}
+
+fn legacy_metadata_matches_namespace(
+    meta: &LegacySnapshotMetadata,
+    primary: &Path,
+    canonical_bak: &Path,
+) -> bool {
+    meta.binary_version == "0.3.30"
+        && meta.created_us > 0
+        && meta.integrity_verified
+        && meta.integrity_kind == CheckKind::Full.to_string()
+        && meta.schema_version >= 0
+        && meta.row_counts.iter().all(|(table, count)| {
+            SNAPSHOT_ROW_COUNT_TABLES.contains(&table.as_str()) && *count >= 0
+        })
+        && primary
+            .to_str()
+            .is_some_and(|path| meta.source_path == path)
+        && canonical_bak
+            .to_str()
+            .is_some_and(|path| meta.snapshot_path == path)
+}
+
 /// Resolve the `.bak` snapshot path for a primary database path.
 #[must_use]
 pub fn snapshot_bak_path(primary: &Path) -> PathBuf {
@@ -233,11 +277,11 @@ fn snapshot_file_identity_from_reader(
     Ok((size, hex::encode(hasher.finalize())))
 }
 
-fn existing_snapshot_metadata_is_owned(
+fn existing_snapshot_metadata_authority(
     meta_path: &Path,
     primary: &Path,
     canonical_bak: &Path,
-) -> DbResult<bool> {
+) -> DbResult<SnapshotMetadataAuthority> {
     match std::fs::symlink_metadata(meta_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
@@ -250,32 +294,130 @@ fn existing_snapshot_metadata_is_owned(
                     meta_path.display()
                 ))
             })?;
-            let existing: VerifiedSnapshotMetadata = serde_json::from_slice(&bytes).map_err(
-                |error| {
-                    DbError::Sqlite(format!(
-                        "snapshot metadata refuses to replace unrecognized regular file {}: {error}",
-                        meta_path.display()
-                    ))
-                },
-            )?;
-            if !metadata_matches_snapshot_namespace(&existing, primary, canonical_bak) {
-                return Err(DbError::Sqlite(format!(
-                    "snapshot metadata refuses to replace foreign or future authority {}",
-                    meta_path.display()
-                )));
+            match serde_json::from_slice::<VerifiedSnapshotMetadata>(&bytes) {
+                Ok(existing) => {
+                    if !metadata_matches_snapshot_namespace(&existing, primary, canonical_bak) {
+                        return Err(DbError::Sqlite(format!(
+                            "snapshot metadata refuses to replace foreign or future authority {}",
+                            meta_path.display()
+                        )));
+                    }
+                    Ok(SnapshotMetadataAuthority::Current(bytes))
+                }
+                Err(error) => {
+                    // Unknown versions, partially written current records and
+                    // operator evidence must not be mistaken for legacy output.
+                    if serde_json::from_slice::<LegacySnapshotMetadata>(&bytes).is_ok_and(|meta| {
+                        legacy_metadata_matches_namespace(&meta, primary, canonical_bak)
+                    }) {
+                        Ok(SnapshotMetadataAuthority::Legacy(bytes))
+                    } else {
+                        Err(DbError::Sqlite(format!(
+                            "snapshot metadata refuses to replace unrecognized regular file {}: {error}",
+                            meta_path.display()
+                        )))
+                    }
+                }
             }
-            Ok(true)
         }
         Ok(_) => Err(DbError::Sqlite(format!(
             "snapshot metadata destination {} is not a regular non-symlink file",
             meta_path.display()
         ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SnapshotMetadataAuthority::Missing)
+        }
         Err(error) => Err(DbError::Sqlite(format!(
             "snapshot metadata cannot inspect destination {}: {error}",
             meta_path.display()
         ))),
     }
+}
+
+/// Preserve the old record before publishing new authority. The content-derived
+/// name makes crash retries idempotent; an occupied name is accepted only when
+/// it already contains these exact bytes in a regular, non-symlink file.
+fn preserve_legacy_snapshot_metadata(meta_path: &Path, bytes: &[u8]) -> DbResult<PathBuf> {
+    use std::io::Write as _;
+
+    let parent = meta_path.parent().ok_or_else(|| {
+        DbError::Sqlite("snapshot metadata has no evidence directory".to_string())
+    })?;
+    let mut name = meta_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".legacy-{}.json", hex::encode(Sha256::digest(bytes))));
+    let preserved = parent.join(name);
+    let verify_existing = || -> DbResult<()> {
+        let existing = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+            &preserved,
+            MAX_SNAPSHOT_METADATA_BYTES,
+        )
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "snapshot metadata cannot inspect preserved legacy evidence {}: {error}",
+                preserved.display()
+            ))
+        })?;
+        if existing != bytes {
+            return Err(DbError::Sqlite(format!(
+                "snapshot metadata legacy evidence {} is occupied by different bytes",
+                preserved.display()
+            )));
+        }
+        Ok(())
+    };
+    match std::fs::symlink_metadata(&preserved) {
+        Ok(_) => verify_existing()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut stage = tempfile::Builder::new()
+                .prefix(".snapshot-legacy-")
+                .tempfile_in(parent)
+                .map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "snapshot metadata cannot stage legacy evidence: {error}"
+                    ))
+                })?;
+            mcp_agent_mail_core::disk::set_private_writable_file_permissions(stage.as_file())
+                .and_then(|()| stage.write_all(bytes))
+                .and_then(|()| stage.as_file().sync_all())
+                .map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "snapshot metadata cannot preserve legacy evidence: {error}"
+                    ))
+                })?;
+            match stage.persist_noclobber(&preserved) {
+                Ok(file) => file.sync_all().map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "snapshot metadata cannot sync legacy evidence: {error}"
+                    ))
+                })?,
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    verify_existing()?;
+                }
+                Err(error) => {
+                    return Err(DbError::Sqlite(format!(
+                        "snapshot metadata cannot publish legacy evidence {}: {}",
+                        preserved.display(),
+                        error.error
+                    )));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(DbError::Sqlite(format!(
+                "snapshot metadata cannot inspect legacy evidence {}: {error}",
+                preserved.display()
+            )));
+        }
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            DbError::Sqlite(format!(
+                "snapshot metadata cannot sync legacy evidence directory: {error}"
+            ))
+        })?;
+    Ok(preserved)
 }
 
 /// Write the metadata sidecar atomically (tmp file + rename).
@@ -308,8 +450,8 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
             parent.display()
         )));
     }
-    let replacing_owned_authority =
-        existing_snapshot_metadata_is_owned(&meta_path, &primary, &canonical_bak)?;
+    let replacing_authority =
+        existing_snapshot_metadata_authority(&meta_path, &primary, &canonical_bak)?;
 
     let mut staged = tempfile::Builder::new()
         .prefix(".snapshot-meta-")
@@ -344,17 +486,25 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
 
     // Revalidate the destination immediately before the atomic replace so an
     // occupied symlink/non-file can never redirect or absorb the write.
-    let still_owned = existing_snapshot_metadata_is_owned(&meta_path, &primary, &canonical_bak)?;
-    if still_owned != replacing_owned_authority {
+    if let SnapshotMetadataAuthority::Legacy(bytes) = &replacing_authority {
+        let preserved = preserve_legacy_snapshot_metadata(&meta_path, bytes)?;
+        tracing::info!(
+            metadata = %meta_path.display(),
+            evidence = %preserved.display(),
+            "preserved v0.3.30 snapshot metadata before publishing a freshly verified snapshot"
+        );
+    }
+    let still_owned = existing_snapshot_metadata_authority(&meta_path, &primary, &canonical_bak)?;
+    if still_owned != replacing_authority {
         return Err(DbError::Sqlite(format!(
-            "snapshot metadata destination {} changed occupancy during publication",
+            "snapshot metadata destination {} changed during publication",
             meta_path.display()
         )));
     }
-    let persisted = if replacing_owned_authority {
-        staged.persist(&meta_path)
-    } else {
+    let persisted = if replacing_authority == SnapshotMetadataAuthority::Missing {
         staged.persist_noclobber(&meta_path)
+    } else {
+        staged.persist(&meta_path)
     }
     .map_err(|error| {
         DbError::Sqlite(format!(
@@ -963,6 +1113,208 @@ mod tests {
 
         assert!(error.to_string().contains("unrecognized regular file"));
         assert_eq!(std::fs::read(&meta_path).unwrap(), sentinel);
+    }
+
+    fn legacy_metadata_bytes(primary: &Path) -> Vec<u8> {
+        let primary = normalized_snapshot_primary(primary).unwrap();
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "created_us": 1_789_546_475_731_049_i64,
+            "integrity_verified": true,
+            "integrity_kind": "integrity_check",
+            "schema_version": 1,
+            "row_counts": {"agents": 21, "messages": 5257},
+            "source_path": primary.to_str().unwrap(),
+            "snapshot_path": snapshot_bak_path(&primary).to_str().unwrap(),
+            "binary_version": "0.3.30"
+        }))
+        .unwrap()
+    }
+
+    fn preserved_legacy_paths(parent: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".meta.json.legacy-")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_metadata_is_preserved_before_fresh_verification_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let primary_before = std::fs::read(&primary).unwrap();
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        let legacy = legacy_metadata_bytes(&primary);
+        std::fs::write(&meta_path, &legacy).unwrap();
+
+        assert!(read_snapshot_metadata(&primary).is_none());
+        assert!(latest_verified_snapshot(&primary).is_none());
+        assert!(
+            restore_from_verified_snapshot(&primary, dir.path())
+                .unwrap()
+                .is_none(),
+            "legacy claims must never grant restore authority"
+        );
+
+        let fresh = record_snapshot_metadata(&primary, 42).expect("upgrade old metadata");
+        assert_eq!(fresh.schema, SNAPSHOT_METADATA_SCHEMA);
+        assert_eq!(fresh.created_us, 42);
+        assert_eq!(fresh.row_counts.get("messages"), Some(&3));
+        assert_eq!(fresh.row_counts.get("agents"), Some(&1));
+        assert_eq!(fresh.snapshot_size_bytes, primary_before.len() as u64);
+        assert_eq!(
+            fresh.snapshot_sha256,
+            hex::encode(Sha256::digest(&primary_before))
+        );
+        assert_eq!(latest_verified_snapshot(&primary), Some(fresh));
+        assert_eq!(std::fs::read(&primary).unwrap(), primary_before);
+
+        let preserved = preserved_legacy_paths(dir.path());
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(std::fs::read(&preserved[0]).unwrap(), legacy);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&preserved[0])
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        record_snapshot_metadata(&primary, 43).expect("normal refresh after upgrade");
+        assert_eq!(preserved_legacy_paths(dir.path()), preserved);
+        assert_eq!(std::fs::read(&preserved[0]).unwrap(), legacy);
+        assert_eq!(
+            latest_verified_snapshot(&primary).unwrap().created_us,
+            43
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_is_not_replaced_when_backup_verification_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let meta_path = snapshot_meta_path(&primary);
+        let legacy = legacy_metadata_bytes(&primary);
+        std::fs::write(&meta_path, &legacy).unwrap();
+        std::fs::write(snapshot_bak_path(&primary), b"not a SQLite database").unwrap();
+
+        record_snapshot_metadata(&primary, 42).expect_err("invalid backup must fail");
+
+        assert_eq!(std::fs::read(&meta_path).unwrap(), legacy);
+        assert!(preserved_legacy_paths(dir.path()).is_empty());
+        assert!(latest_verified_snapshot(&primary).is_none());
+    }
+
+    #[test]
+    fn legacy_metadata_recognition_rejects_foreign_future_and_partial_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        let original: serde_json::Value =
+            serde_json::from_slice(&legacy_metadata_bytes(&primary)).unwrap();
+        let invalid_fields = [
+            ("source_path", serde_json::json!("/foreign/storage.sqlite3")),
+            (
+                "snapshot_path",
+                serde_json::json!("/foreign/storage.sqlite3.bak"),
+            ),
+            ("binary_version", serde_json::json!("999.0.0")),
+            ("integrity_verified", serde_json::json!(false)),
+            ("integrity_kind", serde_json::json!("quick_check")),
+            ("schema_version", serde_json::json!(-1)),
+            ("row_counts", serde_json::json!({"messages": -1})),
+            ("created_us", serde_json::json!(0)),
+            ("schema", serde_json::json!(SNAPSHOT_METADATA_SCHEMA)),
+            ("snapshot_sha256", serde_json::json!("a".repeat(64))),
+            ("operator_note", serde_json::json!("keep this evidence")),
+        ];
+
+        for (field, value) in invalid_fields {
+            let mut invalid = original.clone();
+            invalid[field] = value;
+            let bytes = serde_json::to_vec_pretty(&invalid).unwrap();
+            std::fs::write(&meta_path, &bytes).unwrap();
+
+            let error = record_snapshot_metadata(&primary, 42).expect_err(field);
+
+            assert!(
+                error.to_string().contains("unrecognized regular file"),
+                "{field}: {error}"
+            );
+            assert_eq!(std::fs::read(&meta_path).unwrap(), bytes, "{field}");
+            assert!(preserved_legacy_paths(dir.path()).is_empty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn legacy_metadata_preservation_is_restart_safe_and_refuses_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        let legacy = legacy_metadata_bytes(&primary);
+        std::fs::write(&meta_path, &legacy).unwrap();
+
+        // Stand in for a crash after durable preservation but before publish.
+        let preserved = preserve_legacy_snapshot_metadata(&meta_path, &legacy).unwrap();
+        record_snapshot_metadata(&primary, 42).expect("retry after evidence preservation");
+        assert_eq!(preserved_legacy_paths(dir.path()), vec![preserved.clone()]);
+        assert_eq!(std::fs::read(&preserved).unwrap(), legacy);
+
+        std::fs::write(&meta_path, &legacy).unwrap();
+        let sentinel = b"operator evidence occupying the preserved name";
+        std::fs::write(&preserved, sentinel).unwrap();
+        let error = record_snapshot_metadata(&primary, 43)
+            .expect_err("occupied evidence must not be overwritten");
+
+        assert!(error.to_string().contains("occupied by different bytes"));
+        assert_eq!(std::fs::read(&preserved).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&meta_path).unwrap(), legacy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_metadata_evidence_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        let legacy = legacy_metadata_bytes(&primary);
+        std::fs::write(&meta_path, &legacy).unwrap();
+        let preserved = preserve_legacy_snapshot_metadata(&meta_path, &legacy).unwrap();
+        let moved = dir.path().join("preserved-original-legacy.json");
+        std::fs::rename(&preserved, &moved).unwrap();
+        symlink(&moved, &preserved).unwrap();
+
+        record_snapshot_metadata(&primary, 42).expect_err("symlink witness must fail closed");
+
+        assert_eq!(std::fs::read(&meta_path).unwrap(), legacy);
+        assert_eq!(std::fs::read(&moved).unwrap(), legacy);
+        assert!(
+            std::fs::symlink_metadata(&preserved)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
