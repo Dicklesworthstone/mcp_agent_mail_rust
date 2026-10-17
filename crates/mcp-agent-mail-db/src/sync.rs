@@ -925,6 +925,56 @@ pub struct MarkMessagesReadBatch {
     pub message_ids: Vec<i64>,
 }
 
+type SyncReadReceipts = std::collections::BTreeMap<i64, (Option<i64>, Option<i64>)>;
+
+/// Receipt timestamps are authority, not best-effort display fields.
+fn sync_receipt_timestamp(row: &sqlmodel_core::Row, field: &str) -> Result<Option<i64>, DbError> {
+    match row.get_by_name(field) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::BigInt(value)) => Ok(Some(*value)),
+        Some(Value::Int(value)) => Ok(Some(i64::from(*value))),
+        _ => Err(DbError::Sqlite(format!(
+            "direct receipt {field} is missing or not an integer"
+        ))),
+    }
+}
+
+fn direct_read_receipts(
+    conn: &DbConn,
+    agent_id: i64,
+    sorted_ids: &[i64],
+) -> Result<SyncReadReceipts, DbError> {
+    let mut receipts = SyncReadReceipts::new();
+    for chunk in sorted_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT message_id, read_ts, ack_ts FROM message_recipients \
+             WHERE agent_id = ? AND message_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let mut params = Vec::with_capacity(chunk.len() + 1);
+        params.push(Value::BigInt(agent_id));
+        params.extend(chunk.iter().copied().map(Value::BigInt));
+        for row in conn
+            .query_sync(&sql, &params)
+            .map_err(|e| DbError::Sqlite(e.to_string()))?
+        {
+            let id = row
+                .get_named::<i64>("message_id")
+                .map_err(|e| DbError::Sqlite(e.to_string()))?;
+            let state = (
+                sync_receipt_timestamp(&row, "read_ts")?,
+                sync_receipt_timestamp(&row, "ack_ts")?,
+            );
+            if chunk.binary_search(&id).is_err() || receipts.insert(id, state).is_some() {
+                return Err(DbError::Sqlite(
+                    "direct receipt query returned a duplicate or unrequested message".into(),
+                ));
+            }
+        }
+    }
+    Ok(receipts)
+}
+
 fn mark_messages_read_batch_sync_conn(
     conn: &DbConn,
     agent_id: i64,
@@ -939,31 +989,19 @@ fn mark_messages_read_batch_sync_conn(
     unique_message_ids.dedup();
     let read_ts = crate::now_micros();
 
-    begin_sync_write_tx(conn)?;
+    let transaction = SyncWriteTransaction::begin(conn)?;
 
     let result = (|| -> Result<Vec<i64>, DbError> {
+        // Observe the entire request before any chunk can change receipts.
+        let mut expected = direct_read_receipts(conn, agent_id, &unique_message_ids)?;
         let mut updated_message_ids = Vec::new();
-        for chunk in unique_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
-            let select_sql = format!(
-                "SELECT DISTINCT message_id FROM message_recipients \
-                 WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({})",
-                placeholders(chunk.len())
-            );
-            let mut select_params = Vec::with_capacity(1 + chunk.len());
-            select_params.push(Value::BigInt(agent_id));
-            for &message_id in chunk {
-                select_params.push(Value::BigInt(message_id));
+        for (&id, (existing_read, _)) in &mut expected {
+            if existing_read.is_none() {
+                *existing_read = Some(read_ts);
+                updated_message_ids.push(id);
             }
-            for row in conn
-                .query_sync(&select_sql, &select_params)
-                .map_err(|e| DbError::Sqlite(e.to_string()))?
-            {
-                let message_id = row
-                    .get_named("message_id")
-                    .map_err(|e| DbError::Sqlite(e.to_string()))?;
-                updated_message_ids.push(message_id);
-            }
-
+        }
+        for chunk in updated_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
             let sql = format!(
                 "UPDATE message_recipients \
                  SET read_ts = ? \
@@ -981,26 +1019,24 @@ fn mark_messages_read_batch_sync_conn(
         }
 
         rebuild_agent_inbox_stats_sync(conn, agent_id)?;
-        updated_message_ids.sort_unstable();
-        updated_message_ids.dedup();
+        // Successful SQL execution is not proof of a receipt. Verify after
+        // ALL chunks and stats writes: a late trigger must not undo earlier
+        // reads, alter ACK state, or change an already-read requested row.
+        if direct_read_receipts(conn, agent_id, &unique_message_ids)? != expected {
+            return Err(DbError::Sqlite(
+                "direct read receipts did not match the requested state".into(),
+            ));
+        }
         Ok(updated_message_ids)
     })();
 
-    match result {
-        Ok(updated_message_ids) => {
-            commit_sync_write_tx(conn)?;
-            Ok(
-                (!updated_message_ids.is_empty()).then_some(MarkMessagesReadBatch {
-                    read_ts,
-                    message_ids: updated_message_ids,
-                }),
-            )
-        }
-        Err(err) => {
-            rollback_sync_write_tx(conn);
-            Err(err)
-        }
-    }
+    let updated_message_ids = transaction.finish(result)?;
+    Ok(
+        (!updated_message_ids.is_empty()).then_some(MarkMessagesReadBatch {
+            read_ts,
+            message_ids: updated_message_ids,
+        }),
+    )
 }
 
 /// Synchronously batch-mark multiple messages as read for a single agent.
@@ -1023,20 +1059,56 @@ pub fn mark_messages_read_batch_sync(
     result
 }
 
-fn begin_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
-    conn.execute_sync("BEGIN IMMEDIATE", &[])
-        .map(|_| ())
-        .map_err(|e| DbError::Sqlite(e.to_string()))
+/// Own only a transaction successfully begun here. COMMIT failure and
+/// unwinding must release it too. A refused nested BEGIN never gives us
+/// ownership of the caller's transaction.
+struct SyncWriteTransaction<'a> {
+    conn: &'a DbConn,
+    active: bool,
 }
 
-fn commit_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
-    conn.execute_sync("COMMIT", &[])
-        .map(|_| ())
-        .map_err(|e| DbError::Sqlite(e.to_string()))
+impl<'a> SyncWriteTransaction<'a> {
+    fn begin(conn: &'a DbConn) -> Result<Self, DbError> {
+        conn.execute_sync("BEGIN IMMEDIATE", &[])
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn finish<T>(mut self, result: Result<T, DbError>) -> Result<T, DbError> {
+        let result = result.and_then(|value| {
+            self.conn
+                .execute_sync("COMMIT", &[])
+                .map(|_| value)
+                .map_err(|e| DbError::Sqlite(e.to_string()))
+        });
+        match result {
+            Ok(value) => {
+                self.active = false;
+                Ok(value)
+            }
+            Err(error) => match self.conn.execute_sync("ROLLBACK", &[]) {
+                Ok(_) => {
+                    self.active = false;
+                    Err(error)
+                }
+                Err(rollback) => {
+                    // Drop makes one last attempt; report both failures,
+                    // never a guarantee that this session is reusable.
+                    Err(DbError::Sqlite(format!(
+                        "synchronous write failed ({error}); rollback failed ({rollback})"
+                    )))
+                }
+            },
+        }
+    }
 }
 
-fn rollback_sync_write_tx(conn: &DbConn) {
-    let _ = conn.execute_sync("ROLLBACK", &[]);
+impl Drop for SyncWriteTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_sync("ROLLBACK", &[]);
+        }
+    }
 }
 
 fn is_agent_name_unique_violation(message: &str) -> bool {
@@ -1270,7 +1342,7 @@ pub fn dispatch_root_message(
     use crate::timestamps::now_micros;
 
     let project_id = resolve_root_project_id(conn)?;
-    begin_sync_write_tx(conn)?;
+    let transaction = SyncWriteTransaction::begin(conn)?;
 
     let dispatch_result = (|| -> Result<i64, DbError> {
         let now = now_micros();
@@ -1287,24 +1359,16 @@ pub fn dispatch_root_message(
         Ok(msg_id)
     })();
 
-    match dispatch_result {
-        Ok(msg_id) => {
-            commit_sync_write_tx(conn)?;
-            // GH#227: every delivery path must invalidate the process-wide
-            // search cache once the message row is committed. This sync path
-            // is the TUI compose dispatch, which runs inside the server
-            // process — without this, cached pre-delivery result sets keep
-            // serving false-negatives for the full cache TTL.
-            crate::search_service::invalidate_search_cache(
-                crate::search_cache::InvalidationTrigger::IndexUpdate,
-            );
-            Ok(msg_id)
-        }
-        Err(err) => {
-            rollback_sync_write_tx(conn);
-            Err(err)
-        }
-    }
+    let msg_id = transaction.finish(dispatch_result)?;
+    // GH#227: every delivery path must invalidate the process-wide
+    // search cache once the message row is committed. This sync path
+    // is the TUI compose dispatch, which runs inside the server
+    // process — without this, cached pre-delivery result sets keep
+    // serving false-negatives for the full cache TTL.
+    crate::search_service::invalidate_search_cache(
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
+    );
+    Ok(msg_id)
 }
 
 #[cfg(test)]
@@ -2540,6 +2604,336 @@ mod tests {
         .expect("one row should be updated");
 
         assert_eq!(batch.message_ids, vec![updated_message_id]);
+    }
+
+    #[test]
+    fn sync_read_write_failure_refuses_ignored_updates() {
+        write_failure_fixture(|conn, _, recipient, first, second| {
+            conn.execute_raw(&format!(
+                "CREATE TRIGGER ignore_second_read BEFORE UPDATE ON message_recipients \
+                 WHEN NEW.message_id={second} BEGIN SELECT RAISE(IGNORE); END"
+            ))
+            .unwrap();
+            let result = mark_messages_read_batch_sync_conn(conn, recipient, &[first, second]);
+            assert!(
+                result.is_err(),
+                "ignored writes cannot count as recorded reads: {result:?}"
+            );
+            assert_no_fixture_reads(conn, recipient);
+        });
+    }
+
+    #[test]
+    fn sync_read_write_failure_releases_failed_commit() {
+        write_failure_fixture(|conn, _, recipient, first, second| {
+            add_deferred_write_failure(conn, "UPDATE", "message_recipients");
+            assert!(mark_messages_read_batch_sync_conn(conn, recipient, &[first, second]).is_err());
+            assert_no_fixture_reads(conn, recipient);
+            assert!(
+                conn.query_sync("SELECT 1 FROM deferred_write_check", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn sync_dispatch_write_failure_releases_failed_commit() {
+        write_failure_fixture(|conn, _, _, _, _| {
+            add_deferred_write_failure(conn, "INSERT", "messages");
+            assert!(
+                dispatch_root_message(
+                    conn,
+                    "Sender",
+                    "must roll back",
+                    "body",
+                    "normal",
+                    None,
+                    &[("Recipient".into(), "to".into())]
+                )
+                .is_err()
+            );
+            let rows = conn
+                .query_sync(
+                    "SELECT id FROM messages WHERE subject='must roll back'",
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                rows.is_empty(),
+                "failed send commit must not remain pending on the connection"
+            );
+            assert!(
+                conn.query_sync("SELECT 1 FROM deferred_write_check", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK")
+                .expect("failed send releases writer");
+        });
+    }
+
+    #[test]
+    fn sync_read_write_failure_preserves_existing_receipts_and_peer_state() {
+        write_failure_fixture(|conn, project, recipient, first, second| {
+            let peer = insert_agent(conn, project, "Peer");
+            conn.execute_raw(&format!(
+                "UPDATE message_recipients SET ack_ts=77 WHERE message_id={first}; \
+                UPDATE message_recipients SET read_ts=55,ack_ts=66 WHERE message_id={second}; \
+                INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+                VALUES({first},{peer},'cc',11,22)"
+            ))
+            .unwrap();
+            let batch =
+                mark_messages_read_batch_sync_conn(conn, recipient, &[second, first, first, 999])
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(batch.message_ids, vec![first]);
+            assert_eq!(
+                direct_read_receipts(conn, recipient, &[first, second]).unwrap(),
+                std::collections::BTreeMap::from([
+                    (first, (Some(batch.read_ts), Some(77))),
+                    (second, (Some(55), Some(66)))
+                ])
+            );
+            assert_eq!(
+                direct_read_receipts(conn, peer, &[first]).unwrap(),
+                std::collections::BTreeMap::from([(first, (Some(11), Some(22)))])
+            );
+            assert!(
+                mark_messages_read_batch_sync_conn(conn, recipient, &[first, second])
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn sync_read_write_failure_refuses_ack_changes_and_stats_side_effects() {
+        for mutate_stats in [false, true] {
+            write_failure_fixture(|conn, _, recipient, first, second| {
+                rebuild_agent_inbox_stats_sync(conn, recipient).unwrap();
+                let before = conn
+                    .query_sync(
+                        "SELECT * FROM inbox_stats WHERE agent_id=?",
+                        &[Value::BigInt(recipient)],
+                    )
+                    .unwrap();
+                let sql = if mutate_stats {
+                    format!(
+                        "CREATE TRIGGER undo_read_from_stats AFTER INSERT ON inbox_stats \
+                        BEGIN UPDATE message_recipients SET read_ts=NULL WHERE message_id={first}; END"
+                    )
+                } else {
+                    "CREATE TRIGGER alter_ack_from_read AFTER UPDATE OF read_ts ON message_recipients \
+                        BEGIN UPDATE message_recipients SET ack_ts=77 WHERE message_id=NEW.message_id AND agent_id=NEW.agent_id; END".into()
+                };
+                conn.execute_raw(&sql).unwrap();
+                let error = mark_messages_read_batch_sync_conn(conn, recipient, &[first, second])
+                    .unwrap_err();
+                assert!(error.to_string().contains("did not match"));
+                assert_no_fixture_reads(conn, recipient);
+                let after = conn
+                    .query_sync(
+                        "SELECT * FROM inbox_stats WHERE agent_id=?",
+                        &[Value::BigInt(recipient)],
+                    )
+                    .unwrap();
+                assert_eq!(before.len(), after.len());
+                for field in [
+                    "total_count",
+                    "unread_count",
+                    "ack_pending_count",
+                    "last_message_ts",
+                ] {
+                    assert_eq!(
+                        before[0].get_named::<Option<i64>>(field).unwrap(),
+                        after[0].get_named::<Option<i64>>(field).unwrap()
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn sync_read_write_failure_refuses_malformed_receipt_authority() {
+        for field in ["read_ts", "ack_ts"] {
+            write_failure_fixture(|conn, _, recipient, first, second| {
+                conn.execute_raw(&format!(
+                    "UPDATE message_recipients SET {field}=X'0102' WHERE message_id={first}"
+                ))
+                .unwrap();
+                let error = mark_messages_read_batch_sync_conn(conn, recipient, &[first, second])
+                    .unwrap_err();
+                assert!(error.to_string().contains("not an integer"));
+                assert_eq!(conn.query_sync(&format!("SELECT typeof({field}) AS kind FROM message_recipients WHERE message_id={first}"),&[]).unwrap()[0]
+                    .get_named::<String>("kind").unwrap(),"blob");
+                assert_eq!(
+                    conn.query_sync(
+                        &format!(
+                            "SELECT read_ts FROM message_recipients WHERE message_id={second}"
+                        ),
+                        &[]
+                    )
+                    .unwrap()[0]
+                        .get_named::<Option<i64>>("read_ts")
+                        .unwrap(),
+                    None
+                );
+                conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn sync_read_write_failure_checks_the_whole_batch_after_the_last_chunk() {
+        for ignore_last in [false, true] {
+            write_failure_fixture(|conn, project, recipient, first, second| {
+                let sender = lookup_agent_id_by_name(conn, project, "Sender")
+                    .unwrap()
+                    .unwrap();
+                conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                let mut ids = vec![first, second];
+                for id in 1000..1500 {
+                    conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                        VALUES({id},{project},{sender},'chunk','body',1000); \
+                        INSERT INTO message_recipients(message_id,agent_id,kind) VALUES({id},{recipient},'to')")).unwrap();
+                    ids.push(id);
+                }
+                conn.execute_raw("COMMIT").unwrap();
+                let body = if ignore_last {
+                    "SELECT RAISE(IGNORE);".into()
+                } else {
+                    format!(
+                        "UPDATE message_recipients SET read_ts=NULL WHERE message_id={first} AND agent_id={recipient};"
+                    )
+                };
+                let timing = if ignore_last { "BEFORE" } else { "AFTER" };
+                conn.execute_raw(&format!(
+                    "CREATE TRIGGER break_last_chunk {timing} UPDATE ON message_recipients \
+                    WHEN NEW.message_id=1499 BEGIN {body} END"
+                ))
+                .unwrap();
+                assert!(mark_messages_read_batch_sync_conn(conn, recipient, &ids).is_err());
+                let rows = direct_read_receipts(conn, recipient, &ids).unwrap();
+                assert_eq!(rows.len(), 502);
+                assert!(rows.values().all(|state| *state == (None, None)));
+                conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn sync_read_write_failure_preserves_caller_transactions_and_cleans_up_unwinding() {
+        write_failure_fixture(|conn, _, recipient, first, second| {
+            conn.execute_raw(&format!(
+                "BEGIN IMMEDIATE; UPDATE message_recipients SET read_ts=55 WHERE message_id={first}"
+            ))
+            .unwrap();
+            assert!(mark_messages_read_batch_sync_conn(conn, recipient, &[second]).is_err());
+            assert!(
+                dispatch_root_message(
+                    conn,
+                    "Sender",
+                    "nested",
+                    "body",
+                    "normal",
+                    None,
+                    &[("Recipient".into(), "to".into())]
+                )
+                .is_err()
+            );
+            assert_eq!(
+                direct_read_receipts(conn, recipient, &[first]).unwrap()[&first].0,
+                Some(55)
+            );
+            conn.execute_raw("ROLLBACK").unwrap();
+            assert_no_fixture_reads(conn, recipient);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _transaction = SyncWriteTransaction::begin(conn).unwrap();
+                conn.execute_raw(&format!(
+                    "UPDATE message_recipients SET read_ts=88 WHERE message_id={first}"
+                ))
+                .unwrap();
+                panic!("injected synchronous transaction unwind");
+            }));
+            assert!(unwound.is_err());
+            assert_no_fixture_reads(conn, recipient);
+        });
+    }
+
+    fn add_deferred_write_failure(conn: &DbConn, operation: &str, table: &str) {
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA foreign_keys", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        conn.execute_raw("CREATE TABLE deferred_write_parent(id INTEGER PRIMARY KEY); \
+            CREATE TABLE deferred_write_check(id INTEGER REFERENCES deferred_write_parent(id) DEFERRABLE INITIALLY DEFERRED)").unwrap();
+        // Prove the fixture reaches COMMIT: the statement itself succeeds.
+        conn.execute_raw("BEGIN IMMEDIATE; INSERT INTO deferred_write_check VALUES(999)")
+            .unwrap();
+        assert!(conn.execute_raw("COMMIT").is_err());
+        conn.execute_raw("ROLLBACK").unwrap();
+        conn.execute_raw(&format!(
+            "CREATE TRIGGER fail_write_commit AFTER {operation} ON {table} \
+            BEGIN INSERT INTO deferred_write_check VALUES(999); END"
+        ))
+        .unwrap();
+    }
+
+    fn assert_no_fixture_reads(conn: &DbConn, recipient: i64) {
+        let rows = conn
+            .query_sync(
+                "SELECT read_ts,ack_ts FROM message_recipients WHERE agent_id=?",
+                &[Value::BigInt(recipient)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                None,
+                "failed batch cannot publish any read"
+            );
+            assert_eq!(row.get_named::<Option<i64>>("ack_ts").unwrap(), None);
+        }
+        conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK")
+            .expect("writer must be reusable after failed batch");
+    }
+
+    fn write_failure_fixture(test: impl FnOnce(&DbConn, i64, i64, i64, i64)) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sync-write-failure.sqlite3");
+        let conn = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "sync write failure fixture",
+        );
+        conn.execute_raw(schema::PRAGMA_DB_INIT_SQL).unwrap();
+        block_on({
+            let conn = &*conn;
+            move |cx| async move {
+                schema::migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap();
+            }
+        });
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let recipient = insert_agent(&conn, project, "Recipient");
+        let first = insert_message(&conn, project, sender, "first");
+        let second = insert_message(&conn, project, sender, "second");
+        for id in [first, second] {
+            conn.execute_sync(
+                "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                &[Value::BigInt(id), Value::BigInt(recipient)],
+            )
+            .unwrap();
+        }
+        test(&conn, project, recipient, first, second);
     }
 
     #[test]
