@@ -144,6 +144,13 @@ pub fn find_reservation_artifact(reservations_dir: &Path, id: i64) -> Option<Pat
 ///   reproduced safely, so this returns `None` — callers must treat that as
 ///   "skip explicitly", never guess.
 ///
+/// The exact current-generation filename is checked directly, without walking
+/// unrelated history (GH#362). Every call rechecks its file type; no cached path
+/// becomes evidence. Legacy, missing, and unknown-generation lookups retain the
+/// full scan, including older noncanonical numeric spellings. When both exact
+/// and noncanonical current-generation spellings exist, the emitted exact name
+/// wins deterministically rather than depending on directory iteration order.
+///
 /// Symlinked entries are ignored (never dereferenced), matching the other
 /// finder.
 #[must_use]
@@ -153,6 +160,26 @@ pub fn find_reservation_artifact_for_generation(
     current_generation: Option<&str>,
 ) -> Option<PathBuf> {
     let current_generation = current_generation.filter(|generation| !generation.is_empty());
+    // Only validated tokens may enter a path; untrusted separators must never
+    // turn a lookup into a probe outside this reservation directory.
+    if id > 0
+        && let Some(generation) = current_generation.filter(|value| is_hex_token(value))
+    {
+        let path = reservations_dir.join(reservation_artifact_filename(Some(generation), id));
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            return Some(path);
+        }
+    }
+    scan_reservation_artifact_for_generation(reservations_dir, id, current_generation)
+}
+
+// The original complete selection remains the fallback and performance control.
+// In particular, an unseeded generation cannot bypass ambiguity detection.
+fn scan_reservation_artifact_for_generation(
+    reservations_dir: &Path,
+    id: i64,
+    current_generation: Option<&str>,
+) -> Option<PathBuf> {
     let mut legacy: Option<PathBuf> = None;
     let mut current: Option<PathBuf> = None;
     // Only consulted when the live generation is unknown.
@@ -192,6 +219,8 @@ fn for_each_artifact_of_id(
     id: i64,
     mut visit: impl FnMut(PathBuf, ParsedReservationArtifact),
 ) -> Option<()> {
+    #[cfg(test)]
+    tests::DIRECTORY_SCANS.with(|scans| scans.set(scans.get() + 1));
     let entries = std::fs::read_dir(reservations_dir).ok()?;
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
@@ -216,6 +245,231 @@ fn for_each_artifact_of_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        pub(super) static DIRECTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn exact_lookup_matches_scan_across_generation_and_artifact_combinations() {
+        for mask in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            for (bit, name) in [
+                "id-5.json",
+                "id-5-gaabb.json",
+                "id-5-gccdd.json",
+                "id-05-geeff.json",
+                "id-8-gaabb.json",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if mask & (1 << bit) != 0 {
+                    std::fs::write(dir.path().join(name), b"{}").unwrap();
+                }
+            }
+            for id in [-1, 0, 5, 8, 99] {
+                for generation in [
+                    None,
+                    Some(""),
+                    Some("aabb"),
+                    Some("ccdd"),
+                    Some("eeff"),
+                    Some("AABB"),
+                    Some("a/../b"),
+                ] {
+                    let reference = scan_reservation_artifact_for_generation(
+                        dir.path(),
+                        id,
+                        generation.filter(|value| !value.is_empty()),
+                    );
+                    assert_eq!(
+                        find_reservation_artifact_for_generation(dir.path(), id, generation),
+                        reference,
+                        "mask={mask} id={id} generation={generation:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_name_wins_over_noncanonical_numeric_alias_without_hiding_unknown_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("id-7-gaabb.json");
+        for name in ["id-0007-gaabb.json", "id-+7-gaabb.json", "id-7-gaabb.json"] {
+            std::fs::write(dir.path().join(name), b"{}").unwrap();
+        }
+        assert_eq!(
+            find_reservation_artifact_for_generation(dir.path(), 7, Some("aabb")),
+            Some(exact)
+        );
+        assert!(find_reservation_artifact_for_generation(dir.path(), 7, None).is_none());
+    }
+
+    #[test]
+    #[ignore = "explicit same-invocation real-directory lookup benchmark"]
+    fn exact_generation_lookup_history_scaling() {
+        use std::time::{Duration, Instant};
+        for total in [1_000_i64, 16_500] {
+            let dir = tempfile::tempdir().unwrap();
+            for id in 1..=total {
+                std::fs::write(
+                    dir.path()
+                        .join(reservation_artifact_filename(Some("aabb"), id)),
+                    b"{}",
+                )
+                .unwrap();
+            }
+            let ids: Vec<_> = (0..50).map(|index| 1 + index * (total - 1) / 49).collect();
+            let run = |optimized: bool, generation| {
+                let start = Instant::now();
+                let paths: Vec<_> = ids
+                    .iter()
+                    .map(|&id| {
+                        if optimized {
+                            find_reservation_artifact_for_generation(dir.path(), id, generation)
+                        } else {
+                            scan_reservation_artifact_for_generation(dir.path(), id, generation)
+                        }
+                    })
+                    .collect();
+                (start.elapsed(), paths)
+            };
+            let (_, expected) = run(false, Some("aabb"));
+            assert_eq!(run(true, Some("aabb")).1, expected);
+            let mut baseline = Vec::new();
+            let mut candidate = Vec::new();
+            for round in 0..7 {
+                for optimized in [round % 2 == 0, round % 2 != 0] {
+                    let (elapsed, paths) = run(optimized, Some("aabb"));
+                    assert_eq!(paths, expected);
+                    if optimized {
+                        candidate.push(elapsed);
+                    } else {
+                        baseline.push(elapsed);
+                    }
+                }
+            }
+            baseline.sort_unstable();
+            candidate.sort_unstable();
+            let old = baseline[3];
+            let new = candidate[3];
+            eprintln!(
+                "reservation lookup: entries={total} lookups=50 samples=7 scan_median_us={} exact_median_us={} ratio={:.2}",
+                old.as_micros(),
+                new.as_micros(),
+                old.as_secs_f64() / new.as_secs_f64()
+            );
+            assert!(
+                new.saturating_mul(10) < old,
+                "exact lookup must eliminate the history-sized scan, not just marginally improve it"
+            );
+            // A miss still enumerates history. Record it explicitly; do not
+            // infer the exact-hit improvement for legacy or absent artifacts.
+            let (missing_old, paths) = run(false, Some("ccdd"));
+            let (missing_new, optimized_paths) = run(true, Some("ccdd"));
+            assert_eq!(paths, optimized_paths);
+            assert!(paths.iter().all(Option::is_none));
+            eprintln!(
+                "reservation lookup miss: entries={total} lookups=50 scan_us={} fallback_us={}",
+                missing_old.as_micros(),
+                missing_new.as_micros()
+            );
+            assert!(old > Duration::ZERO && new > Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn known_generation_exact_artifact_does_not_enumerate_unrelated_history() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in 1..=256 {
+            std::fs::write(
+                dir.path()
+                    .join(reservation_artifact_filename(Some("aabb"), id)),
+                b"{}",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("id-42.json"), b"legacy").unwrap();
+        std::fs::write(dir.path().join("id-42-gcccc.json"), b"foreign").unwrap();
+        DIRECTORY_SCANS.with(|scans| scans.set(0));
+        for id in [1, 42, 256] {
+            assert_eq!(
+                find_reservation_artifact_for_generation(dir.path(), id, Some("aabb")),
+                Some(
+                    dir.path()
+                        .join(reservation_artifact_filename(Some("aabb"), id))
+                )
+            );
+        }
+        assert_eq!(
+            DIRECTORY_SCANS.with(std::cell::Cell::get),
+            0,
+            "a fully named current-generation artifact must not enumerate directory history"
+        );
+    }
+
+    #[test]
+    fn exact_lookup_observes_replacement_and_preserves_legacy_and_noncanonical_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("id-7-gab12.json");
+        let legacy = dir.path().join("id-7.json");
+        std::fs::write(&current, b"current").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(
+            find_reservation_artifact_for_generation(dir.path(), 7, Some("ab12")),
+            Some(current.clone())
+        );
+        let retained = dir.path().join("retained-current");
+        std::fs::rename(&current, &retained).unwrap();
+        assert_eq!(
+            find_reservation_artifact_for_generation(dir.path(), 7, Some("ab12")),
+            Some(legacy.clone())
+        );
+        let padded = dir.path().join("id-0007-gab12.json");
+        std::fs::rename(&retained, &padded).unwrap();
+        assert_eq!(
+            find_reservation_artifact_for_generation(dir.path(), 7, Some("ab12")),
+            Some(padded)
+        );
+        std::fs::create_dir(&current).unwrap();
+        assert_eq!(
+            find_reservation_artifact_for_generation(dir.path(), 7, Some("ab12")),
+            Some(dir.path().join("id-0007-gab12.json"))
+        );
+        for generation in ["../../outside", "ab/12", ".", "not-hex"] {
+            assert_eq!(
+                find_reservation_artifact_for_generation(dir.path(), 7, Some(generation)),
+                Some(legacy.clone())
+            );
+        }
+        assert!(find_reservation_artifact_for_generation(dir.path(), 0, Some("ab12")).is_none());
+        assert!(find_reservation_artifact_for_generation(dir.path(), -7, Some("ab12")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_lookup_never_follows_a_symlinked_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside.json");
+        std::fs::write(&target, b"unrelated evidence").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("id-9-gaabb.json")).unwrap();
+        let legacy = dir.path().join("id-9.json");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(
+            find_reservation_artifact_for_generation(dir.path(), 9, Some("aabb")),
+            Some(legacy)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated evidence");
+        std::os::unix::fs::symlink(
+            outside.path().join("missing"),
+            dir.path().join("id-10-gaabb.json"),
+        )
+        .unwrap();
+        assert!(find_reservation_artifact_for_generation(dir.path(), 10, Some("aabb")).is_none());
+    }
 
     #[test]
     fn filename_legacy_when_no_generation() {
