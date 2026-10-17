@@ -586,6 +586,26 @@ pub fn inbox_delivery_events_from_conn(
     after: Option<i64>,
     limit: usize,
 ) -> Result<InboxDeliveryEventPage, InboxDeliveryEventError> {
+    // Range, direct events and shared visibility are one observation. A
+    // peer commit between those queries must not advance next_cursor past
+    // our advertised tail, remove retained events, or mix membership eras.
+    // The inner result preserves typed cursor errors; the outer result
+    // admits/cleans up only our nested read scope, including on error.
+    inbox::with_snapshot(conn, || {
+        Ok(inbox_delivery_events_in_snapshot(
+            conn, project_id, agent_id, after, limit,
+        ))
+    })
+    .map_err(InboxDeliveryEventError::Database)?
+}
+
+fn inbox_delivery_events_in_snapshot(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    after: Option<i64>,
+    limit: usize,
+) -> Result<InboxDeliveryEventPage, InboxDeliveryEventError> {
     if limit == 0 {
         return Err(InboxDeliveryEventError::Database(DbError::invalid(
             "limit",
@@ -703,7 +723,38 @@ pub fn inbox_delivery_events_from_conn(
         Err(error)
             if crate::project_mailbox::is_missing_project_mailbox_table_error(
                 &error.to_string(),
-            ) => {}
+            ) =>
+        {
+            // Only a wholly absent pre-upgrade shared schema is empty.
+            // A remaining receipt table or broken delivery view is an
+            // authority failure, not permission to publish direct-only
+            // success and let a monitor advance past lost shared mail.
+            let objects = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE name COLLATE NOCASE \
+                     IN ('project_mailbox_deliveries', 'project_mailbox_receipts')",
+                    &[],
+                )
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?;
+            let shared_events = conn
+                .query_sync(
+                    "SELECT seq FROM inbox_delivery_events WHERE project_id = ? \
+                 AND agent_id IS NULL AND kind = 'project' LIMIT 1",
+                    &[Value::BigInt(project_id)],
+                )
+                .map_err(|error| {
+                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+                })?;
+            // Shared ledger entries also prove this is not a pre-upgrade
+            // mailbox, even when both shared tables have disappeared.
+            if !objects.is_empty() || !shared_events.is_empty() {
+                return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
+                        "incomplete project mailbox schema; delivery and receipt tables must be repaired".into(),
+                    )));
+            }
+        }
         Err(error) => {
             return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
                 error.to_string(),
@@ -1506,6 +1557,408 @@ mod tests {
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
         );
+    }
+
+    fn event_snapshot_fixture(test: impl FnOnce(&DbConn, &DbConn, i64, i64)) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("delivery-event-snapshot.sqlite3");
+        let reader = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "event reader",
+        );
+        reader.execute_raw(schema::PRAGMA_DB_INIT_SQL).unwrap();
+        block_on({
+            let conn = &*reader;
+            move |cx| async move {
+                schema::migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap();
+            }
+        });
+        let project = insert_project(&reader);
+        let sender = insert_agent(&reader, project, "Sender");
+        let viewer = insert_agent(&reader, project, "Viewer");
+        let direct = insert_message(&reader, project, sender, "direct");
+        let shared = insert_message(&reader, project, sender, "shared");
+        reader
+            .execute_sync(
+                "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                &[Value::BigInt(direct), Value::BigInt(viewer)],
+            )
+            .unwrap();
+        reader.execute_sync("INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES(?,?,'to',1000000)",
+            &[Value::BigInt(shared),Value::BigInt(project)]).unwrap();
+        reader
+            .execute_sync(
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &[
+                    Value::BigInt(project),
+                    Value::BigInt(shared),
+                    Value::BigInt(1000000),
+                ],
+            )
+            .unwrap();
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "event peer writer",
+        );
+        test(&reader, &writer, project, viewer);
+    }
+
+    #[test]
+    fn delivery_event_snapshot_preserves_query_only_caller_transactions_and_cursor_errors() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader.execute_raw("PRAGMA query_only=ON").unwrap();
+            let page = inbox_delivery_events_from_conn(reader, project, viewer, None, 1).unwrap();
+            assert!(page.has_more);
+            assert_eq!(page.events.len(), 1);
+            assert!(matches!(
+                inbox_delivery_events_from_conn(
+                    reader,
+                    project,
+                    viewer,
+                    Some(page.tail_cursor + 1),
+                    1
+                ),
+                Err(InboxDeliveryEventError::CursorAhead { .. })
+            ));
+            assert!(inbox_delivery_events_from_conn(reader, project, viewer, None, 0).is_err());
+            assert!(
+                inbox_delivery_events_from_conn(reader, project, viewer, None, usize::MAX).is_err()
+            );
+            assert_eq!(
+                reader.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            reader.execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; UPDATE messages SET subject='caller pending'").unwrap();
+            let pending =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert!(
+                pending
+                    .events
+                    .iter()
+                    .all(|event| event.subject == "caller pending")
+            );
+            reader
+                .execute_raw("DELETE FROM inbox_delivery_events WHERE seq=1")
+                .unwrap();
+            assert!(matches!(
+                inbox_delivery_events_from_conn(reader, project, viewer, Some(0), 1),
+                Err(InboxDeliveryEventError::CursorExpired { .. })
+            ));
+            reader.execute_raw("ROLLBACK").unwrap();
+            let restored =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert_eq!(restored.events.len(), 2);
+            assert!(
+                restored
+                    .events
+                    .iter()
+                    .all(|event| event.subject == "test subject")
+            );
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_cleans_up_failed_queries_admission_release_and_unwinding() {
+        struct Failed<'a> {
+            conn: &'a DbConn,
+            mode: u8,
+            fired: std::cell::Cell<bool>,
+            releases: std::cell::Cell<usize>,
+        }
+        impl crate::pool::SyncQuery for Failed<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if (self.mode == 0 || self.mode == 1)
+                    && sql.contains("e.agent_id = ?")
+                    && !self.fired.replace(true)
+                {
+                    assert_ne!(self.mode, 1, "injected event reader unwind");
+                    return self
+                        .conn
+                        .query_sync("SELECT * FROM missing_event_source", &[]);
+                }
+                self.conn.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                if sql == "RELEASE SAVEPOINT am_inbox_read" {
+                    self.releases.set(self.releases.get() + 1);
+                }
+                if ((self.mode == 2 && sql == "RELEASE SAVEPOINT am_inbox_read")
+                    || (self.mode == 3 && sql == "SAVEPOINT am_inbox_read"))
+                    && !self.fired.replace(true)
+                {
+                    return self
+                        .conn
+                        .query_sync("SELECT * FROM missing_event_control", &[])
+                        .map(|_| ());
+                }
+                self.conn.execute_raw(sql)
+            }
+        }
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            for mode in 0..4 {
+                reader
+                    .execute_raw("BEGIN IMMEDIATE; UPDATE messages SET subject='caller pending'")
+                    .unwrap();
+                let failed = Failed {
+                    conn: reader,
+                    mode,
+                    fired: std::cell::Cell::new(false),
+                    releases: std::cell::Cell::new(0),
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inbox_delivery_events_from_conn(&failed, project, viewer, None, 10)
+                }));
+                if mode == 1 {
+                    assert!(result.is_err());
+                } else {
+                    assert!(result.unwrap().is_err());
+                }
+                assert!(failed.fired.get());
+                assert_eq!(
+                    failed.releases.get(),
+                    match mode {
+                        2 => 2,
+                        3 => 0,
+                        _ => 1,
+                    }
+                );
+                assert_eq!(
+                    reader
+                        .query_sync("SELECT subject FROM messages WHERE id=1", &[])
+                        .unwrap()[0]
+                        .get_named::<String>("subject")
+                        .unwrap(),
+                    "caller pending"
+                );
+                reader.execute_raw("ROLLBACK").unwrap();
+                reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+                assert_eq!(
+                    inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                        .unwrap()
+                        .events
+                        .len(),
+                    2
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_legacy_absence_requires_no_shared_ledger_evidence() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader
+                .execute_raw(
+                    "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries; \
+                ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+                )
+                .unwrap();
+            assert!(
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incomplete project mailbox schema")
+            );
+            // A genuine pre-upgrade database contains only direct ledger events.
+            reader
+                .execute_raw(
+                    "DELETE FROM inbox_delivery_events WHERE kind='project'; PRAGMA query_only=ON",
+                )
+                .unwrap();
+            let legacy =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert_eq!(legacy.events.len(), 1);
+            assert_eq!(legacy.events[0].kind, "to");
+            assert_eq!(legacy.tail_cursor, legacy.next_cursor);
+            reader
+                .execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_catalog_failure_cannot_become_empty_shared_mail() {
+        struct Broken<'a>(&'a DbConn);
+        impl crate::pool::SyncQuery for Broken<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if sql.contains("FROM sqlite_master") {
+                    return self
+                        .0
+                        .query_sync("SELECT * FROM missing_event_catalog", &[]);
+                }
+                self.0.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+        }
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader
+                .execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+                .unwrap();
+            let error = inbox_delivery_events_from_conn(&Broken(reader), project, viewer, None, 10)
+                .unwrap_err();
+            assert!(error.to_string().contains("missing_event_catalog"));
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_refuses_incomplete_shared_schema() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader
+                .execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+                .unwrap();
+            let error=inbox_delivery_events_from_conn(reader,project,viewer,None,10)
+                .expect_err("missing shared delivery authority must not return a partial direct-only success");
+            assert!(
+                error
+                    .to_string()
+                    .contains("incomplete project mailbox schema")
+            );
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            reader
+                .execute_raw("ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries")
+                .unwrap();
+            assert_eq!(
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                    .unwrap()
+                    .events
+                    .len(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_preserves_tail_and_rows_across_peer_commit() {
+        for prune in [false, true] {
+            event_snapshot_fixture(|reader, writer, project, viewer| {
+                let before =
+                    inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+                assert_eq!(before.events.len(), 2);
+                struct Race<'a> {
+                    reader: &'a DbConn,
+                    writer: &'a DbConn,
+                    project: i64,
+                    viewer: i64,
+                    prune: bool,
+                    fired: std::cell::Cell<bool>,
+                }
+                impl crate::pool::SyncQuery for Race<'_> {
+                    fn query_sync(
+                        &self,
+                        sql: &str,
+                        params: &[Value],
+                    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                        let rows = self.reader.query_sync(sql, params)?;
+                        if sql.contains("AS tail_cursor") && !self.fired.replace(true) {
+                            self.writer.execute_raw("BEGIN IMMEDIATE")?;
+                            self.writer
+                                .execute_raw("UPDATE messages SET subject='peer changed'")?;
+                            if self.prune {
+                                self.writer
+                                    .execute_raw("DELETE FROM inbox_delivery_events")?;
+                            }
+                            let id = insert_message(self.writer, self.project, 1, "peer arrival");
+                            self.writer.execute_sync("INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                                &[Value::BigInt(id),Value::BigInt(self.viewer)])?;
+                            self.writer.execute_raw("COMMIT")?;
+                        }
+                        Ok(rows)
+                    }
+                    fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                        self.reader.execute_raw(sql)
+                    }
+                }
+                let race = Race {
+                    reader,
+                    writer,
+                    project,
+                    viewer,
+                    prune,
+                    fired: std::cell::Cell::new(false),
+                };
+                let observed =
+                    inbox_delivery_events_from_conn(&race, project, viewer, None, 10).unwrap();
+                assert!(race.fired.get());
+                assert_eq!(
+                    observed, before,
+                    "a page and its cursor range must describe one snapshot"
+                );
+                assert!(
+                    observed
+                        .events
+                        .iter()
+                        .all(|event| event.seq <= observed.tail_cursor)
+                );
+                let after =
+                    inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+                assert_eq!(after.events.len(), if prune { 1 } else { 3 });
+                assert!(after.tail_cursor > before.tail_cursor);
+                reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn delivery_event_snapshot_keeps_direct_and_shared_membership_consistent() {
+        event_snapshot_fixture(|reader, writer, project, viewer| {
+            let before =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            struct Race<'a> {
+                reader: &'a DbConn,
+                writer: &'a DbConn,
+                viewer: i64,
+                fired: std::cell::Cell<bool>,
+            }
+            impl crate::pool::SyncQuery for Race<'_> {
+                fn query_sync(
+                    &self,
+                    sql: &str,
+                    params: &[Value],
+                ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                    let rows = self.reader.query_sync(sql, params)?;
+                    if sql.contains("e.agent_id = ?") && !self.fired.replace(true) {
+                        self.writer.execute_sync(
+                            "UPDATE agents SET retired_at=7 WHERE id=?",
+                            &[Value::BigInt(self.viewer)],
+                        )?;
+                    }
+                    Ok(rows)
+                }
+                fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                    self.reader.execute_raw(sql)
+                }
+            }
+            let race = Race {
+                reader,
+                writer,
+                viewer,
+                fired: std::cell::Cell::new(false),
+            };
+            assert_eq!(
+                inbox_delivery_events_from_conn(&race, project, viewer, None, 10).unwrap(),
+                before
+            );
+            assert!(race.fired.get());
+            let after = inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert_eq!(after.events.len(), 1);
+            assert_eq!(after.events[0].kind, "to");
+        });
     }
 
     #[test]
