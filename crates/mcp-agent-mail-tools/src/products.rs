@@ -834,7 +834,7 @@ pub async fn fetch_inbox_product(
     }
     let viewer_ids: Vec<i64> = viewers.iter().filter_map(|viewer| viewer.id).collect();
     let rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent_scoped(
+        mcp_agent_mail_db::product_inbox::fetch_inbox_for_product_agent_scoped(
             ctx.cx(),
             &pool,
             product_id,
@@ -1039,6 +1039,107 @@ mod tests {
     /// `resources::resource_shape_tests::seed_pool`).
     fn seed_pool() -> mcp_agent_mail_db::DbPool {
         get_db_pool().expect("db pool").clone()
+    }
+
+    #[test]
+    fn product_inbox_tool_uses_indexed_readers_and_preserves_delivery_contract() {
+        use mcp_agent_mail_db::{queries, tracking};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("indexed-product-tool.sqlite3");
+        let archive = temp.path().join("archive");
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", database.display())),
+                ("STORAGE_ROOT", &archive.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+                ("MESSAGING_SESSION_IDENTITY", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                    let cx = Cx::current().expect("runtime product context");
+                    let pool = seed_pool();
+                    let mut projects = Vec::new();
+                    for path in ["/indexed-product-first", "/indexed-product-second", "/indexed-product-foreign"] {
+                        projects.push(queries::ensure_project(&cx, &pool, path).await.into_result().unwrap().id.unwrap());
+                    }
+                    let product = queries::ensure_product(&cx, &pool, None, Some("indexed-product-tool"))
+                        .await.into_result().unwrap();
+                    queries::link_product_to_projects(&cx, &pool, product.id.unwrap(), &projects[..2])
+                        .await.into_result().unwrap();
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                    for (offset, project) in projects.iter().enumerate() {
+                        let sender = 10 + i64::try_from(offset).unwrap() * 10;
+                        let viewer = sender + 1;
+                        conn.execute_raw(&format!(
+                            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+                             ({sender},{project},'RedFox','test','test',0,7),({viewer},{project},'BlueLake','test','test',0,7)"
+                        )).unwrap();
+                        let id = 100 + i64::try_from(offset).unwrap() * 10;
+                        conn.execute_raw(&format!(
+                            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts,importance,ack_required,recipients_json) VALUES \
+                             ({id},{project},{sender},'direct','direct body',{id},'high',1,'{{\"to\":[\"BlueLake\"],\"bcc\":[\"PrivateViewer\"]}}'), \
+                             ({},{project},{sender},'shared','shared body',{},'normal',0,'{{\"to\":[\"project:shared\"]}}'); \
+                             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) VALUES({id},{viewer},'bcc',8,9); \
+                             INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES \
+                             ({id},{project},'to',1),({},{project},'to',1); \
+                             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES \
+                             ({id},{viewer},88,99),({},{viewer},NULL,NULL)",
+                            id+1,id+1,id+1,id+1
+                        )).unwrap();
+                    }
+                    conn.execute_raw("COMMIT").unwrap();
+                    drop(conn);
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let invoke = |bodies, urgent, since, limit| {
+                        fetch_inbox_product(&ctx, "indexed-product-tool".into(), "bluelake".into(),
+                            Some(limit), Some(urgent), Some(bodies), since)
+                    };
+                    // Warm normal read admission before observing the tool's actual query route.
+                    invoke(false, false, None, 4).await.unwrap();
+                    let tracker = Arc::new(tracking::QueryTracker::new());
+                    tracker.enable(None);
+                    let _tracking = tracking::set_active_tracker(Arc::clone(&tracker));
+                    for bodies in [false, true] {
+                        tracker.reset();
+                        let response = invoke(bodies, false, None, 3).await.unwrap();
+                        let rows: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap();
+                        assert_eq!(rows.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![111,110,101]);
+                        assert!(rows.iter().all(|row| row.get("body_md").is_some() == bodies));
+                        assert_eq!(rows[0]["via"], "project");
+                        assert_eq!(rows[1]["kind"], "bcc");
+                        assert_eq!(rows[1]["read_ts"], micros_to_iso(8));
+                        assert_eq!(rows[1]["ack_ts"], micros_to_iso(9));
+                        assert!(rows.iter().all(|row|row.get("bcc").is_none_or(|bcc|bcc.as_array().is_some_and(Vec::is_empty))));
+                        assert!(!response.contains("PrivateViewer"));
+                        if bodies {
+                            assert_eq!(rows[0]["body_md"], "shared body");
+                            assert_eq!(rows[1]["body_md"], "direct body");
+                        }
+                        let observations = tracker.snapshot();
+                        assert!(observations.per_table.get("message_recipients").copied().unwrap_or(0)>0,
+                            "the public tool must run the indexed recipient reader, not the old product join: {observations:?}");
+                        assert!(observations.per_table.get("messages").copied().unwrap_or(0)>0,
+                            "message hydration must use the indexed reader: {observations:?}");
+                    }
+                    let urgent: Vec<serde_json::Value> = serde_json::from_str(&invoke(true,true,None,10).await.unwrap()).unwrap();
+                    assert_eq!(urgent.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(),vec![110,100]);
+                    let since: Vec<serde_json::Value> = serde_json::from_str(&invoke(false,false,Some(micros_to_iso(110)),10).await.unwrap()).unwrap();
+                    assert_eq!(since.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(),vec![111]);
+                    let conn=pool.acquire(&cx).await.into_result().unwrap();
+                    let activity=conn.query_sync("SELECT last_active_ts FROM agents WHERE name='BlueLake'",&[]).unwrap();
+                    assert!(activity.iter().all(|row|row.get_named::<i64>("last_active_ts").unwrap()==7));
+                    let receipts=conn.query_sync("SELECT read_ts,ack_ts FROM project_mailbox_receipts WHERE message_id=111 AND agent_id=21",&[]).unwrap();
+                    assert!(receipts[0].get_named::<Option<i64>>("read_ts").unwrap().is_none());
+                    assert!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap().is_none());
+                    drop(conn);
+                });
+                Config::reset_cached();
+            },
+        );
     }
 
     // -----------------------------------------------------------------------
