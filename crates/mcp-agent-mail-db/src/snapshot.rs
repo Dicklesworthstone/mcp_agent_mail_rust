@@ -15,6 +15,12 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
+#[path = "snapshot_authority.rs"]
+mod authority;
+#[cfg(unix)]
+use authority::SnapshotAuthority;
+
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
@@ -551,11 +557,15 @@ pub fn read_snapshot_metadata(primary: &Path) -> Option<VerifiedSnapshotMetadata
 ///
 /// Opens the freshly-written `.bak` to capture row counts + schema version,
 /// then writes the JSON sidecar. Returns the recorded metadata.
+/// Unix publishers share one persistent per-primary authority with verified
+/// readers. Contention refuses before creating an inspection stage.
 pub fn record_snapshot_metadata(
     primary: &Path,
     created_us: i64,
 ) -> DbResult<VerifiedSnapshotMetadata> {
     let primary = normalized_snapshot_primary(primary)?;
+    #[cfg(unix)]
+    let authority = SnapshotAuthority::acquire(&primary, true).map_err(snapshot_authority_error)?;
     let bak = snapshot_bak_path(&primary);
     if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak) {
         return Err(DbError::Sqlite(format!(
@@ -669,17 +679,63 @@ pub fn record_snapshot_metadata(
         snapshot_sha256,
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
     };
+    #[cfg(unix)]
+    authority.revalidate().map_err(snapshot_authority_error)?;
     write_snapshot_metadata(&primary, &meta)?;
     Ok(meta)
+}
+
+#[cfg(unix)]
+fn snapshot_authority_error(error: std::io::Error) -> DbError {
+    DbError::Sqlite(format!(
+        "snapshot authority unavailable; retry without replacing evidence: {error}"
+    ))
 }
 
 struct SelectedVerifiedSnapshot {
     metadata: VerifiedSnapshotMetadata,
     actual_path: PathBuf,
     source: std::fs::File,
+    // Retain publication admission through staging, never through promotion.
+    #[cfg(unix)]
+    authority: Option<SnapshotAuthority>,
 }
 
 fn select_verified_snapshot(primary: &Path) -> Option<SelectedVerifiedSnapshot> {
+    match select_verified_snapshot_checked(primary) {
+        Ok(selected) => selected,
+        Err(error) => {
+            tracing::debug!(%error, "verified snapshot selection is temporarily unavailable");
+            None
+        }
+    }
+}
+
+fn select_verified_snapshot_checked(primary: &Path) -> DbResult<Option<SelectedVerifiedSnapshot>> {
+    let primary = normalized_snapshot_primary(primary)?;
+    // Do not create a lock just because a read probed a fresh mailbox.
+    if read_snapshot_metadata(&primary).is_none() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    let authority =
+        SnapshotAuthority::acquire(&primary, false).map_err(snapshot_authority_error)?;
+    let selected = select_verified_snapshot_inner(&primary);
+    #[cfg(unix)]
+    {
+        authority.revalidate().map_err(snapshot_authority_error)?;
+        Ok(selected.map(|mut selected| {
+            selected.authority = Some(authority);
+            selected
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(selected)
+    }
+}
+
+fn select_verified_snapshot_inner(primary: &Path) -> Option<SelectedVerifiedSnapshot> {
     let primary = normalized_snapshot_primary(primary).ok()?;
     let meta = read_snapshot_metadata(&primary)?;
     let canonical_bak = snapshot_bak_path(&primary);
@@ -734,6 +790,8 @@ fn select_verified_snapshot(primary: &Path) -> Option<SelectedVerifiedSnapshot> 
             metadata: meta,
             actual_path: candidate,
             source,
+            #[cfg(unix)]
+            authority: None,
         });
     }
     None
@@ -769,7 +827,7 @@ pub fn restore_from_verified_snapshot(
     storage_root: &Path,
 ) -> DbResult<Option<VerifiedSnapshotMetadata>> {
     let primary = normalized_snapshot_primary(primary)?;
-    let Some(mut selected) = select_verified_snapshot(&primary) else {
+    let Some(mut selected) = select_verified_snapshot_checked(&primary)? else {
         return Ok(None);
     };
     let meta = selected.metadata;
@@ -853,6 +911,14 @@ pub fn restore_from_verified_snapshot(
             "snapshot restore: staged copy {} failed full integrity check and was preserved for inspection",
             staged.display()
         )));
+    }
+
+    // The staged bytes are independently hash-bound and fully verified. Never
+    // retain snapshot admission while promotion drains database borrowers.
+    #[cfg(unix)]
+    if let Some(authority) = selected.authority {
+        authority.revalidate().map_err(snapshot_authority_error)?;
+        drop(authority);
     }
 
     crate::pool::promote_recovery_candidate(&primary, &staged, storage_root).map_err(|error| {
@@ -988,6 +1054,188 @@ mod tests {
         assert_eq!(first.snapshot_sha256, second.snapshot_sha256);
         assert_eq!(second.created_us, 2);
         assert_eq!(read_snapshot_metadata(&primary), Some(second));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_respects_a_live_authority_owner_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let before = record_snapshot_metadata(&primary, 41).unwrap();
+        let held = authority::SnapshotAuthority::acquire(&primary, true).unwrap();
+        let before_names = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let result = record_snapshot_metadata(&primary, 42);
+        assert!(
+            result.is_err(),
+            "another publisher must not publish while authority is held"
+        );
+        assert_eq!(read_snapshot_metadata(&primary), Some(before));
+        let after_names = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            before_names, after_names,
+            "refusal precedes inspection staging"
+        );
+        drop(held);
+        assert_eq!(
+            record_snapshot_metadata(&primary, 43).unwrap().created_us,
+            43
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_selection_holds_shared_authority_and_restore_refuses_busy_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta = record_snapshot_metadata(&primary, 41).unwrap();
+        let first = select_verified_snapshot(&primary).unwrap();
+        let mut second = select_verified_snapshot(&primary).unwrap();
+        let before = std::fs::read(snapshot_meta_path(&primary)).unwrap();
+        assert!(record_snapshot_metadata(&primary, 42).is_err());
+        assert_eq!(std::fs::read(snapshot_meta_path(&primary)).unwrap(), before);
+        drop(first);
+        assert!(record_snapshot_metadata(&primary, 42).is_err());
+        let copied =
+            snapshot_file_identity_from_reader(&mut second.source, &second.actual_path).unwrap();
+        assert_eq!(copied, (meta.snapshot_size_bytes, meta.snapshot_sha256));
+        drop(second);
+        let newer = record_snapshot_metadata(&primary, 43).unwrap();
+        let held = SnapshotAuthority::acquire(&primary, true).unwrap();
+        assert!(
+            select_verified_snapshot(&primary).is_none(),
+            "a selector cannot ignore the active publisher"
+        );
+        let primary_before = std::fs::read(&primary).unwrap();
+        let names = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before_names = names();
+        let error = restore_from_verified_snapshot(&primary, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("snapshot authority unavailable"));
+        assert_eq!(
+            names(),
+            before_names,
+            "a busy restore must not stage or promote"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), primary_before);
+        assert_eq!(read_snapshot_metadata(&primary), Some(newer));
+        drop(held);
+        assert!(latest_verified_snapshot(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_admission_is_released_after_verification_error_and_empty_reads_are_neutral() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let names = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = names();
+        assert!(latest_verified_snapshot(&primary).is_none());
+        assert!(verified_snapshot_source_path(&primary).is_none());
+        assert!(
+            restore_from_verified_snapshot(&primary, dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(names(), before);
+        let bak = snapshot_bak_path(&primary);
+        std::fs::write(&bak, b"invalid retained backup").unwrap();
+        assert!(record_snapshot_metadata(&primary, 41).is_err());
+        let held = SnapshotAuthority::acquire(&primary, true).unwrap();
+        drop(held);
+        std::fs::rename(&bak, dir.path().join("retained-invalid-backup")).unwrap();
+        std::fs::copy(&primary, &bak).unwrap();
+        assert!(record_snapshot_metadata(&primary, 42).is_ok());
+        assert_eq!(
+            std::fs::read(dir.path().join("retained-invalid-backup")).unwrap(),
+            b"invalid retained backup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_publication_excludes_another_process_and_recovers_after_owner_death() {
+        use std::io::Read as _;
+        const CHILD: &str = "AM_TEST_SNAPSHOT_AUTHORITY_OWNER";
+        if let Some(primary) = std::env::var_os(CHILD) {
+            let primary = PathBuf::from(primary);
+            let _authority = SnapshotAuthority::acquire(&primary, true).unwrap();
+            std::fs::write(primary.with_extension("owner-ready"), b"ready").unwrap();
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta = record_snapshot_metadata(&primary, 41).unwrap();
+        let lock_path = primary.with_file_name("storage.sqlite3.bak.authority.lock");
+        use std::os::unix::fs::MetadataExt as _;
+        let inode = std::fs::metadata(&lock_path).unwrap().ino();
+        let name = std::thread::current().name().unwrap().to_string();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, &primary)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = primary.with_extension("owner-ready");
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "snapshot lock owner failed to start: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Observe all outcomes before terminating the owner so a regression
+        // cannot strand the child behind an assertion's unwinding.
+        let refused_record = record_snapshot_metadata(&primary, 42).is_err();
+        let refused_select = select_verified_snapshot(&primary).is_none();
+        let during = read_snapshot_metadata(&primary);
+        let still_running = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(refused_record && refused_select && still_running);
+        assert_eq!(during, Some(meta));
+        assert_eq!(
+            record_snapshot_metadata(&primary, 43).unwrap().created_us,
+            43
+        );
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().ino(),
+            inode,
+            "owner death releases admission without stale-lock deletion"
+        );
     }
 
     #[test]
