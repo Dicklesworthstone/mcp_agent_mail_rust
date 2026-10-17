@@ -103,6 +103,9 @@ fn scan_until_settled(
 /// file. This is not a transaction snapshot of concurrent archive appends:
 /// completed branches are released. Descriptor use depends on path depth, not
 /// the number of archived messages.
+/// A project's non-message siblings do not contribute to the floor. Its fixed
+/// messages entry stays bound until project completion, rather than treating
+/// ordinary reservation/profile/lock traffic as canonical-history changes.
 #[cfg(unix)]
 mod descriptor_scan {
     use std::ffi::OsStr;
@@ -169,12 +172,12 @@ mod descriptor_scan {
     /// What a classified entry must still match once it is opened.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum OpenCheck {
-        /// The storage root and everything inside it: any change, contents
-        /// included, refuses the scan.
+        /// Enumerated archive directories, storage root and canonical files:
+        /// changes to their contents refuse the scan.
         Generation,
-        /// A directory above the storage root: only a swap matters, because
-        /// unrelated activity in, say, /tmp or $HOME must not fail an
-        /// otherwise stable scan (br-7kk8y).
+        /// Unlisted ancestors or a project whose single messages child is
+        /// independently retained: unrelated siblings cannot change the floor.
+        /// Swaps still refuse; this is never used for enumerated directories.
         Identity,
     }
 
@@ -303,7 +306,11 @@ mod descriptor_scan {
             },
             matches!(level, Level::Root | Level::Project),
             level == Level::Projects,
-            OpenCheck::Generation,
+            if level == Level::Projects {
+                OpenCheck::Identity
+            } else {
+                OpenCheck::Generation
+            },
             hook,
         )?
         else {
@@ -328,6 +335,50 @@ mod descriptor_scan {
         Ok(result)
     }
 
+    // Project membership is one fixed child, not the set of directory entries.
+    // Keep its descriptor (or proven absence) through the parent's final seam,
+    // including a fresh generation check after traversal. A project lock-file
+    // rename is irrelevant; a replaced/created messages entry is never ignored.
+    fn scan_project(
+        project: &Opened,
+        hook: &mut impl FnMut(&Path, Phase),
+    ) -> DbResult<Option<i64>> {
+        let name = OsStr::new("messages");
+        let child = open_child(
+            project,
+            name,
+            FileType::Directory,
+            true,
+            false,
+            OpenCheck::Generation,
+            hook,
+        )?;
+        let result = match &child {
+            Some(messages) => scan_directory(messages, Level::Messages, hook)?,
+            None => None,
+        };
+        hook(&project.path, Phase::Scanned);
+        match child {
+            Some(messages) => {
+                validate_entry(project, name, &messages)?;
+                validate_generation(&messages)?;
+            }
+            None => {
+                if !matches!(
+                    rustix::fs::statat(&project.file, name, AtFlags::SYMLINK_NOFOLLOW),
+                    Err(error) if error == rustix::io::Errno::NOENT
+                ) {
+                    return Err(archive_scan_error(
+                        &project.path.join(name),
+                        "revalidate absent project messages",
+                        "archive entry appeared during scan",
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+
     fn scan_directory(
         directory: &Opened,
         level: Level,
@@ -335,7 +386,7 @@ mod descriptor_scan {
     ) -> DbResult<Option<i64>> {
         let result = match level {
             Level::Root => scan_child(directory, OsStr::new("projects"), level, hook)?,
-            Level::Project => scan_child(directory, OsStr::new("messages"), level, hook)?,
+            Level::Project => return scan_project(directory, hook),
             _ => {
                 let readable = rustix::fs::openat(
                     &directory.file,
@@ -1423,6 +1474,114 @@ mod tests {
     #[test]
     fn archive_scan_refuses_swaps_before_scan_publication() {
         assert_archive_swaps_are_refused(descriptor_scan::Phase::Scanned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_floor_ignores_project_lock_churn_without_retrying_the_history() {
+        for phase in [
+            descriptor_scan::Phase::Classified,
+            descriptor_scan::Phase::Opened,
+            descriptor_scan::Phase::Scanned,
+        ] {
+            let temp = tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("storage");
+            write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+            let project = root.join("projects/proj");
+            let mut churns = 0;
+            let result = scan_until_settled(&root, &mut |path, observed| {
+                if path == project && observed == phase {
+                    churns += 1;
+                    for name in [".archive.lock", ".archive.lock.owner.json"] {
+                        let lock = project.join(name);
+                        fs::write(&lock, b"ordinary publisher lock metadata").unwrap();
+                        fs::rename(&lock, base.join(format!("retained-{churns}-{name}"))).unwrap();
+                    }
+                }
+            });
+            assert!(
+                churns > 0,
+                "project boundary was never exercised: {phase:?}"
+            );
+            assert_eq!(result.unwrap(), Some(97), "{phase:?}");
+            assert_eq!(
+                churns, 1,
+                "benign lock traffic must not rescan canonical history"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_floor_rechecks_messages_entry_at_project_completion() {
+        for replacement in ["directory", "symlink", "missing", "new-year"] {
+            let temp = tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("storage");
+            write_canonical_message(&root, "proj", "2026", "05", "01__97.md", 97);
+            let project = root.join("projects/proj");
+            let messages = project.join("messages");
+            let original = fs::read(messages.join("2026/05/01__97.md")).unwrap();
+            let foreign = base.join("foreign");
+            write_canonical_message(&foreign, "proj", "2027", "01", "01__997.md", 997);
+            let mut injected = false;
+            let result = descriptor_scan::scan(&root, &mut |path, phase| {
+                if path == project && phase == descriptor_scan::Phase::Scanned && !injected {
+                    injected = true;
+                    if replacement == "new-year" {
+                        write_canonical_message(&root, "proj", "2027", "01", "01__997.md", 997);
+                    } else {
+                        fs::rename(&messages, base.join("retained-messages")).unwrap();
+                        if replacement == "directory" {
+                            fs::rename(foreign.join("projects/proj/messages"), &messages).unwrap();
+                        } else if replacement == "symlink" {
+                            std::os::unix::fs::symlink(
+                                foreign.join("projects/proj/messages"),
+                                &messages,
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            });
+            assert!(injected, "project completion boundary was not reached");
+            assert!(
+                result.is_err(),
+                "changed messages authority cannot publish a floor: {replacement}: {result:?}"
+            );
+            let retained = if replacement == "new-year" {
+                messages
+            } else {
+                base.join("retained-messages")
+            };
+            assert_eq!(
+                fs::read(retained.join("2026/05/01__97.md")).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_floor_rechecks_absent_messages_at_project_completion() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("storage");
+        let project = root.join("projects/proj");
+        fs::create_dir_all(&project).unwrap();
+        let mut injected = false;
+        let result = descriptor_scan::scan(&root, &mut |path, phase| {
+            if path == project && phase == descriptor_scan::Phase::Scanned && !injected {
+                injected = true;
+                write_canonical_message(&root, "proj", "2026", "05", "01__997.md", 997);
+            }
+        });
+        assert!(injected);
+        assert!(
+            result.is_err(),
+            "new messages at project completion must not become an empty floor"
+        );
+        assert_eq!(max_message_id_in_archive(&root).unwrap(), Some(997));
     }
 
     #[cfg(unix)]
