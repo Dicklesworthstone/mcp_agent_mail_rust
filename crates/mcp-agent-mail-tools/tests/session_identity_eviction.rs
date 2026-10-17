@@ -320,3 +320,164 @@ fn shared_session_with_no_remaining_proofs_keeps_its_evicted_project_restricted(
         assert_eq!(sent["sender_verification"], "session");
     });
 }
+
+/// Read the actual persistent surfaces that a refused macro used to mutate.
+/// The source pool and connection drop before calling the read-lane preflight.
+async fn handshake_counts(cx: &Cx) -> [i64; 5] {
+    let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("live pool");
+    let conn = pool.acquire(cx).await.into_result().expect("checkout");
+    let mut counts = [0; 5];
+    for (count, sql) in counts.iter_mut().zip([
+        "SELECT COUNT(*) AS n FROM projects",
+        "SELECT COUNT(*) AS n FROM agents",
+        "SELECT COUNT(*) AS n FROM agent_links",
+        "SELECT COUNT(*) AS n FROM messages",
+        "SELECT COUNT(*) AS n FROM message_recipients",
+    ]) {
+        let rows = conn.query_sync(sql, &[]).expect("read persisted count");
+        *count = rows[0].get_named::<i64>("n").expect("integer count");
+    }
+    counts
+}
+
+async fn handshake(
+    ctx: &McpContext,
+    source: &str,
+    requester: &str,
+    target_project: &str,
+    target: &str,
+    register_if_missing: bool,
+) -> Result<Value, String> {
+    mcp_agent_mail_tools::macro_contact_handshake(
+        ctx,
+        source.to_string(),
+        Some(requester.to_string()),
+        Some(target.to_string()),
+        None,
+        None,
+        Some(target_project.to_string()),
+        Some("eviction preflight regression".to_string()),
+        Some(true),
+        Some(3600),
+        Some("Welcome after authorization".to_string()),
+        Some("Both contact actors must be admitted before this mail is sent.".to_string()),
+        None,
+        Some(register_if_missing),
+        Some("codex-cli".to_string()),
+        Some("gpt-5".to_string()),
+        None,
+        None,
+    )
+    .await
+    .map(|json| serde_json::from_str(&json).expect("handshake JSON"))
+    .map_err(|error| tool_error_code(&error).unwrap_or("UNKNOWN").to_string())
+}
+
+#[test]
+fn auto_accept_preflights_evicted_target_before_any_handshake_writes() {
+    run_case(|cx, root| async move {
+        let fixture = evicted_fixture(&cx, &root).await;
+        for binding in session_identity::session_bindings(&fixture.actor) {
+            session_identity::unbind(&fixture.actor, binding.agent_id);
+        }
+        // A later request on the SAME session inherits restrictions despite
+        // having no live proofs. The source project is deliberately unbound;
+        // only preflighting the evicted target prevents partial side effects.
+        let followup = McpContext::with_state(cx.clone(), 3, fixture.actor_state.clone());
+        assert!(session_identity::session_bindings(&followup).is_empty());
+        let before = handshake_counts(&cx).await;
+        assert_eq!(before[2], 0, "the fixture has no contact links");
+        let absent_source = root.join("new-source").to_string_lossy().into_owned();
+        for (source, requester, register) in [
+            (fixture.second_project.as_str(), fixture.retained.as_str(), false),
+            (absent_source.as_str(), "BlueLake", true),
+        ] {
+            let error = handshake(
+                &followup,
+                source,
+                requester,
+                &fixture.first_project,
+                &fixture.victim,
+                register,
+            )
+            .await
+            .expect_err("eviction must refuse the target before the request is committed");
+            assert_eq!(error, "SESSION_IDENTITY_MISMATCH");
+            assert_eq!(
+                handshake_counts(&cx).await,
+                before,
+                "refusal must not create a project, requester, link, intro, welcome or delivery"
+            );
+        }
+        // Positive control: no global disablement of contact workflows, and
+        // no accidental restriction on a genuinely fresh trusted-local session.
+        let fresh = McpContext::with_state(cx.clone(), 4, SessionState::new());
+        let result = handshake(
+            &fresh,
+            &fixture.second_project,
+            &fixture.retained,
+            &fixture.first_project,
+            &fixture.victim,
+            false,
+        )
+        .await
+        .expect("fresh unbound session can complete the same real handshake");
+        assert_eq!(result["response"]["approved"], true);
+        assert!(result["welcome_message"].is_object());
+        assert_eq!(handshake_counts(&cx).await[2], before[2] + 1);
+    });
+}
+
+#[test]
+fn saturated_eviction_history_refuses_new_source_before_creating_its_project() {
+    run_case(|cx, root| async move {
+        let actor = McpContext::with_state(cx.clone(), 1, SessionState::new());
+        let peer = McpContext::with_state(cx.clone(), 2, SessionState::new());
+        let target_project = root.join("target").to_string_lossy().into_owned();
+        ensure_project(&peer, target_project.clone(), None).await.unwrap();
+        let target = create_identity(&peer, &target_project).await;
+
+        // 32 held proofs plus 33 distinct evicted projects exhaust the shipped
+        // 32-project history through real registrations, not a state injection.
+        for ordinal in 0..65 {
+            let project = root.join(format!("history-{ordinal}"));
+            let project = project.to_string_lossy().into_owned();
+            ensure_project(&actor, project.clone(), None).await.unwrap();
+            create_identity(&actor, &project).await;
+        }
+        assert_eq!(session_identity::session_bindings(&actor).len(), 32);
+        for binding in session_identity::session_bindings(&actor) {
+            session_identity::unbind(&actor, binding.agent_id);
+        }
+        assert!(session_identity::session_bindings(&actor).is_empty());
+        let unrelated = set_contact_policy(
+            &actor,
+            target_project.clone(),
+            target.clone(),
+            "open".to_string(),
+        )
+        .await
+        .expect_err("saturation must constrain even a project never held by this session");
+        assert_eq!(tool_error_code(&unrelated), Some("SESSION_IDENTITY_MISMATCH"));
+
+        let before = handshake_counts(&cx).await;
+        let source = root.join("never-created").to_string_lossy().into_owned();
+        assert_eq!(
+            handshake(&actor, &source, "BlueLake", &target_project, &target, true)
+                .await
+                .expect_err("new-project auto-registration cannot reset eviction history"),
+            "SESSION_IDENTITY_MISMATCH"
+        );
+        assert_eq!(
+            handshake_counts(&cx).await,
+            before,
+            "even the source project must not be created before saturated admission refuses"
+        );
+        let fresh = McpContext::with_state(cx.clone(), 3, SessionState::new());
+        let result = handshake(&fresh, &source, "BlueLake", &target_project, &target, true)
+            .await
+            .expect("fresh session retains implicit registration on the same new-project path");
+        assert_eq!(result["response"]["approved"], true);
+        assert_eq!(handshake_counts(&cx).await[0], before[0] + 1);
+    });
+}

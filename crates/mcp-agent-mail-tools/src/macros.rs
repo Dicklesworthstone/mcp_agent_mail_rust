@@ -720,9 +720,11 @@ pub async fn macro_contact_handshake(
     // A handshake has two actors when it auto-accepts: the requester and the
     // recipient deciding the link. Check both on the read-only lane before
     // implicit registration, project creation, link refresh, or intro mail.
-    // A project in which this session holds no identity keeps trusted-local
-    // behavior, just as each granular contact tool does.
-    if !crate::session_identity::session_bindings(ctx).is_empty() {
+    // Empty proof inventory does not imply trusted-local authority: capacity
+    // eviction can leave restrictions even after every live proof was unbound.
+    // Freeze the complete authorization state before the first database await.
+    let authorization = crate::session_identity::ActorAuthorizationSnapshot::capture(ctx)?;
+    if !authorization.permits_unresolved_actor(None) {
         let read_pool = get_coalescer_bypass_read_db_pool()?;
         match resolve_existing_project(ctx, &read_pool, &project_key).await {
             Ok(project) => {
@@ -737,20 +739,21 @@ pub async fn macro_contact_handshake(
                 )
                 .await
                 {
-                    Ok(agent) => crate::session_identity::authorize_actor(
-                        ctx,
-                        &agent,
-                        false,
-                        "request contacts",
-                    )?,
+                    Ok(agent) => authorization.authorize(ctx, &agent, "request contacts")?,
                     Err(error)
                         if register_if_missing != Some(false)
                             && tool_error_code(&error) == Some("NOT_FOUND") =>
                     {
-                        crate::contacts::authorize_requester_creation(
+                        // Use this preflight's snapshot, not a later session
+                        // read that could have lost the requester's restriction.
+                        authorization.authorize(
                             ctx,
-                            project_id,
-                            &from_agent,
+                            &mcp_agent_mail_db::AgentRow {
+                                project_id,
+                                name: from_agent.clone(),
+                                ..Default::default()
+                            },
+                            "auto-register a contact requester",
                         )?;
                     }
                     Err(error) => return Err(error),
@@ -758,7 +761,21 @@ pub async fn macro_contact_handshake(
             }
             Err(error)
                 if register_if_missing != Some(false)
-                    && tool_error_code(&error) == Some("NOT_FOUND") => {}
+                    && tool_error_code(&error) == Some("NOT_FOUND") =>
+            {
+                // No project or agent row exists yet. No id can match a held
+                // proof; saturated eviction history must refuse this path too,
+                // before resolve_project creates anything. This projection is
+                // authorization input only and is never persisted.
+                authorization.authorize(
+                    ctx,
+                    &mcp_agent_mail_db::AgentRow {
+                        name: from_agent.clone(),
+                        ..Default::default()
+                    },
+                    "auto-register a contact requester in a new project",
+                )?;
+            }
             Err(error) => return Err(error),
         }
         if should_auto_accept {
@@ -773,15 +790,11 @@ pub async fn macro_contact_handshake(
                 &project.human_key,
             )
             .await?;
-            crate::session_identity::authorize_actor(
-                ctx,
-                &target,
-                false,
-                "respond to contact requests",
-            )?;
+            authorization.authorize(ctx, &target, "respond to contact requests")?;
         }
     }
 
+    ctx.ensure_live()?;
     let pool = get_db_pool()?;
     // register_if_missing=false means nothing is created implicitly: a missing
     // source project is NOT_FOUND here, before the contact flow's own check.
