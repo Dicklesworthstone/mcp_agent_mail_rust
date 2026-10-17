@@ -217,7 +217,7 @@ impl DbErrorClassification {
                 safe_to_retry: false,
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
-                recommended_command: "am doctor --json",
+                recommended_command: "am doctor check --json",
             },
             DbErrorClass::WalSidecarCorruption => Self {
                 class,
@@ -235,7 +235,10 @@ impl DbErrorClassification {
                 safe_to_retry: false,
                 safe_to_continue_read_only: false,
                 blocks_edits: true,
-                recommended_command: "am doctor migrate --check",
+                // `doctor check` verifies the required tables; `am migrate
+                // --check` only inspects timestamp format and would report
+                // "No migration needed" for a missing table.
+                recommended_command: "am doctor check --json",
             },
             DbErrorClass::EngineProbeLimitation => Self {
                 class,
@@ -253,7 +256,7 @@ impl DbErrorClassification {
                 safe_to_retry: false,
                 safe_to_continue_read_only: true,
                 blocks_edits: true,
-                recommended_command: "am doctor --json",
+                recommended_command: "am doctor check --json",
             },
             DbErrorClass::FtsIndexCorruption => Self {
                 class,
@@ -1707,7 +1710,8 @@ mod tests {
         );
         assert!(!schema.safe_to_retry);
         assert!(schema.blocks_edits);
-        assert_eq!(schema.recommended_command, "am doctor migrate --check");
+        // A read-only check that actually looks for missing tables.
+        assert_eq!(schema.recommended_command, "am doctor check --json");
     }
 
     #[test]

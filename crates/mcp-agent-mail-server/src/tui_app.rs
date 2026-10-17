@@ -2634,6 +2634,18 @@ impl MailAppModel {
             .is_some_and(MailScreen::consumes_text_input)
     }
 
+    /// Whether the active screen claims `key` from the global shortcuts.
+    /// Ctrl+C is exempt so quit confirmation is reachable from every screen.
+    fn active_screen_claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        let ctrl_c =
+            key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Char('c' | 'C'));
+        !ctrl_c
+            && self
+                .screen_manager
+                .active_screen_ref()
+                .is_some_and(|screen| screen.claims_key(key))
+    }
+
     fn sync_palette_hints(&mut self, actions: &[ActionItem]) {
         register_palette_hints(
             &mut self.hint_ranker,
@@ -4747,6 +4759,13 @@ impl Model for MailAppModel {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
+                    // A screen's own binding outranks the global one (`/`
+                    // opens the screen's filter, not the global search).
+                    // The help overlay still takes keys first.
+                    if !self.help_visible && self.active_screen_claims_key(key) {
+                        self.clear_quit_confirmation();
+                        return self.forward_event_to_active_screen(event);
+                    }
                     let is_ctrl_p = key.modifiers.contains(Modifiers::CTRL)
                         && matches!(key.code, KeyCode::Char('p'));
                     if (is_ctrl_p || matches!(key.code, KeyCode::Char(':'))) && !text_mode {
@@ -4877,12 +4896,15 @@ impl Model for MailAppModel {
                             );
                             return Cmd::none();
                         }
-                        KeyCode::Tab => {
+                        // While a form, dialog, or query bar takes text,
+                        // Tab moves between its fields instead of leaving
+                        // the screen mid-edit.
+                        KeyCode::Tab if !text_mode => {
                             let next = self.screen_manager.active_screen().next();
                             self.activate_screen(next);
                             return Cmd::none();
                         }
-                        KeyCode::BackTab => {
+                        KeyCode::BackTab if !text_mode => {
                             let prev = self.screen_manager.active_screen().prev();
                             self.activate_screen(prev);
                             return Cmd::none();
@@ -9624,6 +9646,81 @@ mod tests {
         assert!(!model.state.is_shutdown_requested());
         assert!(model.state.is_headless_detach_requested());
         assert!(matches!(cmd, Cmd::Quit));
+    }
+
+    fn press(model: &mut MailAppModel, code: KeyCode, modifiers: Modifiers) {
+        let key = Event::Key(KeyEvent::new(code).with_modifiers(modifiers));
+        model.update(MailMsg::Terminal(key));
+    }
+
+    #[test]
+    fn typing_in_a_preset_dialog_never_fires_global_shortcuts() {
+        // The save-preset dialogs used to leave text mode off, so `q` in a
+        // preset name requested shutdown and digits jumped screens.
+        for screen in [
+            MailScreenId::Search,
+            MailScreenId::Messages,
+            MailScreenId::Reservations,
+            MailScreenId::Timeline,
+        ] {
+            let mut model = test_model();
+            model.update(MailMsg::SwitchScreen(screen));
+            press(&mut model, KeyCode::Char('s'), Modifiers::CTRL);
+            assert!(model.consumes_text_input(), "{screen:?}: dialog is modal");
+            for ch in ['q', '3', '?', 'm', '/', '.'] {
+                press(&mut model, KeyCode::Char(ch), Modifiers::NONE);
+            }
+            press(&mut model, KeyCode::Tab, Modifiers::NONE);
+            assert!(!model.state.is_shutdown_requested(), "{screen:?}");
+            assert_eq!(model.active_screen(), screen, "{screen:?}");
+            assert!(!model.help_visible(), "{screen:?}");
+        }
+        // Negative control: outside a dialog `q` still quits.
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Timeline));
+        press(&mut model, KeyCode::Char('q'), Modifiers::NONE);
+        assert!(model.state.is_shutdown_requested());
+    }
+
+    #[test]
+    fn slash_opens_the_screen_filter_where_one_exists_else_global_search() {
+        for screen in [
+            MailScreenId::Agents,
+            MailScreenId::Projects,
+            MailScreenId::Contacts,
+            MailScreenId::Attachments,
+            MailScreenId::ArchiveBrowser,
+            MailScreenId::Threads,
+            MailScreenId::Dashboard,
+        ] {
+            let mut model = test_model();
+            model.update(MailMsg::SwitchScreen(screen));
+            assert!(!model.consumes_text_input(), "{screen:?}");
+            press(&mut model, KeyCode::Char('/'), Modifiers::NONE);
+            assert_eq!(model.active_screen(), screen, "{screen:?}: stays put");
+            assert!(model.consumes_text_input(), "{screen:?}: filter is editing");
+        }
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::ToolMetrics));
+        press(&mut model, KeyCode::Char('/'), Modifiers::NONE);
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+    }
+
+    #[test]
+    fn tab_moves_within_a_text_field_and_between_screens_otherwise() {
+        let mut model = test_model();
+        model.update(MailMsg::SwitchScreen(MailScreenId::Search));
+        press(&mut model, KeyCode::Char('/'), Modifiers::NONE);
+        assert!(model.consumes_text_input(), "query bar focused");
+        press(&mut model, KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        assert!(!model.consumes_text_input(), "Tab left the query bar");
+        // The facet rail claims Tab to return to the results ...
+        press(&mut model, KeyCode::Tab, Modifiers::NONE);
+        assert_eq!(model.active_screen(), MailScreenId::Search);
+        // ... and from the results Tab is the shell's next screen again.
+        press(&mut model, KeyCode::Tab, Modifiers::NONE);
+        assert_ne!(model.active_screen(), MailScreenId::Search);
     }
 
     #[test]

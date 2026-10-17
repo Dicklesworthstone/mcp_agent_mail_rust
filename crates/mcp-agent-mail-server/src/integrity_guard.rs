@@ -210,11 +210,16 @@ fn resolve_integrity_guard_sqlite_path(config: &Config) -> Option<PathBuf> {
     crate::resolve_server_database_url_sqlite_path(&config.database_url)
 }
 
+/// Whether the guard runs for `config`, and so refreshes the proactive
+/// `.bak`. Published in the ws-state config so `am doctor health` judges a
+/// backup's age by the server's settings, not the CLI's environment.
+#[must_use]
+pub fn enabled_for(config: &Config) -> bool {
+    config.integrity_check_on_startup && !is_sqlite_memory_database_url(&config.database_url)
+}
+
 pub fn start(config: &Config) {
-    if !config.integrity_check_on_startup {
-        return;
-    }
-    if is_sqlite_memory_database_url(&config.database_url) {
+    if !enabled_for(config) {
         return;
     }
 
@@ -1214,8 +1219,8 @@ mod tests {
         for error in [
             DbError::ResourceBusy("database is locked".to_string()),
             DbError::Pool("pool exhausted".to_string()),
-            DbError::Sqlite("integrity reconcile deferred under lock/busy contention: the canonical second-opinion probe could not run; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
-            DbError::Sqlite("integrity reconcile deferred under staged-copy-inconclusive contention: the canonical second-opinion probe could not run; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
+            DbError::Sqlite("integrity reconcile deferred: the canonical second-opinion probe could not run (database busy, locked or unavailable); the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
+            DbError::Sqlite("integrity reconcile deferred: canonical SQLite ran on a staged copy of the live database and also rejected that copy, but a copy taken while a writer is active can be torn, so its rejection is not authoritative; the primary verdict is unconfirmed and will be re-probed on the next integrity cycle".to_string()),
         ] {
             let expected = error.to_string();
             assert_eq!(

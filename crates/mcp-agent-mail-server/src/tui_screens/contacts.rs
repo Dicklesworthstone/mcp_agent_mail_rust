@@ -488,8 +488,11 @@ impl ContactsScreen {
                 self.show_mermaid_panel = !self.show_mermaid_panel;
             }
             KeyCode::Char('/') => {
+                // A fresh filter starts from the full list, not the one the
+                // previous filter left behind.
                 self.filter_active = true;
                 self.filter.clear();
+                self.rebuild_from_state(state);
             }
             KeyCode::Char('f') => {
                 self.status_filter = self.status_filter.next();
@@ -788,6 +791,19 @@ impl MailScreen for ContactsScreen {
 
     fn consumes_text_input(&self) -> bool {
         self.filter_active
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search. Esc
+        // closes the Mermaid panel or clears a committed filter; with neither
+        // it stays the global quit confirmation.
+        match key.code {
+            KeyCode::Char('/') => true,
+            KeyCode::Escape => {
+                !self.filter_active && (self.show_mermaid_panel || !self.filter.is_empty())
+            }
+            _ => false,
+        }
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -1883,6 +1899,67 @@ mod tests {
 
         assert!(!screen.show_mermaid_panel);
         assert_eq!(screen.filter, "fox");
+    }
+
+    #[test]
+    fn esc_is_claimed_only_while_mermaid_is_open_or_a_filter_is_committed() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contacts_list: vec![
+                ContactSummary {
+                    from_agent: "Alpha".to_string(),
+                    to_agent: "Beta".to_string(),
+                    status: "approved".to_string(),
+                    updated_ts: 1,
+                    ..Default::default()
+                },
+                ContactSummary {
+                    from_agent: "Gamma".to_string(),
+                    to_agent: "Delta".to_string(),
+                    status: "approved".to_string(),
+                    updated_ts: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.contacts.len(), 2);
+
+        // With neither a panel nor a filter Esc stays global, so it still
+        // arms quit confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
+        screen.update(&g, &state);
+        assert!(screen.claims_key(&esc));
+        screen.update(&Event::Key(esc), &state);
+        assert!(!screen.show_mermaid_panel);
+        assert!(!screen.claims_key(&esc));
+
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('a'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+            KeyCode::Enter,
+        ] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert!(!screen.consumes_text_input());
+        assert_eq!(screen.contacts.len(), 1);
+        assert!(screen.claims_key(&esc));
+
+        screen.update(&Event::Key(esc), &state);
+        assert_eq!(screen.filter, "");
+        assert_eq!(
+            screen.contacts.len(),
+            2,
+            "clearing the filter rebuilds the list"
+        );
+        assert!(!screen.claims_key(&esc));
     }
 
     #[test]

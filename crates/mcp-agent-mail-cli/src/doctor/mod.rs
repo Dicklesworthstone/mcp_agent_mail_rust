@@ -30,6 +30,7 @@ pub mod undo;
 use crate::output::CliOutputFormat;
 use crate::{CliError, CliResult};
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_storage::recovery::reservation_reconcile;
 use mcp_agent_mail_tools::reservation_parity::{
     ReservationParityReport, check_reservation_parity_with_canonical_conn,
 };
@@ -331,24 +332,15 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
         // An active live-probe failure outranks any cached-report advice.
         live
     } else if total_findings.unwrap_or(0) == 0 {
-        if report_path.is_none() {
-            "am doctor".to_string()
-        } else {
+        if report_usable {
             "am doctor health".to_string()
+        } else {
+            // No usable report says what is broken: the next step is the
+            // read-only scan of every registered FM.
+            TRIAGE_SCAN_COMMAND.to_string()
         }
     } else {
-        let has_p0 = findings
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .any(|f| f.get("severity").and_then(|s| s.as_str()) == Some("P0"))
-            })
-            .unwrap_or(false);
-        if has_p0 {
-            "am doctor --fix --yes".to_string()
-        } else {
-            "am doctor --dry-run --fix".to_string()
-        }
+        triage_findings_command(&findings)
     };
 
     let actions_planned: Vec<serde_json::Value> = findings
@@ -387,7 +379,7 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
                     Some(serde_json::json!({
                         "id": id,
                         "severity": severity,
-                        "fix_command": format!("am doctor --fix --only {} --yes", id),
+                        "fix_command": fixers::fix_only_command(id),
                         "explain_command": format!("am doctor explain {}", id),
                     }))
                 })
@@ -423,15 +415,41 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
     if !report_available && let Some(map) = envelope.as_object_mut() {
         map.insert(
             "report_note".to_string(),
-            serde_json::Value::String(
+            serde_json::Value::String(format!(
                 "No doctor report exists yet for this target — the finding count is unknown, \
-                 not zero. Run `am doctor` (or `am doctor --json`) to produce one."
-                    .to_string(),
-            ),
+                 not zero. A report is written only by a fix that changed something; run \
+                 `{TRIAGE_SCAN_COMMAND}` to scan every registered failure mode read-only."
+            )),
         );
     }
 
     Ok(envelope)
+}
+
+/// The read-only scan of every registered FM: triage's next step whenever no
+/// usable report names what is broken.
+const TRIAGE_SCAN_COMMAND: &str = "am doctor fix --list --json";
+
+/// Triage's next step for findings carried by a stored report: apply the
+/// first P0 FM's fix, else rehearse the first FM's fix. A report that names
+/// no finding (per-FM run envelopes carry only counts) sends the agent back
+/// to the scan, which re-detects from current state.
+fn triage_findings_command(findings: &serde_json::Value) -> String {
+    fn id_of(finding: &serde_json::Value) -> Option<&str> {
+        finding.get("id").and_then(serde_json::Value::as_str)
+    }
+    let findings = findings.as_array().map_or(&[][..], Vec::as_slice);
+    let p0 = findings
+        .iter()
+        .filter(|f| f.get("severity").and_then(serde_json::Value::as_str) == Some("P0"))
+        .find_map(id_of);
+    if let Some(id) = p0 {
+        fixers::fix_only_command(id)
+    } else if let Some(id) = findings.iter().find_map(id_of) {
+        format!("am doctor fix --only {id} --dry-run")
+    } else {
+        TRIAGE_SCAN_COMMAND.to_string()
+    }
 }
 
 /// A small archive-only parity discrepancy is operational debt, not evidence
@@ -439,6 +457,58 @@ fn triage_envelope(target: &std::path::Path, quick: bool) -> CliResult<serde_jso
 /// Keep the threshold deliberately tight: larger drift, parse failures, and
 /// any mismatch to reservation semantics remain unhealthy and retain exit 1.
 const COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD: usize = 3;
+
+/// How recently the mailbox owner's reservation reconciler must have finished
+/// a pass, and republished a release, for health to call its drift converging.
+const RESERVATION_RECONCILE_PROGRESS_WINDOW_US: i64 = 10 * 60 * 1_000_000;
+
+/// Whether reservation drift is the background reconciler's work in progress
+/// (br-kp1in.19). `Ok(note)` only when every drift item belongs to a row
+/// released in `SQLite` whose artifact still reads active (the one direction
+/// the reconciler repairs) and the reconciler has both run and republished a
+/// release within the window. A reconciler that is absent, idle, or running
+/// without repairing anything keeps health failing; `Err(Some(note))` says
+/// which, for drift it would otherwise own.
+fn reservation_parity_reconciling(
+    report: &ReservationParityReport,
+    progress: Option<&reservation_reconcile::ReservationReconcileProgress>,
+    now_us: i64,
+) -> Result<String, Option<String>> {
+    let drift = &report.drift;
+    if drift.total() == 0 || drift.release_pending_mismatches != drift.total() {
+        return Err(None);
+    }
+    let rows = drift.release_pending_rows;
+    let fix = fixers::fix_only_command("fm-db-state-files-reservation-db-archive-parity");
+    // A time further in the future than clock skew explains is not evidence
+    // of recent progress (the clock moved back since it was written).
+    let recent = |ts_us: i64| {
+        ts_us <= now_us.saturating_add(reservation_reconcile::PROGRESS_CLOCK_SKEW_US)
+            && now_us.saturating_sub(ts_us) <= RESERVATION_RECONCILE_PROGRESS_WINDOW_US
+    };
+    let window_min = RESERVATION_RECONCILE_PROGRESS_WINDOW_US / 60_000_000;
+    let Some(progress) = progress.filter(|progress| recent(progress.pass_us)) else {
+        return Err(Some(format!(
+            "reservation_parity: {rows} released reservation(s) await the background \
+             reconciler, which has not run in the last {window_min} min (is the server up?); \
+             next: {fix}"
+        )));
+    };
+    match progress.last_repair_us.filter(|ts_us| recent(*ts_us)) {
+        Some(last_repair_us) => Ok(format!(
+            "warn: reservation parity: reconciling {rows} released reservation(s); the \
+             background reconciler (pid {}) last republished one {}s ago",
+            progress.pid,
+            now_us.saturating_sub(last_repair_us) / 1_000_000
+        )),
+        None => Err(Some(format!(
+            "reservation_parity: the background reconciler (pid {}) is running but has not \
+             republished any of {rows} pending release(s) in the last {window_min} min; \
+             next: {fix}",
+            progress.pid
+        ))),
+    }
+}
 
 fn reservation_parity_is_cosmetic(report: &ReservationParityReport) -> bool {
     let drift = &report.drift;
@@ -522,6 +592,73 @@ struct DoctorLiveProbeTarget {
     database_url: String,
     storage_root: PathBuf,
     source: &'static str,
+    /// The live server's integrity-guard state, when it advertises one.
+    integrity_guard_enabled: Option<bool>,
+}
+
+/// A proactive backup older than this, while the live owner has run past
+/// [`PROACTIVE_BACKUP_GRACE_SECS`], means its refreshes are failing: a running
+/// integrity guard refreshes the backup once it is an hour old, retrying at
+/// most six hours apart after failures.
+const STALE_PROACTIVE_BACKUP_SECS: u64 = 24 * 60 * 60;
+/// Owner uptime after which the integrity guard has had cycles to refresh.
+const PROACTIVE_BACKUP_GRACE_SECS: u64 = 2 * 60 * 60;
+
+/// `(status, detail)` for the live mailbox's proactive `.bak` (br-31eew).
+///
+/// `guard_attested` is false when the server did not report whether its
+/// integrity guard runs and `guard_enabled` is the CLI's own setting; a stale
+/// backup is then only a warning. `backup_age_secs` is `None` when no backup
+/// exists; `standalone` is false when the backup carries `-wal`/`-shm`/sidecar
+/// companions, which block every refresh.
+fn proactive_backup_health(
+    guard_enabled: bool,
+    guard_attested: bool,
+    backup_age_secs: Option<u64>,
+    owner_age_secs: Option<u64>,
+    standalone: bool,
+) -> (&'static str, String) {
+    let hours = |secs: u64| format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60);
+    let unattested = if guard_attested {
+        ""
+    } else {
+        " (the server did not report whether its integrity guard runs)"
+    };
+    if !guard_enabled {
+        return (
+            "ok",
+            format!("the integrity guard is off, so no proactive backup is expected{unattested}"),
+        );
+    }
+    let settled = owner_age_secs.is_some_and(|age| age >= PROACTIVE_BACKUP_GRACE_SECS);
+    let companions = if standalone {
+        ""
+    } else {
+        "; the backup has -wal/-shm or other companion files, which block every refresh"
+    };
+    match backup_age_secs {
+        None if settled => (
+            "warn",
+            format!(
+                "no proactive backup after {} of server uptime; check the server log for 'proactive backup refresh failed'",
+                hours(owner_age_secs.unwrap_or_default())
+            ),
+        ),
+        None => ("ok", "no proactive backup yet".to_string()),
+        Some(age) if age > STALE_PROACTIVE_BACKUP_SECS && settled => {
+            let detail = format!(
+                "proactive backup is {} old although the server has run {}: refreshes are failing{companions}; check the server log for 'proactive backup refresh failed'",
+                hours(age),
+                hours(owner_age_secs.unwrap_or_default())
+            );
+            if guard_attested {
+                ("fail", detail)
+            } else {
+                ("warn", format!("{detail}{unattested}"))
+            }
+        }
+        Some(age) => ("ok", format!("age {}{companions}", hours(age))),
+    }
 }
 
 /// Read-only retention footprint for the same mailbox selected by the health
@@ -569,12 +706,14 @@ fn doctor_live_probe_target_from_server_config(
             database_url: server_config.database_url,
             storage_root: server_config.storage_root,
             source: "live_server",
+            integrity_guard_enabled: server_config.integrity_guard_enabled,
         };
     }
     DoctorLiveProbeTarget {
         database_url: config.database_url.clone(),
         storage_root: config.storage_root.clone(),
         source: "local_config_unattested",
+        integrity_guard_enabled: None,
     }
 }
 
@@ -602,8 +741,8 @@ fn doctor_live_probe_target(config: &Config) -> DoctorLiveProbeTarget {
 ///    keeps `am doctor explain <fm-id>` informative regardless of run
 ///    history.
 /// 3. If neither stage matches, exit 64 with a hint pointing operators
-///    at `am doctor fixers` (enumerate registry) and `am doctor --json`
-///    (list current findings).
+///    at `am doctor fixers` (enumerate registry) and
+///    `am doctor fix --list --json` (list current findings).
 pub fn handle_explain(
     target: &std::path::Path,
     finding_id: &str,
@@ -614,6 +753,8 @@ pub fn handle_explain(
     // than aborting — silently better UX for `explain` on a registered
     // FM that simply hasn't fired in any run yet.
     let root = runs::doctor_root(target);
+    let specs = fixers::registry();
+    let spec = specs.iter().find(|s| s.id == finding_id);
     let latest_envelope = latest_doctor_report_path_for_root(&root).and_then(|report_path| {
         let body = std::fs::read_to_string(&report_path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -622,6 +763,13 @@ pub fn handle_explain(
             f.get("id").and_then(|i| i.as_str()) == Some(finding_id)
                 || f.get("check").and_then(|i| i.as_str()) == Some(finding_id)
         })?;
+        // A legacy check name matched above is not an FM id; `fix --only`
+        // would refuse it with exit 64, so only an FM gets a fix command.
+        let first_action = if spec.is_some() {
+            fixers::fix_only_command(finding_id)
+        } else {
+            TRIAGE_SCAN_COMMAND.to_string()
+        };
         Some(serde_json::json!({
             "schema_version": "1.0",
             "mode": "latest_run",
@@ -629,7 +777,7 @@ pub fn handle_explain(
             "finding": matched,
             "report_path": report_path.to_string_lossy(),
             "next_actions": [
-                format!("am doctor --fix --only {finding_id} --yes"),
+                first_action,
                 "am doctor capabilities --json".to_string(),
             ],
         }))
@@ -642,8 +790,7 @@ pub fn handle_explain(
 
     // Stage 2: registry fallback. Useful for `explain <fm-id>` when
     // the FM is registered but hasn't fired in any run.
-    let specs = fixers::registry();
-    if let Some(spec) = specs.iter().find(|s| s.id == finding_id) {
+    if let Some(spec) = spec {
         let envelope = serde_json::json!({
             "schema_version": "1.0",
             "mode": "registry",
@@ -652,7 +799,7 @@ pub fn handle_explain(
             "note": "No matching finding in latest run; showing the FM's static contract from the registry.",
             "next_actions": [
                 format!("am doctor fix --only {finding_id} --list --json"),
-                format!("am doctor --fix --only {finding_id} --yes"),
+                fixers::fix_only_command(finding_id),
                 "am doctor fixers --format json".to_string(),
                 "am doctor capabilities --json".to_string(),
             ],
@@ -664,7 +811,7 @@ pub fn handle_explain(
     // Stage 3: not in latest run, not in registry → truly unknown.
     eprintln!("error: finding `{finding_id}` not found in latest run AND not a registered FM.");
     eprintln!(
-        "       Run `am doctor fixers` to enumerate registered FM ids, or `am doctor --json` to list current findings."
+        "       Run `am doctor fixers` to enumerate registered FM ids, or `{TRIAGE_SCAN_COMMAND}` to list current findings."
     );
     Err(CliError::ExitCode(64))
 }
@@ -2910,7 +3057,7 @@ fn print_skipped_doctor_report(skipped: &SkippedDoctorReport) {
 /// per invocation, however many reports were skipped.
 fn print_doctor_history_recovery_hint() {
     ftui_runtime::ftui_println!(
-        "doctor_history: next: am doctor  (writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
+        "doctor_history: next: {TRIAGE_SCAN_COMMAND}  (re-detects from current state; the next fix that changes something writes a fresh report and repoints .doctor/latest; nothing needs to be deleted)"
     );
 }
 
@@ -3266,7 +3413,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
     let corruption = mcp_agent_mail_core::global_metrics().corruption.snapshot();
     if corruption.corruption_class_total > 0 {
         ftui_runtime::ftui_println!(
-            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor --json",
+            "corruption_metrics: {} corruption-class error(s), {} integrity detection(s); next: am doctor check --json",
             corruption.corruption_class_total,
             corruption.detections_total
         );
@@ -3319,6 +3466,35 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         if descriptors.status == "fail" {
             return Err(CliError::ExitCode(1));
         }
+        // br-31eew (GH#337): a proactive backup that silently stopped
+        // refreshing left one mailbox with a 3.5-week-old backup and only a
+        // repeated log warning. With a live owner, say so here.
+        if let Ok(resolved) =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        {
+            let backup = PathBuf::from(format!("{}.bak", resolved.canonical_path));
+            let backup_age_secs = std::fs::symlink_metadata(&backup)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| modified.elapsed().map_or(0, |age| age.as_secs()));
+            let owner_age_secs = owner_pids
+                .iter()
+                .filter_map(|pid| crate::process_age_seconds(*pid))
+                .max();
+            let (status, detail) = proactive_backup_health(
+                probe_target
+                    .integrity_guard_enabled
+                    .unwrap_or(config.integrity_check_on_startup),
+                probe_target.integrity_guard_enabled.is_some(),
+                backup_age_secs,
+                owner_age_secs,
+                mcp_agent_mail_db::pool::sqlite_recovery_candidate_is_standalone(&backup),
+            );
+            ftui_runtime::ftui_println!("proactive_backup: {status} ({detail})");
+            if status == "fail" {
+                return Err(CliError::ExitCode(1));
+            }
+        }
     }
 
     match crate::open_db_for_doctor_check_read_only_with_context(&probe_target.database_url)
@@ -3338,7 +3514,19 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                         COSMETIC_RESERVATION_PARITY_DRIFT_THRESHOLD,
                     );
                 } else {
-                    return Err(CliError::ExitCode(1));
+                    let progress = reservation_reconcile::read_progress(&probe_target.storage_root);
+                    match reservation_parity_reconciling(
+                        &report,
+                        progress.as_ref(),
+                        mcp_agent_mail_core::timestamps::now_micros(),
+                    ) {
+                        Ok(note) => ftui_runtime::ftui_println!("{note}"),
+                        Err(Some(stalled)) => {
+                            ftui_runtime::ftui_println!("{stalled}");
+                            return Err(CliError::ExitCode(1));
+                        }
+                        Err(None) => return Err(CliError::ExitCode(1)),
+                    }
                 }
             }
         }
@@ -3644,7 +3832,7 @@ pub fn handle_undo(
     Ok(())
 }
 
-/// Compute the canonical write_scopes for `am doctor --fix`.
+/// Compute the canonical write_scopes for `am doctor fix`.
 ///
 /// These match `analysis/safety_envelope.md` (Phase 3 synthesis).
 pub(crate) fn default_write_scopes() -> Vec<PathBuf> {
@@ -3699,6 +3887,54 @@ mod tests {
     const FIX_ONLY_LOCK_INVOKER_TEST: &str = "doctor::tests::fix_only_exclusive_lock_invoker_child";
     const FIX_ONLY_LOCK_HOLDER_WITNESS: &str = "FIX_ONLY_SHARED_LOCK_HOLDER_RAN";
     const FIX_ONLY_LOCK_REFUSAL_WITNESS: &str = "FIX_ONLY_EXCLUSIVE_LOCK_REFUSED";
+
+    #[test]
+    fn proactive_backup_health_fails_on_a_backup_that_stopped_refreshing() {
+        // br-31eew (GH#337): a 3.5-week-old backup under a long-running
+        // server with blocking companions is a failure, not a quiet warning.
+        let day = 24 * 60 * 60;
+        let (status, detail) =
+            proactive_backup_health(true, true, Some(25 * day), Some(30 * day), false);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("600h00m old"), "{detail}");
+        assert!(detail.contains("companion files"), "{detail}");
+        let (status, detail) =
+            proactive_backup_health(true, true, Some(2 * day), Some(3 * day), true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(!detail.contains("companion"), "{detail}");
+        assert_eq!(
+            proactive_backup_health(true, true, None, Some(day), true).0,
+            "warn"
+        );
+        // A server that does not report its guard state: the CLI's own
+        // setting is a guess, so a stale backup is a warning, not a failure.
+        let (status, detail) =
+            proactive_backup_health(true, false, Some(2 * day), Some(3 * day), true);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("did not report"), "{detail}");
+        let (status, detail) = proactive_backup_health(false, false, None, Some(3 * day), true);
+        assert_eq!(status, "ok", "{detail}");
+        assert!(detail.contains("did not report"), "{detail}");
+        assert!(
+            !proactive_backup_health(false, true, None, Some(3 * day), true)
+                .1
+                .contains("did not report")
+        );
+
+        // Negative controls: a fresh backup, a server that just started
+        // (the guard has not had a cycle yet), an unknown owner age, and a
+        // disabled guard are all ok.
+        for (age, owner, guard) in [
+            (Some(3_600), Some(30 * day), true),
+            (Some(30 * day), Some(600), true),
+            (Some(30 * day), None, true),
+            (None, Some(600), true),
+            (Some(30 * day), Some(30 * day), false),
+        ] {
+            let (status, detail) = proactive_backup_health(guard, true, age, owner, true);
+            assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
+        }
+    }
 
     // ---- GH#315: stale unusable doctor reports must not break live health ----
 
@@ -4505,6 +4741,95 @@ mod tests {
     }
 
     #[test]
+    fn health_reports_converging_release_drift_but_never_a_stuck_reconciler() {
+        use mcp_agent_mail_tools::reservation_parity::ReservationParityDriftSummary;
+        let report = |drift: ReservationParityDriftSummary| ReservationParityReport {
+            schema_version:
+                mcp_agent_mail_tools::reservation_parity::RESERVATION_PARITY_SCHEMA_VERSION,
+            ok: false,
+            live_generation: None,
+            db_reservations: 32,
+            archive_reservations: 32,
+            drift,
+            examples: Vec::new(),
+        };
+        // The live-host shape: 16 released-in-DB / active-in-archive rows.
+        let pending = report(ReservationParityDriftSummary {
+            released_ts_mismatches: 16,
+            active_status_mismatches: 16,
+            release_pending_rows: 16,
+            release_pending_mismatches: 32,
+            ..Default::default()
+        });
+        let minute = 60 * 1_000_000;
+        let now = 1_000 * minute;
+        let progress =
+            |pass_us, last_repair_us| reservation_reconcile::ReservationReconcileProgress {
+                pid: 7,
+                pass_us,
+                last_repair_us,
+            };
+
+        let converging = reservation_parity_reconciling(
+            &pending,
+            Some(&progress(now - minute, Some(now - 2 * minute))),
+            now,
+        )
+        .expect("a reconciler that just republished a release is converging");
+        assert!(converging.contains("reconciling 16"), "{converging}");
+
+        // No reconciler evidence, a reconciler that stopped running, and one
+        // that runs without repairing anything all keep health failing.
+        for (label, progress) in [
+            ("absent", None),
+            (
+                "stale pass",
+                Some(progress(now - 11 * minute, Some(now - 11 * minute))),
+            ),
+            (
+                "no recent repair",
+                Some(progress(now - minute, Some(now - 30 * minute))),
+            ),
+            ("never repaired", Some(progress(now - minute, None))),
+            // Written before the clock was stepped back: not recent.
+            (
+                "future repair",
+                Some(progress(now - minute, Some(now + 30 * minute))),
+            ),
+            (
+                "future pass",
+                Some(progress(now + 30 * minute, Some(now + 30 * minute))),
+            ),
+        ] {
+            let stalled = reservation_parity_reconciling(&pending, progress.as_ref(), now)
+                .expect_err(label)
+                .expect("pending releases get a reason");
+            assert!(
+                stalled.contains("am doctor fix --only"),
+                "{label}: {stalled}"
+            );
+        }
+
+        // Drift the reconciler does not own fails without a reconciler note,
+        // even while it is visibly repairing other rows.
+        let mixed = report(ReservationParityDriftSummary {
+            released_ts_mismatches: 16,
+            active_status_mismatches: 17,
+            release_pending_rows: 16,
+            release_pending_mismatches: 32,
+            ..Default::default()
+        });
+        assert_eq!(
+            reservation_parity_reconciling(
+                &mixed,
+                Some(&progress(now - minute, Some(now - minute))),
+                now
+            ),
+            Err(None)
+        );
+    }
+
+    #[test]
     fn historical_report_downgrades_only_small_archive_parity_drift() {
         let cosmetic = serde_json::json!({
             "findings": [{
@@ -4561,10 +4886,12 @@ mod tests {
             Some(crate::robot::LiveServerMailboxConfig {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: PathBuf::from("/srv/agent-mail/archive"),
+                integrity_guard_enabled: Some(false),
             }),
         );
 
         assert_eq!(target.source, "live_server");
+        assert_eq!(target.integrity_guard_enabled, Some(false));
         assert_eq!(
             target.database_url,
             "sqlite:////srv/agent-mail/server.sqlite3"
@@ -4666,13 +4993,61 @@ mod tests {
             .as_str()
             .expect("absent report must carry a human-readable note");
         assert!(
-            note.contains("No doctor report exists yet") && note.contains("am doctor"),
-            "note must say the report is missing and how to produce one: {note}"
+            note.contains("No doctor report exists yet") && note.contains(TRIAGE_SCAN_COMMAND),
+            "note must say the report is missing and what to run instead: {note}"
         );
-        assert_eq!(report["recommended_command"], "am doctor");
+        // Bare `am doctor` is a clap usage error (exit 2); the next step must
+        // be a command that parses and runs read-only.
+        assert_eq!(report["recommended_command"], TRIAGE_SCAN_COMMAND);
+        assert_doctor_command_parses(TRIAGE_SCAN_COMMAND);
         // The live probe is healthy, so no synthetic finding materializes.
         assert_eq!(report["live_health"]["status"], "ok");
         assert_eq!(report["findings"], serde_json::json!([]));
+    }
+
+    fn assert_doctor_command_parses(command: &str) {
+        use clap::Parser as _;
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        if let Err(err) = crate::Cli::try_parse_from(&argv) {
+            panic!("`{command}` does not parse: {err}");
+        }
+    }
+
+    #[test]
+    fn triage_findings_command_targets_a_registered_fm_and_parses() {
+        let p0 = fixers::registry()
+            .into_iter()
+            .find(|spec| spec.severity == "P0")
+            .expect("registry has a P0 FM")
+            .id;
+        let p2 = "fm-db-state-files-legacy-fts-residue";
+        // A P0 anywhere wins and is applied; otherwise the first FM is only
+        // rehearsed.
+        let mixed = serde_json::json!([
+            {"id": p2, "severity": "P2"},
+            {"id": p0, "severity": "P0"},
+        ]);
+        assert_eq!(
+            triage_findings_command(&mixed),
+            fixers::fix_only_command(p0)
+        );
+        let minor = serde_json::json!([{"id": p2, "severity": "P2"}]);
+        assert_eq!(
+            triage_findings_command(&minor),
+            format!("am doctor fix --only {p2} --dry-run")
+        );
+        // Per-FM run envelopes carry counts, not findings: re-detect.
+        assert_eq!(
+            triage_findings_command(&serde_json::json!([])),
+            TRIAGE_SCAN_COMMAND
+        );
+        for command in [
+            triage_findings_command(&mixed),
+            triage_findings_command(&minor),
+            triage_findings_command(&serde_json::Value::Null),
+        ] {
+            assert_doctor_command_parses(&command);
+        }
     }
 
     #[cfg(unix)]

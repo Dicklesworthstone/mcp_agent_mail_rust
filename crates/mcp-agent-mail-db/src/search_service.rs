@@ -239,8 +239,32 @@ pub struct SearchOptions {
     pub redaction_policy: Option<RedactionPolicy>,
     /// Whether to emit telemetry events for this query.
     pub track_telemetry: bool,
-    /// Search engine override. `None` = use global config default.
+    /// Search engine override. `None` = the surface's configured engine.
+    /// The rollout kill switches apply either way.
     pub search_engine: Option<SearchEngine>,
+    /// Tool issuing the query (e.g. `"search_messages"`), which selects an
+    /// `AM_SEARCH_ENGINE_FOR_<TOOL>` override. `None` = the global engine.
+    pub surface: Option<&'static str>,
+}
+
+/// Whether this build compiled the semantic tier (`feature = "hybrid"`).
+/// Without it a hybrid or auto query runs lexical and a semantic one fails.
+pub const SEMANTIC_TIER_COMPILED: bool = cfg!(feature = "hybrid");
+
+fn resolve_search_engine(options: &SearchOptions) -> SearchEngine {
+    engine_for(options, &mcp_agent_mail_core::Config::get().search_rollout)
+}
+
+/// The engine a query runs on: the explicit request, else the surface's
+/// override, else the global engine, with the rollout kill switches applied.
+fn engine_for(
+    options: &SearchOptions,
+    rollout: &mcp_agent_mail_core::config::SearchRolloutConfig,
+) -> SearchEngine {
+    options.search_engine.map_or_else(
+        || rollout.effective_engine(options.surface.unwrap_or_default()),
+        |requested| rollout.allowed_engine(requested),
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4335,9 +4359,7 @@ fn build_search_cache_key(
     use std::hash::{Hash, Hasher};
 
     let filter = query.to_search_filter();
-    let engine_mode = options
-        .search_engine
-        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let engine_mode = resolve_search_engine(options);
     let mode = engine_to_search_mode(engine_mode);
     let mut discriminator_hasher = DefaultHasher::new();
     cache_scope_discriminator(query).hash(&mut discriminator_hasher);
@@ -4414,9 +4436,7 @@ pub async fn execute_search(
     let timer = std::time::Instant::now();
     let product_sql_budget = product_sql_budget_state(cx, query);
     let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
-    let engine = options
-        .search_engine
-        .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
+    let engine = resolve_search_engine(options);
     let needs_lexical_freshness = matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
@@ -5168,6 +5188,7 @@ pub async fn execute_search_simple(
         redaction_policy: None,
         track_telemetry: true,
         search_engine: None,
+        surface: None,
     };
 
     match execute_search(cx, pool, query, &options).await {
@@ -5235,6 +5256,69 @@ mod tests {
     use std::time::Duration;
 
     static SEARCH_BOOTSTRAP_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// `AM_SEARCH_ENGINE_FOR_<TOOL>` and `AM_SEARCH_SEMANTIC_ENABLED` were
+    /// parsed but never consulted: every query ran the global engine.
+    #[test]
+    fn engine_routing_honors_surface_overrides_and_the_semantic_kill_switch() {
+        use mcp_agent_mail_core::config::SearchRolloutConfig;
+        let opts = |search_engine, surface| SearchOptions {
+            search_engine,
+            surface,
+            ..SearchOptions::default()
+        };
+        let mut enabled = SearchRolloutConfig {
+            engine: SearchEngine::Lexical,
+            semantic_enabled: true,
+            ..SearchRolloutConfig::default()
+        };
+        enabled
+            .surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Hybrid);
+        assert_eq!(
+            engine_for(&opts(None, Some("search_messages")), &enabled),
+            SearchEngine::Hybrid
+        );
+        assert_eq!(
+            engine_for(&opts(None, Some("search_messages_product")), &enabled),
+            SearchEngine::Lexical
+        );
+        assert_eq!(
+            engine_for(&opts(None, None), &enabled),
+            SearchEngine::Lexical
+        );
+        // An explicit request outranks the surface override.
+        assert_eq!(
+            engine_for(
+                &opts(Some(SearchEngine::Semantic), Some("search_messages")),
+                &enabled
+            ),
+            SearchEngine::Semantic
+        );
+
+        // With the kill switch thrown, no route reaches a semantic engine —
+        // not the global engine, not an override, not an explicit request.
+        let mut killed = SearchRolloutConfig {
+            engine: SearchEngine::Hybrid,
+            semantic_enabled: false,
+            ..SearchRolloutConfig::default()
+        };
+        killed
+            .surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Semantic);
+        for options in [
+            opts(None, None),
+            opts(None, Some("search_messages")),
+            opts(Some(SearchEngine::Hybrid), None),
+            opts(Some(SearchEngine::Auto), Some("search_messages")),
+        ] {
+            assert_eq!(
+                engine_for(&options, &killed),
+                SearchEngine::Lexical,
+                "{options:?}"
+            );
+        }
+    }
 
     /// GH#227: message ingestion must invalidate the process-wide search
     /// cache even when the lexical bridge is uninitialized or bound to a
@@ -6084,6 +6168,7 @@ mod tests {
                 redaction_policy: None,
                 track_telemetry: false,
                 search_engine: Some(SearchEngine::Lexical),
+                surface: None,
             };
             let response = match execute_search(&cx, &pool, &query, &options).await {
                 Outcome::Ok(response) => response,

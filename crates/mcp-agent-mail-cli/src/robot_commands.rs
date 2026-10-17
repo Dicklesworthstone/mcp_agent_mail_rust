@@ -12729,6 +12729,9 @@ fn fetch_ws_state_payload(endpoint: &AtcLiveEndpoint) -> crate::CliResult<serde_
 pub(crate) struct LiveServerMailboxConfig {
     pub database_url: String,
     pub storage_root: std::path::PathBuf,
+    /// Whether the server's integrity guard runs (and so refreshes the
+    /// proactive backup); `None` when an older server does not say.
+    pub integrity_guard_enabled: Option<bool>,
 }
 
 fn live_server_mailbox_config_from_ws_state(
@@ -12756,6 +12759,9 @@ fn live_server_mailbox_config_from_ws_state(
     Ok(LiveServerMailboxConfig {
         database_url,
         storage_root,
+        integrity_guard_enabled: config
+            .get("integrity_guard_enabled")
+            .and_then(serde_json::Value::as_bool),
     })
 }
 
@@ -15531,10 +15537,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 env = env.with_alert(
                     "error",
                     format!(
-                        "{} corruption-class error(s) classified since start; run `am doctor --json`",
+                        "{} corruption-class error(s) classified since start; run `am doctor check --json`",
                         corruption.corruption_class_total
                     ),
-                    Some("am doctor --json".to_string()),
+                    Some("am doctor check --json".to_string()),
                 );
             } else if corruption.detections_total > 0 {
                 env = env.with_alert(
@@ -17871,6 +17877,19 @@ mod tests {
             parsed.storage_root,
             std::path::PathBuf::from("/srv/agent-mail/archive")
         );
+        // A server that predates the field does not say whether its
+        // integrity guard runs.
+        assert_eq!(parsed.integrity_guard_enabled, None);
+
+        let parsed = live_server_mailbox_config_from_ws_state(&serde_json::json!({
+            "config": {
+                "database_url": "sqlite:////srv/agent-mail/server.sqlite3",
+                "storage_root": "/srv/agent-mail/archive",
+                "integrity_guard_enabled": false
+            }
+        }))
+        .expect("parse server mailbox config");
+        assert_eq!(parsed.integrity_guard_enabled, Some(false));
     }
 
     #[test]
@@ -17895,6 +17914,7 @@ mod tests {
             Some(LiveServerMailboxConfig {
                 database_url: "sqlite:////srv/agent-mail/server.sqlite3".to_string(),
                 storage_root: std::path::PathBuf::from("/srv/agent-mail/archive"),
+                integrity_guard_enabled: None,
             }),
             None,
         );
@@ -17919,6 +17939,7 @@ mod tests {
             Some(LiveServerMailboxConfig {
                 database_url: config.database_url.clone(),
                 storage_root: config.storage_root.clone(),
+                integrity_guard_enabled: None,
             }),
             None,
         );
@@ -24672,12 +24693,12 @@ mod tests {
             "am doctor health",
             "am doctor check --json",
             "am doctor locks",
-            "am doctor --json",
+            "am doctor triage --quick",
             "am robot status",
-            "am doctor fix --only fm-db-state-files-world-readable-storage-db",
+            "am doctor fix --only fm-db-state-files-world-readable-storage-db --yes",
             "am doctor fix --list --json",
-            "am doctor --dry-run --fix",
-            "am doctor migrate --check",
+            "am doctor fix --dry-run",
+            "am migrate --check",
             "route the write through the running Agent Mail server",
         ] {
             assert!(

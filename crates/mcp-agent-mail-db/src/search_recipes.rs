@@ -654,6 +654,11 @@ pub fn prune_history(conn: &DbConn, keep: usize) -> Result<u64, String> {
         .skip(keep)
         .map(|(id, _)| id)
         .collect::<Vec<_>>();
+    // Every search prunes, so this is usually empty; skip the write
+    // transaction rather than take the live mailbox's write lock for nothing.
+    if delete_ids.is_empty() {
+        return Ok(0);
+    }
 
     with_sync_write_tx(conn, |conn| {
         let mut deleted = 0_u64;
@@ -1034,6 +1039,14 @@ mod tests {
         assert_eq!(remaining[0].query_text, "q9");
         assert_eq!(remaining[1].query_text, "q8");
         assert_eq!(remaining[2].query_text, "q7");
+
+        // Nothing left to prune: no write transaction is opened, so it
+        // succeeds even inside a caller's open transaction, where opening one
+        // fails (the premise that makes this check discriminate).
+        conn.execute_sync("BEGIN", &[]).expect("begin");
+        assert_eq!(prune_history(&conn, 3), Ok(0));
+        assert!(begin_sync_write_tx(&conn).is_err());
+        conn.execute_sync("ROLLBACK", &[]).expect("rollback");
     }
 
     #[test]

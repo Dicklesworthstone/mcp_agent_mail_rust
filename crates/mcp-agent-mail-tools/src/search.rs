@@ -958,6 +958,7 @@ pub async fn search_messages(
 
     let search_options = mcp_agent_mail_db::search_service::SearchOptions {
         track_telemetry: true,
+        surface: Some("search_messages"),
         ..Default::default()
     };
 

@@ -2146,7 +2146,7 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn consumes_text_input(&self) -> bool {
-        self.create_form.is_some()
+        self.create_form.is_some() || self.preset_dialog_mode != PresetDialogMode::None
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {

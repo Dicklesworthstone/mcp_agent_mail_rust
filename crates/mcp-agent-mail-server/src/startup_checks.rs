@@ -2420,6 +2420,8 @@ fn probe_database(config: &Config) -> ProbeResult {
 /// legacy-import regression can run it from a fresh process against a
 /// freshly imported target (GH#268).
 pub fn probe_integrity(config: &Config) -> ProbeResult {
+    #[cfg(test)]
+    record_startup_work(0);
     if !config.integrity_check_on_startup {
         return ProbeResult::Ok { name: "integrity" };
     }
@@ -2538,6 +2540,8 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
 
     match pool.run_startup_integrity_check() {
         Ok(_) => {
+            #[cfg(test)]
+            record_startup_work(1);
             let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
                 &config.database_url,
                 &config.storage_root,
@@ -2563,6 +2567,8 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
             // alternative (refusing to start) would be worse than the
             // worst case we're guarding against (duplicate-id allocation,
             // which already produces a yellow doctor signal).
+            #[cfg(test)]
+            record_startup_work(2);
             match pool.advance_message_id_floor_from_archive() {
                 Ok(Some(new_floor)) => {
                     tracing::warn!(
@@ -2873,6 +2879,20 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
 #[cfg(test)]
 std::thread_local! {
     static PROBE_RECOVERY_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    // Count real startup operations without replacing their filesystem/DB path.
+    static STARTUP_WORK_COUNTS: std::cell::Cell<[u32; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+#[cfg(test)]
+fn record_startup_work(index: usize) {
+    let mut counts = STARTUP_WORK_COUNTS.get();
+    counts[index] += 1;
+    STARTUP_WORK_COUNTS.set(counts);
+}
+
+#[cfg(test)]
+pub(super) fn take_startup_work_counts() -> [u32; 4] {
+    STARTUP_WORK_COUNTS.replace([0; 4])
 }
 
 #[cfg(test)]
@@ -3233,6 +3253,8 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
 /// logged at warn level and otherwise ignored — rotation failures must never
 /// prevent the server from starting.
 fn rotate_backups_best_effort(config: &Config) {
+    #[cfg(test)]
+    record_startup_work(3);
     let Some(database_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return;
     };

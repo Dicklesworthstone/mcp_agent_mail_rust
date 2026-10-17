@@ -358,9 +358,10 @@ fn scan_project_inventory(
             if after.is_some_and(|cursor| id <= cursor)
                 || previous.is_some_and(|cursor| id < cursor)
             {
-                return Err(CliError::Other(
-                    "overview project cursor did not advance".to_string(),
-                ));
+                return Err(CliError::Other(format!(
+                    "overview project cursor did not advance: {table} INDEXED BY {index}, \
+                     cursor {after:?}, previous {previous:?}, returned {id}"
+                )));
             }
             project(projects, id);
             previous = Some(id);
@@ -772,6 +773,63 @@ mod inventory_tests {
         let mut ids: Vec<_> = projects.into_keys().collect();
         ids.sort_unstable();
         (ids, work)
+    }
+
+    #[test]
+    fn inventory_pages_through_the_mailbox_nocase_agent_index() {
+        // The live mailbox schema: agents carries a (project_id, name COLLATE
+        // NOCASE) index, listed first. `am robot overview` failed with
+        // "overview project cursor did not advance" on a mailbox of 846
+        // agents (more than one page).
+        let (_dir, conn) = fixture();
+        execute(&conn, "DROP TABLE agents");
+        execute(
+            &conn,
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, \
+             name TEXT NOT NULL)",
+        );
+        execute(
+            &conn,
+            "CREATE UNIQUE INDEX idx_agents_project_name_nocase \
+             ON agents(project_id, name COLLATE NOCASE)",
+        );
+        let rows: Vec<String> = (1..=OVERVIEW_PAGE_ROWS * 3)
+            .map(|id| {
+                let case = if id % 2 == 0 { "Blue" } else { "blue" };
+                format!("({id}, {}, '{case}Lake{id}')", id % 29 + 1)
+            })
+            .collect();
+        execute(&conn, "BEGIN");
+        for chunk in rows.chunks(OVERVIEW_PAGE_ROWS) {
+            execute(
+                &conn,
+                &format!("INSERT INTO agents VALUES {}", chunk.join(",")),
+            );
+        }
+        execute(&conn, "COMMIT");
+
+        let mut projects = HashMap::new();
+        let mut work = ScanWork::default();
+        scan_project_inventory(&conn, &mut work, "agents", AGENTS_SQL, 1, &mut projects)
+            .expect("the inventory pages through the NOCASE agent index");
+        assert_eq!(projects.len(), 29);
+    }
+
+    #[test]
+    fn inventory_pages_through_the_mailbox_importance_index() {
+        // The index `am robot overview` picked on the live mailbox, where the
+        // engine returned message rowids from project 2 for `project_id > 3`.
+        for size in [OVERVIEW_PAGE_ROWS + 1, OVERVIEW_PAGE_ROWS * 4 + 13] {
+            let (_dir, conn) = fixture();
+            execute(
+                &conn,
+                "CREATE INDEX idx_msg_project_importance_created \
+                 ON messages(project_id, importance, created_ts)",
+            );
+            seed(&conn, &[(2, size), (3, size), (4, size), (20, 7)]);
+            let (actual, _) = inventory(&conn, true);
+            assert_eq!(actual, [2, 3, 4, 20]);
+        }
     }
 
     #[test]

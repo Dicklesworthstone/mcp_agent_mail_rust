@@ -4539,9 +4539,12 @@ impl DbPool {
     /// - Before export/snapshot (no loose WAL journal)
     /// - Idle periods (reclaim WAL disk space)
     ///
-    /// Returns the number of WAL frames checkpointed, or an error. Errors if
-    /// SQLite reports that the TRUNCATE checkpoint was busy or incomplete.
-    /// No-ops silently for `:memory:` databases.
+    /// Returns the engine's reported checkpointed-frame count, or an error.
+    /// A completed TRUNCATE resets the WAL first, so stock SQLite and
+    /// FrankenSQLite 0.4.9 report 0 on success; do not treat the count as
+    /// progress evidence. Errors if SQLite reports that the TRUNCATE
+    /// checkpoint was busy or incomplete. No-ops silently for `:memory:`
+    /// databases.
     pub fn wal_checkpoint(&self) -> DbResult<u64> {
         if self.sqlite_path == ":memory:" {
             return Ok(0);
@@ -4613,6 +4616,25 @@ impl DbPool {
         })?;
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
+        if !sqlite_recovery_candidate_is_standalone(&bak_path) {
+            // A backup with companions is not the verified generation, and the
+            // retained witness keeps the backup open: drop it first, or the
+            // open-handle check below would count this process as a user.
+            *verified_backup = None;
+            match quarantine_stale_proactive_backup_companions(&bak_path) {
+                Ok(Some(quarantine)) => tracing::warn!(
+                    backup = %bak_path.display(),
+                    quarantine = %quarantine.display(),
+                    "moved stale -wal/-shm companions of the proactive backup aside so the backup can refresh"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    backup = %bak_path.display(),
+                    %error,
+                    "could not quarantine stale proactive-backup companions"
+                ),
+            }
+        }
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             return Err(DbError::Sqlite(format!(
                 "proactive backup destination {} has companion SQLite or FrankenSQLite state; refusing to treat one file from a multi-file generation as a published backup",
@@ -5903,10 +5925,13 @@ async fn run_sqlite_init_once(
 
         drop(canonical_conn);
 
+        // v31 rewrites every messages row once (br-2hpuk); fold that WAL into
+        // the main file before the runtime engine opens it.
         if (dropped_legacy_atc
-            || full_applied
-                .iter()
-                .any(|id| schema::is_atc_runtime_canonical_migration(id)))
+            || full_applied.iter().any(|id| {
+                schema::is_atc_runtime_canonical_migration(id)
+                    || id == "v31_materialize_archive_metadata_json_on_messages"
+            }))
             && let Err(err) = wal_checkpoint_truncate_path(Path::new(sqlite_path))
         {
             return Outcome::Err(SqlError::Custom(format!(
@@ -7700,6 +7725,36 @@ fn is_canonical_second_opinion_inconclusive(message: &str) -> bool {
     message.contains(CANONICAL_SECOND_OPINION_INCONCLUSIVE)
 }
 
+/// Marks the inconclusive case where canonical SQLite did run, on a staged
+/// copy, and rejected that copy (as opposed to having no copy at all).
+const CANONICAL_STAGED_COPY_REJECTED: &str = "could only inspect a private staged copy";
+
+/// What became of a canonical second opinion that [`reconcile_with_canonical`]
+/// defers on, phrased for operators (GH#278).
+///
+/// The text must stay neutral for the corruption and recovery classifiers so
+/// the deferral error cannot re-escalate the reconstruct it defers.
+#[must_use]
+fn canonical_second_opinion_deferral_detail(canonical_error: &str) -> &'static str {
+    if is_canonical_second_opinion_inconclusive(canonical_error) {
+        if canonical_error.contains(CANONICAL_STAGED_COPY_REJECTED) {
+            "canonical SQLite ran on a staged copy of the live database and also rejected that \
+             copy, but a copy taken while a writer is active can be torn, so its rejection is \
+             not authoritative"
+        } else {
+            "no authoritative canonical verdict was available for the live database"
+        }
+    } else if crate::error::is_lock_error(canonical_error) {
+        // The busy-retryable class also covers open and I/O failures.
+        "the canonical second-opinion probe could not run (database busy, locked or unavailable)"
+    } else if is_sqlite_snapshot_conflict_error_message(canonical_error) {
+        "the canonical second-opinion probe could not run because of a stale WAL or snapshot \
+         conflict"
+    } else {
+        "the canonical second-opinion probe failed with a recovery-class error"
+    }
+}
+
 /// Whether the SQLite family at `path` carries FrankenSQLite namespace
 /// authority.
 ///
@@ -7766,9 +7821,9 @@ fn with_canonical_diagnostic_conn(
         (verdict, false) => Ok(verdict),
         (true, true) => Ok(true),
         (false, true) => Err(SqlError::Custom(format!(
-            "{CANONICAL_SECOND_OPINION_INCONCLUSIVE}: {context} could only inspect a private \
-             staged copy of the live family at {} and that copy did not pass; the copy may be \
-             torn under a live writer, so this is not a canonical rejection",
+            "{CANONICAL_SECOND_OPINION_INCONCLUSIVE}: {context} {CANONICAL_STAGED_COPY_REJECTED} \
+             of the live family at {} and that copy did not pass; the copy may be torn under a \
+             live writer, so this is not a canonical rejection",
             path.display()
         ))),
     }
@@ -8313,16 +8368,20 @@ fn reconcile_with_canonical(
                     || is_sqlite_recovery_error_message(&canonical_error_msg)
                     || is_canonical_second_opinion_inconclusive(&canonical_error_msg)
                 {
+                    // GH#278: say what actually happened. A staged-copy
+                    // second opinion DID run; it rejected a copy that a live
+                    // writer may have torn, which is not authoritative.
+                    let second_opinion =
+                        canonical_second_opinion_deferral_detail(&canonical_error_msg);
                     tracing::warn!(
                         phase,
                         path = %path_for_log,
                         check = %kind,
                         primary_error = %message,
                         canonical_error = %canonical_error_msg,
-                        "integrity probe rejected the file but the canonical second-opinion probe \
-                         could not run due to lock/busy contention; deferring (NOT reconstructing) \
-                         so a divergent-engine false positive cannot trigger a spurious recovery \
-                         under concurrent write load (GH#151)"
+                        "integrity probe rejected the file and {second_opinion}; deferring (NOT \
+                         reconstructing) so a divergent-engine false positive cannot trigger a \
+                         spurious recovery under concurrent write load (GH#151)"
                     );
                     // IMPORTANT: do NOT embed the raw primary `message` or the
                     // raw `canonical_error_msg` here — either can contain
@@ -8335,18 +8394,8 @@ fn reconcile_with_canonical(
                     // non-recovery by a regression test). The full primary
                     // verdict and the raw canonical-probe error were already
                     // logged above with structured fields.
-                    let contention_kind = if crate::error::is_lock_error(&canonical_error_msg) {
-                        "lock/busy"
-                    } else if is_sqlite_snapshot_conflict_error_message(&canonical_error_msg) {
-                        "stale-wal/snapshot-conflict"
-                    } else if is_canonical_second_opinion_inconclusive(&canonical_error_msg) {
-                        "staged-copy-inconclusive"
-                    } else {
-                        "transient-recovery"
-                    };
                     return Err(DbError::Sqlite(format!(
-                        "integrity reconcile deferred under {contention_kind} contention: the \
-                         canonical second-opinion probe could not run; the primary verdict is \
+                        "integrity reconcile deferred: {second_opinion}; the primary verdict is \
                          unconfirmed and will be re-probed on the next integrity cycle"
                     )));
                 }
@@ -13981,6 +14030,101 @@ where
             ProactiveBackupRollbackOutcome::RestoredButParentSyncFailed(error.to_string())
         }
     }
+}
+
+/// Move provably stale `-wal`/`-shm` companions of the proactive backup into
+/// `<backup dir>/doctor/reclaimable/stale-backup-companions-<ts>[-n]/`
+/// (br-31eew, GH#337).
+///
+/// A leftover `.bak-shm` and empty `.bak-wal` made every refresh refuse the
+/// destination for weeks. They are stale when every occupied companion is a
+/// regular, singly linked `-wal` without committed frames or `-shm`, and no
+/// process visible in `/proc` holds the backup or a companion open. Any other
+/// companion (journal, wal-cert, FrankenSQLite namespace files) keeps the
+/// refusal. Nothing is deleted. Returns the quarantine directory when
+/// companions were moved.
+#[cfg(target_os = "linux")]
+fn quarantine_stale_proactive_backup_companions(
+    backup_path: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    const MAX_QUARANTINE_ATTEMPTS: u32 = 128;
+    let mut stale = Vec::new();
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.iter())
+    {
+        let companion = sqlite_sidecar_path(backup_path, suffix);
+        if !path_is_occupied(&companion) {
+            continue;
+        }
+        if !matches!(*suffix, "-wal" | "-shm") {
+            return Ok(None);
+        }
+        let metadata = std::fs::symlink_metadata(&companion)?;
+        // The reclaim move refuses hard-linked files; check here, before a
+        // quarantine directory is claimed, so a refusal that would repeat on
+        // every cycle never leaves an empty directory behind.
+        if !metadata.file_type().is_file()
+            || metadata.nlink() != 1
+            || (*suffix == "-wal" && sqlite_wal_has_committed_frames(metadata.len()))
+        {
+            return Ok(None);
+        }
+        stale.push((companion, metadata));
+    }
+    if stale.is_empty()
+        || std::iter::once(backup_path)
+            .chain(stale.iter().map(|(companion, _)| companion.as_path()))
+            .any(|path| !pids_holding_file_via_proc(path).is_empty())
+    {
+        return Ok(None);
+    }
+    let parent = backup_path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup has no parent")
+    })?;
+    let stem = format!(
+        "stale-backup-companions-{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+    );
+    let reclaimable = parent.join("doctor").join("reclaimable");
+    let mut quarantine = None;
+    for attempt in 0..MAX_QUARANTINE_ATTEMPTS {
+        let leaf = if attempt == 0 {
+            stem.clone()
+        } else {
+            format!("{stem}-{attempt}")
+        };
+        match crate::recovery_retention::ReclaimDirectory::claim(&reclaimable.join(leaf)) {
+            Ok(directory) => {
+                quarantine = Some(directory);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let quarantine = quarantine.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "no unique quarantine directory under {}",
+                reclaimable.display()
+            ),
+        )
+    })?;
+    for (companion, metadata) in &stale {
+        quarantine.stage_inventoried_file(companion, metadata)?;
+    }
+    Ok(Some(quarantine.path().to_path_buf()))
+}
+
+/// Without Linux `/proc`, open handles cannot be ruled out, so stale
+/// companions keep the refusal and stay in place.
+#[cfg(not(target_os = "linux"))]
+fn quarantine_stale_proactive_backup_companions(
+    _backup_path: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    Ok(None)
 }
 
 fn rotate_existing_proactive_backup(
@@ -19706,12 +19850,32 @@ mod tests {
                  INSERT INTO checkpoint_probe(value) VALUES ('alpha'), ('beta'), ('gamma');",
             )
             .expect("create committed WAL frames");
-        let checkpointed = pool
-            .wal_checkpoint()
-            .expect("TRUNCATE checkpoint should succeed after rollback");
+        let wal_path = format!("{}-wal", db_path.display());
+        let wal_len = |path: &str| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        let page_size = writer
+            .query_sync("PRAGMA page_size", &[])
+            .expect("read page size")[0]
+            .get_as::<i64>(0)
+            .expect("decode page size");
+        let one_frame = 32 + 24 + u64::try_from(page_size).expect("positive page size");
+        let before = wal_len(&wal_path);
         assert!(
-            checkpointed > 0,
-            "semantic checkpoint fixture must move at least one committed WAL frame"
+            before >= one_frame,
+            "semantic checkpoint fixture must leave at least one committed frame in the WAL, found {before} bytes"
+        );
+        // Stock SQLite reports a completed TRUNCATE checkpoint as 0|0|0 (the
+        // WAL is reset), and FrankenSQLite 0.4.9 matches it, so the returned
+        // count is not the evidence: a WAL with no frame left (stock SQLite
+        // truncates it to 0 bytes; FrankenSQLite may keep only the 32-byte
+        // header) plus the preserved rows below are.
+        pool.wal_checkpoint()
+            .expect("TRUNCATE checkpoint should succeed after rollback");
+        const WAL_HEADER_BYTES: u64 = 32;
+        const WAL_FRAME_HEADER_BYTES: u64 = 24;
+        let after = wal_len(&wal_path);
+        assert!(
+            after < WAL_HEADER_BYTES + WAL_FRAME_HEADER_BYTES,
+            "a completed TRUNCATE checkpoint must leave no WAL frame, found {after} WAL bytes"
         );
         let rows = writer
             .query_sync("SELECT COUNT(*) AS count FROM checkpoint_probe", &[])
@@ -23926,6 +24090,63 @@ mod tests {
                 msg.contains("deferred"),
                 "deferral error should be self-describing: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn reconcile_canonical_deferral_says_whether_the_second_opinion_ran() {
+        // GH#278: when canonical SQLite ran on a staged copy and rejected it,
+        // the deferral must say so instead of claiming the probe could not run
+        // under lock/busy contention. A probe that really was blocked keeps
+        // the "could not run" wording.
+        let staged_rejection = format!(
+            "{CANONICAL_SECOND_OPINION_INCONCLUSIVE}: canonical SQLite integrity diagnostic \
+             {CANONICAL_STAGED_COPY_REJECTED} of the live family at /tmp/storage.sqlite3 and that \
+             copy did not pass; the copy may be torn under a live writer, so this is not a \
+             canonical rejection"
+        );
+        let defer = |canonical_error: String| {
+            let primary: DbResult<integrity::IntegrityCheckResult> =
+                Err(DbError::IntegrityCorruption {
+                    message: "database disk image is malformed: page 77 is never used".to_string(),
+                    details: Vec::new(),
+                });
+            reconcile_with_canonical(
+                primary,
+                integrity::CheckKind::Full,
+                "full-cycle",
+                "/tmp/storage.sqlite3",
+                || Err(SqlError::Custom(canonical_error)),
+                || false,
+            )
+            .expect_err("an unconfirmed verdict must defer")
+            .to_string()
+        };
+
+        let staged = defer(staged_rejection);
+        assert!(
+            staged.contains("ran on a staged copy") && staged.contains("not authoritative"),
+            "{staged}"
+        );
+        assert!(!staged.contains("could not run"), "{staged}");
+        let locked = defer("database is locked".to_string());
+        let io = defer("disk I/O error".to_string());
+        for blocked in [&locked, &io] {
+            assert!(
+                blocked.contains("could not run (database busy, locked or unavailable)"),
+                "{blocked}"
+            );
+        }
+        let recovery = defer("internal error".to_string());
+        assert!(
+            recovery.contains("failed with a recovery-class error"),
+            "{recovery}"
+        );
+        for msg in [&staged, &locked, &io, &recovery] {
+            assert!(msg.contains("deferred"), "{msg}");
+            assert!(!is_corruption_error_message(msg), "{msg}");
+            assert!(!is_sqlite_recovery_error_message(msg), "{msg}");
+            assert!(!is_canonical_second_opinion_inconclusive(msg), "{msg}");
         }
     }
 
@@ -30112,6 +30333,123 @@ mod tests {
             b"companion-generation-witness",
             "rejection must preserve the companion witness"
         );
+    }
+
+    /// A pool over `<dir>/<name>` with a healthy primary and an older `.bak`
+    /// that carries `-wal`/`-shm` companions holding `wal_bytes` / 32 KiB.
+    #[cfg(target_os = "linux")]
+    fn proactive_backup_with_companions(
+        dir: &Path,
+        name: &str,
+        wal_bytes: usize,
+    ) -> (DbPool, PathBuf, PathBuf, PathBuf) {
+        let db_path = dir.join(name);
+        let bak_path = dir.join(format!("{name}.bak"));
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        write_marker_db(&db_path, "healthy-primary");
+        write_marker_db(&bak_path, "weeks-old-backup");
+        let bak_wal = sqlite_sidecar_path(&bak_path, "-wal");
+        let bak_shm = sqlite_sidecar_path(&bak_path, "-shm");
+        std::fs::write(&bak_wal, vec![0_u8; wal_bytes]).unwrap();
+        std::fs::write(&bak_shm, vec![7_u8; 32 * 1024]).unwrap();
+        (pool, bak_path, bak_wal, bak_shm)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proactive_backup_quarantines_stale_wal_and_shm_companions_and_refreshes() {
+        // br-31eew / GH#337: an empty .bak-wal and a leftover .bak-shm that
+        // nothing holds open no longer block every refresh for weeks.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stale_family.db");
+        let bak_path = dir.path().join("stale_family.db.bak");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        write_marker_db(&db_path, "healthy-primary");
+        // Publish through the pool first, as a long-running server does: the
+        // pool then retains a witness that keeps the backup open, which must
+        // not count as another user of the backup family.
+        pool.create_proactive_backup(std::time::Duration::ZERO)
+            .expect("publish the first backup");
+        let bak_wal = sqlite_sidecar_path(&bak_path, "-wal");
+        let bak_shm = sqlite_sidecar_path(&bak_path, "-shm");
+        std::fs::write(&bak_wal, b"").unwrap();
+        std::fs::write(&bak_shm, vec![7_u8; 32 * 1024]).unwrap();
+
+        let refreshed = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect("stale companions must not block the refresh");
+        assert_eq!(refreshed.as_deref(), Some(bak_path.as_path()));
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("healthy-primary")
+        );
+        assert!(!bak_wal.exists() && !bak_shm.exists());
+
+        let quarantines = std::fs::read_dir(dir.path().join("doctor").join("reclaimable"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantines.len(), 1, "{quarantines:?}");
+        let moved = |companion: &Path| quarantines[0].join(companion.file_name().unwrap());
+        assert_eq!(std::fs::read(moved(&bak_wal)).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            std::fs::read(moved(&bak_shm)).unwrap(),
+            vec![7_u8; 32 * 1024]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proactive_backup_keeps_companions_it_cannot_prove_stale() {
+        // A -wal with committed frames is real data.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _bak_path, bak_wal, bak_shm) =
+            proactive_backup_with_companions(dir.path(), "framed_family.db", 4096);
+        let error = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect_err("a -wal with frames must keep the refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("has companion SQLite or FrankenSQLite state"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&bak_wal).unwrap().len(), 4096);
+        assert!(bak_shm.exists());
+        assert!(!dir.path().join("doctor").exists());
+
+        // An open handle means some process may still use the family.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _bak_path, bak_wal, bak_shm) =
+            proactive_backup_with_companions(dir.path(), "held_family.db", 0);
+        let held = std::fs::File::open(&bak_shm).unwrap();
+        pool.create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect_err("a held companion must keep the refusal");
+        drop(held);
+        assert!(bak_wal.exists() && bak_shm.exists());
+        assert!(!dir.path().join("doctor").exists());
+
+        // A hard-linked companion cannot be moved by the reclaim primitive;
+        // the refusal must not claim (and leave) a quarantine directory on
+        // every attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _bak_path, bak_wal, bak_shm) =
+            proactive_backup_with_companions(dir.path(), "linked_family.db", 0);
+        std::fs::hard_link(&bak_shm, dir.path().join("shm-alias")).unwrap();
+        for _ in 0..2 {
+            pool.create_proactive_backup(std::time::Duration::from_hours(1))
+                .expect_err("a hard-linked companion must keep the refusal");
+        }
+        assert!(bak_wal.exists() && bak_shm.exists());
+        assert!(!dir.path().join("doctor").exists());
     }
 
     #[test]

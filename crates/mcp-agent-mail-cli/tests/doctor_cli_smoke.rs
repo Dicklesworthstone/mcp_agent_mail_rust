@@ -31,11 +31,30 @@ fn run_am(tempdir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
         .env("AM_INTERFACE_MODE", "cli")
         .env("STORAGE_ROOT", tempdir)
         .env("DATABASE_URL", db_url)
+        // Registrations below intentionally use test paths inside this private
+        // mailbox; the production guard still rejects them by default.
+        .env("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")
         .env("AM_DOCTOR_BACKUPS_DIR", tempdir.join(".doctor"))
+        .env("XDG_CONFIG_HOME", tempdir.join("config"))
+        .env("XDG_DATA_HOME", tempdir.join("data"))
+        .env("XDG_CACHE_HOME", tempdir.join("cache"))
+        .env("XDG_STATE_HOME", tempdir.join("state"))
+        .env("HTTP_HOST", "127.0.0.1")
+        .env("HTTP_PORT", "0")
+        .env("AGENT_MAIL_URL", "http://127.0.0.1:0/mcp/")
+        .env("AM_ATC_ENABLED", "false")
+        .env("AM_ATC_WRITE_MODE", "off")
+        .env("ATC_LEARNING_DISABLED", "1")
+        .env("LLM_ENABLED", "false")
+        .env("NOTIFICATIONS_ENABLED", "false")
+        .env("TUI_ENABLED", "false")
         // Don't let the test inherit the operator's HTTP_BEARER_TOKEN
         // etc. — the doctor's wrong-mcp-url FM compares against the
         // canonical URL derived from HTTP_HOST/PORT/PATH.
         .env_remove("HTTP_BEARER_TOKEN")
+        .env_remove("AGENT_MAIL_TOKEN")
+        .env_remove("AM_AGENT_TOKEN")
+        .env_remove("AGENT_MAIL_SENDER_TOKEN")
         .env_remove("AM_DOCTOR_YES")
         .current_dir(tempdir)
         .output()
@@ -45,6 +64,157 @@ fn run_am(tempdir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+#[test]
+fn am_reports_missing_shared_archive_head_and_preserves_database_mail() {
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let root = td.path();
+    let project = root.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project_key = project.to_str().unwrap();
+    let fm_id = mcp_agent_mail_cli::doctor::fixers::missing_head_or_broken_git_shape::FM_ID;
+    let run_ok = |args: &[&str]| {
+        let (code, stdout, stderr) = run_am(root, args);
+        assert_eq!(code, 0, "command {args:?}: {stderr}\n{stdout}");
+        (stdout, stderr)
+    };
+    let send = |body: &str| {
+        run_ok(&[
+            "mail",
+            "send",
+            "--project",
+            project_key,
+            "--from",
+            "RedFox",
+            "--to",
+            "RedFox",
+            "--subject",
+            "Shared archive HEAD regression",
+            "--body",
+            body,
+            "--json",
+        ])
+    };
+    let archived_message = |body: &str| {
+        walkdir::WalkDir::new(root.join("projects"))
+            .into_iter()
+            .map(|entry| entry.expect("read archive tree"))
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "md")
+                    && entry
+                        .path()
+                        .components()
+                        .any(|part| part.as_os_str() == "messages")
+            })
+            .find_map(|entry| {
+                let bytes = std::fs::read(entry.path()).expect("read canonical message");
+                String::from_utf8_lossy(&bytes)
+                    .contains(body)
+                    .then(|| (entry.into_path(), bytes))
+            })
+    };
+
+    run_ok(&[
+        "macros",
+        "start-session",
+        "--project",
+        project_key,
+        "--program",
+        "archive-regression",
+        "--model",
+        "real-cli",
+        "--agent-name",
+        "RedFox",
+        "--json",
+    ]);
+    let old_body = "healthy mail and history survive missing shared HEAD";
+    let (_, healthy_stderr) = send(old_body);
+    assert!(!healthy_stderr.contains("Git archive writes failed or remain pending"));
+    let (old_path, old_bytes) = archived_message(old_body).expect("healthy canonical message");
+    let repo = git2::Repository::open(root).expect("real shared archive");
+    let old_tip = repo.head().unwrap().target().unwrap();
+    drop(repo);
+    let head_path = root.join(".git/HEAD");
+    let saved_head = root.join("saved-HEAD");
+    let head_bytes = std::fs::read(&head_path).unwrap();
+    std::fs::rename(&head_path, &saved_head).expect("preserve HEAD while planting fault");
+
+    let (diagnosis, _) = run_ok(&["doctor", "fix", "--only", fm_id, "--list", "--json"]);
+    let diagnosis: serde_json::Value = serde_json::from_str(&diagnosis).unwrap();
+    let finding = &diagnosis["findings"][0];
+    assert_eq!(finding["id"], fm_id);
+    assert_eq!(finding["evidence"]["broken"][0]["kind"], "head_missing");
+    assert_eq!(
+        finding["evidence"]["broken"][0]["repo_path"],
+        root.to_str().unwrap()
+    );
+    assert_eq!(finding["remediation"]["auto_fixable"], false);
+    assert!(!head_path.exists(), "diagnosis must not invent a HEAD");
+
+    let missing_body = "database mail accepted while shared Git HEAD is missing";
+    let (sent, failed_stderr) = send(missing_body);
+    let _: serde_json::Value = serde_json::from_str(&sent).expect("stdout stays valid JSON");
+    assert!(
+        failed_stderr.contains("Git archive writes failed or remain pending"),
+        "archive failure must be visible without tracing: {failed_stderr}"
+    );
+    assert!(failed_stderr.contains("avoid resending"));
+    assert!(archived_message(missing_body).is_none());
+    assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+    assert_eq!(std::fs::read(&saved_head).unwrap(), head_bytes);
+    assert!(
+        !head_path.exists(),
+        "failed send must preserve the missing-HEAD fault"
+    );
+    let (inbox, _) = run_ok(&[
+        "mail",
+        "inbox",
+        "--project",
+        project_key,
+        "--agent",
+        "RedFox",
+        "--include-bodies",
+        "--json",
+    ]);
+    assert!(inbox.contains(old_body));
+    assert!(
+        inbox.contains(missing_body),
+        "DB-accepted mail must survive CLI exit"
+    );
+
+    // Restore only the exact HEAD that this test preserved. No guessed branch,
+    // database reconstruction, reinitialization or history replacement.
+    std::fs::rename(&saved_head, &head_path).unwrap();
+    let (diagnosis, _) = run_ok(&["doctor", "fix", "--only", fm_id, "--list", "--json"]);
+    let diagnosis: serde_json::Value = serde_json::from_str(&diagnosis).unwrap();
+    assert_eq!(diagnosis["findings"].as_array().unwrap().len(), 0);
+    let recovered_body = "new canonical mail commits after exact HEAD restoration";
+    let (_, recovered_stderr) = send(recovered_body);
+    assert!(!recovered_stderr.contains("Git archive writes failed or remain pending"));
+    assert!(archived_message(recovered_body).is_some());
+    assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+    let repo = git2::Repository::open(root).unwrap();
+    let new_tip = repo.head().unwrap().target().unwrap();
+    assert!(repo.find_commit(old_tip).is_ok());
+    assert!(repo.graph_descendant_of(new_tip, old_tip).unwrap());
+    let (inbox, _) = run_ok(&[
+        "mail",
+        "inbox",
+        "--project",
+        project_key,
+        "--agent",
+        "RedFox",
+        "--include-bodies",
+        "--json",
+    ]);
+    assert!(
+        inbox.contains(old_body) && inbox.contains(missing_body) && inbox.contains(recovered_body)
+    );
 }
 
 #[test]

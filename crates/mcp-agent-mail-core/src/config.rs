@@ -988,11 +988,19 @@ impl SearchRolloutConfig {
             .get(surface)
             .copied()
             .unwrap_or(self.engine);
+        self.allowed_engine(base)
+    }
 
-        // Apply kill switch degradation
-        match base {
-            SearchEngine::Semantic if !self.semantic_enabled => SearchEngine::Lexical,
-            SearchEngine::Hybrid | SearchEngine::Auto if !self.semantic_enabled => {
+    /// `engine` with the kill switches applied: while semantic search is
+    /// disabled, every semantic-capable engine runs lexical. This also
+    /// governs an explicit per-query request, so asking for an engine cannot
+    /// bypass the switch.
+    #[must_use]
+    pub const fn allowed_engine(&self, engine: SearchEngine) -> SearchEngine {
+        match engine {
+            SearchEngine::Semantic | SearchEngine::Hybrid | SearchEngine::Auto
+                if !self.semantic_enabled =>
+            {
                 SearchEngine::Lexical
             }
             other => other,
@@ -7852,6 +7860,35 @@ mod tests {
             SearchEngine::Hybrid
         );
         assert_eq!(cfg.effective_engine("other_tool"), SearchEngine::Legacy);
+    }
+
+    #[test]
+    fn allowed_engine_applies_the_kill_switch_to_explicit_requests() {
+        let disabled = SearchRolloutConfig::default();
+        assert!(!disabled.semantic_enabled, "semantic search is opt-in");
+        for requested in [
+            SearchEngine::Semantic,
+            SearchEngine::Hybrid,
+            SearchEngine::Auto,
+        ] {
+            assert_eq!(disabled.allowed_engine(requested), SearchEngine::Lexical);
+        }
+        let enabled = SearchRolloutConfig {
+            semantic_enabled: true,
+            ..SearchRolloutConfig::default()
+        };
+        assert_eq!(
+            enabled.allowed_engine(SearchEngine::Hybrid),
+            SearchEngine::Hybrid
+        );
+        assert_eq!(
+            enabled.allowed_engine(SearchEngine::Auto),
+            SearchEngine::Auto
+        );
+        assert_eq!(
+            disabled.allowed_engine(SearchEngine::Lexical),
+            SearchEngine::Lexical
+        );
     }
 
     #[test]

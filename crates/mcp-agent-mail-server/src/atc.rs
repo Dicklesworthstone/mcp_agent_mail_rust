@@ -97,6 +97,8 @@ fn reset_with_delivery(probe_interval_micros: i64, reset_engine: impl FnOnce()) 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             DeliveryState::new(probe_interval_micros);
+        // The delivery state was replaced wholesale; an old poison flag is stale.
+        delivery_state().clear_poison();
     });
 }
 
@@ -517,6 +519,8 @@ mod admission_boundary_tests {
             })
             .is_err()
         );
+        // The interrupted reset unwound while holding the hydration lock.
+        assert!(population::hydration_is_poisoned_for_test());
         for _ in 0..3 {
             assert!(capture_delivery_epoch().is_none());
             assert!(atc_tick_report(200_000_000).is_none());
@@ -524,6 +528,9 @@ mod admission_boundary_tests {
             assert!(!delivery_epoch_is_current(&old_epoch));
         }
         reset_global_atc_state_for_test(&config);
+        // A complete reset heals the lock; otherwise every later strict
+        // `lock()` (including other tests in this binary) inherits the poison.
+        assert!(!population::hydration_is_poisoned_for_test());
         let replacement = capture_delivery_epoch().unwrap();
         assert!(!Arc::ptr_eq(&old_epoch, &replacement));
         assert!(atc_tick_report(201_000_000).is_some());

@@ -1033,6 +1033,8 @@ fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     maintenance::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
+    // A sync interrupted by exit would leave `.git/index.lock` behind.
+    mcp_agent_mail_storage::stop_archive_index_sync(Duration::from_secs(10));
     cleanup_shutdown_sqlite_sidecars(config);
 }
 
@@ -2565,6 +2567,7 @@ fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Ins
 fn run_http_headless_supervisor(
     config: mcp_agent_mail_core::Config,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     // The standalone headless process owns its signal policy. Embedders using
     // run_http_with_control retain their caller-supplied shutdown authority.
@@ -2586,7 +2589,8 @@ fn run_http_headless_supervisor(
         "HTTP server supervisor started"
     );
     let runtime = build_http_runtime()?;
-    let result_rx = spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None)?;
+    let result_rx =
+        spawn_http_supervisor_task(runtime.handle(), config, None, control_rx, None, on_ready)?;
     // Serving has no deadline. Once signalled, request the normal supervisor
     // drain and use the same bounded join budget as the TUI shutdown path.
     #[cfg(any(unix, windows))]
@@ -2601,7 +2605,69 @@ fn run_http_headless_supervisor(
     result
 }
 
-fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+type HttpReadyCallback = Box<dyn FnOnce(&mcp_agent_mail_core::Config) + Send>;
+
+/// A successful HTTP preflight bound to one immutable configuration snapshot.
+/// Serving consumes this value; callers cannot substitute another config or
+/// reuse a preflight after the first server exits.
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// startup.run()?;
+/// startup.run()?; // the preparation was already consumed
+/// # Ok(()) }
+/// ```
+///
+/// ```compile_fail
+/// # fn example(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+/// let startup = mcp_agent_mail_server::prepare_http_startup(config)?;
+/// let other = mcp_agent_mail_core::Config::default();
+/// startup.run(&other)?; // serving accepts no replacement configuration
+/// # Ok(()) }
+/// ```
+#[must_use]
+pub struct PreparedHttpStartup {
+    config: mcp_agent_mail_core::Config,
+    on_ready: Option<HttpReadyCallback>,
+}
+
+impl PreparedHttpStartup {
+    /// Run once after the first listener passes its readiness self-probe.
+    /// The callback receives the actual bound address (including an assigned
+    /// ephemeral port). It is never run for a failed startup or a restart.
+    pub fn with_ready_callback(
+        mut self,
+        callback: impl FnOnce(&mcp_agent_mail_core::Config) + Send + 'static,
+    ) -> Self {
+        self.on_ready = Some(Box::new(callback));
+        self
+    }
+
+    pub fn run(self) -> std::io::Result<()> {
+        run_http_supervised(self, None)
+    }
+
+    pub fn run_with_control(
+        self,
+        control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
+    ) -> std::io::Result<()> {
+        run_http_supervised(self, Some(control_rx))
+    }
+
+    pub fn run_with_tui(self) -> std::io::Result<()> {
+        run_http_with_tui_prepared(self)
+    }
+}
+
+/// Run the complete HTTP startup checks once, before any client setup writes.
+/// Direct server entrypoints also use this constructor; possession of a
+/// successful report alone cannot bypass the checks.
+pub fn prepare_http_startup(
+    config: &mcp_agent_mail_core::Config,
+) -> std::io::Result<PreparedHttpStartup> {
+    config.validate_user_env_authority()?;
+    install_crash_marker_panic_hook(config.storage_root.clone());
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
@@ -2612,7 +2678,10 @@ fn prepare_http_runtime_startup(config: &mcp_agent_mail_core::Config) -> std::io
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    Ok(())
+    Ok(PreparedHttpStartup {
+        config: config.clone(),
+        on_ready: None,
+    })
 }
 
 fn boot_check_mode_from_config(
@@ -3921,7 +3990,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup failed; binding the HTTP listener in DB-degraded mode. \
                  /healthz stays live and /health reports unavailable until the DB recovers. \
-                 Run `am doctor --json` to diagnose/repair."
+                 Run `am doctor check --json` to diagnose/repair."
             );
         }
         Err(_timeout) => {
@@ -3931,7 +4000,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup still running after the bind deadline; binding the HTTP \
                  listener NOW so the server is reachable (degraded). Recovery continues in the \
-                 background. If this persists, stop the service and run `am doctor --json`."
+                 background. If this persists, stop the service and run `am doctor check --json`."
             );
             // Detach: let the warmup finish in the background; never join here.
         }
@@ -4065,7 +4134,7 @@ fn append_crash_marker(path: &Path, record: &serde_json::Value) {
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
-    run_http_supervised(config, None)
+    prepare_http_startup(config)?.run()
 }
 
 /// Run the headless HTTP server exactly like [`run_http`], but stoppable by
@@ -4084,13 +4153,15 @@ pub fn run_http_with_control(
     config: &mcp_agent_mail_core::Config,
     control_rx: mpsc::Receiver<tui_bridge::ServerControlMsg>,
 ) -> std::io::Result<()> {
-    run_http_supervised(config, Some(control_rx))
+    prepare_http_startup(config)?.run_with_control(control_rx)
 }
 
 fn run_http_supervised(
-    config: &mcp_agent_mail_core::Config,
+    startup: PreparedHttpStartup,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
 ) -> std::io::Result<()> {
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -4098,15 +4169,8 @@ fn run_http_supervised(
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: startup probes (inside `prepare_http_runtime_startup`) must
-    // run BEFORE acquiring runtime activity locks.  The probes take an
-    // exclusive flock on the activity lockfile to verify no other process
-    // is running; if we already hold a shared flock from
-    // `acquire_runtime_mailbox_activity_locks`, the exclusive attempt
-    // deadlocks (EAGAIN) against our own process.
-    prepare_http_runtime_startup(config)?;
-
-    // Safe to acquire now -- probes have confirmed we are the sole owner.
+    // Preparation ran the exclusive integrity probe before runtime locks.
+    // Acquire the real locks now; a competing owner still makes this fail.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
@@ -4143,7 +4207,7 @@ fn run_http_supervised(
     // Keep headless HTTP (`serve --no-tui`) under the same supervised restart
     // policy as the TUI path so long-lived operator sessions self-heal from
     // transport starvation or listener crashes.
-    let result = run_http_headless_supervisor(config.clone(), control_rx);
+    let result = run_http_headless_supervisor(config.clone(), control_rx, on_ready);
     clear_startup_readiness_fast_path();
 
     retention::shutdown();
@@ -4169,11 +4233,16 @@ fn run_http_supervised(
 /// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
 /// this falls back to [`run_http`].
 pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    prepare_http_startup(config)?.run_with_tui()
+}
+
+fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<()> {
+    let config = &startup.config;
     config.validate_user_env_authority()?;
     install_crash_marker_panic_hook(config.storage_root.clone());
     // Fall back to headless mode when not a TTY or TUI is disabled
     if !std::io::stdout().is_terminal() || !config.tui_enabled {
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
 
     // Guard against degenerate PTY geometry (e.g. `stty size` => `0 0`) which can
@@ -4183,30 +4252,19 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
             "[warn] Detected invalid terminal size ({cols}x{rows}); \
              disabling TUI to avoid runaway CPU (headless HTTP mode)"
         );
-        return run_http(config);
+        return run_http_supervised(startup, None);
     }
+
+    let PreparedHttpStartup { config, on_ready } = startup;
+    let config = &config;
 
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
 
-    // IMPORTANT: probes must run BEFORE acquiring runtime activity locks.
-    // `probe_integrity` takes an exclusive flock on the activity lockfile;
-    // if we already hold a shared flock the exclusive attempt deadlocks
-    // (EAGAIN) against our own process.
-    let probe_report = startup_checks::run_startup_probes(config);
-    if !probe_report.is_ok() {
-        return Err(std::io::Error::other(probe_report.format_errors()));
-    }
-    ensure_boot_archive_preflight_pass(config)?;
-
-    // Now that probes have confirmed we are the sole owner, acquire the
-    // runtime shared lock for the lifetime of the process.
+    // Preparation already ran the probes before runtime activity locks.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
-    if config.instrumentation_enabled {
-        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
-    }
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
@@ -4244,6 +4302,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         Some(Arc::clone(&tui_state)),
         Some(server_ctl_rx),
         Some(Arc::clone(&supervisor_fail_fast_active)),
+        on_ready,
     ) {
         Ok(result_rx) => result_rx,
         Err(err) => {
@@ -4925,6 +4984,7 @@ fn spawn_http_supervisor_task(
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
     fail_fast_active: Option<Arc<AtomicBool>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let spawn_handle = runtime_handle;
@@ -4941,6 +5001,7 @@ fn spawn_http_supervisor_task(
                     config,
                     supervisor_state,
                     control_rx,
+                    on_ready,
                 ),
             )
             .await;
@@ -5236,6 +5297,7 @@ async fn run_http_server_supervisor(
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
+    on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
     let (updated_config, mut instance) =
         spawn_http_server_instance(&runtime_handle, config.clone()).await?;
@@ -5280,6 +5342,10 @@ async fn run_http_server_supervisor(
     // ready so `systemctl is-active` only reports `active` once clients can
     // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
     sd_notify_ready();
+
+    if let Some(on_ready) = on_ready {
+        on_ready(&config);
+    }
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
@@ -9273,6 +9339,12 @@ fn should_force_mux_left_split(
 }
 
 fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
+    stable_tui_diff_config_with(full_redraw_max_interval_from_env())
+}
+
+fn stable_tui_diff_config_with(
+    full_redraw_max_interval: Option<Duration>,
+) -> ftui_runtime::terminal_writer::RuntimeDiffConfig {
     // Explicitly tune the runtime diff path so sparse TUI updates remain
     // incremental and strategy switches do not thrash at overlay boundaries.
     let strategy = ftui_render::diff_strategy::DiffStrategyConfig {
@@ -9300,34 +9372,39 @@ fn stable_tui_diff_config() -> ftui_runtime::terminal_writer::RuntimeDiffConfig 
         .with_dirty_span_config(dirty_spans)
         .with_tile_diff_config(tiles)
         // The TUI runs for days inside mux panes. If the visible terminal buffer
-        // is cleared or desynchronized outside the process, sparse diffs cannot
-        // reconstruct it, so force a bounded physical repaint.
+        // is cleared or desynchronized outside the process (a tmux/zellij pane
+        // swap, a detach/reattach), sparse diffs cannot reconstruct it, so a
+        // wall-clock bound forces a physical repaint whether the UI is idle or
+        // busy.
         //
-        // Two complementary bounds:
-        //  - frame-count: resync every N *rendered* frames. Cheap, but advances
-        //    only while the UI is actively rendering.
-        //  - wall-clock: resync at least every `full_redraw_max_secs` of elapsed
-        //    time, *regardless* of render cadence. This is what bounds visible
-        //    terminal-state desync (incremental-diff corruption, a tmux/zellij
-        //    pane swap, or a detach/reattach) when the TUI is idle or rendering
-        //    sparsely — exactly the case where the frame counter stalls and the
-        //    garbage would otherwise persist on screen. Tunable via
-        //    `AM_TUI_FULL_REDRAW_MAX_SECS` (default 1.0; <= 0 disables).
-        .with_full_redraw_interval_frames(20)
-        .with_full_redraw_max_interval(full_redraw_max_interval_from_env())
+        // That repaint re-emits every cell. A 1 s bound plus a 20-frame bound
+        // made an idle TUI resend the whole screen about once a second
+        // (~65 KB/s on an 86x382 pane; GH#338). The wall-clock bound alone
+        // limits how long a desync stays visible, so the frame-count bound is
+        // off and the default interval is `DEFAULT_FULL_REDRAW_MAX_SECS`;
+        // operators can shorten it with `AM_TUI_FULL_REDRAW_MAX_SECS`.
+        .with_full_redraw_interval_frames(0)
+        .with_full_redraw_max_interval(full_redraw_max_interval)
 }
 
+/// Default wall-clock bound, in seconds, between forced full TUI redraws.
+const DEFAULT_FULL_REDRAW_MAX_SECS: f64 = 30.0;
+
 /// Wall-clock bound between forced physical full redraws (see
-/// [`stable_tui_diff_config`]). Reads `AM_TUI_FULL_REDRAW_MAX_SECS`
-/// (floating-point seconds); defaults to 1.0s. A value <= 0 (or unparseable)
-/// disables the time-based resync, leaving only the frame-count bound.
+/// [`stable_tui_diff_config`]), from `AM_TUI_FULL_REDRAW_MAX_SECS`.
 fn full_redraw_max_interval_from_env() -> Option<Duration> {
-    let secs = std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS")
-        .ok()
+    full_redraw_max_interval_from(std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS").ok().as_deref())
+}
+
+/// Parse floating-point seconds. Unset or unparseable falls back to
+/// [`DEFAULT_FULL_REDRAW_MAX_SECS`]; a value <= 0, non-finite, or too large
+/// for a `Duration` disables the wall-clock resync.
+fn full_redraw_max_interval_from(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw
         .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .unwrap_or(1.0);
-    if secs.is_finite() && secs > 0.0 {
-        Some(Duration::from_secs_f64(secs))
+        .unwrap_or(DEFAULT_FULL_REDRAW_MAX_SECS);
+    if secs > 0.0 {
+        Duration::try_from_secs_f64(secs).ok()
     } else {
         None
     }
@@ -11267,6 +11344,8 @@ struct HttpState {
     /// Reused snapshot state for `/mail/ws-state` polling when no live TUI is active.
     ws_state_fallback: Arc<tui_bridge::TuiSharedState>,
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
+    /// Aggregates the failed-request WARN for repeated 401/404 probes.
+    probe_rejection_log: HttpProbeRejectionLog,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11460,6 +11539,7 @@ impl HttpState {
             web_root,
             ws_state_fallback,
             request_diagnostics,
+            probe_rejection_log: HttpProbeRejectionLog::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11565,15 +11645,33 @@ impl HttpState {
         // requests even when the optional high-volume request log is disabled;
         // never include body or authorization data.
         if resp.status >= 400 {
-            tracing::warn!(
-                event = "http_request_error",
-                method = %method_name,
-                path = %path_for_diag,
-                status = resp.status,
-                duration_ms = dur_ms,
-                client_ip = %client_ip.as_deref().unwrap_or("-"),
-                "HTTP request failed"
-            );
+            let client = client_ip.as_deref().unwrap_or("-");
+            match self
+                .probe_rejection_log
+                .admit(client, resp.status, Instant::now())
+            {
+                HttpRejectionLogDecision::Log => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    "HTTP request failed"
+                ),
+                HttpRejectionLogDecision::LogWindowStart { suppressed_before } => tracing::warn!(
+                    event = "http_request_error",
+                    method = %method_name,
+                    path = %path_for_diag,
+                    status = resp.status,
+                    duration_ms = dur_ms,
+                    client_ip = %client,
+                    suppressed_before,
+                    window_secs = HTTP_PROBE_REJECTION_LOG_WINDOW.as_secs(),
+                    "HTTP request failed; further responses with this status to this client within window_secs are counted, not logged"
+                ),
+                HttpRejectionLogDecision::Suppress => {}
+            }
         }
 
         if !needs_request_log {
@@ -17840,6 +17938,66 @@ fn http_request_log_fallback_line(
     format!("http method={method} path={path} status={status} ms={duration_ms} client={client_ip}")
 }
 
+/// Window in which repeated 401/404 rejections from one client are counted
+/// instead of logged (br-5804q).
+const HTTP_PROBE_REJECTION_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Tracked `(client, status)` pairs; beyond this, rejections are logged.
+const HTTP_PROBE_REJECTION_LOG_MAX_KEYS: usize = 1024;
+
+/// Whether to emit the failed-request WARN for one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRejectionLogDecision {
+    /// Not a probe status: always logged.
+    Log,
+    /// First probe rejection of a window, with the count suppressed in the
+    /// previous window for this client and status.
+    LogWindowStart { suppressed_before: u64 },
+    /// A repeat inside the window: counted, not logged.
+    Suppress,
+}
+
+/// Aggregates the failed-request WARN for repeated 401/404 responses per
+/// client (br-5804q, GH#337). An unauthenticated client probing `/mcp`
+/// draws a 401 on every request and then 404s on OAuth `.well-known`
+/// probes, several a minute, which buried real warnings. The first rejection
+/// of each window is logged and says that repeats are counted; the next
+/// logged line carries the count. Other 4xx and every 5xx are always logged.
+#[derive(Default)]
+struct HttpProbeRejectionLog {
+    windows: Mutex<HashMap<(String, u16), (Instant, u64)>>,
+}
+
+impl HttpProbeRejectionLog {
+    fn admit(&self, client_ip: &str, status: u16, now: Instant) -> HttpRejectionLogDecision {
+        if !matches!(status, 401 | 404) {
+            return HttpRejectionLogDecision::Log;
+        }
+        let mut windows = lock_mutex(&self.windows);
+        let key = (client_ip.to_string(), status);
+        if let Some((started, suppressed)) = windows.get_mut(&key) {
+            if now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW {
+                *suppressed += 1;
+                return HttpRejectionLogDecision::Suppress;
+            }
+            let suppressed_before = std::mem::take(suppressed);
+            *started = now;
+            return HttpRejectionLogDecision::LogWindowStart { suppressed_before };
+        }
+        if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            windows.retain(|_, (started, _)| {
+                now.saturating_duration_since(*started) < HTTP_PROBE_REJECTION_LOG_WINDOW
+            });
+            if windows.len() >= HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+                return HttpRejectionLogDecision::Log;
+            }
+        }
+        windows.insert(key, (now, 0));
+        HttpRejectionLogDecision::LogWindowStart {
+            suppressed_before: 0,
+        }
+    }
+}
+
 // render_http_request_panel moved to console.rs (br-1m6a.13)
 
 // ---------------------------------------------------------------------------
@@ -18632,16 +18790,106 @@ mod tests {
         (entry.calls, entry.errors, entry.rejections)
     }
 
+    /// `Write` sink whose bytes the test can read while a `TerminalWriter`
+    /// still owns the writer.
+    #[derive(Clone, Default)]
+    struct SharedTerminalSink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedTerminalSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Present a full 200x50 screen, then `frames` frames that each change one
+    /// eight-cell "clock" run. Returns, per frame, the bytes it emitted and
+    /// whether the writer forced a full redraw.
+    fn present_clock_ticks(
+        config: ftui_runtime::terminal_writer::RuntimeDiffConfig,
+        frames: usize,
+    ) -> Vec<(usize, bool)> {
+        use ftui_render::cell::Cell;
+        use ftui_render::diff_strategy::DiffStrategy;
+
+        let sink = SharedTerminalSink::default();
+        let mut writer = ftui_runtime::terminal_writer::TerminalWriter::with_diff_config(
+            sink.clone(),
+            ftui::ScreenMode::AltScreen,
+            ftui::UiAnchor::Bottom,
+            ftui::TerminalCapabilities::basic(),
+            config,
+        );
+        writer.set_size(200, 50);
+        let mut buffer = ftui_render::buffer::Buffer::new(200, 50);
+        for y in 0..50_u16 {
+            for x in 0..200_u16 {
+                let letter = char::from(b'a' + u8::try_from((x + y) % 26).unwrap_or(0));
+                buffer.set_raw(x, y, Cell::from_char(letter));
+            }
+        }
+        writer.present_ui(&buffer, None, false).unwrap();
+        assert_eq!(writer.last_diff_strategy(), Some(DiffStrategy::FullRedraw));
+
+        let mut emitted = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let digit = char::from(b'0' + u8::try_from(frame % 10).unwrap_or(0));
+            for x in 190..198_u16 {
+                buffer.set_raw(x, 49, Cell::from_char(digit));
+            }
+            let before = sink.0.borrow().len();
+            writer.present_ui(&buffer, None, false).unwrap();
+            let bytes = sink.0.borrow().len() - before;
+            emitted.push((
+                bytes,
+                writer.last_diff_strategy() == Some(DiffStrategy::FullRedraw),
+            ));
+        }
+        emitted
+    }
+
     #[test]
-    fn stable_tui_diff_config_forces_periodic_terminal_resync() {
-        let config = stable_tui_diff_config();
-        assert_eq!(config.full_redraw_interval_frames, 20);
-        // The wall-clock resync is enabled by default (env unset => 1s), so an
-        // idle / sparsely-rendering TUI still resynchronizes the physical
-        // terminal on a time cadence — not only on rendered-frame count.
+    fn stable_tui_diff_config_emits_only_changed_cells_between_resyncs() {
+        // GH#338: with the default 30 s wall-clock bound, a TUI whose only
+        // change is its status-line clock must not repaint the screen.
+        let config = stable_tui_diff_config_with(full_redraw_max_interval_from(None));
+        assert_eq!(config.full_redraw_interval_frames, 0);
+        assert_eq!(
+            config.full_redraw_max_interval,
+            Some(Duration::from_secs(30))
+        );
+        for (frame, (bytes, full_redraw)) in present_clock_ticks(config, 60).into_iter().enumerate()
+        {
+            assert!(!full_redraw, "frame {frame} was a forced full redraw");
+            assert!(bytes < 512, "frame {frame} emitted {bytes} bytes");
+        }
+
+        // Negative control: the previous 20-frame bound repaints all 10,000
+        // cells after 20 incremental frames.
+        let previous = stable_tui_diff_config_with(None).with_full_redraw_interval_frames(20);
+        let ticks = present_clock_ticks(previous, 25);
+        let first_full = ticks
+            .iter()
+            .position(|(_, full_redraw)| *full_redraw)
+            .expect("the 20-frame bound must force a full redraw within 25 frames");
+        assert_eq!(first_full, 20);
         assert!(
-            config.full_redraw_max_interval.is_some(),
-            "wall-clock terminal resync must be enabled by default"
+            ticks[first_full].0 >= 10_000,
+            "full redraw emitted only {} bytes",
+            ticks[first_full].0
+        );
+
+        // The wall-clock bound is still wired: a zero interval forces every
+        // frame to be a full redraw.
+        let always_due = stable_tui_diff_config_with(Some(Duration::ZERO));
+        assert!(
+            present_clock_ticks(always_due, 2)
+                .iter()
+                .all(|(_, full_redraw)| *full_redraw)
         );
     }
 
@@ -18662,15 +18910,83 @@ mod tests {
     }
 
     #[test]
-    fn full_redraw_max_interval_env_parsing() {
-        // Default (env unset path is covered by the config test above); here we
-        // exercise the pure parsing branches via Duration::from_secs_f64 so the
-        // disable/clamp semantics are pinned without mutating process env.
-        assert_eq!(Duration::from_secs_f64(1.0), Duration::from_millis(1000));
-        // Non-positive / non-finite seconds must disable the bound.
-        for bad in [0.0_f64, -1.0, f64::NAN, f64::INFINITY] {
-            let enabled = bad.is_finite() && bad > 0.0;
-            assert!(!enabled, "{bad} must disable the wall-clock resync");
+    fn probe_rejection_log_counts_repeats_per_client_and_status() {
+        use HttpRejectionLogDecision::{Log, LogWindowStart, Suppress};
+        // br-5804q (GH#337): one client's stream of 401s and .well-known
+        // 404s logs once per status per window and reports the count later.
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let first = LogWindowStart {
+            suppressed_before: 0,
+        };
+        assert_eq!(log.admit("10.0.0.1", 401, at(0)), first);
+        assert_eq!(log.admit("10.0.0.1", 401, at(1)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 401, at(30)), Suppress);
+        assert_eq!(log.admit("10.0.0.1", 404, at(2)), first);
+        assert_eq!(log.admit("10.0.0.2", 401, at(3)), first);
+        assert_eq!(
+            log.admit("10.0.0.1", 401, at(61)),
+            LogWindowStart {
+                suppressed_before: 2
+            }
+        );
+        assert_eq!(log.admit("10.0.0.1", 401, at(62)), Suppress);
+
+        // Negative controls: other statuses are never aggregated.
+        for status in [400, 403, 405, 429, 500, 503] {
+            for _ in 0..3 {
+                assert_eq!(log.admit("10.0.0.1", status, at(5)), Log, "{status}");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_rejection_log_stays_bounded_and_logs_when_full() {
+        let log = HttpProbeRejectionLog::default();
+        let t0 = Instant::now();
+        for client in 0..HTTP_PROBE_REJECTION_LOG_MAX_KEYS {
+            log.admit(&format!("client-{client}"), 401, t0);
+        }
+        // A new client while every window is live is logged, not tracked.
+        assert_eq!(
+            log.admit("late-client", 401, t0),
+            HttpRejectionLogDecision::Log
+        );
+        assert_eq!(
+            lock_mutex(&log.windows).len(),
+            HTTP_PROBE_REJECTION_LOG_MAX_KEYS
+        );
+        // Once windows expire, the map is pruned and tracking resumes.
+        let later = t0 + HTTP_PROBE_REJECTION_LOG_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            log.admit("late-client", 401, later),
+            HttpRejectionLogDecision::LogWindowStart {
+                suppressed_before: 0
+            }
+        );
+        assert_eq!(lock_mutex(&log.windows).len(), 1);
+    }
+
+    #[test]
+    fn full_redraw_max_interval_parsing() {
+        let default = Some(Duration::from_secs(30));
+        assert_eq!(full_redraw_max_interval_from(None), default);
+        assert_eq!(full_redraw_max_interval_from(Some("not-a-number")), default);
+        assert_eq!(
+            full_redraw_max_interval_from(Some(" 0.25 ")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            full_redraw_max_interval_from(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        for disabled in ["0", "-1", "NaN", "inf", "1e300"] {
+            assert_eq!(
+                full_redraw_max_interval_from(Some(disabled)),
+                None,
+                "{disabled} must disable the wall-clock resync"
+            );
         }
     }
 
@@ -19525,6 +19841,184 @@ mod tests {
             assert!(error.to_string().contains("newer"), "{error}");
         });
         assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
+    }
+
+    fn run_prepared_http_test_in_child(test_name: &str) -> bool {
+        const CHILD_TEST: &str = "AM_PREPARED_HTTP_STARTUP_TEST_CHILD";
+        if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+            return false;
+        }
+        // Runtime workers can rehydrate Config from the environment. Keep
+        // their whole lifetime in a private process, even under cargo test.
+        let dir = tempfile::tempdir().expect("private worker environment");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .env(
+                "DATABASE_URL",
+                mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &dir.path().join("mailbox.sqlite3"),
+                ),
+            )
+            .env("STORAGE_ROOT", dir.path().join("archive"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_STATE_HOME", dir.path().join("state"))
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", "0")
+            .env("AM_ATC_ENABLED", "false")
+            .env("ATC_LEARNING_DISABLED", "1")
+            .env_remove("HTTP_BEARER_TOKEN")
+            .env_remove("NOTIFY_SOCKET")
+            .current_dir(dir.path())
+            .output()
+            .expect("execute isolated runtime test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "isolated {test_name} did not pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        let config = mcp_agent_mail_core::Config {
+            database_url: std::env::var("DATABASE_URL").expect("isolated child database"),
+            storage_root: std::env::var_os("STORAGE_ROOT")
+                .expect("isolated child archive")
+                .into(),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_bearer_token: None,
+            tui_enabled: false,
+            atc_enabled: false,
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("consumer context");
+            initialize_stdio_database(&cx, &config)
+                .await
+                .expect("seed real mailbox schema");
+        });
+        config
+    }
+
+    #[test]
+    fn prepared_http_startup_runs_probes_once_and_callback_after_readiness() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_runs_probes_once_and_callback_after_readiness",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let expected_storage = config.storage_root.clone();
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        startup_checks::take_startup_work_counts();
+        let startup = prepare_http_startup(&config)
+            .expect("real full preflight")
+            .with_ready_callback(move |bound| {
+                // A real connection must be possible before a setup writer runs.
+                let connected =
+                    std::net::TcpStream::connect((bound.http_host.as_str(), bound.http_port))
+                        .is_ok();
+                *callback_observed.lock().expect("callback result") =
+                    Some((bound.storage_root.clone(), bound.http_port, connected));
+                let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
+            });
+        assert_eq!(startup_checks::take_startup_work_counts(), [1, 1, 1, 1]);
+        // Mutation of the caller's config cannot retarget an existing token.
+        config.storage_root = dir.path().join("different-archive");
+        config.http_host = "invalid.invalid".to_string();
+        startup
+            .run_with_control(control_rx)
+            .expect("serve and drain");
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+        let observation = observed.lock().expect("callback result");
+        let (storage, port, connected) = observation.as_ref().expect("ready callback ran");
+        assert_eq!(storage, &expected_storage);
+        assert_ne!(*port, 0, "callback must receive actual bound port");
+        assert!(*connected, "callback must follow listener bind");
+        assert!(
+            !config.storage_root.exists(),
+            "caller mutation must not retarget startup"
+        );
+    }
+
+    #[test]
+    fn prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_bind_failure_preserves_setup_and_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(false);
+    }
+
+    #[test]
+    fn prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes() {
+        if run_prepared_http_test_in_child(
+            "tests::prepared_http_startup_tui_fallback_bind_failure_does_not_repeat_probes",
+        ) {
+            return;
+        }
+        assert_prepared_http_bind_failure(true);
+    }
+
+    fn assert_prepared_http_bind_failure(use_tui_entrypoint: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = prepared_http_test_config();
+        let available = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        config.http_port = available.local_addr().expect("address").port();
+        drop(available);
+        let setup_path = dir.path().join("client-config.json");
+        std::fs::write(&setup_path, b"original client setup").expect("seed setup");
+        let callback_path = setup_path.clone();
+        let startup = prepare_http_startup(&config)
+            .expect("preflight on available port")
+            .with_ready_callback(move |_| {
+                std::fs::write(callback_path, b"rewritten setup").expect("write setup");
+            });
+        startup_checks::take_startup_work_counts();
+        // Deterministically lose the port after preflight, before actual bind.
+        let _occupied = std::net::TcpListener::bind(("127.0.0.1", config.http_port))
+            .expect("occupy prepared port");
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let result = if use_tui_entrypoint {
+            startup.run_with_tui()
+        } else {
+            startup.run_with_control(control_rx)
+        };
+        let error = result.expect_err("bind must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
+        assert_eq!(
+            std::fs::read(setup_path).expect("setup after failure"),
+            b"original client setup"
+        );
+        assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
+    }
+
+    #[test]
+    fn prepared_http_startup_direct_entrypoints_keep_preflight_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: dir.path().join("archive"),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 0,
+            http_path: "invalid-without-leading-slash".to_string(),
+            ..Default::default()
+        };
+        assert!(prepare_http_startup(&config).is_err());
+        assert!(run_http(&config).is_err());
+        assert!(run_http_with_tui(&config).is_err());
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(run_http_with_control(&config, rx).is_err());
     }
 
     fn config_for_boot_check_storage(

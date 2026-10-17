@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 ///
@@ -49,8 +49,7 @@ const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_
 /// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
 /// `Config::from_env()` calls to avoid flakey cross-test races.
 fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::process_env_lock()
 }
 
 fn crate_root() -> PathBuf {
@@ -598,6 +597,7 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set(vars: &[(&str, &str)]) -> Self {
+        crate::settle_shared_storage();
         let mut previous = Vec::new();
         for (key, value) in vars {
             let old = std::env::var(*key).ok();
@@ -643,6 +643,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
+        crate::drain_shared_storage();
         for (key, value) in self.previous.drain(..) {
             match value {
                 Some(v) => unsafe {
@@ -1197,6 +1198,15 @@ struct FixtureEnv {
     fixtures: Fixtures,
     router: fastmcp::Router,
     tokens: BTreeMap<String, String>,
+}
+
+impl Drop for FixtureEnv {
+    // Fields drop in declaration order, so `tmp` would be removed before
+    // `_env_guard` drains; drain first so queued archive writes still find
+    // their directory (br-odkc4).
+    fn drop(&mut self) {
+        crate::drain_shared_storage();
+    }
 }
 
 fn init_fixture_repo(repo_dir: &Path) {
@@ -4084,7 +4094,7 @@ fn toon_format_resolution_json_fallback() {
     assert_eq!(
         json.get("status").and_then(|v| v.as_str()),
         Some("ok"),
-        "health_check must return status=ok"
+        "health_check must return status=ok: {json}"
     );
 }
 

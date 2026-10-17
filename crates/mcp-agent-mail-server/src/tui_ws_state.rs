@@ -92,6 +92,7 @@ fn config_json(state: &TuiSharedState) -> Value {
         "storage_root": cfg.storage_root,
         "console_theme": cfg.console_theme,
         "tool_filter_profile": cfg.tool_filter_profile,
+        "integrity_guard_enabled": cfg.integrity_guard_enabled,
     })
 }
 
@@ -242,6 +243,33 @@ mod tests {
             payload.get("atc").is_some(),
             "snapshot payload should include ATC state"
         );
+    }
+
+    #[test]
+    fn poll_payload_advertises_whether_the_integrity_guard_runs() {
+        // br-31eew: `am doctor health` judges a stale proactive backup by the
+        // server's guard state, not by the CLI's own environment.
+        let enabled = mcp_agent_mail_core::Config {
+            database_url: "sqlite:////srv/agent-mail/storage.sqlite3".to_string(),
+            integrity_check_on_startup: true,
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let disabled = mcp_agent_mail_core::Config {
+            integrity_check_on_startup: false,
+            ..enabled.clone()
+        };
+        let in_memory = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..enabled.clone()
+        };
+        for (config, expected) in [(enabled, true), (disabled, false), (in_memory, false)] {
+            let payload = poll_payload(&TuiSharedState::new(&config), None);
+            assert_eq!(
+                payload["config"]["integrity_guard_enabled"], expected,
+                "{} on_startup={}",
+                config.database_url, config.integrity_check_on_startup
+            );
+        }
     }
 
     #[test]

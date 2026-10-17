@@ -2253,6 +2253,19 @@ impl MailScreen for ThreadExplorerScreen {
         self.filter_editing
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search. The
+        // detail panel toggles tree/preview focus with Tab and backs out with
+        // Esc, and Esc closes an open Mermaid panel, so neither switches the
+        // screen nor arms quit there; on the bare thread list both stay global.
+        match key.code {
+            KeyCode::Char('/') => true,
+            KeyCode::Tab => self.focus == Focus::DetailPanel,
+            KeyCode::Escape => self.focus == Focus::DetailPanel || self.show_mermaid_panel,
+            _ => false,
+        }
+    }
+
     fn copyable_content(&self) -> Option<String> {
         let thread = self.threads.get(self.cursor)?;
         Some(format!("[{}] {}", thread.thread_id, thread.last_subject))
@@ -4980,6 +4993,46 @@ mod tests {
 
         assert!(!screen.show_mermaid_panel);
         assert_eq!(screen.focus, Focus::DetailPanel);
+    }
+
+    #[test]
+    fn detail_and_mermaid_claim_esc_and_tab_while_the_bare_list_leaves_them_global() {
+        let mut screen = ThreadExplorerScreen::new();
+        screen.threads.push(make_thread("t1", 3, 2));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        let tab = ftui::KeyEvent::new(KeyCode::Tab);
+        // The bare thread list leaves Esc (quit confirmation), Tab (next
+        // screen), and q to the shell.
+        assert!(!screen.claims_key(&esc));
+        assert!(!screen.claims_key(&tab));
+        assert!(!screen.claims_key(&ftui::KeyEvent::new(KeyCode::Char('q'))));
+
+        // Enter opens the detail panel: Tab toggles tree/preview focus there
+        // and Esc backs out to the list, after which both are global again.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert_eq!(screen.focus, Focus::DetailPanel);
+        assert!(screen.claims_key(&tab));
+        assert!(screen.claims_key(&esc));
+        let tree_focus = screen.detail_tree_focus;
+        screen.update(&Event::Key(tab), &state);
+        assert_eq!(screen.detail_tree_focus, !tree_focus);
+        assert_eq!(screen.focus, Focus::DetailPanel);
+        screen.update(&Event::Key(esc), &state);
+        assert_eq!(screen.focus, Focus::ThreadList);
+        assert!(!screen.claims_key(&esc));
+        assert!(!screen.claims_key(&tab));
+
+        // A Mermaid panel open over the list claims Esc to close itself; Tab
+        // still leaves the screen there.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('g'))), &state);
+        assert!(screen.show_mermaid_panel);
+        assert!(screen.claims_key(&esc));
+        assert!(!screen.claims_key(&tab));
+        screen.update(&Event::Key(esc), &state);
+        assert!(!screen.show_mermaid_panel);
+        assert_eq!(screen.focus, Focus::ThreadList);
+        assert!(!screen.claims_key(&esc));
     }
 
     #[test]

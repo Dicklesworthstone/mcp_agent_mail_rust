@@ -4700,6 +4700,16 @@ pub async fn get_project_by_id(
     }
 }
 
+/// Whether `project` is an orphaned-project placeholder, not a real project.
+///
+/// Placeholders (`[unknown-project-<id>]`) surface rows whose `projects` row
+/// was deleted. They must not be granted new file reservations; cleanup
+/// (release) and the contact tools still accept them.
+#[must_use]
+pub fn is_orphan_project_placeholder(project: &ProjectRow) -> bool {
+    is_orphan_placeholder_identifier(&project.slug)
+}
+
 /// Whether `identifier` has the shape of an orphaned-project placeholder
 /// (`[unknown-project-<id>]`, as minted by [`orphaned_project_placeholder`]).
 ///

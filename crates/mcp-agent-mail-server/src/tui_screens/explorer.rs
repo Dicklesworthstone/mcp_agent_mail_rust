@@ -1658,12 +1658,8 @@ impl MailScreen for MailExplorerScreen {
                 action: "Focus search",
             },
             HelpEntry {
-                key: "f",
-                action: "Focus filter rail",
-            },
-            HelpEntry {
-                key: "Tab",
-                action: "Cycle focus",
+                key: "f / Tab",
+                action: "Focus filters / back to results",
             },
             HelpEntry {
                 key: "j/k",
@@ -1722,6 +1718,19 @@ impl MailScreen for MailExplorerScreen {
 
     fn consumes_text_input(&self) -> bool {
         matches!(self.focus, Focus::SearchBar)
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` focuses this screen's search bar rather than the global search.
+        // The filter rail returns to the results with Esc, Tab, or q, so there
+        // they neither arm quit, switch screens, nor quit the TUI; from the
+        // result list all three stay global.
+        matches!(key.code, KeyCode::Char('/'))
+            || (matches!(self.focus, Focus::FilterRail)
+                && matches!(
+                    key.code,
+                    KeyCode::Escape | KeyCode::Tab | KeyCode::Char('q')
+                ))
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -3282,6 +3291,29 @@ mod tests {
             bindings.iter().any(|h| h.key == "P"),
             "P keybinding should be listed"
         );
+    }
+
+    #[test]
+    fn filter_rail_claims_its_exit_keys_and_the_result_list_leaves_them_global() {
+        let mut screen = MailExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let exits = [KeyCode::Escape, KeyCode::Tab, KeyCode::Char('q')];
+        // From the result list Esc arms quit, Tab switches screens, and q
+        // quits the TUI.
+        for code in exits {
+            assert!(!screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+        }
+        // `f` enters the filter rail, where each of them returns to the
+        // results instead, and the claim drops once it has.
+        let f = Event::Key(ftui::KeyEvent::new(KeyCode::Char('f')));
+        for code in exits {
+            screen.update(&f, &state);
+            assert_eq!(screen.focus, Focus::FilterRail);
+            assert!(screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+            assert_eq!(screen.focus, Focus::ResultList, "{code:?}");
+            assert!(!screen.claims_key(&ftui::KeyEvent::new(code)), "{code:?}");
+        }
     }
 
     // ── Test helpers ──────────────────────────────────────────
