@@ -5947,6 +5947,208 @@ struct ServerInboxEntry {
     created_ts: i64,
 }
 
+struct RobotInboxReadSnapshot<'a> {
+    conn: &'a DbConn,
+    active: bool,
+}
+
+impl<'a> RobotInboxReadSnapshot<'a> {
+    fn begin(conn: &'a DbConn) -> Result<Self, CliError> {
+        conn.execute_raw("SAVEPOINT am_robot_inbox")
+            .map_err(|error| CliError::Other(format!("inbox snapshot failed: {error}")))?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn finish(mut self) -> Result<(), CliError> {
+        self.conn
+            .execute_raw("RELEASE SAVEPOINT am_robot_inbox")
+            .map_err(|error| CliError::Other(format!("inbox snapshot release failed: {error}")))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RobotInboxReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_raw("RELEASE SAVEPOINT am_robot_inbox");
+        }
+    }
+}
+
+struct InboxPriority {
+    bucket: i64,
+    label: &'static str,
+    ack_status: &'static str,
+    ack_overdue: bool,
+}
+
+fn inbox_priority(
+    importance: &str,
+    ack_required: bool,
+    read_ts: Option<i64>,
+    ack_ts: Option<i64>,
+    created_ts: i64,
+    ack_threshold: i64,
+) -> InboxPriority {
+    let ack_overdue = ack_required && ack_ts.is_none() && created_ts < ack_threshold;
+    let (bucket, label) = if matches!(importance, "urgent" | "high") && read_ts.is_none() {
+        (1, "urgent")
+    } else if ack_overdue {
+        (2, "ack-overdue")
+    } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
+        (3, "ack-required")
+    } else if read_ts.is_none() {
+        (4, "unread")
+    } else if ack_required && ack_ts.is_none() {
+        (5, "read-unacked")
+    } else {
+        (6, "read")
+    };
+    let ack_status = if !ack_required {
+        "none"
+    } else if ack_ts.is_some() {
+        "acked"
+    } else if ack_overdue {
+        "overdue"
+    } else if read_ts.is_some() {
+        "pending"
+    } else {
+        "required"
+    };
+    InboxPriority {
+        bucket,
+        label,
+        ack_status,
+        ack_overdue,
+    }
+}
+
+fn project_inbox_candidates(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    request: &RobotInboxServerRequest,
+    now_us: i64,
+    ack_threshold: i64,
+) -> Result<Vec<ServerInboxEntry>, CliError> {
+    use mcp_agent_mail_db::sync::{InboxBodyPolicy, InboxFetchOptions};
+
+    let base = InboxFetchOptions {
+        urgent_only: false,
+        unread_only: false,
+        ack_required_only: false,
+        ack_overdue_before: None,
+        topic: None,
+        body_policy: if request.include_bodies {
+            InboxBodyPolicy::Full
+        } else {
+            InboxBodyPolicy::MetadataOnly
+        },
+    };
+    let urgent = InboxFetchOptions {
+        urgent_only: true,
+        unread_only: true,
+        ..base
+    };
+    let overdue = InboxFetchOptions {
+        ack_overdue_before: Some(ack_threshold),
+        ..base
+    };
+
+    // A newest-only window can hide old urgent mail. Each window contains
+    // one priority bucket and possibly higher buckets, so their bounded union
+    // contains every row the final priority-ordered limit can select.
+    let windows = if request.urgent {
+        vec![urgent]
+    } else if request.ack_overdue {
+        vec![
+            InboxFetchOptions {
+                ack_overdue_before: Some(ack_threshold),
+                ..urgent
+            },
+            overdue,
+        ]
+    } else {
+        let mut windows = vec![
+            urgent,
+            overdue,
+            InboxFetchOptions {
+                ack_required_only: true,
+                unread_only: true,
+                ..base
+            },
+            InboxFetchOptions {
+                unread_only: true,
+                ..base
+            },
+        ];
+        if request.all || !request.unread {
+            windows.push(InboxFetchOptions {
+                ack_required_only: true,
+                ..base
+            });
+        }
+        if request.all {
+            windows.push(base);
+        }
+        windows
+    };
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for options in windows {
+        let rows = mcp_agent_mail_db::project_mailbox::fetch_project_mailbox_rows_from_conn(
+            conn,
+            project_id,
+            agent_id,
+            None,
+            request.limit,
+            options,
+        )
+        .map_err(|error| CliError::Other(format!("project inbox query failed: {error}")))?;
+        for row in rows {
+            let message = row.message;
+            let id = message.id.ok_or_else(|| {
+                CliError::Other("project inbox message has no persisted id".to_string())
+            })?;
+            if !seen.insert(id) {
+                continue;
+            }
+            let priority = inbox_priority(
+                &message.importance,
+                message.ack_required != 0,
+                row.read_ts,
+                row.ack_ts,
+                message.created_ts,
+                ack_threshold,
+            );
+            candidates.push(ServerInboxEntry {
+                entry: InboxEntry {
+                    id,
+                    priority: priority.label.to_string(),
+                    from: row.sender_name,
+                    subject: message.subject,
+                    topic: message.topic,
+                    thread: canonical_thread_ref(
+                        id,
+                        message.thread_id.as_deref().unwrap_or(""),
+                    ),
+                    age: format_age(age_seconds_from_micros(now_us, message.created_ts)),
+                    ack_status: priority.ack_status.to_string(),
+                    importance: message.importance,
+                    via: Some("project".to_string()),
+                    body_md: request.include_bodies.then_some(message.body_md),
+                },
+                bucket: priority.bucket,
+                ack_overdue: priority.ack_overdue,
+                created_ts: message.created_ts,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
 fn render_inbox_result(
     cmd_name: &str,
     format: OutputFormat,
@@ -6129,40 +6331,14 @@ fn server_inbox_row_to_entry(
         .get("ack_required")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let ack_overdue = ack_required && ack_ts.is_none() && created_ts < ack_threshold;
-    let bucket = if matches!(importance.as_str(), "urgent" | "high") && read_ts.is_none() {
-        1
-    } else if ack_overdue {
-        2
-    } else if ack_required && ack_ts.is_none() && read_ts.is_none() {
-        3
-    } else if read_ts.is_none() {
-        4
-    } else if ack_required && ack_ts.is_none() {
-        5
-    } else {
-        6
-    };
-    let priority = match bucket {
-        1 => "urgent",
-        2 => "ack-overdue",
-        3 => "ack-required",
-        4 => "unread",
-        5 => "read-unacked",
-        _ => "read",
-    }
-    .to_string();
-    let ack_status = if !ack_required {
-        "none".to_string()
-    } else if ack_ts.is_some() {
-        "acked".to_string()
-    } else if ack_overdue {
-        "overdue".to_string()
-    } else if read_ts.is_some() {
-        "pending".to_string()
-    } else {
-        "required".to_string()
-    };
+    let priority = inbox_priority(
+        &importance,
+        ack_required,
+        read_ts,
+        ack_ts,
+        created_ts,
+        ack_threshold,
+    );
     let thread_id = row
         .get("thread_id")
         .and_then(serde_json::Value::as_str)
@@ -6171,7 +6347,7 @@ fn server_inbox_row_to_entry(
     ServerInboxEntry {
         entry: InboxEntry {
             id,
-            priority,
+            priority: priority.label.to_string(),
             from: row
                 .get("from")
                 .and_then(serde_json::Value::as_str)
@@ -6188,7 +6364,7 @@ fn server_inbox_row_to_entry(
                 .map(str::to_string),
             thread: canonical_thread_ref(id, thread_id),
             age: format_age(age_seconds),
-            ack_status,
+            ack_status: priority.ack_status.to_string(),
             importance,
             via: row
                 .get("via")
@@ -6202,8 +6378,8 @@ fn server_inbox_row_to_entry(
                 None
             },
         },
-        bucket,
-        ack_overdue,
+        bucket: priority.bucket,
+        ack_overdue: priority.ack_overdue,
         created_ts,
     }
 }
@@ -6454,6 +6630,17 @@ fn build_inbox_with_phase(
     let now_us = mcp_agent_mail_db::now_micros();
     // ack_overdue threshold: 30 minutes
     let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
+    let snapshot = RobotInboxReadSnapshot::begin(conn)?;
+    let request = RobotInboxServerRequest {
+        project_key: project_slug.to_string(),
+        agent_name: agent_name.to_string(),
+        urgent: urgent_only,
+        ack_overdue: ack_overdue_only,
+        unread: unread_only,
+        all: show_all,
+        limit,
+        include_bodies,
+    };
 
     // Build WHERE filter based on flags
     let bucket_filter = if urgent_only {
@@ -6502,7 +6689,7 @@ fn build_inbox_with_phase(
          ) sub
          LEFT JOIN agents a_sender ON a_sender.id = sub.sender_id
          WHERE 1=1 {bucket_filter}
-         ORDER BY sub.priority_bucket ASC, sub.created_ts DESC
+         ORDER BY sub.priority_bucket ASC, sub.created_ts DESC, sub.id DESC
          LIMIT ?"
     );
 
@@ -6520,8 +6707,7 @@ fn build_inbox_with_phase(
         .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
     mark_tail_latency_phase(&mut phase, "sqlite_query");
 
-    let mut entries = Vec::new();
-    let mut overdue_ids = Vec::new();
+    let mut projected = Vec::new();
 
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
@@ -6561,32 +6747,57 @@ fn build_inbox_with_phase(
 
         let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
-        if ack_overdue {
-            overdue_ids.push(id);
-        }
-
         let body_md = if include_bodies {
             row.get_named::<String>("body_md").ok()
         } else {
             None
         };
 
-        entries.push(InboxEntry {
-            id,
-            priority: priority_label.to_string(),
-            from: sender,
-            subject,
-            topic,
-            thread: thread_ref,
-            age: format_age(age_seconds),
-            ack_status,
-            importance,
-            // This offline read covers direct deliveries only; project mail
-            // is listed by the server path (br-vsj5s).
-            via: None,
-            body_md,
+        projected.push(ServerInboxEntry {
+            entry: InboxEntry {
+                id,
+                priority: priority_label.to_string(),
+                from: sender,
+                subject,
+                topic,
+                thread: thread_ref,
+                age: format_age(age_seconds),
+                ack_status,
+                importance,
+                via: None,
+                body_md,
+            },
+            bucket,
+            ack_overdue,
+            created_ts,
         });
     }
+    projected.extend(project_inbox_candidates(
+        conn,
+        project_id,
+        agent_id,
+        &request,
+        now_us,
+        ack_threshold,
+    )?);
+    snapshot.finish()?;
+    projected.sort_by(|left, right| {
+        left.bucket
+            .cmp(&right.bucket)
+            .then_with(|| right.created_ts.cmp(&left.created_ts))
+            .then_with(|| right.entry.id.cmp(&left.entry.id))
+    });
+    projected.truncate(limit);
+    let mut overdue_ids = Vec::new();
+    let entries = projected
+        .into_iter()
+        .map(|row| {
+            if row.ack_overdue {
+                overdue_ids.push(row.entry.id);
+            }
+            row.entry
+        })
+        .collect::<Vec<_>>();
     mark_tail_latency_phase(
         &mut phase,
         if include_bodies {
@@ -6655,6 +6866,41 @@ fn build_inbox_with_snapshot_cache(
 ) -> Result<InboxResult, CliError> {
     if include_bodies {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_bypass_bodies");
+        return build_inbox_with_phase(
+            conn,
+            project_id,
+            project_slug,
+            agent_id,
+            agent_name,
+            urgent_only,
+            ack_overdue_only,
+            unread_only,
+            show_all,
+            limit,
+            include_bodies,
+            phase,
+        );
+    }
+
+    // The legacy generation stamp follows direct-recipient touches only.
+    // Shared visibility also depends on lazy receipts and viewer retirement/
+    // contact policy. Probe deliveries without visibility so a retired viewer
+    // cannot receive cached formerly-visible mail. A failed schema probe also
+    // bypasses the cache and lets the authoritative live reader report it.
+    let direct_only = conn
+        .query_sync(
+            "SELECT message_id FROM project_mailbox_deliveries WHERE project_id = ? LIMIT 1",
+            &[Value::BigInt(project_id)],
+        )
+        .is_ok_and(|rows| rows.is_empty())
+        && conn
+            .query_sync(
+                "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0",
+                &[],
+            )
+            .is_ok();
+    if !direct_only {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_bypass_shared_state");
         return build_inbox_with_phase(
             conn,
             project_id,
@@ -24947,6 +25193,298 @@ mod tests {
                 .map(|entry| entry.id)
                 .collect::<Vec<_>>(),
             vec![130]
+        );
+    }
+
+    #[test]
+    fn robot_inbox_shared_visibility_preserves_direct_delivery_and_read_only_state() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0);
+             INSERT INTO agents
+                (id, project_id, name, program, model, inception_ts, last_active_ts,
+                 retired_at, contact_policy)
+             VALUES (4, 2, 'OtherSender', '', '', 0, 0, NULL, 'auto'),
+                    (5, 2, 'OtherReader', '', '', 0, 0, NULL, 'auto'),
+                    (6, 1, 'LateReader', '', '', 300, 0, NULL, 'auto'),
+                    (7, 1, 'RetiredReader', '', '', 0, 0, 42, 'auto'),
+                    (8, 1, 'BlockedReader', '', '', 0, 0, NULL, 'BLOCK_ALL');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, thread_id, topic, importance,
+                 ack_required, created_ts, body_md)
+             VALUES (100, 1, 1, 'Shared handoff', 'HANDOFF', 'release', 'normal', 1, 100, 'shared body'),
+                    (101, 1, 1, 'Direct and shared', NULL, NULL, 'normal', 0, 110, 'direct body'),
+                    (102, 1, 2, 'Sent by viewer', NULL, NULL, 'normal', 0, 120, 'own body'),
+                    (200, 2, 4, 'Other project', NULL, NULL, 'normal', 0, 130, 'private body');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             SELECT id, project_id, 'to', created_ts FROM messages;
+             INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (101, 2, 'to');
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+             VALUES (100, 3, 150, 160);
+             PRAGMA query_only = ON;",
+        )
+        .expect("seed real shared mailbox schema");
+
+        let inbox = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, false, true, 20, true,
+        )
+        .expect("read shared inbox with query_only enabled");
+        assert_eq!(
+            inbox.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![100, 101],
+            "the viewer sees one shared handoff and one direct delivery"
+        );
+        let handoff = &inbox.entries[0];
+        assert_eq!(handoff.via.as_deref(), Some("project"));
+        assert_eq!(handoff.topic.as_deref(), Some("release"));
+        assert_eq!(handoff.body_md.as_deref(), Some("shared body"));
+        assert_eq!(handoff.ack_status, "overdue");
+        assert_eq!(inbox.entries[1].via, None, "a direct delivery wins");
+
+        let carol = build_inbox(
+            &conn, 1, "proj", 3, "Carol", false, false, false, true, 20, false,
+        )
+        .expect("read another viewer's receipts");
+        let carol_handoff = carol.entries.iter().find(|entry| entry.id == 100).unwrap();
+        assert_eq!(carol_handoff.ack_status, "acked");
+        assert_eq!(carol_handoff.priority, "read");
+        assert!(carol.entries.iter().all(|entry| entry.body_md.is_none()));
+
+        for (agent_id, agent_name) in [
+            (5, "OtherReader"),
+            (6, "LateReader"),
+            (7, "RetiredReader"),
+            (8, "BlockedReader"),
+        ] {
+            assert!(
+                build_inbox(
+                    &conn, 1, "proj", agent_id, agent_name, false, false, false, true, 20, false,
+                )
+                .expect("visibility refusal remains a successful empty read")
+                .entries
+                .is_empty(),
+                "{agent_name} must not receive shared mail"
+            );
+        }
+
+        let state = conn
+            .query_sync(
+                "SELECT (SELECT COUNT(*) FROM message_recipients) AS direct_count,
+                        (SELECT COUNT(*) FROM project_mailbox_receipts) AS receipt_count,
+                        (SELECT SUM(last_active_ts) FROM agents) AS activity",
+                &[],
+            )
+            .expect("observe state after read-only inboxes");
+        assert_eq!(state[0].get_named::<i64>("direct_count").unwrap(), 1);
+        assert_eq!(state[0].get_named::<i64>("receipt_count").unwrap(), 1);
+        assert_eq!(state[0].get_named::<i64>("activity").unwrap(), 0);
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_named::<i64>("query_only")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn robot_inbox_shared_priority_windows_keep_old_actionable_mail_before_limit() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let recent = mcp_agent_mail_db::now_micros() - MICROS_PER_MINUTE;
+        let old = recent - 2 * MICROS_PER_HOUR;
+        conn.execute_raw(&format!(
+            "INSERT INTO messages
+                (id, project_id, sender_id, subject, importance, ack_required, created_ts, body_md)
+             VALUES (300, 1, 1, 'Shared urgent', 'urgent', 1, {old}, 'b'),
+                    (301, 1, 1, 'Direct urgent', 'urgent', 1, {}, 'b'),
+                    (302, 1, 1, 'Shared read overdue', 'normal', 1, {}, 'b'),
+                    (303, 1, 1, 'Shared needs ack', 'normal', 1, {recent}, 'b'),
+                    (304, 1, 1, 'Direct unread', 'normal', 0, {}, 'b'),
+                    (305, 1, 1, 'Shared unread', 'normal', 0, {}, 'b'),
+                    (306, 1, 1, 'Shared read unacked', 'normal', 1, {}, 'b'),
+                    (307, 1, 1, 'Shared settled', 'normal', 0, {}, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             SELECT id, project_id, 'to', created_ts FROM messages WHERE id NOT IN (301, 304);
+             INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (301, 2, 'to'), (304, 2, 'to');
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts)
+             VALUES (302, 2, {recent}), (306, 2, {recent}), (307, 2, {recent});",
+            old + 1,
+            old + 2,
+            recent + 1,
+            recent + 1,
+            recent + 2,
+            recent + 3,
+        ))
+        .expect("seed all six priority classes");
+        for id in 400..410_i64 {
+            conn.query_sync(
+                "INSERT INTO messages
+                    (id, project_id, sender_id, subject, created_ts, body_md)
+                 VALUES (?, 1, 1, 'New ordinary mail', ?, 'b')",
+                &[
+                    sqlmodel_core::Value::BigInt(id),
+                    sqlmodel_core::Value::BigInt(recent + id),
+                ],
+            )
+            .expect("seed newer ordinary mail");
+            conn.query_sync(
+                "INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (?, 1, 'to', ?)",
+                &[
+                    sqlmodel_core::Value::BigInt(id),
+                    sqlmodel_core::Value::BigInt(recent + id),
+                ],
+            )
+            .expect("seed newer shared delivery");
+        }
+        conn.execute_raw("PRAGMA query_only = ON")
+            .expect("make the production inbox read-only");
+
+        for (limit, expected) in [
+            (0, vec![]),
+            (2, vec![301, 300]),
+            (3, vec![301, 300, 302]),
+            (4, vec![301, 300, 302, 303]),
+            (6, vec![301, 300, 302, 303, 409, 408]),
+        ] {
+            let result = build_inbox(
+                &conn, 1, "proj", 2, "Bob", false, false, true, false, limit, false,
+            )
+            .expect("merge priority windows before applying limit");
+            assert_eq!(
+                result.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+                expected,
+                "limit {limit} must not hide old urgent mail behind new ordinary deliveries"
+            );
+        }
+        let urgent = build_inbox(
+            &conn, 1, "proj", 2, "Bob", true, false, false, false, 20, false,
+        )
+        .expect("urgent shared inbox");
+        assert_eq!(
+            urgent.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![301, 300]
+        );
+        let overdue = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, true, false, false, 20, false,
+        )
+        .expect("overdue shared inbox");
+        assert_eq!(
+            overdue.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![301, 300, 302]
+        );
+        assert!(overdue.alerts[0].1.contains("#301, #300, #302"));
+
+        let all = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, false, true, 30, false,
+        )
+        .expect("all shared priority classes");
+        let expected = [301, 300, 302, 303]
+            .into_iter()
+            .chain((400..410).rev())
+            .chain([305, 304, 306, 307])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            expected,
+            "equal timestamps use message id as the deterministic tie-break"
+        );
+        assert_eq!(all.entries[16].priority, "read-unacked");
+        assert_eq!(all.entries[17].priority, "read");
+    }
+
+    #[test]
+    fn robot_inbox_shared_receipts_and_policy_bypass_direct_snapshot_cache() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now = mcp_agent_mail_db::now_micros();
+        conn.execute_raw(&format!(
+            "INSERT INTO messages
+                (id, project_id, sender_id, subject, ack_required, created_ts, body_md)
+             VALUES (500, 1, 1, 'Shared cache state', 1, {now}, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (500, 1, 'to', {now});"
+        ))
+        .expect("seed shared cache fixture");
+        let fetch = |all| {
+            build_inbox_with_snapshot_cache(
+                &conn, 1, "proj", 2, "Bob", false, false, !all, all, 20, false, None,
+            )
+            .expect("read the current shared state")
+        };
+        assert_eq!(fetch(false).entries[0].id, 500);
+        conn.execute_raw(&format!(
+            "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts)
+             VALUES (500, 2, {now})"
+        ))
+        .expect("record only Bob's read receipt");
+        assert!(fetch(false).entries.is_empty());
+        assert_eq!(fetch(true).entries[0].ack_status, "pending");
+        conn.execute_raw(&format!(
+            "UPDATE project_mailbox_receipts SET ack_ts = {now} WHERE message_id = 500 AND agent_id = 2"
+        ))
+        .expect("acknowledge shared message");
+        assert_eq!(fetch(true).entries[0].ack_status, "acked");
+        conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 2")
+            .expect("retire viewer without touching last_active_ts");
+        assert!(fetch(true).entries.is_empty());
+        conn.execute_raw(
+            "UPDATE agents SET retired_at = NULL, contact_policy = 'block_all' WHERE id = 2",
+        )
+        .expect("unretire with shared delivery blocked");
+        assert!(fetch(true).entries.is_empty());
+        conn.execute_raw("UPDATE agents SET contact_policy = 'open' WHERE id = 2")
+            .expect("accept shared mail again");
+        assert_eq!(fetch(true).entries[0].id, 500);
+    }
+
+    #[test]
+    fn robot_inbox_shared_schema_failures_release_only_their_read_snapshot() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, created_ts, body_md)
+             VALUES (600, 1, 1, 'Retained delivery', 100, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (600, 1, 'to', 100);
+             BEGIN IMMEDIATE;
+             ALTER TABLE project_mailbox_receipts RENAME TO retained_project_mailbox_receipts;
+             COMMIT;",
+        )
+        .expect("retain receipts while simulating an incomplete shared schema");
+        let error = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect_err("missing receipt authority must not become an empty inbox");
+        assert!(error.to_string().contains("incomplete project mailbox schema"));
+
+        conn.execute_raw(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE retained_project_mailbox_receipts RENAME TO project_mailbox_receipts;
+             COMMIT;
+             BEGIN;
+             UPDATE messages SET subject = 'Uncommitted caller change' WHERE id = 600;",
+        )
+        .expect("reader released its failed savepoint, allowing a new transaction");
+        let result = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("read inside the caller's transaction");
+        assert_eq!(result.entries[0].subject, "Uncommitted caller change");
+        conn.execute_raw("ROLLBACK")
+            .expect("inbox read did not commit the caller's transaction");
+        assert_eq!(
+            build_inbox(
+                &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+            )
+            .unwrap()
+            .entries[0]
+                .subject,
+            "Retained delivery"
         );
     }
 
