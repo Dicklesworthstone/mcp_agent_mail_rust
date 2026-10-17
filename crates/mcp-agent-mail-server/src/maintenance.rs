@@ -11,6 +11,9 @@
 
 #[path = "maintenance_midx.rs"]
 mod midx_recovery;
+#[cfg(unix)]
+#[path = "maintenance_capture.rs"]
+mod output_capture;
 
 use mcp_agent_mail_core::Config;
 use serde::Serialize;
@@ -1209,6 +1212,12 @@ fn terminate_maintenance_child(
     git_dir: &Path,
     termination_reason: &str,
 ) -> Option<String> {
+    // Capture can time out on inherited pipes AFTER the direct child was
+    // reaped. Never signal that reusable PID or invent lock ownership for a
+    // lock observed after its exit. Keep the original active-child evidence.
+    if child.try_wait().ok().flatten().is_some() {
+        return None;
+    }
     let git_pid = child.id();
     let git_process_start_ticks = process_start_ticks(git_pid);
 
@@ -1294,26 +1303,32 @@ fn run_maintenance_once(git_dir: &Path) -> MaintenanceReport {
     // only be requested after the loose-objects task has created a pack.
     let include_incremental_repack = pack_before.is_some_and(|count| count > 0);
 
-    let mut child =
-        match build_git_maintenance_command(git_dir, work_tree, include_incremental_repack)
+    let command = build_git_maintenance_command(git_dir, work_tree, include_incremental_repack);
+    #[cfg(unix)]
+    let spawned = output_capture::CapturedChild::spawn(command, &SHUTDOWN);
+    #[cfg(not(unix))]
+    let spawned = {
+        let mut command = command;
+        command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                return MaintenanceReport {
-                    loose_before,
-                    pack_count_before: pack_before,
-                    disk_bytes_before: disk_before,
-                    lock_reaped: lock_preflight.reaped,
-                    lock_evidence: lock_preflight.evidence,
-                    error: Some(e.to_string()),
-                    notes,
-                    ..Default::default()
-                };
-            }
-        };
+    };
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            return MaintenanceReport {
+                loose_before,
+                pack_count_before: pack_before,
+                disk_bytes_before: disk_before,
+                lock_reaped: lock_preflight.reaped,
+                lock_evidence: lock_preflight.evidence,
+                error: Some(e.to_string()),
+                notes,
+                ..Default::default()
+            };
+        }
+    };
     // GH#234 fail-open under disk pressure: an evidence-write failure most
     // likely means the disk is full — exactly when maintenance is most
     // needed. Do NOT kill the freshly spawned git child; let it run and note
@@ -1334,9 +1349,40 @@ fn run_maintenance_once(git_dir: &Path) -> MaintenanceReport {
         );
     }
 
-    // Poll the child process, checking for shutdown signal so we don't
-    // block server exit if git maintenance hangs.
+    // Drain while Git is running: waiting for exit first deadlocks on full
+    // pipes. Unix also bounds inherited writers after the direct child exits.
+    #[cfg(unix)]
+    let output: std::io::Result<std::process::Output> = match child.wait_output(
+        &SHUTDOWN,
+        Duration::from_secs(MAINTENANCE_COMMAND_TIMEOUT_SECS),
+    ) {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            let detail = error.to_string();
+            let lock_evidence = terminate_maintenance_child(child.child_mut(), git_dir, &detail);
+            return MaintenanceReport {
+                loose_before,
+                loose_after: count_loose_objects(git_dir),
+                pack_count_before: pack_before,
+                pack_count_after: count_pack_files(git_dir),
+                disk_bytes_before: disk_before,
+                disk_bytes_after: measure_objects_disk_usage(git_dir),
+                lock_reaped: lock_preflight.reaped,
+                lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
+                error: Some(lock_evidence.map_or(detail.clone(), |evidence| {
+                    format!("{detail}; {evidence}")
+                })),
+                notes,
+                ..Default::default()
+            };
+        }
+    };
+
+    // Non-Unix retains its existing process/pipe behavior; the Unix capture
+    // guarantees above are not a claim about this fallback.
+    #[cfg(not(unix))]
     let started = Instant::now();
+    #[cfg(not(unix))]
     let output = loop {
         match child.try_wait() {
             Ok(Some(_status)) => break child.wait_with_output(),
