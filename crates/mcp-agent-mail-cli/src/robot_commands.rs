@@ -6130,10 +6130,7 @@ fn project_inbox_candidates(
                     from: row.sender_name,
                     subject: message.subject,
                     topic: message.topic,
-                    thread: canonical_thread_ref(
-                        id,
-                        message.thread_id.as_deref().unwrap_or(""),
-                    ),
+                    thread: canonical_thread_ref(id, message.thread_id.as_deref().unwrap_or("")),
                     age: format_age(age_seconds_from_micros(now_us, message.created_ts)),
                     ack_status: priority.ack_status.to_string(),
                     importance: message.importance,
@@ -6963,6 +6960,11 @@ fn build_inbox_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
+        && entry
+            .result
+            .entries
+            .iter()
+            .all(|message| message.via.is_none())
         && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
@@ -6984,6 +6986,11 @@ fn build_inbox_with_snapshot_cache(
         include_bodies,
         phase,
     )?;
+    // A shared delivery can arrive after the direct-only eligibility probe.
+    // Never store its live result under a generation that cannot track it.
+    if result.entries.iter().any(|message| message.via.is_some()) {
+        return Ok(result);
+    }
     if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
         cache.clear();
     }
@@ -25232,7 +25239,11 @@ mod tests {
         )
         .expect("read shared inbox with query_only enabled");
         assert_eq!(
-            inbox.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            inbox
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
             vec![100, 101],
             "the viewer sees one shared handoff and one direct delivery"
         );
@@ -25354,7 +25365,11 @@ mod tests {
             )
             .expect("merge priority windows before applying limit");
             assert_eq!(
-                result.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
                 expected,
                 "limit {limit} must not hide old urgent mail behind new ordinary deliveries"
             );
@@ -25364,7 +25379,11 @@ mod tests {
         )
         .expect("urgent shared inbox");
         assert_eq!(
-            urgent.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            urgent
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
             vec![301, 300]
         );
         let overdue = build_inbox(
@@ -25372,7 +25391,11 @@ mod tests {
         )
         .expect("overdue shared inbox");
         assert_eq!(
-            overdue.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            overdue
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
             vec![301, 300, 302]
         );
         assert!(overdue.alerts[0].1.contains("#301, #300, #302"));
@@ -25460,7 +25483,11 @@ mod tests {
             &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
         )
         .expect_err("missing receipt authority must not become an empty inbox");
-        assert!(error.to_string().contains("incomplete project mailbox schema"));
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete project mailbox schema")
+        );
 
         conn.execute_raw(
             "BEGIN IMMEDIATE;
@@ -25485,6 +25512,93 @@ mod tests {
             .entries[0]
                 .subject,
             "Retained delivery"
+        );
+    }
+
+    #[test]
+    fn robot_inbox_direct_cache_rejects_shared_rows_after_delivery_authority_changes() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0);
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, importance, ack_required, created_ts, body_md)
+             VALUES (650, 1, 1, 'Retained shared authority', 'urgent', 1, 100, 'b');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (650, 1, 'to', 100);",
+        )
+        .expect("seed shared mail under the real schema");
+        let shared = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build the result that can arrive after the cache eligibility probe");
+        assert_eq!(shared.entries.len(), 1);
+        assert_eq!(shared.entries[0].via.as_deref(), Some("project"));
+        assert!(!shared.alerts.is_empty());
+        let generation = robot_status_snapshot_generation(&conn, 1).unwrap();
+        let key = RobotInboxSnapshotKey {
+            db_identity: robot_db_identity(&conn),
+            project_id: 1,
+            project_slug: "proj".to_string(),
+            agent_id: 2,
+            agent_name: "Bob".to_string(),
+            urgent_only: false,
+            ack_overdue_only: false,
+            unread_only: true,
+            show_all: false,
+            limit: 20,
+        };
+
+        conn.execute_raw(
+            "UPDATE project_mailbox_deliveries SET project_id = 2 WHERE message_id = 650;
+             UPDATE agents SET retired_at = 42 WHERE id = 2;",
+        )
+        .expect("change delivery authority without deleting the retained message");
+        assert_eq!(
+            robot_status_snapshot_generation(&conn, 1).unwrap(),
+            generation,
+            "the legacy stamp does not track shared delivery or retirement changes"
+        );
+        assert!(
+            conn.query_sync(
+                "SELECT message_id FROM project_mailbox_deliveries WHERE project_id = 1",
+                &[],
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // Model the reachable post-race cache state without timing hooks:
+        // the eligibility probe saw direct-only state, then a live read saw
+        // shared mail and was stored under the same legacy generation.
+        robot_inbox_snapshot_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                RobotInboxSnapshotEntry {
+                    generation,
+                    cached_at: Instant::now(),
+                    result: shared,
+                },
+            );
+
+        let inbox = build_inbox_with_snapshot_cache(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false, None,
+        )
+        .expect("reject shared cache authority and rebuild the live inbox");
+        assert!(inbox.entries.is_empty());
+        assert!(inbox.alerts.is_empty());
+        assert!(inbox.actions.is_empty());
+        assert_eq!(
+            conn.query_sync("SELECT id FROM messages WHERE id = 650", &[])
+                .unwrap()
+                .len(),
+            1,
+            "retaining the message must not preserve obsolete delivery visibility"
         );
     }
 

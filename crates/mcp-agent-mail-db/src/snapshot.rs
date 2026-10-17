@@ -344,7 +344,10 @@ fn preserve_legacy_snapshot_metadata(meta_path: &Path, bytes: &[u8]) -> DbResult
         DbError::Sqlite("snapshot metadata has no evidence directory".to_string())
     })?;
     let mut name = meta_path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".legacy-{}.json", hex::encode(Sha256::digest(bytes))));
+    name.push(format!(
+        ".legacy-{}.json",
+        hex::encode(Sha256::digest(bytes))
+    ));
     let preserved = parent.join(name);
     let verify_existing = || -> DbResult<()> {
         let existing = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
@@ -1195,10 +1198,7 @@ mod tests {
         record_snapshot_metadata(&primary, 43).expect("normal refresh after upgrade");
         assert_eq!(preserved_legacy_paths(dir.path()), preserved);
         assert_eq!(std::fs::read(&preserved[0]).unwrap(), legacy);
-        assert_eq!(
-            latest_verified_snapshot(&primary).unwrap().created_us,
-            43
-        );
+        assert_eq!(latest_verified_snapshot(&primary).unwrap().created_us, 43);
     }
 
     #[test]

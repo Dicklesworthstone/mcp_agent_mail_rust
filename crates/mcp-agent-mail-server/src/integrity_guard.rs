@@ -416,7 +416,11 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
                 if full_completed || !skipped_quick_cycle {
                     if take_deferred_proactive_backup() {
                         tracing::debug!("integrity guard: deferred automatic backup refresh");
-                    } else if !run_automatic_backup(&pool, &config.storage_root, &mut backup_schedule) {
+                    } else if !run_automatic_backup(
+                        &pool,
+                        &config.storage_root,
+                        &mut backup_schedule,
+                    ) {
                         return false;
                     }
                 }
@@ -1730,7 +1734,8 @@ mod tests {
             let before = std::fs::read(&primary).unwrap();
             let old_backups: Vec<_> = (0..50)
                 .map(|index| {
-                    let path = database_dir.join(format!("mail.sqlite3.bak.20000101_0000{index:02}"));
+                    let path =
+                        database_dir.join(format!("mail.sqlite3.bak.20000101_0000{index:02}"));
                     std::fs::copy(&primary, &path).unwrap();
                     path
                 })
@@ -1742,7 +1747,10 @@ mod tests {
                 schedule.request_verified();
             }
             let published = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("AM_BACKUP_KEEP_COUNT", "3"), ("AM_BACKUP_ROTATION_DELETE", "0")],
+                &[
+                    ("AM_BACKUP_KEEP_COUNT", "3"),
+                    ("AM_BACKUP_ROTATION_DELETE", "0"),
+                ],
                 || run_automatic_backup(&pool, &storage_root, &mut schedule),
             );
             assert!(published);
@@ -1778,7 +1786,10 @@ mod tests {
                     ) == Some(crate::backup_rotation::BackupKind::ManualBackup)
                 })
                 .count();
-            assert_eq!(resident_backups, 3, "rotation must run before this call returns");
+            assert_eq!(
+                resident_backups, 3,
+                "rotation must run before this call returns"
+            );
             let quarantines: Vec<_> = std::fs::read_dir(storage_root.join("doctor/reclaimable"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -1815,11 +1826,15 @@ mod tests {
             let failed = producer_result.is_err();
             let mut schedule = AutomaticBackupSchedule::default();
             schedule.request_verified();
-            let followups = run_automatic_backup_with(&mut schedule, || now, |_| {
-                rotate_after_published_backup_with(producer_result, || {
-                    panic!("an unpublished backup must not authorize rotation")
-                })
-            });
+            let followups = run_automatic_backup_with(
+                &mut schedule,
+                || now,
+                |_| {
+                    rotate_after_published_backup_with(producer_result, || {
+                        panic!("an unpublished backup must not authorize rotation")
+                    })
+                },
+            );
             assert_eq!(
                 followups, failed,
                 "preserve the existing producer-result contract"
@@ -1834,12 +1849,16 @@ mod tests {
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.request_verified();
         let rotated = std::cell::Cell::new(false);
-        assert!(run_automatic_backup_with(&mut schedule, || now, |_| {
-            rotate_after_published_backup_with(Ok(true), || {
-                rotated.set(true);
-                Err(std::io::Error::other("quarantine unavailable"))
-            })
-        }));
+        assert!(run_automatic_backup_with(
+            &mut schedule,
+            || now,
+            |_| {
+                rotate_after_published_backup_with(Ok(true), || {
+                    rotated.set(true);
+                    Err(std::io::Error::other("quarantine unavailable"))
+                })
+            }
+        ));
         assert!(rotated.get());
         assert_eq!(schedule.consecutive_failures(), 0);
         assert_eq!(schedule.next_attempt(now), Some(BackupKind::Proactive));
