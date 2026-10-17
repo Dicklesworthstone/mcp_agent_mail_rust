@@ -975,11 +975,19 @@ fn reconcile_message_batch_inner(
                         break;
                     }
                     let ticket = durability::ticket_for(config, &prepared);
-                    let result =
-                        reconcile_prepared_inner(config, &prepared, Some(RepairControl { cx, stop }));
+                    let result = reconcile_prepared_inner(
+                        config,
+                        &prepared,
+                        Some(RepairControl { cx, stop }),
+                    );
                     if result.is_ok() {
                         durability::confirm_repaired(
-                            cx, pool, config, &selected_identity, stop, ticket.as_ref(),
+                            cx,
+                            pool,
+                            config,
+                            &selected_identity,
+                            stop,
+                            ticket.as_ref(),
                         );
                     }
                     result
@@ -1179,34 +1187,43 @@ fn prune_retention_candidate(
     // Match archive writers' lock order: publication fence, then project lock.
     // Keep both through the DB commit so cooperating archive writes cannot
     // invalidate the evidence between verification and destructive retention.
-    let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
+    // Replayable maintenance must not retain promotion admission indefinitely
+    // behind a busy publisher. Use the native recovery fence and lock budget.
+    let control = RepairControl { cx, stop };
+    let _mutation = control
+        .begin_at(&config.storage_root)
+        .map_err(|error| error.to_string())?;
     let archive = crate::open_archive(config, &prepared.project_slug)
         .map_err(|error| error.to_string())?
         .ok_or("retention requires an existing authoritative project archive")?;
-    crate::with_project_lock(&archive, || {
-        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-            return Ok(PruneAttempt::Interrupted);
-        }
-        if verify_retention_archive(&archive, &prepared, &mut report.archive_bytes)
-            .map_err(super::invalid)?
-            .is_none()
-        {
-            return Ok(PruneAttempt::NextBatch);
-        }
-        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-            return Ok(PruneAttempt::Interrupted);
-        }
-        let pruned = outcome(block_on(prune_verified_settled_messages(
-            cx,
-            pool,
-            older_than_us,
-            1,
-            std::slice::from_ref(&candidate),
-        )))
-        .map_err(super::invalid)?;
-        Ok(PruneAttempt::Pruned(pruned))
-    })
-    .map_err(|error| error.to_string())
+    archive
+        .with_repair_lock(
+            || control.cancelled(),
+            || {
+                if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                    return Ok(PruneAttempt::Interrupted);
+                }
+                if verify_retention_archive(&archive, &prepared, &mut report.archive_bytes)
+                    .map_err(super::invalid)?
+                    .is_none()
+                {
+                    return Ok(PruneAttempt::NextBatch);
+                }
+                if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                    return Ok(PruneAttempt::Interrupted);
+                }
+                let pruned = outcome(block_on(prune_verified_settled_messages(
+                    cx,
+                    pool,
+                    older_than_us,
+                    1,
+                    std::slice::from_ref(&candidate),
+                )))
+                .map_err(super::invalid)?;
+                Ok(PruneAttempt::Pruned(pruned))
+            },
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// Prune only settled messages whose complete archive has been verified.
@@ -1220,6 +1237,9 @@ fn prune_retention_candidate(
 /// Connections are released during archive reads. One write-activity lease
 /// excludes recovery promotion from source selection through deletion; each
 /// candidate also retains the archive publication fence and project lock.
+/// Promotion and publication contention defer without waiting indefinitely;
+/// project-lock admission shares recovery's bounded, cancellation-aware budget.
+/// Deferred evidence is always reverified before a later deletion attempt.
 pub fn prune_archived_message_batch(
     cx: &Cx,
     pool: &DbPool,
@@ -1236,7 +1256,8 @@ pub fn prune_archived_message_batch(
     if corruption_circuit_breaker().is_tripped() {
         return Err("archive-verified retention refused: source corruption breaker is open".into());
     }
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    let _write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or("archive-verified retention deferred: recovery promotion or admission contention")?;
     validate_pool_binding(pool, config)?;
     {
         let conn = outcome(block_on(pool.acquire(cx)))?;
@@ -1292,6 +1313,13 @@ pub fn prune_archived_message_batch(
                 if pruned.deleted_messages == 0 {
                     report.deferred += 1;
                 }
+            }
+            Err(_) if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() => {
+                // A cancelled lock wait did not inspect or delete this source.
+                // Preserve its position rather than consuming it as a conflict.
+                report.interrupted = true;
+                completed_page = false;
+                break;
             }
             Err(reason) => {
                 report.deferred += 1;
@@ -2423,7 +2451,10 @@ mod tests {
                 assert_eq!(report.unchanged, 16, "pass {pass}: {report:?}");
                 assert_eq!(report.repaired, 0);
                 assert_eq!(report.deferred, 0);
-                assert!(report.budget_exhausted, "healthy pages must not hide an older orphan");
+                assert!(
+                    report.budget_exhausted,
+                    "healthy pages must not hide an older orphan"
+                );
                 assert_eq!(report.checkpoint_saved, Some(true));
             }
             let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
@@ -2435,8 +2466,19 @@ mod tests {
             assert!(repaired.repaired <= MAX_REPAIRS_PER_BATCH);
             assert!(repaired.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
             let original = prepare_message(cx, pool, 901).unwrap();
-            assert_eq!(reconcile_prepared(config, &original).unwrap(), ReconcileResult::default());
-            assert!(verify_retention_archive(&crate::open_archive(config, "project").unwrap().unwrap(), &original, &mut 0).unwrap().is_some());
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap(),
+                ReconcileResult::default()
+            );
+            assert!(
+                verify_retention_archive(
+                    &crate::open_archive(config, "project").unwrap().unwrap(),
+                    &original,
+                    &mut 0
+                )
+                .unwrap()
+                .is_some()
+            );
 
             let end = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
             assert_eq!(end.scanned, 0);
@@ -2448,9 +2490,17 @@ mod tests {
             assert_eq!(wrapped.unchanged, 16);
             assert!(!wrapped.budget_exhausted);
             assert!(cursor.startup_backfill_complete);
-            assert_eq!(retained_message_ids(cx, pool), (901..941).collect::<Vec<_>>());
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..941).collect::<Vec<_>>()
+            );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            let receipts = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901", &[]).unwrap();
+            let receipts = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901",
+                    &[],
+                )
+                .unwrap();
             assert_eq!(receipts.len(), 2);
             for receipt in receipts {
                 assert_eq!(receipt.get_named::<i64>("read_ts").unwrap(), 2_000_000);
@@ -2464,8 +2514,10 @@ mod tests {
         retention_fixture(40, |cx, pool, config| {
             archive_fixture_range(cx, pool, config, 902..941);
             let stop = AtomicBool::new(false);
-            let mut before_restart = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let first = reconcile_message_batch(cx, pool, config, &mut before_restart, &stop).unwrap();
+            let mut before_restart =
+                ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let first =
+                reconcile_message_batch(cx, pool, config, &mut before_restart, &stop).unwrap();
             assert_eq!(first.unchanged, 16);
             assert_eq!(before_restart.backfill_ceiling, Some(924));
             assert_eq!(first.checkpoint_saved, Some(true));
@@ -2491,12 +2543,16 @@ mod tests {
     fn empty_and_stopped_startup_backfill_do_not_request_busy_polling() {
         retention_fixture(0, |cx, pool, config| {
             let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
-            let stopped = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(true)).unwrap();
+            let stopped =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(true))
+                    .unwrap();
             assert!(stopped.interrupted);
             assert!(!stopped.budget_exhausted);
             assert!(!cursor.startup_backfill_complete);
             for _ in 0..3 {
-                let empty = reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+                let empty =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
                 assert_eq!(empty.scanned, 0);
                 assert!(!empty.budget_exhausted);
                 assert!(cursor.startup_backfill_complete);
