@@ -61,6 +61,7 @@ pub mod never_written_pages;
 pub mod pool;
 #[path = "pool.rs"]
 mod pool_impl;
+pub mod product_inbox;
 pub mod project_mailbox;
 pub mod queries;
 pub mod query_assistance;
