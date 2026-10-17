@@ -91,7 +91,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 19 agent-optimized CLI subcommands with `toon`/`json` output (`md` for thread and message views) for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
-| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing are controlled by the hybrid feature flag (`feature = "hybrid"`). |
+| **Hybrid Search** | Search V3 via frankensearch. The lexical tier ships by default; semantic and hybrid routing need a build with the hybrid feature (`feature = "hybrid"`) and the runtime opt-in `AM_SEARCH_SEMANTIC_ENABLED=true`. Without both, every query runs lexical. |
 | **Pre-Commit Guard** | Git hook that blocks commits touching files reserved by other agents |
 | **Dual-Mode Interface** | MCP server (`mcp-agent-mail`) and operator CLI (`am`) share tools but enforce strict surface separation |
 
@@ -395,9 +395,10 @@ macro_prepare_thread(project_key="/abs/path/to/repo", thread_id="FEAT-123",
 macro_file_reservation_cycle(project_key="/abs/path/to/repo", agent_name="GreenCastle",
                              paths=["src/auth/**"], ttl_seconds=3600, auto_release=true)
 
-# Contact handshake between agents in different projects (records the link;
-# a welcome message is only delivered within one project — across projects the
-# response carries welcome_skipped_reason instead)
+# Contact handshake between agents in different projects: approves the link and
+# delivers the welcome into the target's project (without auto_accept the link
+# stays pending, no welcome is sent, and the response says why; auto_accept never
+# overrides a link the target has blocked)
 macro_contact_handshake(project_key="/abs/path/to/repo", requester="GreenCastle",
                         target="BlueLake", to_project="/abs/path/to/other/repo",
                         auto_accept=true, welcome_subject="Coordination channel",
@@ -774,7 +775,7 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 | 6 | Reservations | File reservation status, conflicts, and create/release actions |
 | 7 | Tool Metrics | Per-tool call counts, latency distributions, and failures |
 | 8 | System Health | Probe/circuit/disk/memory diagnostics plus ATC health widget |
-| 9 | Timeline | Events/Commits/Combined timeline views with inspector |
+| 9 | Timeline | Events/Commits/Combined/Log timeline views with inspector |
 | 10 | Projects | Project inventory and routing helpers |
 | 11 | Contacts | Contact links, policy view, and graph/mermaid modes |
 | 12 | Explorer | Unified inbox/outbox explorer with direction and ack filters |
@@ -783,10 +784,10 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 | 15 | Archive Browser | Two-pane Git archive browser with tree + file preview |
 | 16 | ATC | Snapshot-driven ATC control surface with decision drill-in and retention report |
 
-**Global keys:** `?` help, `Ctrl+P`/`:` command palette, `/` global search focus, `.` contextual action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast-focus mode, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API transport, `q` quit.
+**Global keys:** `?` help, `Ctrl+P`/`:` command palette, `/` the screen's own filter (global search focus on screens without one), `.` contextual action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast-focus mode, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API transport, `q` quit.
 **ATC keys:** `d` decision detail, `r` retention report, `i` toggle detail pane, `Tab` switch agents/decisions.
 
-**Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` for Table/Graph mode; batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
+**Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined/Log and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` for Table/Graph mode; batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
 
 **Command palette:** Press `Ctrl+P` (or `:` outside text-entry) to open a searchable action launcher that includes screen navigation, transport/layout controls, and dynamic entities (agents/projects/threads/tools/reservations).
 
@@ -965,7 +966,24 @@ sequenceDiagram
 ### Across Different Repos
 
 - **Option A (single project bus):** Register both repos under the same `project_key`. Keep reservation patterns specific (`frontend/**` vs `backend/**`).
-- **Option B (separate projects):** Each repo has its own `project_key`. Contact links (`request_contact`/`respond_contact` or `macro_contact_handshake`) record the cross-project relationship, and the product bus gives cross-project search and inbox views. `send_message` itself delivers only within one project: naming a contact from another project, or an agent registered in another project linked to the same product, is refused with `CROSS_PROJECT_RECIPIENT` rather than delivered (no same-name placeholder is created). For direct messages between repos, use Option A.
+- **Option B (separate projects):** Each repo has its own `project_key`. Link two agents with a contact handshake, then address the other agent with a project-qualified name:
+
+  ```
+  macro_contact_handshake(project_key="/abs/path/frontend", requester="BlueLake",
+                          target="GreenCastle", to_project="/abs/path/backend",
+                          auto_accept=true)
+  send_message(project_key="/abs/path/frontend", sender_name="BlueLake",
+               to=["GreenCastle@/abs/path/backend"], subject="API change",
+               body_md="Please bump /v2.", thread_id="br-124", ack_required=true)
+  ```
+
+  - `Name@project` takes the project's human key or its slug (as returned by `ensure_project` and listed by `resource://projects`), and so does the older `project:<project>#Name` form. The qualified name is resolved in that project only and is never auto-registered.
+  - The message is delivered only while an approved, unexpired contact link exists between the two agents (in either direction). Without one the send fails with `CONTACT_REQUIRED` and a ready `macro_contact_handshake` call; a blocked link or a `block_all` recipient fails with `CONTACT_BLOCKED`. This holds even when the recipient's own contact policy is `open`.
+  - The message is stored in the recipient's project, so the recipient reads it with its ordinary `fetch_inbox`, acknowledges it with `acknowledge_message`, and answers with `reply_message` in its own project. A default reply to a message from another project goes back to the original sender in that sender's project over the same link.
+  - One message lives in one project: a send may address agents of one other project, or local agents, but not both (`INVALID_ARGUMENT`; send twice instead).
+  - A plain name still addresses only the sender's project. Naming a contact from another project, or an agent registered in another project of the same product, is refused with `CROSS_PROJECT_RECIPIENT` (the error carries the qualified address to use); no same-name placeholder is created.
+
+  The product bus (`fetch_inbox_product`, `search_messages_product`, `summarize_thread_product`) aggregates an agent's inboxes and threads across the linked projects.
 
 ### External Git Coordination (opt-in)
 
@@ -1116,7 +1134,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_TUI_COACH_HINTS_ENABLED` | `true` | Enable contextual coach-hint notifications |
 | `AM_TUI_EFFECTS` | `true` | Enable text/animation effects |
 | `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
-| `AM_TUI_FULL_REDRAW_MAX_SECS` | `1.0` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs incremental-diff render desync; `<= 0` disables the bound |
+| `AM_TUI_FULL_REDRAW_MAX_SECS` | `30` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs terminal desync (e.g. after a mux pane swap). Each forced redraw resends the whole screen, so lower values cost terminal output; `<= 0` disables the bound |
 | `AM_IDEMPOTENCY_RETENTION_SECS` | `86400` | Retention window in seconds for `file_reservation_paths` idempotency keys; invalid or non-positive values fall back to 24 hours |
 | `WORKTREES_ENABLED` | `false` | Build slots feature flag |
 | `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run `PRAGMA integrity_check` during startup self-heal (set `false` to fast-unblock a degraded boot) |
@@ -1319,7 +1337,7 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 - **Write-behind cache** with dual-indexed ReadCache and deferred touch batching (30s flush)
 - **Async git commit coalescer** (write-behind queue) to avoid commit storms
 - **i64 microseconds** for all timestamps (no `chrono::NaiveDateTime` in storage layer)
-- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate, with portable/no-default builds retaining the deterministic lexical path.
+- **Search V3 via frankensearch**: lexical tier ships by default in the supported search stack; semantic and hybrid fusion are compiled through the `feature = "hybrid"` gate and run only with `AM_SEARCH_SEMANTIC_ENABLED=true`; portable/no-default builds and the default runtime keep the deterministic lexical path.
 - **Compatibility testing** against intentionally retained Python wire contracts,
   plus Rust-native durability and behavior fixtures. The Rust implementation is
   authoritative; legacy parity never overrides reliability, security, bounded
@@ -1417,7 +1435,7 @@ The important boundary is this: Git stores the durable human-auditable artifacts
 
 1. A resource read, robot command, TUI view, or web request asks for mailbox or tooling state.
 2. The server resolves scope: project, agent, product, thread, search query, or tooling view.
-3. For direct state, an existing live SQLite mailbox answers through a query-only lane; it does not wait for archive reconstruction or the write-behind coalescer, and a read request does not create a missing project. `fetch_inbox` performs its optional read-receipt update separately after the bounded read. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is enabled.
+3. For direct state, an existing live SQLite mailbox answers through a query-only lane; it does not wait for archive reconstruction or the write-behind coalescer, and a read request does not create a missing project. `fetch_inbox` performs its optional read-receipt update separately after the bounded read. For search, Search V3 plans the query and executes the appropriate lexical route, or the semantic/hybrid route when the `feature = "hybrid"` build path is compiled in and `AM_SEARCH_SEMANTIC_ENABLED=true`.
 4. The result is rendered as MCP JSON, robot `toon`/`json`/`md`, TUI widgets, or HTML under `/mail/`.
 
 That consistency comes from a shared DB + archive + metrics pipeline. The TUI, web UI, robot CLI, and MCP resources are separate renderers over the same underlying state.
@@ -1429,7 +1447,7 @@ That consistency comes from a shared DB + archive + metrics pipeline. The TUI, w
 Search V3 is not an afterthought bolted onto mailbox rows. It is a dedicated query path with shared planning and diagnostics:
 
 - Queries are normalized, classified, and routed through a unified search service.
-- Lexical mode provides the baseline contract and diagnostics surface; semantic and hybrid modes extend that contract when the `hybrid` feature is enabled.
+- Lexical mode provides the baseline contract and diagnostics surface; semantic and hybrid modes extend that contract in a `hybrid`-feature build with `AM_SEARCH_SEMANTIC_ENABLED=true`. Otherwise a semantic, hybrid, or auto request runs lexical.
 - Candidate budgeting and fusion keep broad natural-language queries from exploding while preserving exact-match strength for identifiers and short phrases.
 - The same search path serves MCP tools, `am mail search`, `am robot search`, TUI search, and web UI search routes.
 - Empty or non-searchable queries route through a deterministic SQL plan before Search V3 candidate retrieval. Legacy SQLite FTS artifacts still exist for migration hygiene and cleanup, but the current search architecture is Search V3 plus that deterministic SQL plan, not a hidden FTS fallback.
@@ -1623,7 +1641,7 @@ These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which record
 
 #### Search V3 frankensearch lexical-tier baselines (2026-02-18)
 
-Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion are controlled by the `hybrid` feature.
+Tantivy is the lexical backend inside frankensearch; semantic and hybrid fusion need the `hybrid` feature and `AM_SEARCH_SEMANTIC_ENABLED=true`.
 
 | Corpus size | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 |
 |-------------|--------------|--------------|--------------|------------|
@@ -1761,7 +1779,7 @@ What `check` inspects:
 | Port 8765 already in use | `am serve-http --port 9000` or stop the existing server |
 | TUI not rendering | Check `TUI_ENABLED=true` and that your terminal supports 256 colors |
 | TUI appears **frozen** (render/input stuck, but the process is still serving MCP/API) | Do **not** kill the process. Run the non-interactive freeze escape hatch `am tui-dump --format json`: it returns the same situational snapshot the TUI renders, fetched live from `/mail/ws-state` (including a per-loop liveness verdict that names the stalled loop) and falling back to a local SQLite read if the whole process is wedged. Always exits 0. `am robot health --format json` also classifies the stall and points at the same read-out. If the freeze persists, restart headless: `mcp-agent-mail serve --no-tui`. |
-| TUI shows **garbled / stale cells** (render corruption that clears on resize) | A guaranteed full redraw is bounded by wall clock: `AM_TUI_FULL_REDRAW_MAX_SECS` (default `1.0`s). Lower it (e.g. `0.25`) to repair incremental-diff desync faster, or set `<= 0` to disable the bound. Ensure you are on the latest build — confirm with `am --version` and reinstall via `./install-local.sh` if stale, since render fixes ship in the binary, not the running session. |
+| TUI shows **garbled / stale cells** (render corruption that clears on resize) | A guaranteed full redraw is bounded by wall clock: `AM_TUI_FULL_REDRAW_MAX_SECS` (default `30`s). Lower it (e.g. `2`) to repair desync faster at the cost of resending the whole screen that often, or set `<= 0` to disable the bound. Ensure you are on the latest build — confirm with `am --version` and reinstall via `./install-local.sh` if stale, since render fixes ship in the binary, not the running session. |
 | TUI becomes **mostly blank after running for a while** | Upgrade to `v0.3.21` or later and confirm with `am --version`. Older builds could mistake a healthy 100 ms frame for a missed 16.6 ms budget and then replace most content with an `EssentialOnly` frame. Current builds keep the console at full visual fidelity under load; `am e2e run --project . tui_full_traversal` verifies this against an emulated terminal screen. |
 | `Resource is temporarily busy` | The message includes the activity-lock owner PID, age, mode, subject, and executable when metadata is available. Run the read-only `am doctor locks --json`; do not remove lock files. Stale advisory metadata is reaped only after an exclusive-lock probe proves no kernel holder and records PID/executable liveness evidence. |
 | Interactive `am` while a service is running | It attaches a read-only TUI snapshot and leaves the service running. Restart coordination uses a single mailbox mutex with bounded jittered backoff, so concurrent starts wait for a live peer instead of restart-fighting. Use `--takeover` only for an intentional replacement. |
@@ -1772,7 +1790,7 @@ What `check` inspects:
 | Tools time out / "Database corruption detected" under heavy load | Inspect the timeout response or `health_check` timeout diagnostics: they report `contended_path`, whether that stage exceeded the client deadline, p99 pool-acquire/database-write/archive queue/archive-commit latency, and blocking-dispatch occupancy. An unattributed dispatch timeout is reported as such, not blamed on SQLite. Also run `am robot health --include-host --format json`; if `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, relieve host pressure before reconstructing. |
 | `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor check --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
-| `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |
+| `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all` (a dry run unless `--apply`). |
 
 ### Known-bad git versions
 
@@ -1819,7 +1837,7 @@ A: No. One server handles multiple projects. Each project is identified by its a
 A: Agent Mail generates memorable adjective+noun names (e.g., `GreenCastle`, `BlueLake`, `RedHarbor`) when agents register. Agents can also specify a name explicitly.
 
 **Q: Can agents in different repos talk to each other?**
-A: Yes, by sharing one `project_key` for both repos (Option A under "Across Different Repos"); direct `send_message` delivery is scoped to one project. With separate projects, contact links record the relationship and the product bus provides cross-project search and inbox queries, but a `send_message` naming an agent from another project is refused (`CROSS_PROJECT_RECIPIENT`) instead of being delivered.
+A: Yes. Either share one `project_key` for both repos (Option A under "Across Different Repos"), or keep separate projects, approve a contact link with `macro_contact_handshake(..., to_project=...)`, and address the other agent as `Name@project` (Option B). The message is stored in the recipient's project, where it reads, acknowledges and replies as usual. A plain name only addresses the sender's own project.
 
 **Q: Does this work with Claude Code's Max subscription?**
 A: Yes. You can use a Max account with Agent Mail. Each agent session connects to the same MCP server regardless of subscription tier.

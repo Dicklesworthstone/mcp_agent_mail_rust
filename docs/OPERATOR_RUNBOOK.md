@@ -92,10 +92,10 @@ remediation hints and exits. Probes check:
 | `1`-`9` | Jump to screens 1-9 | Suppressed during text input |
 | `0` | Jump to screen 10 | Projects screen |
 | `! @ # $ % ^` | Jump to screens 11-16 | Contacts, Explorer, Analytics, Attachments, Archive Browser, ATC |
-| `Tab` / `Shift+Tab` | Next/previous screen | Cycles through all 16 screens |
+| `Tab` / `Shift+Tab` | Next/previous screen | Cycles through all 16 screens; while a field, form, or dialog takes text, Tab moves within it |
 | `Ctrl+P` | Command palette | Always available outside text-entry conflicts |
 | `:` | Command palette | Suppressed during text input |
-| `/` | Global search deep link | Opens Search with query focus |
+| `/` | Screen filter, else global search | Screens with their own filter or search bar open it; the others open Search with query focus |
 | `.` | Contextual action menu | Uses focused row/entity actions |
 | `Ctrl+N` | Open compose overlay | Global compose panel |
 | `Ctrl+Y` | Toggle toast focus mode | Enter toast navigation/dismiss mode |
@@ -142,7 +142,7 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 
 - Messages: `g` toggles Local/Global inbox mode; `c` opens compose; `Ctrl+M` marks read; `Ctrl+V` drops to thread.
 - Threads: `e/c` expands/collapses all message cards; `Left/Right` collapses/expands selected branch.
-- Timeline: `V` cycles Events/Commits/Combined; lowercase `v` toggles visual selection mode.
+- Timeline: `V` cycles Events/Commits/Combined/Log; lowercase `v` toggles visual selection mode.
 - Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
 - Contacts: `n` toggles Table/Graph; `g` toggles Mermaid panel.
 - Reservations: `n` opens create-reservation form.
@@ -160,7 +160,7 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 | 6 | Reservations | Active/released file reservations, create/release workflows |
 | 7 | Tool Metrics | Per-tool latency/error/call-count observability |
 | 8 | SystemHealth | Probes, disk/memory, and circuit-breaker state |
-| 9 | Timeline     | Events/Commits/Combined chronology + inspector |
+| 9 | Timeline     | Events/Commits/Combined/Log chronology + inspector |
 | 10 | Projects    | Project inventory, stats, and routing helpers |
 | 11 | Contacts    | Contact graph and policy management |
 | 12 | Explorer    | Unified mailbox explorer with direction and ack filters |
@@ -1099,7 +1099,7 @@ The ATC operator loop checks for this file every tick (~5 seconds). When present
 ### Verify
 
 ```bash
-am robot atc --summary-only --toon | grep kill_switch
+am robot atc --summary-only --format toon | grep kill_switch
 ```
 
 ### Behavior while disabled

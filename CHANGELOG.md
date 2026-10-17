@@ -6,8 +6,8 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_PLAN.md), and per-release sign-off packets should start from [docs/RELEASE_READINESS_TEMPLATE.md](docs/RELEASE_READINESS_TEMPLATE.md).
 
-Scope window: [v0.3.35 → v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.35...v0.3.36)
-and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...main). Entries use git diffs, tag targets,
+Scope window: [v0.3.36 → v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.36...v0.3.37)
+and the [unreleased changes on `main`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.3.37...main). Entries use git diffs, tag targets,
 GitHub publication metadata, Beads records, and executed release receipts.
 Publication dates are UTC; post-tag installer changes are identified separately.
 
@@ -17,6 +17,7 @@ Recent releases; the earlier version history continues below.
 
 | Version | Published (UTC) | Status | Delivered capability |
 |---------|-----------------|--------|----------------------|
+| [v0.3.37](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.37) | 2026-10-05 | **Release** | Safe mailbox upgrades after the v30 short-record incident (br-2hpuk); FrankenSQLite 0.4.9; Linux descriptor bound and descriptor-exhaustion reporting; stalled write-behind drain detection |
 | [v0.3.36](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.36) | 2026-09-16 | **Release** | Windows/WAL recovery, contention and search fixes; six signed platform archives and matching GHCR images |
 | [v0.3.35](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.35) | 2026-09-09 | **Release** | Lifecycle tokens over HTTP (PR #310 option c); bounded tmux probe readers; six-platform binary assets |
 | [v0.3.34](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.34) | 2026-09-08 | **Release** | Windows UNC snapshots, bounded tmux identity probes, six-platform binaries and matching GHCR images |
@@ -26,9 +27,84 @@ Recent releases; the earlier version history continues below.
 
 ## Unreleased
 
-These changes are not a published release. Dependency upgrades and the full
-release validation remain in progress; selected passing tests do not establish
-release readiness.
+No changes since v0.3.37.
+
+## v0.3.37 — 2026-10-05 [Release]
+
+Changes after the [v0.3.36 tag](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/tree/v0.3.36).
+
+### Upgrade notes (read first)
+
+- **Stop every v0.3.36 `am` process that uses a mailbox (server, TUI and CLI)
+  before starting v0.3.37 on it.** v0.3.36 embeds FrankenSQLite 0.3.18 and
+  v0.3.37 embeds 0.4.9; the two engine lines must not share a live database.
+  FrankenSQLite 0.4.9 refuses a read-write open while a 0.3.x engine holds the
+  file, and v0.3.37 read-only commands never migrate a mailbox (below), but an
+  old process joining a mailbox that a v0.3.37 server already has open is not
+  detected.
+- **The first v0.3.37 server start migrates the mailbox to schema v31.** v30
+  adds `messages.archive_metadata_json`; v31 then rewrites every existing
+  message row once through C SQLite (values unchanged) and checkpoints the
+  WAL. On a large mailbox this takes a few seconds and temporarily needs free
+  disk about the size of the `messages` table; the lexical search index is
+  refreshed afterwards. Take a backup first (`sqlite3 storage.sqlite3
+  ".backup storage.sqlite3.pre-v0.3.37"`) if you have no recent one.
+- If an `am robot` or other read-only command reports that the mailbox schema
+  is older than the binary, upgrade and restart the server that owns the
+  mailbox (or run `am migrate` with no server running).
+
+### Mailbox upgrade safety (br-2hpuk, P0)
+
+- **Pre-v30 message rows read correctly after the v30 column is added.**
+  v0.3.36 (FrankenSQLite 0.3.18) stored each row's rowid in the INTEGER
+  PRIMARY KEY slot. After `ALTER TABLE messages ADD COLUMN
+  archive_metadata_json` those records are one field short, and FrankenSQLite
+  0.4.4 decoded them shifted by one column: inboxes looked empty and search
+  found nothing, although C SQLite read the same bytes correctly and
+  `integrity_check` passed. Two independent fixes: migration
+  `v31_materialize_archive_metadata_json_on_messages` rewrites every legacy
+  row as a full canonical record through C SQLite, and the mailbox engine moves
+  to registry FrankenSQLite 0.4.9, which decodes such short records correctly
+  (upstream a2398978a). A regression test writes the legacy rowid-in-slot
+  layout and compares the runtime engine with C SQLite after v30 alone and
+  after v31; on the previous engine pin it fails without v31 and passes with
+  it.
+- **Read-only commands never migrate or recover an existing mailbox.** A
+  read-only `am robot` command used to fall back to the initializing open when
+  its read-only admission refused, and so applied v30 to a live mailbox owned
+  by a running v0.3.36 server. Robot reads now open an existing mailbox
+  read-only or fail with an upgrade hint. The local fallbacks of `am agents
+  list` and `am agents show`, `am agents resolve-pane`, and `am agents reap
+  --dry-run` read a private snapshot of the mailbox, like `am mail inbox`,
+  instead of a pool whose first use migrates the live file.
+- **FrankenSQLite 0.4.9 replaces the patched 0.4.4 revision.** 0.4.9 contains
+  the SQL compatibility, NOCASE, INSERT SELECT UPSERT and Linux descriptor
+  repairs that the former pin backported, plus the short-record decoder fix
+  and a guard against mixing engine lines on one database.
+
+### Other changes since v0.3.36
+
+- **Agent activity is recorded on use (GH #334).** `last_active_ts` used to
+  move only at registration. Sending, replying, reading, acknowledging and the
+  file-reservation tools now record the acting agent's activity (at most one
+  write per agent per minute), so `list_agents` ordering, `active_within_days`
+  and `am agents reap` see real activity.
+- **Cross-project recipient names are refused instead of stranded (GH #335).**
+  `send_message` auto-registration refuses (`CROSS_PROJECT_RECIPIENT`, nothing
+  written) a recipient name registered in another project linked to the same
+  product; project-qualified recipients are delivered over an approved contact
+  link. Unknown names still auto-register.
+- **Descriptor exhaustion is named and watched (GH #333, br-kp1in.17).**
+  Failures at the descriptor ceiling report descriptor exhaustion; `health_check`,
+  `am doctor` and `am robot health` show descriptor headroom and a rising
+  descriptor floor; `am service install` renders `LimitNOFILE`.
+- **A ref lock left by a killed writer no longer blocks every later archive
+  commit (br-1l9mc).**
+- **Search catch-up is shared and spurious full lexical rebuilds under concurrent
+  sends are gone (br-ekdk1, br-th4ac).**
+- **File reservations refuse orphaned-project placeholders.** `[unknown-project-N]`
+  names data whose project row was deleted; it stays readable, and release still
+  works, but it can no longer be granted new reservations.
 
 - **Recover small archive deltas containing empty projects in place.** Missing
   project records no longer force a full mailbox reconstruction merely because
@@ -81,28 +157,29 @@ release readiness.
   Status checks recognize that mismatch and setup repairs existing entries.
   Gemini's separate `httpUrl` configuration remains supported.
   ([repair](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/038a7d18); `br-tip25`)
-- **Mailbox dependencies move to FrankenSQLite 0.4.4.** SQLModel 0.5.0,
+- **Mailbox dependencies move to FrankenSQLite 0.4.9.** SQLModel 0.5.0,
   Asupersync 0.5.0, FastMCP 0.10.0 and FrankenSearch 0.6.0 move together so
   database and reranker contexts remain compatible. FastMCP stays pinned to
   the upstream negotiation repair, preserving newer clients' initialization
   proposals. Embedded Beads retains its separate patched 0.3.18 engine.
-  The 0.4.4 engine revision carries forward prepared-DML binding and stored
-  CREATE-prefix fixes omitted from the published release. Migration tracking
+  FrankenSQLite 0.4.9 includes the prepared-DML binding and stored
+  CREATE-prefix fixes that a patched 0.4.4 revision carried during
+  development (see "Mailbox upgrade safety" above). Migration tracking
   gains SQLModel's checksum column while preserving existing records.
   Upgrade qualification is tracked in `UPGRADE_LOG.md` and `br-5lgwn`.
 - **Preserve parameters when replaying `INSERT ... SELECT` with UPSERT.**
-  The pinned engine resolves original UPSERT and RETURNING bindings before
+  FrankenSQLite 0.4.9 resolves original UPSERT and RETURNING bindings before
   replaying materialized rows, including attached-database targets. This
   repairs the out-of-range binding error exposed by sibling-discovery
   persistence. Six SQLite differential tests and all twelve application
-  sibling-discovery regressions pass; broader release validation remains open.
-  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/24ae22dafad39b8e0333f7e4c1719efa55813d2b))
+  sibling-discovery regressions pass.
+  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/746983217))
 - **Bound retained database descriptors on Linux.** Repeated opens reuse an
   existing lock-domain descriptor after inode and access checks. Regression
   tests verify the descriptor bound, foreign-process lock exclusion, permission
   revocation, replacement paths and exclusive creation. Other operating
   systems retain their existing descriptor implementation.
-  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/db458bfba780e79d099d9f8986da5a1f7b360901))
+  ([engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/e232519d3))
 - **Update rustls to 0.23.45**, addressing `RUSTSEC-2026-0285` in the
   previous 0.23.43 dependency. Transport regression validation is tracked
   with the dependency upgrade above.
@@ -142,11 +219,11 @@ release readiness.
   passes canonical `integrity_check` could still fail `create_proactive_backup` every
   quick cycle, because the exported copy writes `COLLATE NOCASE` indexes in the primary
   engine's key order and canonical SQLite reads that ordering as corruption. Each failed
-  cycle also preserved a ~24 MB staging directory with no sweeper. The pinned
-  [engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/dbcc7adb5d2491504af4c07a38a58378522f5a07)
+  cycle also preserved a ~24 MB staging directory with no sweeper. The
+  [engine repair](https://github.com/Dicklesworthstone/frankensqlite/commit/ac4cbf1ad) (in FrankenSQLite 0.4.9)
   corrects ASCII case folding, punctuation ordering and embedded-NUL comparisons;
   canonical full-integrity validation remains strict. Four real export and
-  public-backup regressions pass with this pin. Staging is now
+  public-backup regressions pass with this engine. Staging is now
   admission-controlled and descriptor-bound, retry admission persists across restarts,
   rotation can no longer overwrite quarantine evidence, and reclaim never touches a live
   database whose name carries a recovery marker.
@@ -175,7 +252,8 @@ release readiness.
   to durable mail. Scheduling stays fair across deferred dispatch instead of reordering
   critical effects.
   ([GH #258](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/258),
-  [GH #264](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/264))
+  [GH #264](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/264); the first
+  GH #258 hydration bound shipped in v0.3.31, so parts of this entry predate v0.3.36)
 - **Integrity gating requires fresh, complete evidence before writes are released.**
   Corruption-recovery authorization is bound to a fresh observation epoch, the server
   refuses writes after a reconciled integrity failure, migrations are checksummed and
@@ -225,6 +303,32 @@ release readiness.
   crate's public API — and `dead_code` on two engine-local duplicates of
   `atc_sync_population_from_db`/`atc_tick` that the canonical re-exports shadow, kept rather
   than deleted while the ATC work tracked in GH #264 is still in flight.
+
+### Release verification
+
+Run through the RCH worker fleet on the pinned `nightly-2026-08-31`, split into
+crate groups because the fleet was saturated:
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo check --workspace --lib --bins`, and portable-feature clippy for the
+  shipped packages: pass.
+- Tests: server 5,378 passed; tools 1,149; core 2,074; db library 3,420 and
+  integration 765; CLI library 2,917; `mcp-agent-mail` 52. Known failures, all
+  classified against the previous HEAD (`21a25c2b`, FrankenSQLite 0.4.4) on the
+  same workers:
+  - two `robot overview` tests that insert rowid `i64::MAX` hit a FrankenSQLite
+    0.4.9 bug (fixed upstream, unreleased; `br-9pnpe`). Mailbox ids never
+    approach that value.
+  - three conformance tests fail identically at `21a25c2b` (test isolation:
+    a sticky write-back durability flag; `br-odkc4`).
+  - load-only timeouts (autocommit storm init-gate wait, index freshness lag,
+    e2e-runner child timeout) pass when rerun alone; CLI integration tests that
+    spawn the `am` binary were lost to worker-side artifact cleanup and are
+    covered by the black-box release smoke and installer e2e on the published
+    binaries.
+- Regression matrix for br-2hpuk (runtime engine vs C SQLite on the legacy
+  rowid-in-slot layout): FrankenSQLite 0.4.4 without v31 misreads every row;
+  0.4.4 with v31, and 0.4.9 with or without v31, read every row correctly.
 
 ### Build and compatibility notes
 - **Toolchain unchanged and load-bearing:** the pinned `nightly-2026-08-31` in

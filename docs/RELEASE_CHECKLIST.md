@@ -348,7 +348,7 @@ wc -l "${SOAK_TREND}"
 
    # CLI accepts all commands:
    am share --help                  # Should exit 0
-   am doctor check --json           # Exit 0 healthy, 1 findings; inspect JSON
+   am doctor check --json | jq -e .healthy   # --json always exits 0; .healthy is the verdict
 
    # Native deployment validation path:
    am share deploy verify-live https://example.github.io/agent-mail --bundle /tmp/agent-mail-bundle --json > /tmp/verify-live.json

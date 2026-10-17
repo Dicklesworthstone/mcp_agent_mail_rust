@@ -434,8 +434,9 @@ Every `--fix` run creates `<repo>/.doctor/runs/<ISO>__<run-id>/`:
 # Startup health probe (CI-safe; cheap)
 am doctor health
 
-# Full diagnose (offline by default)
-am doctor check --json | jq '.findings[] | select(.severity == "P0")'
+# Full diagnose (offline by default; --json exits 0, so branch on .healthy)
+am doctor check --json | jq '.checks[] | select(.status != "ok")'
+am doctor fix --list --json | jq '.per_fm[] | select(.findings_count > 0 and .severity == "P0")'
 
 # Plan-then-fix
 am doctor fix --dry-run
@@ -631,8 +632,8 @@ mcp_agent_mail_rust/
 | 15 | Archive Browser | Two-pane Git archive browser and file preview |
 | 16 | ATC | Air Traffic Controller decision engine status and transparency cards |
 
-Key bindings: `?` help, `Ctrl+P`/`:` command palette, `/` global search, `.` action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast focus, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API, `q` quit.
-Webapp-parity keys: Messages `g` (Local/Global inbox), Messages `s` (show/hide system messages — file reservations, contact requests, etc.; hidden by default), Threads `e/c` (expand/collapse all), Timeline `V` (Events/Commits/Combined), Contacts `n` (Table/Graph).
+Key bindings: `?` help, `Ctrl+P`/`:` command palette, `/` the screen's own filter (global search on screens without one), `.` action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast focus, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API, `q` quit.
+Webapp-parity keys: Messages `g` (Local/Global inbox), Messages `s` (show/hide system messages — file reservations, contact requests, etc.; hidden by default), Threads `e/c` (expand/collapse all), Timeline `V` (Events/Commits/Combined/Log), Contacts `n` (Table/Graph).
 
 ### Dual-Mode Interface
 
