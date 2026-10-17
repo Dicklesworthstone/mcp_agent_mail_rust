@@ -101,7 +101,7 @@ impl OrphanForeignKeyRowsFinding {
     pub fn to_finding(&self) -> super::Finding {
         let auto_fixable = self.has_auto_fixable_rows();
         let command = if auto_fixable {
-            format!("am doctor fix --only {FM_ID} --yes")
+            super::fix_only_command(FM_ID)
         } else {
             format!("am doctor explain {FM_ID}")
         };

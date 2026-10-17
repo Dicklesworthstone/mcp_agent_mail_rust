@@ -79,7 +79,7 @@ impl SupervisorRespawnLoopFinding {
                 "db_path": self.model.db_path,
                 "manual_steps": [
                     "journalctl --user -u agent-mail.service -n 200 --no-pager   # find the recurring crash cause",
-                    "am doctor --json   # the crash is often a degraded DB or stale/known-bad binary",
+                    "am doctor check --json   # the crash is often a degraded DB or stale/known-bad binary",
                     "systemctl --user reset-failed agent-mail.service && systemctl --user restart agent-mail.service",
                 ],
                 "risk": "auto-restart masks a recurring crash; the port flaps and health probes are intermittent",

@@ -132,7 +132,7 @@ impl CodexStartupTimeoutFinding {
                 "tool": "codex",
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor fix --only {FM_ID}"),
+                command: super::fix_only_command(FM_ID),
                 explain_command: format!("am doctor explain {FM_ID}"),
                 // Auto-fix sets startup_timeout_sec on the existing
                 // mcp_agent_mail entry via format-preserving

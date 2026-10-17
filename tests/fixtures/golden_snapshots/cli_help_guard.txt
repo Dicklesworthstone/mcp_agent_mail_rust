@@ -3,7 +3,7 @@ Install, check, and manage the pre-commit file-reservation guard hook
 Usage: am guard <COMMAND>
 
 Commands:
-  check      
+  check      Check paths read from stdin against other agents' active exclusive reservations; exit 1 on a conflict
   install    
   status     
   uninstall  

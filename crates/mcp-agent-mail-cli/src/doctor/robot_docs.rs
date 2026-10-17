@@ -12,9 +12,10 @@
 
 /// The full paste-ready handbook. Includes:
 /// - One-paragraph orientation
-/// - The 15-verb table (legacy + pass-14..26 additions)
+/// - Every `am doctor` verb, split into diagnose and repair tables
 /// - The 11-code exit table
-/// - 7 most common workflows (5 original + per-FM verbs + list-all)
+/// - Copy-paste workflows (baseline, plan-then-fix, undo, pre-commit,
+///   targeted, per-FM, list-all)
 /// - Pointers to capabilities + JSON shapes
 /// - The two AGENTS.md absolutes that affect doctor behavior
 pub fn handbook() -> &'static str {
@@ -88,80 +89,110 @@ or run other commands to use the doctor effectively.
 
 ## Orientation
 
-`am doctor` diagnoses (and, with `--fix`, repairs) Agent Mail's mailbox
-state: SQLite DB, Git-backed archive, MCP client configs, pre-commit guard,
-runtime listener, environment, share/atc/search/identity state. Every
+`am doctor` diagnoses (and, through `am doctor fix`, repairs) Agent Mail's
+mailbox state: SQLite DB, Git-backed archive, MCP client configs, pre-commit
+guard, runtime listener, environment, share/atc/search/identity state. Every
 mutation is **backed up first**, **hash-witnessed**, and **reversible via
 `am doctor undo <run-id>`**. The doctor never deletes user files; it
 quarantines via rename.
 
-## The 15 Verbs
+`am doctor` always takes a verb: bare `am doctor` prints usage and exits 2,
+and every flag belongs to a verb (`am doctor check --json`, never
+`am doctor --json`). Mutating verbs refuse to prompt on a non-interactive
+stdin, so an agent passes `--yes` (or `--dry-run`) explicitly.
 
-| Verb | Purpose | Mutates? | Default exit |
-|------|---------|----------|--------------|
-| `am doctor check` (`--json`) | Run all detectors. Read-only. | No | 0 healthy / 1 findings |
-| `am doctor fix --yes` | Run detectors + apply fixers. Backups first. | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |
-| `am doctor fix --dry-run` | Print the fix plan; do not execute. | No | 0 |
-| `am doctor fix --only <fm-id>` | Run a single registered FM through the chokepoint. Exit equals the envelope's `exit_code`: 1 = findings remain, nothing mutated; 2 = partial fix. | Yes (via `mutate()`) | 0 / 1 / 2 / 3 / 4 / 64 |
-| `am doctor fix --only <fm-id> --list` | Detect a single FM only — no chokepoint. | No | 0 |
-| `am doctor fix --list` | Detect every registered FM in one round-trip. | No | 0 |
-| `am doctor undo <run-id>` | Restore from `.doctor/runs/<run-id>/backups/`. | Yes (restore-only) | 0 / 3 |
-| `am doctor capabilities --json` | Print machine-readable contract (detectors, fixers, fm_fixers, exit codes, env vars). | No | 0 |
-| `am doctor fixers` | List all per-FM detector+fixer pairs in the registry. | No | 0 |
-| `am doctor explain <id>` | Drill into one finding (latest run) or one registered FM (registry fallback). | No | 0 / 64 |
-| `am doctor robot-docs` | This handbook. | No | 0 |
-| `am doctor health` | One-line liveness summary. For CI. | No | 0 / 1 |
-| `am doctor ls` | List `.doctor/runs/` entries. | No | 0 |
-| `am doctor triage` | Mega-command: status + findings + plan + capabilities URL in one envelope; always includes a live mailbox probe (`live_health`) so it cannot report all-clear during an active failure. | No | 0 |
-| `am doctor selftest` | Exercise mutate() primitives end-to-end in a tempdir. | No | 0 / 1 |
+## Verbs
 
-Legacy verbs preserved (use the typed forms above for new work):
-`repair`, `backups`, `restore`, `reconstruct`, `archive-scan`,
-`archive-verify`, `archive-normalize`, `fix` (without `--only`,
-runs the legacy multi-detector flow), `fix-orphan-refs`,
-`pack-archive`.
+Diagnose (read-only):
+
+| Verb | Purpose | Default exit |
+|------|---------|--------------|
+| `am doctor check` (`--json`, `--verbose`, `[PROJECT]`) | Run every mailbox check. The table form exits 1 when a check fails; `--json` always exits 0 — branch on `.healthy`. | 0 / 1 (table) |
+| `am doctor health` | One-line verdict from the live mailbox plus the latest run history. For CI and pre-commit hooks. | 0 healthy / 1 findings |
+| `am doctor triage` (`--quick`) | One JSON envelope: live mailbox probe (`live_health`), the latest run report, planned actions, and a `recommended_command`. Never reports all-clear during an active live failure. | 0 |
+| `am doctor fix --list` (`--json`) | Run every registered FM detector in one round-trip; `per_fm[]`, `skipped[]`, `total_findings`. | 0 |
+| `am doctor fix --only <fm-id> --list` | Run one FM's detector — no chokepoint, no run dir. | 0 |
+| `am doctor locks` (`--json`) | Activity locks, holder PIDs, and the owner class (`live` / `wedged` / `reclaimable` / `stale`) with a safe next command. | 0 |
+| `am doctor drain` (`--json`) | Whether mutating doctor work is safe right now (`safe_to_mutate`) and the supervised drain steps when a live owner is present. Never kills `am`. | 0 |
+| `am doctor archive-scan` | Audit archive hygiene. | see `--help` |
+| `am doctor archive-verify` | Cross-check archive artifacts against SQLite for tamper evidence. | see `--help` |
+| `am doctor backups` (`--json`) | List the SQLite backups available to `restore`. | 0 |
+| `am doctor artifacts` | Inventory test/perf/forensic/e2e artifact roots. Deletes nothing. | 0 |
+| `am doctor ls` | List `.doctor/runs/` entries. | 0 |
+| `am doctor explain <id>` | Drill into one finding (latest run) or one registered FM (registry fallback). | 0 / 64 |
+| `am doctor fixers` | List every per-FM detector+fixer pair in the registry. | 0 |
+| `am doctor capabilities --json` | Machine-readable contract (detectors, fixers, fm_fixers, exit codes, env vars, write scopes). | 0 |
+| `am doctor robot-docs` | This handbook. | 0 |
+| `am doctor selftest` | Exercise the `mutate()` primitives end-to-end in a tempdir. | 0 / 1 |
+| `am doctor mcp-selftest` | MCP JSON-RPC decode + dispatch self-test in an isolated scratch mailbox. | 0 / 1 |
+| `am doctor write-selftest` | Real write-path self-test in an isolated scratch mailbox. | 0 / 1 |
+| `am doctor support-bundle` (`--json`) | Write a sanitized incident bundle for maintainers (the bundle is its only write). | 0 |
+
+Repair (mutating; preview first with `--dry-run`):
+
+| Verb | Purpose | Default exit |
+|------|---------|--------------|
+| `am doctor fix --only <fm-id> --yes` | Apply one FM's fix through the `mutate()` chokepoint. Exit equals the envelope's `exit_code`: 1 = findings remain, nothing mutated; 2 = partial fix. | 0 / 1 / 2 / 3 / 4 / 64 |
+| `am doctor fix --yes` | The legacy multi-detector flow (shell rc aliases, PATH order, MCP configs, stale `.git/index.lock`, guard hooks, database repair/reconstruct, an unhealthy local server, WAL mode). Prefer `--only`. | 0 / 2 / 3 / 4 |
+| `am doctor undo <run-id>` | Restore from `.doctor/runs/<run-id>/backups/`. | 0 / 3 |
+| `am doctor repair` | Repair the SQLite index in place. Refuses (exit 3) while a live owner holds the mailbox. | 0 / 3 |
+| `am doctor reconstruct` | Rebuild the SQLite index from the Git archive. Same owner guard as `repair`. | 0 / 3 |
+| `am doctor restore <backup-path>` | Restore the database from a backup listed by `backups`. | see `--help` |
+| `am doctor vacuum` | VACUUM + ANALYZE the live database in place (orphaned pages). Same owner guard. | see `--help` |
+| `am doctor reclaim` | Consolidate stale recovery debris into one reversible directory. Previews without `--yes`. | 0 |
+| `am doctor archive-normalize` | Quarantine or annotate anomalous archive files. Never deletes. | see `--help` |
+| `am doctor fix-orphan-refs` | Report refs whose objects are missing; prunes (with backups) only with `--apply`. | see `--help` |
+| `am doctor pack-archive` | Git loose-object repack of the archive (`--plan` only inspects). | see `--help` |
+
+When a live owner blocks `repair` / `reconstruct` / `vacuum`, drain it
+through its supervisor and confirm with `am doctor drain`; pass
+`--take-ownership` only for an owner `am doctor locks` classifies as
+`reclaimable`. Doctor never kills `am`.
 
 ## Exit codes
 
 | Code | Name | When |
 |------|------|------|
 | 0 | success_or_healthy | Clean diagnose, fix complete, undo complete |
-| 1 | findings_present_no_fix | Diagnose found issues; `--fix` is recommended |
-| 2 | fix_partial | `--fix`: some fixed, some not (see `report.json::partial_failures`) |
+| 1 | findings_present_no_fix | Diagnose found issues; a fix is recommended |
+| 2 | fix_partial | `fix`: some fixed, some not (see `report.json::partial_failures`) |
 | 3 | fix_failed_rolled_back | At least one mutation failed; rolled back |
 | 4 | refused_unsafe | State unsafe (schema mismatch, scope violation, unmet precondition) |
 | 5 | concurrency_lost | Another doctor invocation holds the lock |
-| 6 | online_required | At least one finding needs `--online`; not passed |
-| 64 | usage_error | Unknown flag / missing arg (POSIX EX_USAGE) |
+| 6 | online_required | Reserved; no verb takes `--online` today |
+| 64 | usage_error | Arguments parse but name nothing valid: unknown FM or finding id, missing FM input (POSIX EX_USAGE). A flag or verb the parser rejects exits 2 |
 | 66 | no_input | Target path doesn't exist or isn't a recognized project |
 | 73 | cant_create | Couldn't create `.doctor/runs/<run-id>/` |
 | 74 | io_error | Filesystem I/O during read or non-mutating write |
 
-## Five Recipes (Copy-Paste Ready)
+## Recipes (Copy-Paste Ready)
 
 ### 1. Healthy-baseline triage (start of session)
 
 ```bash
-am doctor --json | jq -e '.ok'
+am doctor check --json | jq -e '.healthy'
 ```
 
-Returns `true` healthy, `false` with findings. If false:
+Prints `true` (exit 0) when healthy, `false` (exit 1, from `jq -e`)
+otherwise. If false:
 
 ```bash
-am doctor --json | jq '.findings[] | {id, severity, title}'
+am doctor check --json | jq '.checks[] | select(.status != "ok") | {check, status, detail}'
+am doctor fix --list --json | jq '.per_fm[] | select(.findings_count > 0) | {fm_id, severity, findings_count}'
 ```
 
 ### 2. Plan-then-fix workflow
 
 ```bash
-am doctor --dry-run --fix          # preview
-am doctor --fix                    # apply with backups
-am doctor                          # confirm exit 0
+am doctor fix --only <fm-id> --dry-run       # rehearse through the chokepoint
+am doctor fix --only <fm-id> --yes           # apply with backups
+am doctor fix --only <fm-id> --list --json   # confirm findings_count is 0
 ```
 
 ### 3. Reverse a fix that went wrong
 
 ```bash
+am doctor undo latest --dry-run    # print the restore plan
 am doctor undo latest              # most recent
 # or:
 am doctor ls                       # see all runs
@@ -171,17 +202,19 @@ am doctor undo 2026-05-09T16-30-15Z__abc123
 ### 4. Pre-commit fast path
 
 ```bash
-am doctor --quick --json           # < 200ms; only fast detectors
+am doctor health                   # one line; exit 1 when findings are present
 ```
 
-Use as a pre-commit gate; fail if exit 1.
+Use as a pre-commit gate; fail if exit 1. `am doctor triage --quick` is
+the JSON equivalent for agents (it always exits 0; read
+`recommended_command`).
 
 ### 5. Targeted scope (one finding at a time)
 
 ```bash
-am doctor --json | jq -r '.findings[0].id'           # get a finding id
-am doctor explain <finding-id>                        # see evidence
-am doctor fix --only <fm-id> --yes                   # apply just that fix
+am doctor fix --list --json | jq -r '.per_fm[] | select(.findings_count > 0) | .fm_id'
+am doctor explain <fm-id>                             # see evidence
+am doctor fix --only <fm-id> --yes                    # apply just that fix
 ```
 
 `am doctor explain` falls back to the registry when no recent
@@ -224,11 +257,12 @@ surfaced in `skipped[]` with the missing field name.
 
 ## Per-run artifacts
 
-Every `--fix` run creates `.doctor/runs/<ISO>__<run-id>/`:
+Every `fix --only` (or `archive-normalize`) run that changes something
+creates `.doctor/runs/<ISO>__<run-id>/`:
 
 ```
 .doctor/runs/2026-05-09T16-30-15Z__abc123/
-├── report.json           # findings + summary; same shape as `--json` output
+├── report.json           # the run's JSON envelope (summary + outcome)
 ├── report.md             # human-readable narrative
 ├── actions.jsonl         # one line per mutate() call (before/after hashes)
 ├── backups/              # verbatim per-file copies (preserves perms, mtime)
@@ -246,8 +280,8 @@ per run, ordered by start time).
 
 ## Hard guarantees (kernel axioms applied)
 
-- **Detect-then-fix**: detectors are pure; nothing writes without `--fix`.
-- **Single chokepoint**: every disk write under `--fix` flows through
+- **Detect-then-fix**: detectors are pure; nothing writes without `fix`.
+- **Single chokepoint**: every disk write under `fix --only` flows through
   one `mutate()` function. Verified by `validate-doctor.sh`.
 - **Backup before mutation**: `mutate()` writes a verbatim backup BEFORE
   changing anything. `cmp_strict(backup, live)` succeeds at backup time.
@@ -257,25 +291,30 @@ per run, ordered by start time).
 - **Reversible**: `undo <run-id>` reads `actions.jsonl` in reverse,
   restores from `backups/`, verifies hash. Fails closed if any backup
   is missing.
-- **Idempotent**: `--fix` then `--fix` → second run reports `actions_taken: 0`.
-- **Concurrency-safe**: two `--fix` invocations → one wins, the other
+- **Idempotent**: the same `fix --only <fm-id> --yes` twice → the second
+  run reports `actions_taken: 0`.
+- **Concurrency-safe**: two `fix` invocations → one wins, the other
   refuses with exit 5.
 - **Crash-recoverable**: SIGKILL mid-fix → next run finishes or aborts
   cleanly. Atomic write-tmp-rename throughout.
-- **Read-only by default**: bare `am doctor` never mutates state.
+- **Read-only by default**: the diagnose verbs never mutate state.
 - **Stable JSON schema**: `--json` always includes `schema_version`.
 - **Stdout = data, stderr = progress**: `--json | jq` is always safe.
-- **Offline by default**: network probes opt-in via `--online`.
+- **Offline**: the only network I/O is a loopback probe of the local
+  Agent Mail listener.
 
-## What `am doctor --fix` will NOT do (per AGENTS.md + safety envelope)
+## What `am doctor fix --only` will NOT do (per AGENTS.md + safety envelope)
 
 - Delete user files (rename to `<run-dir>/quarantine/<rel>` instead).
 - Run `rm -rf`, `git reset --hard`, `git clean -fd`.
 - Edit your shell rc files (`~/.bashrc`, `~/.zshrc`, etc.) — emits a finding.
+  The legacy `am doctor fix` flow is the exception: it comments out Python
+  aliases and appends `~/.local/bin` to PATH in rc files, so preview it
+  with `am doctor fix --dry-run`.
 - Modify canonical mail messages under `<storage_root>/projects/<slug>/messages/`.
 - Touch `~/.gitconfig` or `~/.git-credentials`.
 - Send any `send_message` call (broadcast or otherwise — Rule 2 of AGENTS.md).
-- Probe network unless `--online` is set.
+- Reach anything beyond the loopback listener probe.
 - Mutate while another doctor invocation holds the lock.
 
 ## Capabilities (machine-readable contract)
@@ -351,7 +390,7 @@ mod tests {
         let h = handbook();
         for verb in [
             "am doctor",
-            "--fix",
+            "am doctor fix",
             "--dry-run",
             "--only",
             "undo",

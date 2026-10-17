@@ -18,7 +18,7 @@ Ring Fill                               Drops                                   
 │                │     j/k              Scroll event log                                              │                │
 │                │     Enter            Search (if query) or timeline event                           │                │
 │                │     Click            Edit live filter / choose quick filter                        │                │
-│                │     Esc              Dismiss overlay / quit confirm                                │                │
+│                │     Esc              Clear live filter / quit confirm                              │                │
 │                │     f                Toggle auto-follow                                            │                │
 │                │     v                Cycle verbosity tier                                          │                │
 │                │     t                Cycle quick filter                                            │                │

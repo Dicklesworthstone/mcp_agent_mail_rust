@@ -193,6 +193,34 @@ pub fn begin_write_activity() -> WriteActivityGuard {
     )
 }
 
+/// Admit retryable background work without waiting for recovery promotion.
+///
+/// The promotion predicate and writer increment are checked under the same
+/// admission mutex. Existing writers are allowed, but an active promotion
+/// (including an unsuccessful drain awaiting drop) always wins. Unlike cold
+/// bootstrap's blocking API, this has no promotion-owner thread exemption.
+///
+/// A nested repair must use this API or reuse its caller's live lease: waiting
+/// for promotion while holding another writer lease prevents that promotion
+/// from draining the caller. `None` requires deferral without mutation; it is
+/// not permission to continue unguarded. A contended admission mutex also
+/// returns `None`. Initialization and guard destruction retain their ordinary
+/// synchronization; this does not put a deadline on the admitted operation.
+#[must_use]
+pub fn try_begin_write_activity() -> Option<WriteActivityGuard> {
+    let mut state = match barrier().state.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    if state.promotion_active {
+        return None;
+    }
+    state.writers = state.writers.checked_add(1)?;
+    drop(state);
+    Some(WriteActivityGuard { _priv: () })
+}
+
 /// Keep diagnostic callbacks outside the process-global admission lock.
 /// Subscribers may inspect barrier metrics or unwind. Neither may strand the
 /// mutex, leak a counted writer, or skip a successor promotion's exclusion.
@@ -1310,5 +1338,131 @@ mod tests {
         assert!(current_thread_holds_promotion_barrier());
         drop(owner);
         assert_eq!(active_writer_count(), 0);
+    }
+
+    #[test]
+    fn try_writer_coexists_with_writers_and_can_drop_on_another_thread() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let first = begin_write_activity();
+        let second = try_begin_write_activity().expect("writers do not exclude other writers");
+        assert_eq!(active_writer_count(), 2);
+        assert!(try_acquire_promotion_barrier_if_idle().is_none());
+        std::thread::spawn(move || drop(second)).join().unwrap();
+        assert_eq!(active_writer_count(), 1);
+        drop(first);
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn try_writer_never_waits_for_the_admission_mutex() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let state = barrier().state.lock().unwrap();
+        assert!(try_begin_write_activity().is_none());
+        assert_eq!(state.writers, 0);
+        drop(state);
+        let admitted = try_begin_write_activity().expect("admission after contention");
+        assert_eq!(active_writer_count(), 1);
+        drop(admitted);
+    }
+
+    #[test]
+    fn try_writer_refuses_ready_and_failed_promotion_even_for_the_owner() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let owner = try_acquire_promotion_barrier_if_idle().expect("idle owner");
+        assert!(try_begin_write_activity().is_none());
+        assert!(current_thread_holds_promotion_barrier());
+        assert_eq!(active_writer_count(), 0);
+        drop(owner);
+        let writer = begin_write_activity();
+        let (failed, outcome) = acquire_promotion_barrier_draining(Duration::ZERO);
+        assert!(matches!(outcome, DrainOutcome::TimedOut { .. }));
+        assert!(try_begin_write_activity().is_none());
+        assert_eq!(active_writer_count(), 1);
+        drop(writer);
+        assert!(try_begin_write_activity().is_none());
+        assert!(!current_thread_holds_promotion_barrier());
+        drop(failed);
+        assert!(try_begin_write_activity().is_some());
+        assert_eq!(active_writer_count(), 0);
+    }
+
+    #[test]
+    fn nested_try_writer_defers_so_a_real_promotion_can_drain() {
+        if run_in_isolated_process() {
+            return;
+        }
+        let writer = begin_write_activity();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let recovery = std::thread::spawn(move || {
+            let (owner, outcome) = acquire_promotion_barrier_draining(Duration::from_secs(30));
+            done_tx.send(outcome).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(owner);
+            released
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !barrier().state.lock().unwrap().promotion_active {
+            assert!(
+                Instant::now() < deadline,
+                "promotion never closed admission"
+            );
+            std::thread::yield_now();
+        }
+        // Model a replay batch already holding its generation lease. This
+        // nested admission must finish while recovery still needs that lease.
+        let deferred = try_begin_write_activity().is_none();
+        let writers_before_drop = active_writer_count();
+        drop(writer);
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+        let _ = release_tx.send(());
+        recovery.join().unwrap().expect("release recovery owner");
+        assert!(deferred);
+        assert_eq!(writers_before_drop, 1);
+        assert!(matches!(outcome.unwrap(), DrainOutcome::Drained { .. }));
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_begin_write_activity().is_some());
+    }
+
+    #[test]
+    fn try_writer_recovers_poison_without_losing_its_writer_count() {
+        if run_in_isolated_process() {
+            return;
+        }
+        assert!(
+            std::thread::spawn(|| {
+                let _state = barrier().state.lock().unwrap();
+                panic!("poison admission metadata");
+            })
+            .join()
+            .is_err()
+        );
+        let writer =
+            try_begin_write_activity().expect("same poison recovery as blocking admission");
+        assert_eq!(active_writer_count(), 1);
+        drop(writer);
+        assert_eq!(active_writer_count(), 0);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
+    }
+
+    #[test]
+    fn try_writer_refuses_counter_overflow_without_mutating_admission() {
+        if run_in_isolated_process() {
+            return;
+        }
+        barrier().state.lock().unwrap().writers = usize::MAX;
+        let refused = try_begin_write_activity().is_none();
+        let after = active_writer_count();
+        barrier().state.lock().unwrap().writers = 0;
+        assert!(refused);
+        assert_eq!(after, usize::MAX);
+        assert!(try_acquire_promotion_barrier_if_idle().is_some());
     }
 }

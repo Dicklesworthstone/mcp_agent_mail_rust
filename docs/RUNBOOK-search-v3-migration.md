@@ -30,15 +30,18 @@ This runbook provides step-by-step procedures for migrating from SQLite FTS5 to 
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
-| `AM_SEARCH_ENGINE` | `legacy`, `lexical`, `semantic`, `hybrid`, `auto` | `legacy` | Primary search engine |
+| `AM_SEARCH_ENGINE` | `legacy`, `lexical`, `semantic`, `hybrid`, `auto` | `lexical` | Primary search engine |
 | `AM_SEARCH_SHADOW_MODE` | `off`, `log_only`, `compare` | `off` | Shadow comparison mode |
 | `AM_SEARCH_SEMANTIC_ENABLED` | `true`, `false` | `false` | Kill switch for semantic embeddings |
 | `AM_SEARCH_RERANK_ENABLED` | `true`, `false` | `false` | Kill switch for reranking |
 | `AM_SEARCH_FALLBACK_ON_ERROR` | `true`, `false` | `true` | Fall back to FTS5 on V3 errors |
-| `AM_SEARCH_ENGINE_FOR_<TOOL>` | (same as above) | - | Per-tool engine override |
+| `AM_SEARCH_ENGINE_FOR_<TOOL>` | (same as above) | - | Per-tool engine override; read by `search_messages` and `search_messages_product` |
 
 **Kill switch behavior:**
-- `AM_SEARCH_SEMANTIC_ENABLED=false` + `AM_SEARCH_ENGINE=hybrid` → degrades to `lexical`
+- `AM_SEARCH_SEMANTIC_ENABLED=false` + `AM_SEARCH_ENGINE=hybrid` → degrades to `lexical`.
+  The switch also governs per-tool overrides and engines chosen per query
+  (the TUI search mode), so `semantic`, `hybrid`, and `auto` all run
+  `lexical` until it is `true`.
 - `AM_SEARCH_RERANK_ENABLED=false` → skips reranking step, returns fusion scores
 
 Build-mode boundary: runtime `hybrid` settings require a binary built with the
@@ -299,11 +302,15 @@ If triggers have been removed, FTS5 data may be stale. Options:
 Override engine for specific tools while testing:
 
 ```bash
-# Use hybrid for search_messages, but legacy for summarize_thread
-export AM_SEARCH_ENGINE=legacy
+# Hybrid for the two search tools, lexical everywhere else
+export AM_SEARCH_ENGINE=lexical
+export AM_SEARCH_SEMANTIC_ENABLED=true   # without it the overrides run lexical
 export AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES=hybrid
-export AM_SEARCH_ENGINE_FOR_FETCH_INBOX_PRODUCT=hybrid
+export AM_SEARCH_ENGINE_FOR_SEARCH_MESSAGES_PRODUCT=hybrid
 ```
+
+Overrides are read from the process environment of the server, not from
+`config.env`.
 
 ---
 
@@ -331,10 +338,9 @@ Semantic embedding generation can be slow without GPU:
 ```bash
 # Disable semantic temporarily
 export AM_SEARCH_SEMANTIC_ENABLED=false
-
-# Or reduce embedding batch size
-export AM_SEARCH_EMBEDDING_BATCH_SIZE=10
 ```
+
+There is no environment knob for the embedding batch size.
 
 ### Shadow Metrics Show High Divergence
 

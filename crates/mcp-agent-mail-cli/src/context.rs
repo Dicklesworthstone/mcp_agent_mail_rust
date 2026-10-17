@@ -22,7 +22,8 @@ use crate::{CliError, CliResult};
 
 // ── Sync context ────────────────────────────────────────────────────────
 
-/// Shared context for sync CLI handlers (read-only queries).
+/// Shared context for sync CLI handlers. Its open initializes and migrates
+/// the mailbox, so read-only verbs must not use it (br-2hpuk).
 pub struct CliContext {
     pub conn: mcp_agent_mail_db::DbConn,
     pub config: Config,
@@ -67,6 +68,9 @@ impl CliContext {
 pub struct AsyncCliContext {
     pub pool: mcp_agent_mail_db::DbPool,
     pub config: Config,
+    /// For a read verb: the private mailbox snapshot and CLI read locks that
+    /// `pool` reads from; they must outlive the pool's use.
+    _read_snapshot: Option<crate::CanonicalReadPool>,
 }
 
 impl AsyncCliContext {
@@ -77,7 +81,55 @@ impl AsyncCliContext {
         let pool_cfg = DbPoolConfig::from_env();
         let pool = mcp_agent_mail_db::get_or_create_pool(&pool_cfg)
             .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
-        Ok(Self { pool, config })
+        Ok(Self {
+            pool,
+            config,
+            _read_snapshot: None,
+        })
+    }
+
+    /// Open for a read-only verb (br-2hpuk).
+    ///
+    /// A pool runs the full schema init, migrations and recovery on first
+    /// use, so a read verb must never point one at the live mailbox: it may
+    /// be owned by a running server of another version, and a read once
+    /// migrated a live mailbox that way. An existing mailbox is read from a
+    /// private snapshot under the CLI read locks, as `mail inbox` does, so
+    /// any init only touches that copy. A missing or empty mailbox has
+    /// nothing to protect and takes the normal open.
+    pub fn open_for_read(verb: &str) -> CliResult<Self> {
+        let mut config = Config::from_env();
+        config.interface_mode = InterfaceMode::Cli;
+        let database_url = DbPoolConfig::from_env().database_url;
+        Self::open_for_read_with(config, &database_url, verb)
+    }
+
+    pub(crate) fn open_for_read_with(
+        config: Config,
+        database_url: &str,
+        verb: &str,
+    ) -> CliResult<Self> {
+        if !crate::read_verb_mailbox_is_initialized(database_url) {
+            let mut pool_cfg = DbPoolConfig::from_env();
+            pool_cfg.database_url = database_url.to_string();
+            let pool = mcp_agent_mail_db::get_or_create_pool(&pool_cfg)
+                .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+            return Ok(Self {
+                pool,
+                config,
+                _read_snapshot: None,
+            });
+        }
+        let read_snapshot = crate::open_db_async_canonical_read_with_database_url(
+            database_url,
+            Some(config.storage_root.as_path()),
+            verb,
+        )?;
+        Ok(Self {
+            pool: read_snapshot.pool().clone(),
+            config,
+            _read_snapshot: Some(read_snapshot),
+        })
     }
 
     /// Build an MCP server URL from config, for server-tool delegation.

@@ -88,7 +88,7 @@ impl ReservationArtifactNormalizeFinding {
                 "safety_policy": "Only a regular JSON artifact whose embedded id and project match its path is eligible. Legacy names additionally require a live (project, id) DB row. Filename generation wins over JSON db_generation; malformed, symlinked, and unmatched artifacts remain untouched.",
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor fix --only {FM_ID} --yes"),
+                command: super::fix_only_command(FM_ID),
                 explain_command: format!("am doctor explain {FM_ID}"),
                 auto_fixable: true,
                 estimated_actions,

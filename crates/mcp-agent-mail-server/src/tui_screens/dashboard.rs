@@ -1836,7 +1836,7 @@ impl MailScreen for DashboardScreen {
             },
             HelpEntry {
                 key: "Esc",
-                action: "Dismiss overlay / quit confirm",
+                action: "Clear live filter / quit confirm",
             },
             HelpEntry {
                 key: "f",
@@ -1883,6 +1883,17 @@ impl MailScreen for DashboardScreen {
 
     fn consumes_text_input(&self) -> bool {
         self.quick_query_active
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` starts this screen's quick query rather than the global search.
+        // Esc clears an applied query; with no query it stays the global quit
+        // confirmation.
+        match key.code {
+            KeyCode::Char('/') => true,
+            KeyCode::Escape => !self.quick_query_active && !self.quick_query().is_empty(),
+            _ => false,
+        }
     }
 
     fn title(&self) -> &'static str {
@@ -8418,6 +8429,52 @@ mod tests {
         let visible = screen.visible_entries();
         assert_eq!(visible.len(), 1);
         assert!(visible[0].summary.contains("alpha"));
+    }
+
+    #[test]
+    fn esc_is_claimed_only_while_an_applied_live_query_can_be_cleared() {
+        let state = TuiSharedState::new(&Config::default());
+        let mut screen = DashboardScreen::new();
+        screen.verbosity = VerbosityTier::All;
+        for (seq, summary) in [(1, "alpha endpoint"), (2, "beta tool")] {
+            screen.push_event_entry(EventEntry {
+                kind: MailEventKind::HttpRequest,
+                severity: EventSeverity::Info,
+                seq,
+                timestamp_micros: 0,
+                timestamp: String::new(),
+                icon: '→',
+                summary: summary.to_string(),
+            });
+        }
+        screen.invalidate_visible_cache();
+        assert_eq!(screen.visible_entries().len(), 2);
+
+        // With no query Esc stays global, so it still arms quit confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        // Esc inside the editor ends the edit and keeps the query applied.
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('a'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+            KeyCode::Char('h'),
+            KeyCode::Char('a'),
+            KeyCode::Escape,
+        ] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert!(!screen.consumes_text_input());
+        assert_eq!(screen.quick_query(), "alpha");
+        assert_eq!(screen.visible_entries().len(), 1);
+        assert!(screen.claims_key(&esc));
+
+        screen.update(&Event::Key(esc), &state);
+        assert_eq!(screen.quick_query(), "");
+        assert_eq!(screen.visible_entries().len(), 2);
+        assert!(!screen.claims_key(&esc));
     }
 
     #[test]

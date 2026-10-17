@@ -20,7 +20,7 @@ use fastmcp::legacy_2024::LegacyContent;
 use fastmcp::{Budget, CallToolParams, Cx, McpContext};
 use fastmcp_core::SessionState;
 use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,8 +32,7 @@ const TEST_SEARCH_ENGINE: &str = "legacy";
 /// Tests in this file mutate process-wide env vars and share global metrics.
 /// Serialize them to avoid races.
 fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::process_env_lock()
 }
 
 struct EnvGuard {
@@ -42,6 +41,7 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn set(vars: &[(&str, &str)]) -> Self {
+        crate::settle_shared_storage();
         let mut previous = Vec::new();
         for (key, value) in vars {
             let old = std::env::var(*key).ok();
@@ -79,6 +79,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        crate::drain_shared_storage();
         for (key, value) in self.previous.drain(..) {
             match value {
                 Some(v) => unsafe { std::env::set_var(&key, v) },

@@ -4,19 +4,22 @@
 //!
 //! Pre-pass-27 the handbook still listed "10 Verbs" while passes 14,
 //! 16, 17, 23, 24 had grown the surface to 14. Agents calling cold
-//! got an incomplete picture.
-//!
-//! This test pins the verb list: adding a new verb to `lib.rs`
-//! without updating `robot_docs.rs::HANDBOOK_TEXT` fails CI here.
+//! got an incomplete picture. A hand-pinned count drifted again (15
+//! listed against 28 real verbs), and its copy-paste recipes used
+//! spellings clap rejects (`am doctor --json`, `am doctor --fix`), so
+//! the verb list and the recipes are now checked against the parser
+//! itself.
 
 #![forbid(unsafe_code)]
 
+use clap::{CommandFactory, Parser};
+use mcp_agent_mail_cli::Cli;
 use mcp_agent_mail_cli::doctor::robot_docs::handbook;
 
 const REQUIRED_VERBS: &[&str] = &[
-    "am doctor",
-    "am doctor --fix",
-    "am doctor --dry-run --fix",
+    "am doctor check --json",
+    "am doctor fix --dry-run",
+    "am doctor fix --yes",
     "am doctor fix --only",
     "am doctor fix --list",
     "am doctor undo",
@@ -28,6 +31,8 @@ const REQUIRED_VERBS: &[&str] = &[
     "am doctor ls",
     "am doctor triage",
     "am doctor selftest",
+    "am doctor locks",
+    "am doctor drain",
 ];
 
 const REQUIRED_TOPICS: &[&str] = &[
@@ -53,6 +58,73 @@ fn handbook_lists_every_doctor_verb() {
 }
 
 #[test]
+fn handbook_names_every_verb_clap_accepts() {
+    let text = handbook();
+    let cli = Cli::command();
+    let doctor = cli
+        .find_subcommand("doctor")
+        .expect("`am doctor` is a subcommand");
+    let verbs: Vec<&str> = doctor
+        .get_subcommands()
+        .map(clap::Command::get_name)
+        .filter(|name| *name != "help")
+        .collect();
+    assert!(verbs.len() > 20, "doctor verbs went missing: {verbs:?}");
+    for verb in verbs {
+        assert!(
+            text.contains(&format!("`am doctor {verb}")),
+            "handbook never names `am doctor {verb}` — add it to a verb table"
+        );
+    }
+}
+
+/// Every `am ...` line in the handbook's fenced shell blocks is meant to be
+/// pasted, so each must parse. Pipes and trailing comments are not part of
+/// the command; `<placeholders>` stand in for one argument each.
+#[test]
+fn handbook_shell_recipes_parse() {
+    let mut in_shell_block = false;
+    let mut checked = 0;
+    for line in handbook().lines() {
+        let trimmed = line.trim();
+        if let Some(fence) = trimmed.strip_prefix("```") {
+            in_shell_block = !in_shell_block && fence == "bash";
+            continue;
+        }
+        if !in_shell_block || !trimmed.starts_with("am ") {
+            continue;
+        }
+        let command = trimmed.split('|').next().unwrap_or_default();
+        let command = command.split(" #").next().unwrap_or_default().trim();
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        if let Err(err) = Cli::try_parse_from(&argv) {
+            panic!("handbook recipe `{command}` does not parse: {err}");
+        }
+        checked += 1;
+    }
+    assert!(checked >= 20, "only {checked} recipe lines found");
+}
+
+#[test]
+fn handbook_shell_recipe_check_rejects_the_old_spellings() {
+    // The negative control for the parse check above: the spellings the
+    // handbook used to publish are usage errors.
+    for old in [
+        "am doctor --json",
+        "am doctor --dry-run --fix",
+        "am doctor --fix --only fm-x --yes",
+        "am doctor --quick --json",
+        "am doctor",
+    ] {
+        let argv: Vec<&str> = old.split_whitespace().collect();
+        assert!(
+            Cli::try_parse_from(&argv).is_err(),
+            "`{old}` unexpectedly parses"
+        );
+    }
+}
+
+#[test]
 fn handbook_covers_load_bearing_topics() {
     let text = handbook();
     for topic in REQUIRED_TOPICS {
@@ -61,22 +133,6 @@ fn handbook_covers_load_bearing_topics() {
             "handbook missing required topic: `{topic}` — agents reading cold won't learn this concept"
         );
     }
-}
-
-#[test]
-fn handbook_verb_count_matches_table_header() {
-    // The verb table header pins the count. If a future pass adds or
-    // removes a verb, the header must be updated too — otherwise
-    // operators see "## The N Verbs" listing N+1 rows, which is
-    // confusing. Pass-27 set "14"; a parallel agent recounted to "15"
-    // (the original undercount included --dry-run --fix as a
-    // sub-form rather than a separate row). Pass-30 realigns the test
-    // to the canonical 15 count and pins it.
-    let text = handbook();
-    assert!(
-        text.contains("## The 15 Verbs"),
-        "handbook header must say `## The 15 Verbs` (pass-30 contract)"
-    );
 }
 
 #[test]

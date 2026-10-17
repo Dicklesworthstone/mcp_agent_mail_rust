@@ -80,7 +80,7 @@ impl WalModeDisabledFinding {
                 "remediation_pragma": "PRAGMA journal_mode=WAL;",
             }),
             remediation: FindingRemediation {
-                command: format!("am doctor --fix --only {FM_ID} --yes"),
+                command: super::fix_only_command(FM_ID),
                 explain_command: format!("am doctor explain {FM_ID}"),
                 auto_fixable: true,
                 estimated_actions: 1,

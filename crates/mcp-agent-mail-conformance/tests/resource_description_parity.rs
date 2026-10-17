@@ -7,7 +7,7 @@
 //! wording freely, while these tests keep the supported resource inventory and
 //! important operator guidance from disappearing accidentally.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// A unified (uri, description) from both resources and resource templates.
 struct ResourceEntry {
@@ -16,8 +16,7 @@ struct ResourceEntry {
 }
 
 fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::process_env_lock()
 }
 
 struct EnvVarGuard {
@@ -26,6 +25,7 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set(vars: &[(&str, &str)]) -> Self {
+        crate::settle_shared_storage();
         let mut previous = Vec::new();
         for (key, value) in vars {
             let old = std::env::var(*key).ok();
@@ -41,6 +41,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
+        crate::drain_shared_storage();
         for (key, value) in self.previous.drain(..) {
             match value {
                 Some(v) => unsafe {

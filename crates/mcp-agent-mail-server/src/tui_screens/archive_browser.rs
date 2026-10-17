@@ -4,6 +4,7 @@
 //! Right pane: file content preview with format-aware rendering
 //! (syntax-highlighted JSON, rendered markdown, plain text with line numbers).
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -271,8 +272,13 @@ pub struct ArchiveBrowserScreen {
     preview_path: String,
     /// Scroll offset in the preview pane.
     preview_scroll: u16,
-    /// Which pane has focus: `false` = tree, `true` = preview.
+    /// Which pane has focus: `false` = tree, `true` = preview. Read it
+    /// through [`Self::preview_has_focus`], which drops a focus the last
+    /// frame had no preview pane to show.
     preview_focused: bool,
+    /// Whether the last frame drew the preview pane (Md+ width with
+    /// `detail_visible`); the tree keeps focus while it is hidden.
+    preview_shown: Cell<bool>,
     /// Current archive root path.
     archive_root: Option<PathBuf>,
     /// Filter text for searching file names.
@@ -302,6 +308,7 @@ impl ArchiveBrowserScreen {
             preview_path: String::new(),
             preview_scroll: 0,
             preview_focused: false,
+            preview_shown: Cell::new(false),
             archive_root: None,
             filter: String::new(),
             filter_active: false,
@@ -311,6 +318,10 @@ impl ArchiveBrowserScreen {
             last_data_gen: super::DataGeneration::stale(),
             pending_periodic_refresh: false,
         }
+    }
+
+    fn preview_has_focus(&self) -> bool {
+        self.preview_focused && self.preview_shown.get()
     }
 
     fn preview_max_scroll(&self) -> u16 {
@@ -806,7 +817,7 @@ impl ArchiveBrowserScreen {
     fn render_tree(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
         let tp = crate::tui_theme::TuiThemePalette::current();
 
-        let border_style = if self.preview_focused {
+        let border_style = if self.preview_has_focus() {
             Style::default().fg(tp.panel_border_dim)
         } else {
             Style::default().fg(tp.panel_border_focused)
@@ -859,7 +870,7 @@ impl ArchiveBrowserScreen {
                 };
 
                 let selected = self.tree_state.selected == Some(i);
-                let row_style = if selected && !self.preview_focused {
+                let row_style = if selected && !self.preview_has_focus() {
                     Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
                 } else {
                     name_style
@@ -881,7 +892,7 @@ impl ArchiveBrowserScreen {
     fn render_preview(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
 
-        let border_style = if self.preview_focused {
+        let border_style = if self.preview_has_focus() {
             Style::default().fg(tp.panel_border_focused)
         } else {
             Style::default().fg(tp.panel_border_dim)
@@ -1056,7 +1067,7 @@ impl ArchiveBrowserScreen {
                         self.toggle_expand();
                     } else {
                         self.load_preview();
-                        self.preview_focused = true;
+                        self.preview_focused = self.preview_shown.get();
                     }
                 }
             }
@@ -1078,7 +1089,7 @@ impl ArchiveBrowserScreen {
                 }
             }
             KeyCode::Tab => {
-                self.preview_focused = true;
+                self.preview_focused = self.preview_shown.get();
             }
             KeyCode::Char('/') => {
                 self.filter_active = true;
@@ -1145,6 +1156,8 @@ impl MailScreen for ArchiveBrowserScreen {
             if self.filter_active {
                 return self.handle_filter_key(key.code, state);
             }
+            // A resize can hide the focused preview.
+            self.preview_focused = self.preview_has_focus();
             if self.preview_focused {
                 return self.handle_preview_key(key);
             }
@@ -1185,6 +1198,7 @@ impl MailScreen for ArchiveBrowserScreen {
         let split = layout.split(content_area);
         let tree_area = split.rects[0];
         let has_preview = split.rects.len() >= 2;
+        self.preview_shown.set(has_preview);
 
         // Render tree pane (with optional filter bar)
         if self.filter_active {
@@ -1297,8 +1311,8 @@ impl MailScreen for ArchiveBrowserScreen {
                 action: "Collapse dir / go to parent",
             },
             HelpEntry {
-                key: "Tab",
-                action: "Switch pane focus",
+                key: "Enter / Esc, Tab",
+                action: "Focus file preview / back to tree",
             },
             HelpEntry {
                 key: "/",
@@ -1333,8 +1347,21 @@ impl MailScreen for ArchiveBrowserScreen {
         self.filter_active
     }
 
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // The file tree filters with `/`; the focused preview pages with
+        // Ctrl+D/U and returns to the tree with Tab or Esc (so Esc there
+        // never arms quit, and Ctrl+D in the tree detaches again).
+        if self.preview_has_focus() {
+            matches!(key.code, KeyCode::Tab | KeyCode::Escape)
+                || (key.modifiers.contains(Modifiers::CTRL)
+                    && matches!(key.code, KeyCode::Char('d' | 'u')))
+        } else {
+            matches!(key.code, KeyCode::Char('/'))
+        }
+    }
+
     fn copyable_content(&self) -> Option<String> {
-        if self.preview_focused {
+        if self.preview_has_focus() {
             self.preview_content.clone()
         } else {
             self.tree_state.selected.and_then(|sel| {
@@ -1478,6 +1505,72 @@ mod tests {
         assert!(screen.preview_content.is_none());
         assert_eq!(screen.title(), "Archive Browser");
         assert_eq!(screen.tab_label(), "Archive");
+    }
+
+    #[test]
+    fn preview_claims_its_paging_keys_and_the_tree_leaves_detach_global() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c)).with_modifiers(Modifiers::CTRL);
+        let mut screen = ArchiveBrowserScreen::new();
+        // In the tree, Ctrl+D stays the shell's detach and `/` filters.
+        assert!(!screen.claims_key(&ctrl('d')));
+        assert!(screen.claims_key(&KeyEvent::new(KeyCode::Char('/'))));
+        assert!(!screen.claims_key(&KeyEvent::new(KeyCode::Tab)));
+        // The focused preview pages with Ctrl+D/U and returns with Tab or
+        // Esc, so Esc there never reaches the global quit confirmation.
+        screen.preview_shown.set(true);
+        screen.preview_focused = true;
+        assert!(screen.claims_key(&ctrl('d')));
+        assert!(screen.claims_key(&ctrl('u')));
+        assert!(screen.claims_key(&KeyEvent::new(KeyCode::Tab)));
+        assert!(screen.claims_key(&KeyEvent::new(KeyCode::Escape)));
+        assert!(!screen.claims_key(&ctrl('c')));
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let esc = Event::Key(KeyEvent::new(KeyCode::Escape));
+        let _ = screen.update(&esc, &state);
+        assert!(!screen.preview_focused);
+        assert!(!screen.claims_key(&KeyEvent::new(KeyCode::Escape)));
+    }
+
+    #[test]
+    fn focus_stays_on_the_tree_while_the_preview_pane_is_hidden() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.entries = vec![ArchiveEntry {
+            name: "a.md".into(),
+            rel_path: "a.md".into(),
+            is_dir: false,
+            size: 1,
+            depth: 0,
+            expanded: false,
+            child_count: 0,
+        }];
+        screen.tree_state.selected = Some(0);
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter));
+        let render = |screen: &ArchiveBrowserScreen, width: u16| {
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(width, 30, &mut pool);
+            screen.view(&mut frame, Rect::new(0, 0, width, 30), &state);
+        };
+
+        // Below the Md breakpoint there is no preview pane to focus.
+        render(&screen, 80);
+        let _ = screen.update(&enter, &state);
+        assert!(!screen.preview_focused);
+        assert!(!screen.claims_key(&KeyEvent::new(KeyCode::Escape)));
+
+        // A wide frame shows it, and Enter on a file moves focus there.
+        render(&screen, 140);
+        let _ = screen.update(&enter, &state);
+        assert!(screen.preview_focused);
+        assert!(screen.claims_key(&KeyEvent::new(KeyCode::Escape)));
+
+        // Shrinking the terminal hides it again: the claims drop at once
+        // and the next key goes to the tree, not the invisible preview.
+        render(&screen, 80);
+        assert!(!screen.claims_key(&KeyEvent::new(KeyCode::Escape)));
+        let _ = screen.update(&Event::Key(KeyEvent::new(KeyCode::Char('/'))), &state);
+        assert!(!screen.preview_focused);
+        assert!(screen.filter_active);
     }
 
     #[test]

@@ -992,6 +992,7 @@ fn evaluate_query_with_mode(
                     redaction_policy: None,
                     track_telemetry: false,
                     search_engine: Some(mode.engine()),
+                    surface: None,
                 };
                 let resp = match execute_search(&cx, &p, &query, &opts).await {
                     Outcome::Ok(resp) => resp,

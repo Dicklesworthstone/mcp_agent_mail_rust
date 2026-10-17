@@ -9,6 +9,29 @@ use mcp_agent_mail_db::coalesce::CoalesceMap;
 use mcp_agent_mail_db::models::ProjectRow;
 use mcp_agent_mail_db::read_cache;
 
+/// Sequence number of the newest entry in `ledger` (0 when empty).
+///
+/// The global ledger is a process-wide 1000-entry ring buffer shared by every
+/// test in this binary. Once it is full, counting entries before and after an
+/// action cannot observe a new one (the count stays at the cap), so these tests
+/// mark the newest sequence number and look for entries recorded after it.
+fn seq_mark(ledger: &EvidenceLedger) -> u64 {
+    ledger.recent(1).first().map_or(0, |entry| entry.seq)
+}
+
+/// Entries for `decision_point` recorded after `mark`, newest first.
+fn recorded_since(
+    ledger: &EvidenceLedger,
+    decision_point: &str,
+    mark: u64,
+) -> Vec<EvidenceLedgerEntry> {
+    ledger
+        .query(decision_point, usize::MAX)
+        .into_iter()
+        .filter(|entry| entry.seq > mark)
+        .collect()
+}
+
 fn make_project(slug: &str) -> ProjectRow {
     ProjectRow {
         id: Some(1),
@@ -22,16 +45,15 @@ fn make_project(slug: &str) -> ProjectRow {
 #[test]
 fn evidence_cache_eviction_recorded() {
     let ledger = evidence_ledger();
-    let before = ledger.query("cache.deferred_flush", 1000).len();
+    let mark = seq_mark(ledger);
 
     let cache = read_cache();
     cache.enqueue_touch(9901, 1000);
     let _ = cache.drain_touches();
 
-    let after = ledger.query("cache.deferred_flush", 1000).len();
     assert!(
-        after > before,
-        "expected evidence entry for cache.deferred_flush after drain, before={before} after={after}"
+        !recorded_since(ledger, "cache.deferred_flush", mark).is_empty(),
+        "expected a cache.deferred_flush evidence entry after seq {mark}"
     );
 }
 
@@ -39,7 +61,7 @@ fn evidence_cache_eviction_recorded() {
 #[test]
 fn evidence_coalesce_outcome_recorded() {
     let ledger = evidence_ledger();
-    let before = ledger.query("coalesce.outcome", 1000).len();
+    let mark = seq_mark(ledger);
 
     let map: CoalesceMap<String, String> =
         CoalesceMap::new(100, std::time::Duration::from_millis(100));
@@ -47,21 +69,24 @@ fn evidence_coalesce_outcome_recorded() {
         map.execute_or_join("test-key".into(), || Ok("hello".to_string()));
     assert!(result.is_ok());
 
-    let after = ledger.query("coalesce.outcome", 1000).len();
+    let entries = recorded_since(ledger, "coalesce.outcome", mark);
     assert!(
-        after > before,
-        "expected evidence entry for coalesce.outcome, before={before} after={after}"
+        !entries.is_empty(),
+        "expected a coalesce.outcome evidence entry after seq {mark}"
     );
-
-    let entries = ledger.query("coalesce.outcome", 1);
-    assert_eq!(entries[0].decision_point, "coalesce.outcome");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.decision_point == "coalesce.outcome")
+    );
+    assert!(entries.iter().any(|e| e.action == "executed"));
 }
 
 /// 3. Trigger deferred flush with multiple touches, verify entry recorded.
 #[test]
 fn evidence_deferred_flush_recorded() {
     let ledger = evidence_ledger();
-    let before = ledger.query("cache.deferred_flush", 1000).len();
+    let mark = seq_mark(ledger);
 
     let cache = read_cache();
     cache.enqueue_touch(9801, 1000);
@@ -69,13 +94,11 @@ fn evidence_deferred_flush_recorded() {
     cache.enqueue_touch(9803, 3000);
     let _ = cache.drain_touches();
 
-    let after = ledger.query("cache.deferred_flush", 1000).len();
+    let entries = recorded_since(ledger, "cache.deferred_flush", mark);
     assert!(
-        after > before,
-        "expected evidence entry for cache.deferred_flush, before={before} after={after}"
+        !entries.is_empty(),
+        "expected a cache.deferred_flush evidence entry after seq {mark}"
     );
-
-    let entries = ledger.query("cache.deferred_flush", 1);
     let evidence = &entries[0].evidence;
     // pending_count may be any value (other tests may contribute)
     assert!(evidence.get("pending_count").is_some());
@@ -107,6 +130,7 @@ fn evidence_no_regression_cache_stress() {
 #[test]
 fn evidence_multiple_decision_points() {
     let ledger = evidence_ledger();
+    let mark = seq_mark(ledger);
 
     // Trigger cache.deferred_flush
     let cache = read_cache();
@@ -118,8 +142,8 @@ fn evidence_multiple_decision_points() {
     let _: Result<_, String> = map.execute_or_join("multi-test".into(), || Ok(42));
 
     // Verify distinct decision points are recorded
-    let flush_entries = ledger.query("cache.deferred_flush", 100);
-    let coalesce_entries = ledger.query("coalesce.outcome", 100);
+    let flush_entries = recorded_since(ledger, "cache.deferred_flush", mark);
+    let coalesce_entries = recorded_since(ledger, "coalesce.outcome", mark);
 
     assert!(
         !flush_entries.is_empty(),
@@ -245,6 +269,7 @@ fn evidence_integration_jsonl_roundtrip() {
 #[test]
 fn evidence_integration_all_decision_points() {
     let ledger = evidence_ledger();
+    let mark = seq_mark(ledger);
 
     // Exercise cache decision point
     let cache = read_cache();
@@ -257,9 +282,10 @@ fn evidence_integration_all_decision_points() {
     let _: Result<_, String> = map.execute_or_join("integration-all".into(), || Ok("ok".into()));
 
     // Verify at least 2 distinct decision points are recorded
-    let all_recent = ledger.recent(100);
+    let all_recent = ledger.recent(usize::MAX);
     let distinct_dps: std::collections::HashSet<&str> = all_recent
         .iter()
+        .filter(|e| e.seq > mark)
         .map(|e| e.decision_point.as_str())
         .collect();
 

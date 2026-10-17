@@ -815,7 +815,7 @@ impl GitRefIntegritySweepState {
             .filter(|project| project.finding_count > 0)
             .count();
         Some(format!(
-            "registered projects have {} orphan refs across {} projects. Run: am doctor fix-orphan-refs --all --dry-run",
+            "registered projects have {} orphan refs across {} projects. Run: am doctor fix-orphan-refs --all",
             self.total_findings, affected_projects
         ))
     }
@@ -893,7 +893,7 @@ fn boot_archive_preflight_remediation(snapshot: &BootArchivePreflightSnapshot) -
         return None;
     }
     Some(format!(
-        "archive has {} boot finding(s) across {} project candidate(s). Run: am doctor fix-orphan-refs --all --dry-run",
+        "archive has {} boot finding(s) across {} project candidate(s). Run: am doctor fix-orphan-refs --all",
         snapshot.findings_count,
         boot_archive_preflight_affected_projects(snapshot),
     ))
@@ -2438,7 +2438,7 @@ impl SystemHealthScreen {
                 confidence: 0.95,
                 title: "Boot archive check findings".to_string(),
                 rationale: Some(remediation),
-                next_steps: vec!["am doctor fix-orphan-refs --all --dry-run".to_string()],
+                next_steps: vec!["am doctor fix-orphan-refs --all".to_string()],
             });
         }
         if let Some(banner) = snap.git_ref_integrity.banner() {
@@ -3263,7 +3263,7 @@ fn build_system_health_recommendations(
             action: "Dry-run orphan ref cleanup".to_string(),
             reason: banner,
             evidence: "system-health://git-ref-integrity".to_string(),
-            safe_command: "am doctor fix-orphan-refs --all --dry-run".to_string(),
+            safe_command: "am doctor fix-orphan-refs --all".to_string(),
         });
     }
 
@@ -3283,7 +3283,7 @@ fn build_system_health_recommendations(
                 "mode={} projects={} findings={} duration={}ms",
                 boot.mode, boot.total_projects, boot.findings_count, boot.duration_ms
             ),
-            safe_command: "am doctor fix-orphan-refs --all --dry-run".to_string(),
+            safe_command: "am doctor fix-orphan-refs --all".to_string(),
         });
     }
 
@@ -4694,6 +4694,7 @@ mod tests {
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "127.0.0.1");
@@ -4716,6 +4717,7 @@ mod tests {
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "::1");
@@ -5617,6 +5619,7 @@ mod tests {
             console_theme: String::new(),
             tool_filter_profile: String::new(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "127.0.0.1");
@@ -5639,6 +5642,7 @@ mod tests {
             console_theme: String::new(),
             tool_filter_profile: String::new(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let err = parse_http_endpoint(&cfg).unwrap_err();
         assert!(err.contains("unsupported endpoint scheme"));
@@ -5659,6 +5663,7 @@ mod tests {
             console_theme: String::new(),
             tool_filter_profile: String::new(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         let parsed = parse_http_endpoint(&cfg).expect("parse");
         assert_eq!(parsed.host, "127.0.0.1");
@@ -5889,7 +5894,7 @@ mod tests {
             "expected boot-check row, got:\n{text}"
         );
         assert!(
-            text.contains("am doctor fix-orphan-refs --all --dry-run"),
+            text.contains("am doctor fix-orphan-refs --all"),
             "expected boot-check remediation, got:\n{text}"
         );
     }
@@ -6414,7 +6419,7 @@ mod tests {
         assert_eq!(
             sweep.banner().as_deref(),
             Some(
-                "registered projects have 3 orphan refs across 2 projects. Run: am doctor fix-orphan-refs --all --dry-run"
+                "registered projects have 3 orphan refs across 2 projects. Run: am doctor fix-orphan-refs --all"
             )
         );
     }

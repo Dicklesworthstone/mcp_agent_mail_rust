@@ -1732,7 +1732,7 @@ pub fn build_release_health_report(inputs: &ReleaseHealthInputs) -> ReleaseHealt
             ReleaseHealthComponentId::Doctor,
             inputs.doctor_report.as_deref(),
             inputs.offline,
-            "provide --doctor-report from `am doctor --json` or `am doctor health`",
+            "provide --doctor-report from `am doctor check --json` or `am doctor health`",
         ),
         evidence_file_component(
             ReleaseHealthComponentId::RobotHealth,

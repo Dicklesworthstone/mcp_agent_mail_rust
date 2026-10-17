@@ -101,7 +101,7 @@ filter = '''
 | test(native_security_privacy_gate)
 | test(rapid_key_sequences_no_panic)
 | (binary_id(mcp-agent-mail-server::it) & test(/^tui_perf_baselines::/))
-| (binary_id(mcp-agent-mail-server::it) & test(/^golden_snapshots::/))
+| binary_id(mcp-agent-mail-server::golden_snapshots)
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 '''
@@ -167,7 +167,7 @@ filter = '''
 | test(native_security_privacy_gate)
 | test(rapid_key_sequences_no_panic)
 | (binary_id(mcp-agent-mail-server::it) & test(/^tui_perf_baselines::/))
-| (binary_id(mcp-agent-mail-server::it) & test(/^golden_snapshots::/))
+| binary_id(mcp-agent-mail-server::golden_snapshots)
 | test(=tui_app::tests::perf_modal_overlay_render)
 | test(=tui_widgets::tests::mermaid_contact_graph_50_nodes_stays_under_10ms)
 '''

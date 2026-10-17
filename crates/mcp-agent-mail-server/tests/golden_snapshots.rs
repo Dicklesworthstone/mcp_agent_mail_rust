@@ -5,8 +5,12 @@
 //! Renders each screen at standard terminal sizes (80x24, 120x40) and
 //! compares against stored `.snap` baselines under `tests/snapshots/`.
 //!
-//! Run `BLESS=1 cargo test -p mcp-agent-mail-server --test it golden_snapshots::`
+//! Run `BLESS=1 cargo test -p mcp-agent-mail-server --test golden_snapshots`
 //! to create or update snapshot files.
+//!
+//! This file is its own test binary, not a module of `tests/it.rs`: the Tool
+//! Metrics and System Health screens read process-global metrics, which other
+//! tests in a shared binary would move while these goldens render.
 
 use std::sync::Arc;
 

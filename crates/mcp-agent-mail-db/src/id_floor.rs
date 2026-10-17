@@ -55,11 +55,46 @@ const MAX_FRONTMATTER_PREFIX_BYTES: u64 = 256 * 1024;
 pub fn max_message_id_in_archive(storage_root: &Path) -> DbResult<Option<i64>> {
     #[cfg(unix)]
     {
-        descriptor_scan::scan(storage_root, &mut |_, _| {})
+        scan_until_settled(storage_root, &mut |_, _| {})
     }
     #[cfg(not(unix))]
     {
         scan_archive_by_path(storage_root)
+    }
+}
+
+/// Complete scans tried before a concurrent append fails the seed.
+#[cfg(unix)]
+const ARCHIVE_SCAN_ATTEMPTS: u32 = 3;
+#[cfg(unix)]
+const ARCHIVE_CONTENTS_CHANGED: &str = "archive contents changed during scan";
+
+/// Rescan when an append landed in a directory mid-scan, which happens when
+/// the first send after startup races write-behind archive writes. A
+/// rejected scan omitted nothing (it failed instead), and a later one that
+/// sees a stable archive is complete. Directory swaps and every other error
+/// still fail on the first attempt.
+#[cfg(unix)]
+fn scan_until_settled(
+    storage_root: &Path,
+    hook: &mut impl FnMut(&Path, descriptor_scan::Phase),
+) -> DbResult<Option<i64>> {
+    let mut attempt = 1;
+    loop {
+        match descriptor_scan::scan(storage_root, hook) {
+            Err(DbError::Internal(message))
+                if attempt < ARCHIVE_SCAN_ATTEMPTS
+                    && message.contains(ARCHIVE_CONTENTS_CHANGED) =>
+            {
+                tracing::debug!(
+                    attempt,
+                    "message id archive scan saw a concurrent append; rescanning"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
+                attempt += 1;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -1408,6 +1443,44 @@ mod tests {
         let error = result.expect_err("an ID added during enumeration must not be omitted");
         assert!(error.to_string().contains("contents changed during scan"));
         assert_eq!(max_message_id_in_archive(&root).unwrap(), Some(97));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_seed_scan_rescans_after_a_concurrent_append_but_not_forever() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write_canonical_message(&root, "proj", "2026", "05", "01__7.md", 7);
+        let month = root.join("projects/proj/messages/2026/05");
+        // One append mid-scan (write-behind finishing an earlier send): the
+        // seed rescans and includes it instead of failing the caller.
+        let mut appended = 0;
+        let settled = scan_until_settled(&root, &mut |path, phase| {
+            if path == month && phase == descriptor_scan::Phase::Scanned && appended == 0 {
+                appended += 1;
+                write_canonical_message(&root, "proj", "2026", "05", "02__97.md", 97);
+            }
+        });
+        assert_eq!(appended, 1);
+        assert_eq!(settled.unwrap(), Some(97));
+        // An archive that never stops changing still fails closed.
+        let mut next = 100;
+        let churning = scan_until_settled(&root, &mut |path, phase| {
+            if path == month && phase == descriptor_scan::Phase::Scanned {
+                next += 1;
+                write_canonical_message(
+                    &root,
+                    "proj",
+                    "2026",
+                    "05",
+                    &format!("{next}__{next}.md"),
+                    next,
+                );
+            }
+        });
+        assert_eq!(next, 100 + i64::from(ARCHIVE_SCAN_ATTEMPTS));
+        let error = churning.expect_err("persistent churn must not publish a floor");
+        assert!(error.to_string().contains("contents changed during scan"));
     }
 
     #[cfg(unix)]

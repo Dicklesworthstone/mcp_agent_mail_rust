@@ -638,6 +638,7 @@ fn capture_snapshot(
                     redaction_policy: None,
                     track_telemetry: false,
                     search_engine: Some(eng),
+                    surface: None,
                 };
                 // execute_search returns ScopedSearchResponse; extract inner results
                 match execute_search(&cx, &pool, &sq, &opts).await {

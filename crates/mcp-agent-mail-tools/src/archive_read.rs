@@ -1251,13 +1251,35 @@ pub fn acquire_if_needed(
             // perturb. One content hash is vastly cheaper than a
             // reconstruction, and it is the same authority `run_build` already
             // publishes on.
-            let cheap_fresh = Instant::now().duration_since(exact_at) < exact_audit_interval()
-                && cheap_generation(&slot.scope, caller_deadline)? == expected_cheap;
+            //
+            // A sample can also meet another writer's `.git/index.lock` (the
+            // background index sync, Git run in the archive, another
+            // process). That is contention, not failure: retry the way a busy
+            // build is retried instead of failing the caller's read.
+            let cheap_fresh = if Instant::now().duration_since(exact_at) < exact_audit_interval() {
+                match cheap_generation(&slot.scope, caller_deadline) {
+                    Ok(cheap) => cheap == expected_cheap,
+                    Err(AcquireError::Busy(_)) => {
+                        wait_retry_slice(&slot);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                false
+            };
 
             let content_unchanged = if cheap_fresh {
                 true
             } else {
-                exact_generation(&slot.scope, caller_deadline)? == expected_exact
+                match exact_generation(&slot.scope, caller_deadline) {
+                    Ok(exact) => exact == expected_exact,
+                    Err(AcquireError::Busy(_)) => {
+                        wait_retry_slice(&slot);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
 
             if content_unchanged
@@ -1692,6 +1714,41 @@ mod tests {
         drop(conn);
         assert_eq!(snapshot_family(snapshot.path()), family_before);
         drop(snapshots);
+        reset_for_test();
+    }
+
+    #[test]
+    fn ready_snapshot_read_waits_out_a_held_git_index_lock() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        write_archive_fixture(&storage_root);
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let cx = Cx::for_testing();
+        acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+            .expect("cold acquire")
+            .expect("archive must require a snapshot");
+
+        // Another writer (the background index sync, Git run in the archive,
+        // another process) holds the index lock while the next read samples
+        // its ready snapshot's generation.
+        let lock = storage_root.join(".git").join("index.lock");
+        std::fs::write(&lock, b"").expect("hold index lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::remove_file(&lock).expect("release index lock");
+        });
+        let reread = acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx);
+        releaser.join().expect("releaser thread");
+        assert!(
+            matches!(reread, Ok(Some(_))),
+            "a held index lock is contention to wait out, not a failed read: {:?}",
+            reread.err()
+        );
         reset_for_test();
     }
 

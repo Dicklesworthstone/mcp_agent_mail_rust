@@ -722,7 +722,7 @@ impl MailScreen for AtcScreen {
         }
 
         match key.code {
-            // Panel switching
+            // Panel switching (`d` enters Decisions; Tab is claimed only there)
             KeyCode::Tab => {
                 tracing::debug!(
                     event = "tui.atc.key_pressed",
@@ -926,8 +926,8 @@ impl MailScreen for AtcScreen {
                 action: "Jump to first/last",
             },
             HelpEntry {
-                key: "Tab",
-                action: "Switch panel (Agents/Decisions)",
+                key: "d / Tab",
+                action: "Drill into decisions / back to agents",
             },
             HelpEntry {
                 key: "s",
@@ -942,10 +942,6 @@ impl MailScreen for AtcScreen {
                 action: "Toggle detail panel",
             },
             HelpEntry {
-                key: "d",
-                action: "Drill into decision detail",
-            },
-            HelpEntry {
                 key: "r",
                 action: "Open retention report",
             },
@@ -958,6 +954,12 @@ impl MailScreen for AtcScreen {
 
     fn context_help_tip(&self) -> Option<&'static str> {
         Some("ATC decision engine: agent liveness, conflict detection, and evidence ledger")
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `d` focuses the decision log and Tab there returns to the agent
+        // table; in the agent table Tab stays the shell's screen cycling.
+        self.focus == FocusPanel::Decisions && matches!(key.code, KeyCode::Tab)
     }
 
     fn title(&self) -> &'static str {
@@ -1305,8 +1307,28 @@ mod tests {
     fn keybindings_include_decision_and_retention_shortcuts() {
         let screen = AtcScreen::new();
         let bindings = screen.keybindings();
-        assert!(bindings.iter().any(|binding| binding.key == "d"));
+        assert!(bindings.iter().any(|binding| binding.key == "d / Tab"));
         assert!(bindings.iter().any(|binding| binding.key == "r"));
+    }
+
+    #[test]
+    fn decisions_claim_tab_back_to_agents_and_agents_leave_it_global() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let tab = ftui::KeyEvent::new(KeyCode::Tab);
+        let mut screen = AtcScreen::new();
+        // The agent table leaves Tab to the shell's screen cycling.
+        assert_eq!(screen.focus, FocusPanel::Agents);
+        assert!(!screen.claims_key(&tab));
+        // `d` drills into the decision log, which then claims Tab (only Tab).
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('d'))), &state);
+        assert_eq!(screen.focus, FocusPanel::Decisions);
+        assert!(screen.claims_key(&tab));
+        assert!(!screen.claims_key(&ftui::KeyEvent::new(KeyCode::BackTab)));
+        assert!(!screen.claims_key(&ftui::KeyEvent::new(KeyCode::Escape)));
+        // Tab returns to the agent table and releases the claim again.
+        let _ = screen.update(&Event::Key(tab), &state);
+        assert_eq!(screen.focus, FocusPanel::Agents);
+        assert!(!screen.claims_key(&tab));
     }
 
     #[test]

@@ -113,6 +113,8 @@ pub enum ServerControlMsg {
     ComposeEnvelope(crate::tui_compose::ComposeEnvelope),
 }
 
+/// Independent server settings mirrored for rendering and `/mail/ws-state`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSnapshot {
     pub endpoint: String,
@@ -129,6 +131,8 @@ pub struct ConfigSnapshot {
     pub console_theme: String,
     pub tool_filter_profile: String,
     pub tui_debug: bool,
+    /// Whether the integrity guard runs and so refreshes the proactive `.bak`.
+    pub integrity_guard_enabled: bool,
 }
 
 impl ConfigSnapshot {
@@ -161,6 +165,7 @@ impl ConfigSnapshot {
             console_theme: format!("{:?}", config.console_theme),
             tool_filter_profile: config.tool_filter.profile.clone(),
             tui_debug: config.tui_debug,
+            integrity_guard_enabled: crate::integrity_guard::enabled_for(config),
         }
     }
 
@@ -2166,6 +2171,7 @@ mod tests {
             console_theme: "cyberpunk_aurora".into(),
             tool_filter_profile: "default".into(),
             tui_debug: false,
+            integrity_guard_enabled: true,
         };
         assert_eq!(snap.transport_mode(), "custom");
     }
@@ -2187,6 +2193,7 @@ mod tests {
                 console_theme: String::new(),
                 tool_filter_profile: String::new(),
                 tui_debug: false,
+                integrity_guard_enabled: true,
             }
         };
         assert_eq!(snap.transport_mode(), "mcp");
@@ -2209,6 +2216,7 @@ mod tests {
                 console_theme: String::new(),
                 tool_filter_profile: String::new(),
                 tui_debug: false,
+                integrity_guard_enabled: true,
             }
         };
         assert_eq!(snap.transport_mode(), "api");
@@ -2289,6 +2297,7 @@ mod tests {
             console_theme: "default".into(),
             tool_filter_profile: "minimal".into(),
             tui_debug: false,
+            integrity_guard_enabled: false,
         };
         state.update_config_snapshot(new_snap);
         let snap2 = state.config_snapshot();

@@ -17,6 +17,34 @@ mod resource_coverage_guard;
 mod resource_description_parity;
 mod tool_description_parity;
 
+/// The one lock every module's env/fixture lock returns (br-odkc4).
+///
+/// All modules of this binary mutate the process environment
+/// (`DATABASE_URL`, `STORAGE_ROOT`, ...) and share the process-global
+/// write-back queue and its sticky durability flag. Per-module locks let a
+/// test in one module run while another module's test had swapped those out.
+pub(crate) fn process_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
+/// Drain the process-global write-back queue and async commit coalescer.
+/// Env guards call this on drop, before their test's tempdir is removed, so
+/// queued archive writes never outlive the directory they target.
+pub(crate) fn drain_shared_storage() {
+    mcp_agent_mail_storage::wbq_flush();
+    mcp_agent_mail_storage::flush_async_commits();
+}
+
+/// Settle what an earlier test left queued and clear the sticky durability
+/// flag, so any degradation (or stalled commit drain that `health_check`
+/// reports) a test sees is its own. Call only while holding
+/// [`process_env_lock`].
+pub(crate) fn settle_shared_storage() {
+    drain_shared_storage();
+    mcp_agent_mail_storage::clear_durability_degraded();
+}
+
 // The workspace-level release/docs drift guard. It includes doc_consistency.rs
 // and resource_coverage_guard.rs again under its own module, as it did when it
 // was a separate test binary, so the one `docs_drift_ci::` gate filter selects

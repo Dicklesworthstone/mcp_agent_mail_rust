@@ -553,8 +553,11 @@ impl MailScreen for ProjectsScreen {
                     self.table_state.selected = Some(0);
                 }
                 KeyCode::Char('/') => {
+                    // A fresh filter starts from the full list, not the
+                    // one the previous filter left behind.
                     self.filter_active = true;
                     self.filter.clear();
+                    self.rebuild_from_state(state);
                 }
                 KeyCode::Char('s') => {
                     self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
@@ -713,6 +716,17 @@ impl MailScreen for ProjectsScreen {
 
     fn consumes_text_input(&self) -> bool {
         self.filter_active
+    }
+
+    fn claims_key(&self, key: &ftui::KeyEvent) -> bool {
+        // `/` opens this screen's filter rather than the global search. Esc
+        // clears a committed filter; with no filter it stays the global quit
+        // confirmation.
+        match key.code {
+            KeyCode::Char('/') => true,
+            KeyCode::Escape => !self.filter_active && !self.filter.is_empty(),
+            _ => false,
+        }
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -1315,6 +1329,56 @@ mod tests {
         let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
         screen.update(&esc, &state);
         assert!(!screen.consumes_text_input());
+    }
+
+    #[test]
+    fn esc_is_claimed_only_while_a_committed_filter_can_be_cleared() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 2,
+            projects_list: vec![
+                ProjectSummary {
+                    slug: "alpha".into(),
+                    human_key: "/tmp/alpha".into(),
+                    ..Default::default()
+                },
+                ProjectSummary {
+                    slug: "beta".into(),
+                    human_key: "/tmp/beta".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let mut screen = ProjectsScreen::new();
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.projects.len(), 2);
+
+        // With no filter Esc stays global, so it still arms quit confirmation.
+        let esc = ftui::KeyEvent::new(KeyCode::Escape);
+        assert!(!screen.claims_key(&esc));
+
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('a'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+            KeyCode::Enter,
+        ] {
+            screen.update(&Event::Key(ftui::KeyEvent::new(code)), &state);
+        }
+        assert!(!screen.consumes_text_input());
+        assert_eq!(screen.projects.len(), 1);
+        assert!(screen.claims_key(&esc));
+
+        screen.update(&Event::Key(esc), &state);
+        assert_eq!(screen.filter, "");
+        assert_eq!(
+            screen.projects.len(),
+            2,
+            "clearing the filter rebuilds the list"
+        );
+        assert!(!screen.claims_key(&esc));
     }
 
     #[test]

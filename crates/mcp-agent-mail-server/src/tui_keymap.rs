@@ -48,15 +48,16 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         action: "Jump to screen",
         text_suppressible: true,
     },
+    // While a screen takes text, Tab moves between its fields instead.
     GlobalBinding {
         label: "Tab",
         action: "Next screen",
-        text_suppressible: false,
+        text_suppressible: true,
     },
     GlobalBinding {
         label: "Shift+Tab",
         action: "Previous screen",
-        text_suppressible: false,
+        text_suppressible: true,
     },
     GlobalBinding {
         label: "m",
@@ -66,12 +67,12 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
     GlobalBinding {
         label: "Ctrl+P",
         action: "Command palette",
-        text_suppressible: false,
+        text_suppressible: true,
     },
     GlobalBinding {
         label: "Ctrl+E",
         action: "Export screen snapshot",
-        text_suppressible: false,
+        text_suppressible: true,
     },
     GlobalBinding {
         label: ":",
@@ -81,7 +82,7 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
     GlobalBinding {
         label: "Ctrl+T",
         action: "Cycle theme",
-        text_suppressible: true,
+        text_suppressible: false,
     },
     GlobalBinding {
         label: "F1",
@@ -184,7 +185,7 @@ pub fn detect_conflicts(
 
     for global in GLOBAL_BINDINGS {
         if !global.text_suppressible {
-            // Non-suppressible globals (Tab, Esc, Ctrl+P) are always processed
+            // Non-suppressible globals (Esc, Ctrl+P, F1) are always processed
             // before screen dispatch, so they can't conflict.
             continue;
         }
@@ -308,13 +309,13 @@ fn default_profile_bindings() -> Vec<ProfileBinding> {
 fn vim_profile_bindings() -> Vec<ProfileBinding> {
     vec![
         pb("jump_screen", JUMP_BINDING_LABEL, "Jump to screen", true),
-        pb("next_screen", "Tab", "Next screen", false),
-        pb("prev_screen", "Shift+Tab", "Previous screen", false),
+        pb("next_screen", "Tab", "Next screen", true),
+        pb("prev_screen", "Shift+Tab", "Previous screen", true),
         pb("toggle_mode", "m", "Toggle MCP/API mode", true),
         pb("command_palette", ":", "Command palette", true),
-        pb("command_palette_ctrl", "Ctrl+P", "Command palette", false),
-        pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
-        pb("cycle_theme", "Ctrl+T", "Cycle theme", true),
+        pb("command_palette_ctrl", "Ctrl+P", "Command palette", true),
+        pb("export_menu", "Ctrl+E", "Export screen snapshot", true),
+        pb("cycle_theme", "Ctrl+T", "Cycle theme", false),
         pb("toggle_help", "F1", "Toggle help", false),
         pb("clipboard_yank", "y", "Copy to clipboard", true),
         pb("quit", "q", "Quit", true),
@@ -344,12 +345,12 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
 fn emacs_profile_bindings() -> Vec<ProfileBinding> {
     vec![
         pb("jump_screen", JUMP_BINDING_LABEL, "Jump to screen", true),
-        pb("next_screen", "Tab", "Next screen", false),
-        pb("prev_screen", "Shift+Tab", "Previous screen", false),
+        pb("next_screen", "Tab", "Next screen", true),
+        pb("prev_screen", "Shift+Tab", "Previous screen", true),
         pb("toggle_mode", "m", "Toggle MCP/API mode", true),
-        pb("command_palette", "Ctrl+P", "Command palette", false),
-        pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
-        pb("cycle_theme", "Ctrl+T", "Cycle theme", true),
+        pb("command_palette", "Ctrl+P", "Command palette", true),
+        pb("export_menu", "Ctrl+E", "Export screen snapshot", true),
+        pb("cycle_theme", "Ctrl+T", "Cycle theme", false),
         pb("toggle_help", "F1", "Toggle help", false),
         pb("quit", "q", "Quit", true),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
@@ -375,10 +376,10 @@ fn emacs_profile_bindings() -> Vec<ProfileBinding> {
 
 fn minimal_profile_bindings() -> Vec<ProfileBinding> {
     vec![
-        pb("next_screen", "Tab", "Next screen", false),
-        pb("prev_screen", "Shift+Tab", "Previous screen", false),
-        pb("command_palette", "Ctrl+P", "Command palette", false),
-        pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
+        pb("next_screen", "Tab", "Next screen", true),
+        pb("prev_screen", "Shift+Tab", "Previous screen", true),
+        pb("command_palette", "Ctrl+P", "Command palette", true),
+        pb("export_menu", "Ctrl+E", "Export screen snapshot", true),
         pb("toggle_help", "F1", "Toggle help", false),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
         pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
@@ -853,13 +854,17 @@ mod tests {
 
     #[test]
     fn detect_conflicts_non_suppressible_ignored() {
-        // Tab is non-suppressible, so it doesn't conflict even if a screen binds Tab
-        let screen_bindings = &[("Tab", "Screen tab action")];
+        // F1 is non-suppressible, so it doesn't conflict even if a screen binds F1
+        let screen_bindings = &[("F1", "Screen F1 action")];
         let conflicts = detect_conflicts(screen_bindings);
         assert!(
             conflicts.is_empty(),
             "non-suppressible bindings should not report conflicts"
         );
+        // Tab gives way to a screen that takes text, so a screen binding on
+        // it outside text input does conflict.
+        let conflicts = detect_conflicts(&[("Tab", "Screen tab action")]);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
     }
 
     /// Verify no screen has keybindings that conflict with global text-suppressible bindings.
@@ -902,17 +907,19 @@ mod tests {
             }
         }
 
-        // Known acceptable overlaps: screen bindings that are intentionally
-        // the same as global bindings (e.g., a screen that also uses '?' for help).
-        // These are handled by the global dispatch taking precedence.
-        // Filter out known-safe overlaps where the action semantics match.
+        // Known acceptable overlaps: the screen claims the key (`claims_key`)
+        // only in the state where its own binding applies, and leaves the
+        // global binding in force everywhere else.
         let critical: Vec<&str> = all_conflicts
             .iter()
             .filter(|c| {
-                // Number keys overlap with timeline's "1-9" correlation links.
-                // This is handled: timeline only processes 1-9 when the dock is visible,
-                // while global number keys are caught first in tui_app.rs.
-                !c.contains(JUMP_BINDING_LABEL)
+                // Timeline claims a digit only while the selected event has
+                // that correlation link (timeline's
+                // digits_follow_correlation_links_only_where_the_selected_event_has_one).
+                let timeline_link = c.contains(JUMP_BINDING_LABEL);
+                // Threads claims Tab only while its detail panel has focus.
+                let threads_detail_tab = c.starts_with("Screen 'Threads'") && c.ends_with("on Tab");
+                !(timeline_link || threads_detail_tab)
             })
             .map(String::as_str)
             .collect();
@@ -962,14 +969,16 @@ mod tests {
     fn text_suppressible_flag_correctness() {
         for binding in GLOBAL_BINDINGS {
             match binding.label {
-                "Tab" | "Shift+Tab" | "Esc" | "Ctrl+P" | "F1" | "F12" => {
+                // Mirrors the `!text_mode` guards in `MailAppModel::update`.
+                "Esc" | "Ctrl+T" | "Ctrl+C" | "Ctrl+D" | "F1" | "F12" => {
                     assert!(
                         !binding.text_suppressible,
                         "{} should NOT be text-suppressible",
                         binding.label
                     );
                 }
-                "q" | ":" | "m" | "Ctrl+T" | "y" | JUMP_BINDING_LABEL => {
+                "Tab" | "Shift+Tab" | "q" | ":" | "m" | "Ctrl+P" | "Ctrl+E" | "y"
+                | JUMP_BINDING_LABEL => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",
@@ -1223,7 +1232,9 @@ mod tests {
     fn registry_is_suppressible() {
         let reg = KeymapRegistry::default();
         assert!(reg.is_suppressible("quit"));
-        assert!(!reg.is_suppressible("next_screen")); // Tab is not suppressible
+        // Tab moves between a form's fields while a screen takes text.
+        assert!(reg.is_suppressible("next_screen"));
+        assert!(!reg.is_suppressible("cycle_theme")); // Ctrl+T fires anywhere
     }
 
     #[test]

@@ -257,7 +257,7 @@ Promotion from each phase requires all of:
    test "$denial_status" -eq 2
 
    # CLI binary works
-   am doctor check --json | jq .status  # must be "healthy"
+   am doctor check --json | jq .healthy  # must be true
    ```
 5. Monitor for 24 hours (see Section 5).
 
@@ -355,7 +355,7 @@ Initiate kill-switch if ANY of:
    curl -sf http://127.0.0.1:8765/health | jq -e '.status == "ready"'
 
    # Doctor passes
-   am doctor check --json | jq .status
+   am doctor check --json | jq .healthy
    # Expected: "healthy"
    ```
 
@@ -414,7 +414,7 @@ into routine operational monitoring.
 curl -sf http://127.0.0.1:8765/health | jq -e '.status == "ready"'
 
 # Doctor check
-am doctor check --json 2>/dev/null | jq -e '.status == "healthy"'
+am doctor check --json 2>/dev/null | jq -e '.healthy'
 ```
 
 ### 5.2 Denial Path Integrity (Every Hour)
@@ -491,7 +491,7 @@ SERVER_PID=$!
 sleep 3
 
 # Verify server is healthy
-am doctor check --json | jq .status
+am doctor check --json | jq .healthy
 
 # Run dual-mode E2E
 am e2e run --project . dual_mode
@@ -513,7 +513,7 @@ am serve-http &
 sleep 3
 
 # Verify recovery
-am doctor check --json | jq .status
+am doctor check --json | jq .healthy
 
 # Verify denial path still works post-restart
 denial_status=0

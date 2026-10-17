@@ -1,7 +1,18 @@
+Check paths read from stdin against other agents' active exclusive reservations; exit 1 on a conflict.
+
+Honors the installed hook's switches: AGENT_MAIL_BYPASS=1 skips the check, AGENT_MAIL_GUARD_MODE=warn reports conflicts without failing, and FILE_RESERVATIONS_ENFORCEMENT_ENABLED=false disables it.
+
 Usage: am guard check [OPTIONS]
 
 Options:
       --stdin-nul
+          Read NUL-separated paths (as from `git diff -z`) instead of lines
+
       --advisory
+          Report conflicts but exit 0
+
       --repo <REPO>
-  -h, --help         Print help
+          Repository to check (default: the current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')

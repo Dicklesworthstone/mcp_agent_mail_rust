@@ -502,8 +502,15 @@ impl<T> OutstandingIntents<T> {
 }
 
 // ── Ack-intent canonical hashing ────────────────────────────────────────────
+//
+// `hash_json_value` hashes keys in insertion order (the workspace enables
+// serde_json's `preserve_order`), so these projections fix the field order
+// every writer hashes. A reader verifying a record must hash through them,
+// not through its own copy of the field list.
 
-fn ack_intent_hash_payload(record: &Value) -> Value {
+/// The hashed fields of an acknowledgement intent, in writer order.
+#[must_use]
+pub fn ack_intent_hash_payload(record: &Value) -> Value {
     let mut payload = json!({
         "schema_version": record["schema_version"].clone(),
         "kind": record["kind"].clone(),
@@ -534,7 +541,9 @@ fn ack_intent_has_supported_schema(record: &Value) -> bool {
     }
 }
 
-fn ack_replay_hash_payload(record: &Value) -> Value {
+/// The hashed fields of an acknowledgement replay marker, in writer order.
+#[must_use]
+pub fn ack_replay_hash_payload(record: &Value) -> Value {
     json!({
         "schema_version": record["schema_version"].clone(),
         "kind": record["kind"].clone(),
@@ -743,7 +752,10 @@ fn ensure_supported_release_schema(record: &Value) -> std::io::Result<()> {
     ))
 }
 
-fn release_intent_hash_payload(record: &Value) -> Value {
+/// The hashed fields of a release intent, in writer order (see the note on
+/// [`ack_intent_hash_payload`]).
+#[must_use]
+pub fn release_intent_hash_payload(record: &Value) -> Value {
     json!({
         "schema_version": record["schema_version"].clone(),
         "kind": record["kind"].clone(),
@@ -756,7 +768,10 @@ fn release_intent_hash_payload(record: &Value) -> Value {
     })
 }
 
-fn release_replay_hash_payload(record: &Value) -> Value {
+/// The hashed fields of a release replay marker, in writer order: `released`
+/// precedes `error_detail`.
+#[must_use]
+pub fn release_replay_hash_payload(record: &Value) -> Value {
     json!({
         "schema_version": record["schema_version"].clone(),
         "kind": record["kind"].clone(),
