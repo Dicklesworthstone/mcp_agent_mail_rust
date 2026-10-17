@@ -2555,7 +2555,7 @@ pub fn probe_integrity(config: &Config) -> ProbeResult {
             {
                 tracing::warn!(
                     detail = %verdict.archive_drift.detail,
-                    "startup integrity probe found archive-backed state ahead of healthy sqlite; attempting automatic recovery"
+                    "startup integrity probe found archive-backed state ahead of healthy sqlite; attempting archive reconciliation (not confirmed corruption)"
                 );
                 return attempt_probe_recovery(config);
             }
@@ -2679,7 +2679,11 @@ fn classify_recovery_failure_root_cause(detail: &str) -> String {
     let compact = compact_probe_detail(detail);
     let lower = compact.to_ascii_lowercase();
 
-    if lower.contains("mailbox mutation refused")
+    if lower.contains("archive reconciliation failed on healthy primary") {
+        format!(
+            "archive reconciliation failed while the primary database was healthy; automatic reconstruction was not attempted ({compact})"
+        )
+    } else if lower.contains("mailbox mutation refused")
         || lower.contains("wait for the active owner to finish")
         || lower.contains("supervised restart or operator intervention")
     {
@@ -2969,7 +2973,7 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
         Ok(()) => {
             tracing::warn!(
                 path = %db_path.display(),
-                "database auto-recovered from corruption; startup will continue with recovered data"
+                "database/archive reconciliation completed; startup will continue (this does not establish database corruption)"
             );
             ProbeResult::Ok { name: "integrity" }
         }
@@ -2980,14 +2984,8 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
                 db_path.display(),
                 classify_recovery_failure_root_cause(&e.to_string())
             ),
-            fix: format!(
-                "Try these in order:\n\
-                 1. `am doctor repair --yes` — automatic repair from backups/archive\n\
-                 2. `am doctor reconstruct --yes` — rebuild the database from the Git archive\n\
-                 3. `am clear-and-reset-everything` — archive current state and start completely fresh\n\
-                 The corrupt file has been quarantined at {}.corrupt-*",
-                db_path.display()
-            ),
+            fix: "Preserve the complete database family, archive, and startup logs. Run `am doctor check --json` and inspect the reported schema/replay error before retrying. A reconciliation failure does not prove corruption and must not be worked around by deleting WAL or recovery artifacts. See docs/OPERATOR_COOKBOOK.md for pre-upgrade verification."
+                .into(),
         }),
     }
 }

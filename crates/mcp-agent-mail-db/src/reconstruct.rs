@@ -6922,7 +6922,7 @@ pub fn apply_archive_ahead_delta(
     }
     let db_ids = collect_db_message_ids(db_path)
         .map_err(|e| DbError::Sqlite(format!("incremental apply: collect db message ids: {e}")))?;
-    let missing: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
+    let mut missing: BTreeSet<i64> = archive_ids.difference(&db_ids).copied().collect();
     if missing.len() > max_messages {
         return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
             "{} archive messages are missing from the database, above the incremental bound of {max_messages}",
@@ -6961,7 +6961,67 @@ pub fn apply_archive_ahead_delta(
     conn.execute_raw("BEGIN IMMEDIATE;")
         .map_err(|e| DbError::Sqlite(format!("incremental apply: begin transaction: {e}")))?;
 
-    let outcome = apply_delta_in_transaction(&conn, &project_dirs, &missing, max_messages);
+    // GH#357: startup reconciliation precedes normal pool migrations. Replay
+    // needs these additive message columns even on an otherwise healthy older
+    // database. Use the canonical migration definitions, inside the
+    // same transaction as the delta, without running unrelated rebuild/drop
+    // migrations against the live primary. A refusal or failure rolls back both.
+    let outcome = (|| {
+        // The guarded inventory can use a different engine/snapshot. Confirm
+        // absence in the canonical write transaction before touching a row:
+        // a committed WAL row is never a missing message to replay or rewrite.
+        let mut present = Vec::new();
+        for id in &missing {
+            if !conn
+                .query_sync(
+                    "SELECT id FROM messages WHERE id = ?",
+                    &[Value::BigInt(*id)],
+                )
+                .map_err(|error| DbError::Sqlite(format!("archive delta recheck: {error}")))?
+                .is_empty()
+            {
+                present.push(*id);
+            }
+        }
+        for id in present {
+            missing.remove(&id);
+        }
+        let mut added_column = false;
+        for migration in schema::schema_migrations() {
+            let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
+                continue;
+            };
+            if table == "messages"
+                && matches!(
+                    column.as_str(),
+                    "recipients_json" | "topic" | "archive_metadata_json"
+                )
+                && !reconstruct_migration_preflight_already_satisfied(&conn, &migration)?
+            {
+                conn.execute_raw(&migration.up).map_err(|error| {
+                    DbError::Sqlite(format!(
+                        "archive delta schema preflight {}: {error}",
+                        migration.id
+                    ))
+                })?;
+                added_column = true;
+            }
+        }
+        if added_column {
+            // v31's canonical record materialization is required before the
+            // runtime engine next decodes legacy short records (br-2hpuk).
+            // This preserves every value, including unknown reply lineage.
+            conn.execute_raw(
+                "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NULL",
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!("archive delta record materialization: {error}"))
+            })?;
+        }
+        // Leave the ledger to normal initialization: it preflights existing
+        // columns, validates checksums, and runs dependent backfills/indexes.
+        apply_delta_in_transaction(&conn, &project_dirs, &missing, max_messages)
+    })();
     match outcome {
         Ok(ArchiveDeltaApplyOutcome::Applied(stats)) => {
             conn.execute_raw("COMMIT;")
@@ -7039,9 +7099,12 @@ fn apply_delta_in_transaction(
 
     let expected = missing.len();
     if expected == 0 && projects_added == 0 {
-        return Ok(ArchiveDeltaApplyOutcome::NotApplicable(
-            "the database already holds every canonical archive message id and project".to_string(),
-        ));
+        return Ok(ArchiveDeltaApplyOutcome::Applied(ArchiveDeltaApplyStats {
+            missing_message_ids: 0,
+            messages_applied: 0,
+            projects_visited,
+            duplicate_files_skipped: 0,
+        }));
     }
     let found: BTreeSet<i64> = candidate_files.iter().map(|(id, ..)| *id).collect();
     if found.len() != expected {

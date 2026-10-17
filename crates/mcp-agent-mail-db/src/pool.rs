@@ -6952,13 +6952,18 @@ fn reconcile_archive_state_before_init(
                 || archive_max_id > db_after.max_message_id
                 || !still_missing_projects.is_empty();
             if still_ahead {
+                record_pending_archive_drift(primary_path);
                 tracing::warn!(
                     path = %primary_path.display(),
                     messages_applied = applied.messages_applied,
                     db_messages = db_after.messages,
                     archive_messages = archive_message_count,
-                    "incremental archive apply committed but the archive is still ahead; reconstructing"
+                    "incremental archive apply committed but inventories still disagree; preserving primary without reconstruction"
                 );
+                return Err(SqlError::Custom(
+                    "archive reconciliation failed on healthy primary; post-apply inventories disagree; no reconstruction attempted"
+                        .to_string(),
+                ));
             } else {
                 clear_pending_archive_drift(primary_path);
                 tracing::info!(
@@ -6979,11 +6984,15 @@ fn reconcile_archive_state_before_init(
             );
         }
         Err(error) => {
-            tracing::warn!(
+            record_pending_archive_drift(primary_path);
+            tracing::error!(
                 path = %primary_path.display(),
                 error = %error,
-                "incremental archive apply failed; reconstructing from archive"
+                "incremental archive reconciliation failed; preserving healthy primary without reconstruction"
             );
+            return Err(SqlError::Custom(format!(
+                "archive reconciliation failed on healthy primary; no reconstruction attempted: {error}"
+            )));
         }
     }
     let stats = match reconstruct_archive_drift_of_healthy_primary(primary_path, storage_root) {
@@ -31268,6 +31277,121 @@ mod tests {
         assert_eq!(subjects, ["First", "Second", "Third"]);
         // The second reconcile has nothing to do.
         assert!(!reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+    }
+
+    #[test]
+    fn archive_ahead_upgrade_preflight_is_atomic_and_preserves_primary() {
+        // Exercise success, a schema-preflight failure, and an interrupted
+        // replay after schema preparation has already written successfully.
+        for failure_stage in ["none", "preflight", "replay"] {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("storage.sqlite3");
+            let storage_root = dir.path().join("storage");
+            let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+            push_archive_ahead(&msg_dir);
+            let canonical = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+            canonical
+                .execute_raw("ALTER TABLE messages DROP COLUMN archive_metadata_json")
+                .unwrap();
+            if failure_stage != "none" {
+                let operation = if failure_stage == "preflight" {
+                    "UPDATE"
+                } else {
+                    "INSERT"
+                };
+                canonical
+                    .execute_raw(&format!(
+                        "CREATE TRIGGER refuse_delta BEFORE {operation} ON messages \
+                     BEGIN SELECT RAISE(ABORT, 'interrupted upgrade'); END"
+                    ))
+                    .unwrap();
+            }
+            drop(canonical);
+            let identity = primary_identity(&primary);
+            let result = reconcile_archive_state_before_init(&primary, &storage_root);
+            assert_eq!(primary_identity(&primary), identity);
+            let canonical = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+            let columns = canonical
+                .query_sync("PRAGMA table_info(messages)", &[])
+                .unwrap();
+            let has_metadata = columns
+                .iter()
+                .any(|row| row.get_named::<String>("name").unwrap() == "archive_metadata_json");
+            if failure_stage != "none" {
+                assert!(result.is_err(), "a replay error must not reconstruct");
+                assert!(
+                    !has_metadata,
+                    "schema preparation must roll back with replay"
+                );
+                let rows = canonical
+                    .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("count").unwrap(), 1);
+                canonical.execute_raw("DROP TRIGGER refuse_delta").unwrap();
+                drop(canonical);
+                assert!(reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+            } else {
+                assert!(result.unwrap());
+                assert!(has_metadata);
+                drop(canonical);
+            }
+            assert_eq!(count_messages(&primary), 2);
+            assert_eq!(primary_identity(&primary), identity);
+        }
+    }
+
+    #[test]
+    fn archive_ahead_inventory_includes_committed_canonical_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let msg_dir = seed_reconstructed_primary_from_archive(&primary, &storage_root);
+        push_archive_ahead(&msg_dir);
+        let canonical = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+        canonical
+            .execute_raw("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        canonical.execute_raw(
+            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+             SELECT 2,project_id,sender_id,'committed in WAL','WAL body',created_ts FROM messages WHERE id=1"
+        ).unwrap();
+        canonical
+            .execute_raw(
+                "UPDATE messages SET archive_metadata_json = '{\"in_reply_to\":1}' WHERE id=2",
+            )
+            .unwrap();
+        assert!(
+            sqlite_sidecar_path(&primary, "-wal")
+                .metadata()
+                .unwrap()
+                .len()
+                > 32
+        );
+        assert_eq!(inspect_mailbox_db_inventory(&primary).unwrap().messages, 2);
+        assert!(!reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
+        let replay =
+            crate::reconstruct::apply_archive_ahead_delta(&primary, &storage_root, 64).unwrap();
+        assert!(matches!(
+            replay,
+            crate::reconstruct::ArchiveDeltaApplyOutcome::Applied(ref stats)
+                if stats.messages_applied == 0
+        ));
+        let rows = canonical
+            .query_sync(
+                "SELECT subject, archive_metadata_json FROM messages WHERE id=2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows[0].get_named::<String>("subject").unwrap(),
+            "committed in WAL"
+        );
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("archive_metadata_json")
+                .unwrap(),
+            "{\"in_reply_to\":1}"
+        );
     }
 
     #[test]

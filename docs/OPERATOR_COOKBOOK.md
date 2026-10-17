@@ -96,6 +96,59 @@ use `DB_MAINTENANCE_ENABLED=false`; checks and backups still run. These settings
 take effect when the server starts. Existing service overrides remain an
 operator decision; inspect them before changing a deployment.
 
+### Verify a mailbox before upgrading [read-only]
+
+Use the installed binary and the same `STORAGE_ROOT` and `DATABASE_URL` as
+the service. Stop the service gracefully through its supervisor and prevent
+automatic restarts while inspecting or copying the mailbox. Then run:
+
+```bash
+am doctor locks --json
+am doctor drain --json
+am doctor check --json
+am doctor archive-verify --json
+am doctor backups --json
+```
+
+Inspect `safe_to_mutate` in the drain report; its exit code alone does not
+prove the owner has stopped. Resolve findings before upgrading. Preserve an
+offline copy of the entire storage directory and, if the database lives
+elsewhere, its complete database family, including WAL, SHM, engine sidecars,
+and recovery artifacts. Keep the old binary and the diagnostic output. Copy
+only while all mailbox writers remain stopped; copying the main SQLite file
+alone can omit committed WAL data.
+
+There is no required standalone forced-checkpoint command in this procedure.
+Do not delete WAL, SHM, certificate, or namespace files to make an upgrade
+start. `am doctor check` is verification, not a promise to checkpoint or
+migrate. Start the new binary with the same configuration, then repeat the
+checks and review startup logs. Preserve the offline copy until verification
+passes. A support bundle can retain sanitized diagnostic evidence:
+
+```bash
+am doctor support-bundle --output-dir /abs/path/upgrade-evidence --json
+```
+
+For GH#357, startup may reconcile archive-ahead state before normal pool
+migrations. Bounded replay now prepares its required additive message columns
+transactionally through canonical SQLite before querying them; the ordinary
+migration runner subsequently records the migrations and performs dependent
+work. When columns are added, canonical record materialization preserves
+legacy row values before runtime reads resume. Replay rechecks missing IDs in
+its write transaction and leaves already present messages untouched. If
+post-apply inventories still disagree, startup stops without reconstructing.
+A replay/schema error rolls back and stops reconciliation without
+reconstructing a healthy primary. Existing corruption recovery still has its
+separate health checks and recovery admission controls.
+
+Archive-ahead means inventory drift, not confirmed corruption. A successful
+reconciliation message does not establish damage. The reported 984-versus-982
+upgrade discrepancy has not been reproduced here; stale WAL certification is
+an unverified hypothesis. Keep the complete pre-upgrade database family and
+logs if inventories disagree. Do not infer missing committed rows from an
+`immutable=1` read of a main file when a populated WAL exists: that mode ignores
+the WAL.
+
 ## 3. Register a named operator agent [stateful]
 
 **Goal:** Create or refresh an explicit agent identity for a project.
