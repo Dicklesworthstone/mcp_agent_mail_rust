@@ -11,7 +11,8 @@
 //!
 //! This module adds the durable layer: a tiny JSON sidecar next to the
 //! database records consecutive automatic-recovery failures **for the same
-//! database content** (fingerprinted by size + full-file hash). Once the failure
+//! database generation** (on Unix, a stable full-content family fingerprint;
+//! other platforms retain the bounded single-file fingerprint). Once the failure
 //! count reaches the threshold the breaker trips, and automatic recovery
 //! refuses fast — BEFORE any forensic capture — until either
 //!
@@ -115,6 +116,17 @@ impl RecoveryBreakerState {
             // cooldown or an explicitly successful repair still clears it.
             || fingerprint == "unreadable"
             || self.db_fingerprint == "unreadable"
+            // A former main-only record proves nothing about sidecar changes.
+            // Do not erase its history merely because this binary now records
+            // the whole family. A genuine main-content change remains visible.
+            || family_fingerprint_parts(fingerprint).is_some_and(|(main, _)| {
+                self.db_fingerprint == main
+                    // pool.rs's live, descriptor-neutral format cannot be
+                    // compared to a raw content hash after ownership changes.
+                    || self.db_fingerprint.split_once(':').is_some_and(|(_, hash)| {
+                        hash.starts_with("fdc10ce1")
+                    })
+            })
     }
 }
 
@@ -428,10 +440,12 @@ fn open_breaker_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Content fingerprint of the database file: `len:sha256(bytes)`.
+/// Content fingerprint of the offline database generation.
 ///
-/// A missing file fingerprints as `missing`; an unreadable one as
-/// `unreadable` (both stable, so failures on them still accumulate). Recovery
+/// Unix covers the complete known SQLite family, including absent members.
+/// Other platforms retain `len:sha256(bytes)`. A missing family is `missing`;
+/// an unreadable one is `unreadable` (failures on either still accumulate).
+/// Recovery
 /// is exceptional and correctness matters more than the cost of hashing the
 /// complete generation: a same-length repair beyond the first SQLite page must
 /// reset the breaker.
@@ -447,7 +461,7 @@ pub fn fingerprint_db(db_path: &Path) -> String {
     fingerprint_db_with_observer(db_path, |_, _| {})
 }
 
-fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, u64)) -> String {
+fn fingerprint_db_with_observer(db_path: &Path, observed: impl FnMut(&Path, u64)) -> String {
     // Resolve relative paths once; a later process-wide chdir must not make
     // final verification consult a different file with the same basename.
     let path = if db_path.is_absolute() {
@@ -458,7 +472,19 @@ fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, 
         };
         cwd.join(db_path)
     };
-    match std::fs::symlink_metadata(&path) {
+    #[cfg(unix)]
+    {
+        fingerprint_unix_family(&path, observed).unwrap_or_else(|_| "unreadable".to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        fingerprint_single_file(&path, observed)
+    }
+}
+
+#[cfg(not(unix))]
+fn fingerprint_single_file(path: &Path, mut observed: impl FnMut(&Path, u64)) -> String {
+    match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return "missing".to_string();
         }
@@ -466,7 +492,7 @@ fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, 
         _ => return "unreadable".to_string(),
     }
     let mut capture = || -> std::io::Result<String> {
-        let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path)?;
+        let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
         let before = file.metadata()?;
         let identity = same_file::Handle::from_file(file.try_clone()?)?;
         let limit = before.len().checked_add(1).ok_or_else(|| {
@@ -476,7 +502,7 @@ fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, 
         let mut hasher = sha2::Sha256::new();
         let mut read_bytes = 0_u64;
         let mut buffer = vec![0_u8; 64 * 1024];
-        observed(&path, 0);
+        observed(path, 0);
         loop {
             let count = match reader.read(&mut buffer) {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -489,14 +515,14 @@ fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, 
                 .checked_add(count as u64)
                 .ok_or_else(|| std::io::Error::other("fingerprint read length overflow"))?;
             hasher.update(&buffer[..count]);
-            observed(&path, read_bytes);
+            observed(path, read_bytes);
         }
         if read_bytes != before.len() || !fingerprint_metadata_matches(&before, &file.metadata()?) {
             return Err(std::io::Error::other(
                 "fingerprint source changed while reading",
             ));
         }
-        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path)?;
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
         if !fingerprint_metadata_matches(&before, &current.metadata()?)
             || same_file::Handle::from_file(current)? != identity
         {
@@ -507,6 +533,192 @@ fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, 
     // Disappearance after starting a read is uncertainty, not a new missing
     // generation. All observation errors retain existing failure history.
     capture().unwrap_or_else(|_| "unreadable".to_string())
+}
+
+/// Open the resolved parent component-by-component, retaining its directory
+/// descriptor for every family lookup. Canonicalizing only the parent keeps
+/// normal platform aliases usable without following a database/sidecar link.
+#[cfg(unix)]
+fn fingerprint_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::path::Component;
+    let canonical = std::fs::canonicalize(path)?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = std::fs::File::from(rustix::fs::open("/", flags, Mode::empty())?);
+    for component in canonical.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory = std::fs::File::from(rustix::fs::openat(
+                    &directory,
+                    name,
+                    flags,
+                    Mode::empty(),
+                )?);
+            }
+            _ => return Err(std::io::Error::other("invalid resolved fingerprint parent")),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn fingerprint_member_file(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let file = std::fs::File::from(rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "fingerprint family member is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+struct FingerprintMember {
+    leaf: std::ffi::OsString,
+    source: Option<(std::fs::File, std::fs::Metadata)>,
+}
+
+#[cfg(unix)]
+fn fingerprint_unix_family(
+    path: &Path,
+    mut observed: impl FnMut(&Path, u64),
+) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    // Match the recovery family's durable/coordination members, never its
+    // breaker sidecar, snapshots, locks, or historical quarantine files.
+    const SUFFIXES: [&str; 8] = [
+        "",
+        "-journal",
+        "-wal",
+        "-shm",
+        "-wal-cert",
+        "-wal-cert-head",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+    ];
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("fingerprint primary has no parent"))?;
+    let basename = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("fingerprint primary has no basename"))?;
+    let parent = match fingerprint_directory(parent_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("missing".to_string());
+        }
+        result => result?,
+    };
+    let parent_identity = parent.metadata()?;
+    let mut members = Vec::with_capacity(SUFFIXES.len());
+    // Retain every present inode BEFORE reading any member. This prevents an
+    // inode from being recycled during the multi-file observation and keeps
+    // an earlier member's witness alive until the entire family is checked.
+    for suffix in SUFFIXES {
+        let mut leaf = basename.to_os_string();
+        leaf.push(suffix);
+        let source = match fingerprint_member_file(&parent, &leaf) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                Some((file, metadata))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        members.push(FingerprintMember { leaf, source });
+    }
+
+    let mut family = sha2::Sha256::new();
+    family.update(b"mcp-agent-mail-offline-family-v1\0");
+    let mut main = "missing".to_string();
+    let mut present = false;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for (suffix, member) in SUFFIXES.into_iter().zip(&mut members) {
+        family.update((suffix.len() as u64).to_le_bytes());
+        family.update(suffix.as_bytes());
+        let Some((file, before)) = member.source.as_mut() else {
+            family.update([0]);
+            continue;
+        };
+        present = true;
+        family.update([1]);
+        family.update(before.len().to_le_bytes());
+        family.update(before.dev().to_le_bytes());
+        family.update(before.ino().to_le_bytes());
+        let limit = before
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("fingerprint member too large"))?;
+        let mut reader = (&mut *file).take(limit);
+        let mut content = sha2::Sha256::new();
+        let mut read_bytes = 0_u64;
+        let member_path = parent_path.join(&member.leaf);
+        observed(&member_path, 0);
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            read_bytes = read_bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| std::io::Error::other("fingerprint length overflow"))?;
+            content.update(&buffer[..count]);
+            observed(&member_path, read_bytes);
+        }
+        if read_bytes != before.len() || !fingerprint_metadata_matches(before, &file.metadata()?) {
+            return Err(std::io::Error::other(
+                "fingerprint family changed while streaming",
+            ));
+        }
+        let digest = content.finalize();
+        if suffix.is_empty() {
+            main = format!("{read_bytes}:{}", hex::encode(digest));
+        }
+        family.update(digest);
+    }
+
+    // Crucially, recheck ALL members after ALL streams. Verifying a member
+    // only when its own read finishes would accept main-old + WAL-new pairs.
+    // Absence is part of the witness, not permission to ignore a new member.
+    for member in &members {
+        match (
+            &member.source,
+            fingerprint_member_file(&parent, &member.leaf),
+        ) {
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            (Some((file, before)), Ok(current))
+                if fingerprint_metadata_matches(before, &file.metadata()?)
+                    && fingerprint_metadata_matches(before, &current.metadata()?) => {}
+            _ => {
+                return Err(std::io::Error::other(
+                    "fingerprint family changed after streaming",
+                ));
+            }
+        }
+    }
+    let current_parent = fingerprint_directory(parent_path)?.metadata()?;
+    if current_parent.dev() != parent_identity.dev()
+        || current_parent.ino() != parent_identity.ino()
+    {
+        return Err(std::io::Error::other("fingerprint parent was displaced"));
+    }
+    if present {
+        Ok(format!("family1:{main}:{}", hex::encode(family.finalize())))
+    } else {
+        Ok("missing".to_string())
+    }
 }
 
 fn fingerprint_metadata_matches(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
@@ -580,19 +792,33 @@ pub fn load(db_path: &Path) -> std::io::Result<Option<RecoveryBreakerState>> {
     Ok(Some(state))
 }
 
+fn canonical_fingerprint_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn scalar_fingerprint_valid(fingerprint: &str) -> bool {
+    matches!(fingerprint, "missing" | "unreadable")
+        || fingerprint.split_once(':').is_some_and(|(len, hash)| {
+            len.parse::<u64>()
+                .is_ok_and(|parsed| parsed.to_string() == len)
+                && canonical_fingerprint_hash(hash)
+        })
+}
+
+fn family_fingerprint_parts(fingerprint: &str) -> Option<(&str, &str)> {
+    let (main, family_hash) = fingerprint.strip_prefix("family1:")?.rsplit_once(':')?;
+    (main != "unreadable"
+        && scalar_fingerprint_valid(main)
+        && canonical_fingerprint_hash(family_hash))
+    .then_some((main, family_hash))
+}
+
 fn recovery_breaker_state_is_semantically_valid(state: &RecoveryBreakerState) -> bool {
-    let fingerprint_is_valid = matches!(state.db_fingerprint.as_str(), "missing" | "unreadable")
-        || state
-            .db_fingerprint
-            .split_once(':')
-            .is_some_and(|(len, hash)| {
-                len.parse::<u64>()
-                    .is_ok_and(|parsed| parsed.to_string() == len)
-                    && hash.len() == 64
-                    && hash
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            });
+    let fingerprint_is_valid = scalar_fingerprint_valid(&state.db_fingerprint)
+        || family_fingerprint_parts(&state.db_fingerprint).is_some();
     state.schema == 1
         && fingerprint_is_valid
         && state.last_failure_unix >= 0
@@ -1291,6 +1517,350 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"operator evidence");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn family_fingerprint_observes_real_peer_wal_commit_without_opening_sqlite() {
+        const CHILD: &str = "AM_TEST_FAMILY_WAL_WRITER";
+        fn wait_marker(path: &Path) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out awaiting {}",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        if let Some(path) = std::env::var_os(CHILD) {
+            let db = PathBuf::from(path);
+            let root = db.parent().unwrap();
+            let conn = crate::CanonicalDbConn::open_file(db.to_str().unwrap()).unwrap();
+            conn.execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; CREATE TABLE observed (id INTEGER PRIMARY KEY);").unwrap();
+            conn.execute_raw("INSERT INTO observed VALUES (1)").unwrap();
+            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                .unwrap();
+            conn.execute_raw("INSERT INTO observed VALUES (2)").unwrap();
+            std::fs::write(root.join("ready-1"), b"ready").unwrap();
+            wait_marker(&root.join("advance"));
+            conn.execute_raw("INSERT INTO observed VALUES (3)").unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS n FROM observed", &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 3);
+            std::fs::write(root.join("ready-2"), b"ready").unwrap();
+            wait_marker(&root.join("finish"));
+            return;
+        }
+        struct Peer(std::process::Child);
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        let db = root.join("db");
+        let name = std::thread::current().name().unwrap().to_string();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, &db)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut peer = Peer(child);
+        wait_marker(&root.join("ready-1"));
+        let main_bytes = std::fs::read(&db).unwrap();
+        let wal = crate::pool::sqlite_path_with_suffix(&db, "-wal");
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(
+            wal_before.len() > 32,
+            "fixture requires committed WAL frames"
+        );
+        let before = fingerprint_db(&db);
+        assert!(family_fingerprint_parts(&before).is_some());
+        let mut injected = false;
+        let unstable = fingerprint_db_with_observer(&db, |path, count| {
+            if path != wal || count != 0 {
+                return;
+            }
+            injected = true;
+            std::fs::write(root.join("advance"), b"commit now").unwrap();
+            wait_marker(&root.join("ready-2"));
+        });
+        assert!(injected);
+        assert_eq!(unstable, "unreadable");
+        let after = fingerprint_db(&db);
+        assert!(family_fingerprint_parts(&after).is_some());
+        assert_ne!(
+            before, after,
+            "WAL-only commit did not change family identity"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            main_bytes,
+            "fixture unexpectedly checkpointed the main file"
+        );
+        assert_ne!(std::fs::read(&wal).unwrap(), wal_before);
+        assert!(
+            peer.0.try_wait().unwrap().is_none(),
+            "peer must still own its live connection"
+        );
+        let mut state = record_failure(None, &before, "old family failure", CFG, 1_000);
+        for _ in 0..2 {
+            state = record_failure(Some(&state), &before, "old family failure", CFG, 1_000);
+        }
+        assert_eq!(
+            evaluate(Some(&state), &after, CFG, 1_001),
+            BreakerVerdict::Allow
+        );
+        state.attempt_in_progress = true;
+        assert!(matches!(
+            evaluate(Some(&state), &after, CFG, 1_001),
+            BreakerVerdict::Refuse { .. }
+        ));
+        std::fs::write(root.join("finish"), b"finish").unwrap();
+        assert!(peer.0.wait().unwrap().success());
+    }
+
+    #[test]
+    fn family_fingerprint_format_transition_preserves_existing_failure_authority() {
+        let main = format!("4:{}", "a".repeat(64));
+        let changed_main = format!("4:{}", "b".repeat(64));
+        let family = format!("family1:{main}:{}", "c".repeat(64));
+        let other_family = format!("family1:{main}:{}", "d".repeat(64));
+        let mut old = record_failure(None, &main, "old failure", CFG, 1_000);
+        for _ in 0..2 {
+            old = record_failure(Some(&old), &main, "old failure", CFG, 1_000);
+        }
+        assert!(matches!(
+            evaluate(Some(&old), &family, CFG, 1_001),
+            BreakerVerdict::Refuse { .. }
+        ));
+        assert_eq!(
+            record_failure(Some(&old), &family, "still failed", CFG, 1_001).consecutive_failures,
+            4
+        );
+        assert_eq!(
+            evaluate(
+                Some(&old),
+                &format!("family1:{changed_main}:{}", "c".repeat(64)),
+                CFG,
+                1_001
+            ),
+            BreakerVerdict::Allow
+        );
+        let mut upgraded = old.clone();
+        upgraded.db_fingerprint.clone_from(&family);
+        assert_eq!(
+            evaluate(Some(&upgraded), &other_family, CFG, 1_001),
+            BreakerVerdict::Allow
+        );
+        upgraded.attempt_in_progress = true;
+        assert!(matches!(
+            evaluate(Some(&upgraded), &other_family, CFG, 1_001),
+            BreakerVerdict::Refuse { .. }
+        ));
+        old.db_fingerprint = format!("4:fdc10ce1{}", "e".repeat(56));
+        assert!(matches!(
+            evaluate(Some(&old), &family, CFG, 1_001),
+            BreakerVerdict::Refuse { .. }
+        ));
+
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("db");
+        let valid = cleared_state(&family);
+        store(&db, &valid).unwrap();
+        let before = std::fs::read(breaker_sidecar_path(&db)).unwrap();
+        for invalid in [
+            format!("family2:{main}:{}", "c".repeat(64)),
+            format!("family1:unreadable:{}", "c".repeat(64)),
+            format!("family1:04:{}:{}", "a".repeat(64), "c".repeat(64)),
+            format!("family1:{main}:{}", "C".repeat(64)),
+            format!("family1:{main}:{}", "c".repeat(63)),
+            format!("family1:missing:extra:{}", "c".repeat(64)),
+        ] {
+            let mut state = valid.clone();
+            state.db_fingerprint = invalid;
+            assert!(store(&db, &state).is_err());
+            assert_eq!(std::fs::read(breaker_sidecar_path(&db)).unwrap(), before);
+        }
+        assert_eq!(load(&db).unwrap(), Some(valid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_fingerprint_refuses_unsafe_members_and_parent_displacement() {
+        for shape in ["symlink", "directory", "fifo"] {
+            let td = tempfile::tempdir().unwrap();
+            let db = td.path().join("db");
+            let wal = crate::pool::sqlite_path_with_suffix(&db, "-wal");
+            let sentinel = td.path().join("unrelated");
+            std::fs::write(&db, b"primary evidence").unwrap();
+            std::fs::write(&sentinel, b"unrelated evidence").unwrap();
+            match shape {
+                "symlink" => std::os::unix::fs::symlink(&sentinel, &wal).unwrap(),
+                "directory" => std::fs::create_dir(&wal).unwrap(),
+                "fifo" => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &wal,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                    0,
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(fingerprint_db(&db), "unreadable", "{shape}");
+            assert_eq!(std::fs::read(&db).unwrap(), b"primary evidence");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated evidence");
+            assert!(std::fs::symlink_metadata(&wal).is_ok());
+        }
+        let td = tempfile::tempdir().unwrap();
+        let parent = td.path().join("mailbox");
+        std::fs::create_dir(&parent).unwrap();
+        let db = parent.join("db");
+        std::fs::write(&db, b"primary evidence").unwrap();
+        let retained = td.path().join("retained-mailbox");
+        let mut changed = false;
+        let result = fingerprint_db_with_observer(&db, |_, count| {
+            if count != 0 {
+                return;
+            }
+            changed = true;
+            std::fs::rename(&parent, &retained).unwrap();
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::write(&db, b"replacement evidence").unwrap();
+        });
+        assert!(changed);
+        assert_eq!(result, "unreadable");
+        assert_eq!(
+            std::fs::read(retained.join("db")).unwrap(),
+            b"primary evidence"
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"replacement evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_fingerprint_covers_every_sidecar_and_missing_primary() {
+        for suffix in [
+            "-journal",
+            "-wal",
+            "-shm",
+            "-wal-cert",
+            "-wal-cert-head",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+        ] {
+            for main_present in [false, true] {
+                let td = tempfile::tempdir().unwrap();
+                let db = td.path().join("db");
+                if main_present {
+                    std::fs::write(&db, b"main").unwrap();
+                }
+                let baseline = fingerprint_db(&db);
+                let member = crate::pool::sqlite_path_with_suffix(&db, suffix);
+                std::fs::write(&member, b"AAAA").unwrap();
+                let first = fingerprint_db(&db);
+                assert_ne!(first, baseline, "{suffix}: sidecar existence was omitted");
+                assert_ne!(first, "unreadable");
+                assert_eq!(first, fingerprint_db(&db));
+                std::fs::write(&member, b"BBBB").unwrap();
+                let changed = fingerprint_db(&db);
+                assert_ne!(
+                    first, changed,
+                    "{suffix}: same-length sidecar edits were omitted"
+                );
+                let mut tripped = record_failure(None, &first, "failure", CFG, 1_000);
+                for _ in 0..2 {
+                    tripped = record_failure(Some(&tripped), &first, "failure", CFG, 1_000);
+                }
+                assert_eq!(
+                    evaluate(Some(&tripped), &changed, CFG, 1_001),
+                    BreakerVerdict::Allow
+                );
+                store(&db, &tripped).unwrap();
+                assert_eq!(load(&db).unwrap(), Some(tripped));
+                assert_eq!(
+                    changed,
+                    fingerprint_db(&db),
+                    "breaker sidecar fed its own hash"
+                );
+                std::fs::rename(&member, td.path().join("retained-sidecar")).unwrap();
+                assert_eq!(fingerprint_db(&db), baseline);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_fingerprint_rechecks_earlier_members_and_missing_entries() {
+        for change in [
+            "main-after-read",
+            "sidecar-after-read",
+            "new-sidecar",
+            "missing-main",
+        ] {
+            let td = tempfile::tempdir().unwrap();
+            let db = td.path().join("db");
+            let wal = crate::pool::sqlite_path_with_suffix(&db, "-wal");
+            let journal = crate::pool::sqlite_path_with_suffix(&db, "-journal");
+            if change != "missing-main" {
+                std::fs::write(&db, b"AAAA").unwrap();
+            }
+            std::fs::write(&wal, b"WWWW").unwrap();
+            std::fs::write(&journal, b"JJJJ").unwrap();
+            let mut injected = false;
+            let result = fingerprint_db_with_observer(&db, |path, read| {
+                if path != wal || read != 0 {
+                    return;
+                }
+                injected = true;
+                match change {
+                    "main-after-read" => std::fs::write(&db, b"BBBB").unwrap(),
+                    "sidecar-after-read" => std::fs::write(&journal, b"KKKK").unwrap(),
+                    "new-sidecar" => std::fs::write(
+                        crate::pool::sqlite_path_with_suffix(&db, "-wal-cert"),
+                        b"new certificate",
+                    )
+                    .unwrap(),
+                    "missing-main" => std::fs::write(&db, b"new main").unwrap(),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(injected, "{change}: sidecar reads were never exercised");
+            assert_eq!(result, "unreadable", "{change} accepted a mixed family");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_fingerprint_distinguishes_replaced_sidecar_inode() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("db");
+        let wal = crate::pool::sqlite_path_with_suffix(&db, "-wal");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"identical bytes").unwrap();
+        let before = fingerprint_db(&db);
+        let metadata = std::fs::metadata(&wal).unwrap();
+        std::fs::rename(&wal, td.path().join("retained-wal")).unwrap();
+        std::fs::write(&wal, b"identical bytes").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        assert_ne!(
+            before,
+            fingerprint_db(&db),
+            "a replacement family reused the old generation identity"
+        );
+    }
+
     #[test]
     fn fingerprint_read_work_is_bounded_by_the_initial_length() {
         let td = tempfile::tempdir().unwrap();
@@ -1321,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_stable_vectors_preserve_existing_wire_identity() {
+    fn fingerprint_stable_vectors_preserve_main_content_identity() {
         let td = tempfile::tempdir().unwrap();
         for (name, bytes, expected) in [
             (
@@ -1337,12 +1907,15 @@ mod tests {
         ] {
             let db = td.path().join(name);
             std::fs::write(&db, bytes).unwrap();
-            assert_eq!(fingerprint_db(&db), expected);
-            let state = record_failure(None, expected, "failure", CFG, 1_000);
+            let fingerprint = fingerprint_db(&db);
+            let main = family_fingerprint_parts(&fingerprint)
+                .map_or(fingerprint.as_str(), |(main, _)| main);
+            assert_eq!(main, expected);
+            let state = record_failure(None, &fingerprint, "failure", CFG, 1_000);
             store(&db, &state).unwrap();
             assert_eq!(
                 fingerprint_db(&db),
-                expected,
+                fingerprint,
                 "control state changed content identity"
             );
             assert_eq!(load(&db).unwrap(), Some(state));
