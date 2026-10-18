@@ -1464,7 +1464,7 @@ mod tests {
         record_snapshot_metadata(&primary, 42).expect_err("invalid backup must fail");
 
         assert_eq!(std::fs::read(&meta_path).unwrap(), legacy);
-        assert!(preserved_legacy_paths(dir.path()).is_empty());
+        assert_eq!(preserved_legacy_paths(dir.path()).len(), 0);
         assert!(latest_verified_snapshot(&primary).is_none());
     }
 

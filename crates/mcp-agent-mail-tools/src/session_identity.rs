@@ -511,10 +511,7 @@ mod tests {
             agent(1, 20, "BlueLake"),
             agent(2, 10, "BlueLake"),
             agent(0, 10, "BlueLake"),
-            mcp_agent_mail_db::AgentRow {
-                id: None,
-                ..own.clone()
-            },
+            mcp_agent_mail_db::AgentRow { id: None, ..own },
         ] {
             assert!(!binding.matches_agent(&other), "accepted {other:?}");
         }
@@ -529,7 +526,7 @@ mod tests {
             },
             SessionBinding {
                 agent_name: String::new(),
-                ..binding.clone()
+                ..binding
             },
         ] {
             let row = agent(invalid.agent_id, invalid.project_id, &invalid.agent_name);

@@ -712,7 +712,7 @@ mod tests {
             } else {
                 &metadata_path
             };
-            assert!(!fs::read(evidence).unwrap().is_empty());
+            assert_ne!(fs::read(evidence).unwrap().len(), 0);
             if replace_lock {
                 assert!(root.join("retained-authority.lock").is_file());
             } else {

@@ -25434,7 +25434,7 @@ mod tests {
              VALUES (500, 1, 'to', {now});"
         ))
         .expect("seed shared cache fixture");
-        let fetch = |all| {
+        let fetch = |all: bool| {
             build_inbox_with_snapshot_cache(
                 &conn, 1, "proj", 2, "Bob", false, false, !all, all, 20, false, None,
             )

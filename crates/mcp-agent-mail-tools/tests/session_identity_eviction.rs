@@ -387,7 +387,7 @@ fn auto_accept_preflights_evicted_target_before_any_handshake_writes() {
         // having no live proofs. The source project is deliberately unbound;
         // only preflighting the evicted target prevents partial side effects.
         let followup = McpContext::with_state(cx.clone(), 3, fixture.actor_state.clone());
-        assert!(session_identity::session_bindings(&followup).is_empty());
+        assert_eq!(session_identity::session_bindings(&followup).len(), 0);
         let before = handshake_counts(&cx).await;
         assert_eq!(before[2], 0, "the fixture has no contact links");
         let absent_source = root.join("new-source").to_string_lossy().into_owned();
@@ -458,7 +458,7 @@ fn saturated_eviction_history_refuses_new_source_before_creating_its_project() {
         for binding in session_identity::session_bindings(&actor) {
             session_identity::unbind(&actor, binding.agent_id);
         }
-        assert!(session_identity::session_bindings(&actor).is_empty());
+        assert_eq!(session_identity::session_bindings(&actor).len(), 0);
         let unrelated = set_contact_policy(
             &actor,
             target_project.clone(),
