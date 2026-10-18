@@ -8968,6 +8968,8 @@ async fn create_message_with_recipients_tx(
     // recipient ids before this runs, so a genuinely distinct recipient is
     // never silently dropped; the post-commit visibility probe still verifies
     // every distinct recipient is present.
+    let mut delivered_agent_ids = Vec::with_capacity(recipients.len());
+    let mut recount_agent_ids = Vec::new();
     for (agent_id, kind) in recipients {
         let params = [
             Value::BigInt(message_id),
@@ -8977,7 +8979,8 @@ async fn create_message_with_recipients_tx(
         match map_sql_outcome(
             traw_execute(cx, tracked, INSERT_MESSAGE_RECIPIENT_SQL, &params).await,
         ) {
-            Outcome::Ok(_) => {}
+            Outcome::Ok(0) => recount_agent_ids.push(*agent_id),
+            Outcome::Ok(_) => delivered_agent_ids.push(*agent_id),
             Outcome::Err(error) => {
                 let existing_rows = match map_sql_outcome(
                     traw_query(
@@ -9050,11 +9053,18 @@ async fn create_message_with_recipients_tx(
         );
     }
 
-    let recipient_agent_ids: Vec<i64> = recipients.iter().map(|(id, _)| *id).collect();
     try_in_tx!(
         cx,
         tracked,
-        rebuild_agents_inbox_stats_in_tx(cx, tracked, &recipient_agent_ids).await
+        add_new_message_to_inbox_stats_in_tx(
+            cx,
+            tracked,
+            &delivered_agent_ids,
+            &recount_agent_ids,
+            ack_required,
+            now,
+        )
+        .await
     );
 
     // Record the idempotency key + serialized result in the SAME transaction as
@@ -13609,6 +13619,75 @@ fn is_tolerable_inbox_stats_rebuild_error(error: &DbError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Count one new message into an existing `inbox_stats` row.
+const ADD_NEW_MESSAGE_TO_INBOX_STATS_SQL: &str = "UPDATE inbox_stats SET \
+     total_count = total_count + 1, \
+     unread_count = unread_count + 1, \
+     ack_pending_count = ack_pending_count + ?2, \
+     last_message_ts = MAX(COALESCE(last_message_ts, 0), ?3) \
+     WHERE agent_id = ?1";
+
+/// Count a just-inserted message into its recipients' `inbox_stats` rows.
+///
+/// Sends used to recount every recipient's whole inbox here, O(inbox) per
+/// recipient under the message write serializer (br-qbhs0). Read, ack and
+/// repair paths still recount, so an existing row is exact before the send,
+/// and adding each inserted recipient row as one unread message keeps it
+/// exact, as the recount counts rows. Agents without a row yet, and
+/// recipients whose insert was a no-op, get the full recount instead. The
+/// row is looked up rather than inferred from the UPDATE's affected-row
+/// count, which older engines reported unreliably.
+async fn add_new_message_to_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    delivered_agent_ids: &[i64],
+    recount_agent_ids: &[i64],
+    ack_required: bool,
+    created_ts: i64,
+) -> Outcome<(), DbError> {
+    let mut recount = recount_agent_ids.to_vec();
+    for &agent_id in delivered_agent_ids {
+        let existing = match map_sql_outcome(
+            traw_query(
+                cx,
+                tracked,
+                "SELECT agent_id FROM inbox_stats WHERE agent_id = ?",
+                &[Value::BigInt(agent_id)],
+            )
+            .await,
+        ) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
+                return Outcome::Ok(());
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        };
+        if existing.is_empty() {
+            recount.push(agent_id);
+            continue;
+        }
+        let params = [
+            Value::BigInt(agent_id),
+            Value::BigInt(i64::from(ack_required)),
+            Value::BigInt(created_ts),
+        ];
+        match map_sql_outcome(
+            traw_execute(cx, tracked, ADD_NEW_MESSAGE_TO_INBOX_STATS_SQL, &params).await,
+        ) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) if is_tolerable_inbox_stats_rebuild_error(&error) => {
+                return Outcome::Ok(());
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+        }
+    }
+    rebuild_agents_inbox_stats_in_tx(cx, tracked, &recount).await
 }
 
 async fn rebuild_agents_inbox_stats_in_tx(
@@ -29086,6 +29165,165 @@ mod tests {
                     "non-ack-required message should not create ack debt"
                 );
             }
+        });
+    }
+
+    /// br-qbhs0: a send counts itself into each recipient's `inbox_stats` row
+    /// instead of recounting the whole inbox. The row must equal the recount
+    /// through a missing row, an existing one, ack-required and plain mail, a
+    /// duplicated recipient entry, and a read and an ack in between.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_message_counts_itself_into_inbox_stats_exactly_like_a_recount() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        // (total, unread, ack_pending, last_message_ts) as stored, and as a
+        // recount of message_recipients computes it; zeros when there is none.
+        fn stored_and_recounted(path: &str, agent_id: i64) -> ([i64; 4], [i64; 4]) {
+            let conn = crate::DbConn::open_file(path.to_string()).expect("open verify connection");
+            let read = |sql: &str| {
+                let rows = conn
+                    .query_sync(sql, &[Value::BigInt(agent_id)])
+                    .expect("query inbox stats");
+                rows.first().map_or([0; 4], |row| {
+                    [
+                        row.get_named::<i64>("total").unwrap_or(0),
+                        row.get_named::<i64>("unread").unwrap_or(0),
+                        row.get_named::<i64>("ack_pending").unwrap_or(0),
+                        row.get_named::<i64>("last_ts").unwrap_or(0),
+                    ]
+                })
+            };
+            let stored = read(
+                "SELECT total_count AS total, unread_count AS unread, \
+                 ack_pending_count AS ack_pending, last_message_ts AS last_ts \
+                 FROM inbox_stats WHERE agent_id = ?",
+            );
+            let recounted = read(
+                "SELECT COUNT(*) AS total, \
+                 COALESCE(SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread, \
+                 COALESCE(SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 THEN 1 ELSE 0 END), 0) AS ack_pending, \
+                 COALESCE(MAX(m.created_ts), 0) AS last_ts \
+                 FROM message_recipients mr JOIN messages m ON m.id = mr.message_id \
+                 WHERE mr.agent_id = ?",
+            );
+            (stored, recounted)
+        }
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_stats_counted_on_send.db");
+        let path = pool.sqlite_path().to_string();
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection for inbox_stats setup");
+            create_inbox_stats_table_for_test(&conn);
+            drop(conn);
+
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-counted-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenStone", "RedCastle", "PinkHarbor"] {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "e2e-test",
+                    "test-model",
+                    Some("inbox stats"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            let (sender, a, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+            let send = |subject: &'static str, ack: bool, recipients: Vec<(i64, &'static str)>| {
+                let (cx, pool) = (&cx, &pool);
+                async move {
+                    create_message_with_recipients(
+                        cx,
+                        pool,
+                        project_id,
+                        sender,
+                        subject,
+                        "body",
+                        Some("THREAD-INBOX-COUNTED"),
+                        "normal",
+                        ack,
+                        "[]",
+                        &recipients,
+                    )
+                    .await
+                    .into_result()
+                    .expect("create message")
+                    .id
+                    .expect("message id")
+                }
+            };
+            let assert_exact = |step: &str| {
+                for agent in [a, b, c] {
+                    let (stored, recounted) = stored_and_recounted(&path, agent);
+                    assert_eq!(
+                        stored, recounted,
+                        "{step}: agent {agent} inbox_stats must equal the recount"
+                    );
+                }
+            };
+
+            // No row yet: every recipient falls back to the recount.
+            let first = send("first", true, vec![(a, "to"), (b, "cc")]).await;
+            assert_exact("first send");
+            // Existing rows are counted in place; plain mail adds no ack debt,
+            // and a duplicated recipient entry counts once.
+            send("second", false, vec![(a, "to"), (a, "cc"), (c, "bcc")]).await;
+            assert_exact("second send");
+            mark_message_read(&cx, &pool, a, first)
+                .await
+                .into_result()
+                .expect("mark read");
+            acknowledge_message(&cx, &pool, b, first)
+                .await
+                .into_result()
+                .expect("acknowledge");
+            assert_exact("after read and ack");
+            let third = send("third", true, vec![(a, "to"), (b, "to")]).await;
+            assert_exact("third send");
+
+            let (stored_a, _) = stored_and_recounted(&path, a);
+            assert_eq!(
+                stored_a[..3],
+                [3, 2, 2],
+                "a: three messages, the first read, two still awaiting an ack"
+            );
+            let (stored_b, _) = stored_and_recounted(&path, b);
+            assert_eq!(stored_b[0], 2, "b received two messages");
+            assert_eq!(
+                stored_b[2], 1,
+                "b acknowledged the first; the third awaits an ack"
+            );
+            let third_ts: i64 = crate::DbConn::open_file(path.clone())
+                .expect("open verify connection")
+                .query_sync(
+                    "SELECT created_ts AS ts FROM messages WHERE id = ?",
+                    &[Value::BigInt(third)],
+                )
+                .expect("third message")[0]
+                .get_named::<i64>("ts")
+                .expect("created_ts");
+            assert_eq!(
+                stored_b[3], third_ts,
+                "last_message_ts follows the newest message"
+            );
         });
     }
 
