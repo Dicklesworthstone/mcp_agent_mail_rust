@@ -614,7 +614,7 @@ mod tests {
             assert!(authorize_actor(&ctx, &agent(1, 20, "RedStone"), false, "ack").is_ok());
             assert!(authorize_actor(&ctx, &agent(3, 30, "GreenCastle"), false, "ack").is_ok());
             unbind(&ctx, 1);
-            assert!(session_bindings(&ctx).is_empty());
+            assert_eq!(session_bindings(&ctx).len(), 0);
             assert!(authorize_actor(&ctx, &agent(2, 10, "GreenCastle"), false, "ack").is_err());
             assert!(authorize_actor(&ctx, &agent(2, 20, "GreenCastle"), false, "ack").is_ok());
         });
@@ -627,10 +627,10 @@ mod tests {
             bind(&ctx, 10, 1, "BlueLake");
             bind(&ctx, 10, 1, "BlueLake");
             assert_eq!(session_bindings(&ctx).len(), 1);
-            assert!(identity_state(&ctx).evicted_projects.is_empty());
+            assert_eq!(identity_state(&ctx).evicted_projects.len(), 0);
             bind(&ctx, 10, 2, "GreenCastle");
             bind(&ctx, 20, 1, "RedStone");
-            assert!(identity_state(&ctx).evicted_projects.is_empty());
+            assert_eq!(identity_state(&ctx).evicted_projects.len(), 0);
             assert!(authorize_actor(&ctx, &agent(1, 10, "BlueLake"), false, "ack").is_err());
             assert!(authorize_actor(&ctx, &agent(2, 10, "GreenCastle"), false, "ack").is_ok());
             // The remaining proof is removed explicitly, not by displacement;
@@ -656,7 +656,7 @@ mod tests {
                 }
             }
             assert!(identity_state(&ctx).eviction_history_saturated);
-            assert!(identity_state(&ctx).evicted_projects.is_empty());
+            assert_eq!(identity_state(&ctx).evicted_projects.len(), 0);
             assert!(authorize_actor(&ctx, &agent(1, count, "BlueLake"), false, "ack").is_ok());
             for project in [1, count - 1, 99_999] {
                 assert!(
@@ -697,7 +697,7 @@ mod tests {
                 |ctx| bind(ctx, 20, 1, "RedStone"),
                 |ctx| unbind(ctx, 1),
             );
-            assert!(session_bindings(&ctx).is_empty());
+            assert_eq!(session_bindings(&ctx).len(), 0);
             assert_eq!(identity_state(&ctx).evicted_projects, [10]);
             assert!(authorize_actor(&ctx, &agent(2, 10, "GreenCastle"), false, "ack").is_err());
         });

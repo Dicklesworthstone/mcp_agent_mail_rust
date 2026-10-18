@@ -1866,7 +1866,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let db = td.path().join("growing-db");
         let initial = 64 * 1024_u64;
-        std::fs::write(&db, vec![0; initial as usize]).unwrap();
+        std::fs::write(&db, vec![0; usize::try_from(initial).unwrap()]).unwrap();
         let mut largest_read = 0;
         let mut extensions = 0;
         let result = fingerprint_db_with_observer(&db, |path, bytes| {
