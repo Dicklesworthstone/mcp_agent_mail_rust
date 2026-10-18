@@ -5,6 +5,8 @@
 //! uses the existing no-clobber, BCC-safe, Git-verifying reconciler. Unknown,
 //! oversized and non-message failures require the existing operator clear.
 
+mod extra_paths;
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,9 +188,12 @@ impl Witness {
         else {
             return None;
         };
-        // The normal reconciler cannot authorize arbitrary extra commit paths.
-        // Preserve operator refusal instead of pretending they were repaired.
-        if !extra_paths.is_empty() || project_slug.len() > 1024 {
+        // Referenced attachment files are already obligations of the normal
+        // reconciler. Arbitrary extra paths (including shared manifests) are
+        // not: never clear their failure after verifying only the message.
+        if project_slug.len() > 1024
+            || !extra_paths::covered_by_message(project_slug, message_json, extra_paths)
+        {
             return None;
         }
         let id = message_json.get("id")?.as_i64().filter(|id| *id > 0)?;
