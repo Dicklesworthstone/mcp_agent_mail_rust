@@ -167,7 +167,13 @@ fn run_pass(
         || stop.load(Ordering::Acquire),
         has_time,
     );
-    if result.is_err() {
+    // This exact, internal refusal is emitted before the slice accesses its
+    // pool. It says nothing about connection health. All source/query failures
+    // carry a different contextual prefix and still retire the worker handle.
+    let admission_deferred = result.as_ref().err().is_some_and(|error| {
+        error.as_str() == "ACK scan deferred: recovery write admission is busy"
+    });
+    if result.is_err() && !admission_deferred {
         // The slice has already released its generation lease. A failed or
         // retired connection family must not be reused forever after recovery.
         // Preserve the bounded cursor: its next successful read either resumes
@@ -598,6 +604,10 @@ mod tests {
             },
             |delay| {
                 waits.push(delay);
+                // Assertions in an attempt are caught by the production
+                // supervisor too. Fail outside it instead of looping forever
+                // if an unexpected assertion prevents normal termination.
+                assert!(waits.len() <= 2, "ACK attempt repeatedly failed");
                 false
             },
             |_| Duration::ZERO,
@@ -805,5 +815,89 @@ mod tests {
             assert!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap().is_some());
             assert!(receipts[1].get_named::<Option<i64>>("ack_ts").unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn promotion_deferral_keeps_the_worker_pool_and_continuation() {
+        const CHILD: &str = "AM_TEST_ACK_WORKER_POOL_ADMISSION_CHILD";
+        let name = std::thread::current()
+            .name()
+            .expect("named test thread")
+            .to_string();
+        if std::env::var(CHILD).ok().as_deref() != Some(name.as_str()) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, &name)
+                .output()
+                .expect("run isolated ACK worker admission test");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("ACK worker pool admission completed"),
+                "isolated ACK worker admission failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let (temp, mut config) = fixture();
+            std::fs::create_dir_all(temp.path().join("mailbox")).unwrap();
+            config.ack_escalation_enabled = false;
+            let control = seed(&config);
+            let cx = Cx::for_testing();
+            block_on(mcp_agent_mail_db::queries::db_generation_id(&cx, &control))
+                .into_result()
+                .unwrap();
+            seed_tail(&control, &cx);
+            let selected = selected_pool(&config);
+            let stop = AtomicBool::new(false);
+            let mut pool = None;
+            let mut state = AckScanState::default();
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || false)
+                    .unwrap(),
+                (3, 1)
+            );
+            let engine = pool.as_ref().unwrap().engine_identity_key();
+            let cursor = state.cursor.clone();
+            let identity = state.identity.clone();
+            let warned = state.warned.clone();
+            let current = state.current.clone();
+            assert!(cursor.is_some());
+            let promotion =
+                mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle()
+                    .expect("isolated process has no active writer");
+            let result = run_pass(
+                &config,
+                &selected,
+                &mut pool,
+                &mut state,
+                &stop,
+                || panic!("admission refusal must not process a row"),
+            );
+            drop(promotion);
+            let error = result.expect_err("promotion must refuse the scan");
+            assert_eq!(error, "ACK scan deferred: recovery write admission is busy");
+            assert!(pool.is_some(), "contention must not discard a usable pool");
+            assert_eq!(pool.as_ref().unwrap().engine_identity_key(), engine);
+            assert_eq!(state.cursor, cursor);
+            assert_eq!(state.identity, identity);
+            assert_eq!(state.warned, warned);
+            assert_eq!(state.current, current);
+            assert_eq!(
+                next_ack_scan_delay(Duration::from_secs(60), true, true),
+                Duration::from_secs(60)
+            );
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || true)
+                    .unwrap(),
+                (2, 2)
+            );
+            assert_eq!(pool.as_ref().unwrap().engine_identity_key(), engine);
+            assert!(state.cursor.is_none());
+            assert_eq!(state.warned.len(), 3);
+        });
+        println!("ACK worker pool admission completed");
     }
 }
