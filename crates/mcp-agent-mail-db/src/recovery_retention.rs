@@ -29,6 +29,9 @@ mod namespace;
 #[cfg(unix)]
 pub use namespace::{CompletedReclaimMove, ReclaimDirectory};
 
+#[cfg(unix)]
+pub(crate) use namespace::delete_inventoried_file;
+
 #[cfg(all(test, unix))]
 use namespace::{
     MAX_RECLAIM_MOVE_ATTEMPTS, create_private_reclaim_directory, move_recovery_debris,

@@ -103,6 +103,75 @@ impl SnapshotRetentionGuard {
             .map(|selected| selected.actual_path.as_path())
     }
 
+    /// Reclaim a strict, dated periodic generation only when a newer, fully
+    /// verified snapshot remains available under this same exclusive admission.
+    /// The caller selects the retention window; this boundary enforces safety.
+    ///
+    /// # Errors
+    /// Refuses unresolved verification, a pinned or changed file, companion
+    /// recovery state, newer generations, and unsafe namespace operations.
+    pub fn delete_superseded_generation(
+        &self,
+        primary: &Path,
+        path: &Path,
+        inventoried: &std::fs::Metadata,
+    ) -> io::Result<()> {
+        use mcp_agent_mail_core::disk::{
+            SqliteRecoveryCandidateKind, classify_sqlite_recovery_candidate_name,
+        };
+        self.revalidate()?;
+        if super::snapshot_meta_path(primary) != self.metadata_path {
+            return Err(invalid("retention authority belongs to another database"));
+        }
+        let selected = self
+            .selected
+            .as_ref()
+            .ok_or_else(|| invalid("no verified replacement"))?;
+        let candidate = primary
+            .file_name()
+            .zip(path.file_name())
+            .and_then(|(db, name)| classify_sqlite_recovery_candidate_name(db, name))
+            .ok_or_else(|| invalid("not a strict periodic generation"))?;
+        if candidate.kind() != SqliteRecoveryCandidateKind::TimestampedBak
+            || candidate.generation_micros().is_none_or(|created| {
+                created.saturating_add(1_000_000) > selected.metadata.created_us
+            })
+        {
+            return Err(invalid("generation is not superseded by verified snapshot"));
+        }
+        let pinned = selected.source.metadata()?;
+        if pinned.dev() == inventoried.dev() && pinned.ino() == inventoried.ino() {
+            return Err(invalid("cannot reclaim the verified snapshot"));
+        }
+        if !crate::pool::sqlite_recovery_candidate_is_standalone(path) {
+            return Err(invalid("generation has companion recovery state"));
+        }
+        // Admission already performed full integrity verification. Rehash the
+        // exact pinned inode rather than rescanning every generation for every
+        // eviction (quadratic IO on an accumulated multi-week backlog).
+        let mut current =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&selected.actual_path)?;
+        let current_metadata = current.metadata()?;
+        if current_metadata.dev() != pinned.dev()
+            || current_metadata.ino() != pinned.ino()
+            || !crate::pool::sqlite_recovery_candidate_is_standalone(&selected.actual_path)
+        {
+            return Err(invalid("verified replacement changed during retention"));
+        }
+        let identity =
+            super::snapshot_file_identity_from_reader(&mut current, &selected.actual_path)
+                .map_err(io::Error::other)?;
+        if identity.0 != selected.metadata.snapshot_size_bytes
+            || identity.1 != selected.metadata.snapshot_sha256
+        {
+            return Err(invalid(
+                "verified replacement bytes changed during retention",
+            ));
+        }
+        self.revalidate()?;
+        crate::recovery_retention::delete_inventoried_file(path, inventoried)
+    }
+
     /// Recheck ownership and metadata before another destructive operation.
     /// Participating writers are excluded; changed external evidence refuses
     /// further work rather than allowing a stale pin to authorize eviction.

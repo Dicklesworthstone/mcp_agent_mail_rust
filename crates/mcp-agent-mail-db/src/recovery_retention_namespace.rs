@@ -1,6 +1,8 @@
 //! Descriptor-bound namespace operations for recovery-debris consolidation.
 //!
-//! No source is copied or deleted. Each path component is opened without
+//! Consolidation never copies or deletes a source. The separate snapshot
+//! reclamation primitive deletes only files admitted by snapshot authority.
+//! Each path component is opened without
 //! following user-controlled symlinks; rename and durability sync use the same
 //! retained directory handles. A changed namespace after a completed move is
 //! an error, not permission to retry or to overwrite a replacement pathname.
@@ -317,6 +319,38 @@ fn validate_inventoried_file(file: &File, expected: &Metadata) -> io::Result<()>
     Ok(())
 }
 
+/// Remove one admitted superseded snapshot through its retained parent. Never
+/// follows symlinks, traverses directories, or accepts hard-linked aliases.
+pub(crate) fn delete_inventoried_file(source: &Path, inventoried: &Metadata) -> io::Result<()> {
+    let source = absolute_spelling(source)?;
+    let parent_path = source
+        .parent()
+        .ok_or_else(|| invalid("backup has no parent"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| invalid("backup has no name"))?;
+    let parent = open_directory(parent_path, false)?;
+    let file = File::from(rustix::fs::openat(
+        &parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    validate_inventoried_file(&file, inventoried)?;
+    let expected = rustix::fs::fstat(&file)?;
+    parent.sync_all()?;
+    validate_directory(parent_path, &parent)?;
+    validate_source_entry(&parent, name, &expected)?;
+    validate_inventoried_file(&file, inventoried)?;
+    rustix::fs::unlinkat(&parent, name, AtFlags::empty())?;
+    // Unlink has already reclaimed the namespace entry. A durability failure
+    // must not misreport it as kept or invite a retry against a replacement.
+    if let Err(error) = parent.sync_all() {
+        tracing::warn!(%error, path = %source.display(), "backup deleted; directory sync failed");
+    }
+    Ok(())
+}
+
 pub(super) fn move_recovery_debris_into(
     source: &Path,
     destination: &ReclaimDirectory,
@@ -483,6 +517,39 @@ mod tests {
 
     fn fixture() -> PathBuf {
         tempfile::tempdir().unwrap().keep().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn deletion_refuses_replacements_links_and_symlinked_parents() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"original").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let retained = root.join("retained");
+        std::fs::rename(&source, &retained).unwrap();
+        std::fs::write(&source, b"replaced").unwrap();
+        assert!(delete_inventoried_file(&source, &inventoried).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"replaced");
+        let alias = root.join("alias");
+        std::fs::hard_link(&retained, &alias).unwrap();
+        assert!(delete_inventoried_file(&alias, &std::fs::metadata(&alias).unwrap()).is_err());
+        let symlink = root.join("symlink");
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        assert!(
+            delete_inventoried_file(&symlink, &std::fs::symlink_metadata(&symlink).unwrap())
+                .is_err()
+        );
+        let parent_alias = root.join("parent-alias");
+        std::os::unix::fs::symlink(&root, &parent_alias).unwrap();
+        assert!(
+            delete_inventoried_file(
+                &parent_alias.join("generation"),
+                &std::fs::metadata(&source).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(retained).unwrap(), b"original");
+        assert_eq!(std::fs::read(source).unwrap(), b"replaced");
     }
 
     #[test]
