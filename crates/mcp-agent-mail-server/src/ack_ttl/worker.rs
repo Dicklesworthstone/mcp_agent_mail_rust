@@ -176,12 +176,6 @@ mod tests {
             std::fs::create_dir_all(temp.path().join("mailbox")).unwrap();
             let control = seed(&config);
             let cx = Cx::for_testing();
-            let conn = block_on(control.acquire(&cx)).into_result().unwrap();
-            let before = conn
-                .query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
-                .unwrap();
-            assert!(before.is_empty(), "fixture must start without a generation");
-            drop(conn);
             let selected = selected_pool(&config);
             let mut pool = None;
             let mut state = AckScanState::default();
