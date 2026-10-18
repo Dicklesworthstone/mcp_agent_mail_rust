@@ -26,9 +26,10 @@ pub use escalation::{AckEscalationOutcome, AckEscalationRequest, grant_ack_escal
 
 use asupersync::{Cx, Outcome};
 use sqlmodel_core::{Connection as _, Row, Value};
+use sqlmodel_pool::PooledConnection;
 
 use crate::queries::UnackedMessageRow;
-use crate::{DbError, DbPool, DbResult};
+use crate::{DbConn, DbError, DbPool, DbResult};
 
 /// Maximum delivered rows in one observation, excluding its overflow witness.
 pub const MAX_ACK_SCAN_PAGE_SIZE: usize = 128;
@@ -253,6 +254,27 @@ fn decode_page(database_scope: String, rows: Vec<Row>, page_size: usize) -> DbRe
     })
 }
 
+/// A read that did not complete must not return an uncertain session to the
+/// pool. Dropping only the worker's DbPool wrapper does not remove idle readers
+/// from the shared runtime pool. Own the exact checkout across the await so
+/// cancellation, a dropped future and unwinding take the same retirement path.
+/// A successful SQL observation remains reusable even if its metadata is later
+/// refused: corrupt authority is not repaired by repeatedly reopening readers.
+struct AckReadLease {
+    connection: Option<PooledConnection<DbConn>>,
+    reusable: bool,
+}
+
+impl Drop for AckReadLease {
+    fn drop(&mut self) {
+        if !self.reusable
+            && let Some(connection) = self.connection.take()
+        {
+            crate::close_db_conn(connection.detach(), "incomplete overdue ACK scan query");
+        }
+    }
+}
+
 /// Read one fresh page using the runtime mailbox connection and caller context.
 ///
 /// The result contains no subjects, bodies, recipient names, or attachment data.
@@ -270,14 +292,24 @@ pub async fn overdue_ack_page(
         Ok(query) => query,
         Err(error) => return Outcome::Err(error),
     };
-    let conn = match pool.acquire(cx).await {
+    let connection = match pool.acquire(cx).await {
         Outcome::Ok(conn) => conn,
         Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    let mut lease = AckReadLease {
+        connection: Some(connection),
+        reusable: false,
+    };
     let started = crate::tracking::query_timer();
-    let result = conn.query(cx, &sql, &params).await;
+    let result = lease
+        .connection
+        .as_ref()
+        .expect("live ACK scan connection")
+        .query(cx, &sql, &params)
+        .await;
+    lease.reusable = matches!(&result, Outcome::Ok(_));
     crate::tracking::record_query(&sql, crate::tracking::elapsed_us(started));
     match result {
         Outcome::Ok(rows) => match decode_page(scope, rows, page_size) {
@@ -293,6 +325,208 @@ pub async fn overdue_ack_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // last_insert_rowid belongs to the native connection, unlike user_version
+    // or another persistent PRAGMA. Queries and UPDATE/ALTER statements do not
+    // change it, so this witnesses real reuse/retirement without pointer guesses.
+    const READER_MARKER: i64 = 8_123_456_789;
+
+    fn mark_reader(conn: &DbConn) {
+        conn.execute_raw("CREATE TABLE IF NOT EXISTS ack_reader_witness (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute_sync(
+            "INSERT OR REPLACE INTO ack_reader_witness(id) VALUES (?)",
+            &[READER_MARKER.into()],
+        )
+        .unwrap();
+        assert_eq!(count(conn, "SELECT last_insert_rowid()"), READER_MARKER);
+    }
+
+    #[test]
+    fn failed_runtime_scan_retires_its_reader_and_resumes_after_a_new_ack() {
+        shared_pool(|pool, cx| {
+            let generation = run(crate::queries::db_generation_id(cx, pool))
+                .into_result()
+                .unwrap();
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(104, 101, 'GoldLeaf', 'test', 'test', 1, 1)")
+                .unwrap();
+            drop(conn);
+            let first = run(overdue_ack_page(cx, pool, None, 1_000_000, 1))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&first), [(901, 102)]);
+            assert_eq!(first.generation_id(), generation.as_deref());
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            let original_cursor = cursor.clone();
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            mark_reader(&conn);
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO unavailable_ack_receipts")
+                .unwrap();
+            drop(conn);
+
+            // This fails in the real SQL driver, not in a replacement decoder.
+            let failed = run(overdue_ack_page(cx, pool, Some(&cursor), i64::MAX, 128));
+            assert!(matches!(failed, Outcome::Err(_)), "{failed:?}");
+            assert_eq!(cursor, original_cursor, "an error must not consume the page");
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_ne!(
+                count(&conn, "SELECT last_insert_rowid()"),
+                READER_MARKER,
+                "the next checkout must not recycle the failed reader"
+            );
+            assert_eq!(count(&conn, "SELECT id FROM ack_reader_witness"), READER_MARKER);
+            conn.execute_raw("ALTER TABLE unavailable_ack_receipts RENAME TO project_mailbox_receipts")
+                .unwrap();
+            // Receipt changes after the failure must be read afresh. New mail
+            // cannot extend the original lap's high-water mark or cutoff.
+            conn.execute_raw("INSERT INTO project_mailbox_receipts(message_id, agent_id, read_ts, ack_ts) VALUES(901, 103, 77, 88)")
+                .unwrap();
+            conn.execute_raw("INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts, ack_required) VALUES(902, 101, 101, 'Later mail', 'Keep later body', 1000001, 1)")
+                .unwrap();
+            conn.execute_raw("INSERT INTO project_mailbox_deliveries VALUES(902, 101, 'to', 1000001)")
+                .unwrap();
+            drop(conn);
+            let resumed = run(overdue_ack_page(cx, pool, Some(&cursor), i64::MAX, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&resumed), [(901, 104)]);
+            assert_eq!(resumed.overdue_before_ts(), 1_000_000);
+            assert_eq!(resumed.generation_id(), generation.as_deref());
+            assert!(resumed.continuation_after(1).unwrap().is_none());
+            let request = AckEscalationRequest {
+                observed: &resumed.rows[0],
+                overdue_before_ts: resumed.overdue_before_ts(),
+                generation_id: resumed.generation_id(),
+                project_slug: "project",
+                project_key: "/project",
+                recipient_name: "GoldLeaf",
+                holder_id: 104,
+                holder_name: "GoldLeaf",
+                ttl_seconds: 3600,
+                exclusive: true,
+            };
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::Granted(_))
+            ));
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::AlreadyCovered)
+            ));
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM messages"), 2);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
+            assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 104);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM message_recipients"), 0);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 2);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 1);
+            assert_eq!(count(&conn, "SELECT read_ts FROM project_mailbox_receipts"), 77);
+            assert_eq!(count(&conn, "SELECT ack_ts FROM project_mailbox_receipts"), 88);
+        });
+    }
+
+    #[test]
+    fn successful_reads_and_metadata_refusals_keep_the_healthy_reader() {
+        shared_pool(|pool, cx| {
+            let generation = run(crate::queries::db_generation_id(cx, pool))
+                .into_result()
+                .unwrap();
+            assert!(generation.is_some());
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            mark_reader(&conn);
+            drop(conn);
+            let first = run(overdue_ack_page(cx, pool, None, 1_000_000, 1))
+                .into_result()
+                .unwrap();
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
+            conn.execute_raw("UPDATE db_identity SET generation_id = '' WHERE singleton = 0")
+                .unwrap();
+            drop(conn);
+            let bad = run(overdue_ack_page(cx, pool, None, 1_000_000, 1));
+            assert!(matches!(bad, Outcome::Err(_)), "invalid metadata must remain refused");
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(
+                count(&conn, "SELECT last_insert_rowid()"),
+                READER_MARKER,
+                "successful SQL exposing invalid metadata must not churn the pool"
+            );
+            conn.execute_sync(
+                "UPDATE db_identity SET generation_id = ? WHERE singleton = 0",
+                &[first.generation_id().unwrap().into()],
+            )
+            .unwrap();
+            drop(conn);
+            for size in [0, MAX_ACK_SCAN_PAGE_SIZE + 1] {
+                assert!(matches!(
+                    run(overdue_ack_page(cx, pool, None, 1_000_000, size)),
+                    Outcome::Err(_)
+                ));
+            }
+            let again = run(overdue_ack_page(cx, pool, None, 1_000_000, 1))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&again), keys(&first));
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+        });
+    }
+
+    #[test]
+    fn dropping_a_suspended_read_lease_does_not_return_its_session() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        shared_pool(|pool, cx| {
+            let connection = run(pool.acquire(cx)).into_result().unwrap();
+            mark_reader(&connection);
+            // Suspend with the same concrete pooled-reader guard used by the
+            // query await. This tests future-drop ownership, not an injected
+            // successful database response or a claimed in-flight driver cancel.
+            let mut future = Box::pin(async move {
+                let lease = AckReadLease {
+                    connection: Some(connection),
+                    reusable: false,
+                };
+                std::future::pending::<()>().await;
+                drop(lease);
+            });
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+            drop(future);
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_ne!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
+            assert_eq!(count(&conn, "SELECT id FROM ack_reader_witness"), READER_MARKER);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM messages"), 1);
+            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+        });
+    }
+
+    #[test]
+    fn unwinding_an_unconfirmed_read_retires_only_that_checkout() {
+        shared_pool(|pool, cx| {
+            let connection = run(pool.acquire(cx)).into_result().unwrap();
+            mark_reader(&connection);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _lease = AckReadLease {
+                    connection: Some(connection),
+                    reusable: false,
+                };
+                panic!("interrupted ACK read ownership");
+            }));
+            assert!(unwound.is_err());
+            let conn = run(pool.acquire(cx)).into_result().unwrap();
+            assert_ne!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
+            assert_eq!(count(&conn, "SELECT id FROM ack_reader_witness"), READER_MARKER);
+            drop(conn);
+            let page = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&page), [(901, 102), (901, 103)]);
+        });
+    }
 
     fn fixture(test: impl FnOnce(&crate::DbConn)) {
         let root = tempfile::tempdir().unwrap();
