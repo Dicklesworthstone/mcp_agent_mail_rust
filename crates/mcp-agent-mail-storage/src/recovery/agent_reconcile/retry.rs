@@ -229,7 +229,7 @@ mod tests {
         for prefer_retry in [false, true] {
             let candidates = interleave(vec![100, 101, 102], vec![1, 2, 3], prefer_retry);
             assert_eq!(candidates.len(), 6);
-            for pair in candidates.chunks_exact(2) {
+            for pair in candidates.as_chunks::<2>().0 {
                 assert_ne!(pair[0].retry, pair[1].retry);
             }
             assert_eq!(

@@ -10467,12 +10467,10 @@ pub fn atc_record_outcome(
         if let Ok(mut engine) = engine_lock.lock()
             && engine.enabled()
         {
-            let changed = if let Ok(mut tuner) = tuner_lock.lock() {
+            let changed = tuner_lock.lock().is_ok_and(|mut tuner| {
                 tuner.record_outcome(action, state, (predicted_loss - actual_loss).abs());
                 tuner.maybe_update(&mut engine.liveness_core)
-            } else {
-                false
-            };
+            });
             // Do not hold the tuner lock during policy fan-out.
             if changed {
                 engine.propagate_liveness_policy();

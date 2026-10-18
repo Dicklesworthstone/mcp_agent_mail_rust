@@ -419,7 +419,7 @@ mod tests {
                         "({},1,11,'large','large-body-{}',{})",
                         40000 + n,
                         n,
-                        1000000 + n
+                        1_000_000 + n
                     )
                 })
                 .collect::<Vec<_>>()
@@ -822,12 +822,14 @@ mod tests {
                 for start in (previous + 1..=count).step_by(128) {
                     let end = (start + 127).min(count);
                     let messages = (start..=end)
-                        .map(|n| format!("({},3,31,'noise','noise body',{})", 100000 + n, n * 1000))
+                        .map(|n| {
+                            format!("({},3,31,'noise','noise body',{})", 100_000 + n, n * 1000)
+                        })
                         .collect::<Vec<_>>()
                         .join(",");
                     conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) VALUES {messages}")).unwrap();
                     let recipients = (start..=end)
-                        .map(|n| format!("({},32,'to')", 100000 + n))
+                        .map(|n| format!("({},32,'to')", 100_000 + n))
                         .collect::<Vec<_>>()
                         .join(",");
                     conn.execute_raw(&format!("INSERT INTO message_recipients(message_id,agent_id,kind) VALUES {recipients}")).unwrap();

@@ -533,8 +533,8 @@ mod tests {
         old.extra_queries.clear();
         let diagnostic = explain_query_plan(&conn, &old).unwrap();
         assert_eq!(diagnostic.status, "warn");
-        assert!(!diagnostic.warnings.is_empty());
-        assert!(!diagnostic.missing_expected_indexes.is_empty());
+        assert_ne!(diagnostic.warnings.len(), 0);
+        assert_ne!(diagnostic.missing_expected_indexes.len(), 0);
     }
 
     #[test]

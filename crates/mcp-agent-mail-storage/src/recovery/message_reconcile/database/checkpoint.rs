@@ -913,8 +913,10 @@ mod tests {
         other.defer_transient(90_000, now);
         store.save(&other).unwrap();
         let original = std::fs::read(&store.path).unwrap();
-        let mut cursor = ReconcileCursor::default();
-        cursor.checkpoint_dirty = true;
+        let mut cursor = ReconcileCursor {
+            checkpoint_dirty: true,
+            ..ReconcileCursor::default()
+        };
         for id in 1..=i64::try_from(MAX_RETRY_IDS).unwrap() {
             cursor.defer_transient(id, now);
         }
@@ -943,8 +945,10 @@ mod tests {
         other
             .conflict_backoff
             .push_back((80_000, now + MAX_RETRY_BACKOFF));
-        let mut cursor = ReconcileCursor::default();
-        cursor.checkpoint_dirty = true;
+        let mut cursor = ReconcileCursor {
+            checkpoint_dirty: true,
+            ..ReconcileCursor::default()
+        };
         for id in 1..=i64::try_from(MAX_RETRY_IDS).unwrap() {
             cursor
                 .conflict_backoff
@@ -1043,9 +1047,11 @@ mod tests {
             drop(first);
 
             let second = Store::open(Binding::capture(cx, pool, config).unwrap()).unwrap();
-            let mut other = ReconcileCursor::default();
-            other.tail_after = Some(940);
-            other.backfill_ceiling = Some(0);
+            let mut other = ReconcileCursor {
+                tail_after: Some(940),
+                backfill_ceiling: Some(0),
+                ..ReconcileCursor::default()
+            };
             other.defer_transient(902, now);
             second.save(&other).unwrap();
             drop(second);

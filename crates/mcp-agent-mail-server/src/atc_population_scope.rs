@@ -1240,7 +1240,9 @@ mod tests {
         assert_eq!(effects.len(), 940);
         assert_eq!(actions.len(), 940);
         for (pair, agent) in effects
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .zip(population.iter().skip(1).step_by(2))
         {
             assert_eq!(pair[0].agent, agent.name);

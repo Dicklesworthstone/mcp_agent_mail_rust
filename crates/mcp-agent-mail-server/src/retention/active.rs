@@ -157,7 +157,7 @@ fn supervise_with(
     }
 }
 
-fn apply_successful_turn_pool_policy(pool: &mut Option<DbPool>, turn: &turn::Turn) {
+fn apply_successful_turn_pool_policy(pool: Option<&DbPool>, turn: &turn::Turn) {
     if turn.idle && pool.is_some() {
         // Empty is healthy, not a generation failure. Keep the worker's
         // one-connection source pool across the normal idle interval. The
@@ -234,7 +234,7 @@ fn run_with(
             match result {
                 Ok(turn) => {
                     delay = turn.delay;
-                    apply_successful_turn_pool_policy(&mut pool, &turn);
+                    apply_successful_turn_pool_policy(pool.as_ref(), &turn);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "active lease repair deferred; source and archive preserved");
@@ -483,13 +483,13 @@ mod tests {
             selected.run_migrations = true;
             let source = DbPool::new(&selected).unwrap();
             let engine = source.engine_identity_key();
-            let mut pool = Some(source);
+            let pool = Some(source);
             let turn = turn::Turn {
                 delay: POLL_INTERVAL,
                 idle: true,
             };
 
-            apply_successful_turn_pool_policy(&mut pool, &turn);
+            apply_successful_turn_pool_policy(pool.as_ref(), &turn);
 
             let retained = pool
                 .as_ref()
@@ -645,19 +645,18 @@ mod tests {
         let worker = TestWorker::spawn(config.clone(), false);
         let deadline = Instant::now() + Duration::from_secs(10);
         let observed = loop {
-            let path = std::fs::read_dir(parent).ok().and_then(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .find(|path| {
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with(".am-active-reservation-reconcile-")
-                                    && name.ends_with(".json")
-                            })
-                    })
-            });
+            let path =
+                std::fs::read_dir(parent).ok().and_then(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| {
+                            path.extension().is_some_and(|ext| ext == "json")
+                                && path.file_name().and_then(|name| name.to_str()).is_some_and(
+                                    |name| name.starts_with(".am-active-reservation-reconcile-"),
+                                )
+                        })
+                });
             if let Some(path) = path {
                 let snapshot = std::fs::read(&path)
                     .ok()

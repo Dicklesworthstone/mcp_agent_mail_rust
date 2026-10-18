@@ -1650,9 +1650,9 @@ mod tests {
                         "({id},1,{},'subject-{id}','body-{id}',{},'{}',{},'{}')",
                         if id % 5 == 0 { 2 } else { 1 },
                         id * 1000,
-                        ["normal", "high", "urgent", "low"][(id % 4) as usize],
+                        ["normal", "high", "urgent", "low"][usize::try_from(id % 4).unwrap()],
                         i64::from(id % 3 != 0),
-                        ["Handoffs", "other", "é", "É"][(id % 4) as usize]
+                        ["Handoffs", "other", "é", "É"][usize::try_from(id % 4).unwrap()]
                     )
                 })
                 .collect::<Vec<_>>()

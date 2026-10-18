@@ -563,10 +563,10 @@ mod tests {
                  INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
                  VALUES({id},2,'{}',{},{})",
                 1_000_000 + ((id * 17) % (count + 1)) * 1000,
-                ["normal", "high", "urgent", "low"][(id % 4) as usize],
+                ["normal", "high", "urgent", "low"][usize::try_from(id % 4).unwrap()],
                 i64::from(id % 3 != 0),
-                ["Handoffs", "other", "é", "É"][(id % 4) as usize],
-                ["to", "cc", "bcc"][(id % 3) as usize],
+                ["Handoffs", "other", "é", "É"][usize::try_from(id % 4).unwrap()],
+                ["to", "cc", "bcc"][usize::try_from(id % 3).unwrap()],
                 if id % 5 == 0 { "2000000" } else { "NULL" },
                 if id % 7 == 0 { "2500000" } else { "NULL" },
             ))

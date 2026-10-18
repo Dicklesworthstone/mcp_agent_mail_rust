@@ -1599,7 +1599,7 @@ mod tests {
                 &[
                     Value::BigInt(project),
                     Value::BigInt(shared),
-                    Value::BigInt(1000000),
+                    Value::BigInt(1_000_000),
                 ],
             )
             .unwrap();

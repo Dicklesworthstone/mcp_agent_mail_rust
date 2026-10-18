@@ -3299,7 +3299,7 @@ fn apply_journal_size_limit(conn: &DbConn, bytes: u64) -> Result<(), SqlError> {
 ///
 /// The gate is process-wide rather than per database: a mailbox process
 /// serves one database, and the hold is bounded either way.
-pub(crate) struct WalResetGate {
+pub struct WalResetGate {
     closed: AtomicBool,
     /// Microseconds after [`WalResetGate::epoch`] before which a new reset is
     /// not attempted, so a WAL pinned by a long reader cannot make every
@@ -3308,14 +3308,14 @@ pub(crate) struct WalResetGate {
     epoch: OnceLock<Instant>,
 }
 
-pub(crate) static WAL_RESET_GATE: WalResetGate = WalResetGate::new();
+pub static WAL_RESET_GATE: WalResetGate = WalResetGate::new();
 
 /// Longest a checkout waits on a closed gate. The holder reopens it well
 /// before this; the bound only guards against a holder that never returns.
 const WAL_RESET_GATE_MAX_WAIT: Duration = Duration::from_secs(2);
 
 /// Releases the [`WalResetGate`] when the reset attempt ends, however it ends.
-pub(crate) struct WalResetGateHold<'gate> {
+pub struct WalResetGateHold<'gate> {
     gate: &'gate WalResetGate,
 }
 
@@ -5992,7 +5992,7 @@ fn sqlite_init_gate(
 
 /// The legacy ATC telemetry tables that, as of br-bvq1x.11.7, are isolated into
 /// the sidecar DB (`atc.sqlite3`) and must not remain in the primary mailbox DB.
-pub(crate) const LEGACY_ATC_MAIN_TABLES: [&str; 4] = [
+pub const LEGACY_ATC_MAIN_TABLES: [&str; 4] = [
     "atc_experiences",
     "atc_experience_rollups",
     "atc_leader_lease",
@@ -6963,17 +6963,16 @@ fn reconcile_archive_state_before_init(
                     "archive reconciliation failed on healthy primary; post-apply inventories disagree; no reconstruction attempted"
                         .to_string(),
                 ));
-            } else {
-                clear_pending_archive_drift(primary_path);
-                tracing::info!(
-                    path = %primary_path.display(),
-                    storage_root = %storage_root.display(),
-                    messages_applied = applied.messages_applied,
-                    projects_visited = applied.projects_visited,
-                    "applied the archive-ahead delta in place; no reconstruct needed"
-                );
-                return Ok(true);
             }
+            clear_pending_archive_drift(primary_path);
+            tracing::info!(
+                path = %primary_path.display(),
+                storage_root = %storage_root.display(),
+                messages_applied = applied.messages_applied,
+                projects_visited = applied.projects_visited,
+                "applied the archive-ahead delta in place; no reconstruct needed"
+            );
+            return Ok(true);
         }
         Ok(crate::reconstruct::ArchiveDeltaApplyOutcome::NotApplicable(reason)) => {
             tracing::info!(
@@ -7097,7 +7096,7 @@ fn sqlite_validation_anchor(path: &Path) -> Result<PathBuf, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<(), SqlError> {
+pub fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<(), SqlError> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
@@ -7432,7 +7431,7 @@ impl CanonicalSnapshotTempDir {
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
+pub fn open_sqlite_file_with_lock_retry(sqlite_path: &str) -> Result<DbConn, SqlError> {
     open_sqlite_file_with_lock_retry_impl(
         sqlite_path,
         |path| DbConn::open_file(path),
@@ -8013,7 +8012,7 @@ pub fn is_corruption_error_message(message: &str) -> bool {
 /// Open failures of the copy are never a verdict here: they carry no evidence
 /// beyond what [`is_corruption_error_message`] already recognises.
 #[must_use]
-pub(crate) fn private_copy_integrity_probe_failure_is_verdict(message: &str) -> bool {
+pub fn private_copy_integrity_probe_failure_is_verdict(message: &str) -> bool {
     if is_corruption_error_message(message) {
         return true;
     }
@@ -9851,7 +9850,7 @@ fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
 }
 
 #[must_use]
-pub(crate) fn sqlite_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub fn sqlite_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut suffixed = path.as_os_str().to_os_string();
     suffixed.push(suffix);
     PathBuf::from(suffixed)
@@ -9865,11 +9864,7 @@ fn os_string_with_suffix(value: &OsStr, suffix: &str) -> OsString {
 }
 
 #[must_use]
-pub(crate) fn sqlite_path_with_file_name_suffix(
-    path: &Path,
-    suffix: &str,
-    fallback: &str,
-) -> PathBuf {
+pub fn sqlite_path_with_file_name_suffix(path: &Path, suffix: &str, fallback: &str) -> PathBuf {
     match path.file_name() {
         Some(file_name) => path.with_file_name(os_string_with_suffix(file_name, suffix)),
         None => path.with_file_name(fallback),
@@ -11524,7 +11519,7 @@ fn note_health_probe_staging_for_test(source: &Path) {
 }
 
 #[cfg(test)]
-pub(crate) fn health_probe_stagings_for_test(source: &Path) -> usize {
+pub fn health_probe_stagings_for_test(source: &Path) -> usize {
     HEALTH_PROBE_STAGINGS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -12010,7 +12005,7 @@ fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
-pub(crate) fn recovery_file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+pub fn recovery_file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -12107,7 +12102,7 @@ fn sqlite_sidecar_occupancy(path: &Path) -> (bool, Option<u64>) {
     }
 }
 
-pub(crate) fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
+pub fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     sqlite_backup_candidates_with(primary_path, sqlite_recovery_candidate_is_standalone)
 }
 
@@ -14530,9 +14525,7 @@ fn sqlite_recovery_candidate_has_mailbox_schema(
 /// `-shm` files merely while inspecting it, making the validator contaminate
 /// the evidence it is deciding whether to trust.
 #[allow(clippy::result_large_err)]
-pub(crate) fn open_immutable_canonical_sqlite(
-    path: &Path,
-) -> Result<crate::CanonicalDbConn, SqlError> {
+pub fn open_immutable_canonical_sqlite(path: &Path) -> Result<crate::CanonicalDbConn, SqlError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -14569,7 +14562,7 @@ pub(crate) fn open_immutable_canonical_sqlite(
 /// authoritative: a corrupt btree can still answer `SELECT … NOT INDEXED`
 /// with phantom or extra identities, which then looks like 951-message
 /// "loss" and wedges reconstruct forever (br-r6awv).
-pub(crate) fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<bool, SqlError> {
+pub fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<bool, SqlError> {
     if !is_real_file(path) {
         return Ok(false);
     }
@@ -14598,9 +14591,7 @@ pub(crate) fn sqlite_file_passes_full_integrity_check(path: &Path) -> Result<boo
 /// run recovery on the copy and produce a real verdict. Only ever call this
 /// on a throwaway staging copy: a writable open consumes journal/WAL
 /// sidecars, which is exactly what the authority path must never suffer.
-pub(crate) fn sqlite_private_copy_passes_full_integrity_check(
-    path: &Path,
-) -> Result<bool, SqlError> {
+pub fn sqlite_private_copy_passes_full_integrity_check(path: &Path) -> Result<bool, SqlError> {
     if !is_real_file(path) {
         return Ok(false);
     }
@@ -15265,7 +15256,7 @@ fn rollback_quarantined_candidate_moves_with_sync(
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) fn quarantine_reconstruction_candidate_path(
+pub fn quarantine_reconstruction_candidate_path(
     candidate_path: &Path,
     primary_path: &Path,
     reason: &str,
@@ -16549,16 +16540,16 @@ fn recent_reconstruct_store(
     );
 }
 
-/// Clear the coalescing cache. Intended for tests only — production lookup
-/// also gates every hit on matching archive inventory and a healthy live file.
-/// Build a mailbox-shaped database whose coordination tables stay fully
-/// readable while the last page (part of an unrelated filler b-tree) is
-/// zeroed. On this shape canonical SQLite *raises* `database disk image is
-/// malformed` from inside `PRAGMA integrity_check` instead of reporting error
-/// rows — the GH#312 source shape ("semantic snapshot succeeded but full
-/// integrity_check failed").
+/// Build a mailbox-shaped database with a torn last page (GH#312).
+///
+/// Its coordination tables stay fully readable while the last page (part of
+/// an unrelated filler b-tree) is zeroed. On this shape canonical SQLite
+/// *raises* `database disk image is malformed` from inside
+/// `PRAGMA integrity_check` instead of reporting error rows — the GH#312
+/// source shape ("semantic snapshot succeeded but full integrity_check
+/// failed").
 #[cfg(test)]
-pub(crate) fn seed_readable_db_with_torn_filler_page(path: &Path) {
+pub fn seed_readable_db_with_torn_filler_page(path: &Path) {
     {
         let conn = crate::CanonicalDbConn::open_file(path.display().to_string())
             .expect("open canonical db");
@@ -16577,11 +16568,12 @@ pub(crate) fn seed_readable_db_with_torn_filler_page(path: &Path) {
     append_filler_btree_and_tear_last_page(path);
 }
 
-/// Append a multi-page filler table plus index to an existing standalone
-/// SQLite file, then zero-fill its final page. Every pre-existing table stays
-/// readable; `PRAGMA integrity_check` raises instead of reporting rows.
+/// Append a filler b-tree to a standalone SQLite file and zero its last page.
+///
+/// The filler is a multi-page table plus index. Every pre-existing table
+/// stays readable; `PRAGMA integrity_check` raises instead of reporting rows.
 #[cfg(test)]
-pub(crate) fn append_filler_btree_and_tear_last_page(path: &Path) {
+pub fn append_filler_btree_and_tear_last_page(path: &Path) {
     use std::io::{Seek, SeekFrom, Write};
     {
         let conn = crate::CanonicalDbConn::open_file(path.display().to_string())
@@ -16630,8 +16622,10 @@ pub(crate) fn append_filler_btree_and_tear_last_page(path: &Path) {
     file.sync_all().expect("sync torn fixture");
 }
 
+/// Clear the coalescing cache. Intended for tests only — production lookup
+/// also gates every hit on matching archive inventory and a healthy live file.
 #[cfg(test)]
-pub(crate) fn reset_recent_reconstruct_cache_for_test() {
+pub fn reset_recent_reconstruct_cache_for_test() {
     recent_reconstruct_cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -31316,7 +31310,11 @@ mod tests {
             let has_metadata = columns
                 .iter()
                 .any(|row| row.get_named::<String>("name").unwrap() == "archive_metadata_json");
-            if failure_stage != "none" {
+            if failure_stage == "none" {
+                assert!(result.unwrap());
+                assert!(has_metadata);
+                drop(canonical);
+            } else {
                 assert!(result.is_err(), "a replay error must not reconstruct");
                 assert!(
                     !has_metadata,
@@ -31329,10 +31327,6 @@ mod tests {
                 canonical.execute_raw("DROP TRIGGER refuse_delta").unwrap();
                 drop(canonical);
                 assert!(reconcile_archive_state_before_init(&primary, &storage_root).unwrap());
-            } else {
-                assert!(result.unwrap());
-                assert!(has_metadata);
-                drop(canonical);
             }
             assert_eq!(count_messages(&primary), 2);
             assert_eq!(primary_identity(&primary), identity);
@@ -34292,7 +34286,7 @@ mod tests {
             .expect("SHM metadata")
             .permissions()
             .mode();
-        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o000))
             .expect("make SHM descriptor-open hostile");
 
         let result = classify_sqlite_family_cleanup(&db_path);

@@ -6859,7 +6859,7 @@ first body
         let refreshed =
             require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || next));
         assert_eq!(refreshed.agents, 2);
-        assert!(refreshed.agents_list.is_empty());
+        assert_eq!(refreshed.agents_list.len(), 0);
     }
 
     #[test]
@@ -6962,9 +6962,9 @@ first body
             require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || now + 1));
         assert_eq!(refreshed.file_reservations, 0);
         assert_eq!(refreshed.projects_list[0].reservation_count, 0);
-        assert!(refreshed.reservation_snapshots.is_empty());
+        assert_eq!(refreshed.reservation_snapshots.len(), 0);
         assert_eq!(refreshed.agents, 2);
-        assert!(refreshed.agents_list.is_empty());
+        assert_eq!(refreshed.agents_list.len(), 0);
         let rows = state
             .conn
             .query_sync("SELECT id FROM file_reservations", &[])

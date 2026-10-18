@@ -103,7 +103,9 @@ mod tests {
         assert_eq!(
             restart_delay(
                 MAX_RESTART_DELAY,
-                MAX_RESTART_DELAY - Duration::from_nanos(1)
+                MAX_RESTART_DELAY
+                    .checked_sub(Duration::from_nanos(1))
+                    .unwrap()
             ),
             MAX_RESTART_DELAY
         );

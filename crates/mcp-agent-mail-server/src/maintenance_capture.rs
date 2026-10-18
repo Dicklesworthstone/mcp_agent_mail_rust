@@ -225,11 +225,17 @@ mod tests {
         assert_eq!(output.stdout.len(), 128 * 4096 + 10);
         assert_eq!(output.stderr.len(), 128 * 4096 + 10);
         assert_eq!(
-            output.stdout.iter().filter(|&&byte| byte == b'X').count(),
+            output
+                .stdout
+                .iter()
+                .fold(0, |count, &byte| count + usize::from(byte == b'X')),
             128
         );
         assert_eq!(
-            output.stderr.iter().filter(|&&byte| byte == b'Y').count(),
+            output
+                .stderr
+                .iter()
+                .fold(0, |count, &byte| count + usize::from(byte == b'Y')),
             128
         );
         assert!(output.stdout.ends_with(b"stdout-end"));
