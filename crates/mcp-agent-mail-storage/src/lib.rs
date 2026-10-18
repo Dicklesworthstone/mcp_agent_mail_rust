@@ -11010,7 +11010,10 @@ pub fn get_recent_commits(
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
-    revwalk.set_sorting(git2::Sort::TIME)?;
+    // The archive is a first-parent append-only history. TIME sorting makes
+    // libgit2 pre-walk the entire repository before yielding the first commit,
+    // defeating the bounded scan on long-lived mailboxes (GH#361).
+    revwalk.set_sorting(git2::Sort::NONE)?;
 
     let mut commits = Vec::new();
 
@@ -11072,7 +11075,7 @@ pub fn get_recent_commits(
 
 /// Default hard ceiling on commits examined by [`get_recent_commits`] when a
 /// path filter is present. Overridable via `AM_RECENT_COMMITS_SCAN_BUDGET`.
-const DEFAULT_RECENT_COMMITS_SCAN_BUDGET: usize = 20_000;
+const DEFAULT_RECENT_COMMITS_SCAN_BUDGET: usize = 1_000;
 
 fn recent_commits_scan_budget() -> usize {
     mcp_agent_mail_core::config::env_value("AM_RECENT_COMMITS_SCAN_BUDGET")
