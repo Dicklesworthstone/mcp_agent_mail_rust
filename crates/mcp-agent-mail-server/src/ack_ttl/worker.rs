@@ -170,6 +170,48 @@ mod tests {
     }
 
     #[test]
+    fn first_escalation_seeds_generation_and_stamps_the_archive() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let (temp, config) = fixture();
+            std::fs::create_dir_all(temp.path().join("mailbox")).unwrap();
+            let control = seed(&config);
+            let cx = Cx::for_testing();
+            let conn = block_on(control.acquire(&cx)).into_result().unwrap();
+            let before = conn
+                .query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
+                .unwrap();
+            assert!(before.is_empty(), "fixture must start without a generation");
+            drop(conn);
+            let selected = selected_pool(&config);
+            let mut pool = None;
+            let mut state = AckScanState::default();
+            let stop = AtomicBool::new(false);
+            assert_eq!(
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || true).unwrap(),
+                (1, 1)
+            );
+            let conn = block_on(control.acquire(&cx)).into_result().unwrap();
+            let generation = conn
+                .query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
+                .unwrap()[0]
+                .get_named::<String>("generation_id")
+                .unwrap();
+            let id = conn
+                .query_sync("SELECT id FROM file_reservations", &[])
+                .unwrap()[0]
+                .get_named::<i64>("id")
+                .unwrap();
+            let filename = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                Some(&generation), id,
+            );
+            let path = config.storage_root.join("projects/ack-worker/file_reservations").join(filename);
+            let artifact: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(artifact["db_generation"], generation);
+            assert_eq!(artifact["id"], id);
+        });
+    }
+
+    #[test]
     fn pool_selection_pins_both_authorities_and_never_runs_migrations() {
         let (_temp, config) = fixture();
         let selected = selected_pool(&config);
