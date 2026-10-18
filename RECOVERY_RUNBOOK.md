@@ -25,9 +25,31 @@ the port) rotates the backup files next to `storage.sqlite3`. It keeps the
 newest `AM_BACKUP_KEEP_COUNT` (default 3, minimum 1) of each kind: `.bak*` and
 `manual-backup-*`, `corrupt-*`, `reconstruct-*`, `archive-reconcile-*`,
 `salvage-*`, and `pre-migrate*` / `pre-python-import*` / `pre-acfs-import*` /
-`pre-reindex*`. By default the older ones are moved to
-`<storage_root>/doctor/reclaimable/rotation-<timestamp>/`. With
-`AM_BACKUP_ROTATION_DELETE=1` they are deleted.
+`pre-reindex*`. Incident evidence is moved to
+`<storage_root>/doctor/reclaimable/rotation-<timestamp>/`. Archive-reconcile
+evidence remains owned by the separate recovery-retention planner.
+
+Periodic dated `.bak.YYYYMMDD_HHMMSS[-NN]` generations have a different policy
+on Unix: excess generations are deleted only when a newer hash-bound snapshot
+passes full integrity verification under exclusive snapshot admission. The
+exact `.bak` publication slot and the verified source are always retained.
+Old `rotation-*` directories are swept with the same checks, one strict periodic
+file at a time; incident files, unknown names, nested directories, symlinks and
+hard-linked aliases are never automatically removed by this sweep.
+
+Unset `AM_BACKUP_ROTATION_DELETE` enables this periodic reclamation. Explicit
+false preserves move-only retention. Explicit true also enables the existing
+incident-deletion policy. Without safe reclamation (including on non-Unix),
+automatic publication refuses at `max(1, AM_BACKUP_KEEP_COUNT) + 3` existing
+backup images, including prior rotation staging. An admitted cycle can add at
+most one image. Thus the periodic producer cannot grow indefinitely even with
+bad metadata, busy recovery readers, or a no-delete policy. Existing over-budget
+evidence is preserved, and explicit operator backups remain outside this bound.
+This is a count bound for periodic images, not a total filesystem byte quota:
+database growth, incident evidence and operator exports have separate ownership.
+When admission warns that its retention budget is exhausted, repair snapshot
+authority or explicitly reclaim retained backups; the guard backs off without
+classifying the mailbox as corrupt or stopping message writes.
 
 A restart after an integrity incident writes new backups, which can rotate the
 last pre-incident backup out (GH#278). Before restarting a server that reported

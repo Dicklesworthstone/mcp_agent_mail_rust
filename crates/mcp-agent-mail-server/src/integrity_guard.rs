@@ -711,6 +711,16 @@ fn run_automatic_backup(
 ) -> bool {
     let primary = Path::new(pool.sqlite_path());
     run_admitted_backup_with(primary, schedule, Instant::now, |kind| {
+        let keep = crate::backup_rotation::resolved_keep_per_kind();
+        // Reclaim historical staging before admission, including after an
+        // operator repairs metadata. Failure must not mint another generation.
+        if crate::backup_rotation::admit_periodic_publication(storage_root, primary, keep).is_err()
+        {
+            crate::backup_rotation::rotate_storage_backups(storage_root, primary, keep)
+                .map_err(|error| error.to_string())?;
+        }
+        crate::backup_rotation::admit_periodic_publication(storage_root, primary, keep)
+            .map_err(|error| error.to_string())?;
         let result = match kind {
             BackupKind::Proactive => pool
                 .create_proactive_backup(Duration::from_secs(BACKUP_MAX_AGE_SECS))
@@ -1711,7 +1721,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn automatic_admission_allows_real_proactive_and_verified_publication() {
-        for verified in [false, true] {
+        for (verified, old_count) in [(false, 4), (true, 4), (false, 50), (true, 50)] {
             let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
             let database_dir = root.join("database");
             let storage_root = root.join("archive");
@@ -1732,7 +1742,7 @@ mod tests {
             })
             .expect("create real backup pool");
             let before = std::fs::read(&primary).unwrap();
-            let old_backups: Vec<_> = (0..50)
+            let old_backups: Vec<_> = (0..old_count)
                 .map(|index| {
                     let path =
                         database_dir.join(format!("mail.sqlite3.bak.20000101_0000{index:02}"));
@@ -1755,6 +1765,27 @@ mod tests {
             );
             assert!(published);
             let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+            if old_count == 50 {
+                assert!(
+                    !backup.exists(),
+                    "over-budget move-only retention must refuse the real producer"
+                );
+                assert_eq!(std::fs::read(&primary).unwrap(), before);
+                assert_eq!(schedule.consecutive_failures(), 1);
+                let resident = crate::backup_rotation::inspect_storage_backups(&primary)
+                    .unwrap()
+                    .artifact_count;
+                let staged: usize = std::fs::read_dir(storage_root.join("doctor/reclaimable"))
+                    .unwrap()
+                    .map(|entry| std::fs::read_dir(entry.unwrap().path()).unwrap().count())
+                    .sum();
+                assert_eq!(
+                    resident + staged,
+                    50,
+                    "admission must preserve every historical image"
+                );
+                continue;
+            }
             assert!(
                 backup.is_file(),
                 "the real producer must publish, not merely return best-effort success"
@@ -1796,7 +1827,7 @@ mod tests {
                 .collect();
             assert_eq!(quarantines.len(), 1);
             let quarantine = &quarantines[0];
-            assert_eq!(std::fs::read_dir(quarantine).unwrap().count(), 48);
+            assert_eq!(std::fs::read_dir(quarantine).unwrap().count(), 2);
             for original in old_backups {
                 let retained = if original.is_file() {
                     original

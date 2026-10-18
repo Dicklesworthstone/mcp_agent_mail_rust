@@ -7,10 +7,12 @@
 //! files totaling ~1.3 GB in a single storage_root.
 //!
 //! This module keeps the N most recent of each *kind* and quarantines the
-//! rest by moving them into `doctor/reclaimable/rotation-<ts>[-<n>]/` inside the
-//! storage root, where an operator (or `am doctor`) can inspect and reclaim
-//! them later. Nothing is hard-deleted unless the operator explicitly opts
-//! back in via `AM_BACKUP_ROTATION_DELETE`. Kinds are classified by filename
+//! rest by moving incident evidence into `doctor/reclaimable/rotation-<ts>[-<n>]/`.
+//! On Unix, dated periodic `.bak` generations are instead deleted by default
+//! only after a newer fully verified snapshot authorizes reclamation. Previously
+//! staged periodic generations are reclaimed by the same safety boundary.
+//! An explicit false `AM_BACKUP_ROTATION_DELETE` preserves move-only retention;
+//! the automatic producer then stops at its publication budget. Kinds are classified by filename
 //! suffix pattern so we never touch the live DB (`storage.sqlite3`), the
 //! Codex sidecar DB, or unrelated files.
 //!
@@ -49,8 +51,9 @@ pub use mcp_agent_mail_db::recovery_retention::{
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
 ///
 /// "Staged" means moved into a `doctor/reclaimable/rotation-<ts>[-<n>]/`
-/// quarantine directory (the default); "deleted" means hard-removed, which
-/// only happens behind the explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
+/// quarantine directory; "deleted" means hard-removed. Superseded periodic
+/// generations can be deleted by default under verified snapshot admission;
+/// other kinds require explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
 /// Staged bytes are *not* reclaimed disk. On Unix, staging also requires the
 /// source-file and parent-directory syncs and identity checks to complete.
 /// A rename followed by failed sync or validation is separately unconfirmed:
@@ -139,9 +142,9 @@ pub fn resolved_keep_per_kind() -> usize {
 
 /// Whether the operator opted back into legacy hard-delete rotation.
 ///
-/// Read from `AM_BACKUP_ROTATION_DELETE`. Default (unset or falsy) stages
-/// evicted backups under `doctor/reclaimable/` instead of deleting them, so
-/// rotation never destroys data on its own.
+/// Read from `AM_BACKUP_ROTATION_DELETE`. This controls legacy incident
+/// deletion. Periodic generations use a separate verified reclamation lane:
+/// unset enables it, explicit false disables it.
 ///
 /// Uses the same truthy vocabulary as `mcp_agent_mail_core`'s bool parsing.
 #[must_use]
@@ -152,6 +155,135 @@ pub fn rotation_delete_opted_in() -> bool {
             "1" | "true" | "t" | "yes" | "y"
         )
     })
+}
+
+/// Periodic snapshots reclaim superseded bytes by default. An explicit false
+/// retains the operator's move-only policy; publication admission then bounds
+/// further growth instead of silently ignoring that policy.
+fn periodic_reclamation_enabled() -> bool {
+    mcp_agent_mail_core::config::process_env_value("AM_BACKUP_ROTATION_DELETE")
+        .is_none_or(|_| rotation_delete_opted_in())
+}
+
+/// Stop the automatic producer when retention cannot make progress. The
+/// budget is count-based (at most keep + 3 existing periodic images before
+/// refusing another publication), and includes old move-only staging. It
+/// therefore scales with the mailbox instead of imposing a fixed DB size.
+/// Explicit operator exports are unaffected. Never remove evidence merely
+/// because verification failed or the operator disabled deletion.
+pub(crate) fn admit_periodic_publication(
+    storage_root: &Path,
+    primary: &Path,
+    keep: usize,
+) -> std::io::Result<()> {
+    let mut count = 0_usize;
+    // Admission is fail-closed, unlike the best-effort health inventory:
+    // never discard an unreadable directory entry and call it spare capacity.
+    let database_parent = primary
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match fs::read_dir(database_parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if primary
+                    .file_name()
+                    .and_then(|db| classify_backup_file(db, &entry.file_name()))
+                    == Some(BackupKind::ManualBackup)
+                {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = storage_root.join("doctor/reclaimable");
+    match fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_name().to_string_lossy().starts_with("rotation-")
+                    || !fs::symlink_metadata(entry.path())?.file_type().is_dir()
+                {
+                    continue;
+                }
+                for file in fs::read_dir(entry.path())? {
+                    let file = file?;
+                    if primary
+                        .file_name()
+                        .and_then(|db| classify_backup_file(db, &file.file_name()))
+                        == Some(BackupKind::ManualBackup)
+                    {
+                        count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // Window + exact publication slot + an older verified pin + one spare
+    // publication. Do not deadlock a valid refresh on its own retained pin.
+    if count >= keep.max(MIN_KEEP_PER_KIND).saturating_add(3) {
+        return Err(std::io::Error::other(format!(
+            "periodic backup retention budget exhausted ({count} images); restore verified snapshot authority or reclaim retained backups before publishing more"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reclaim_rotated_periodic_backups(
+    storage_root: &Path,
+    primary: &Path,
+    guard: &mcp_agent_mail_db::snapshot::SnapshotRetentionGuard,
+    report: &mut RotateReport,
+) -> std::io::Result<()> {
+    let parent = storage_root.join("doctor/reclaimable");
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("rotation-")
+            || !fs::symlink_metadata(entry.path())?.file_type().is_dir()
+        {
+            continue;
+        }
+        // Never recursively delete a quarantine: it may also contain incident
+        // evidence, unknown files, or another database's recovery material.
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            let Some(candidate) = primary.file_name().and_then(|db| {
+                mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(
+                    db,
+                    &file.file_name(),
+                )
+            }) else {
+                continue;
+            };
+            if candidate.kind()
+                != mcp_agent_mail_core::disk::SqliteRecoveryCandidateKind::TimestampedBak
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(file.path())?;
+            match guard.delete_superseded_generation(primary, &file.path(), &metadata) {
+                Ok(()) => {
+                    report.deleted += 1;
+                    report.bytes_deleted = report.bytes_deleted.saturating_add(metadata.len());
+                }
+                Err(error) => report
+                    .failures
+                    .push(RotationFailure::from_error(&file.path(), &error)),
+            }
+        }
+    }
+    Ok(())
 }
 
 // Preserve the existing non-Unix move contract. The stronger descriptor and
@@ -254,12 +386,13 @@ fn stage_backup_noreplace(
     }
 }
 
-/// Rotate backup files beside `database_path`, staging evictions for reclaim.
+/// Rotate backup files beside `database_path` and reclaim superseded periodic images.
 ///
 /// Keeps `keep_per_kind` newest of each kind and stages the rest into
 /// `<storage_root>/doctor/reclaimable/rotation-<UTC ts>[-<n>]/` for operator
-/// reclaim. With the explicit `AM_BACKUP_ROTATION_DELETE` opt-in the evicted
-/// files are hard-deleted instead (the legacy behavior).
+/// reclaim. Unix periodic generations instead use verified deletion unless
+/// explicitly disabled; historical rotation staging uses that same boundary.
+/// Other kinds require `AM_BACKUP_ROTATION_DELETE` opt-in for deletion.
 /// An external database parent is inventoried in place; quarantine remains
 /// under the archive root. Cross-device staging reports a refusal without a
 /// copy-and-delete fallback.
@@ -368,9 +501,6 @@ where
             .push((entry.path(), mtime, meta));
     }
 
-    if by_kind.is_empty() {
-        return Ok(report);
-    }
     // Inventory is only a hint: every move checks its retained file witness.
     // Acquire before choosing a pin, then retain admission for the whole pass.
     // Do not create control state for a missing/empty backup inventory.
@@ -391,6 +521,16 @@ where
     let pinned_verified_snapshot = snapshot_authority_occupied
         .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(snapshot_primary))
         .flatten();
+
+    #[cfg(unix)]
+    if periodic_reclamation_enabled() && pinned_verified_snapshot.is_some() {
+        reclaim_rotated_periodic_backups(
+            &storage_root,
+            &database_path,
+            &snapshot_guard,
+            &mut report,
+        )?;
+    }
 
     // Quarantine directory for this rotation pass. Created lazily on the
     // first staged file so a no-op rotation leaves no empty directories.
@@ -455,6 +595,9 @@ where
             .iter()
             .enumerate()
             .filter(|(index, (path, _, _))| {
+                if path == &mcp_agent_mail_db::snapshot::snapshot_bak_path(snapshot_primary) {
+                    return false;
+                }
                 if *index < keep {
                     return false;
                 }
@@ -479,6 +622,30 @@ where
                 let failure = RotationFailure::from_error(path, &error);
                 summary.record_failure(&failure, size);
                 report.failures.push(failure);
+                continue;
+            }
+            #[cfg(unix)]
+            if kind == BackupKind::ManualBackup && periodic_reclamation_enabled() {
+                match snapshot_guard.delete_superseded_generation(snapshot_primary, path, metadata)
+                {
+                    Ok(()) => {
+                        summary.deleted += 1;
+                        summary.bytes_deleted = summary.bytes_deleted.saturating_add(size);
+                    }
+                    Err(error) => {
+                        summary.kept += 1;
+                        report
+                            .failures
+                            .push(RotationFailure::from_error(path, &error));
+                    }
+                }
+                continue;
+            }
+            #[cfg(not(unix))]
+            if kind == BackupKind::ManualBackup && periodic_reclamation_enabled() {
+                // No descriptor-bound deletion contract on this platform.
+                // Publication admission still prevents indefinite growth.
+                summary.kept += 1;
                 continue;
             }
             if delete_opted_in {
@@ -608,6 +775,172 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn verified_mailbox(root: &Path) -> PathBuf {
+        let primary = root.join("storage.sqlite3");
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+            .unwrap();
+        drop(conn);
+        fs::copy(
+            &primary,
+            mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
+        )
+        .unwrap();
+        mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 2_000_000_000_000_000)
+            .unwrap();
+        primary
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_cycles_reclaim_disk_and_historical_staging() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let staged = tmp.path().join("doctor/reclaimable/rotation-legacy");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(
+            staged.join("storage.sqlite3.bak.20000101_000000"),
+            vec![7; 1_048_576],
+        )
+        .unwrap();
+        fs::write(
+            staged.join("storage.sqlite3.corrupt-evidence"),
+            b"incident evidence",
+        )
+        .unwrap();
+        let live = fs::read(&primary).unwrap();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "true")],
+            || {
+                // 30 days of hourly generations without sleeps or a mocked FS.
+                for cycle in 0..720 {
+                    admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
+                    let day = cycle / 24 + 1;
+                    let hour = cycle % 24;
+                    let generation = tmp
+                        .path()
+                        .join(format!("storage.sqlite3.bak.200001{day:02}_{hour:02}0000"));
+                    fs::write(&generation, vec![7; 16_384]).unwrap();
+                    let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                    assert!(report.failures.is_empty(), "{:?}", report.failures);
+                    let inventory = inspect_storage_backups(&primary).unwrap();
+                    assert!(inventory.artifact_count <= 4); // window plus exact pin
+                    let blocks: u64 = inventory
+                        .artifacts
+                        .iter()
+                        .map(|artifact| fs::metadata(&artifact.path).unwrap().blocks())
+                        .sum();
+                    assert!(
+                        blocks
+                            <= fs::metadata(mcp_agent_mail_db::snapshot::snapshot_bak_path(
+                                &primary
+                            ))
+                            .unwrap()
+                            .blocks()
+                                + 3 * 32
+                    );
+                }
+            },
+        );
+        assert!(!staged.join("storage.sqlite3.bak.20000101_000000").exists());
+        assert_eq!(
+            fs::read(staged.join("storage.sqlite3.corrupt-evidence")).unwrap(),
+            b"incident evidence"
+        );
+        assert_eq!(fs::read(primary).unwrap(), live);
+    }
+
+    #[test]
+    fn publication_budget_counts_previously_staged_material() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("storage.sqlite3");
+        let staged = tmp.path().join("doctor/reclaimable/rotation-old");
+        fs::create_dir_all(&staged).unwrap();
+        for index in 0..6 {
+            fs::write(
+                staged.join(format!("storage.sqlite3.bak.20000101_00000{index}")),
+                b"retained",
+            )
+            .unwrap();
+        }
+        assert!(admit_periodic_publication(tmp.path(), &primary, 3).is_err());
+        assert_eq!(fs::read_dir(staged).unwrap().count(), 6);
+    }
+
+    #[test]
+    fn no_delete_cycles_stop_publication_without_destroying_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let primary = tmp.path().join("storage.sqlite3");
+        fs::write(
+            mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
+            b"current",
+        )
+        .unwrap();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || {
+                let mut published = 0;
+                for cycle in 0..720 {
+                    if admit_periodic_publication(tmp.path(), &primary, 3).is_err() {
+                        assert_eq!(published, 5);
+                        return;
+                    }
+                    fs::write(
+                        tmp.path()
+                            .join(format!("storage.sqlite3.bak.20000101_0000{cycle:02}")),
+                        b"retained",
+                    )
+                    .unwrap();
+                    let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+                    assert_eq!(report.deleted, 0);
+                    assert!(report.failures.is_empty());
+                    published += 1;
+                }
+                panic!("move-only rotation must not permit endless publication");
+            },
+        );
+        assert_eq!(
+            fs::read(mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary)).unwrap(),
+            b"current"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_reclamation_refuses_busy_authority_and_unverified_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let old = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        fs::write(&old, b"old recovery evidence").unwrap();
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| rotate_storage_backups(tmp.path(), &primary, 1).is_err())
+                    .join()
+                    .unwrap()
+            );
+        });
+        // External corruption of the pinned bytes must invalidate reclamation,
+        // even when the metadata sidecar and admission lock have not changed.
+        fs::write(
+            mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
+            b"corrupt",
+        )
+        .unwrap();
+        assert!(
+            guard
+                .delete_superseded_generation(&primary, &old, &fs::metadata(&old).unwrap())
+                .is_err()
+        );
+        assert_eq!(fs::read(old).unwrap(), b"old recovery evidence");
+    }
     use std::io::Write;
     use std::thread::sleep;
     use std::time::Duration;
