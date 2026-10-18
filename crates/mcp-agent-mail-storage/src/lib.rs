@@ -6652,6 +6652,11 @@ fn coalescer_commit_with_retry(
     // Try lock-free commit first (avoids index.lock entirely)
     {
         let repo = Repository::open(repo_root)?;
+        // Blob filter attribute lookup otherwise loads and parses the entire
+        // on-disk index on every commit, scaling with all archive history.
+        // The lock-free tree builder does not use this in-memory index.
+        let mut empty_index = git2::Index::new_ext(repo.object_format())?;
+        repo.set_index(&mut empty_index)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
         let commit_start = std::time::Instant::now();
         match commit_paths_lockfree(&repo, config, message, &refs) {
@@ -7638,6 +7643,11 @@ pub fn commit_paths_with_retry(
     // Try lock-free commit first (avoids index.lock entirely)
     {
         let repo = Repository::open(repo_root)?;
+        // Blob filter attribute lookup otherwise loads and parses the entire
+        // on-disk index on every commit, scaling with all archive history.
+        // The lock-free tree builder does not use this in-memory index.
+        let mut empty_index = git2::Index::new_ext(repo.object_format())?;
+        repo.set_index(&mut empty_index)?;
         let commit_start = std::time::Instant::now();
         match commit_paths_lockfree(&repo, config, message, rel_paths) {
             Ok(()) => {
