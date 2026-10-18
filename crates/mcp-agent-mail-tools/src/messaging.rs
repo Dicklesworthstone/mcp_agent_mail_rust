@@ -300,6 +300,35 @@ fn agent_deregistered_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
     )
 }
 
+/// The #122 write-back latch refusal shared by `send_message` and
+/// `reply_message`. The server discharges the latch itself once the archive
+/// reconciler re-archives every failed message (br-6r7k2), so the text must
+/// not send operators to `am doctor repair` alone: that refuses a live owner.
+fn durability_degraded_error() -> McpError {
+    let stats = mcp_agent_mail_storage::wbq_stats();
+    legacy_tool_error(
+        "DURABILITY_DEGRADED",
+        format!(
+            "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
+             last failure at us={}); refusing new messages until the failed write-backs are \
+             verified in the archive. The server re-archives failed messages and lifts this \
+             refusal by itself once disk pressure is below critical (it retries about once a \
+             minute; /health/durability shows the state). If it persists, a supervised restart \
+             reruns the archive reconcile, or run `am doctor repair` after draining the server \
+             (repair refuses a live owner).",
+            stats.unrecoverable_errors, stats.last_unrecoverable_error_us
+        ),
+        true,
+        json!({
+            "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+            "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+            "wbq_errors_total": stats.errors,
+            "wbq_enqueued_total": stats.enqueued,
+            "wbq_drained_total": stats.drained,
+        }),
+    )
+}
+
 async fn ensure_agent_accepts_new_messages(
     ctx: &McpContext,
     pool: &mcp_agent_mail_db::DbPool,
@@ -3198,25 +3227,7 @@ effective_free_bytes={free}"
     // writes in that state would issue more such IDs and produce silent
     // data loss. Refuse loud and direct the operator at the recovery path.
     if mcp_agent_mail_storage::durability_degraded() {
-        let stats = mcp_agent_mail_storage::wbq_stats();
-        return Err(legacy_tool_error(
-            "DURABILITY_DEGRADED",
-            format!(
-                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
-                 last failure at us={}); refusing to accept new messages until operator clears the \
-                 durability flag via `am doctor repair` (which will also recover any in-memory \
-                 rows that never persisted)",
-                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
-            ),
-            true,
-            json!({
-                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
-                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
-                "wbq_errors_total": stats.errors,
-                "wbq_enqueued_total": stats.enqueued,
-                "wbq_drained_total": stats.drained,
-            }),
-        ));
+        return Err(durability_degraded_error());
     }
 
     let pool = get_db_pool()?;
@@ -4156,25 +4167,7 @@ effective_free_bytes={free}"
     // writes in that state would issue more such IDs and produce silent
     // data loss. Refuse loud and direct the operator at the recovery path.
     if mcp_agent_mail_storage::durability_degraded() {
-        let stats = mcp_agent_mail_storage::wbq_stats();
-        return Err(legacy_tool_error(
-            "DURABILITY_DEGRADED",
-            format!(
-                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
-                 last failure at us={}); refusing to accept new messages until operator clears the \
-                 durability flag via `am doctor repair` (which will also recover any in-memory \
-                 rows that never persisted)",
-                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
-            ),
-            true,
-            json!({
-                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
-                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
-                "wbq_errors_total": stats.errors,
-                "wbq_enqueued_total": stats.enqueued,
-                "wbq_drained_total": stats.drained,
-            }),
-        ));
+        return Err(durability_degraded_error());
     }
 
     let pool = get_db_pool()?;

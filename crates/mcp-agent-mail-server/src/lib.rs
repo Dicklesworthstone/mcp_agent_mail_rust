@@ -12035,7 +12035,9 @@ impl HttpState {
                 // dead under contention.
                 body["durability_state"] = serde_json::json!("not_probed");
                 // The write-back latch is one atomic load, so it is cheap enough here.
-                // Still 200: a restart would not recover the lost write-back.
+                // Still 200: the listener is alive and reads still work, and the
+                // archive reconciler lifts the latch once the failed write-backs
+                // are re-archived, so a supervisor restart loop would not help.
                 if mcp_agent_mail_storage::durability_degraded() {
                     body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
                 }
@@ -16793,9 +16795,10 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
 }
 
 /// The mailbox verdict cannot see the write-back latch (#122), which refuses
-/// every send with `DURABILITY_DEGRADED` until `am doctor repair`. Without this,
-/// `/health/durability` said "healthy", `allows_writes: true` on a mailbox that
-/// had refused all sends for hours (mac studio, 2026-10-14 after ENOSPC).
+/// every send with `DURABILITY_DEGRADED` until the failed write-backs are
+/// verified in the archive. Without this, `/health/durability` said "healthy",
+/// `allows_writes: true` on a mailbox that had refused all sends for hours (mac
+/// studio, 2026-10-14 after ENOSPC).
 fn apply_wbq_write_gate(
     body: &mut serde_json::Value,
     latched: Option<mcp_agent_mail_storage::WbqStats>,
@@ -16810,7 +16813,9 @@ fn apply_wbq_write_gate(
         "error_code": "DURABILITY_DEGRADED",
         "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
         "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
-        "recovery": "am doctor repair",
+        "recovery": "automatic once the archive reconciler re-archives the failed messages and \
+                     disk pressure is below critical; otherwise a supervised restart, or \
+                     `am doctor repair` after draining the server",
     });
 }
 
