@@ -27,6 +27,8 @@
 //!   trusted-local behavior, unless its last binding there was evicted by the
 //!   session's capacity limit. Automatic eviction withdraws proof, never the
 //!   project's identity restriction.
+//!   Rebinding a reused numeric id in a different project follows the same
+//!   rule when it displaces the old project's last proof.
 //! - **Contact actors.** Requests act as the requester; approvals and blocks
 //!   act as the recipient. An auto-accepting handshake preflights both actors
 //!   before creating or refreshing a link. A bound session must explicitly
@@ -95,7 +97,7 @@ impl SessionBinding {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct SessionIdentityState {
     held: Vec<SessionBinding>,
-    // Only projects whose final proof was automatically evicted need a marker.
+    // A final proof lost to automatic eviction or displacement needs a marker.
     // Explicit unbind keeps its existing semantics, but cannot erase a marker.
     evicted_projects: Vec<i64>,
     eviction_history_saturated: bool,
@@ -193,17 +195,45 @@ pub fn session_bindings(ctx: &McpContext) -> Vec<SessionBinding> {
 /// Bind `agent_id` to this session. A no-op when the feature is off or the
 /// call has no session state.
 pub fn bind(ctx: &McpContext, project_id: i64, agent_id: i64, agent_name: &str) {
-    if !enabled() || !ctx.has_session_state() || agent_id <= 0 {
+    if !enabled()
+        || !ctx.has_session_state()
+        || agent_id <= 0
+        || project_id <= 0
+        || agent_name.trim().is_empty()
+    {
         return;
     }
     let stored = update_bindings(ctx, |state| {
-        state.held.retain(|binding| binding.agent_id != agent_id);
+        // Database recovery can give an existing numeric id to a newly
+        // established identity in another project. Replacing that slot is not
+        // an explicit unbind of the former project: retain its restriction if
+        // this removes its last proof. Do this in the same atomic state update
+        // as the new binding, with the existing bounded eviction history.
+        let mut displaced_projects = Vec::new();
+        state.held.retain(|binding| {
+            if binding.agent_id != agent_id {
+                return true;
+            }
+            if binding.project_id != project_id {
+                displaced_projects.push(binding.project_id);
+            }
+            false
+        });
         state.held.push(SessionBinding {
             project_id,
             agent_id,
             agent_name: agent_name.to_string(),
             bound_at_us: mcp_agent_mail_db::now_micros(),
         });
+        for previous_project in displaced_projects {
+            if !state
+                .held
+                .iter()
+                .any(|binding| binding.project_id == previous_project)
+            {
+                state.restrict_evicted_project(previous_project);
+            }
+        }
         state.enforce_capacity();
         true
     });
@@ -329,7 +359,7 @@ fn authorize_actor_from_state(
         "bound_to_other_agent"
     };
     let explanation = if names.is_empty() {
-        "This MCP session lost identity proof through capacity eviction; its project restrictions remain"
+        "This MCP session lost identity proof through automatic binding removal; its project restrictions remain"
             .to_string()
     } else {
         format!(
@@ -561,6 +591,120 @@ mod tests {
                 "cancellation must not erase another request's proof"
             );
             assert!(!holds(&live, None));
+        });
+    }
+
+    #[test]
+    fn cross_project_id_displacement_preserves_the_former_project_restriction() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            bind(&ctx, 10, 1, "BlueLake");
+            bind(&ctx, 20, 1, "RedStone");
+            let state = identity_state(&ctx);
+            assert_eq!(state.held.len(), 1);
+            assert_eq!((state.held[0].project_id, state.held[0].agent_id), (20, 1));
+            assert_eq!(state.evicted_projects, [10]);
+            let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            for old_actor in [agent(1, 10, "BlueLake"), agent(2, 10, "GreenCastle")] {
+                let error = authorize_actor(&ctx, &old_actor, false, "read inbox")
+                    .expect_err("automatic displacement is not a trusted-local reset");
+                assert_eq!(
+                    crate::tool_error_code(&error),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                assert!(snapshot.authorize(&ctx, &old_actor, "ack").is_err());
+                assert!(authorize_actor(&ctx, &old_actor, true, "ack").is_ok());
+            }
+            assert!(!snapshot.permits_unresolved_actor(Some(10)));
+            assert!(authorize_actor(&ctx, &agent(1, 20, "RedStone"), false, "ack").is_ok());
+            assert!(authorize_actor(&ctx, &agent(3, 30, "GreenCastle"), false, "ack").is_ok());
+            unbind(&ctx, 1);
+            assert!(session_bindings(&ctx).is_empty());
+            assert!(authorize_actor(&ctx, &agent(2, 10, "GreenCastle"), false, "ack").is_err());
+            assert!(authorize_actor(&ctx, &agent(2, 20, "GreenCastle"), false, "ack").is_ok());
+        });
+    }
+
+    #[test]
+    fn refresh_and_displacement_with_another_old_project_proof_do_not_add_history() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            bind(&ctx, 10, 1, "BlueLake");
+            bind(&ctx, 10, 1, "BlueLake");
+            assert_eq!(session_bindings(&ctx).len(), 1);
+            assert!(identity_state(&ctx).evicted_projects.is_empty());
+            bind(&ctx, 10, 2, "GreenCastle");
+            bind(&ctx, 20, 1, "RedStone");
+            assert!(identity_state(&ctx).evicted_projects.is_empty());
+            assert!(authorize_actor(&ctx, &agent(1, 10, "BlueLake"), false, "ack").is_err());
+            assert!(authorize_actor(&ctx, &agent(2, 10, "GreenCastle"), false, "ack").is_ok());
+            // The remaining proof is removed explicitly, not by displacement;
+            // this preserves the documented explicit-unbind fallback policy.
+            unbind(&ctx, 2);
+            assert!(authorize_actor(&ctx, &agent(3, 10, "BlueLake"), false, "ack").is_ok());
+        });
+    }
+
+    #[test]
+    fn repeated_id_displacements_use_the_existing_bounded_restriction_history() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            let count = i64::try_from(MAX_EVICTED_PROJECTS + 2).unwrap();
+            for project in 1..=count {
+                bind(&ctx, project, 1, "BlueLake");
+                let state = identity_state(&ctx);
+                assert_eq!(state.held.len(), 1);
+                assert!(state.evicted_projects.len() <= MAX_EVICTED_PROJECTS);
+                if project == count - 1 {
+                    assert_eq!(state.evicted_projects.len(), MAX_EVICTED_PROJECTS);
+                    assert!(!state.eviction_history_saturated);
+                }
+            }
+            assert!(identity_state(&ctx).eviction_history_saturated);
+            assert!(identity_state(&ctx).evicted_projects.is_empty());
+            assert!(authorize_actor(&ctx, &agent(1, count, "BlueLake"), false, "ack").is_ok());
+            for project in [1, count - 1, 99_999] {
+                assert!(
+                    authorize_actor(&ctx, &agent(2, project, "RedStone"), false, "ack").is_err()
+                );
+                assert!(authorize_actor(&ctx, &agent(2, project, "RedStone"), true, "ack").is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn malformed_binding_cannot_displace_valid_proof() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            bind(&ctx, 10, 1, "BlueLake");
+            let before = identity_state(&ctx);
+            for (project, id, name) in [
+                (0, 1, "RedStone"),
+                (-1, 1, "RedStone"),
+                (20, 0, "RedStone"),
+                (20, 1, ""),
+                (20, 1, " \t"),
+            ] {
+                bind(&ctx, project, id, name);
+                assert_eq!(identity_state(&ctx), before);
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_displacement_and_unbind_cannot_erase_the_old_restriction() {
+        with_feature(true, || {
+            let state = fastmcp_core::SessionState::new();
+            let ctx = McpContext::with_state(asupersync::Cx::for_testing(), 3, state.clone());
+            bind(&ctx, 10, 1, "BlueLake");
+            interleave_updates(
+                state,
+                |ctx| bind(ctx, 20, 1, "RedStone"),
+                |ctx| unbind(ctx, 1),
+            );
+            assert!(session_bindings(&ctx).is_empty());
+            assert_eq!(identity_state(&ctx).evicted_projects, [10]);
+            assert!(authorize_actor(&ctx, &agent(2, 10, "GreenCastle"), false, "ack").is_err());
         });
     }
 
