@@ -877,10 +877,16 @@ mod tests {
                 assert_eq!(count(conn, "SELECT COUNT(*) FROM messages"), 2);
                 assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 2);
                 assert_eq!(
-                    count(conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                    count(
+                        conn,
+                        "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                    ),
                     2
                 );
-                assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+                assert_eq!(
+                    count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                    0
+                );
                 assert_eq!(
                     count(conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
                     1
@@ -912,7 +918,10 @@ mod tests {
             );
             assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 5);
             assert_eq!(
-                count(conn, "SELECT ack_ts FROM message_recipients WHERE message_id = 10"),
+                count(
+                    conn,
+                    "SELECT ack_ts FROM message_recipients WHERE message_id = 10"
+                ),
                 42
             );
         });
@@ -943,7 +952,10 @@ mod tests {
                 vec![(1, 1), (1, 2), (1, 5), (2, 5)]
             );
             assert_eq!(
-                count(conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                count(
+                    conn,
+                    "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                ),
                 6
             );
         });
@@ -962,7 +974,10 @@ mod tests {
             assert!(!observed.has_more);
             assert!(observed.continuation_after(2).unwrap().is_none());
             assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 940);
-            assert_eq!(count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
         });
     }
 
@@ -1000,8 +1015,10 @@ mod tests {
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             conn.execute_raw("UPDATE agents SET retired_at = 42 WHERE id = 102")
                 .unwrap();
-            conn.execute_raw("INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 102, 'to')")
-                .unwrap();
+            conn.execute_raw(
+                "INSERT INTO message_recipients(message_id, agent_id, kind) VALUES(901, 102, 'to')",
+            )
+            .unwrap();
             drop(conn);
             let observed = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
                 .into_result()
@@ -1010,8 +1027,10 @@ mod tests {
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             conn.execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 102")
                 .unwrap();
-            conn.execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(103, 42)")
-                .unwrap();
+            conn.execute_raw(
+                "INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(103, 42)",
+            )
+            .unwrap();
             drop(conn);
             let request = AckEscalationRequest {
                 observed: &observed.rows[0],
@@ -1050,10 +1069,16 @@ mod tests {
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
             assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 102);
             assert_eq!(
-                count(&conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                count(
+                    &conn,
+                    "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                ),
                 1
             );
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
             assert_eq!(
                 count(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
                 1

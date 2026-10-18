@@ -1369,9 +1369,10 @@ fn run_maintenance_once(git_dir: &Path) -> MaintenanceReport {
                 disk_bytes_after: measure_objects_disk_usage(git_dir),
                 lock_reaped: lock_preflight.reaped,
                 lock_evidence: lock_evidence.clone().or(lock_preflight.evidence),
-                error: Some(lock_evidence.map_or(detail.clone(), |evidence| {
-                    format!("{detail}; {evidence}")
-                })),
+                error: Some(
+                    lock_evidence
+                        .map_or(detail.clone(), |evidence| format!("{detail}; {evidence}")),
+                ),
                 notes,
                 ..Default::default()
             };

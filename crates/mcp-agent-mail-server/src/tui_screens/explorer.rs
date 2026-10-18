@@ -1182,12 +1182,7 @@ impl MailExplorerScreen {
             AckFilter::All => {}
         }
         let candidates = message_ids.iter().copied().collect();
-        let source = deliveries::source(
-            conn,
-            Some(&candidates),
-            recipient_agent_ids,
-            &mut params,
-        )?;
+        let source = deliveries::source(conn, Some(&candidates), recipient_agent_ids, &mut params)?;
 
         let where_clause = format!(" WHERE {}", conditions.join(" AND "));
         let sql = format!(

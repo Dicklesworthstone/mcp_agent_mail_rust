@@ -424,9 +424,11 @@ fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareEr
         });
     }
     for row in &rows {
-        let name = row.get_named::<String>("name").map_err(|e| ShareError::Sqlite {
-            message: format!("decode scope column in {table}: {e}"),
-        })?;
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode scope column in {table}: {e}"),
+            })?;
         if name.eq_ignore_ascii_case(column) {
             return Ok(true);
         }
@@ -568,29 +570,35 @@ fn append_scope_project_recipient(
     let Some(row) = rows.first() else {
         return Ok(());
     };
-    let delivery_project = row
-        .get_named::<i64>("delivery_project_id")
+    let delivery_project =
+        row.get_named::<i64>("delivery_project_id")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode shared delivery project for message {message_id}: {e}"),
+            })?;
+    let message_project =
+        row.get_named::<i64>("message_project_id")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode shared message project for message {message_id}: {e}"),
+            })?;
+    let slug = row
+        .get_named::<String>("slug")
         .map_err(|e| ShareError::Sqlite {
-            message: format!("decode shared delivery project for message {message_id}: {e}"),
+            message: format!("decode shared project slug for message {message_id}: {e}"),
         })?;
-    let message_project = row
-        .get_named::<i64>("message_project_id")
+    let kind = row
+        .get_named::<String>("kind")
         .map_err(|e| ShareError::Sqlite {
-            message: format!("decode shared message project for message {message_id}: {e}"),
+            message: format!("decode shared delivery kind for message {message_id}: {e}"),
         })?;
-    let slug = row.get_named::<String>("slug").map_err(|e| ShareError::Sqlite {
-        message: format!("decode shared project slug for message {message_id}: {e}"),
-    })?;
-    let kind = row.get_named::<String>("kind").map_err(|e| ShareError::Sqlite {
-        message: format!("decode shared delivery kind for message {message_id}: {e}"),
-    })?;
     let address = project_mailbox_address(&slug);
     if delivery_project != message_project
         || slug.is_empty()
         || parse_project_mailbox_address(&address) != Some(slug.as_str())
     {
         return Err(ShareError::Validation {
-            message: format!("invalid shared delivery identity for message {message_id}; scope refused"),
+            message: format!(
+                "invalid shared delivery identity for message {message_id}; scope refused"
+            ),
         });
     }
     match kind.as_str() {
@@ -598,7 +606,9 @@ fn append_scope_project_recipient(
         "cc" => cc.push(address),
         _ => {
             return Err(ShareError::Validation {
-                message: format!("invalid shared delivery kind for message {message_id}; scope refused"),
+                message: format!(
+                    "invalid shared delivery kind for message {message_id}; scope refused"
+                ),
             });
         }
     }
@@ -953,9 +963,18 @@ mod tests {
     #[test]
     fn scope_rejects_ambiguous_aliases_before_any_deletion() {
         for (sql, identifier) in [
-            ("UPDATE projects SET slug = 'PROJ-ALPHA' WHERE id = 2", "proj-alpha"),
-            ("UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 2", "proj-alpha"),
-            ("UPDATE projects SET human_key = '/DATA/PROJECTS/ALPHA' WHERE id = 2", "/data/projects/alpha"),
+            (
+                "UPDATE projects SET slug = 'PROJ-ALPHA' WHERE id = 2",
+                "proj-alpha",
+            ),
+            (
+                "UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 2",
+                "proj-alpha",
+            ),
+            (
+                "UPDATE projects SET human_key = '/DATA/PROJECTS/ALPHA' WHERE id = 2",
+                "/data/projects/alpha",
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let db = create_test_db(dir.path());
@@ -963,10 +982,8 @@ mod tests {
             conn.execute_raw(sql).unwrap();
             drop(conn);
             // An earlier valid selection must not permit a partial scope.
-            let error = apply_project_scope(
-                &db,
-                &["proj-beta".to_string(), identifier.to_string()],
-            );
+            let error =
+                apply_project_scope(&db, &["proj-beta".to_string(), identifier.to_string()]);
             // The slug-collision case changes proj-beta, so use its unique
             // human key to reach the ambiguous selection in that case.
             let error = if matches!(error, Err(ShareError::ScopeIdentifierNotFound { .. })) {
@@ -1008,11 +1025,9 @@ mod tests {
         conn.execute_raw("UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 1")
             .unwrap();
         drop(conn);
-        let result = apply_project_scope(
-            &db,
-            &["proj-alpha".to_string(), "PROJ-ALPHA".to_string()],
-        )
-        .unwrap();
+        let result =
+            apply_project_scope(&db, &["proj-alpha".to_string(), "PROJ-ALPHA".to_string()])
+                .unwrap();
         assert_eq!(result.projects.len(), 1);
         assert_eq!(result.projects[0].id, 1);
         assert_eq!(result.remaining.messages, 2);
@@ -1053,22 +1068,30 @@ mod tests {
                 let rows = conn
                     .query_sync("SELECT recipients_json FROM messages WHERE id=1", &[])
                     .unwrap();
-                let routing: serde_json::Value = serde_json::from_str(
-                    &rows[0].get_named::<String>("recipients_json").unwrap(),
-                )
-                .unwrap();
+                let routing: serde_json::Value =
+                    serde_json::from_str(&rows[0].get_named::<String>("recipients_json").unwrap())
+                        .unwrap();
                 let mut expected = json!({"to": [], "cc": [], "bcc": []});
                 if direct {
-                    expected["to"].as_array_mut().unwrap().push(json!("GreenCastle"));
+                    expected["to"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("GreenCastle"));
                 }
                 expected[kind]
                     .as_array_mut()
                     .unwrap()
                     .push(json!("project:proj-alpha"));
                 assert_eq!(routing, expected);
-                assert_eq!(count_table(&conn, "message_recipients").unwrap(), 1 + i64::from(direct));
+                assert_eq!(
+                    count_table(&conn, "message_recipients").unwrap(),
+                    1 + i64::from(direct)
+                );
                 let deliveries = conn
-                    .query_sync("SELECT message_id, kind FROM project_mailbox_deliveries", &[])
+                    .query_sync(
+                        "SELECT message_id, kind FROM project_mailbox_deliveries",
+                        &[],
+                    )
                     .unwrap();
                 assert_eq!(deliveries.len(), 1);
                 assert_eq!(deliveries[0].get_named::<i64>("message_id").unwrap(), 1);
@@ -1106,8 +1129,15 @@ mod tests {
             assert_eq!(count_table(&conn, "messages").unwrap(), 3);
             assert_eq!(count_table(&conn, "message_recipients").unwrap(), 3);
             assert_eq!(count_table(&conn, "agent_links").unwrap(), 1);
-            let rows = conn.query_sync("SELECT recipients_json FROM messages WHERE id=1", &[]).unwrap();
-            assert!(rows[0].get_named::<String>("recipients_json").unwrap().contains("PurpleBear"));
+            let rows = conn
+                .query_sync("SELECT recipients_json FROM messages WHERE id=1", &[])
+                .unwrap();
+            assert!(
+                rows[0]
+                    .get_named::<String>("recipients_json")
+                    .unwrap()
+                    .contains("PurpleBear")
+            );
         }
     }
 
@@ -1117,10 +1147,15 @@ mod tests {
         let db = create_test_db(dir.path());
         add_shared_scope_state(&db, "to");
         let conn = Conn::open_file(db.display().to_string()).unwrap();
-        conn.execute_raw("INSERT INTO projects(id,slug,human_key) VALUES(3,'keep-other','/keep-other')").unwrap();
-        conn.execute_raw("UPDATE project_mailbox_deliveries SET project_id=3 WHERE message_id=1").unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key) VALUES(3,'keep-other','/keep-other')",
+        )
+        .unwrap();
+        conn.execute_raw("UPDATE project_mailbox_deliveries SET project_id=3 WHERE message_id=1")
+            .unwrap();
         drop(conn);
-        let error = apply_project_scope(&db, &["proj-alpha".to_string(), "keep-other".to_string()]).unwrap_err();
+        let error = apply_project_scope(&db, &["proj-alpha".to_string(), "keep-other".to_string()])
+            .unwrap_err();
         assert!(matches!(error, ShareError::Validation { .. }));
         let conn = Conn::open_file(db.display().to_string()).unwrap();
         assert_eq!(count_table(&conn, "projects").unwrap(), 3);
@@ -1132,14 +1167,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
         let conn = Conn::open_file(db.display().to_string()).unwrap();
-        conn.execute_raw("CREATE VIEW tool_metrics_snapshots AS SELECT secret FROM missing_private_source").unwrap();
+        conn.execute_raw(
+            "CREATE VIEW tool_metrics_snapshots AS SELECT secret FROM missing_private_source",
+        )
+        .unwrap();
         drop(conn);
         assert!(apply_project_scope(&db, &["proj-alpha".to_string()]).is_err());
         let conn = Conn::open_file(db.display().to_string()).unwrap();
         assert_eq!(count_table(&conn, "projects").unwrap(), 2);
         assert_eq!(count_table(&conn, "messages").unwrap(), 3);
         assert_eq!(count_table(&conn, "agent_links").unwrap(), 1);
-        assert!(matches!(table_exists(&conn, "tool_metrics_snapshots"), Err(ShareError::Validation { .. })));
+        assert!(matches!(
+            table_exists(&conn, "tool_metrics_snapshots"),
+            Err(ShareError::Validation { .. })
+        ));
         assert!(!table_exists(&conn, "genuinely_absent_table").unwrap());
         assert!(table_exists(&conn, "PROJECTS").unwrap());
     }

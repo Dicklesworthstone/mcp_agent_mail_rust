@@ -392,7 +392,11 @@ fn auto_accept_preflights_evicted_target_before_any_handshake_writes() {
         assert_eq!(before[2], 0, "the fixture has no contact links");
         let absent_source = root.join("new-source").to_string_lossy().into_owned();
         for (source, requester, register) in [
-            (fixture.second_project.as_str(), fixture.retained.as_str(), false),
+            (
+                fixture.second_project.as_str(),
+                fixture.retained.as_str(),
+                false,
+            ),
             (absent_source.as_str(), "BlueLake", true),
         ] {
             let error = handshake(
@@ -437,7 +441,9 @@ fn saturated_eviction_history_refuses_new_source_before_creating_its_project() {
         let actor = McpContext::with_state(cx.clone(), 1, SessionState::new());
         let peer = McpContext::with_state(cx.clone(), 2, SessionState::new());
         let target_project = root.join("target").to_string_lossy().into_owned();
-        ensure_project(&peer, target_project.clone(), None).await.unwrap();
+        ensure_project(&peer, target_project.clone(), None)
+            .await
+            .unwrap();
         let target = create_identity(&peer, &target_project).await;
 
         // 32 held proofs plus 33 distinct evicted projects exhaust the shipped
@@ -461,7 +467,10 @@ fn saturated_eviction_history_refuses_new_source_before_creating_its_project() {
         )
         .await
         .expect_err("saturation must constrain even a project never held by this session");
-        assert_eq!(tool_error_code(&unrelated), Some("SESSION_IDENTITY_MISMATCH"));
+        assert_eq!(
+            tool_error_code(&unrelated),
+            Some("SESSION_IDENTITY_MISMATCH")
+        );
 
         let before = handshake_counts(&cx).await;
         let source = root.join("never-created").to_string_lossy().into_owned();

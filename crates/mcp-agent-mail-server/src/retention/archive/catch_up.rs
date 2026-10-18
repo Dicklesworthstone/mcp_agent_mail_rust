@@ -25,8 +25,7 @@ const MAX_TURN_ACTIVE_TIME: Duration = Duration::from_millis(250);
 // independent 16 MiB bound, so a turn admits less than 32 MiB in total. This is
 // not a resident-memory allocation or permission to enlarge a storage batch.
 const TURN_PAYLOAD_TARGET: usize = 16 * 1024 * 1024;
-const DISK_PRESSURE_DEFERRED: &str =
-    "message reconciliation deferred: critical disk pressure";
+const DISK_PRESSURE_DEFERRED: &str = "message reconciliation deferred: critical disk pressure";
 
 /// Run one finite repair turn, observing each real storage report separately.
 /// The returned backlog hint controls only the worker's next sleep, never
@@ -327,7 +326,13 @@ mod tests {
 
     #[test]
     fn interruption_contention_and_no_scan_progress_never_spin_in_a_turn() {
-        for mode in ["interrupted", "contended", "conflict_only", "empty", "complete"] {
+        for mode in [
+            "interrupted",
+            "contended",
+            "conflict_only",
+            "empty",
+            "complete",
+        ] {
             let mut calls = 0;
             run_with(
                 || {
@@ -406,27 +411,24 @@ mod tests {
     fn admission_after_progress_preserves_reports_and_next_turn_recovers() {
         let mut calls = 0;
         let mut observed = Vec::new();
-        let result = run_with(
-            || {
-                calls += 1;
-                if calls == 1 {
-                    Ok(busy_report())
-                } else {
-                    Err("message reconciliation deferred: checkpoint is owned by another worker"
+        let result =
+            run_with(
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(busy_report())
+                    } else {
+                        Err("message reconciliation deferred: checkpoint is owned by another worker"
                         .to_string())
-                }
-            },
-            |report| observed.push(report.repaired),
-            || Duration::ZERO,
-        );
+                    }
+                },
+                |report| observed.push(report.repaired),
+                || Duration::ZERO,
+            );
         assert!(finish_turn(result, || false).unwrap());
         assert_eq!(calls, 2);
         assert_eq!(observed, [4]);
-        let recovered = run_with(
-            || Ok(ReconcileReport::default()),
-            |_| {},
-            || Duration::ZERO,
-        );
+        let recovered = run_with(|| Ok(ReconcileReport::default()), |_| {}, || Duration::ZERO);
         assert!(!finish_turn(recovered, || false).unwrap());
     }
 
@@ -447,7 +449,9 @@ mod tests {
         }
         for backlog in [false, true] {
             assert_eq!(
-                finish_turn(Ok(backlog), || panic!("successful turn needs no refusal check")),
+                finish_turn(Ok(backlog), || panic!(
+                    "successful turn needs no refusal check"
+                )),
                 Ok(backlog)
             );
         }
@@ -457,8 +461,18 @@ mod tests {
     fn cooperative_targets_do_not_expand_a_storage_batch() {
         let report = busy_report();
         assert!(continue_turn(1, 0, Duration::ZERO, &report));
-        assert!(!continue_turn(MAX_BATCHES_PER_TURN, 0, Duration::ZERO, &report));
-        assert!(!continue_turn(1, TURN_PAYLOAD_TARGET, Duration::ZERO, &report));
+        assert!(!continue_turn(
+            MAX_BATCHES_PER_TURN,
+            0,
+            Duration::ZERO,
+            &report
+        ));
+        assert!(!continue_turn(
+            1,
+            TURN_PAYLOAD_TARGET,
+            Duration::ZERO,
+            &report
+        ));
         assert!(!continue_turn(1, 0, MAX_TURN_ACTIVE_TIME, &report));
     }
 
@@ -521,9 +535,19 @@ mod tests {
         assert_eq!(calls.get(), MAX_BATCHES_PER_TURN);
         assert_eq!(observed, MAX_BATCHES_PER_TURN);
         let report = healthy_page();
-        assert!(!continue_turn(1, TURN_PAYLOAD_TARGET, Duration::ZERO, &report));
+        assert!(!continue_turn(
+            1,
+            TURN_PAYLOAD_TARGET,
+            Duration::ZERO,
+            &report
+        ));
         assert!(!continue_turn(1, 0, MAX_TURN_ACTIVE_TIME, &report));
-        assert!(!continue_turn(MAX_BATCHES_PER_TURN, 0, Duration::ZERO, &report));
+        assert!(!continue_turn(
+            MAX_BATCHES_PER_TURN,
+            0,
+            Duration::ZERO,
+            &report
+        ));
     }
 }
 
@@ -599,7 +623,10 @@ mod retry_tests {
             || Duration::ZERO,
         )
         .unwrap();
-        assert!(backlog, "zero scanned is not proof that retained debt vanished");
+        assert!(
+            backlog,
+            "zero scanned is not proof that retained debt vanished"
+        );
         assert_eq!(calls, 1);
     }
 

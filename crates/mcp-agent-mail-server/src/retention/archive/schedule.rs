@@ -181,7 +181,11 @@ mod tests {
             None
         );
         assert_eq!(
-            schedule.run_if_due(Lane::Reservations, || due + IDLE, || Some(Ok::<_, ()>(true))),
+            schedule.run_if_due(
+                Lane::Reservations,
+                || due + IDLE,
+                || Some(Ok::<_, ()>(true))
+            ),
             Some(Ok(true))
         );
         assert_eq!(schedule.next_delay(due + IDLE), Duration::from_secs(1));
@@ -220,7 +224,10 @@ mod tests {
             schedule.run_if_due(Lane::Messages, || start, || Some(Err("source replaced"))),
             Some(Err("source replaced"))
         );
-        assert_eq!(schedule.run_if_due::<()>(Lane::Agents, || start, || None), None);
+        assert_eq!(
+            schedule.run_if_due::<()>(Lane::Agents, || start, || None),
+            None
+        );
         assert_eq!(
             schedule.run_if_due::<()>(Lane::Reservations, || start, || None),
             None
@@ -336,7 +343,11 @@ mod tests {
         let mut schedule = RepairSchedule::new(IDLE, false, true);
         let completed = start + Duration::from_secs(10);
         assert_eq!(
-            schedule.run_if_due(Lane::Reservations, || completed, || Some(Ok::<_, ()>(false))),
+            schedule.run_if_due(
+                Lane::Reservations,
+                || completed,
+                || Some(Ok::<_, ()>(false))
+            ),
             Some(Ok(false))
         );
         assert_eq!(schedule.next_delay(start), IDLE);

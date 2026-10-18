@@ -39,7 +39,10 @@ pub(super) struct CapturedChild {
 impl CapturedChild {
     pub(super) fn spawn(mut command: Command, stop: &AtomicBool) -> io::Result<Self> {
         if stop.load(Ordering::Acquire) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted by shutdown"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted by shutdown",
+            ));
         }
         let started = Instant::now();
         let (stdout, stdout_writer) = output_pipe()?;
@@ -47,15 +50,26 @@ impl CapturedChild {
         // The maintenance and MIDX recovery paths classify Git diagnostics.
         // Keep those diagnostics stable even under a localized server locale.
         command.env("LC_ALL", "C");
-        command.stdin(Stdio::null()).stdout(stdout_writer).stderr(stderr_writer);
+        command
+            .stdin(Stdio::null())
+            .stdout(stdout_writer)
+            .stderr(stderr_writer);
         if stop.load(Ordering::Acquire) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted by shutdown"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "interrupted by shutdown",
+            ));
         }
         let child = command.spawn()?;
         // Command retains explicit Stdio handles after spawn. Its copies must
         // close now, otherwise even a child without descendants never gets EOF.
         drop(command);
-        Ok(Self { child, stdout: Some(stdout), stderr: Some(stderr), started })
+        Ok(Self {
+            child,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            started,
+        })
     }
 
     pub(super) fn id(&self) -> u32 {
@@ -88,12 +102,17 @@ impl CapturedChild {
         let mut pause = Duration::from_millis(1);
         loop {
             if stop.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted by shutdown"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "interrupted by shutdown",
+                ));
             }
             if self.started.elapsed() >= timeout {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("maintenance child or inherited output pipes timed out after {timeout:?}"),
+                    format!(
+                        "maintenance child or inherited output pipes timed out after {timeout:?}"
+                    ),
                 ));
             }
             // One chunk from EACH pipe per turn. A continuous stdout producer
@@ -107,7 +126,11 @@ impl CapturedChild {
                 && self.stdout.is_none()
                 && self.stderr.is_none()
             {
-                return Ok(Output { status, stdout, stderr });
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             if out_progress || err_progress {
                 pause = Duration::from_millis(1);
@@ -188,17 +211,27 @@ mod tests {
     fn real_large_stdout_and_stderr_complete_without_pipe_deadlock() {
         let stop = AtomicBool::new(false);
         // POSIX shell builtins; each stream exceeds pipe capacity many times.
-        let mut child = CapturedChild::spawn(shell(
-            "i=0; while [ \"$i\" -lt 128 ]; do printf '%4096s' X; \
+        let mut child = CapturedChild::spawn(
+            shell(
+                "i=0; while [ \"$i\" -lt 128 ]; do printf '%4096s' X; \
              printf '%4096s' Y >&2; i=$((i + 1)); done; \
              printf stdout-end; printf stderr-end >&2",
-        ), &stop).unwrap();
+            ),
+            &stop,
+        )
+        .unwrap();
         let output = child.wait_output(&stop, Duration::from_secs(5)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 128 * 4096 + 10);
         assert_eq!(output.stderr.len(), 128 * 4096 + 10);
-        assert_eq!(output.stdout.iter().filter(|&&byte| byte == b'X').count(), 128);
-        assert_eq!(output.stderr.iter().filter(|&&byte| byte == b'Y').count(), 128);
+        assert_eq!(
+            output.stdout.iter().filter(|&&byte| byte == b'X').count(),
+            128
+        );
+        assert_eq!(
+            output.stderr.iter().filter(|&&byte| byte == b'Y').count(),
+            128
+        );
         assert!(output.stdout.ends_with(b"stdout-end"));
         assert!(output.stderr.ends_with(b"stderr-end"));
         assert!(child.child_mut().try_wait().unwrap().is_some());
@@ -213,7 +246,10 @@ mod tests {
         let output = child.wait_output(&stop, Duration::from_secs(5)).unwrap();
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout, b"partial packing");
-        assert_eq!(output.stderr, b"could not load pack; failed to write multi-pack-index");
+        assert_eq!(
+            output.stderr,
+            b"could not load pack; failed to write multi-pack-index"
+        );
     }
 
     #[test]
@@ -230,10 +266,14 @@ mod tests {
     #[test]
     fn combined_output_limit_refuses_instead_of_returning_truncated_success() {
         let stop = AtomicBool::new(false);
-        let mut child = CapturedChild::spawn(shell(
-            "while :; do printf '%4096s' X; printf '%4096s' Y >&2; done",
-        ), &stop).unwrap();
-        let error = child.capture(&stop, Duration::from_secs(5), 32 * 1024).unwrap_err();
+        let mut child = CapturedChild::spawn(
+            shell("while :; do printf '%4096s' X; printf '%4096s' Y >&2; done"),
+            &stop,
+        )
+        .unwrap();
+        let error = child
+            .capture(&stop, Duration::from_secs(5), 32 * 1024)
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("MAINTENANCE_OUTPUT_LIMIT"));
         // Owning Drop kills/reaps the direct child, with no reader thread join.
@@ -259,7 +299,9 @@ mod tests {
         // inherited descendant descriptor, without leaving an orphan process.
         // The direct child's real stdout still drains; hold the stderr writer.
         child.stderr = Some(reader);
-        let error = child.capture(&stop, Duration::from_millis(250), 1024).unwrap_err();
+        let error = child
+            .capture(&stop, Duration::from_millis(250), 1024)
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(child.child_mut().try_wait().unwrap().is_some());
         drop(writer);
@@ -275,7 +317,9 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
                 stop.store(true, Ordering::Release);
             });
-            let error = child.wait_output(&stop, Duration::from_secs(3)).unwrap_err();
+            let error = child
+                .wait_output(&stop, Duration::from_secs(3))
+                .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         });
         drop(child);
@@ -297,27 +341,45 @@ mod tests {
         let lock = git_dir.join("objects/maintenance.lock");
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         let stop = AtomicBool::new(false);
-        let mut command = shell("printf 'owned maintenance lock' > \"$AM_TEST_LOCK\"; exec sleep 5");
+        let mut command =
+            shell("printf 'owned maintenance lock' > \"$AM_TEST_LOCK\"; exec sleep 5");
         command.env("AM_TEST_LOCK", &lock);
         let mut child = CapturedChild::spawn(command, &stop).unwrap();
         let active = super::super::record_active_maintenance_evidence(
-            &git_dir, child.id(), super::super::process_start_ticks(child.id()),
+            &git_dir,
+            child.id(),
+            super::super::process_start_ticks(child.id()),
         );
         assert!(active.is_some());
-        let error = child.wait_output(&stop, Duration::from_secs(1)).unwrap_err();
+        let error = child
+            .wait_output(&stop, Duration::from_secs(1))
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(std::fs::read(&lock).unwrap(), b"owned maintenance lock");
-        let evidence = super::super::terminate_maintenance_child(child.child_mut(), &git_dir, &error.to_string());
+        let evidence = super::super::terminate_maintenance_child(
+            child.child_mut(),
+            &git_dir,
+            &error.to_string(),
+        );
         assert!(evidence.is_some());
         assert!(child.child_mut().try_wait().unwrap().is_some());
         drop(child);
         let preflight = super::super::preflight_maintenance_lock(&git_dir);
         assert!(preflight.reaped, "{preflight:?}");
-        let retained = std::fs::read_dir(git_dir.join("objects")).unwrap()
+        let retained = std::fs::read_dir(git_dir.join("objects"))
+            .unwrap()
             .map(Result::unwrap)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with("maintenance.lock.agent-mail-quarantine-"))
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("maintenance.lock.agent-mail-quarantine-")
+            })
             .expect("owned stale lock retained by move-only recovery");
-        assert_eq!(std::fs::read(retained.path()).unwrap(), b"owned maintenance lock");
+        assert_eq!(
+            std::fs::read(retained.path()).unwrap(),
+            b"owned maintenance lock"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -325,7 +387,8 @@ mod tests {
     fn unwinding_capture_reaps_its_direct_child() {
         let pid = std::cell::Cell::new(0);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let child = CapturedChild::spawn(shell("exec sleep 30"), &AtomicBool::new(false)).unwrap();
+            let child =
+                CapturedChild::spawn(shell("exec sleep 30"), &AtomicBool::new(false)).unwrap();
             pid.set(child.id());
             panic!("exercise owned child cleanup during unwind");
         }));
@@ -340,14 +403,28 @@ mod tests {
         let git_dir = scratch.path().join("archive.git");
         let stop = AtomicBool::new(false);
         let mut child = CapturedChild::spawn(shell("exit 0"), &stop).unwrap();
-        assert!(child.wait_output(&stop, Duration::from_secs(5)).unwrap().status.success());
+        assert!(
+            child
+                .wait_output(&stop, Duration::from_secs(5))
+                .unwrap()
+                .status
+                .success()
+        );
         let lock = git_dir.join("objects/maintenance.lock");
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, b"created after that child exited").unwrap();
-        assert!(super::super::terminate_maintenance_child(
-            child.child_mut(), &git_dir, "inherited pipe timeout",
-        ).is_none());
-        assert_eq!(std::fs::read(lock).unwrap(), b"created after that child exited");
+        assert!(
+            super::super::terminate_maintenance_child(
+                child.child_mut(),
+                &git_dir,
+                "inherited pipe timeout",
+            )
+            .is_none()
+        );
+        assert_eq!(
+            std::fs::read(lock).unwrap(),
+            b"created after that child exited"
+        );
         assert!(!git_dir.join("agent-mail-maintenance").exists());
     }
 }

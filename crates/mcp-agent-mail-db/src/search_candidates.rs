@@ -280,7 +280,12 @@ impl CandidateBudget {
             config.max_lexical,
         );
         let mut semantic_limit = clamp_candidate_limit(
-            scaled_ceil_limit(requested_limit, base_semantic_bps, class_semantic_bps, SCALE),
+            scaled_ceil_limit(
+                requested_limit,
+                base_semantic_bps,
+                class_semantic_bps,
+                SCALE,
+            ),
             config.min_semantic,
             config.max_semantic,
         );

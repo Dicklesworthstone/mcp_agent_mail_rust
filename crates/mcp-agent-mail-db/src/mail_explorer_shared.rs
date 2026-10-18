@@ -208,7 +208,10 @@ mod tests {
             assert_eq!(all.entries[0].kind.as_deref(), Some("bcc"));
             assert_eq!(all.entries[0].ack_ts, None, "direct receipt wins");
             assert_eq!(all.entries[2].kind.as_deref(), Some("project"));
-            assert_eq!(all.entries[2].read_ts, None, "another project identity's receipt is private");
+            assert_eq!(
+                all.entries[2].read_ts, None,
+                "another project identity's receipt is private"
+            );
             assert_eq!(all.entries[3].ack_ts, Some(8));
             query.project_id = Some(1);
             assert_eq!(ids(&page(runtime, pool, &query)), [102, 101, 100]);
@@ -233,7 +236,10 @@ mod tests {
                 (AckFilter::PendingAck, vec![102, 200]),
                 (AckFilter::Acknowledged, vec![100]),
             ] {
-                let query = ExplorerQuery { ack_filter: filter, ..query() };
+                let query = ExplorerQuery {
+                    ack_filter: filter,
+                    ..query()
+                };
                 let result = page(runtime, pool, &query);
                 assert_eq!(ids(&result), expected);
                 assert_eq!(result.total_count, expected.len());
@@ -244,7 +250,11 @@ mod tests {
                 (SortMode::ImportanceDesc, 200),
                 (SortMode::AgentAlpha, 102),
             ] {
-                let query = ExplorerQuery { sort, limit: 1, ..query() };
+                let query = ExplorerQuery {
+                    sort,
+                    limit: 1,
+                    ..query()
+                };
                 let result = page(runtime, pool, &query);
                 assert_eq!(ids(&result), [expected]);
                 assert_eq!(result.total_count, 4);
@@ -263,20 +273,38 @@ mod tests {
     #[test]
     fn shared_visibility_excludes_sender_late_retired_opted_out_and_foreign_viewers() {
         fixture(|runtime, pool| {
-            for agent in ["AmberFox", "ZebraFox", "LateFox", "BlockedFox", "RetiredFox"] {
-                let query = ExplorerQuery { agent_name: agent.to_string(), ..query() };
+            for agent in [
+                "AmberFox",
+                "ZebraFox",
+                "LateFox",
+                "BlockedFox",
+                "RetiredFox",
+            ] {
+                let query = ExplorerQuery {
+                    agent_name: agent.to_string(),
+                    ..query()
+                };
                 let result = page(runtime, pool, &query);
                 assert!(result.entries.is_empty(), "{agent}");
                 assert_eq!(result.total_count, 0, "{agent}");
             }
             let foreign = ExplorerQuery {
-                agent_name: "BlueLake".to_string(), project_id: Some(2), ..query()
+                agent_name: "BlueLake".to_string(),
+                project_id: Some(2),
+                ..query()
             };
             assert_eq!(ids(&page(runtime, pool, &foreign)), [200]);
             // A retired direct recipient still has its explicitly delivered
             // history. Shared eligibility must not erase that direct lane.
-            execute(runtime, pool, "UPDATE agents SET retired_at = 10 WHERE id = 11");
-            let retired = ExplorerQuery { project_id: Some(1), ..query() };
+            execute(
+                runtime,
+                pool,
+                "UPDATE agents SET retired_at = 10 WHERE id = 11",
+            );
+            let retired = ExplorerQuery {
+                project_id: Some(1),
+                ..query()
+            };
             assert_eq!(ids(&page(runtime, pool, &retired)), [102, 101]);
         });
     }
@@ -285,26 +313,45 @@ mod tests {
     fn shared_address_display_preserves_bcc_privacy_and_outbox_ordering() {
         fixture(|runtime, pool| {
             let incoming = page(runtime, pool, &query());
-            let shared = incoming.entries.iter().find(|entry| entry.message_id == 100).unwrap();
+            let shared = incoming
+                .entries
+                .iter()
+                .find(|entry| entry.message_id == 100)
+                .unwrap();
             assert_eq!(shared.to_agents, "project:alpha");
             assert!(!shared.to_agents.contains("HiddenFox"));
-            assert_eq!(incoming.stats.unique_agents, 3, "addresses are not agent identities");
-            let outbox = page(runtime, pool, &ExplorerQuery {
-                agent_name: "AmberFox".to_string(),
-                direction: Direction::Outbound,
-                sort: SortMode::AgentAlpha,
-                limit: 1,
-                ..Default::default()
-            });
+            assert_eq!(
+                incoming.stats.unique_agents, 3,
+                "addresses are not agent identities"
+            );
+            let outbox = page(
+                runtime,
+                pool,
+                &ExplorerQuery {
+                    agent_name: "AmberFox".to_string(),
+                    direction: Direction::Outbound,
+                    sort: SortMode::AgentAlpha,
+                    limit: 1,
+                    ..Default::default()
+                },
+            );
             assert_eq!(outbox.total_count, 3);
             assert_eq!(ids(&outbox), [101]);
-            let outbox = page(runtime, pool, &ExplorerQuery {
-                agent_name: "AmberFox".to_string(),
-                direction: Direction::All,
-                limit: 50,
-                ..Default::default()
-            });
-            let shared = outbox.entries.iter().find(|entry| entry.message_id == 100).unwrap();
+            let outbox = page(
+                runtime,
+                pool,
+                &ExplorerQuery {
+                    agent_name: "AmberFox".to_string(),
+                    direction: Direction::All,
+                    limit: 50,
+                    ..Default::default()
+                },
+            );
+            let shared = outbox
+                .entries
+                .iter()
+                .find(|entry| entry.message_id == 100)
+                .unwrap();
             assert_eq!(shared.to_agents, "HiddenFox,project:alpha");
             assert_eq!(outbox.stats.outbound_count, 3);
             assert_eq!(outbox.stats.inbound_count, 0);
@@ -320,7 +367,9 @@ mod tests {
                 let cx = Cx::current().expect("runtime context");
                 let conn = expect_ok(pool.acquire(&cx).await);
                 for table in ["message_recipients", "project_mailbox_receipts"] {
-                    let rows = conn.query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[]).unwrap();
+                    let rows = conn
+                        .query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                        .unwrap();
                     assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 3);
                 }
             });
@@ -330,16 +379,28 @@ mod tests {
     #[test]
     fn partial_shared_schema_errors_but_complete_legacy_absence_remains_readable() {
         fixture(|runtime, pool| {
-            execute(runtime, pool, "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts");
+            execute(
+                runtime,
+                pool,
+                "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+            );
             runtime.block_on(async {
                 let cx = Cx::current().expect("runtime context");
                 let result = fetch_explorer_page(&cx, pool, &query()).await;
                 match result {
-                    Outcome::Err(error) => assert!(error.to_string().contains("incomplete project mailbox schema")),
+                    Outcome::Err(error) => assert!(
+                        error
+                            .to_string()
+                            .contains("incomplete project mailbox schema")
+                    ),
                     _ => panic!("partial schema must not report an empty shared inbox"),
                 }
             });
-            execute(runtime, pool, "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries");
+            execute(
+                runtime,
+                pool,
+                "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            );
             let legacy = page(runtime, pool, &query());
             assert_eq!(ids(&legacy), [102, 101]);
             assert_eq!(legacy.total_count, 2);

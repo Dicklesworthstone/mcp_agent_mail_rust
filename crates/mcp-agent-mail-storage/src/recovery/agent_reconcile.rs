@@ -1808,8 +1808,12 @@ mod tests {
             }
             drop(conn);
             outcome(block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
-                cx, pool, 101, Some(123_456_789),
-            ))).unwrap();
+                cx,
+                pool,
+                101,
+                Some(123_456_789),
+            )))
+            .unwrap();
             let archive = crate::open_archive(config, "project").unwrap().unwrap();
             crate::flush_async_commits();
             let process = crate::archive_process_lock(&archive).unwrap();
@@ -1817,18 +1821,31 @@ mod tests {
             let mut cursor = AgentReconcileCursor::default();
             let stop = AtomicBool::new(false);
             let first = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!((first.deferred_transient, first.retry_len, first.repaired), (1, 1, 4));
+            assert_eq!(
+                (first.deferred_transient, first.retry_len, first.repaired),
+                (1, 1, 4)
+            );
             assert_eq!(cursor.after, 105);
             assert_eq!(cursor.ceiling, Some(181));
             assert_eq!(fs::read(profile_path(config)).unwrap(), before);
             outcome(block_on(mcp_agent_mail_db::queries::deregister_agent(
-                cx, pool, 101, 345_678_901,
-            ))).unwrap();
+                cx,
+                pool,
+                101,
+                345_678_901,
+            )))
+            .unwrap();
             let latest = read_source(cx, pool, 101).unwrap();
             drop(held);
             let resumed = reconcile_agent_batch(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!((resumed.repaired, resumed.deferred, resumed.retry_len), (4, 0, 0));
-            assert!(cursor.after > 105 && cursor.after < 181, "history must also advance without wrapping");
+            assert_eq!(
+                (resumed.repaired, resumed.deferred, resumed.retry_len),
+                (4, 0, 0)
+            );
+            assert!(
+                cursor.after > 105 && cursor.after < 181,
+                "history must also advance without wrapping"
+            );
             assert_eq!(cursor.ceiling, Some(181));
             let profile = assert_profile_committed(config);
             assert_eq!(profile["deregistered_at"], timestamp(345_678_901).unwrap());

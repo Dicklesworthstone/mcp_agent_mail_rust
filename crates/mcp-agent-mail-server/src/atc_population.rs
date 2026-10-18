@@ -1355,12 +1355,21 @@ mod tests {
         let _guard = engine::GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
         super::super::reset_global_atc_state_for_test(&config);
         let epoch = super::super::capture_delivery_epoch().unwrap();
         let report = release_report(2_000_000);
         sync_population_with(3_000_000, || Ok(Vec::new())).unwrap();
-        assert!(super::super::delivery_state().lock().unwrap().last_tick_count.is_none());
+        assert!(
+            super::super::delivery_state()
+                .lock()
+                .unwrap()
+                .last_tick_count
+                .is_none()
+        );
         let returned = super::super::admit_report(&epoch, report, 2_000_000).unwrap();
         assert!(returned.effects.is_empty() && returned.actions.is_empty());
         assert_eq!(returned.summary.kernel.pending_effects, 0);
@@ -1375,7 +1384,10 @@ mod tests {
         let _guard = engine::GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
         super::super::reset_global_atc_state_for_test(&config);
         sync_population_with(1_000_000, || Ok(rows(1))).unwrap();
         let _ = tick_report(2_000_000).unwrap();
@@ -1389,12 +1401,14 @@ mod tests {
                 let mut fresh = rows(1);
                 fresh[0].last_active_ts = 4_000_000;
                 Ok(fresh)
-            }).unwrap();
+            })
+            .unwrap();
             // Complete the hydration/inference turn, but do not admit a newer
             // report. Tick ordering alone cannot reject the older release.
             let _ = tick_report(5_000_000).unwrap();
             Some(4_000_000)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(observations, 1);
         assert!(returned.effects.is_empty() && returned.actions.is_empty());
         assert_eq!(atc_population_hydration_stats().scope_effects_withheld, 1);
@@ -1408,16 +1422,29 @@ mod tests {
         let _guard = engine::GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
         super::super::reset_global_atc_state_for_test(&config);
         let epoch = super::super::capture_delivery_epoch().unwrap();
         let report = release_report(2_000_000);
         sync_population_with(3_000_000, || {
             assert!(super::super::admit_report(&epoch, report, 2_000_000).is_none());
-            assert!(super::super::delivery_state().lock().unwrap().last_tick_count.is_none());
-            assert_eq!(super::super::atc_delivery_stats(), super::super::AtcDeliveryStats::default());
+            assert!(
+                super::super::delivery_state()
+                    .lock()
+                    .unwrap()
+                    .last_tick_count
+                    .is_none()
+            );
+            assert_eq!(
+                super::super::atc_delivery_stats(),
+                super::super::AtcDeliveryStats::default()
+            );
             Ok(rows(1))
-        }).unwrap();
+        })
+        .unwrap();
         assert!(super::super::atc_tick_report(4_000_000).is_some());
         super::super::reset_global_atc_state_for_test(&config);
     }
@@ -1427,7 +1454,10 @@ mod tests {
         let _guard = engine::GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
         for count in [0, 1, 65] {
             super::super::reset_global_atc_state_for_test(&config);
             let epoch = super::super::capture_delivery_epoch().unwrap();
@@ -1441,8 +1471,17 @@ mod tests {
             let before = atc_population_hydration_stats();
             assert!(super::super::admit_report(&epoch, report, 2_000_000).is_none());
             assert_eq!(atc_population_hydration_stats(), before);
-            assert!(super::super::delivery_state().lock().unwrap().last_tick_count.is_none());
-            assert_eq!(super::super::atc_delivery_stats(), super::super::AtcDeliveryStats::default());
+            assert!(
+                super::super::delivery_state()
+                    .lock()
+                    .unwrap()
+                    .last_tick_count
+                    .is_none()
+            );
+            assert_eq!(
+                super::super::atc_delivery_stats(),
+                super::super::AtcDeliveryStats::default()
+            );
         }
         super::super::reset_global_atc_state_for_test(&config);
     }
@@ -1452,7 +1491,10 @@ mod tests {
         let _guard = engine::GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
         super::super::reset_global_atc_state_for_test(&config);
         let epoch = super::super::capture_delivery_epoch().unwrap();
         let mut report = release_report(2_000_000);
@@ -1486,7 +1528,10 @@ mod tests {
             // the regression must fail rather than leave a blocked worker.
             drop(delivery);
             let returned = worker.join().unwrap().unwrap();
-            assert!(held, "population scope was not stable through final admission");
+            assert!(
+                held,
+                "population scope was not stable through final admission"
+            );
             assert_eq!(returned.effects.len(), 1);
             assert_eq!(returned.actions.len(), 1);
         });
@@ -1499,7 +1544,10 @@ mod tests {
         let _guard = engine::GLOBAL_ATC_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config { atc_enabled: true, ..Default::default() };
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
         super::super::reset_global_atc_state_for_test(&config);
         let first = super::super::atc_tick_report(2_000_000).unwrap();
         let before = super::super::atc_delivery_stats();
@@ -1508,11 +1556,15 @@ mod tests {
                 let progress = super::super::atc_tick_report(4_000_000).unwrap();
                 assert_eq!(progress.summary.tick_count, first.summary.tick_count);
                 assert!(progress.effects.is_empty() && progress.actions.is_empty());
-                assert_eq!(progress.summary.policy.fallback_reason.as_deref(), Some("population_refresh_in_progress"));
+                assert_eq!(
+                    progress.summary.policy.fallback_reason.as_deref(),
+                    Some("population_refresh_in_progress")
+                );
                 assert_eq!(super::super::atc_delivery_stats(), before);
             }
             Ok(Vec::new())
-        }).unwrap();
+        })
+        .unwrap();
         super::super::reset_global_atc_state_for_test(&config);
     }
 }

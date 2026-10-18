@@ -151,7 +151,10 @@ mod tests {
         assert_eq!(queue.len(), MAX_RETRY_IDS);
         assert_eq!(queue.due(now), before);
         assert!(!queue.contains(50_000));
-        assert!(queue.defer(1, now), "an existing debt can still back off at capacity");
+        assert!(
+            queue.defer(1, now),
+            "an existing debt can still back off at capacity"
+        );
         assert_eq!(queue.len(), MAX_RETRY_IDS);
         queue.forget(2);
         assert!(!queue.is_full());

@@ -17,12 +17,14 @@ const ADMISSION_REFUSAL: &str =
     "active reservation repair deferred: recovery promotion or admission contention";
 const CHECKPOINT_ADMISSION_REFUSAL: &str =
     "active reservation repair deferred: checkpoint is owned by another worker";
-const DISK_PRESSURE_REFUSAL: &str =
-    "active reservation repair deferred: critical disk pressure";
+const DISK_PRESSURE_REFUSAL: &str = "active reservation repair deferred: critical disk pressure";
 
 pub(super) fn disk_is_critical() -> bool {
     pressure_is_critical(
-        mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load(),
+        mcp_agent_mail_core::global_metrics()
+            .system
+            .disk_pressure_level
+            .load(),
     )
 }
 
@@ -69,10 +71,15 @@ pub(super) fn run(
 ) -> Result<Turn, String> {
     let started = Instant::now();
     run_with(
-        || with_disk_admission(
-            mcp_agent_mail_core::global_metrics().system.disk_pressure_level.load(),
-            &mut repair,
-        ),
+        || {
+            with_disk_admission(
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+                &mut repair,
+            )
+        },
         observe,
         || started.elapsed(),
         cancelled,
@@ -160,18 +167,20 @@ mod tests {
                 |_| panic!("pressure has no storage report"),
                 || Duration::ZERO,
                 || false,
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(turn, stopped());
             assert!(!turn.idle);
         }
         for pressure in [0, critical - 1] {
             assert_eq!(
-                with_disk_admission(pressure, || Ok(busy())).unwrap().repaired,
+                with_disk_admission(pressure, || Ok(busy()))
+                    .unwrap()
+                    .repaired,
                 4,
             );
             assert_eq!(
-                with_disk_admission(pressure, || Err("source unavailable".into()))
-                    .unwrap_err(),
+                with_disk_admission(pressure, || Err("source unavailable".into())).unwrap_err(),
                 "source unavailable",
             );
         }
@@ -191,36 +200,48 @@ mod tests {
         ]);
         let mut observed = Vec::new();
         let paused = run_with(
-            || with_disk_admission(pressure.get(), || {
-                Ok(reports.pop_front().expect("only pending work may be consumed"))
-            }),
+            || {
+                with_disk_admission(pressure.get(), || {
+                    Ok(reports
+                        .pop_front()
+                        .expect("only pending work may be consumed"))
+                })
+            },
             |report| {
                 observed.push(report.repaired);
                 pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
             },
             || Duration::ZERO,
             || false,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(paused, stopped());
         assert_eq!(observed, [4]);
         assert_eq!(reports.len(), 1);
         for _ in 0..60 {
-            assert_eq!(run_with(
-                || with_disk_admission(pressure.get(), || panic!("no storage while critical")),
-                |_| panic!("no fabricated batch"),
-                || Duration::ZERO,
-                || false,
-            ).unwrap(), stopped());
+            assert_eq!(
+                run_with(
+                    || with_disk_admission(pressure.get(), || panic!("no storage while critical")),
+                    |_| panic!("no fabricated batch"),
+                    || Duration::ZERO,
+                    || false,
+                )
+                .unwrap(),
+                stopped()
+            );
         }
         pressure.set(0);
         let resumed = run_with(
-            || with_disk_admission(pressure.get(), || {
-                Ok(reports.pop_front().expect("resume, not replay"))
-            }),
+            || {
+                with_disk_admission(pressure.get(), || {
+                    Ok(reports.pop_front().expect("resume, not replay"))
+                })
+            },
             |report| observed.push(report.repaired),
             || Duration::ZERO,
             || false,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(resumed.delay, POLL_INTERVAL);
         assert!(!resumed.idle);
         assert_eq!(observed, [4, 1]);
@@ -242,7 +263,8 @@ mod tests {
             |_| panic!("no report"),
             || Duration::ZERO,
             || true,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(stopped.delay, POLL_INTERVAL);
         assert!(!stopped.idle);
     }
@@ -302,7 +324,11 @@ mod tests {
         ]);
         let mut observed = Vec::new();
         let turn = run_with(
-            || Ok(reports.pop_front().expect("empty completed round must yield")),
+            || {
+                Ok(reports
+                    .pop_front()
+                    .expect("empty completed round must yield"))
+            },
             |report| observed.push((report.scanned, report.repaired)),
             || Duration::ZERO,
             || false,
@@ -461,14 +487,17 @@ mod tests {
             let turn = run_with(
                 || {
                     calls += 1;
-                    if calls == 1 { return Ok(busy()); }
+                    if calls == 1 {
+                        return Ok(busy());
+                    }
                     stop.set(cancel);
                     Err(CHECKPOINT_ADMISSION_REFUSAL.to_string())
                 },
                 |report| observed.push(report.repaired),
                 || Duration::ZERO,
                 || stop.get(),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(calls, 2);
             assert_eq!(observed, [4]);
             assert_eq!(turn, if cancel { stopped() } else { pending() });
@@ -486,7 +515,11 @@ mod tests {
                     if calls == 1 {
                         Ok(busy())
                     } else {
-                        let error = if admission { ADMISSION_REFUSAL } else { "source changed" };
+                        let error = if admission {
+                            ADMISSION_REFUSAL
+                        } else {
+                            "source changed"
+                        };
                         Err(error.to_string())
                     }
                 },

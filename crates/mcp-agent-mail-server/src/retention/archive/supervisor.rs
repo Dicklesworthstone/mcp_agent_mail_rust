@@ -52,7 +52,9 @@ pub(super) fn run(
     wait: impl FnMut(Duration) -> bool,
     observe_restart: impl FnMut(Restart),
 ) {
-    run_with(stop, attempt, wait, observe_restart, |started| started.elapsed());
+    run_with(stop, attempt, wait, observe_restart, |started| {
+        started.elapsed()
+    });
 }
 
 fn run_with(
@@ -94,9 +96,15 @@ mod tests {
             previous = restart_delay(previous, Duration::ZERO);
             assert_eq!(previous, Duration::from_secs(expected));
         }
-        assert_eq!(restart_delay(Duration::MAX, Duration::ZERO), MAX_RESTART_DELAY);
         assert_eq!(
-            restart_delay(MAX_RESTART_DELAY, MAX_RESTART_DELAY - Duration::from_nanos(1)),
+            restart_delay(Duration::MAX, Duration::ZERO),
+            MAX_RESTART_DELAY
+        );
+        assert_eq!(
+            restart_delay(
+                MAX_RESTART_DELAY,
+                MAX_RESTART_DELAY - Duration::from_nanos(1)
+            ),
             MAX_RESTART_DELAY
         );
         assert_eq!(
@@ -117,10 +125,11 @@ mod tests {
             &stop,
             |_| {
                 calls.set(calls.get() + 1);
-                same_thread.set(same_thread.get() && std::thread::current().id() == original_thread);
+                same_thread
+                    .set(same_thread.get() && std::thread::current().id() == original_thread);
                 match calls.get() {
                     1 => panic!("injected archive run failure"),
-                    2 => {},
+                    2 => {}
                     _ => stop.store(true, Ordering::Release),
                 }
             },

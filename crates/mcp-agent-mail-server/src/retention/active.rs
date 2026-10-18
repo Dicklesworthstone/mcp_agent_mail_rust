@@ -171,7 +171,9 @@ fn apply_successful_turn_pool_policy(pool: &mut Option<DbPool>, turn: &turn::Tur
 }
 
 fn run(config: &Config, stop: &AtomicBool) {
-    run_with(config, stop, turn::disk_is_critical, |delay| pause(delay, stop));
+    run_with(config, stop, turn::disk_is_critical, |delay| {
+        pause(delay, stop)
+    });
 }
 
 fn run_with(
@@ -278,7 +280,15 @@ mod tests {
             },
         );
         assert_eq!(probes.get(), 3);
-        assert_eq!(delays, [CATCH_UP_INTERVAL, POLL_INTERVAL, POLL_INTERVAL, POLL_INTERVAL]);
+        assert_eq!(
+            delays,
+            [
+                CATCH_UP_INTERVAL,
+                POLL_INTERVAL,
+                POLL_INTERVAL,
+                POLL_INTERVAL
+            ]
+        );
         assert!(!database.exists());
         assert!(!config.storage_root.exists());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
@@ -302,7 +312,11 @@ mod tests {
             &stop,
             || {
                 probes.set(probes.get() + 1);
-                assert_eq!(probes.get(), 1, "shutdown must precede the next disk/source probe");
+                assert_eq!(
+                    probes.get(),
+                    1,
+                    "shutdown must precede the next disk/source probe"
+                );
                 true
             },
             |delay| {
@@ -477,7 +491,9 @@ mod tests {
 
             apply_successful_turn_pool_policy(&mut pool, &turn);
 
-            let retained = pool.as_ref().expect("healthy idle turn retired source pool");
+            let retained = pool
+                .as_ref()
+                .expect("healthy idle turn retired source pool");
             assert_eq!(retained.engine_identity_key(), engine);
             assert!(!retained.is_closed());
         });
@@ -591,7 +607,8 @@ mod tests {
                 .env(CHILD, name)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn().unwrap();
+                .spawn()
+                .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut expired = false;
             while child.try_wait().unwrap().is_none() {
@@ -603,8 +620,12 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let output = child.wait_with_output().unwrap();
-            assert!(!expired && output.status.success(), "{name}: {}\n{}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(
+                !expired && output.status.success(),
+                "{name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
             return;
         }
@@ -625,46 +646,77 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let observed = loop {
             let path = std::fs::read_dir(parent).ok().and_then(|entries| {
-                entries.filter_map(Result::ok).map(|entry| entry.path()).find(|path| {
-                    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-                        name.starts_with(".am-active-reservation-reconcile-") && name.ends_with(".json")
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with(".am-active-reservation-reconcile-")
+                                    && name.ends_with(".json")
+                            })
                     })
-                })
             });
             if let Some(path) = path {
-                let snapshot = std::fs::read(&path).ok().and_then(|bytes| {
-                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                });
+                let snapshot = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
                 if snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot["retries"].as_array().is_some_and(|ids| ids.len() == count)
+                    snapshot["retries"]
+                        .as_array()
+                        .is_some_and(|ids| ids.len() == count)
                 }) {
                     break Some(path);
                 }
             }
-            if Instant::now() >= deadline { break None; }
+            if Instant::now() >= deadline {
+                break None;
+            }
             std::thread::sleep(Duration::from_millis(25));
         };
         // Join while publication is still refused. The next worker must not
         // inherit either this run's cursor or its lifetime checkpoint lock.
         drop(worker);
         let _ = release_tx.send(());
-        assert!(owner.join().unwrap().is_ok(), "worker waited for fence-owner expiry");
+        assert!(
+            owner.join().unwrap().is_ok(),
+            "worker waited for fence-owner expiry"
+        );
         let path = observed.expect("worker never checkpointed its deferred active leases");
-        let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let mut ids = snapshot["retries"].as_array().unwrap().iter()
-            .map(|entry| entry["id"].as_i64().unwrap()).collect::<Vec<_>>();
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut ids = snapshot["retries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_i64().unwrap())
+            .collect::<Vec<_>>();
         ids.sort_unstable();
-        assert_eq!(ids, (401..=400 + i64::try_from(count).unwrap()).collect::<Vec<_>>());
+        assert_eq!(
+            ids,
+            (401..=400 + i64::try_from(count).unwrap()).collect::<Vec<_>>()
+        );
         assert_eq!(snapshot["binding"]["generation"], "aabb");
         assert_eq!(snapshot["version"], 1);
-        let lock = std::fs::OpenOptions::new().read(true).write(true)
-            .open(path.with_extension("json.lock")).unwrap();
-        fs2::FileExt::try_lock_exclusive(&lock).expect("stopped worker retained checkpoint ownership");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock)
+            .expect("stopped worker retained checkpoint ownership");
         drop(lock);
         for id in ids {
-            assert!(!config.storage_root.join(format!(
-                "projects/project/file_reservations/id-{id}-gaabb.json"
-            )).exists(), "a held publication fence must not be bypassed");
+            assert!(
+                !config
+                    .storage_root
+                    .join(format!(
+                        "projects/project/file_reservations/id-{id}-gaabb.json"
+                    ))
+                    .exists(),
+                "a held publication fence must not be bypassed"
+            );
         }
     }
 
@@ -732,7 +784,10 @@ mod tests {
             };
             // Join before inspecting results, including on assertion failure.
             drop(worker);
-            assert!(complete, "the worker did not commit the complete active backlog");
+            assert!(
+                complete,
+                "the worker did not commit the complete active backlog"
+            );
             assert_eq!(
                 attempts.load(Ordering::Acquire),
                 if fail_first { 2 } else { 1 }
@@ -754,7 +809,10 @@ mod tests {
                     .output()
                     .unwrap();
                 assert!(committed.status.success());
-                assert_eq!(committed.stdout, bytes, "working tree and committed lease must agree");
+                assert_eq!(
+                    committed.stdout, bytes,
+                    "working tree and committed lease must agree"
+                );
             }
             let pool = DbPool::new(&selected_pool(&config)).unwrap();
             let conn = fastmcp_core::block_on(pool.acquire(&cx))
@@ -766,9 +824,16 @@ mod tests {
                     &[],
                 )
                 .unwrap();
-            assert_eq!(rows.len(), count, "repair must not create or remove source leases");
+            assert_eq!(
+                rows.len(),
+                count,
+                "repair must not create or remove source leases"
+            );
             for (offset, row) in rows.iter().enumerate() {
-                assert_eq!(row.get_named::<i64>("id").unwrap(), 401 + i64::try_from(offset).unwrap());
+                assert_eq!(
+                    row.get_named::<i64>("id").unwrap(),
+                    401 + i64::try_from(offset).unwrap()
+                );
                 assert_eq!(row.get_named::<Option<i64>>("released_ts").unwrap(), None);
                 assert_eq!(row.get_named::<i64>("expires_ts").unwrap(), expires);
             }

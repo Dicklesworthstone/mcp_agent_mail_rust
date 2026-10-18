@@ -136,7 +136,9 @@ fn steady_writes_reuse_one_engine_and_recovery_invalidates_resident_owners() {
         passes += 1;
     }
     for writer in writers {
-        writer.join().expect("writer completed without a cold bootstrap");
+        writer
+            .join()
+            .expect("writer completed without a cold bootstrap");
     }
     assert!(write_barrier::try_acquire_promotion_barrier_if_idle().is_none());
     let (failed, drain) =
@@ -163,8 +165,14 @@ fn steady_writes_reuse_one_engine_and_recovery_invalidates_resident_owners() {
     assert!(!matches!(drain, DrainOutcome::TimedOut { .. }));
     assert!(write_barrier::try_begin_write_activity().is_none());
     let recovery = pool.try_recover_from_corruption("GH353 healthy-file retirement regression");
-    assert!(recovery.is_err(), "healthy parser-only recovery remains terminal");
-    assert!(get_cached_pool(&config).is_none(), "retired generation was resurrected");
+    assert!(
+        recovery.is_err(),
+        "healthy parser-only recovery remains terminal"
+    );
+    assert!(
+        get_cached_pool(&config).is_none(),
+        "retired generation was resurrected"
+    );
     assert!(runtime.block_on(pool.acquire(&cx)).into_result().is_err());
     let replacement = get_or_create_pool(&config).unwrap();
     assert_ne!(replacement.sqlite_identity_key(), generation);
@@ -190,7 +198,13 @@ fn steady_writes_reuse_one_engine_and_recovery_invalidates_resident_owners() {
         drop(create_pool(&other).unwrap());
     }
     assert!(
-        WRITE_POOL_RESIDENTS.get().unwrap().lock().unwrap().owners.len()
+        WRITE_POOL_RESIDENTS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .owners
+            .len()
             <= WRITE_POOL_RESIDENT_CAPACITY
     );
     assert_eq!(

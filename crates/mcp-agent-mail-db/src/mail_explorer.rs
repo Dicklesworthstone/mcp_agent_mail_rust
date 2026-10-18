@@ -979,8 +979,7 @@ fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
 fn collect_agent_names(agents: &mut std::collections::HashSet<String>, names_csv: &str) {
     for raw in names_csv.split(',') {
         let name = raw.trim();
-        if !name.is_empty()
-            && crate::project_mailbox::parse_project_mailbox_address(name).is_none()
+        if !name.is_empty() && crate::project_mailbox::parse_project_mailbox_address(name).is_none()
         {
             agents.insert(name.to_string());
         }

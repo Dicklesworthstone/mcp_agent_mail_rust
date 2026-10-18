@@ -827,10 +827,13 @@ pub fn transform_file(
         let content = transform(&source)?;
         // Refuse before backup/pending records: rolling back here would
         // itself clobber the concurrent writer we are trying to protect.
-        reject_unexpected_symlink(path, &Op::WriteFile {
-            content: Vec::new(),
-            mode,
-        })?;
+        reject_unexpected_symlink(
+            path,
+            &Op::WriteFile {
+                content: Vec::new(),
+                mode,
+            },
+        )?;
         ensure_in_scope(&ctx.capabilities, path)?;
         if sha256_of_path(path)? != before_hash {
             return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
@@ -865,8 +868,9 @@ pub fn transform_file(
 ///   longer matches the backup's right after we copied it (TOCTOU
 ///   detected).
 pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, MutateError> {
-    mutate_prepared(ctx, path, op, |op, _| Ok(Some(op)))?
-        .ok_or(MutateError::Unsupported("unconditional mutation unexpectedly skipped"))
+    mutate_prepared(ctx, path, op, |op, _| Ok(Some(op)))?.ok_or(MutateError::Unsupported(
+        "unconditional mutation unexpectedly skipped",
+    ))
 }
 
 fn mutate_prepared(
@@ -2263,10 +2267,21 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, MutateError::TamperedBeforeMutate(p) if p == target));
         assert_eq!(fs::read(&target).unwrap(), b"concurrent operator edit");
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
-        assert_eq!(fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(), 0);
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+            0
+        );
         // The error must also release the lock.
-        assert!(transform_file(&ctx, &target, 0o600, |_| Ok(None)).unwrap().is_none());
+        assert!(
+            transform_file(&ctx, &target, 0o600, |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2302,10 +2317,9 @@ mod tests {
             .collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(fs::read(&backups[0]).unwrap(), original);
-        let restored = run_undo_with_scopes(
-            td.path(), run_id, false, true, &[td.path().to_path_buf()],
-        )
-        .unwrap();
+        let restored =
+            run_undo_with_scopes(td.path(), run_id, false, true, &[td.path().to_path_buf()])
+                .unwrap();
         assert!(restored.failures.is_empty(), "{:?}", restored.failures);
         assert_eq!(fs::read(&target).unwrap(), original);
     }
@@ -2316,10 +2330,16 @@ mod tests {
         let target = td.path().join("config.json");
         fs::write(&target, b"not-json").unwrap();
         let ctx = make_ctx(&td, "2026-10-14T00-00-03Z__transform_skip");
-        assert!(transform_file(&ctx, &target, 0o600, |_| Ok(None)).unwrap().is_none());
-        assert!(transform_file(&ctx, &target, 0o600, |source| Ok(Some(source.to_vec())))
-            .unwrap()
-            .is_none());
+        assert!(
+            transform_file(&ctx, &target, 0o600, |_| Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            transform_file(&ctx, &target, 0o600, |source| Ok(Some(source.to_vec())))
+                .unwrap()
+                .is_none()
+        );
         let err = transform_file(&ctx, &target, 0o600, |source| {
             let value: serde_json::Value = serde_json::from_slice(source)?;
             Ok(Some(serde_json::to_vec(&value)?))
@@ -2327,8 +2347,15 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, MutateError::Serde(_)));
         assert_eq!(fs::read(&target).unwrap(), b"not-json");
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
-        assert_eq!(fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(), 0);
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+            0
+        );
     }
 
     #[test]
@@ -2338,13 +2365,22 @@ mod tests {
         fs::write(&target, b"original").unwrap();
         let mut ctx = make_ctx(&td, "2026-10-14T00-00-04Z__transform_dry");
         ctx.dry_run = true;
-        assert!(transform_file(&ctx, &target, 0o600, |_| Ok(Some(b"new".to_vec())))
-            .unwrap()
-            .is_some());
+        assert!(
+            transform_file(&ctx, &target, 0o600, |_| Ok(Some(b"new".to_vec())))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(fs::read(&target).unwrap(), b"original");
         assert!(!td.path().join(".config.json.doctor-lock").exists());
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
-        assert_eq!(fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(), 0);
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+            0
+        );
         ctx.dry_run = false;
         let missing = td.path().join("missing-parent/config.json");
         let skipped = transform_file(&ctx, &missing, 0o600, |_| {

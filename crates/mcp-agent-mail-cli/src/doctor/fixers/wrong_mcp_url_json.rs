@@ -139,7 +139,10 @@ fn scan_value_containers(
     out: &mut Vec<WrongMcpUrlFinding>,
 ) {
     for container_key in SERVERS_CONTAINER_KEYS {
-        let Some(servers) = parent.get(container_key).and_then(serde_json::Value::as_object) else {
+        let Some(servers) = parent
+            .get(container_key)
+            .and_then(serde_json::Value::as_object)
+        else {
             continue;
         };
         for (server_name, server_val) in servers {
@@ -223,7 +226,12 @@ fn url_slot_mut<'a>(
     } else {
         let (container, rest) = pointer.split_once('.')?;
         let (server, field) = rest.rsplit_once('.')?;
-        (None, container.to_string(), server.to_string(), field.to_string())
+        (
+            None,
+            container.to_string(),
+            server.to_string(),
+            field.to_string(),
+        )
     };
     if !SERVERS_CONTAINER_KEYS.contains(&container.as_str())
         || !URL_FIELD_NAMES.contains(&field.as_str())
@@ -592,7 +600,11 @@ mod tests {
             crate::doctor::mutate::MutateError::LockHeld(_)
         ));
         assert_eq!(fs::read(&path).unwrap(), b"{operator write in progress");
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -658,7 +670,11 @@ mod tests {
         assert_eq!(findings[0].json_pointer, "mcpServers.agent-mail.url");
         for field in URL_FIELD_NAMES {
             let expected = format!("/projects/~1repo/mcp_servers/agent-mail.prod/{field}");
-            assert!(findings.iter().any(|finding| finding.json_pointer == expected));
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.json_pointer == expected)
+            );
         }
     }
 
@@ -694,7 +710,10 @@ mod tests {
         assert_eq!(fix(&ctx, &findings[0]).unwrap().actions_taken, 1);
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(repaired["projects"][project]["mcp_servers"][server]["url"], CANONICAL);
+        assert_eq!(
+            repaired["projects"][project]["mcp_servers"][server]["url"],
+            CANONICAL
+        );
         assert_eq!(
             repaired["projects"][project]["mcp_servers"][server]["headers"]["X-Keep"],
             "yes"
@@ -743,7 +762,11 @@ mod tests {
             assert_eq!(result.actions_skipped, 1);
             assert_eq!(fs::read_to_string(&path).unwrap(), edited);
         }
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -807,7 +830,10 @@ mod tests {
         }
         assert_eq!(config, original);
         for token in ["/repo.v2", "~1", "agent/mail.prod~", "漢字/~/path"] {
-            assert_eq!(decode_pointer_token(&escape_pointer_token(token)).as_deref(), Some(token));
+            assert_eq!(
+                decode_pointer_token(&escape_pointer_token(token)).as_deref(),
+                Some(token)
+            );
         }
     }
 }

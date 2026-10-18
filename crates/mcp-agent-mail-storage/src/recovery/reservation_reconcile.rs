@@ -817,11 +817,22 @@ mod tests {
             drop(held);
             let result = worker.join().unwrap();
             pending.expect("observe an actual pending single-connection checkout");
-            assert!(fence_available, "DB checkout retained the global archive fence");
-            assert!(archive_absent, "archive initialized before source checkout completed");
+            assert!(
+                fence_available,
+                "DB checkout retained the global archive fence"
+            );
+            assert!(
+                archive_absent,
+                "archive initialized before source checkout completed"
+            );
             let relative = "projects/project/file_reservations/id-401-gaabb.json";
             if changed_generation {
-                assert!(result.unwrap_err().to_string().contains("source/generation changed"));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("source/generation changed")
+                );
                 assert!(!config.storage_root.join(relative).exists());
             } else {
                 assert!(result.unwrap());

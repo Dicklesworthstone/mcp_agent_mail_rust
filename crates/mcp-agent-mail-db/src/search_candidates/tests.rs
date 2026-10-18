@@ -26,8 +26,7 @@ fn budget_is_mode_aware() {
     let config = CandidateBudgetConfig::default();
     let hybrid =
         CandidateBudget::derive(20, CandidateMode::Hybrid, QueryClass::ShortKeyword, config);
-    let auto =
-        CandidateBudget::derive(20, CandidateMode::Auto, QueryClass::ShortKeyword, config);
+    let auto = CandidateBudget::derive(20, CandidateMode::Auto, QueryClass::ShortKeyword, config);
     let fallback = CandidateBudget::derive(
         20,
         CandidateMode::LexicalFallback,
@@ -665,7 +664,10 @@ fn budget_derivation_serde_roundtrip() {
     let derivation2: CandidateBudgetDerivation = serde_json::from_str(&json).unwrap();
     assert_eq!(derivation.budget, derivation2.budget);
     assert_eq!(derivation.decision.mode, derivation2.decision.mode);
-    assert_eq!(derivation.decision.query_class, derivation2.decision.query_class);
+    assert_eq!(
+        derivation.decision.query_class,
+        derivation2.decision.query_class
+    );
     assert_eq!(
         derivation.decision.chosen_action,
         derivation2.decision.chosen_action

@@ -21,8 +21,7 @@ use mcp_agent_mail_storage::recovery::reservation_reconcile::{
 
 const MAX_BATCHES_PER_TURN: usize = 8;
 const MAX_TURN_ACTIVE_TIME: Duration = Duration::from_millis(250);
-const DISK_PRESSURE_DEFERRED: &str =
-    "reservation reconciliation deferred: critical disk pressure";
+const DISK_PRESSURE_DEFERRED: &str = "reservation reconciliation deferred: critical disk pressure";
 
 /// Run existing bounded storage passes, retaining their individual reports.
 /// Each pass admits at most 32 source candidates and attempts four releases.
@@ -183,7 +182,12 @@ mod tests {
         }
         assert!(critical > 0);
         for level in [0, critical - 1] {
-            assert_eq!(with_disk_admission(level, || Ok(busy_report())).unwrap().repaired, 4);
+            assert_eq!(
+                with_disk_admission(level, || Ok(busy_report()))
+                    .unwrap()
+                    .repaired,
+                4
+            );
         }
     }
 
@@ -203,31 +207,37 @@ mod tests {
         ]);
         let mut observed = Vec::new();
         let follow_up = run_with(
-            || with_disk_admission(pressure.get(), || {
-                calls.set(calls.get() + 1);
-                Ok(reports.pop_front().expect("no speculative storage pass"))
-            }),
+            || {
+                with_disk_admission(pressure.get(), || {
+                    calls.set(calls.get() + 1);
+                    Ok(reports.pop_front().expect("no speculative storage pass"))
+                })
+            },
             |report| {
                 observed.push(report.repaired);
                 pressure.set(critical);
             },
             || Duration::ZERO,
             || false,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(!follow_up, "critical pressure must not force fast polling");
         assert_eq!(calls.get(), 1);
         assert_eq!(observed, [4]);
         assert_eq!(reports.len(), 1, "paused work must remain pending");
         pressure.set(0);
-        assert!(!run_with(
-            || with_disk_admission(pressure.get(), || {
-                calls.set(calls.get() + 1);
-                Ok(reports.pop_front().expect("resume the remaining work"))
-            }),
-            |report| observed.push(report.repaired),
-            || Duration::ZERO,
-            || false,
-        ).unwrap());
+        assert!(
+            !run_with(
+                || with_disk_admission(pressure.get(), || {
+                    calls.set(calls.get() + 1);
+                    Ok(reports.pop_front().expect("resume the remaining work"))
+                }),
+                |report| observed.push(report.repaired),
+                || Duration::ZERO,
+                || false,
+            )
+            .unwrap()
+        );
         assert_eq!(calls.get(), 2);
         assert_eq!(observed, [4, 1]);
         assert!(reports.is_empty());
@@ -247,13 +257,15 @@ mod tests {
             },
         ]);
         let mut observed = Vec::new();
-        assert!(!run_with(
-            || Ok(reports.pop_front().expect("a completed round must yield")),
-            |report| observed.push((report.scanned, report.unchanged, report.repaired)),
-            || Duration::ZERO,
-            || false,
-        )
-        .unwrap());
+        assert!(
+            !run_with(
+                || Ok(reports.pop_front().expect("a completed round must yield")),
+                |report| observed.push((report.scanned, report.unchanged, report.repaired)),
+                || Duration::ZERO,
+                || false,
+            )
+            .unwrap()
+        );
         assert_eq!(observed, [(32, 32, 0), (32, 32, 0), (18, 17, 1)]);
         assert!(reports.is_empty());
     }
@@ -261,34 +273,38 @@ mod tests {
     #[test]
     fn healthy_discovery_obeys_batch_and_active_time_bounds() {
         let mut observed = 0;
-        assert!(run_with(
-            || Ok(healthy_page()),
-            |_| observed += 1,
-            || Duration::ZERO,
-            || false,
-        )
-        .unwrap());
+        assert!(
+            run_with(
+                || Ok(healthy_page()),
+                |_| observed += 1,
+                || Duration::ZERO,
+                || false,
+            )
+            .unwrap()
+        );
         assert_eq!(observed, MAX_BATCHES_PER_TURN);
         for observer_is_slow in [false, true] {
             let time = Cell::new(Duration::ZERO);
             let calls = Cell::new(0);
-            assert!(run_with(
-                || {
-                    calls.set(calls.get() + 1);
-                    if !observer_is_slow {
-                        time.set(MAX_TURN_ACTIVE_TIME);
-                    }
-                    Ok(healthy_page())
-                },
-                |_| {
-                    if observer_is_slow {
-                        time.set(MAX_TURN_ACTIVE_TIME);
-                    }
-                },
-                || time.get(),
-                || false,
-            )
-            .unwrap());
+            assert!(
+                run_with(
+                    || {
+                        calls.set(calls.get() + 1);
+                        if !observer_is_slow {
+                            time.set(MAX_TURN_ACTIVE_TIME);
+                        }
+                        Ok(healthy_page())
+                    },
+                    |_| {
+                        if observer_is_slow {
+                            time.set(MAX_TURN_ACTIVE_TIME);
+                        }
+                    },
+                    || time.get(),
+                    || false,
+                )
+                .unwrap()
+            );
             assert_eq!(calls.get(), 1);
         }
     }
@@ -296,32 +312,36 @@ mod tests {
     #[test]
     fn healthy_work_cannot_spin_on_cooling_debt_or_ignore_cancellation() {
         let mut calls = 0;
-        assert!(run_with(
-            || {
-                calls += 1;
-                Ok(ReservationReconcileReport {
-                    retry_len: 1,
-                    ..healthy_page()
-                })
-            },
-            |_| {},
-            || Duration::ZERO,
-            || false,
-        )
-        .unwrap());
+        assert!(
+            run_with(
+                || {
+                    calls += 1;
+                    Ok(ReservationReconcileReport {
+                        retry_len: 1,
+                        ..healthy_page()
+                    })
+                },
+                |_| {},
+                || Duration::ZERO,
+                || false,
+            )
+            .unwrap()
+        );
         assert_eq!(calls, 1);
         let stop = Cell::new(false);
         let mut observed = 0;
-        assert!(!run_with(
-            || Ok(healthy_page()),
-            |_| {
-                observed += 1;
-                stop.set(true);
-            },
-            || Duration::ZERO,
-            || stop.get(),
-        )
-        .unwrap());
+        assert!(
+            !run_with(
+                || Ok(healthy_page()),
+                |_| {
+                    observed += 1;
+                    stop.set(true);
+                },
+                || Duration::ZERO,
+                || stop.get(),
+            )
+            .unwrap()
+        );
         assert_eq!(observed, 1);
     }
 
@@ -477,12 +497,16 @@ mod tests {
         let backlog = run_with(
             || {
                 stop.set(true);
-                Err("reservation reconciliation deferred: checkpoint owned by another worker".into())
+                Err(
+                    "reservation reconciliation deferred: checkpoint owned by another worker"
+                        .into(),
+                )
             },
             |_| observed += 1,
             || Duration::ZERO,
             || stop.get(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(!backlog);
         assert_eq!(observed, 0);
     }
@@ -509,13 +533,15 @@ mod tests {
         assert!(backlog);
         assert_eq!(calls, 2);
         assert_eq!(observed, [4]);
-        assert!(!run_with(
-            || Ok(ReservationReconcileReport::default()),
-            |_| {},
-            || Duration::ZERO,
-            || false,
-        )
-        .unwrap());
+        assert!(
+            !run_with(
+                || Ok(ReservationReconcileReport::default()),
+                |_| {},
+                || Duration::ZERO,
+                || false,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -605,13 +631,15 @@ mod tests {
 
     #[test]
     fn stop_before_admission_never_reads_or_publishes() {
-        assert!(!run_with(
-            || panic!("stopped turn must not invoke storage"),
-            |_| panic!("no invented report"),
-            || Duration::ZERO,
-            || true,
-        )
-        .unwrap());
+        assert!(
+            !run_with(
+                || panic!("stopped turn must not invoke storage"),
+                |_| panic!("no invented report"),
+                || Duration::ZERO,
+                || true,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -772,10 +800,15 @@ mod tests {
         })
         .unwrap();
         let cx = Cx::for_testing();
-        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+        let conn = fastmcp_core::block_on(pool.acquire(&cx))
+            .into_result()
+            .unwrap();
         conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(71, 'project', '/project', 1)").unwrap();
         conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(81, 71, 'BlueLake', 'test', 'test', 1, 1)").unwrap();
-        conn.execute_raw("INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')").unwrap();
+        conn.execute_raw(
+            "INSERT OR REPLACE INTO db_identity(singleton, generation_id) VALUES(0, 'aabb')",
+        )
+        .unwrap();
         for id in 401..483 {
             conn.execute_raw(&format!(
                 "INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'worker/{id}.rs', 1, 'unchanged', 1000000, 9000000, NULL)"
@@ -790,12 +823,15 @@ mod tests {
         // Exercise the actual worker entrypoint and metric before allowing
         // recovery. A pause must not even create its checkpoint beside SQLite.
         let before_names = directory_names(temp.path());
-        let pressure = &mcp_agent_mail_core::global_metrics().system.disk_pressure_level;
+        let pressure = &mcp_agent_mail_core::global_metrics()
+            .system
+            .disk_pressure_level;
         let restore_pressure = RestoreDiskPressure(pressure.load());
         pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
         let paused = run(&cx, &pool, &config, &mut cursor, &stop, |_| {
             panic!("disk pause must not report a completed storage pass");
-        }).unwrap();
+        })
+        .unwrap();
         drop(restore_pressure);
         assert!(!paused);
         assert_eq!(directory_names(temp.path()), before_names);
@@ -834,35 +870,53 @@ mod tests {
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
         let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
         assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
-        assert!(!config.storage_root.join("projects/project/file_reservations/id-401-gaabb.json").exists());
+        assert!(
+            !config
+                .storage_root
+                .join("projects/project/file_reservations/id-401-gaabb.json")
+                .exists()
+        );
         // A later pressure pause must also keep an already-owned checkpoint.
         // No DB reader is held while the competing cursor checks admission.
         let owned_names = directory_names(temp.path());
         let head_before_pause = repo.head().unwrap().target();
         let restore_pressure = RestoreDiskPressure(pressure.load());
         pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
-        assert!(!run(&cx, &pool, &config, &mut cursor, &stop, |_| {
-            panic!("an owned checkpoint pause is not a completed pass");
-        }).unwrap());
+        assert!(
+            !run(&cx, &pool, &config, &mut cursor, &stop, |_| {
+                panic!("an owned checkpoint pause is not a completed pass");
+            })
+            .unwrap()
+        );
         drop(restore_pressure);
         assert_eq!(directory_names(temp.path()), owned_names);
         assert_eq!(repo.head().unwrap().target(), head_before_pause);
         let mut contender = ReservationReconcileCursor::default();
         assert_eq!(
-            contender.reconcile_checkpointed(&cx, &pool, &config, &stop).unwrap_err(),
+            contender
+                .reconcile_checkpointed(&cx, &pool, &config, &stop)
+                .unwrap_err(),
             "reservation reconciliation deferred: checkpoint owned by another worker",
         );
-        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+        let conn = fastmcp_core::block_on(pool.acquire(&cx))
+            .into_result()
+            .unwrap();
         assert_eq!(
-            conn.query_sync("SELECT COUNT(*) FROM file_reservations WHERE released_ts IS NULL", &[])
-                .unwrap()[0]
+            conn.query_sync(
+                "SELECT COUNT(*) FROM file_reservations WHERE released_ts IS NULL",
+                &[]
+            )
+            .unwrap()[0]
                 .get_as::<i64>(0)
                 .unwrap(),
             82,
         );
         assert_eq!(
-            conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=482", &[])
-                .unwrap()[0]
+            conn.query_sync(
+                "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=482",
+                &[]
+            )
+            .unwrap()[0]
                 .get_as::<i64>(0)
                 .unwrap(),
             5_000_000,

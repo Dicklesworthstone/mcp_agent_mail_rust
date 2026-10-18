@@ -1574,10 +1574,7 @@ fn write_op_sync_direct_with_cancel(
 /// context. Cancellation racing fence admission exits before any archive
 /// mutation bookkeeping or filesystem publication begins.
 #[must_use]
-pub fn write_op_sync_direct_cancellable(
-    cx: &asupersync::Cx,
-    op: &WriteOp,
-) -> DirectArchiveWrite {
+pub fn write_op_sync_direct_cancellable(cx: &asupersync::Cx, op: &WriteOp) -> DirectArchiveWrite {
     write_op_sync_direct_with_cancel(op, || cx.checkpoint().is_err())
 }
 

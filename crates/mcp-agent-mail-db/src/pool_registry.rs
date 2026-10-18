@@ -205,7 +205,9 @@ mod tests {
         );
         let displaced = {
             let _guard = registry_lock.lock().unwrap();
-            cache.retain("second".into(), || ReentrantDrop(Arc::clone(&registry_lock)))
+            cache.retain("second".into(), || {
+                ReentrantDrop(Arc::clone(&registry_lock))
+            })
         };
         drop(displaced);
     }

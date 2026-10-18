@@ -236,11 +236,7 @@ fn create_retention_pool_if_admitted(
     Some(create_pool(&retention_pool_config(config)))
 }
 
-fn retention_loop(
-    config: &Config,
-    settled_before_us: i64,
-    last_report: &mut Option<Instant>,
-) {
+fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Option<Instant>) {
     let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
     let message_repair_enabled = message_archive_reconcile::enabled(config);
     let reservation_repair_enabled = reservation_reconcile::enabled(config);
@@ -318,10 +314,8 @@ fn retention_loop(
         // deadline before borrowing the pool, creating a Cx or reading SQL.
         // Missing pools and errors get the normal retry delay, without a
         // fabricated successful storage report or a discarded repair cursor.
-        if let Some(Err(error)) = repair_schedule.run_if_due(
-            schedule::Lane::Messages,
-            Instant::now,
-            || {
+        if let Some(Err(error)) =
+            repair_schedule.run_if_due(schedule::Lane::Messages, Instant::now, || {
                 if SHUTDOWN.load(Ordering::Acquire) {
                     return None;
                 }
@@ -354,8 +348,8 @@ fn retention_loop(
                         }
                     },
                 ))
-            },
-        ) {
+            })
+        {
             warn!(
                 target: "maintenance",
                 event = "message_archive_reconcile_source_unavailable",
@@ -367,10 +361,8 @@ fn retention_loop(
             pool = None;
         }
 
-        if let Some(Err(error)) = repair_schedule.run_if_due(
-            schedule::Lane::Agents,
-            Instant::now,
-            || {
+        if let Some(Err(error)) =
+            repair_schedule.run_if_due(schedule::Lane::Agents, Instant::now, || {
                 if SHUTDOWN.load(Ordering::Acquire) {
                     return None;
                 }
@@ -398,8 +390,8 @@ fn retention_loop(
                         }
                     },
                 ))
-            },
-        ) {
+            })
+        {
             warn!(
                 target: "maintenance",
                 event = "agent_archive_reconcile_source_unavailable",
@@ -2201,7 +2193,10 @@ mod source_admission_tests {
         let config = config(&obstruction);
         let result = create_retention_pool_if_admitted(&config, 0)
             .expect("noncritical pressure must attempt ordinary source admission");
-        assert!(result.is_err(), "an invalid source must remain a real error");
+        assert!(
+            result.is_err(),
+            "an invalid source must remain a real error"
+        );
         assert_eq!(std::fs::read(&obstruction).unwrap(), b"preserve this file");
     }
 }

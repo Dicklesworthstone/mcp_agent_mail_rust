@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
-use mcp_agent_mail_db::{DbConn, DbPool};
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value as SqlValue};
+use mcp_agent_mail_db::{DbConn, DbPool};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -1172,9 +1172,14 @@ mod tests {
             let original = prepare_message(cx, pool, 901).unwrap();
             assert_eq!(original.body, "Keep this body.");
             assert_eq!(original.message["bcc"], json!(["RedFox"]));
-            assert_eq!(reconcile_prepared(config, &original).unwrap(), ReconcileResult::default());
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap(),
+                ReconcileResult::default()
+            );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            let rows = conn.query_sync("SELECT COUNT(*) AS n FROM messages", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap();
             assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
             let receipts = conn.query_sync(
                 "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901 AND agent_id = 102",
@@ -1194,10 +1199,15 @@ mod tests {
                     conn.query_sync(sql, params)
                         .map_err(ReconcileFailure::source_unavailable)
                 })
-            }).unwrap();
+            })
+            .unwrap();
             assert_eq!(original.body, "Keep this body.");
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            assert_eq!(query_only(&conn), 1, "successful reads must retain the connection");
+            assert_eq!(
+                query_only(&conn),
+                1,
+                "successful reads must retain the connection"
+            );
             conn.execute_raw("PRAGMA query_only = OFF").unwrap();
         });
     }
@@ -1206,14 +1216,24 @@ mod tests {
     fn conflicting_source_metadata_does_not_retire_reader_or_weaken_refusal() {
         fixture(|cx, pool, config| {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"]}' WHERE id = 901").unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"]}' WHERE id = 901",
+            )
+            .unwrap();
             conn.execute_raw("PRAGMA query_only = ON").unwrap();
             drop(conn);
             let failure = prepare_message_classified(cx, pool, 901).err().unwrap();
-            assert!(!failure.transient, "conflicting evidence is not a failed reader");
+            assert!(
+                !failure.transient,
+                "conflicting evidence is not a failed reader"
+            );
             assert!(failure.detail.contains("lacks cc array"));
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            assert_eq!(query_only(&conn), 1, "metadata refusal must not churn the pool");
+            assert_eq!(
+                query_only(&conn),
+                1,
+                "metadata refusal must not churn the pool"
+            );
             conn.execute_raw("PRAGMA query_only = OFF").unwrap();
             drop(conn);
             let report = reconcile_message_batch(
@@ -1222,11 +1242,17 @@ mod tests {
                 config,
                 &mut ReconcileCursor::default(),
                 &AtomicBool::new(false),
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(report.deferred_conflict, 1);
             assert_eq!(report.repaired, 0);
             assert_eq!(report.retry_len, 0);
-            assert!(!config.storage_root.join("projects/project/messages").exists());
+            assert!(
+                !config
+                    .storage_root
+                    .join("projects/project/messages")
+                    .exists()
+            );
         });
     }
 }

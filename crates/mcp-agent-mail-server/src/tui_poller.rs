@@ -6856,11 +6856,8 @@ first body
             ));
         }
         let next = completed + 30_000_000;
-        let refreshed = require_full_update(fetch_db_stats_with_clock(
-            &mut state,
-            &previous,
-            || next,
-        ));
+        let refreshed =
+            require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || next));
         assert_eq!(refreshed.agents, 2);
         assert!(refreshed.agents_list.is_empty());
     }
@@ -6884,7 +6881,10 @@ first body
         if available_version.is_some() {
             assert!(matches!(update, Some(DbPollSnapshotUpdate::Snapshot(_))));
         } else {
-            assert!(matches!(update, Some(DbPollSnapshotUpdate::TimestampOnly(_))));
+            assert!(matches!(
+                update,
+                Some(DbPollSnapshotUpdate::TimestampOnly(_))
+            ));
         }
     }
 
@@ -6912,12 +6912,15 @@ first body
             );
             // Without an engine change notification the existing 30s fallback
             // remains the freshness contract; do not claim event-driven reads.
-            let observed_at = if changed_version { now + 1 } else { now + 30_000_000 };
-            let refreshed = require_full_update(fetch_db_stats_with_clock(
-                &mut state,
-                &previous,
-                || observed_at,
-            ));
+            let observed_at = if changed_version {
+                now + 1
+            } else {
+                now + 30_000_000
+            };
+            let refreshed =
+                require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || {
+                    observed_at
+                }));
             assert_eq!(refreshed.agents, 3);
             assert_eq!(refreshed.agents_list.len(), 1);
             assert_eq!(refreshed.agents_list[0].name, "RedFox");
@@ -6955,18 +6958,22 @@ first body
             expires_ts: 2,
             released_ts: None,
         }];
-        let refreshed = require_full_update(fetch_db_stats_with_clock(
-            &mut state,
-            &previous,
-            || now + 1,
-        ));
+        let refreshed =
+            require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || now + 1));
         assert_eq!(refreshed.file_reservations, 0);
         assert_eq!(refreshed.projects_list[0].reservation_count, 0);
         assert!(refreshed.reservation_snapshots.is_empty());
         assert_eq!(refreshed.agents, 2);
         assert!(refreshed.agents_list.is_empty());
-        let rows = state.conn.query_sync("SELECT id FROM file_reservations", &[]).unwrap();
-        assert_eq!(rows.len(), 1, "observability must not delete the expired lease");
+        let rows = state
+            .conn
+            .query_sync("SELECT id FROM file_reservations", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "observability must not delete the expired lease"
+        );
     }
 
     #[test]

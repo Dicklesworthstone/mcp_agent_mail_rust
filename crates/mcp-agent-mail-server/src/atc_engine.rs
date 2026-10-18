@@ -6660,12 +6660,7 @@ mod engine_tests {
             entry.sprt_log_lr = 5.0;
         }
         engine.schedule_entry_for_push("Phoenix", i64::MAX);
-        engine.record_pending_liveness_feedback(
-            "Phoenix",
-            LivenessAction::Suspect,
-            2.0,
-            8_000_000,
-        );
+        engine.record_pending_liveness_feedback("Phoenix", LivenessAction::Suspect, 2.0, 8_000_000);
         let before = engine.agents["Phoenix"].clone();
         let heap = engine.liveness_schedule.clone().into_sorted_vec();
 
@@ -6676,7 +6671,10 @@ mod engine_tests {
         let after = &engine.agents["Phoenix"];
         assert_eq!(after.state, before.state);
         assert_eq!(after.project_key, before.project_key);
-        assert_eq!(after.rhythm.last_activity_ts, before.rhythm.last_activity_ts);
+        assert_eq!(
+            after.rhythm.last_activity_ts,
+            before.rhythm.last_activity_ts
+        );
         assert_eq!(after.schedule_version, before.schedule_version);
         assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
         assert!(engine.pending_liveness_feedback.contains_key("Phoenix"));
@@ -6697,11 +6695,19 @@ mod engine_tests {
 
         engine.observe_activity("FeedbackAgent", None, 3_000_000);
         engine.observe_activity("FeedbackAgent", None, 4_000_000);
-        assert!(engine.pending_liveness_feedback.contains_key("FeedbackAgent"));
+        assert!(
+            engine
+                .pending_liveness_feedback
+                .contains_key("FeedbackAgent")
+        );
         assert_eq!(engine.resolved_experience_count, 0);
 
         engine.observe_activity("FeedbackAgent", None, 4_000_001);
-        assert!(!engine.pending_liveness_feedback.contains_key("FeedbackAgent"));
+        assert!(
+            !engine
+                .pending_liveness_feedback
+                .contains_key("FeedbackAgent")
+        );
         assert_eq!(engine.resolved_experience_count, 1);
     }
 

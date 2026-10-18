@@ -1162,7 +1162,10 @@ mod tests {
                 "{result:?}"
             );
             assert_failed_grant_rolled_back(&conn);
-            assert_eq!(connection_scalar(&conn, "SELECT id FROM ack_grant_audit"), 700);
+            assert_eq!(
+                connection_scalar(&conn, "SELECT id FROM ack_grant_audit"),
+                700
+            );
             conn.execute_raw("DROP TRIGGER ignore_ack_grant").unwrap();
             let committed = granted(run(grant_on_connection(cx, &conn, &request, &pattern)));
             assert_eq!(
@@ -1265,7 +1268,10 @@ mod tests {
                 .unwrap();
             assert_eq!(stored.len(), 1);
             let stored = &stored[0];
-            assert_eq!(stored.get_named::<i64>("id").unwrap(), committed.id.unwrap());
+            assert_eq!(
+                stored.get_named::<i64>("id").unwrap(),
+                committed.id.unwrap()
+            );
             assert_eq!(
                 stored.get_named::<i64>("project_id").unwrap(),
                 committed.project_id
@@ -1282,7 +1288,10 @@ mod tests {
                 stored.get_named::<i64>("exclusive").unwrap(),
                 committed.exclusive
             );
-            assert_eq!(stored.get_named::<String>("reason").unwrap(), committed.reason);
+            assert_eq!(
+                stored.get_named::<String>("reason").unwrap(),
+                committed.reason
+            );
             assert_eq!(
                 stored.get_named::<i64>("created_ts").unwrap(),
                 committed.created_ts
@@ -1291,7 +1300,10 @@ mod tests {
                 stored.get_named::<i64>("expires_ts").unwrap(),
                 committed.expires_ts
             );
-            assert_eq!(stored.get_named::<Option<i64>>("released_ts").unwrap(), None);
+            assert_eq!(
+                stored.get_named::<Option<i64>>("released_ts").unwrap(),
+                None
+            );
             assert_eq!(
                 Some(connection_scalar(
                     &conn,
@@ -1299,7 +1311,10 @@ mod tests {
                 )),
                 committed.id
             );
-            assert_eq!(connection_scalar(&conn, "SELECT id FROM ack_grant_audit"), 700);
+            assert_eq!(
+                connection_scalar(&conn, "SELECT id FROM ack_grant_audit"),
+                700
+            );
         });
     }
 
@@ -1348,7 +1363,11 @@ mod tests {
                             0
                         );
                         assert_eq!(
-                            scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                            scalar(
+                                pool,
+                                cx,
+                                "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                            ),
                             i64::from(!shared)
                         );
                     });
@@ -1363,7 +1382,11 @@ mod tests {
             let request = request(generation, observed);
             execute(pool, cx, "UPDATE agents SET retired_at = 42 WHERE id = 102");
             stale(run(grant_ack_escalation(cx, pool, &request)));
-            execute(pool, cx, "UPDATE agents SET retired_at = NULL WHERE id = 102");
+            execute(
+                pool,
+                cx,
+                "UPDATE agents SET retired_at = NULL WHERE id = 102",
+            );
             let first = granted(run(grant_ack_escalation(cx, pool, &request)));
             execute(
                 pool,
@@ -1382,7 +1405,11 @@ mod tests {
                 first.expires_ts
             );
             assert_eq!(
-                scalar(pool, cx, "SELECT deregistered_at FROM agent_deregistrations"),
+                scalar(
+                    pool,
+                    cx,
+                    "SELECT deregistered_at FROM agent_deregistrations"
+                ),
                 42
             );
         });
@@ -1397,7 +1424,11 @@ mod tests {
                 "ALTER TABLE agent_deregistrations RENAME TO unavailable_deregistrations",
             );
             assert!(matches!(
-                run(grant_ack_escalation(cx, pool, &request(generation, observed))),
+                run(grant_ack_escalation(
+                    cx,
+                    pool,
+                    &request(generation, observed)
+                )),
                 Outcome::Err(_)
             ));
             assert_eq!(
@@ -1413,7 +1444,11 @@ mod tests {
                 cx,
                 "ALTER TABLE unavailable_deregistrations RENAME TO agent_deregistrations",
             );
-            granted(run(grant_ack_escalation(cx, pool, &request(generation, observed))));
+            granted(run(grant_ack_escalation(
+                cx,
+                pool,
+                &request(generation, observed),
+            )));
         });
     }
 

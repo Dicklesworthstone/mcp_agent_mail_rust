@@ -67,7 +67,11 @@ impl ReleaseFlow {
             decision_id: effect.decision_id,
             trace_id: effect.trace_id.clone(),
             agent: effect.agent.clone(),
-            project_key: effect.project_key.as_deref().map(str::trim).map(str::to_string),
+            project_key: effect
+                .project_key
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_string),
         }
     }
 }
@@ -979,12 +983,15 @@ mod tests {
                 "release_reservations_requested" => Some(AtcTickAction::ReleaseReservations {
                     agent: effect.agent.clone(),
                 }),
-                "send_advisory" => effect.message.as_ref().map(|message| {
-                    AtcTickAction::SendAdvisory {
-                        agent: effect.agent.clone(),
-                        message: message.clone(),
-                    }
-                }),
+                "send_advisory" => {
+                    effect
+                        .message
+                        .as_ref()
+                        .map(|message| AtcTickAction::SendAdvisory {
+                            agent: effect.agent.clone(),
+                            message: message.clone(),
+                        })
+                }
                 _ => None,
             })
             .collect()
@@ -995,7 +1002,12 @@ mod tests {
         let mut active = row("BlueLake", 1, "/alpha");
         active.last_active_ts += 1;
         let scope = PopulationScope::from_rows(&[active]);
-        let request = effect("BlueLake", Some("/alpha"), "release_reservations_requested", None);
+        let request = effect(
+            "BlueLake",
+            Some("/alpha"),
+            "release_reservations_requested",
+            None,
+        );
         let paired = request_notice(&request, "ATC requested reservation release");
         let mut completed = request_notice(&request, "a previous release completed");
         completed.decision_id = 99;
@@ -1006,13 +1018,23 @@ mod tests {
         let mut actions = proposal_actions(&effects);
         assert_eq!(
             scope.retain_authorized(&mut effects, &mut actions),
-            ScopeDisposition { effects_withheld: 2, actions_withheld: 2 }
+            ScopeDisposition {
+                effects_withheld: 2,
+                actions_withheld: 2
+            }
         );
         assert_eq!(effects.len(), 2);
-        assert_eq!(effects[0].message.as_deref(), Some("a previous release completed"));
+        assert_eq!(
+            effects[0].message.as_deref(),
+            Some("a previous release completed")
+        );
         assert_eq!(effects[1].message.as_deref(), Some("inspect the conflict"));
         assert_eq!(actions.len(), 2);
-        assert!(actions.iter().all(|action| matches!(action, AtcTickAction::SendAdvisory { .. })));
+        assert!(
+            actions
+                .iter()
+                .all(|action| matches!(action, AtcTickAction::SendAdvisory { .. }))
+        );
     }
 
     #[test]
@@ -1020,7 +1042,12 @@ mod tests {
         let mut active = row("BlueLake", 1, "/alpha");
         active.last_active_ts += 1;
         let scope = PopulationScope::from_rows(&[active, row("RedFox", 1, "/alpha")]);
-        let request = effect("BlueLake", Some("/alpha"), "release_reservations_requested", None);
+        let request = effect(
+            "BlueLake",
+            Some("/alpha"),
+            "release_reservations_requested",
+            None,
+        );
         for dimension in ["decision", "trace", "agent", "project"] {
             let mut rejected = request.clone();
             let mut independent = request_notice(&request, "same body for distinct decisions");
@@ -1035,7 +1062,10 @@ mod tests {
             let mut actions = proposal_actions(&effects);
             assert_eq!(
                 scope.retain_authorized(&mut effects, &mut actions),
-                ScopeDisposition { effects_withheld: 1, actions_withheld: 1 },
+                ScopeDisposition {
+                    effects_withheld: 1,
+                    actions_withheld: 1
+                },
                 "dimension={dimension}"
             );
             assert_eq!(effects.len(), 1);
@@ -1055,23 +1085,57 @@ mod tests {
         let mut active = row("BlueLake", 1, "/alpha");
         active.last_active_ts += 1;
         let scope = PopulationScope::from_rows(&[active]);
-        let old = effect("BlueLake", Some("/alpha"), "release_reservations_requested", None);
+        let old = effect(
+            "BlueLake",
+            Some("/alpha"),
+            "release_reservations_requested",
+            None,
+        );
         let mut fresh = old.clone();
         fresh.timestamp_micros += 1;
         fresh.effect_id = "fresh-request".into();
-        let proposals = [old, fresh, request_notice(&effect(
-            "BlueLake", Some("/alpha"), "release_reservations_requested", None,
-        ), "request notice")];
-        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let proposals = [
+            old,
+            fresh,
+            request_notice(
+                &effect(
+                    "BlueLake",
+                    Some("/alpha"),
+                    "release_reservations_requested",
+                    None,
+                ),
+                "request notice",
+            ),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
             let mut effects: Vec<_> = order.iter().map(|&i| proposals[i].clone()).collect();
-            let expected: Vec<_> = order.iter().filter(|&&i| i != 0)
-                .map(|&i| proposals[i].effect_id.clone()).collect();
+            let expected: Vec<_> = order
+                .iter()
+                .filter(|&&i| i != 0)
+                .map(|&i| proposals[i].effect_id.clone())
+                .collect();
             let mut actions = proposal_actions(&effects);
             assert_eq!(
                 scope.retain_authorized(&mut effects, &mut actions),
-                ScopeDisposition { effects_withheld: 1, actions_withheld: 1 }
+                ScopeDisposition {
+                    effects_withheld: 1,
+                    actions_withheld: 1
+                }
             );
-            assert_eq!(effects.iter().map(|effect| effect.effect_id.clone()).collect::<Vec<_>>(), expected);
+            assert_eq!(
+                effects
+                    .iter()
+                    .map(|effect| effect.effect_id.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
             assert_eq!(actions.len(), 2);
         }
     }
@@ -1081,11 +1145,19 @@ mod tests {
         let mut unobserved = row("BlueLake", 1, "/alpha");
         unobserved.last_active_ts = 0;
         let scope = PopulationScope::from_rows(&[unobserved]);
-        let request = effect("BlueLake", Some("/alpha"), "release_reservations_requested", None);
+        let request = effect(
+            "BlueLake",
+            Some("/alpha"),
+            "release_reservations_requested",
+            None,
+        );
         let completed = request_notice(&request, "completed independently");
         let mut effects = vec![completed.clone()];
         let mut actions = proposal_actions(&effects);
-        assert_eq!(scope.retain_authorized(&mut effects, &mut actions), ScopeDisposition::default());
+        assert_eq!(
+            scope.retain_authorized(&mut effects, &mut actions),
+            ScopeDisposition::default()
+        );
         assert_eq!(effects.len(), 1);
         assert_eq!(actions.len(), 1);
 
@@ -1109,8 +1181,16 @@ mod tests {
             sync_population_with(1_000_000, || Ok(vec![row("BlueLake", 1, "/alpha")])).unwrap();
             let epoch = atc::capture_delivery_epoch().unwrap();
             let mut report = super::super::tick_report(1_000_000).unwrap();
-            let request = effect("BlueLake", Some("/alpha"), "release_reservations_requested", None);
-            report.effects = vec![request.clone(), request_notice(&request, "release requested")];
+            let request = effect(
+                "BlueLake",
+                Some("/alpha"),
+                "release_reservations_requested",
+                None,
+            );
+            report.effects = vec![
+                request.clone(),
+                request_notice(&request, "release requested"),
+            ];
             report.actions = proposal_actions(&report.effects);
             let mut active = row("BlueLake", 1, "/alpha");
             active.last_active_ts = 2_000_000;
@@ -1130,31 +1210,47 @@ mod tests {
 
     #[test]
     fn a_940_agent_withdrawal_cannot_leave_false_request_notices_behind() {
-        let population: Vec<_> = (0..940).map(|index| {
-            let mut active = row(&format!("Agent{index:04}"), 1, "/alpha");
-            active.last_active_ts += i64::from(index % 2 == 0);
-            active
-        }).collect();
+        let population: Vec<_> = (0..940)
+            .map(|index| {
+                let mut active = row(&format!("Agent{index:04}"), 1, "/alpha");
+                active.last_active_ts += i64::from(index % 2 == 0);
+                active
+            })
+            .collect();
         let scope = PopulationScope::from_rows(&population);
         let mut effects = Vec::new();
         for agent in &population {
-            let request = effect(&agent.name, Some("/alpha"), "release_reservations_requested", None);
+            let request = effect(
+                &agent.name,
+                Some("/alpha"),
+                "release_reservations_requested",
+                None,
+            );
             let notice = request_notice(&request, "release requested");
             effects.extend([request, notice]);
         }
         let mut actions = proposal_actions(&effects);
         assert_eq!(
             scope.retain_authorized(&mut effects, &mut actions),
-            ScopeDisposition { effects_withheld: 940, actions_withheld: 940 }
+            ScopeDisposition {
+                effects_withheld: 940,
+                actions_withheld: 940
+            }
         );
         assert_eq!(effects.len(), 940);
         assert_eq!(actions.len(), 940);
-        for (pair, agent) in effects.chunks_exact(2).zip(population.iter().skip(1).step_by(2)) {
+        for (pair, agent) in effects
+            .chunks_exact(2)
+            .zip(population.iter().skip(1).step_by(2))
+        {
             assert_eq!(pair[0].agent, agent.name);
             assert_eq!(pair[0].kind, "release_reservations_requested");
             assert_eq!(pair[1].agent, agent.name);
             assert_eq!(pair[1].semantics.family, "release_notice");
         }
-        assert_eq!(scope.retain_authorized(&mut effects, &mut actions), ScopeDisposition::default());
+        assert_eq!(
+            scope.retain_authorized(&mut effects, &mut actions),
+            ScopeDisposition::default()
+        );
     }
 }

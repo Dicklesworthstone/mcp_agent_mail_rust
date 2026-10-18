@@ -1479,7 +1479,11 @@ mod tests {
 
     #[test]
     fn shared_mailbox_scrub_preserves_routing_but_not_reader_activity() {
-        for preset in [ScrubPreset::Standard, ScrubPreset::Strict, ScrubPreset::Archive] {
+        for preset in [
+            ScrubPreset::Standard,
+            ScrubPreset::Strict,
+            ScrubPreset::Archive,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let db = create_fixture_db(dir.path());
             seed_shared_mailbox_scrub_state(&db);
@@ -1497,14 +1501,14 @@ mod tests {
                     ("inbox_delivery_events", i64::from(archive)),
                 ] {
                     assert_eq!(
-                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}"))
+                            .unwrap(),
                         expected,
                         "preset={preset:?}, table={table}"
                     );
                 }
-                let routing: Value = serde_json::from_str(
-                    &message_text(&conn, "recipients_json"),
-                ).unwrap();
+                let routing: Value =
+                    serde_json::from_str(&message_text(&conn, "recipients_json")).unwrap();
                 let expected = if strict {
                     serde_json::json!({"to": [], "cc": [], "bcc": []})
                 } else {
@@ -1517,13 +1521,26 @@ mod tests {
                     ).unwrap();
                     assert_eq!(rows[0].get_named::<String>("kind").unwrap(), "cc");
                     assert_eq!(rows[0].get_named::<i64>("delivered_ts").unwrap(), 100);
-                    let rows = conn.query_sync(
-                        "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1", &[],
-                    ).unwrap();
-                    assert_eq!(rows[0].get_named::<Option<String>>("read_ts").unwrap().as_deref(),
-                        if archive { Some("read-before") } else { None });
-                    assert_eq!(rows[0].get_named::<Option<String>>("ack_ts").unwrap().as_deref(),
-                        if archive { Some("ack-before") } else { None });
+                    let rows = conn
+                        .query_sync(
+                            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1",
+                            &[],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        rows[0]
+                            .get_named::<Option<String>>("read_ts")
+                            .unwrap()
+                            .as_deref(),
+                        if archive { Some("read-before") } else { None }
+                    );
+                    assert_eq!(
+                        rows[0]
+                            .get_named::<Option<String>>("ack_ts")
+                            .unwrap()
+                            .as_deref(),
+                        if archive { Some("ack-before") } else { None }
+                    );
                 }
                 if archive {
                     let rows = conn.query_sync(
@@ -1535,9 +1552,16 @@ mod tests {
                     assert_eq!(rows[1].get_named::<i64>("agent_id").unwrap(), 2);
                     assert_eq!(rows[1].get_named::<Option<i64>>("read_ts").unwrap(), None);
                     assert_eq!(rows[1].get_named::<Option<i64>>("ack_ts").unwrap(), None);
-                    assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+                    assert_eq!(
+                        message_text(&conn, "archive_metadata_json"),
+                        PRIVATE_ATTACHMENT
+                    );
                 }
-                assert!(conn.query_sync("PRAGMA foreign_key_check", &[]).unwrap().is_empty());
+                assert!(
+                    conn.query_sync("PRAGMA foreign_key_check", &[])
+                        .unwrap()
+                        .is_empty()
+                );
             }
         }
     }
@@ -1561,8 +1585,10 @@ mod tests {
                 } else {
                     conn.execute_raw(&format!("ALTER TABLE {table} RENAME TO private_original"))
                         .unwrap();
-                    conn.execute_raw(&format!("CREATE VIEW {table} AS SELECT * FROM private_original"))
-                        .unwrap();
+                    conn.execute_raw(&format!(
+                        "CREATE VIEW {table} AS SELECT * FROM private_original"
+                    ))
+                    .unwrap();
                 }
                 drop(conn);
                 let error = scrub_snapshot(&db, preset).unwrap_err();
@@ -1582,25 +1608,49 @@ mod tests {
                     ("inbox_delivery_events", 1),
                 ] {
                     assert_eq!(
-                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}"))
+                            .unwrap(),
                         expected,
                         "rollback preset={preset:?}, table={table}"
                     );
                 }
                 assert_eq!(message_text(&conn, "body_md"), "Hello world");
-                assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
-                assert_eq!(serde_json::from_str::<Value>(&message_text(&conn, "recipients_json")).unwrap(),
-                    serde_json::json!({"to": ["TestAgent"], "cc": ["project:test"], "bcc": []}));
-                assert_eq!(conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
-                    .unwrap()[0].get_named::<i64>("ack_required").unwrap(), 1);
-                assert_eq!(conn.query_sync("SELECT human_key FROM projects WHERE id = 1", &[])
-                    .unwrap()[0].get_named::<String>("human_key").unwrap(), "/test");
-                let rows = conn.query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[]).unwrap();
-                assert_eq!(rows[0].get_named::<String>("read_ts").unwrap(), "read-before");
+                assert_eq!(
+                    message_text(&conn, "archive_metadata_json"),
+                    PRIVATE_ATTACHMENT
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(&message_text(&conn, "recipients_json")).unwrap(),
+                    serde_json::json!({"to": ["TestAgent"], "cc": ["project:test"], "bcc": []})
+                );
+                assert_eq!(
+                    conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("ack_required")
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    conn.query_sync("SELECT human_key FROM projects WHERE id = 1", &[])
+                        .unwrap()[0]
+                        .get_named::<String>("human_key")
+                        .unwrap(),
+                    "/test"
+                );
+                let rows = conn
+                    .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get_named::<String>("read_ts").unwrap(),
+                    "read-before"
+                );
                 assert_eq!(rows[0].get_named::<String>("ack_ts").unwrap(), "ack-before");
-                let rows = conn.query_sync(
-                    "SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE agent_id = 1", &[],
-                ).unwrap();
+                let rows = conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE agent_id = 1",
+                        &[],
+                    )
+                    .unwrap();
                 assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 17);
                 assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 19);
             }

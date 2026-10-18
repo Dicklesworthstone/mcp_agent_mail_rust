@@ -130,7 +130,9 @@ fn runtime_candidate(selected: &DbPoolConfig) -> mcp_agent_mail_db::DbResult<DbP
     drop(activity);
 
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&selected.database_url) {
-        return Err(readmission_deferred("cannot recreate a retired in-memory mailbox"));
+        return Err(readmission_deferred(
+            "cannot recreate a retired in-memory mailbox",
+        ));
     }
     if critical_disk_pressure() {
         return Err(readmission_deferred("critical disk pressure"));
@@ -142,7 +144,9 @@ fn runtime_candidate(selected: &DbPoolConfig) -> mcp_agent_mail_db::DbResult<DbP
     let (_promotion, outcome) =
         write_barrier::acquire_promotion_barrier_draining(Duration::from_secs(1));
     if matches!(outcome, DrainOutcome::TimedOut { .. }) {
-        return Err(readmission_deferred("writers did not drain within the re-admission budget"));
+        return Err(readmission_deferred(
+            "writers did not drain within the re-admission budget",
+        ));
     }
     if critical_disk_pressure() {
         return Err(readmission_deferred("critical disk pressure"));
@@ -246,12 +250,15 @@ mod tests {
             assert_eq!(calls.get(), i32::from(!already_stopped));
             assert_eq!(waits.get(), i32::from(!already_stopped));
         }
-        assert!(retry::<(), _>(
-            || Err("source unavailable"),
-            || false,
-            |_| false,
-            |_, _, _| {},
-        ).is_none());
+        assert!(
+            retry::<(), _>(
+                || Err("source unavailable"),
+                || false,
+                |_| false,
+                |_, _, _| {},
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -264,15 +271,18 @@ mod tests {
         }
         let stop = Cell::new(false);
         let dropped = Cell::new(false);
-        assert!(retry::<_, ()>(
-            || {
-                stop.set(true);
-                Ok(Source(&dropped))
-            },
-            || stop.get(),
-            |_| panic!("a successful late open must not wait"),
-            |_, _, _| panic!("a successful late open is not a failure"),
-        ).is_none());
+        assert!(
+            retry::<_, ()>(
+                || {
+                    stop.set(true);
+                    Ok(Source(&dropped))
+                },
+                || stop.get(),
+                |_| panic!("a successful late open must not wait"),
+                |_, _, _| panic!("a successful late open is not a failure"),
+            )
+            .is_none()
+        );
         assert!(dropped.get());
     }
 
@@ -292,7 +302,10 @@ mod tests {
         let config = config(scratch.path());
         let selected = pool_config(&config);
         assert_eq!(selected.database_url, config.database_url);
-        assert_eq!(selected.storage_root.as_deref(), Some(config.storage_root.as_path()));
+        assert_eq!(
+            selected.storage_root.as_deref(),
+            Some(config.storage_root.as_path())
+        );
         assert_eq!(selected.min_connections, 1);
         assert_eq!(selected.max_connections, 1);
         assert_eq!(selected.warmup_connections, 0);
@@ -313,7 +326,10 @@ mod tests {
         // three failed admissions. No database or source bytes are deleted.
         let pool = open(&config, &AtomicBool::new(false), |delay| {
             delays.push(delay.as_secs());
-            assert_eq!(std::fs::read(&blocked).unwrap(), b"preserve source evidence");
+            assert_eq!(
+                std::fs::read(&blocked).unwrap(),
+                b"preserve source evidence"
+            );
             if delays.len() == 3 {
                 std::fs::rename(&blocked, &preserved).unwrap();
                 std::fs::create_dir(&blocked).unwrap();
@@ -321,12 +337,20 @@ mod tests {
             }
             assert!(delays.len() <= 3, "repaired source must be admitted");
             true
-        }).expect("source eventually admitted on the same worker invocation");
+        })
+        .expect("source eventually admitted on the same worker invocation");
         assert_eq!(delays, [1, 2, 4]);
-        assert_eq!(std::fs::read(&preserved).unwrap(), b"preserve source evidence");
+        assert_eq!(
+            std::fs::read(&preserved).unwrap(),
+            b"preserve source evidence"
+        );
         let cx = asupersync::Cx::for_testing();
-        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
-        let rows = conn.query_sync("SELECT COUNT(*) AS c FROM messages", &[]).unwrap();
+        let conn = fastmcp_core::block_on(pool.acquire(&cx))
+            .into_result()
+            .unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .unwrap();
         assert_eq!(rows[0].get_named::<i64>("c").unwrap(), 0);
         assert!(blocked.join("mail.sqlite3").is_file());
     }

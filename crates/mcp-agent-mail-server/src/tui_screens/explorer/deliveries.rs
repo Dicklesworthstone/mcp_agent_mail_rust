@@ -180,10 +180,18 @@ mod tests {
     #[test]
     fn terminal_inbox_includes_shared_mail_with_direct_precedence_and_private_receipts() {
         fixture(|conn| {
-            let rows = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap();
-            assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), [102,101,200,100]);
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101, 200, 100]
+            );
             assert_eq!(rows[0].ack_ts, None, "direct receipt must win");
-            assert_eq!(rows[2].read_ts, None, "foreign identity's receipt is not the viewer's");
+            assert_eq!(
+                rows[2].read_ts, None,
+                "foreign identity's receipt is not the viewer's"
+            );
             assert_eq!(rows[3].ack_ts, Some(8));
             assert_eq!(rows[3].topic.as_deref(), Some("topic-a"));
             assert_eq!(rows[3].body_md, "shared body");
@@ -199,16 +207,45 @@ mod tests {
     #[test]
     fn terminal_shared_mail_honors_viewer_eligibility_and_candidate_bindings() {
         fixture(|conn| {
-            for name in ["AmberFox", "ZebraFox", "LateFox", "BlockedFox", "RetiredFox", "MissingFox"] {
-                assert!(screen(name).fetch_inbound(conn, Some(&candidates())).unwrap().is_empty(), "{name}");
+            for name in [
+                "AmberFox",
+                "ZebraFox",
+                "LateFox",
+                "BlockedFox",
+                "RetiredFox",
+                "MissingFox",
+            ] {
+                assert!(
+                    screen(name)
+                        .fetch_inbound(conn, Some(&candidates()))
+                        .unwrap()
+                        .is_empty(),
+                    "{name}"
+                );
             }
             let selected = HashSet::from([100, 200]);
-            let rows = screen("BlueLake").fetch_inbound(conn, Some(&selected)).unwrap();
-            assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), [200,100]);
-            assert!(screen("BlueLake").fetch_inbound(conn, Some(&HashSet::new())).unwrap().is_empty());
-            conn.execute_raw("UPDATE agents SET retired_at=10 WHERE id=11").unwrap();
-            let rows = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap();
-            assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), [102,101,200]);
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&selected))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [200, 100]
+            );
+            assert!(
+                screen("BlueLake")
+                    .fetch_inbound(conn, Some(&HashSet::new()))
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute_raw("UPDATE agents SET retired_at=10 WHERE id=11")
+                .unwrap();
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101, 200]
+            );
         });
     }
 
@@ -216,18 +253,24 @@ mod tests {
     fn terminal_receipt_filters_and_status_aggregation_use_the_same_deliveries() {
         fixture(|conn| {
             for (filter, expected) in [
-                (AckFilter::Unread, vec![102,101,200]),
-                (AckFilter::PendingAck, vec![102,200]),
+                (AckFilter::Unread, vec![102, 101, 200]),
+                (AckFilter::PendingAck, vec![102, 200]),
                 (AckFilter::Acknowledged, vec![100]),
             ] {
                 let mut screen = screen("BlueLake");
                 screen.ack_filter = filter;
                 let rows = screen.fetch_inbound(conn, Some(&candidates())).unwrap();
-                assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), expected);
+                assert_eq!(
+                    rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                    expected
+                );
             }
             let global = screen("").fetch_inbound(conn, Some(&candidates())).unwrap();
             let shared = global.iter().find(|row| row.message_id == 100).unwrap();
-            assert_eq!(shared.ack_ts, None, "unsettled direct BCC recipient still owes an ack");
+            assert_eq!(
+                shared.ack_ts, None,
+                "unsettled direct BCC recipient still owes an ack"
+            );
         });
     }
 
@@ -241,25 +284,42 @@ mod tests {
             assert_eq!(rows[0].message_id, 200);
             assert_eq!(rows[0].to_agents, "project:beta");
             assert_eq!(rows[0].direction, Direction::Outbound);
-            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (200,21,50,60)").unwrap();
-            assert!(sender.fetch_outbound(conn, Some(&candidates())).unwrap().is_empty());
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (200,21,50,60)")
+                .unwrap();
+            assert!(
+                sender
+                    .fetch_outbound(conn, Some(&candidates()))
+                    .unwrap()
+                    .is_empty()
+            );
             sender.ack_filter = AckFilter::Acknowledged;
-            assert_eq!(sender.fetch_outbound(conn, Some(&candidates())).unwrap()[0].message_id, 200);
+            assert_eq!(
+                sender.fetch_outbound(conn, Some(&candidates())).unwrap()[0].message_id,
+                200
+            );
         });
     }
 
     #[test]
     fn terminal_inbox_hides_bcc_but_sender_outbox_keeps_it_and_shared_address() {
         fixture(|conn| {
-            let incoming = recipient_names(conn, &[100,102], false).unwrap();
+            let incoming = recipient_names(conn, &[100, 102], false).unwrap();
             assert_eq!(incoming[&100], "project:alpha");
             assert_eq!(incoming[&102], "project:alpha");
-            let outgoing = recipient_names(conn, &[100,102], true).unwrap();
+            let outgoing = recipient_names(conn, &[100, 102], true).unwrap();
             assert_eq!(outgoing[&100], "HiddenFox, project:alpha");
             assert_eq!(outgoing[&102], "BlueLake, project:alpha");
-            let rows = screen("AmberFox").fetch_outbound(conn, Some(&candidates())).unwrap();
+            let rows = screen("AmberFox")
+                .fetch_outbound(conn, Some(&candidates()))
+                .unwrap();
             assert_eq!(rows.len(), 3);
-            assert_eq!(rows.iter().find(|row| row.message_id == 100).unwrap().to_agents, outgoing[&100]);
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.message_id == 100)
+                    .unwrap()
+                    .to_agents,
+                outgoing[&100]
+            );
         });
     }
 
@@ -267,18 +327,37 @@ mod tests {
     fn terminal_shared_queries_are_read_only_and_do_not_invent_empty_partial_schema() {
         fixture(|conn| {
             conn.execute_raw("PRAGMA query_only=ON").unwrap();
-            assert_eq!(screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap().len(), 4);
+            assert_eq!(
+                screen("BlueLake")
+                    .fetch_inbound(conn, Some(&candidates()))
+                    .unwrap()
+                    .len(),
+                4
+            );
             for table in ["message_recipients", "project_mailbox_receipts"] {
-                let rows = conn.query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[]).unwrap();
+                let rows = conn
+                    .query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                    .unwrap();
                 assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 3);
             }
             conn.execute_raw("PRAGMA query_only=OFF").unwrap();
-            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts").unwrap();
-            let error = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap_err();
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+                .unwrap();
+            let error = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap_err();
             assert!(error.contains("incomplete project mailbox schema"));
-            conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries").unwrap();
-            let legacy = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap();
-            assert_eq!(legacy.iter().map(|row| row.message_id).collect::<Vec<_>>(), [102,101]);
+            conn.execute_raw(
+                "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            )
+            .unwrap();
+            let legacy = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                legacy.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101]
+            );
         });
     }
 }

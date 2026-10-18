@@ -1192,7 +1192,10 @@ mod admission_boundary_tests {
         assert_eq!(report.effects.len(), 1);
         assert_eq!(report.effects[0].kind, "release_reservations_requested");
         assert_eq!(report.actions.len(), 1);
-        assert!(matches!(report.actions[0], AtcTickAction::ReleaseReservations { .. }));
+        assert!(matches!(
+            report.actions[0],
+            AtcTickAction::ReleaseReservations { .. }
+        ));
         assert_eq!(admission.stats().admitted, 0);
         assert_eq!(admission.stats().deferred, 1);
         assert!(cursor.is_none());

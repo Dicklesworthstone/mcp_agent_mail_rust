@@ -118,7 +118,10 @@ impl RetryQueue {
     /// the current batch. Repeated failures rotate behind other ready IDs and
     /// back off exponentially, capped at the normal one-minute worker cadence.
     pub(super) fn defer(&mut self, id: i64, now: Instant) {
-        assert!(self.can_admit(id), "profile retry capacity must precede admission");
+        assert!(
+            self.can_admit(id),
+            "profile retry capacity must precede admission"
+        );
         let previous = self
             .entries
             .iter()
@@ -192,7 +195,11 @@ mod tests {
             queue.defer(7, now);
         }
         assert_eq!(queue.len(), 1);
-        assert!(queue.ready_ids(now + MAX_BACKOFF - Duration::from_nanos(1)).is_empty());
+        assert!(
+            queue
+                .ready_ids(now + MAX_BACKOFF - Duration::from_nanos(1))
+                .is_empty()
+        );
         assert_eq!(queue.ready_ids(now + MAX_BACKOFF), [7]);
         queue.forget(7);
         assert_eq!(queue.len(), 0);
@@ -226,17 +233,34 @@ mod tests {
                 assert_ne!(pair[0].retry, pair[1].retry);
             }
             assert_eq!(
-                candidates.iter().filter(|item| item.retry).map(|item| item.id).collect::<Vec<_>>(),
+                candidates
+                    .iter()
+                    .filter(|item| item.retry)
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>(),
                 [1, 2, 3]
             );
             assert_eq!(
-                candidates.iter().filter(|item| !item.retry).map(|item| item.id).collect::<Vec<_>>(),
+                candidates
+                    .iter()
+                    .filter(|item| !item.retry)
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>(),
                 [100, 101, 102]
             );
         }
         assert!(interleave(Vec::new(), Vec::new(), true).is_empty());
-        assert_eq!(interleave(vec![9], Vec::new(), true), [Candidate { id: 9, retry: false }]);
-        assert_eq!(interleave(Vec::new(), vec![9], false), [Candidate { id: 9, retry: true }]);
+        assert_eq!(
+            interleave(vec![9], Vec::new(), true),
+            [Candidate {
+                id: 9,
+                retry: false
+            }]
+        );
+        assert_eq!(
+            interleave(Vec::new(), vec![9], false),
+            [Candidate { id: 9, retry: true }]
+        );
     }
 
     #[test]
@@ -245,11 +269,19 @@ mod tests {
             let failure = Failure::from(StorageError::Io(std::io::Error::new(kind, "busy")));
             assert!(failure.transient);
         }
-        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::InvalidData] {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
             let failure = Failure::from(StorageError::Io(std::io::Error::new(kind, "evidence")));
             assert!(!failure.transient);
         }
-        assert!(!Failure::from(StorageError::InvalidPath("publication fence busy is not identity authority".into())).transient);
+        assert!(
+            !Failure::from(StorageError::InvalidPath(
+                "publication fence busy is not identity authority".into()
+            ))
+            .transient
+        );
         assert!(!Failure::from("agent source is ambiguous").transient);
     }
 }

@@ -138,9 +138,8 @@ fn generated_source_sequences_preserve_first_occurrences_and_exact_accounting() 
                                     candidate.semantic_score,
                                 ),
                             ] {
-                                let first = source
-                                    .iter()
-                                    .position(|hit| hit.doc_id == candidate.doc_id);
+                                let first =
+                                    source.iter().position(|hit| hit.doc_id == candidate.doc_id);
                                 assert_eq!(rank, first.map(|idx| idx + 1));
                                 assert_eq!(score, first.map(|idx| source[idx].score));
                             }

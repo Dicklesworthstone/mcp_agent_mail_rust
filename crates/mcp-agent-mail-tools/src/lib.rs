@@ -33,8 +33,8 @@ mod issue353_bootstrap_tests {
     };
     use mcp_agent_mail_core::Config;
     use mcp_agent_mail_db::DbPoolConfig;
-    use std::sync::{Arc, Barrier, Mutex};
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -90,10 +90,7 @@ mod issue353_bootstrap_tests {
             let request = get_db_pool_for_config(&config).unwrap();
             assert_eq!(request.engine_identity_key(), engine);
         }
-        assert_eq!(
-            DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed),
-            before
-        );
+        assert_eq!(DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed), before);
     }
 
     #[test]
@@ -114,14 +111,8 @@ mod issue353_bootstrap_tests {
                         match get_db_pool_for_config(&config) {
                             Ok(pool) => return pool.engine_identity_key(),
                             Err(error) => {
-                                assert_eq!(
-                                    crate::tool_error_code(&error),
-                                    Some("RESOURCE_BUSY")
-                                );
-                                assert!(
-                                    Instant::now() < deadline,
-                                    "initializer never completed"
-                                );
+                                assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+                                assert!(Instant::now() < deadline, "initializer never completed");
                                 std::thread::sleep(Duration::from_millis(2));
                             }
                         }
@@ -962,7 +953,8 @@ pub mod tool_util {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err(db_error_to_mcp_error(DbError::ResourceBusy(
-                    "database pool initialization is already in progress; retry the operation".into(),
+                    "database pool initialization is already in progress; retry the operation"
+                        .into(),
                 )));
             }
         };

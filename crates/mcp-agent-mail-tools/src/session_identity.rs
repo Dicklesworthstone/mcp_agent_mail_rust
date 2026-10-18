@@ -341,9 +341,7 @@ fn authorize_actor_from_state(
         .filter(|binding| binding.project_id == agent.project_id)
         .collect();
     if (held.is_empty() && !state.eviction_restricts(agent.project_id))
-        || held
-            .iter()
-            .any(|binding| binding.matches_agent(agent))
+        || held.iter().any(|binding| binding.matches_agent(agent))
     {
         return Ok(());
     }

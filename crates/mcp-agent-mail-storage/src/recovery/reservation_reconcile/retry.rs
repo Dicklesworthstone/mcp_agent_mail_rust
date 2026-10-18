@@ -84,7 +84,10 @@ fn transient(error: &StorageError) -> bool {
         if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
 }
 
-fn finish(mut report: ReservationReconcileReport, queue: &RetryQueue) -> ReservationReconcileReport {
+fn finish(
+    mut report: ReservationReconcileReport,
+    queue: &RetryQueue,
+) -> ReservationReconcileReport {
     report.retry_len = queue.pending.len();
     report
 }
@@ -193,24 +196,26 @@ fn attempt(
     let mut attempted = false;
     // Source validation failures remain conflicts. In particular, an invalid
     // generation or absent holder must not become trusted retry authority.
-    let result = read_source(cx, pool, id).map_err(invalid).and_then(|source| {
-        source.map_or(Ok(false), |source| {
-            let result = publish_release(
-                cx,
-                pool,
-                config,
-                &source,
-                ReleaseTargets::WithOwnedAliases,
-                &mut attempted,
-            );
-            tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
+    let result = read_source(cx, pool, id)
+        .map_err(invalid)
+        .and_then(|source| {
+            source.map_or(Ok(false), |source| {
+                let result = publish_release(
+                    cx,
+                    pool,
+                    config,
+                    &source,
+                    ReleaseTargets::WithOwnedAliases,
+                    &mut attempted,
+                );
+                tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
                 reservation_id = id, project = %source.project_slug,
                 generation = ?source.generation, db_state = "released",
                 action = "verify_terminal_release", outcome = ?result,
                 "reservation archive release reconciliation decision");
-            result
-        })
-    });
+                result
+            })
+        });
     report.attempted += usize::from(attempted);
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
@@ -324,8 +329,8 @@ fn run_admitted(
     }
     // Preserve both new guard-unblocking work and historical progress even
     // under permanent retry pressure: at least one write slot for each lane.
-    let priority_limit = (report.attempted + PRIORITY_REPAIRS_PER_BATCH)
-        .min(MAX_REPAIRS_PER_BATCH - 1);
+    let priority_limit =
+        (report.attempted + PRIORITY_REPAIRS_PER_BATCH).min(MAX_REPAIRS_PER_BATCH - 1);
     for unexpired_only in [true, false] {
         let position = if unexpired_only {
             &mut cursor.priority
@@ -364,7 +369,9 @@ fn run_admitted(
                 break;
             }
             if corruption_circuit_breaker().is_tripped() {
-                return Err("reservation reconciliation stopped: source corruption observed".into());
+                return Err(
+                    "reservation reconciliation stopped: source corruption observed".into(),
+                );
             }
             if !attempt(cx, pool, config, id, &mut cursor.retries, &mut report, stop) {
                 return Ok(finish(report, &cursor.retries));
@@ -404,17 +411,39 @@ mod tests {
             drop(conn);
             let mut position = ScanPosition::default();
             for expected in [128, 256] {
-                assert!(select_ids(cx, pool, &mut position, 16, true).unwrap().is_empty());
+                assert!(
+                    select_ids(cx, pool, &mut position, 16, true)
+                        .unwrap()
+                        .is_empty()
+                );
                 assert_eq!(position.after, expected);
                 assert_eq!(position.ceiling, Some(9_000_000));
             }
-            assert_eq!(select_ids(cx, pool, &mut position, 16, true).unwrap(), [9_000_000]);
+            assert_eq!(
+                select_ids(cx, pool, &mut position, 16, true).unwrap(),
+                [9_000_000]
+            );
             assert_eq!(position.after, 256, "selection cannot consume a release");
             advance(&mut position, 9_000_000);
             assert_eq!(position.ceiling, None);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            assert_eq!(conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 262);
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=9000000", &[]).unwrap()[0].get_as::<Option<i64>>(0).unwrap(), None);
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                262
+            );
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=9000000",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<Option<i64>>(0)
+                    .unwrap(),
+                None
+            );
             assert!(!config.storage_root.join("projects").exists());
         });
     }
@@ -487,11 +516,19 @@ mod tests {
     #[test]
     fn lock_and_io_backpressure_are_distinct_from_conflicting_or_cancelled_evidence() {
         assert!(transient(&StorageError::LockTimeout("held".into())));
-        assert!(transient(&std::io::Error::from(std::io::ErrorKind::WouldBlock).into()));
-        assert!(transient(&std::io::Error::from(std::io::ErrorKind::TimedOut).into()));
+        assert!(transient(
+            &std::io::Error::from(std::io::ErrorKind::WouldBlock).into()
+        ));
+        assert!(transient(
+            &std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+        ));
         assert!(!transient(&invalid("foreign generation")));
-        assert!(!transient(&std::io::Error::from(std::io::ErrorKind::Interrupted).into()));
-        assert!(!transient(&std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()));
+        assert!(!transient(
+            &std::io::Error::from(std::io::ErrorKind::Interrupted).into()
+        ));
+        assert!(!transient(
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()
+        ));
     }
 
     #[test]
@@ -526,15 +563,28 @@ mod tests {
                 let page = run(cx, pool, config, &mut cursor, &stop).unwrap();
                 assert_eq!((page.scanned, page.unchanged, page.repaired), (32, 32, 0));
                 assert_eq!((page.attempted, page.deferred, page.retry_len), (0, 0, 0));
-                assert!(page.budget_exhausted, "unfinished healthy page needs catch-up");
+                assert!(
+                    page.budget_exhausted,
+                    "unfinished healthy page needs catch-up"
+                );
                 assert_eq!(cursor.history.after, after);
                 assert_eq!(cursor.history.ceiling, Some(482));
                 assert!(!path.exists());
             }
             let final_page = run(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!((final_page.scanned, final_page.unchanged, final_page.repaired), (18, 17, 1));
+            assert_eq!(
+                (
+                    final_page.scanned,
+                    final_page.unchanged,
+                    final_page.repaired
+                ),
+                (18, 17, 1)
+            );
             assert_eq!(final_page.attempted, 1);
-            assert!(!final_page.budget_exhausted, "do not spin into another history round");
+            assert!(
+                !final_page.budget_exhausted,
+                "do not spin into another history round"
+            );
             assert_eq!(cursor.history.ceiling, None);
             let artifact = read_artifact(&path).unwrap().unwrap();
             assert_eq!(artifact.value["id"], 482);
@@ -562,8 +612,11 @@ mod tests {
                 82,
             );
             assert_eq!(
-                conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=482", &[])
-                    .unwrap()[0]
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=482",
+                    &[]
+                )
+                .unwrap()[0]
                     .get_as::<i64>(0)
                     .unwrap(),
                 5_000_000,
@@ -581,30 +634,52 @@ mod tests {
             )).unwrap();
             drop(conn);
             let source = read_source(cx, pool, 433).unwrap().unwrap();
-            assert!(publish_release(
-                cx,
-                pool,
-                config,
-                &source,
-                ReleaseTargets::WithOwnedAliases,
-                &mut false,
-            )
-            .unwrap());
+            assert!(
+                publish_release(
+                    cx,
+                    pool,
+                    config,
+                    &source,
+                    ReleaseTargets::WithOwnedAliases,
+                    &mut false,
+                )
+                .unwrap()
+            );
             // Both cursors captured the same upper bound, but priority has
             // one already-archived row to revisit while history finishes.
             let mut cursor = ReservationReconcileCursor {
                 source_identity: pool.sqlite_identity_key(),
-                priority: ScanPosition { after: 432, ceiling: Some(434) },
-                history: ScanPosition { after: 433, ceiling: Some(434) },
+                priority: ScanPosition {
+                    after: 432,
+                    ceiling: Some(434),
+                },
+                history: ScanPosition {
+                    after: 433,
+                    ceiling: Some(434),
+                },
                 ..Default::default()
             };
             let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
-            assert_eq!((report.scanned, report.unchanged, report.repaired), (2, 2, 0));
-            assert_eq!((report.attempted, report.deferred, report.retry_len), (0, 0, 0));
+            assert_eq!(
+                (report.scanned, report.unchanged, report.repaired),
+                (2, 2, 0)
+            );
+            assert_eq!(
+                (report.attempted, report.deferred, report.retry_len),
+                (0, 0, 0)
+            );
             assert_eq!(cursor.history.ceiling, None);
             assert_eq!(cursor.priority.ceiling, Some(434));
-            assert!(!report.budget_exhausted, "finished history must leave fast catch-up");
-            assert!(!config.storage_root.join("projects/project/file_reservations/id-434-gaabb.json").exists());
+            assert!(
+                !report.budget_exhausted,
+                "finished history must leave fast catch-up"
+            );
+            assert!(
+                !config
+                    .storage_root
+                    .join("projects/project/file_reservations/id-434-gaabb.json")
+                    .exists()
+            );
         });
     }
 
@@ -655,11 +730,15 @@ mod tests {
             assert_eq!(cursor.history.ceiling, Some(481));
             assert_eq!(fs::read(&path).unwrap(), before);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='after contention' WHERE id=401").unwrap();
+            conn.execute_raw("UPDATE file_reservations SET reason='after contention' WHERE id=401")
+                .unwrap();
             drop(conn);
             drop(held);
             let resumed = run(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!(resumed.repaired, 1, "must not wait for the history round to wrap");
+            assert_eq!(
+                resumed.repaired, 1,
+                "must not wait for the history round to wrap"
+            );
             assert_eq!(resumed.retry_len, 0);
             assert!(cursor.history.after > 432 && cursor.history.after < 481);
             assert!(resumed.scanned <= usize::try_from(IDS_PER_BATCH).unwrap());
@@ -667,14 +746,51 @@ mod tests {
             let artifact = read_artifact(&path).unwrap().unwrap();
             assert_eq!(artifact.value["reason"], "after contention");
             assert_eq!(artifact.value["operator_note"], "preserve this note");
-            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(
+                artifact.value["released_ts"],
+                source.artifact["released_ts"]
+            );
             let repo = Repository::open(&config.storage_root).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
-            assert_eq!(committed_artifact(&repo, Some(&tree), "projects/project/file_reservations/id-401-gaabb.json").unwrap().unwrap().bytes, artifact.bytes);
+            assert_eq!(
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-401-gaabb.json"
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
+                artifact.bytes
+            );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap()[0].get_as::<Option<i64>>(0).unwrap(), None);
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 5_000_000);
-            assert_eq!(conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 81);
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<Option<i64>>(0)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                5_000_000
+            );
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                81
+            );
         });
     }
 
@@ -719,8 +835,13 @@ mod tests {
                 min_connections: 1,
                 max_connections: 1,
                 ..Default::default()
-            }).unwrap();
-            assert!(run(cx, &readonly, config, &mut cursor, &AtomicBool::new(false)).unwrap_err().contains("query-only"));
+            })
+            .unwrap();
+            assert!(
+                run(cx, &readonly, config, &mut cursor, &AtomicBool::new(false))
+                    .unwrap_err()
+                    .contains("query-only")
+            );
             assert!(cursor.retries.contains(401));
             assert!(!config.storage_root.join("projects").exists());
         });
@@ -731,7 +852,12 @@ mod tests {
         super::super::tests::fixture(|cx, pool, config| {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
             let future = mcp_agent_mail_db::now_micros() + 86_400_000_000;
-            for (id, expires) in [(402, 9_000_000), (403, 9_000_000), (900, future), (901, future)] {
+            for (id, expires) in [
+                (402, 9_000_000),
+                (403, 9_000_000),
+                (900, future),
+                (901, future),
+            ] {
                 conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'retry/{id}.rs', 1, 'released', 1000000, {expires}, 5000000)")).unwrap();
             }
             drop(conn);
@@ -744,13 +870,24 @@ mod tests {
             let report = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
             assert_eq!(report.repaired, 4);
             assert_eq!(report.attempted, 4);
-            assert_eq!(report.scanned, 4, "scan duplicates must not be attempted twice");
+            assert_eq!(
+                report.scanned, 4,
+                "scan duplicates must not be attempted twice"
+            );
             assert_eq!(report.retry_len, 0);
-            let dir = config.storage_root.join("projects/project/file_reservations");
+            let dir = config
+                .storage_root
+                .join("projects/project/file_reservations");
             for id in [401, 402, 403, 900] {
-                assert!(dir.join(reservation_artifact_filename(Some("aabb"), id)).is_file());
+                assert!(
+                    dir.join(reservation_artifact_filename(Some("aabb"), id))
+                        .is_file()
+                );
             }
-            assert!(!dir.join(reservation_artifact_filename(Some("aabb"), 901)).exists());
+            assert!(
+                !dir.join(reservation_artifact_filename(Some("aabb"), 901))
+                    .exists()
+            );
         });
     }
 

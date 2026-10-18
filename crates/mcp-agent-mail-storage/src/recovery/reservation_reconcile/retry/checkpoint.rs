@@ -94,8 +94,12 @@ impl Binding {
             _ => return Err("reservation checkpoint source generation is ambiguous".into()),
         };
         drop(conn);
-        Self::at(Path::new(pool.sqlite_path()), &config.storage_root, generation)
-            .map_err(|error| format!("reservation checkpoint source identity failed: {error}"))
+        Self::at(
+            Path::new(pool.sqlite_path()),
+            &config.storage_root,
+            generation,
+        )
+        .map_err(|error| format!("reservation checkpoint source identity failed: {error}"))
     }
 
     fn at(database: &Path, archive: &Path, generation: Option<String>) -> io::Result<Self> {
@@ -225,7 +229,9 @@ impl Snapshot {
 
     fn validate(&self, binding: &Binding) -> io::Result<()> {
         if self.version != VERSION || &self.binding != binding {
-            return Err(invalid("checkpoint source, archive, generation or version changed"));
+            return Err(invalid(
+                "checkpoint source, archive, generation or version changed",
+            ));
         }
         if self.saved_at_us <= 0
             || !self.priority.valid()
@@ -292,9 +298,9 @@ fn check_sidecar(path: &Path) -> io::Result<()> {
 
 fn contended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
-        || error.raw_os_error().is_some_and(|code| {
-            Some(code) == fs2::lock_contended_error().raw_os_error()
-        })
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
 }
 
 #[derive(Debug)]
@@ -353,15 +359,14 @@ impl Store {
         self.check_owner()?;
         check_sidecar(&self.path)?;
         let bytes = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
-            &self.path,
-            MAX_BYTES,
+            &self.path, MAX_BYTES,
         ) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)
-            .map_err(|error| invalid(&error.to_string()))?;
+        let snapshot: Snapshot =
+            serde_json::from_slice(&bytes).map_err(|error| invalid(&error.to_string()))?;
         snapshot.validate(&self.binding)?;
         Ok(Some(snapshot))
     }
@@ -374,7 +379,9 @@ impl Store {
             self.binding.generation.clone(),
         )?;
         if current != self.binding {
-            return Err(invalid("checkpoint database was replaced during reconciliation"));
+            return Err(invalid(
+                "checkpoint database was replaced during reconciliation",
+            ));
         }
         check_sidecar(&self.path)?;
         let snapshot = Snapshot::capture(
@@ -384,8 +391,7 @@ impl Store {
             mcp_agent_mail_db::now_micros(),
         );
         snapshot.validate(&self.binding)?;
-        let bytes = serde_json::to_vec(&snapshot)
-            .map_err(|error| invalid(&error.to_string()))?;
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| invalid(&error.to_string()))?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
             return Err(invalid("checkpoint exceeds its byte budget"));
         }
@@ -442,7 +448,11 @@ fn run_with_state(
     state: &mut State,
 ) -> Result<ReservationReconcileReport, String> {
     let binding = Binding::capture(cx, pool, config)?;
-    if state.binding.as_ref().is_some_and(|previous| previous != &binding) {
+    if state
+        .binding
+        .as_ref()
+        .is_some_and(|previous| previous != &binding)
+    {
         // A same-pool logical-generation change also invalidates every hint.
         // Never carry an old generation's retained IDs into a new identity.
         cursor.priority = ScanPosition::default();
@@ -512,8 +522,14 @@ mod tests {
     fn debt(now: Instant) -> ReservationReconcileCursor {
         let mut cursor = ReservationReconcileCursor {
             source_identity: "current-process".into(),
-            priority: ScanPosition { after: 90, ceiling: Some(100) },
-            history: ScanPosition { after: 40, ceiling: Some(100) },
+            priority: ScanPosition {
+                after: 90,
+                ceiling: Some(100),
+            },
+            history: ScanPosition {
+                after: 40,
+                ceiling: Some(100),
+            },
             ..Default::default()
         };
         cursor.retries.pending.push_back(DeferredRelease {
@@ -543,15 +559,29 @@ mod tests {
                 ..Default::default()
             };
             snapshot.restore(&mut cursor, now, wall);
-            assert_eq!((cursor.priority.after, cursor.priority.ceiling), (90, Some(100)));
-            assert_eq!((cursor.history.after, cursor.history.ceiling), (40, Some(100)));
+            assert_eq!(
+                (cursor.priority.after, cursor.priority.ceiling),
+                (90, Some(100))
+            );
+            assert_eq!(
+                (cursor.history.after, cursor.history.ceiling),
+                (40, Some(100))
+            );
             assert_eq!(cursor.source_identity, "new-process");
             assert_eq!(
-                cursor.retries.pending.iter().map(|retry| retry.id).collect::<Vec<_>>(),
+                cursor
+                    .retries
+                    .pending
+                    .iter()
+                    .map(|retry| retry.id)
+                    .collect::<Vec<_>>(),
                 [7, 80]
             );
             assert_eq!(cursor.retries.pending[0].ready_at, now);
-            assert_eq!(cursor.retries.pending[1].ready_at, now + Duration::from_secs(wait));
+            assert_eq!(
+                cursor.retries.pending[1].ready_at,
+                now + Duration::from_secs(wait)
+            );
             assert_eq!(cursor.retries.pending[1].attempts, 6);
         }
     }
@@ -582,7 +612,8 @@ mod tests {
             &binding.database,
             &binding.archive,
             binding.generation.clone(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(snapshot.validate(&replacement).is_err());
     }
 
@@ -606,7 +637,9 @@ mod tests {
             .write(true)
             .open(&store.lock_path)
             .unwrap();
-        assert!(contended(&FileExt::try_lock_exclusive(&contender).unwrap_err()));
+        assert!(contended(
+            &FileExt::try_lock_exclusive(&contender).unwrap_err()
+        ));
         drop(contender);
         std::fs::rename(&store.path, store.path.with_extension("obstruction")).unwrap();
         std::fs::rename(&held, &store.path).unwrap();
@@ -665,7 +698,11 @@ mod tests {
         assert_eq!(store.load().unwrap().unwrap().retries.len(), MAX_RETRY_IDS);
         std::fs::write(&store.path, b"not JSON").unwrap();
         assert!(store.load().is_err());
-        std::fs::write(&store.path, vec![b' '; usize::try_from(MAX_BYTES + 1).unwrap()]).unwrap();
+        std::fs::write(
+            &store.path,
+            vec![b' '; usize::try_from(MAX_BYTES + 1).unwrap()],
+        )
+        .unwrap();
         assert!(store.load().is_err());
     }
 
@@ -676,7 +713,9 @@ mod tests {
             let path = binding.path().unwrap();
             let lock = path.with_extension("json.lock");
             let mut cursor = ReservationReconcileCursor::default();
-            let stopped = cursor.reconcile_checkpointed(cx, pool, config, &AtomicBool::new(true)).unwrap();
+            let stopped = cursor
+                .reconcile_checkpointed(cx, pool, config, &AtomicBool::new(true))
+                .unwrap();
             assert!(stopped.interrupted);
             assert_eq!(stopped.scanned, 0);
             assert!(!path.exists() && !lock.exists());
@@ -686,8 +725,11 @@ mod tests {
                 min_connections: 1,
                 max_connections: 1,
                 ..Default::default()
-            }).unwrap();
-            let error = cursor.reconcile_checkpointed(cx, &readonly, config, &AtomicBool::new(false)).unwrap_err();
+            })
+            .unwrap();
+            let error = cursor
+                .reconcile_checkpointed(cx, &readonly, config, &AtomicBool::new(false))
+                .unwrap_err();
             assert!(error.contains("query-only"));
             assert!(!path.exists() && !lock.exists());
             assert!(!config.storage_root.join("projects").exists());
@@ -707,8 +749,13 @@ mod tests {
             let held = process.lock().unwrap();
             let stop = AtomicBool::new(false);
             let mut cursor = ReservationReconcileCursor::default();
-            let first = cursor.reconcile_checkpointed(cx, pool, config, &stop).unwrap();
-            assert_eq!((first.deferred_transient, first.retry_len, first.repaired), (1, 1, 0));
+            let first = cursor
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
+            assert_eq!(
+                (first.deferred_transient, first.retry_len, first.repaired),
+                (1, 1, 0)
+            );
             assert_eq!(cursor.history.after, 432);
             let binding = Binding::capture(cx, pool, config).unwrap();
             let persisted = std::fs::read(binding.path().unwrap()).unwrap();
@@ -717,15 +764,25 @@ mod tests {
             assert_eq!(snapshot.retries[0].id, 401);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
             let mut competing = ReservationReconcileCursor::default();
-            assert_eq!(competing.reconcile_checkpointed(cx, pool, config, &stop).unwrap_err(), OWNED);
+            assert_eq!(
+                competing
+                    .reconcile_checkpointed(cx, pool, config, &stop)
+                    .unwrap_err(),
+                OWNED
+            );
             assert_eq!(competing.history.after, 0);
             assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
             drop(cursor);
             drop(held);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='current after restart' WHERE id=401").unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET reason='current after restart' WHERE id=401",
+            )
+            .unwrap();
             drop(conn);
-            let resumed = competing.reconcile_checkpointed(cx, pool, config, &stop).unwrap();
+            let resumed = competing
+                .reconcile_checkpointed(cx, pool, config, &stop)
+                .unwrap();
             assert_eq!((resumed.repaired, resumed.retry_len), (1, 0));
             assert!(competing.history.after > 432 && competing.history.after < 481);
             assert!(resumed.scanned <= 32 && resumed.attempted <= 4);
@@ -739,8 +796,26 @@ mod tests {
             let entry = tree.get_path(Path::new(relative)).unwrap();
             assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap()[0].get_as::<Option<i64>>(0).unwrap(), None);
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 5_000_000);
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<Option<i64>>(0)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                5_000_000
+            );
         });
     }
 }

@@ -277,7 +277,12 @@ fn scan_value_containers(
             // spellings so mixed/upper-case Authorization is repaired too.
             for (inside_headers, fields) in [
                 (false, Some(server_obj)),
-                (true, server_obj.get("headers").and_then(serde_json::Value::as_object)),
+                (
+                    true,
+                    server_obj
+                        .get("headers")
+                        .and_then(serde_json::Value::as_object),
+                ),
             ] {
                 let Some(fields) = fields else {
                     continue;
@@ -774,9 +779,16 @@ mod tests {
         writer.try_lock_exclusive().unwrap();
         fs::write(&path, b"{in-progress operator edit").unwrap();
         let error = fix(&ctx, &findings[0]).unwrap_err();
-        assert!(matches!(error, crate::doctor::mutate::MutateError::LockHeld(_)));
+        assert!(matches!(
+            error,
+            crate::doctor::mutate::MutateError::LockHeld(_)
+        ));
         assert_eq!(fs::read(&path).unwrap(), b"{in-progress operator edit");
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -793,7 +805,11 @@ mod tests {
         assert_eq!(result.actions_taken, 0);
         assert_eq!(result.actions_skipped, 1);
         assert_eq!(fs::read(&path).unwrap(), edited);
-        assert!(fs::read(ctx.run_dir.join("actions.jsonl")).unwrap().is_empty());
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -6509,8 +6509,7 @@ pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
 #[cfg(test)]
 #[test]
 fn coordinator_launch_timeout_never_authorizes_sqlite_recovery() {
-    let message =
-        "internal error: write coordinator service start timed out while another launcher remained in Starting state";
+    let message = "internal error: write coordinator service start timed out while another launcher remained in Starting state";
     assert!(!is_sqlite_recovery_error_message(message));
     assert!(crate::error::is_lock_error(message));
 }
@@ -34298,11 +34297,8 @@ mod tests {
 
         let result = classify_sqlite_family_cleanup(&db_path);
 
-        std::fs::set_permissions(
-            &shm_path,
-            std::fs::Permissions::from_mode(original_mode),
-        )
-        .expect("restore SHM permissions");
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(original_mode))
+            .expect("restore SHM permissions");
         let plan = result.expect("healthy WAL classification must inspect SHM metadata only");
         assert!(plan.is_empty());
         assert!(shm_path.exists());

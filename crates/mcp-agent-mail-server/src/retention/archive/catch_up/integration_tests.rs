@@ -104,7 +104,11 @@ fn assert_source_untouched(fixture: &Fixture) {
     let rows = conn
         .query_sync("SELECT id, subject, body_md FROM messages ORDER BY id", &[])
         .unwrap();
-    assert_eq!(rows.len(), 9, "repair must neither delete nor redeliver mail");
+    assert_eq!(
+        rows.len(),
+        9,
+        "repair must neither delete nor redeliver mail"
+    );
     for (row, id) in rows.iter().zip(9001_i64..=9009) {
         assert_eq!(row.get_named::<i64>("id").unwrap(), id);
         assert_eq!(
@@ -172,7 +176,10 @@ fn assert_committed_bundles(fixture: &Fixture, expected_messages: usize) {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, bytes, "disk and committed archive must agree");
+        assert_eq!(
+            output.stdout, bytes,
+            "disk and committed archive must agree"
+        );
         *copies.entry(id).or_default() += 1;
     }
     assert_eq!(copies.len(), expected_messages);
@@ -189,7 +196,15 @@ fn real_crash_orphans_converge_across_checkpointed_batches_without_client_reads(
     let mut cursor = ReconcileCursor::settled_before(now_micros());
     let mut reports = Vec::new();
     let backlog = run_with(
-        || reconcile_message_batch(&fixture.cx, &fixture.pool, &fixture.config, &mut cursor, &stop),
+        || {
+            reconcile_message_batch(
+                &fixture.cx,
+                &fixture.pool,
+                &fixture.config,
+                &mut cursor,
+                &stop,
+            )
+        },
         |report| reports.push((report.repaired, report.deferred, report.checkpoint_saved)),
         || Duration::ZERO,
     )
@@ -216,7 +231,15 @@ fn shutdown_between_real_batches_leaves_remaining_source_mail_untouched() {
     let mut cursor = ReconcileCursor::settled_before(now_micros());
     let mut observed = Vec::new();
     let backlog = run_with(
-        || reconcile_message_batch(&fixture.cx, &fixture.pool, &fixture.config, &mut cursor, &stop),
+        || {
+            reconcile_message_batch(
+                &fixture.cx,
+                &fixture.pool,
+                &fixture.config,
+                &mut cursor,
+                &stop,
+            )
+        },
         |report| {
             observed.push((report.repaired, report.interrupted));
             stop.store(true, Ordering::Release);
@@ -305,46 +328,58 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
     let mut message_turns = 0usize;
     for second in 0..60 {
         let now = start + Duration::from_secs(second);
-        let result = schedule.run_if_due(Lane::Messages, || now, || {
-            message_turns += 1;
-            Some(super::run(
-                &fixture.cx,
-                &fixture.pool,
-                &fixture.config,
-                &mut cursor,
-                &stop,
-                |_| reports += 1,
-            ))
-        });
+        let result = schedule.run_if_due(
+            Lane::Messages,
+            || now,
+            || {
+                message_turns += 1;
+                Some(super::run(
+                    &fixture.cx,
+                    &fixture.pool,
+                    &fixture.config,
+                    &mut cursor,
+                    &stop,
+                    |_| reports += 1,
+                ))
+            },
+        );
         assert_eq!(result, Some(Ok(true)));
-        let agent = schedule.run_if_due(Lane::Agents, || now, || {
-            peer_turns[0] += 1;
-            Some(super::super::agent_catch_up::run(
-                &fixture.cx,
-                &fixture.pool,
-                &fixture.config,
-                &mut agent_cursor,
-                &stop,
-                |report| {
-                    assert!(!report.interrupted);
-                    assert_eq!(report.deferred, 0);
-                },
-            ))
-        });
-        let reservation = schedule.run_if_due(Lane::Reservations, || now, || {
-            peer_turns[1] += 1;
-            Some(super::super::reservation_catch_up::run(
-                &fixture.cx,
-                &fixture.pool,
-                &fixture.config,
-                &mut reservation_cursor,
-                &stop,
-                |report| {
-                    assert!(!report.interrupted);
-                    assert_eq!(report.deferred, 0);
-                },
-            ))
-        });
+        let agent = schedule.run_if_due(
+            Lane::Agents,
+            || now,
+            || {
+                peer_turns[0] += 1;
+                Some(super::super::agent_catch_up::run(
+                    &fixture.cx,
+                    &fixture.pool,
+                    &fixture.config,
+                    &mut agent_cursor,
+                    &stop,
+                    |report| {
+                        assert!(!report.interrupted);
+                        assert_eq!(report.deferred, 0);
+                    },
+                ))
+            },
+        );
+        let reservation = schedule.run_if_due(
+            Lane::Reservations,
+            || now,
+            || {
+                peer_turns[1] += 1;
+                Some(super::super::reservation_catch_up::run(
+                    &fixture.cx,
+                    &fixture.pool,
+                    &fixture.config,
+                    &mut reservation_cursor,
+                    &stop,
+                    |report| {
+                        assert!(!report.interrupted);
+                        assert_eq!(report.deferred, 0);
+                    },
+                ))
+            },
+        );
         for (index, result) in [agent, reservation].into_iter().enumerate() {
             match result {
                 Some(Ok(false)) => {
@@ -412,7 +447,10 @@ fn real_checkpoint_lock_contention_yields_then_resumes_the_same_source_and_curso
             break;
         }
     }
-    assert!(finished, "released checkpoint ownership must not pin catch-up");
+    assert!(
+        finished,
+        "released checkpoint ownership must not pin catch-up"
+    );
     assert_eq!(repaired, 5, "do not replay the four completed repairs");
     assert_source_untouched(&fixture);
     assert_committed_bundles(&fixture, 9);
@@ -526,7 +564,10 @@ fn gh354_idle_database_workers_park_and_serve_after_idle() {
     let read_started = Instant::now();
     assert_source_untouched(&fixture);
     let first_read_ms = read_started.elapsed().as_millis();
-    assert!(first_read_ms < 5_000, "post-idle reads took {first_read_ms} ms");
+    assert!(
+        first_read_ms < 5_000,
+        "post-idle reads took {first_read_ms} ms"
+    );
 
     // Idle throttling must not achieve low CPU by abandoning accepted mail.
     // Exercise actual checkpointed catch-up after the quiet interval and

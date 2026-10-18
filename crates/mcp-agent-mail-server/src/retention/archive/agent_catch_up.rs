@@ -20,8 +20,7 @@ const ADMISSION_DEFERRED: &str =
     "agent reconciliation deferred: recovery promotion or admission contention";
 const CHECKPOINT_OWNED: &str =
     "agent reconciliation deferred: checkpoint is owned by another worker";
-const DISK_PRESSURE_DEFERRED: &str =
-    "agent reconciliation deferred: critical disk pressure";
+const DISK_PRESSURE_DEFERRED: &str = "agent reconciliation deferred: critical disk pressure";
 const MAX_BATCHES_PER_TURN: usize = 8;
 const MAX_ACTIVE_PER_TURN: Duration = Duration::from_millis(250);
 
@@ -97,10 +96,7 @@ fn run_with(
         if interrupted() || !follow_up {
             return Ok(false);
         }
-        if !continue_turn
-            || batches >= MAX_BATCHES_PER_TURN
-            || elapsed() >= MAX_ACTIVE_PER_TURN
-        {
+        if !continue_turn || batches >= MAX_BATCHES_PER_TURN || elapsed() >= MAX_ACTIVE_PER_TURN {
             return Ok(true);
         }
     }
@@ -174,11 +170,14 @@ mod tests {
             assert_eq!(calls, 1);
         }
         for interrupted in [false, true] {
-            assert!(!finish(
-                Err(DISK_PRESSURE_DEFERRED.into()),
-                || interrupted,
-                |_| panic!("pressure refusal is not a completed storage report"),
-            ).unwrap());
+            assert!(
+                !finish(
+                    Err(DISK_PRESSURE_DEFERRED.into()),
+                    || interrupted,
+                    |_| panic!("pressure refusal is not a completed storage report"),
+                )
+                .unwrap()
+            );
         }
         let other = format!("{DISK_PRESSURE_DEFERRED}: source also failed");
         assert_eq!(
@@ -205,50 +204,64 @@ mod tests {
             },
         ]);
         let mut observed = Vec::new();
-        assert!(!run_with(
-            || with_disk_admission(pressure.get(), || {
-                Ok(pending.pop_front().expect("no speculative storage batch"))
-            }),
-            || false,
-            || Duration::ZERO,
-            |report| {
-                observed.push(report.repaired);
-                pressure.set(critical);
-            },
-        ).unwrap());
-        assert_eq!(observed, [4]);
-        assert_eq!(pending.len(), 1, "a pressure refusal cannot consume work");
-        for _ in 0..60 {
-            assert!(!run_with(
+        assert!(
+            !run_with(
                 || with_disk_admission(pressure.get(), || {
-                    panic!("sustained pressure cannot execute storage")
+                    Ok(pending.pop_front().expect("no speculative storage batch"))
                 }),
                 || false,
                 || Duration::ZERO,
-                |_| panic!("no report for a paused turn"),
-            ).unwrap());
+                |report| {
+                    observed.push(report.repaired);
+                    pressure.set(critical);
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(observed, [4]);
+        assert_eq!(pending.len(), 1, "a pressure refusal cannot consume work");
+        for _ in 0..60 {
+            assert!(
+                !run_with(
+                    || with_disk_admission(pressure.get(), || {
+                        panic!("sustained pressure cannot execute storage")
+                    }),
+                    || false,
+                    || Duration::ZERO,
+                    |_| panic!("no report for a paused turn"),
+                )
+                .unwrap()
+            );
         }
         pressure.set(0);
-        assert!(!run_with(
-            || with_disk_admission(pressure.get(), || {
-                Ok(pending.pop_front().expect("the remaining batch, not a replay"))
-            }),
-            || false,
-            || Duration::ZERO,
-            |report| observed.push(report.repaired),
-        ).unwrap());
+        assert!(
+            !run_with(
+                || with_disk_admission(pressure.get(), || {
+                    Ok(pending
+                        .pop_front()
+                        .expect("the remaining batch, not a replay"))
+                }),
+                || false,
+                || Duration::ZERO,
+                |report| observed.push(report.repaired),
+            )
+            .unwrap()
+        );
         assert_eq!(observed, [4, 1]);
         assert!(pending.is_empty());
     }
 
     #[test]
     fn cancellation_before_a_pressure_turn_skips_even_the_batch_callback() {
-        assert!(!run_with(
-            || panic!("cancelled work must not enter disk or source admission"),
-            || true,
-            || Duration::ZERO,
-            |_| panic!("cancelled work has no report"),
-        ).unwrap());
+        assert!(
+            !run_with(
+                || panic!("cancelled work must not enter disk or source admission"),
+                || true,
+                || Duration::ZERO,
+                |_| panic!("cancelled work has no report"),
+            )
+            .unwrap()
+        );
     }
 
     // Used only in isolated children, never concurrently with another test's
@@ -258,11 +271,15 @@ mod tests {
     impl Drop for RestoreDiskPressure {
         fn drop(&mut self) {
             mcp_agent_mail_core::global_metrics()
-                .system.disk_pressure_level.set(self.0);
+                .system
+                .disk_pressure_level
+                .set(self.0);
         }
     }
 
-    fn tree_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn tree_bytes(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
         let mut entries = std::collections::BTreeMap::new();
         let mut directories = vec![root.to_path_buf()];
         while let Some(directory) = directories.pop() {
@@ -270,7 +287,10 @@ mod tests {
                 let entry = entry.unwrap();
                 let path = entry.path();
                 let kind = entry.file_type().unwrap();
-                assert!(!kind.is_symlink(), "owned fixture must not follow a foreign path");
+                assert!(
+                    !kind.is_symlink(),
+                    "owned fixture must not follow a foreign path"
+                );
                 let value = if kind.is_dir() {
                     directories.push(path.clone());
                     None
@@ -289,7 +309,9 @@ mod tests {
         if isolated() {
             return;
         }
-        let metric = &mcp_agent_mail_core::global_metrics().system.disk_pressure_level;
+        let metric = &mcp_agent_mail_core::global_metrics()
+            .system
+            .disk_pressure_level;
         let _restore = RestoreDiskPressure(metric.load());
         metric.set(0);
         let temp = tempfile::tempdir().unwrap();
@@ -305,19 +327,28 @@ mod tests {
         for existing in [false, true] {
             if existing {
                 fastmcp_core::block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
-                    &cx, &pool, 701, Some(345_678_901),
-                )).into_result().unwrap();
+                    &cx,
+                    &pool,
+                    701,
+                    Some(345_678_901),
+                ))
+                .into_result()
+                .unwrap();
             }
             mcp_agent_mail_storage::flush_async_commits();
-            let borrower = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+            let borrower = fastmcp_core::block_on(pool.acquire(&cx))
+                .into_result()
+                .unwrap();
             let before = tree_bytes(temp.path());
             let position = format!("{cursor:?}");
             metric.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
             for _ in 0..3 {
-                assert!(!run(
-                    &cx, &pool, &config, &mut cursor, &stop,
-                    |_| panic!("disk refusal cannot report a completed repair"),
-                ).unwrap());
+                assert!(
+                    !run(&cx, &pool, &config, &mut cursor, &stop, |_| panic!(
+                        "disk refusal cannot report a completed repair"
+                    ),)
+                    .unwrap()
+                );
             }
             // With this one-connection pool exhausted, the old path waits or
             // errors at checkout. The pressure gate must return without it.
@@ -339,16 +370,23 @@ mod tests {
                 backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
                     assert_eq!(report.deferred, 0);
                     repaired += report.repaired;
-                }).unwrap();
+                })
+                .unwrap();
             }
-            assert!(!backlog, "disk recovery must resume the original finite scan");
+            assert!(
+                !backlog,
+                "disk recovery must resume the original finite scan"
+            );
             assert_eq!(repaired, if existing { 1 } else { 5 });
             assert_eq!(pool.engine_identity_key(), engine);
             if existing {
                 let relative = "projects/gh353/agents/BlueLake/profile.json";
                 let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
                 let profile: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(profile["retired_at"], mcp_agent_mail_db::micros_to_iso(345_678_901));
+                assert_eq!(
+                    profile["retired_at"],
+                    mcp_agent_mail_db::micros_to_iso(345_678_901)
+                );
                 assert!(profile.get("registration_token").is_none());
                 let repo = git2::Repository::open(&config.storage_root).unwrap();
                 let tree = repo.head().unwrap().peel_to_tree().unwrap();
@@ -366,29 +404,33 @@ mod tests {
                     Err(CHECKPOINT_OWNED.into()),
                     || interrupted,
                     |_| panic!("a refused checkpoint has no completed storage report"),
-                ).unwrap(),
+                )
+                .unwrap(),
                 !interrupted,
             );
         }
         let mut calls = 0;
         let mut reports = Vec::new();
-        assert!(run_with(
-            || {
-                calls += 1;
-                match calls {
-                    1 => Ok(AgentReconcileReport {
-                        repaired: 4,
-                        budget_exhausted: true,
-                        ..Default::default()
-                    }),
-                    2 => Err(CHECKPOINT_OWNED.into()),
-                    _ => panic!("checkpoint admission must not spin inside one turn"),
-                }
-            },
-            || false,
-            || Duration::ZERO,
-            |report| reports.push(report.repaired),
-        ).unwrap());
+        assert!(
+            run_with(
+                || {
+                    calls += 1;
+                    match calls {
+                        1 => Ok(AgentReconcileReport {
+                            repaired: 4,
+                            budget_exhausted: true,
+                            ..Default::default()
+                        }),
+                        2 => Err(CHECKPOINT_OWNED.into()),
+                        _ => panic!("checkpoint admission must not spin inside one turn"),
+                    }
+                },
+                || false,
+                || Duration::ZERO,
+                |report| reports.push(report.repaired),
+            )
+            .unwrap()
+        );
         assert_eq!(calls, 2);
         assert_eq!(reports, [4]);
         let reason = "agent checkpoint ownership changed; rescan required";
@@ -409,22 +451,32 @@ mod tests {
         let cx = Cx::for_testing();
         let stop = AtomicBool::new(false);
         let mut owner = AgentReconcileCursor::default();
-        let first = owner.reconcile_checkpointed(&cx, &pool, &config, &stop).unwrap();
+        let first = owner
+            .reconcile_checkpointed(&cx, &pool, &config, &stop)
+            .unwrap();
         assert_eq!((first.repaired, first.deferred), (4, 0));
         assert!(first.budget_exhausted);
         let mut contender = AgentReconcileCursor::default();
-        assert!(run(
-            &cx, &pool, &config, &mut contender, &stop,
-            |_| panic!("another owner must refuse before any storage report"),
-        ).unwrap());
+        assert!(
+            run(&cx, &pool, &config, &mut contender, &stop, |_| panic!(
+                "another owner must refuse before any storage report"
+            ),)
+            .unwrap()
+        );
         assert_eq!(pool.engine_identity_key(), engine);
-        assert!(!config.storage_root.join("projects/gh353/agents/SilverCloud/profile.json").exists());
+        assert!(
+            !config
+                .storage_root
+                .join("projects/gh353/agents/SilverCloud/profile.json")
+                .exists()
+        );
         drop(owner);
         let mut reports = Vec::new();
-        assert!(!run(
-            &cx, &pool, &config, &mut contender, &stop,
-            |report| reports.push((report.scanned, report.repaired)),
-        ).unwrap());
+        assert!(
+            !run(&cx, &pool, &config, &mut contender, &stop, |report| reports
+                .push((report.scanned, report.repaired)),)
+            .unwrap()
+        );
         // A reset-to-zero scan would report five inspected profiles, not one.
         assert_eq!(reports, [(1, 1)]);
         assert_eq!(pool.engine_identity_key(), engine);
@@ -619,7 +671,9 @@ mod tests {
             let mut observed = 0;
             assert!(
                 run_with(
-                    || Ok(pending.take().expect("a refusing pass must not be retried in this turn")),
+                    || Ok(pending
+                        .take()
+                        .expect("a refusing pass must not be retried in this turn")),
                     || false,
                     || Duration::ZERO,
                     |_| observed += 1,
@@ -773,7 +827,9 @@ mod tests {
     fn assert_profiles_match_source_and_git(cx: &Cx, pool: &DbPool, config: &Config) {
         let repo = git2::Repository::open(&config.storage_root).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
-        let conn = fastmcp_core::block_on(pool.acquire(cx)).into_result().unwrap();
+        let conn = fastmcp_core::block_on(pool.acquire(cx))
+            .into_result()
+            .unwrap();
         for (index, name) in NAMES.iter().enumerate() {
             let id = 701 + index;
             let rows = conn
@@ -831,7 +887,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while write_barrier::active_writer_count() == 0 {
-            assert!(Instant::now() < deadline, "selection never reached admission");
+            assert!(
+                Instant::now() < deadline,
+                "selection never reached admission"
+            );
             std::thread::yield_now();
         }
         let (promotion, drain) =
@@ -843,7 +902,10 @@ mod tests {
             .expect("refusal must return before the failed promotion guard is released");
         worker.join().unwrap();
         assert_eq!(outcome, Ok(true));
-        assert_eq!(reports, 0, "a partial refused pass is not a completed report");
+        assert_eq!(
+            reports, 0,
+            "a partial refused pass is not a completed report"
+        );
         assert!(!write_barrier::current_thread_holds_promotion_barrier());
         assert!(write_barrier::try_begin_write_activity().is_none());
         assert!(!config.storage_root.join("projects/gh353/agents").exists());
@@ -923,7 +985,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (config, _, pool) = mailbox(temp.path());
         let cx = Cx::for_testing();
-        let conn = fastmcp_core::block_on(pool.acquire(&cx)).into_result().unwrap();
+        let conn = fastmcp_core::block_on(pool.acquire(&cx))
+            .into_result()
+            .unwrap();
         for id in 706..=734 {
             conn.execute_sync(
                 "INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES(?, 701, ?, 'test', 'test', '', 1000000, 2000000)",
@@ -942,17 +1006,26 @@ mod tests {
             backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
                 assert_eq!(report.deferred, 0);
                 initial_repairs += report.repaired;
-            }).unwrap();
+            })
+            .unwrap();
         }
         assert!(!backlog, "initial profile materialization did not converge");
         assert_eq!(initial_repairs, 34);
         let relative = "projects/gh353/agents/Agent734/profile.json";
         let before = std::fs::read(config.storage_root.join(relative)).unwrap();
         fastmcp_core::block_on(mcp_agent_mail_db::queries::set_agent_retired_at(
-            &cx, &pool, 734, Some(345_678_901),
-        )).into_result().unwrap();
+            &cx,
+            &pool,
+            734,
+            Some(345_678_901),
+        ))
+        .into_result()
+        .unwrap();
         // Deliberately no lifecycle archive enqueue, client read, or resend.
-        assert_eq!(std::fs::read(config.storage_root.join(relative)).unwrap(), before);
+        assert_eq!(
+            std::fs::read(config.storage_root.join(relative)).unwrap(),
+            before
+        );
         let mut reports = Vec::new();
         let mut backlog = true;
         for _ in 0..2 {
@@ -962,13 +1035,17 @@ mod tests {
             backlog = run(&cx, &pool, &config, &mut cursor, &stop, |report| {
                 assert_eq!(report.deferred, 0);
                 reports.push((report.scanned, report.repaired));
-            }).unwrap();
+            })
+            .unwrap();
         }
         assert!(!backlog);
         assert_eq!(reports, [(32, 0), (2, 1)]);
         let bytes = std::fs::read(config.storage_root.join(relative)).unwrap();
         let profile: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(profile["retired_at"], mcp_agent_mail_db::micros_to_iso(345_678_901));
+        assert_eq!(
+            profile["retired_at"],
+            mcp_agent_mail_db::micros_to_iso(345_678_901)
+        );
         assert!(profile.get("registration_token").is_none());
         let repo = git2::Repository::open(&config.storage_root).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();

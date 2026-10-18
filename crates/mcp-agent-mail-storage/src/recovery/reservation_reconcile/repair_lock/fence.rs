@@ -28,10 +28,7 @@ impl ArchiveMutationGuard {
     /// The predicate can include a worker stop flag as well as its Cx budget.
     /// This is still the native guard, not a parallel fence or epoch protocol.
     #[track_caller]
-    pub(crate) fn try_begin_repair(
-        path: &Path,
-        cancelled: impl FnMut() -> bool,
-    ) -> Result<Self> {
+    pub(crate) fn try_begin_repair(path: &Path, cancelled: impl FnMut() -> bool) -> Result<Self> {
         try_begin_checked(path, cancelled)
     }
 }
