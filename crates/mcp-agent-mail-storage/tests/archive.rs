@@ -59,3 +59,37 @@ fn archive_target_message_bundle_round_trips() -> Result<(), Box<dyn std::error:
 
     Ok(())
 }
+
+#[test]
+fn recent_commits_filter_returns_latest_matching_change() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = TempDir::new()?;
+    let config = test_config(tmp.path());
+    let archive = ensure_archive(&config, "archive-filter")?;
+    let recipients = vec!["RedHarbor".to_string()];
+    for (id, sender, subject) in [(1, "BlueLake", "first"), (2, "RedHarbor", "second")] {
+        let message = serde_json::json!({
+            "id": id,
+            "subject": subject,
+            "thread_id": "br-filter",
+            "created_ts": "2026-04-22T00:00:00Z",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            subject,
+            sender,
+            &recipients,
+            &[],
+            Some(subject),
+        )?;
+        flush_async_commits();
+    }
+    let all = get_recent_commits(&archive, 1, None)?;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].summary, "second");
+    let sender = get_recent_commits(&archive, 5, Some("agents/BlueLake"))?;
+    assert!(sender.iter().any(|c| c.summary == "first"));
+    assert!(!sender.iter().any(|c| c.summary == "second"));
+    Ok(())
+}
