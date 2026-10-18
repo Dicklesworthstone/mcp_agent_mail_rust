@@ -252,7 +252,14 @@ mod unix {
         // Serialize cooperating evidence writers without creating another
         // control file. The directory lock drops before any Git invocation.
         fs2::FileExt::try_lock_exclusive(&directory)?;
-        let digest = format!("{:x}", Sha256::digest(&original.bytes));
+        // The pinned SHA-2 output type does not implement LowerHex. Encode
+        // every byte explicitly, retaining leading zeros in its stable name.
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(&original.bytes) {
+            use std::fmt::Write as _;
+            write!(&mut digest, "{byte:02x}")
+                .map_err(|_| refused("cannot encode MIDX evidence identity"))?;
+        }
         let path = root.join(format!("multi-pack-index-{digest}.original"));
         match fs::symlink_metadata(&path) {
             Ok(_) => {
@@ -327,6 +334,18 @@ mod unix {
             let mut bytes = b"MIDX\x01\x01\x04\x00\x00\x00\x00\x01".to_vec();
             bytes.extend_from_slice(&[ordinal; 40]);
             Index { bytes, device: 0, inode: 0 }
+        }
+
+        #[test]
+        fn evidence_filename_uses_the_complete_lowercase_sha256() {
+            let scratch = tempfile::tempdir().unwrap();
+            let root = scratch.path().canonicalize().unwrap();
+            let original = index(0);
+            let path = preserve(&root, &original).unwrap();
+            assert_eq!(path.file_name().unwrap(),
+                "multi-pack-index-42811216b5546b624c307f2cd91156c9d95e12b17631ff8f6d8310d50f1ae475.original");
+            assert_eq!(std::fs::read(&path).unwrap(), original.bytes);
+            assert_eq!(preserve(&root, &original).unwrap(), path);
         }
 
         #[test]
