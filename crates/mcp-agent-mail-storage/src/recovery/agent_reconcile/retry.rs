@@ -50,6 +50,25 @@ impl From<&str> for Failure {
     }
 }
 
+/// Resource exhaustion is an operational failure, not conflicting identity
+/// evidence. Keep the ID on the bounded retry lane so a recovered filesystem
+/// does not have to wait for the entire roster to wrap before its tombstone
+/// or retirement is archived. Never retain the payload from the failed turn.
+fn retryable_io_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::ResourceBusy
+            | ErrorKind::StorageFull
+            | ErrorKind::QuotaExceeded
+            | ErrorKind::OutOfMemory
+    )
+}
+
 impl From<StorageError> for Failure {
     fn from(error: StorageError) -> Self {
         // Classify the typed error before rendering it. An identity conflict
@@ -60,7 +79,7 @@ impl From<StorageError> for Failure {
                 | StorageError::LockTimeout(_)
                 | StorageError::GitIndexLock { .. }
         ) || matches!(&error, StorageError::Io(error)
-            if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+            if retryable_io_error(error));
         Self {
             detail: error.to_string(),
             transient,
@@ -283,5 +302,86 @@ mod tests {
             .transient
         );
         assert!(!Failure::from("agent source is ambiguous").transient);
+    }
+
+    #[test]
+    fn resource_pressure_keeps_lifecycle_debt_without_erasing_other_ids() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::ResourceBusy,
+            ErrorKind::StorageFull,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::OutOfMemory,
+        ] {
+            let error = StorageError::Io(std::io::Error::new(kind, "profile publication failed"));
+            let detail = error.to_string();
+            let failure = Failure::from(error);
+            assert!(
+                failure.transient,
+                "{kind:?} must retain lifecycle retry debt"
+            );
+            assert_eq!(
+                failure.detail, detail,
+                "do not disguise pressure as lock contention"
+            );
+
+            let now = Instant::now();
+            let mut queue = RetryQueue::default();
+            queue.defer(7, now);
+            queue.defer(8, now);
+            queue.defer(7, now);
+            assert_eq!(queue.ready_ids(now), [8]);
+            assert_eq!(queue.ready_ids(now + Duration::from_secs(1)), [8, 7]);
+            assert_eq!(queue.len(), 2);
+            queue.forget(7);
+            assert_eq!(queue.ready_ids(now + MAX_BACKOFF), [8]);
+        }
+    }
+
+    #[test]
+    fn malformed_or_unsafe_artifacts_do_not_enter_resource_pressure_retries() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::AlreadyExists,
+            ErrorKind::NotADirectory,
+            ErrorKind::Unsupported,
+        ] {
+            let failure = Failure::from(StorageError::Io(std::io::Error::new(
+                kind,
+                "disk full; quota exceeded; interrupted; retry me",
+            )));
+            assert!(
+                !failure.transient,
+                "{kind:?} must not gain retry authority from text"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_enospc_is_not_misclassified_as_conflicting_profile_evidence() {
+        use std::io::Write as _;
+
+        let mut full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("Linux ENOSPC fixture");
+        let error = full.write_all(b"retained lifecycle update").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert!(retryable_io_error(&error));
+        let failure = Failure::from(StorageError::Io(error));
+        assert!(failure.transient);
+        let now = Instant::now();
+        let mut queue = RetryQueue::default();
+        queue.defer(7, now);
+        assert_eq!(queue.ready_ids(now), [7]);
+        assert_eq!(queue.len(), 1);
     }
 }
