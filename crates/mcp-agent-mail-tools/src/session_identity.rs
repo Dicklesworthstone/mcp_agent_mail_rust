@@ -77,6 +77,21 @@ pub struct SessionBinding {
     pub bound_at_us: i64,
 }
 
+impl SessionBinding {
+    /// Compare the resolved canonical row, not a caller alias or only its id.
+    /// Recovery can reuse an id for a different name; that is not the identity
+    /// this session established. This does not identify database generations
+    /// whose project, id and canonical name are all unchanged.
+    fn matches_agent(&self, agent: &mcp_agent_mail_db::AgentRow) -> bool {
+        self.project_id > 0
+            && self.agent_id > 0
+            && !self.agent_name.is_empty()
+            && agent.project_id == self.project_id
+            && agent.id == Some(self.agent_id)
+            && agent.name == self.agent_name
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct SessionIdentityState {
     held: Vec<SessionBinding>,
@@ -209,14 +224,21 @@ pub fn unbind(ctx: &McpContext, agent_id: i64) {
     });
 }
 
-/// Whether this session holds `agent_id`.
+/// Whether the live session's binding inventory contains `agent_id`.
+/// This id-only lookup does not establish a canonical-row match.
 #[must_use]
 pub fn holds(ctx: &McpContext, agent_id: Option<i64>) -> bool {
-    agent_id.is_some_and(|agent_id| {
-        session_bindings(ctx)
+    let Ok(snapshot) = ActorAuthorizationSnapshot::capture(ctx) else {
+        return false;
+    };
+    let held = agent_id.is_some_and(|agent_id| {
+        snapshot
+            .state
+            .held
             .iter()
             .any(|binding| binding.agent_id == agent_id)
-    })
+    });
+    held && ctx.ensure_live().is_ok()
 }
 
 /// Keep deferred mutation admission and its eventual actor check on the same
@@ -291,7 +313,7 @@ fn authorize_actor_from_state(
     if (held.is_empty() && !state.eviction_restricts(agent.project_id))
         || held
             .iter()
-            .any(|binding| Some(binding.agent_id) == agent.id)
+            .any(|binding| binding.matches_agent(agent))
     {
         return Ok(());
     }
@@ -443,6 +465,103 @@ mod tests {
             1,
             fastmcp_core::SessionState::new(),
         )
+    }
+
+    #[test]
+    fn canonical_binding_match_requires_every_identity_component() {
+        let binding = SessionBinding {
+            project_id: 10,
+            agent_id: 1,
+            agent_name: "BlueLake".to_string(),
+            bound_at_us: 100,
+        };
+        let own = agent(1, 10, "BlueLake");
+        assert!(binding.matches_agent(&own));
+        for other in [
+            agent(1, 10, "RedStone"),
+            agent(1, 10, "bluelake"),
+            agent(1, 20, "BlueLake"),
+            agent(2, 10, "BlueLake"),
+            agent(0, 10, "BlueLake"),
+            mcp_agent_mail_db::AgentRow {
+                id: None,
+                ..own.clone()
+            },
+        ] {
+            assert!(!binding.matches_agent(&other), "accepted {other:?}");
+        }
+        for invalid in [
+            SessionBinding {
+                project_id: 0,
+                ..binding.clone()
+            },
+            SessionBinding {
+                agent_id: 0,
+                ..binding.clone()
+            },
+            SessionBinding {
+                agent_name: String::new(),
+                ..binding.clone()
+            },
+        ] {
+            let row = agent(invalid.agent_id, invalid.project_id, &invalid.agent_name);
+            assert!(!invalid.matches_agent(&row), "invalid tuple granted proof");
+        }
+    }
+
+    #[test]
+    fn reused_id_is_refused_by_live_and_captured_actor_authorization() {
+        with_feature(true, || {
+            let ctx = session_ctx();
+            let own = agent(1, 10, "BlueLake");
+            bind(&ctx, 10, 1, &own.name);
+            let snapshot = ActorAuthorizationSnapshot::capture(&ctx).unwrap();
+            for other in [agent(1, 10, "RedStone"), agent(1, 10, "bluelake")] {
+                let error = authorize_actor(&ctx, &other, false, "read inbox")
+                    .expect_err("a reused id must not borrow the bound identity");
+                assert_eq!(
+                    crate::tool_error_code(&error),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                let error = snapshot
+                    .authorize(&ctx, &other, "acknowledge mail")
+                    .expect_err("deferred actor admission needs the same canonical match");
+                assert_eq!(
+                    crate::tool_error_code(&error),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                assert!(authorize_actor(&ctx, &other, true, "read inbox").is_ok());
+            }
+            assert!(authorize_actor(&ctx, &own, false, "read inbox").is_ok());
+            // This policy still permits genuinely unbound projects; permission
+            // through that fallback is not a canonical binding match.
+            assert!(authorize_actor(&ctx, &agent(2, 20, "RedStone"), false, "read").is_ok());
+            unbind(&ctx, 1);
+            assert!(
+                snapshot
+                    .authorize(&ctx, &agent(1, 10, "RedStone"), "ack")
+                    .is_err()
+            );
+            assert!(snapshot.authorize(&ctx, &own, "ack").is_ok());
+        });
+    }
+
+    #[test]
+    fn binding_inventory_cannot_grant_proof_to_a_cancelled_request() {
+        with_feature(true, || {
+            let state = fastmcp_core::SessionState::new();
+            let cancelled = McpContext::with_state(asupersync::Cx::for_testing(), 1, state.clone());
+            let live = McpContext::with_state(asupersync::Cx::for_testing(), 2, state);
+            bind(&live, 10, 1, "BlueLake");
+            assert!(holds(&cancelled, Some(1)));
+            cancelled.request_cancellation().cancel();
+            assert!(!holds(&cancelled, Some(1)));
+            assert!(
+                holds(&live, Some(1)),
+                "cancellation must not erase another request's proof"
+            );
+            assert!(!holds(&live, None));
+        });
     }
 
     #[test]
