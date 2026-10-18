@@ -42,6 +42,9 @@ where
             ("MESSAGING_SESSION_IDENTITY", "true"),
             // A token-profile refusal must not mask the eviction regression.
             ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "0"),
+            // The projects live under a tempfile `.tmpXXXXXX` directory, which
+            // the ephemeral-root guard refuses by default.
+            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
         ],
         || {
             Config::reset_cached();
