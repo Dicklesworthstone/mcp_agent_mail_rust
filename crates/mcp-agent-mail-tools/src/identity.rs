@@ -3043,8 +3043,8 @@ pub async fn create_agent_identity(
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
-    // Generate or validate agent name
-    let agent_name = match name_hint {
+    // Validate the hint; without one, a name is drawn at insert time below.
+    let explicit_name = match name_hint {
         Some(hint) => {
             let hint = hint.trim();
             if hint.is_empty() {
@@ -3057,7 +3057,7 @@ pub async fn create_agent_identity(
                 ));
             } else if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(hint)
             {
-                normalized
+                Some(normalized)
             } else {
                 let (err_type, msg) = detect_agent_name_mistake(hint).unwrap_or_else(|| {
                     (
@@ -3075,7 +3075,7 @@ pub async fn create_agent_identity(
                 ));
             }
         }
-        None => generate_agent_name(),
+        None => None,
     };
 
     // Validate and normalize attachments_policy (case-insensitive, trimmed)
@@ -3097,62 +3097,84 @@ Check that all parameters have valid values."
         ));
     }
 
-    // Optional cryptographic proof gate (off by default). Mirrors the gate on
-    // `register_agent` so this alternate registration entry point cannot be
-    // used to bypass it. No-op when disabled; fail-closed when enabled.
-    crate::proof_gate::enforce(
-        ctx.cx(),
-        &pool,
-        &crate::proof_gate::RegistrationRequest {
-            agent_name: &agent_name,
-            project_key: &project_key,
-            program: &program,
-            model: &model,
-            granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
-            proof: registration_proof.as_deref(),
-        },
-    )
-    .await?;
+    let mut row = if let Some(agent_name) = explicit_name {
+        // Optional cryptographic proof gate (off by default). Mirrors the gate
+        // on `register_agent` so this alternate registration entry point
+        // cannot be used to bypass it. No-op when disabled; fail-closed when
+        // enabled.
+        crate::proof_gate::enforce(
+            ctx.cx(),
+            &pool,
+            &crate::proof_gate::RegistrationRequest {
+                agent_name: &agent_name,
+                project_key: &project_key,
+                program: &program,
+                model: &model,
+                granted_capabilities: DEFAULT_AGENT_CAPABILITIES,
+                proof: registration_proof.as_deref(),
+            },
+        )
+        .await?;
 
-    // Atomic insert-if-absent: eliminates TOCTOU race between a separate
-    // get_agent check and register_agent upsert. Returns Duplicate if the
-    // name was taken between validation and insert.
-    let agent_out = mcp_agent_mail_db::queries::create_agent(
-        ctx.cx(),
-        &pool,
-        project_id,
-        &agent_name,
-        &program,
-        &model,
-        task_description.as_deref(),
-        Some(&policy),
-    )
-    .await;
+        // Atomic insert-if-absent: eliminates TOCTOU race between a separate
+        // get_agent check and register_agent upsert. Returns Duplicate if the
+        // name was taken between validation and insert.
+        let agent_out = mcp_agent_mail_db::queries::create_agent(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &agent_name,
+            &program,
+            &model,
+            task_description.as_deref(),
+            Some(&policy),
+        )
+        .await;
 
-    let mut row = match agent_out {
-        Outcome::Ok(row) => row,
-        Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
-            return Err(legacy_tool_error(
-                "INVALID_ARGUMENT",
-                format!(
-                    "Invalid argument value: Agent name '{agent_name}' already exists in this project. \
+        match agent_out {
+            Outcome::Ok(row) => row,
+            Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Invalid argument value: Agent name '{agent_name}' already exists in this project. \
 Choose a different name (or omit the name to auto-generate one)."
-                ),
-                true,
-                json!({
-                    "field": "name_hint",
-                    "error_detail": agent_name,
-                }),
-            ));
+                    ),
+                    true,
+                    json!({
+                        "field": "name_hint",
+                        "error_detail": agent_name,
+                    }),
+                ));
+            }
+            Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(p) => {
+                return Err(McpError::internal_error(format!(
+                    "Internal panic: {}",
+                    p.message()
+                )));
+            }
         }
-        Outcome::Err(other) => return Err(db_error_to_mcp_error(other)),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            )));
-        }
+    } else {
+        // No hint: draw a fresh name and redraw on collision, as
+        // `register_agent` does (GH#213); the proof gate runs per candidate
+        // inside. A random draw that hits an existing agent is not the
+        // caller's mistake and must not fail the call.
+        claim_fresh_auto_named_agent(
+            ctx,
+            &pool,
+            &project_key,
+            project_id,
+            &program,
+            &model,
+            task_description.as_deref(),
+            &policy,
+            registration_proof.as_deref(),
+            generate_agent_name(),
+            generate_agent_name,
+        )
+        .await?
     };
     enqueue_agent_semantic_index(&row);
 
