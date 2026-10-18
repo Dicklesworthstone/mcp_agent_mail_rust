@@ -9,11 +9,15 @@
 //! ALWAYS look up through the implementation first; retained handles are
 //! owners, not lookup results. In particular, retaining an old handle cannot
 //! resurrect a generation which recovery closed and removed from its index.
+//!
+//! Cold construction is admitted once per mailbox across the shared runtime factory
+//! entry points, not just MCP tool bootstrap. Competing maintenance workers
+//! must not each build an engine before the weak cache picks a winner.
 
 pub use crate::pool_impl::*;
 
-use crate::error::DbResult;
-use std::collections::VecDeque;
+use crate::error::{DbError, DbResult};
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 // A normal server has a request pool and a smaller maintenance pool. Bound
@@ -57,6 +61,88 @@ impl<T> Residency<T> {
 
 static WRITE_POOL_RESIDENTS: OnceLock<Mutex<Residency<DbPool>>> = OnceLock::new();
 
+// Only in-flight construction identities are stored here. A permit is not a
+// writer lease and never authorizes migration or recovery promotion. In
+// particular, a loser must NOT wait for its winner: it may already hold a
+// writer lease that the winner's recovery needs to drain.
+static RUNTIME_POOL_INITIALIZERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+#[cfg(test)]
+static RUNTIME_POOL_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct RuntimePoolInitialization<'registry> {
+    registry: &'registry Mutex<HashSet<String>>,
+    identity: String,
+}
+
+impl<'registry> RuntimePoolInitialization<'registry> {
+    fn try_begin(
+        registry: &'registry Mutex<HashSet<String>>,
+        identity: String,
+    ) -> DbResult<Self> {
+        // This mutex protects bookkeeping only. No filesystem resolution,
+        // pool construction, promotion wait or engine destructor runs here.
+        let mut active = registry.lock().unwrap_or_else(PoisonError::into_inner);
+        if !active.insert(identity.clone()) {
+            return Err(DbError::ResourceBusy(
+                "runtime database pool initialization is already in progress for this mailbox; retry the operation"
+                    .into(),
+            ));
+        }
+        drop(active);
+        Ok(Self { registry, identity })
+    }
+}
+
+impl Drop for RuntimePoolInitialization<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.identity);
+    }
+}
+
+fn create_runtime_pool(
+    config: &DbPoolConfig,
+    create: impl FnOnce(&DbPoolConfig) -> DbResult<DbPool>,
+) -> DbResult<DbPool> {
+    let initializer = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+        &config.database_url,
+    ) {
+        // Memory compatibility selection and caller-owned lifetimes are an
+        // existing, separate contract. Do not merge anonymous sessions under
+        // a shared ':memory:' construction key or change their factory.
+        None
+    } else {
+        if let Some(pool) = get_cached_pool(config) {
+            return Ok(pool);
+        }
+        // Canonical path, not URL spelling or pool shape: maintenance and
+        // request pools of different sizes still initialize the same file.
+        // This key controls scheduling ONLY. The original factory continues
+        // to resolve and validate the configured SQLite/archive authority.
+        let identity = resolve_mailbox_sqlite_path(&config.database_url)?.canonical_path;
+        let registry = RUNTIME_POOL_INITIALIZERS.get_or_init(|| Mutex::new(HashSet::new()));
+        Some(RuntimePoolInitialization::try_begin(registry, identity)?)
+    };
+    // A predecessor can publish between our first lookup and permit
+    // acquisition. Never rebuild that now-hot pool, even on this slow path.
+    if initializer.is_some()
+        && let Some(pool) = get_cached_pool(config)
+    {
+        return Ok(pool);
+    }
+    #[cfg(test)]
+    RUNTIME_POOL_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pool = create(config)?;
+    // Publish resident ownership BEFORE relinquishing construction admission;
+    // the last request dropping must not reopen the original cache-miss gap.
+    retain_runtime_pool(&pool);
+    Ok(pool)
+}
+
 fn retain_runtime_pool(pool: &DbPool) {
     // Anonymous memory databases have caller-owned lifetimes. Retaining one
     // would silently preserve state after its last caller intentionally drops
@@ -92,29 +178,25 @@ pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
 /// Construction, migrations and recovery run WITHOUT the residency mutex.
 /// Callers that can write must still hold the normal write-admission lease;
 /// a genuinely cold bootstrap still requires the existing barrier handoff.
+/// A competing cold factory for the same mailbox returns retryable
+/// `DbError::ResourceBusy`; hot pools never wait for initialization.
 pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
-    let pool = crate::pool_impl::get_or_create_pool(config)?;
-    retain_runtime_pool(&pool);
-    Ok(pool)
+    create_runtime_pool(config, crate::pool_impl::get_or_create_pool)
 }
 
 /// Create or reuse a runtime pool with the same ownership as the main factory.
 pub fn create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
-    let pool = crate::pool_impl::create_pool(config)?;
-    retain_runtime_pool(&pool);
-    Ok(pool)
+    create_runtime_pool(config, crate::pool_impl::create_pool)
 }
 
 /// Preserve compatible-memory-pool selection without pinning memory sessions.
 pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
-    let pool = crate::pool_impl::get_or_reuse_compatible_memory_pool(config)?;
-    retain_runtime_pool(&pool);
-    Ok(pool)
+    create_runtime_pool(config, crate::pool_impl::get_or_reuse_compatible_memory_pool)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Residency;
+    use super::{DbError, HashSet, Residency, RuntimePoolInitialization};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -210,6 +292,79 @@ mod tests {
             })
         };
         drop(displaced);
+    }
+
+    #[test]
+    fn cold_admission_is_per_mailbox_and_never_owns_the_registry_mutex() {
+        let registry = Mutex::new(HashSet::new());
+        let first = RuntimePoolInitialization::try_begin(&registry, "mail-a".into()).unwrap();
+        assert!(
+            registry.try_lock().is_ok(),
+            "construction holds bookkeeping mutex"
+        );
+        assert!(matches!(
+            RuntimePoolInitialization::try_begin(&registry, "mail-a".into()),
+            Err(DbError::ResourceBusy(_))
+        ));
+        let other = RuntimePoolInitialization::try_begin(&registry, "mail-b".into()).unwrap();
+        assert_eq!(registry.lock().unwrap().len(), 2);
+        drop(first);
+        let successor =
+            RuntimePoolInitialization::try_begin(&registry, "mail-a".into()).unwrap();
+        drop(other);
+        drop(successor);
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_and_unwinding_initializers_release_their_mailbox() {
+        let registry = Mutex::new(HashSet::new());
+        let failed: Result<(), DbError> = (|| {
+            let _owner = RuntimePoolInitialization::try_begin(&registry, "mail".into())?;
+            Err(DbError::ResourceBusy("injected initialization failure".into()))
+        })();
+        assert!(failed.is_err());
+        assert!(registry.lock().unwrap().is_empty());
+        let unwound = std::panic::catch_unwind(|| {
+            let _owner = RuntimePoolInitialization::try_begin(&registry, "mail".into()).unwrap();
+            panic!("injected initializer unwind");
+        });
+        assert!(unwound.is_err());
+        assert!(!registry.is_poisoned(), "engine panic poisoned bookkeeping");
+        let successor = RuntimePoolInitialization::try_begin(&registry, "mail".into()).unwrap();
+        drop(successor);
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_cold_admission_has_one_owner_until_every_loser_has_returned() {
+        let registry = Mutex::new(HashSet::new());
+        let start = std::sync::Barrier::new(8);
+        let admitted = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let tasks = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let owner = RuntimePoolInitialization::try_begin(&registry, "mail".into());
+                        let won = owner.is_ok();
+                        let busy = matches!(&owner, Err(DbError::ResourceBusy(_)));
+                        // The winner retains admission until all losing
+                        // calls have returned, not merely until they start.
+                        admitted.wait();
+                        drop(owner);
+                        (won, busy)
+                    })
+                })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|(won, _)| *won).count(), 1);
+        assert_eq!(results.iter().filter(|(_, busy)| *busy).count(), 7);
+        assert!(registry.lock().unwrap().is_empty());
     }
 }
 
