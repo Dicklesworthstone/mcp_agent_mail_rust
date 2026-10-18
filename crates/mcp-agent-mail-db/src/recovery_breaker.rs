@@ -108,7 +108,13 @@ impl RecoveryBreakerState {
     /// An unfinished attempt may have changed the bytes before process death.
     #[must_use]
     pub fn applies_to(&self, fingerprint: &str) -> bool {
-        self.attempt_in_progress || self.db_fingerprint == fingerprint
+        self.attempt_in_progress
+            || self.db_fingerprint == fingerprint
+            // Failed observation proves no change of generation. Preserve the
+            // lineage through both loss and restoration of read access; the
+            // cooldown or an explicitly successful repair still clears it.
+            || fingerprint == "unreadable"
+            || self.db_fingerprint == "unreadable"
     }
 }
 
@@ -429,26 +435,113 @@ fn open_breaker_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// is exceptional and correctness matters more than the cost of hashing the
 /// complete generation: a same-length repair beyond the first SQLite page must
 /// reset the breaker.
+///
+/// Hash only an offline/raw-readable source. Live FrankenSQLite callers must
+/// use [`crate::pool::recovery_breaker_fingerprint`] to avoid releasing another
+/// connection's process-owned file locks by closing a raw file descriptor.
+/// Reads are bounded by the observed length and refuse a changed inode,
+/// timestamp, length, or pathname. An unstable observation is `unreadable`,
+/// never a fabricated content generation or permission to reset the breaker.
 #[must_use]
 pub fn fingerprint_db(db_path: &Path) -> String {
-    let mut file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(db_path) {
-        Ok(file) => file,
+    fingerprint_db_with_observer(db_path, |_, _| {})
+}
+
+fn fingerprint_db_with_observer(db_path: &Path, mut observed: impl FnMut(&Path, u64)) -> String {
+    // Resolve relative paths once; a later process-wide chdir must not make
+    // final verification consult a different file with the same basename.
+    let path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return "unreadable".to_string();
+        };
+        cwd.join(db_path)
+    };
+    match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return "missing".to_string();
         }
-        Err(_) => return "unreadable".to_string(),
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return "unreadable".to_string(),
+    }
+    let mut capture = || -> std::io::Result<String> {
+        let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path)?;
+        let before = file.metadata()?;
+        let identity = same_file::Handle::from_file(file.try_clone()?)?;
+        let limit = before.len().checked_add(1).ok_or_else(|| {
+            std::io::Error::other("fingerprint input exceeds the bounded read contract")
+        })?;
+        let mut reader = (&mut file).take(limit);
+        let mut hasher = sha2::Sha256::new();
+        let mut read_bytes = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        observed(&path, 0);
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            read_bytes = read_bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| std::io::Error::other("fingerprint read length overflow"))?;
+            hasher.update(&buffer[..count]);
+            observed(&path, read_bytes);
+        }
+        if read_bytes != before.len() || !fingerprint_metadata_matches(&before, &file.metadata()?) {
+            return Err(std::io::Error::other(
+                "fingerprint source changed while reading",
+            ));
+        }
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path)?;
+        if !fingerprint_metadata_matches(&before, &current.metadata()?)
+            || same_file::Handle::from_file(current)? != identity
+        {
+            return Err(std::io::Error::other("fingerprint source pathname changed"));
+        }
+        Ok(format!("{read_bytes}:{}", hex::encode(hasher.finalize())))
     };
-    let len = file.metadata().map_or(0, |meta| meta.len());
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => hasher.update(&buffer[..read]),
-            Err(_) => return "unreadable".to_string(),
+    // Disappearance after starting a read is uncertainty, not a new missing
+    // generation. All observation errors retain existing failure history.
+    capture().unwrap_or_else(|_| "unreadable".to_string())
+}
+
+fn fingerprint_metadata_matches(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if !before.is_file()
+        || !after.is_file()
+        || before.len() != after.len()
+        || !before
+            .modified()
+            .is_ok_and(|modified| after.modified().ok() == Some(modified))
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.nlink() != after.nlink()
+            || before.mode() != after.mode()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return false;
         }
     }
-    format!("{len}:{}", hex::encode(hasher.finalize()))
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if before.creation_time() != after.creation_time()
+            || before.file_attributes() != after.file_attributes()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Load the durable sidecar.
@@ -1196,6 +1289,154 @@ mod tests {
 
         assert!(load(&db).is_err());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"operator evidence");
+    }
+
+    #[test]
+    fn fingerprint_read_work_is_bounded_by_the_initial_length() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("growing-db");
+        let initial = 64 * 1024_u64;
+        std::fs::write(&db, vec![0; initial as usize]).unwrap();
+        let mut largest_read = 0;
+        let mut extensions = 0;
+        let result = fingerprint_db_with_observer(&db, |path, bytes| {
+            largest_read = largest_read.max(bytes);
+            if extensions < 4 {
+                extensions += 1;
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(initial * (extensions + 1))
+                    .unwrap();
+            }
+        });
+        assert_eq!(result, "unreadable");
+        assert_eq!(
+            largest_read,
+            initial + 1,
+            "the reader followed growth instead of its captured bound"
+        );
+        assert_eq!(extensions, 3);
+    }
+
+    #[test]
+    fn fingerprint_stable_vectors_preserve_existing_wire_identity() {
+        let td = tempfile::tempdir().unwrap();
+        for (name, bytes, expected) in [
+            (
+                "empty",
+                b"".as_slice(),
+                "0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                b"abc".as_slice(),
+                "3:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            let db = td.path().join(name);
+            std::fs::write(&db, bytes).unwrap();
+            assert_eq!(fingerprint_db(&db), expected);
+            let state = record_failure(None, expected, "failure", CFG, 1_000);
+            store(&db, &state).unwrap();
+            assert_eq!(
+                fingerprint_db(&db),
+                expected,
+                "control state changed content identity"
+            );
+            assert_eq!(load(&db).unwrap(), Some(state));
+        }
+    }
+
+    #[test]
+    fn fingerprint_uncertainty_preserves_failure_lineage() {
+        let mut tripped = record_failure(None, "stable-generation", "failure", CFG, 1_000);
+        for _ in 0..2 {
+            tripped = record_failure(Some(&tripped), "stable-generation", "failure", CFG, 1_000);
+        }
+        assert!(
+            matches!(
+                evaluate(Some(&tripped), "unreadable", CFG, 1_001),
+                BreakerVerdict::Refuse { .. }
+            ),
+            "an unreadable generation is not proof of a repaired database"
+        );
+        let failed = record_failure(Some(&tripped), "unreadable", "cannot observe", CFG, 1_001);
+        assert_eq!(failed.consecutive_failures, 4);
+        assert!(matches!(
+            evaluate(Some(&failed), "readable-again", CFG, 1_002),
+            BreakerVerdict::Refuse { .. }
+        ));
+        assert_eq!(
+            evaluate(Some(&failed), "readable-again", CFG, 1_101),
+            BreakerVerdict::AllowHalfOpen
+        );
+        assert_eq!(
+            evaluate(
+                Some(&cleared_state("unreadable")),
+                "readable-again",
+                CFG,
+                1_002
+            ),
+            BreakerVerdict::Allow
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_refuses_mutation_during_streaming_even_with_restored_mtime() {
+        for mutation in ["rewrite", "truncate", "grow", "replace", "symlink"] {
+            let td = tempfile::tempdir().unwrap();
+            let db = td.path().join("db");
+            let bytes = vec![b'a'; 128 * 1024];
+            std::fs::write(&db, &bytes).unwrap();
+            let before = std::fs::metadata(&db).unwrap();
+            let retained = td.path().join("retained-original");
+            let fingerprint = fingerprint_db_with_observer(&db, |path, read| {
+                if read != 64 * 1024 {
+                    return;
+                }
+                match mutation {
+                    "rewrite" => std::fs::write(path, vec![b'b'; bytes.len()]).unwrap(),
+                    "truncate" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(64 * 1024)
+                        .unwrap(),
+                    "grow" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_len(192 * 1024)
+                        .unwrap(),
+                    "replace" => {
+                        std::fs::rename(path, &retained).unwrap();
+                        std::fs::write(path, &bytes).unwrap();
+                    }
+                    "symlink" => {
+                        std::fs::rename(path, &retained).unwrap();
+                        std::os::unix::fs::symlink(&retained, path).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                if mutation != "symlink" {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_times(
+                            std::fs::FileTimes::new().set_modified(before.modified().unwrap()),
+                        )
+                        .unwrap();
+                }
+            });
+            assert_eq!(
+                fingerprint, "unreadable",
+                "{mutation} produced a mixed or displaced fingerprint"
+            );
+        }
     }
 
     #[test]
