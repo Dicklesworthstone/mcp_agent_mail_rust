@@ -216,6 +216,16 @@ fn run_ack_ttl_slice(
     let cx = block_on(async {
         Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
     });
+    // Establish a durable generation before any automatic reservation is granted.
+    // Otherwise a fresh database may reuse an old id-N.json artifact filename.
+    if config.ack_escalation_enabled
+        && config.ack_escalation_mode.eq_ignore_ascii_case("file_reservation")
+    {
+        match block_on(queries::db_generation_id(&cx, pool)) {
+            Outcome::Ok(Some(_)) => {}
+            other => return Err(format!("ACK escalation generation admission failed: {other:?}")),
+        }
+    }
     let now = now_micros();
     let ttl_us = i64::try_from(config.ack_ttl_seconds)
         .unwrap_or(1800)
