@@ -20,6 +20,8 @@
 mod authority;
 #[cfg(unix)]
 use authority::SnapshotAuthority;
+#[cfg(unix)]
+pub use authority::SnapshotRetentionGuard;
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _};

@@ -25,6 +25,98 @@ pub(super) struct SnapshotAuthority {
     name: OsString,
 }
 
+/// Exclusive snapshot admission retained from pin selection through eviction.
+///
+/// This coordinates retention with metadata publishers and verified readers.
+/// It neither opens the live database nor enters database recovery admission.
+/// The caller must still validate each inventoried file before moving it.
+#[must_use]
+pub struct SnapshotRetentionGuard {
+    authority: SnapshotAuthority,
+    metadata_path: PathBuf,
+    metadata: RetentionMetadata,
+    selected: Option<super::SelectedVerifiedSnapshot>,
+}
+
+#[derive(PartialEq, Eq)]
+enum RetentionMetadata {
+    Absent,
+    Bytes(Vec<u8>),
+    Unavailable,
+}
+
+fn retention_metadata(path: &Path) -> RetentionMetadata {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => RetentionMetadata::Absent,
+        Ok(metadata) if metadata.is_file() => {
+            match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                path,
+                super::MAX_SNAPSHOT_METADATA_BYTES,
+            ) {
+                Ok(bytes) => RetentionMetadata::Bytes(bytes),
+                Err(_) => RetentionMetadata::Unavailable,
+            }
+        }
+        _ => RetentionMetadata::Unavailable,
+    }
+}
+
+impl SnapshotRetentionGuard {
+    /// Acquire without waiting, then select the exact verified generation.
+    /// An unreadable or malformed sidecar stays occupied, never absent.
+    ///
+    /// # Errors
+    /// Refuses live readers/publishers, unsafe lock paths, or changed authority.
+    pub fn acquire(primary: &Path) -> io::Result<Self> {
+        let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
+        let authority = SnapshotAuthority::acquire(&primary, true)?;
+        let metadata_path = super::snapshot_meta_path(&primary);
+        let metadata = retention_metadata(&metadata_path);
+        let selected = if matches!(metadata, RetentionMetadata::Bytes(_)) {
+            // Already exclusive: reacquiring the public selector's shared lock
+            // would reject our own admission and discard a valid pin.
+            super::select_verified_snapshot_inner(&primary)
+        } else {
+            None
+        };
+        let guard = Self {
+            authority,
+            metadata_path,
+            metadata,
+            selected,
+        };
+        guard.revalidate()?;
+        Ok(guard)
+    }
+
+    /// Whether a sidecar exists or its absence could not be established.
+    #[must_use]
+    pub fn metadata_occupied(&self) -> bool {
+        self.metadata != RetentionMetadata::Absent
+    }
+
+    /// The verified backup that must remain outside quarantine this pass.
+    #[must_use]
+    pub fn verified_source_path(&self) -> Option<&Path> {
+        self.selected
+            .as_ref()
+            .map(|selected| selected.actual_path.as_path())
+    }
+
+    /// Recheck ownership and metadata before another destructive operation.
+    /// Participating writers are excluded; changed external evidence refuses
+    /// further work rather than allowing a stale pin to authorize eviction.
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.authority.revalidate()?;
+        if retention_metadata(&self.metadata_path) != self.metadata {
+            return Err(invalid(
+                "snapshot metadata changed during retention; rescan required",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }

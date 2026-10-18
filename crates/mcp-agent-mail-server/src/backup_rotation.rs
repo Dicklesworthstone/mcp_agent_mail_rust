@@ -272,6 +272,9 @@ fn stage_backup_noreplace(
 /// Unix staging verifies the original inventory, retains the claimed directory
 /// across the batch, and distinguishes a refused operation from a completed
 /// rename with unconfirmed durability. Both are recorded in `failures`.
+/// Snapshot admission spans pin selection through the final eviction. Busy
+/// readers/publishers refuse before quarantine creation. Changed metadata or
+/// lock ownership stops further moves without losing earlier move accounting.
 /// The explicit hard-delete lane and non-Unix staging retain their prior
 /// behavior; they do not inherit the Unix descriptor-bound guarantees.
 pub fn rotate_storage_backups(
@@ -327,13 +330,6 @@ where
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let snapshot_metadata = mcp_agent_mail_db::snapshot::snapshot_meta_path(snapshot_primary);
-    let snapshot_authority_occupied = match fs::symlink_metadata(&snapshot_metadata) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-    };
-    let pinned_verified_snapshot = snapshot_authority_occupied
-        .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(snapshot_primary))
-        .flatten();
 
     let mut report = RotateReport::default();
     let entries = match fs::read_dir(database_parent) {
@@ -371,6 +367,30 @@ where
             .or_default()
             .push((entry.path(), mtime, meta));
     }
+
+    if by_kind.is_empty() {
+        return Ok(report);
+    }
+    // Inventory is only a hint: every move checks its retained file witness.
+    // Acquire before choosing a pin, then retain admission for the whole pass.
+    // Do not create control state for a missing/empty backup inventory.
+    #[cfg(unix)]
+    let snapshot_guard =
+        mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(snapshot_primary)?;
+    #[cfg(unix)]
+    let (snapshot_authority_occupied, pinned_verified_snapshot) = (
+        snapshot_guard.metadata_occupied(),
+        snapshot_guard.verified_source_path().map(Path::to_path_buf),
+    );
+    #[cfg(not(unix))]
+    let snapshot_authority_occupied = match fs::symlink_metadata(&snapshot_metadata) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    #[cfg(not(unix))]
+    let pinned_verified_snapshot = snapshot_authority_occupied
+        .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(snapshot_primary))
+        .flatten();
 
     // Quarantine directory for this rotation pass. Created lazily on the
     // first staged file so a no-op rotation leaves no empty directories.
@@ -454,6 +474,13 @@ where
         };
         for (path, _mtime, metadata) in to_evict {
             let size = metadata.len();
+            #[cfg(unix)]
+            if let Err(error) = snapshot_guard.revalidate() {
+                let failure = RotationFailure::from_error(path, &error);
+                summary.record_failure(&failure, size);
+                report.failures.push(failure);
+                continue;
+            }
             if delete_opted_in {
                 // Legacy hard-delete behavior — only behind the explicit
                 // `AM_BACKUP_ROTATION_DELETE` opt-in.
@@ -505,6 +532,20 @@ where
             };
             match stage(path, directory, metadata) {
                 Ok(dest) => {
+                    #[cfg(unix)]
+                    if let Err(error) = snapshot_guard.revalidate() {
+                        let failure = RotationFailure {
+                            source: path.clone(),
+                            rename_completed: true,
+                            requested_destination: Some(dest),
+                            error: format!(
+                                "backup moved but snapshot authority changed: {error}; evidence retained, do not retry"
+                            ),
+                        };
+                        summary.record_failure(&failure, size);
+                        report.failures.push(failure);
+                        continue;
+                    }
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
                     summary.staged += 1;
                     summary.bytes_staged = summary.bytes_staged.saturating_add(size);
@@ -594,6 +635,214 @@ mod tests {
             &[("AM_BACKUP_ROTATION_DELETE", "0")],
             || rotate_storage_backups(root, &root.join("storage.sqlite3"), keep).expect("rotate"),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_coordination_preserves_partial_progress_when_authority_changes() {
+        for replace_lock in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let primary = root.join("storage.sqlite3");
+            for day in 1..=3 {
+                fs::write(
+                    root.join(format!("storage.sqlite3.bak.2026010{day}_000000")),
+                    b"retained backup contents",
+                )
+                .unwrap();
+            }
+            let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+            let lock_path = root.join("storage.sqlite3.bak.authority.lock");
+            let mut moves = Vec::new();
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "0")],
+                || {
+                    rotate_storage_backups_with(
+                        &root,
+                        &primary,
+                        1,
+                        |source, directory, metadata| {
+                            let destination = stage_backup_noreplace(source, directory, metadata)?;
+                            moves.push((source.to_path_buf(), destination.clone()));
+                            // Model an external actor that does not honor admission.
+                            if replace_lock {
+                                fs::rename(&lock_path, root.join("retained-authority.lock"))?;
+                                fs::write(&lock_path, b"replacement authority evidence")?;
+                            } else {
+                                fs::write(&metadata_path, b"changed snapshot evidence")?;
+                            }
+                            Ok(destination)
+                        },
+                    )
+                    .unwrap()
+                },
+            );
+            assert_eq!(moves.len(), 1, "stale admission authorized a second move");
+            assert_eq!(
+                (
+                    report.staged,
+                    report.deleted,
+                    report.kept,
+                    report.unconfirmed_moves
+                ),
+                (0, 0, 2, 1)
+            );
+            assert_eq!(
+                report.bytes_unconfirmed_moves,
+                b"retained backup contents".len() as u64
+            );
+            assert_eq!(report.failures.len(), 2);
+            assert!(report.failures[0].rename_completed);
+            assert!(!report.failures[1].rename_completed);
+            assert_eq!(
+                report.failures[0].requested_destination.as_ref(),
+                Some(&moves[0].1)
+            );
+            assert!(!moves[0].0.exists());
+            assert_eq!(fs::read(&moves[0].1).unwrap(), b"retained backup contents");
+            for day in [1, 3] {
+                assert_eq!(
+                    fs::read(root.join(format!("storage.sqlite3.bak.2026010{day}_000000")))
+                        .unwrap(),
+                    b"retained backup contents"
+                );
+            }
+            let evidence = if replace_lock {
+                &lock_path
+            } else {
+                &metadata_path
+            };
+            assert!(!fs::read(evidence).unwrap().is_empty());
+            if replace_lock {
+                assert!(root.join("retained-authority.lock").is_file());
+            } else {
+                let resumed = rotate_with_delete_off(&root, 1);
+                assert_eq!((resumed.kept, resumed.staged), (2, 0));
+                assert_eq!(
+                    fs::read(&metadata_path).unwrap(),
+                    b"changed snapshot evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_coordination_empty_inventory_does_not_create_authority() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join("unrelated.txt"), b"untouched").unwrap();
+        assert_eq!(rotate_with_delete_off(&root, 1), RotateReport::default());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(fs::read(root.join("unrelated.txt")).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_coordination_excludes_metadata_refresh_through_final_move() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+            .unwrap();
+        drop(conn);
+        fs::copy(
+            &primary,
+            mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
+        )
+        .unwrap();
+        let original = mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 41).unwrap();
+        for day in 1..=2 {
+            fs::write(
+                root.join(format!("storage.sqlite3.bak.2026010{day}_000000")),
+                b"older evidence",
+            )
+            .unwrap();
+        }
+        let mut observations = Vec::new();
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || {
+                rotate_storage_backups_with(&root, &primary, 1, |source, directory, metadata| {
+                    // The native publication API runs at each real move. It must
+                    // not replace the metadata that selected this pass's pin.
+                    observations.push(
+                        mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 42)
+                            .is_err(),
+                    );
+                    stage_backup_noreplace(source, directory, metadata)
+                })
+                .unwrap()
+            },
+        );
+        assert_eq!(report.staged, 2);
+        assert_eq!(
+            observations,
+            [true, true],
+            "metadata changed during retention's eviction interval"
+        );
+        assert_eq!(
+            mcp_agent_mail_db::snapshot::read_snapshot_metadata(&primary),
+            Some(original)
+        );
+        assert_eq!(
+            mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 43)
+                .unwrap()
+                .created_us,
+            43
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_coordination_refuses_live_snapshot_owners_before_eviction() {
+        use fs2::FileExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        for shared in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let primary = root.join("storage.sqlite3");
+            let older = root.join("storage.sqlite3.bak.20260101_000000");
+            let newer = root.join("storage.sqlite3.bak.20260102_000000");
+            fs::write(&older, b"old backup evidence").unwrap();
+            fs::write(&newer, b"new backup evidence").unwrap();
+            let lock_path = root.join("storage.sqlite3.bak.authority.lock");
+            let owner = fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&lock_path)
+                .unwrap();
+            let inode = owner.metadata().unwrap().ino();
+            if shared {
+                fs2::FileExt::lock_shared(&owner).unwrap();
+            } else {
+                owner.lock_exclusive().unwrap();
+            }
+            let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "0")],
+                || rotate_storage_backups(&root, &primary, 1),
+            );
+            drop(owner);
+            assert!(
+                result.is_err(),
+                "retention ignored a live snapshot owner: shared={shared}"
+            );
+            assert_eq!(fs::read(&older).unwrap(), b"old backup evidence");
+            assert_eq!(fs::read(&newer).unwrap(), b"new backup evidence");
+            assert!(
+                !root.join("doctor").exists(),
+                "busy admission created quarantine"
+            );
+            assert_eq!(fs::metadata(&lock_path).unwrap().ino(), inode);
+            let resumed = rotate_with_delete_off(&root, 1);
+            assert_eq!((resumed.staged, resumed.kept), (1, 1));
+            assert_eq!(fs::metadata(&lock_path).unwrap().ino(), inode);
+        }
     }
 
     #[test]
