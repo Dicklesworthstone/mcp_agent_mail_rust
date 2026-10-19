@@ -7447,10 +7447,26 @@ mod tests {
         for (path, bytes) in artifacts {
             assert_eq!(std::fs::read(path).expect("retained archive"), bytes);
         }
-        assert!(matches!(
-            apply_archive_ahead_delta(&db, &storage, 2).expect("repeat bounded delta"),
-            ArchiveDeltaApplyOutcome::NotApplicable(_)
-        ));
+        // GH#357: a delta with nothing missing is an applied no-op, so startup
+        // re-checks drift instead of escalating to reconstruction. The repeat
+        // must not replay rows or re-attest reply metadata.
+        let repeat = apply_archive_ahead_delta(&db, &storage, 2).expect("repeat bounded delta");
+        let ArchiveDeltaApplyOutcome::Applied(stats) = repeat else {
+            panic!("an already-applied delta must be an applied no-op");
+        };
+        assert_eq!(stats.missing_message_ids, 0);
+        assert_eq!(stats.messages_applied, 0);
+        let conn = SqliteDbConn::open_file(db.to_str().unwrap()).expect("inspect repeat");
+        assert_incremental_reply_metadata_rows(&conn);
+        let after = conn
+            .query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM message_recipients ORDER BY message_id",
+                &[],
+            )
+            .expect("read receipts after the repeat");
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].get_as::<i64>(1).unwrap(), 123);
+        assert_eq!(after[0].get_as::<i64>(2).unwrap(), 456);
     }
 
     #[test]
