@@ -3266,17 +3266,7 @@ fn rotate_backups_best_effort(config: &Config) {
     let keep = crate::backup_rotation::resolved_keep_per_kind();
     match crate::backup_rotation::rotate_storage_backups(&config.storage_root, &database_path, keep)
     {
-        Ok(report) if report.evicted() > 0 => {
-            tracing::info!(
-                staged = report.staged,
-                deleted = report.deleted,
-                kept = report.kept,
-                bytes_staged = report.bytes_staged,
-                bytes_deleted = report.bytes_deleted,
-                "backup rotation staged old backups in storage_root"
-            );
-        }
-        Ok(_) => {}
+        Ok(report) => crate::integrity_guard::report_backup_rotation(&report, "startup"),
         Err(err) => {
             tracing::warn!(
                 storage_root = %config.storage_root.display(),

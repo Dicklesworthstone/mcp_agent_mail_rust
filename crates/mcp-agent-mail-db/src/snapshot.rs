@@ -36,6 +36,42 @@ use crate::integrity::CheckKind;
 const SNAPSHOT_METADATA_SCHEMA: u32 = 1;
 const MAX_SNAPSHOT_METADATA_BYTES: u64 = 64 * 1024;
 
+/// One admission covers both backup-file publication and its metadata commit.
+/// Keeping this boundary in the DB crate also protects explicit operator
+/// exports, which do not pass through the automatic exporter's journal lease.
+pub(crate) struct SnapshotPublicationGuard {
+    primary: PathBuf,
+    #[cfg(unix)]
+    authority: SnapshotAuthority,
+}
+
+impl SnapshotPublicationGuard {
+    pub(crate) fn acquire(primary: &Path) -> DbResult<Self> {
+        let primary = normalized_snapshot_primary(primary)?;
+        #[cfg(unix)]
+        let authority =
+            SnapshotAuthority::acquire(&primary, true).map_err(snapshot_authority_error)?;
+        Ok(Self {
+            primary,
+            #[cfg(unix)]
+            authority,
+        })
+    }
+
+    pub(crate) fn revalidate(&self, primary: &Path) -> DbResult<()> {
+        if normalized_snapshot_primary(primary)? != self.primary {
+            return Err(DbError::Sqlite(
+                "snapshot publication authority belongs to another database".to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        self.authority
+            .revalidate()
+            .map_err(snapshot_authority_error)?;
+        Ok(())
+    }
+}
+
 /// Tables whose row counts are recorded in snapshot metadata. These are the
 /// core coordination tables; a missing table is skipped (best-effort) so the
 /// snapshot still records what it can on partial schemas.
@@ -565,9 +601,17 @@ pub fn record_snapshot_metadata(
     primary: &Path,
     created_us: i64,
 ) -> DbResult<VerifiedSnapshotMetadata> {
+    let authority = SnapshotPublicationGuard::acquire(primary)?;
+    record_snapshot_metadata_admitted(primary, created_us, &authority)
+}
+
+pub(crate) fn record_snapshot_metadata_admitted(
+    primary: &Path,
+    created_us: i64,
+    authority: &SnapshotPublicationGuard,
+) -> DbResult<VerifiedSnapshotMetadata> {
     let primary = normalized_snapshot_primary(primary)?;
-    #[cfg(unix)]
-    let authority = SnapshotAuthority::acquire(&primary, true).map_err(snapshot_authority_error)?;
+    authority.revalidate(&primary)?;
     let bak = snapshot_bak_path(&primary);
     if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak) {
         return Err(DbError::Sqlite(format!(
@@ -681,8 +725,7 @@ pub fn record_snapshot_metadata(
         snapshot_sha256,
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    #[cfg(unix)]
-    authority.revalidate().map_err(snapshot_authority_error)?;
+    authority.revalidate(&primary)?;
     write_snapshot_metadata(&primary, &meta)?;
     Ok(meta)
 }
@@ -1136,6 +1179,228 @@ mod tests {
         assert_eq!(read_snapshot_metadata(&primary), Some(newer));
         drop(held);
         assert!(latest_verified_snapshot(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_pool_publication_refuses_a_verified_snapshot_reader_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let pool = crate::DbPool::new(&crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", primary.display()),
+            ..Default::default()
+        })
+        .unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let metadata = record_snapshot_metadata(&primary, 42).unwrap();
+        let reader = select_verified_snapshot(&primary).unwrap();
+        let names = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before_names = names();
+        let before_backup = std::fs::read(&backup).unwrap();
+        let error = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot authority unavailable"));
+        assert_eq!(
+            names(),
+            before_names,
+            "busy publication must not create a stage"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), before_backup);
+        assert_eq!(read_snapshot_metadata(&primary), Some(metadata));
+        drop(reader);
+        SnapshotPublicationGuard::acquire(&primary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_preserves_failed_verification_and_the_last_valid_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let created_us = chrono::DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
+            .unwrap()
+            .timestamp_micros();
+        let metadata = record_snapshot_metadata(&primary, created_us).unwrap();
+        let last_valid = primary.with_file_name("storage.sqlite3.bak.20261001_000000");
+        std::fs::rename(&backup, &last_valid).unwrap();
+        std::fs::write(&backup, b"interrupted newer backup").unwrap();
+        let invalid = primary.with_file_name("storage.sqlite3.bak.20260901_000000");
+        std::fs::write(&invalid, b"unresolved old forensic evidence").unwrap();
+        assert!(record_snapshot_metadata(&primary, created_us + 1).is_err());
+        assert_eq!(read_snapshot_metadata(&primary), Some(metadata));
+
+        let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        assert_eq!(guard.verified_source_path(), Some(last_valid.as_path()));
+        let pin_error = guard
+            .delete_superseded_generation(
+                &primary,
+                &last_valid,
+                &std::fs::metadata(&last_valid).unwrap(),
+            )
+            .unwrap_err();
+        assert!(pin_error.to_string().contains("verified snapshot"));
+        let verification_error = guard
+            .delete_superseded_generation(&primary, &invalid, &std::fs::metadata(&invalid).unwrap())
+            .unwrap_err();
+        assert!(
+            verification_error
+                .to_string()
+                .contains("failed full verification")
+        );
+        assert_eq!(
+            std::fs::read(&last_valid).unwrap(),
+            std::fs::read(&primary).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&invalid).unwrap(),
+            b"unresolved old forensic evidence"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"interrupted newer backup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retention_reclaims_a_verified_superseded_generation_after_its_reader_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        {
+            let conn = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+            conn.execute_raw("INSERT INTO db_identity VALUES (0, 'reader-test-generation')")
+                .unwrap();
+            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                .unwrap();
+        }
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let old = primary.with_file_name("storage.sqlite3.bak.20261001_000000");
+        std::fs::copy(&primary, &old).unwrap();
+        {
+            let conn = crate::CanonicalDbConn::open_file(old.to_str().unwrap()).unwrap();
+            conn.execute_raw("UPDATE messages SET subject = 'previous subject' WHERE id = 1")
+                .unwrap();
+            conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                .unwrap();
+        }
+        let created_us = chrono::DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
+            .unwrap()
+            .timestamp_micros();
+        record_snapshot_metadata(&primary, created_us).unwrap();
+        let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        assert_eq!(guard.verified_source_path(), Some(backup.as_path()));
+        let inventoried = std::fs::metadata(&old).unwrap();
+        let reader = std::fs::File::open(&old).unwrap();
+        let error = guard
+            .delete_superseded_generation(&primary, &old, &inventoried)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(old.exists());
+        drop(reader);
+        let equivalent_primary = primary.parent().unwrap().join(".").join("storage.sqlite3");
+        let deleted = guard
+            .delete_superseded_generation(&equivalent_primary, &old, &inventoried)
+            .unwrap();
+        assert_eq!(deleted.logical_bytes, inventoried.len());
+        assert!(!old.exists());
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            std::fs::read(&primary).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclamation_requires_matching_lineage_or_exact_duplicate_bytes() {
+        for scenario in [
+            "matching_lineage",
+            "foreign_lineage",
+            "unseeded_duplicate",
+            "unseeded_changed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let primary = root.join("storage.sqlite3");
+            make_restorable_mailbox_db(&primary);
+            if matches!(scenario, "matching_lineage" | "foreign_lineage") {
+                let conn = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+                conn.execute_raw(
+                    "INSERT INTO db_identity VALUES (0, 'original-mailbox-generation')",
+                )
+                .unwrap();
+                conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .unwrap();
+            }
+            let history = root.join("doctor/reclaimable/rotation-20261001T000000Z");
+            std::fs::create_dir_all(&history).unwrap();
+            let old = history.join("storage.sqlite3.bak.20261001_000000");
+            std::fs::copy(&primary, &old).unwrap();
+            if scenario == "foreign_lineage" {
+                let conn = crate::CanonicalDbConn::open_file(old.to_str().unwrap()).unwrap();
+                conn.execute_raw(
+                    "UPDATE db_identity SET generation_id = 'another-mailbox-generation'",
+                )
+                .unwrap();
+                conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .unwrap();
+            }
+            let resident = root.join("storage.sqlite3.bak.20261001_000000");
+            std::fs::copy(&old, &resident).unwrap();
+            if scenario != "unseeded_duplicate" {
+                let conn = crate::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
+                conn.execute_raw(
+                    "INSERT INTO messages (id, project_id, sender_id, subject, body_md,
+                         importance, ack_required, created_ts, recipients_json, attachments)
+                     VALUES (4, 1, 1, 'new message', hex(zeroblob(32768)), 'normal', 0, 4, '{}', '[]')",
+                )
+                .unwrap();
+                conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .unwrap();
+            }
+            let backup = snapshot_bak_path(&primary);
+            std::fs::copy(&primary, &backup).unwrap();
+            if scenario != "unseeded_duplicate" {
+                assert!(
+                    std::fs::metadata(&backup).unwrap().len()
+                        > std::fs::metadata(&old).unwrap().len(),
+                    "growing recovery generations must occupy additional database pages"
+                );
+            }
+            let created_us = chrono::DateTime::parse_from_rfc3339("2026-10-18T12:00:00Z")
+                .unwrap()
+                .timestamp_micros();
+            record_snapshot_metadata(&primary, created_us).unwrap();
+            let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+            for path in [&old, &resident] {
+                let inventoried = std::fs::metadata(path).unwrap();
+                let before = std::fs::read(path).unwrap();
+                let result = if path == &old {
+                    guard.delete_superseded_historical_generation(&primary, path, &inventoried)
+                } else {
+                    guard.delete_superseded_generation(&primary, path, &inventoried)
+                };
+                if matches!(scenario, "foreign_lineage" | "unseeded_changed") {
+                    assert!(result.unwrap_err().to_string().contains("lineage"));
+                    assert_eq!(std::fs::read(path).unwrap(), before);
+                } else {
+                    assert_eq!(result.unwrap().logical_bytes, inventoried.len());
+                    assert!(!path.exists(), "{scenario} must be safely reclaimable");
+                }
+            }
+            assert_eq!(
+                std::fs::read(&backup).unwrap(),
+                std::fs::read(&primary).unwrap()
+            );
+        }
     }
 
     #[cfg(unix)]

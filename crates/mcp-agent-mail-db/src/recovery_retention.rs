@@ -27,10 +27,12 @@ use std::time::UNIX_EPOCH;
 mod namespace;
 
 #[cfg(unix)]
-pub use namespace::{CompletedReclaimMove, ReclaimDirectory};
+pub use namespace::{
+    CompletedReclaimDelete, CompletedReclaimMove, ReclaimDirectory, ReclaimedFileBytes,
+};
 
 #[cfg(unix)]
-pub(crate) use namespace::delete_inventoried_file;
+pub(crate) use namespace::{delete_inventoried_file, preflight_inventoried_file_readers};
 
 #[cfg(all(test, unix))]
 use namespace::{

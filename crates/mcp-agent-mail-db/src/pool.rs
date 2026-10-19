@@ -4789,9 +4789,30 @@ impl DbPool {
         if !primary.exists() {
             return Ok(None);
         }
+        let authority = crate::snapshot::SnapshotPublicationGuard::acquire(primary)?;
+        self.create_proactive_backup_admitted(max_age, &authority, || Ok(()))
+    }
+
+    /// The same admission must span `.bak` replacement and any subsequent
+    /// metadata commit. A verified snapshot calls this while already admitted.
+    fn create_proactive_backup_admitted(
+        &self,
+        max_age: std::time::Duration,
+        authority: &crate::snapshot::SnapshotPublicationGuard,
+        before_export: impl FnOnce() -> DbResult<()>,
+    ) -> DbResult<Option<PathBuf>> {
+        if self.sqlite_path == ":memory:" {
+            return Ok(None);
+        }
+        let primary = self.validated_sqlite_path("proactive backup")?;
+        if !primary.exists() {
+            return Ok(None);
+        }
+        authority.revalidate(primary)?;
         let mut verified_backup = self.proactive_backup.lock().map_err(|error| {
             DbError::Sqlite(format!("proactive backup authority lock poisoned: {error}"))
         })?;
+        let mut before_export = Some(before_export);
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
@@ -4799,18 +4820,23 @@ impl DbPool {
             // retained witness keeps the backup open: drop it first, or the
             // open-handle check below would count this process as a user.
             *verified_backup = None;
-            match quarantine_stale_proactive_backup_companions(&bak_path) {
+            match quarantine_stale_proactive_backup_companions(&bak_path, || {
+                before_export
+                    .take()
+                    .map_or(Ok(()), |admit| admit().map_err(std::io::Error::other))
+            }) {
                 Ok(Some(quarantine)) => tracing::warn!(
                     backup = %bak_path.display(),
                     quarantine = %quarantine.display(),
                     "moved stale -wal/-shm companions of the proactive backup aside so the backup can refresh"
                 ),
                 Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    backup = %bak_path.display(),
-                    %error,
-                    "could not quarantine stale proactive-backup companions"
-                ),
+                Err(error) => {
+                    return Err(DbError::Sqlite(format!(
+                        "could not quarantine stale proactive-backup companions for {}: {error}",
+                        bak_path.display()
+                    )));
+                }
             }
         }
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
@@ -4890,6 +4916,9 @@ impl DbPool {
         ensure_recovery_disk_headroom(primary, expected_write_bytes, "proactive backup")
             .map_err(|error| DbError::Sqlite(error.to_string()))?;
 
+        if let Some(admit) = before_export.take() {
+            admit()?;
+        }
         let (staged_directory, staged_backup) = create_proactive_backup_stage(primary, &bak_path)?;
         let staged_authority =
             match SqliteFileWitness::capture_standalone(&staged_backup).and_then(|witness| {
@@ -4912,6 +4941,13 @@ impl DbPool {
             return Err(DbError::Sqlite(format!(
                 "proactive backup destination {} gained companion state before publish; existing backup is untouched and staged directory {} was preserved",
                 bak_path.display(),
+                preserved.display()
+            )));
+        }
+        if let Err(error) = authority.revalidate(primary) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "{error}; proactive-backup stage {} was preserved before rotation",
                 preserved.display()
             )));
         }
@@ -4942,6 +4978,13 @@ impl DbPool {
                     .as_ref()
                     .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
                 preserved_stage.display()
+            )));
+        }
+        if let Err(error) = authority.revalidate(primary) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "{error}; proactive-backup stage {} and the previously rotated generation were preserved without publication",
+                preserved.display()
             )));
         }
         if let Err(error) = rename_noreplace_preserving_source(&staged_backup, &bak_path) {
@@ -4994,6 +5037,13 @@ impl DbPool {
                 bak_path.display()
             ))
         })?;
+        if let Err(error) = authority.revalidate(primary) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "{error}; proactive backup was published, but authority is uncertain; stage {} and the previous generation were preserved",
+                preserved.display()
+            )));
+        }
         staged_authority.verify(&bak_path)?;
         *verified_backup = Some(staged_authority);
         drop(verified_backup);
@@ -5108,6 +5158,22 @@ impl DbPool {
     pub fn create_verified_snapshot(
         &self,
     ) -> DbResult<Option<crate::snapshot::VerifiedSnapshotMetadata>> {
+        self.create_verified_snapshot_with_export_admission(|| Ok(()))
+    }
+
+    /// Capture a verified snapshot after a caller admits the first possible
+    /// export mutation. The callback runs at most once, while publication is
+    /// exclusive, immediately before staging an export or preserving stale
+    /// backup companions. A busy snapshot reader, failed live verification,
+    /// or other earlier refusal does not consume the caller's admission.
+    ///
+    /// The callback may durably reserve a bounded automatic repair attempt.
+    /// Once it succeeds, a later error may have preserved partial output, so
+    /// callers must keep that reservation until separately proven reclaimable.
+    pub fn create_verified_snapshot_with_export_admission(
+        &self,
+        before_export: impl FnOnce() -> DbResult<()>,
+    ) -> DbResult<Option<crate::snapshot::VerifiedSnapshotMetadata>> {
         if self.sqlite_path == ":memory:" {
             return Ok(None);
         }
@@ -5131,12 +5197,19 @@ impl DbPool {
 
         // Refresh the .bak (reuses staged-copy + validate + atomic-swap). A zero
         // max-age forces a fresh copy of the just-verified database.
-        let Some(bak) = self.create_proactive_backup(std::time::Duration::ZERO)? else {
+        let authority = crate::snapshot::SnapshotPublicationGuard::acquire(primary)?;
+        let Some(bak) = self.create_proactive_backup_admitted(
+            std::time::Duration::ZERO,
+            &authority,
+            before_export,
+        )?
+        else {
             return Ok(None);
         };
 
         let created_us = mcp_agent_mail_core::timestamps::now_micros();
-        let meta = crate::snapshot::record_snapshot_metadata(primary, created_us)?;
+        let meta =
+            crate::snapshot::record_snapshot_metadata_admitted(primary, created_us, &authority)?;
         db.snapshot_created_total.inc();
         db.last_verified_snapshot_us
             .set(u64::try_from(created_us.max(0)).unwrap_or(0));
@@ -14855,6 +14928,7 @@ where
 #[cfg(target_os = "linux")]
 fn quarantine_stale_proactive_backup_companions(
     backup_path: &Path,
+    before_mutation: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<Option<PathBuf>> {
     const MAX_QUARANTINE_ATTEMPTS: u32 = 128;
     let mut stale = Vec::new();
@@ -14896,6 +14970,7 @@ fn quarantine_stale_proactive_backup_companions(
         chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
     );
     let reclaimable = parent.join("doctor").join("reclaimable");
+    before_mutation()?;
     let mut quarantine = None;
     for attempt in 0..MAX_QUARANTINE_ATTEMPTS {
         let leaf = if attempt == 0 {
@@ -14932,6 +15007,7 @@ fn quarantine_stale_proactive_backup_companions(
 #[cfg(not(target_os = "linux"))]
 fn quarantine_stale_proactive_backup_companions(
     _backup_path: &Path,
+    _before_mutation: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<Option<PathBuf>> {
     Ok(None)
 }
@@ -31680,6 +31756,127 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verified_snapshot_uses_one_publication_admission_and_excludes_retention() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("snapshot_admission.db");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = Cx::for_testing();
+        runtime.block_on(async {
+            let _connection = pool.acquire(&cx).await.into_result().unwrap();
+        });
+
+        let mut admission_calls = 0;
+        let metadata = pool
+            .create_verified_snapshot_with_export_admission(|| {
+                admission_calls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .expect("verified capture");
+        assert_eq!(admission_calls, 1);
+        assert_eq!(
+            crate::snapshot::read_snapshot_metadata(&db_path),
+            Some(metadata)
+        );
+        let guard = crate::snapshot::SnapshotRetentionGuard::acquire(&db_path).unwrap();
+        assert!(guard.verified_source_path().is_some());
+        let before = std::fs::read(crate::snapshot::snapshot_bak_path(&db_path)).unwrap();
+        let error = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot authority unavailable"));
+        assert_eq!(
+            std::fs::read(crate::snapshot::snapshot_bak_path(&db_path)).unwrap(),
+            before
+        );
+        let error = pool
+            .create_verified_snapshot_with_export_admission(|| {
+                admission_calls += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot authority unavailable"));
+        assert_eq!(
+            admission_calls, 1,
+            "busy readers must not spend an export slot"
+        );
+        drop(guard);
+
+        let before_names = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let error = pool
+            .create_verified_snapshot_with_export_admission(|| {
+                admission_calls += 1;
+                Err(DbError::Sqlite("repair slot refused".to_string()))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("repair slot refused"));
+        assert_eq!(admission_calls, 2);
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            before_names,
+            "refused admission must not create an export stage or rotate a generation"
+        );
+        assert_eq!(
+            std::fs::read(crate::snapshot::snapshot_bak_path(&db_path)).unwrap(),
+            before
+        );
+
+        // A public verified capture must neither reacquire its own lock nor
+        // leave it held after the metadata has been durably committed.
+        assert!(pool.create_verified_snapshot().unwrap().is_some());
+        assert!(crate::snapshot::SnapshotRetentionGuard::acquire(&db_path).is_ok());
+    }
+
+    #[test]
+    fn verified_export_admission_is_not_spent_by_failed_live_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("invalid_snapshot_source.db");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", primary.display()),
+            ..Default::default()
+        })
+        .unwrap();
+        std::fs::write(&primary, b"unverified damaged mailbox bytes").unwrap();
+        let mut admitted = false;
+        assert!(
+            pool.create_verified_snapshot_with_export_admission(|| {
+                admitted = true;
+                Ok(())
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            !admitted,
+            "failed verification must preserve the repair allowance"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"unverified damaged mailbox bytes"
+        );
+        assert!(!crate::snapshot::snapshot_bak_path(&primary).exists());
+        assert!(!crate::snapshot::snapshot_meta_path(&primary).exists());
+    }
+
     #[test]
     fn proactive_online_backup_captures_rows_committed_only_in_live_wal() {
         let dir = tempfile::tempdir().unwrap();
@@ -32239,9 +32436,35 @@ mod tests {
         std::fs::write(&bak_wal, b"").unwrap();
         std::fs::write(&bak_shm, vec![7_u8; 32 * 1024]).unwrap();
 
+        let admission = crate::snapshot::SnapshotPublicationGuard::acquire(&db_path).unwrap();
+        let refused = pool.create_proactive_backup_admitted(
+            std::time::Duration::from_hours(1),
+            &admission,
+            || Err(DbError::Sqlite("repair slot refused".to_string())),
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("repair slot refused")
+        );
+        assert!(bak_wal.exists() && bak_shm.exists());
+        assert!(!dir.path().join("doctor").exists());
+        let mut admission_calls = 0;
         let refreshed = pool
-            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .create_proactive_backup_admitted(
+                std::time::Duration::from_hours(1),
+                &admission,
+                || {
+                    admission_calls += 1;
+                    Ok(())
+                },
+            )
             .expect("stale companions must not block the refresh");
+        assert_eq!(
+            admission_calls, 1,
+            "quarantine and export share one reservation"
+        );
         assert_eq!(refreshed.as_deref(), Some(bak_path.as_path()));
         assert_eq!(
             sqlite_marker_value(&bak_path).as_deref(),

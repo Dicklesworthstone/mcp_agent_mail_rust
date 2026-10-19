@@ -108,19 +108,46 @@ impl SnapshotRetentionGuard {
     /// The caller selects the retention window; this boundary enforces safety.
     ///
     /// # Errors
-    /// Refuses unresolved verification, a pinned or changed file, companion
-    /// recovery state, newer generations, and unsafe namespace operations.
+    /// Refuses unresolved verification, unproven database lineage, a pinned or
+    /// changed file, companion recovery state, newer generations, and unsafe
+    /// namespace operations. Unknown lineage requires exact duplicate bytes.
     pub fn delete_superseded_generation(
         &self,
         primary: &Path,
         path: &Path,
         inventoried: &std::fs::Metadata,
-    ) -> io::Result<()> {
+    ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
+        self.delete_superseded_generation_with(primary, path, inventoried)
+    }
+
+    /// Historical quarantine names do not prove which database produced them.
+    /// Require a shared persistent DB generation token, or a byte-identical
+    /// duplicate of the pinned snapshot, before applying periodic retention.
+    ///
+    /// # Errors
+    /// Refuses unknown or conflicting lineage unless the bytes are identical,
+    /// in addition to every refusal of [`Self::delete_superseded_generation`].
+    pub fn delete_superseded_historical_generation(
+        &self,
+        primary: &Path,
+        path: &Path,
+        inventoried: &std::fs::Metadata,
+    ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
+        self.delete_superseded_generation_with(primary, path, inventoried)
+    }
+
+    fn delete_superseded_generation_with(
+        &self,
+        primary: &Path,
+        path: &Path,
+        inventoried: &std::fs::Metadata,
+    ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
         use mcp_agent_mail_core::disk::{
             SqliteRecoveryCandidateKind, classify_sqlite_recovery_candidate_name,
         };
         self.revalidate()?;
-        if super::snapshot_meta_path(primary) != self.metadata_path {
+        let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
+        if super::snapshot_meta_path(&primary) != self.metadata_path {
             return Err(invalid("retention authority belongs to another database"));
         }
         let selected = self
@@ -145,6 +172,35 @@ impl SnapshotRetentionGuard {
         }
         if !crate::pool::sqlite_recovery_candidate_is_standalone(path) {
             return Err(invalid("generation has companion recovery state"));
+        }
+        crate::recovery_retention::preflight_inventoried_file_readers(path, inventoried)?;
+        // A dated spelling is not a completed, recoverable publication.
+        // Truncated files, unrelated SQLite schemas, and corrupt snapshots
+        // remain evidence even when a newer healthy restore point exists.
+        match crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(path) {
+            Ok(true) => {}
+            Ok(false) => return Err(invalid("periodic generation failed full verification")),
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "periodic generation verification unavailable: {error}"
+                )));
+            }
+        }
+        // Neither residence beside the primary nor a quarantine timestamp
+        // proves provenance: an earlier physical DB reconstruction or another
+        // mailbox may have left a perfectly valid but distinct recovery image.
+        let same_generation = immutable_generation_id(path)
+            .zip(immutable_generation_id(&selected.actual_path))
+            .is_some_and(|(candidate, replacement)| candidate == replacement);
+        if !same_generation {
+            let identity = super::snapshot_file_identity(path).map_err(io::Error::other)?;
+            if identity.0 != selected.metadata.snapshot_size_bytes
+                || identity.1 != selected.metadata.snapshot_sha256
+            {
+                return Err(invalid(
+                    "backup has no proven matching database lineage or duplicate bytes",
+                ));
+            }
         }
         // Admission already performed full integrity verification. Rehash the
         // exact pinned inode rather than rescanning every generation for every
@@ -184,6 +240,22 @@ impl SnapshotRetentionGuard {
         }
         Ok(())
     }
+}
+
+/// Read only through immutable canonical SQLite; never seed or repair a
+/// candidate's identity to make it eligible for deletion. Unknown legacy
+/// schemas, malformed identities, and query errors require byte equality.
+fn immutable_generation_id(path: &Path) -> Option<String> {
+    let connection = crate::pool::open_immutable_canonical_sqlite(path).ok()?;
+    let rows = connection.query_sync(
+        "SELECT singleton, substr(generation_id, 1, 257) AS generation_id FROM db_identity LIMIT 2",
+        &[],
+    ).ok()?;
+    if rows.len() != 1 || rows[0].get_named::<i64>("singleton").ok()? != 0 {
+        return None;
+    }
+    let generation = rows[0].get_named::<String>("generation_id").ok()?;
+    (!generation.is_empty() && generation.len() <= 256).then_some(generation)
 }
 
 fn invalid(message: &str) -> io::Error {
