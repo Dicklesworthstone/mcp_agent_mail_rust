@@ -47,6 +47,15 @@ const PHASES: &[(&str, &str, bool)] = &[
         true,
     ),
     (
+        // Signals belong to both the message and its recipient. A kept
+        // message may still have a signal for an excluded BCC recipient.
+        // Clear these before recipients, messages or agents lose ownership
+        // information; the v26 ledger has non-cascading foreign keys.
+        "message_delivery_signal_receipts",
+        "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
+        true,
+    ),
+    (
         "message_recipients",
         "message_id IN (SELECT id FROM messages WHERE project_id IN ($ids)) OR agent_id IN (SELECT id FROM agents WHERE project_id IN ($ids))",
         false,
@@ -350,6 +359,142 @@ mod tests {
         let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
         assert_eq!(result.removed_count, 2);
         assert_kept_scope(&path, false);
+    }
+
+    fn add_signal_receipts(path: &Path) {
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_raw("CREATE TABLE message_delivery_signal_receipts(message_id INTEGER NOT NULL REFERENCES messages(id), agent_id INTEGER NOT NULL REFERENCES agents(id), delivery_route TEXT NOT NULL, signal_path_digest TEXT NOT NULL, observed_ts INTEGER NOT NULL, PRIMARY KEY(message_id, agent_id, delivery_route))").unwrap();
+        conn.execute_raw("INSERT INTO message_delivery_signal_receipts VALUES
+            (101,11,'inbox','kept-inbox',170),
+            (101,11,'notification','kept-notification',171),
+            (101,22,'inbox','excluded-bcc',172),
+            (202,11,'inbox','excluded-message',173),
+            (303,22,'inbox','excluded-both',174)").unwrap();
+    }
+
+    type SignalRow = (i64, i64, String, String, i64);
+
+    fn signal_rows(conn: &Conn) -> Vec<SignalRow> {
+        conn.query_sync(
+            "SELECT message_id, agent_id, delivery_route, signal_path_digest, observed_ts FROM message_delivery_signal_receipts ORDER BY message_id, agent_id, delivery_route",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_named("message_id").unwrap(),
+                row.get_named("agent_id").unwrap(),
+                row.get_named("delivery_route").unwrap(),
+                row.get_named("signal_path_digest").unwrap(),
+                row.get_named("observed_ts").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn scope_preserves_exact_selected_signals_and_unscoped_history() {
+        for scoped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fixture(dir.path());
+            add_signal_receipts(&path);
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            let before = signal_rows(&conn);
+            assert_eq!(before.len(), 5);
+            drop(conn);
+            let identifiers = if scoped {
+                vec!["keep".to_string()]
+            } else {
+                Vec::new()
+            };
+            apply_project_scope(&path, &identifiers).unwrap();
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            let expected: Vec<_> = before
+                .into_iter()
+                .filter(|row| !scoped || (row.0 == 101 && row.1 == 11))
+                .collect();
+            assert_eq!(signal_rows(&conn), expected);
+            assert!(
+                conn.query_sync("PRAGMA foreign_key_check", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            if scoped {
+                assert_kept_scope(&path, false);
+            }
+        }
+    }
+
+    #[test]
+    fn signal_scope_clears_every_chunk_before_deleting_any_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        add_signal_receipts(&path);
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE")
+            .unwrap();
+        for id in 4..400 {
+            conn.execute_raw(&format!(
+                "INSERT INTO projects VALUES({id},'p-{id}','/p-{id}')"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("INSERT INTO messages(id,project_id,sender_id) VALUES(999,399,22);
+            INSERT INTO message_delivery_signal_receipts VALUES(999,11,'inbox','late-message',175),
+            (999,22,'inbox','cross-chunk',176); COMMIT").unwrap();
+        drop(conn);
+        let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 398);
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        let rows = signal_rows(&conn);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.0 == 101 && row.1 == 11));
+        assert_kept_scope(&path, false);
+    }
+
+    #[test]
+    fn signal_scope_refuses_ignored_deletions_and_rolls_back_all_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(dir.path());
+        add_signal_receipts(&path);
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        let before = signal_rows(&conn);
+        conn.execute_raw("CREATE TRIGGER preserve_signal BEFORE DELETE ON message_delivery_signal_receipts WHEN OLD.agent_id = 22 BEGIN SELECT RAISE(IGNORE); END").unwrap();
+        drop(conn);
+        let error = apply_project_scope(&path, &["keep".to_string()]).unwrap_err();
+        assert!(matches!(error, ShareError::Validation { .. }));
+        let conn = Conn::open_file(path.display().to_string()).unwrap();
+        assert_eq!(signal_rows(&conn), before);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM messages"), 3);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 2);
+    }
+
+    #[test]
+    fn signal_scope_rejects_uninspectable_authority_without_partial_export() {
+        for malformed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fixture(dir.path());
+            add_signal_receipts(&path);
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            if malformed {
+                conn.execute_raw("ALTER TABLE message_delivery_signal_receipts RENAME COLUMN agent_id TO unavailable_agent_id").unwrap();
+            } else {
+                conn.execute_raw("ALTER TABLE message_delivery_signal_receipts RENAME TO retained_signals;
+                    CREATE VIEW message_delivery_signal_receipts AS SELECT * FROM retained_signals").unwrap();
+            }
+            drop(conn);
+            assert!(apply_project_scope(&path, &["keep".to_string()]).is_err());
+            let conn = Conn::open_file(path.display().to_string()).unwrap();
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM message_delivery_signal_receipts"),
+                5
+            );
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);
+            assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM agent_links"), 2);
+        }
     }
 
     #[test]
