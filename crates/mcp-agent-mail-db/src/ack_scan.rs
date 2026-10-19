@@ -24,7 +24,7 @@
 mod escalation;
 pub use escalation::{AckEscalationOutcome, AckEscalationRequest, grant_ack_escalation};
 
-use asupersync::{Cx, Outcome};
+use asupersync::{CancelReason, Cx, Outcome};
 use sqlmodel_core::{Connection as _, Row, Value};
 use sqlmodel_pool::PooledConnection;
 
@@ -275,11 +275,43 @@ impl Drop for AckReadLease {
     }
 }
 
+fn cancelled_page(cx: &Cx) -> Outcome<AckScanPage, DbError> {
+    Outcome::Cancelled(
+        cx.cancel_reason()
+            .unwrap_or_else(|| CancelReason::user("overdue ACK scan cancelled")),
+    )
+}
+
+/// A completed SQL read is not permission to publish a page after its caller
+/// has cancelled. Check both sides of decoding without consuming continuation
+/// state. SQL completion, not this response decision, controls reader reuse.
+fn decode_live_page(
+    cx: &Cx,
+    scope: String,
+    rows: Vec<Row>,
+    page_size: usize,
+) -> Outcome<AckScanPage, DbError> {
+    if cx.checkpoint().is_err() {
+        return cancelled_page(cx);
+    }
+    let result = decode_page(scope, rows, page_size);
+    if cx.checkpoint().is_err() {
+        return cancelled_page(cx);
+    }
+    match result {
+        Ok(page) => Outcome::Ok(page),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
 /// Read one fresh page using the runtime mailbox connection and caller context.
 ///
 /// The result contains no subjects, bodies, recipient names, or attachment data.
 /// Callers performing escalations must keep their existing generation/write
 /// lease through that page's actions, then release it before yielding.
+/// Cancellation before admission or after a successful SQL read returns no
+/// page, so a caller cannot advance its cursor from a cancelled observation.
+/// An already-running native query still has no preemptive execution deadline.
 pub async fn overdue_ack_page(
     cx: &Cx,
     pool: &DbPool,
@@ -287,6 +319,9 @@ pub async fn overdue_ack_page(
     overdue_before_ts: i64,
     page_size: usize,
 ) -> Outcome<AckScanPage, DbError> {
+    if cx.checkpoint().is_err() {
+        return cancelled_page(cx);
+    }
     let scope = pool.sqlite_identity_key();
     let (sql, params) = match page_query(&scope, cursor, overdue_before_ts, page_size) {
         Ok(query) => query,
@@ -298,6 +333,11 @@ pub async fn overdue_ack_page(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    if cx.checkpoint().is_err() {
+        // The query has not begun; ordinary Drop can return this unused,
+        // healthy checkout. Do not retire it as an interrupted SQL session.
+        return cancelled_page(cx);
+    }
     let mut lease = AckReadLease {
         connection: Some(connection),
         reusable: false,
@@ -312,10 +352,7 @@ pub async fn overdue_ack_page(
     lease.reusable = matches!(&result, Outcome::Ok(_));
     crate::tracking::record_query(&sql, crate::tracking::elapsed_us(started));
     match result {
-        Outcome::Ok(rows) => match decode_page(scope, rows, page_size) {
-            Ok(page) => Outcome::Ok(page),
-            Err(error) => Outcome::Err(error),
-        },
+        Outcome::Ok(rows) => decode_live_page(cx, scope, rows, page_size),
         Outcome::Err(error) => Outcome::Err(DbError::Sqlite(error.to_string())),
         Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => Outcome::Panicked(payload),
@@ -325,6 +362,148 @@ pub async fn overdue_ack_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_scan_does_not_wait_for_or_change_the_only_reader() {
+        shared_pool(|pool, cx| {
+            let held = run(pool.acquire(cx)).into_result().unwrap();
+            mark_reader(&held);
+            let stopped = Cx::for_testing();
+            stopped.set_cancel_requested(true);
+            assert!(matches!(
+                run(overdue_ack_page(&stopped, pool, None, 1_000_000, 128)),
+                Outcome::Cancelled(_)
+            ));
+            assert_eq!(count(&held, "SELECT last_insert_rowid()"), READER_MARKER);
+            assert_eq!(
+                count(&held, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+            drop(held);
+            let page = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
+                .into_result()
+                .unwrap();
+            assert_eq!(keys(&page), [(901, 102), (901, 103)]);
+        });
+    }
+
+    #[test]
+    fn cancellation_after_sql_does_not_consume_a_frozen_continuation() {
+        fixture(|conn| {
+            seed(conn, 1, &[1, 2, 3], 10);
+            seed(conn, 2, &[3], 20);
+            let first = page(conn, "db", None, 10, 1);
+            let cursor = first.continuation_after(1).unwrap().unwrap();
+            let original = cursor.clone();
+            let (sql, params) = page_query("db", Some(&cursor), 999, 128).unwrap();
+            let rows = conn.query_sync(&sql, &params).unwrap();
+            // The driver has actually returned a page. Cancel at the production
+            // completion boundary, not through a made-up successful response.
+            let stopped = Cx::for_testing();
+            stopped.set_cancel_requested(true);
+            assert!(matches!(
+                decode_live_page(&stopped, "db".into(), rows, 128),
+                Outcome::Cancelled(_)
+            ));
+            assert_eq!(cursor, original);
+            conn.execute_raw(
+                "UPDATE message_recipients SET ack_ts = 50 WHERE message_id = 1 AND agent_id = 2",
+            )
+            .unwrap();
+            seed(conn, 3, &[3], 10);
+            let (sql, params) = page_query("db", Some(&cursor), 999, 128).unwrap();
+            let live = Cx::for_testing();
+            let resumed = decode_live_page(
+                &live,
+                "db".into(),
+                conn.query_sync(&sql, &params).unwrap(),
+                128,
+            )
+            .into_result()
+            .unwrap();
+            assert_eq!(keys(&resumed), [(1, 3)]);
+            assert_eq!(resumed.overdue_before_ts(), 10);
+            assert!(resumed.continuation_after(1).unwrap().is_none());
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM messages"), 3);
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM message_recipients"), 5);
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn cancelled_response_after_completed_sql_keeps_its_healthy_checkout() {
+        shared_pool(|pool, cx| {
+            let scope = pool.sqlite_identity_key();
+            let connection = run(pool.acquire(cx)).into_result().unwrap();
+            mark_reader(&connection);
+            let mut lease = AckReadLease {
+                connection: Some(connection),
+                reusable: false,
+            };
+            let (sql, params) = page_query(&scope, None, 1_000_000, 128).unwrap();
+            let rows = lease
+                .connection
+                .as_ref()
+                .unwrap()
+                .query_sync(&sql, &params)
+                .unwrap();
+            // This synchronous fixture isolates the completed-query boundary.
+            // An incomplete native query still uses the retirement tests below.
+            lease.reusable = true;
+            let stopped = Cx::for_testing();
+            stopped.set_cancel_requested(true);
+            assert!(matches!(
+                decode_live_page(&stopped, scope, rows, 128),
+                Outcome::Cancelled(_)
+            ));
+            drop(lease);
+            let reused = run(pool.acquire(cx)).into_result().unwrap();
+            assert_eq!(count(&reused, "SELECT last_insert_rowid()"), READER_MARKER);
+            assert_eq!(count(&reused, "SELECT COUNT(*) FROM messages"), 1);
+            assert_eq!(
+                count(&reused, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn cancellation_cannot_make_invalid_generation_valid_on_a_later_read() {
+        fixture(|conn| {
+            seed(conn, 1, &[1], 10);
+            conn.execute_raw("UPDATE db_identity SET generation_id = ''")
+                .unwrap();
+            let (sql, params) = page_query("db", None, 10, 1).unwrap();
+            let stopped = Cx::for_testing();
+            stopped.set_cancel_requested(true);
+            assert!(matches!(
+                decode_live_page(
+                    &stopped,
+                    "db".into(),
+                    conn.query_sync(&sql, &params).unwrap(),
+                    1,
+                ),
+                Outcome::Cancelled(_)
+            ));
+            let live = Cx::for_testing();
+            assert!(matches!(
+                decode_live_page(
+                    &live,
+                    "db".into(),
+                    conn.query_sync(&sql, &params).unwrap(),
+                    1,
+                ),
+                Outcome::Err(_)
+            ));
+            assert_eq!(
+                count(conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                1
+            );
+        });
+    }
 
     // last_insert_rowid belongs to the native connection, unlike user_version
     // or another persistent PRAGMA. Queries and UPDATE/ALTER statements do not
