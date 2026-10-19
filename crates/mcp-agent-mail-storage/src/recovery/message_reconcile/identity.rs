@@ -276,9 +276,17 @@ mod tests {
         let mut options = git2::RepositoryInitOptions::new();
         options.initial_head("new-archive");
         let repo = Repository::init_opts(dir.path(), &options).unwrap();
-        assert_eq!(repo.head().unwrap_err().code(), ErrorCode::UnbornBranch);
+        // `git2::Reference` is not `Debug`, so `unwrap_err` cannot compile.
+        assert_eq!(
+            repo.head().err().as_ref().map(git2::Error::code),
+            Some(ErrorCode::UnbornBranch)
+        );
         let mut budget = CanonicalScanBudget::default();
-        assert!(head_tree_for_identity(&repo, &mut budget).unwrap().is_none());
+        assert!(
+            head_tree_for_identity(&repo, &mut budget)
+                .unwrap()
+                .is_none()
+        );
         assert!(repo.references().unwrap().next().is_none());
     }
 
@@ -314,7 +322,10 @@ mod tests {
                 repo.reference("refs/tags/retained-identity", oid, false, "fixture")
                     .unwrap();
             }
-            assert_eq!(repo.head().unwrap_err().code(), ErrorCode::UnbornBranch);
+            assert_eq!(
+                repo.head().err().as_ref().map(git2::Error::code),
+                Some(ErrorCode::UnbornBranch)
+            );
             let mut budget = CanonicalScanBudget::default();
             let error = head_tree_for_identity(&repo, &mut budget).unwrap_err();
             assert!(error.to_string().contains("retained Git refs"), "{error}");
@@ -360,7 +371,10 @@ mod tests {
                 repo.find_reference(&original_ref).unwrap().target(),
                 Some(before)
             );
-            assert_eq!(std::fs::read(repo.path().join("HEAD")).unwrap(), head_before);
+            assert_eq!(
+                std::fs::read(repo.path().join("HEAD")).unwrap(),
+                head_before
+            );
             assert_eq!(std::fs::read(&evidence).unwrap(), prior);
             if interrupted {
                 for (path, bytes) in files {
