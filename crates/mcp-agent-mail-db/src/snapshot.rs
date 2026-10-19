@@ -120,9 +120,10 @@ pub struct VerifiedSnapshotMetadata {
     pub binary_version: String,
 }
 
-/// The exact unversioned record emitted by v0.3.30 (GH#355). It is recognized
-/// only so a freshly verified snapshot can supersede it without losing the old
-/// evidence. These claims never authorize a restore or identify backup bytes.
+/// The exact unversioned record emitted by v0.3.13 through v0.3.30 (GH#355).
+/// It is recognized only so a freshly verified snapshot can supersede it
+/// without losing the old evidence. These claims never authorize a restore or
+/// identify backup bytes.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacySnapshotMetadata {
@@ -143,12 +144,27 @@ enum SnapshotMetadataAuthority {
     Legacy(Vec<u8>),
 }
 
+/// v0.3.13 introduced the sidecar and every release through v0.3.30 wrote the
+/// same eight-field record; v0.3.31 added `schema`. Accept exactly those
+/// release spellings, never a future, prerelease or zero-padded version.
+fn is_unversioned_metadata_release(version: &str) -> bool {
+    version
+        .strip_prefix("0.3.")
+        .and_then(|patch| {
+            patch
+                .parse::<u32>()
+                .ok()
+                .filter(|parsed| parsed.to_string() == patch)
+        })
+        .is_some_and(|patch| (13..=30).contains(&patch))
+}
+
 fn legacy_metadata_matches_namespace(
     meta: &LegacySnapshotMetadata,
     primary: &Path,
     canonical_bak: &Path,
 ) -> bool {
-    meta.binary_version == "0.3.30"
+    is_unversioned_metadata_release(&meta.binary_version)
         && meta.created_us > 0
         && meta.integrity_verified
         && meta.integrity_kind == CheckKind::Full.to_string()
@@ -538,7 +554,7 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
         tracing::info!(
             metadata = %meta_path.display(),
             evidence = %preserved.display(),
-            "preserved v0.3.30 snapshot metadata before publishing a freshly verified snapshot"
+            "preserved legacy (v0.3.13-v0.3.30) snapshot metadata before publishing a freshly verified snapshot"
         );
     }
     let still_owned = existing_snapshot_metadata_authority(&meta_path, &primary, &canonical_bak)?;
@@ -2017,6 +2033,51 @@ mod tests {
             );
             assert_eq!(std::fs::read(&meta_path).unwrap(), bytes, "{field}");
             assert!(preserved_legacy_paths(dir.path()).is_empty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn legacy_metadata_from_every_unversioned_release_is_superseded() {
+        // v0.3.13 through v0.3.30 wrote the same record. An upgrade from any of
+        // them must not leave the sidecar blocking verified backups (GH#355).
+        let versions = [
+            ("0.3.13", true),
+            ("0.3.29", true),
+            ("0.3.30", true),
+            ("0.3.12", false),
+            ("0.3.31", false),
+            ("0.3.013", false),
+            ("0.3.29-rc.1", false),
+            ("1.3.20", false),
+        ];
+        for (version, recognized) in versions {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join("storage.sqlite3");
+            make_restorable_mailbox_db(&primary);
+            std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+            let meta_path = snapshot_meta_path(&primary);
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&legacy_metadata_bytes(&primary)).unwrap();
+            record["binary_version"] = serde_json::json!(version);
+            let legacy = serde_json::to_vec_pretty(&record).unwrap();
+            std::fs::write(&meta_path, &legacy).unwrap();
+
+            let result = record_snapshot_metadata(&primary, 42);
+            let preserved = preserved_legacy_paths(dir.path());
+            if recognized {
+                let fresh = result.unwrap_or_else(|error| panic!("{version}: {error}"));
+                assert_eq!(fresh.schema, SNAPSHOT_METADATA_SCHEMA, "{version}");
+                assert_eq!(preserved.len(), 1, "{version}");
+                assert_eq!(std::fs::read(&preserved[0]).unwrap(), legacy, "{version}");
+            } else {
+                let error = result.expect_err(version);
+                assert!(
+                    error.to_string().contains("unrecognized regular file"),
+                    "{version}: {error}"
+                );
+                assert_eq!(std::fs::read(&meta_path).unwrap(), legacy, "{version}");
+                assert!(preserved.is_empty(), "{version}");
+            }
         }
     }
 
