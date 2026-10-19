@@ -51,6 +51,26 @@ fn templates_render_error_page() {
     assert!(out.contains("<!DOCTYPE html") || out.contains("<html"));
 }
 
+#[test]
+fn templates_footer_shows_the_render_time_year() {
+    let before = chrono::Datelike::year(&chrono::Utc::now());
+    let out = templates::render_template("error.html", ErrorCtx { message: "boom" })
+        .expect("render error.html");
+    let after = chrono::Datelike::year(&chrono::Utc::now());
+    let footer = out
+        .split_once("<footer")
+        .and_then(|(_, rest)| rest.split_once("</footer>"))
+        .map(|(footer, _)| footer)
+        .expect("base layout renders a footer");
+    // Tolerate a New Year rollover between the two clock reads.
+    assert!(
+        [before, after]
+            .iter()
+            .any(|year| footer.contains(&format!("MCP Agent Mail &copy; {year}"))),
+        "{footer}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Mail UI template rendering tests (br-1bm.5.3)
 // ---------------------------------------------------------------------------

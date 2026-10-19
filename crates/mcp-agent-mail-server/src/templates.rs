@@ -89,8 +89,15 @@ fn tojson(value: Value) -> Result<Value, Error> {
     Ok(Value::from_safe_string(rv))
 }
 
+/// The calendar year at render time, for the shared page footer. Evaluated on
+/// every render so a long-running server never shows a stale year.
+fn current_year() -> i32 {
+    chrono::Datelike::year(&chrono::Utc::now())
+}
+
 static ENV: LazyLock<Environment<'static>> = LazyLock::new(|| {
     let mut env = Environment::new();
+    env.add_function("current_year", current_year);
 
     env.set_auto_escape_callback(|name| {
         let is_html = std::path::Path::new(name)
