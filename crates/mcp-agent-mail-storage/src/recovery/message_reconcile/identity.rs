@@ -11,6 +11,33 @@ use git2::{ErrorCode, ObjectType, Oid, Repository, Tree};
 use super::{CanonicalScanBudget, MAX_MESSAGE_ARTIFACT_BYTES, invalid};
 use crate::ProjectArchive;
 
+/// An unborn branch is not proof that the archive has no recorded history.
+/// A damaged or redirected HEAD may coexist with branch, tag, or packed refs
+/// carrying identities that disappeared from the working tree. Do not choose
+/// an arbitrary replacement ref: the operator must restore HEAD's authority.
+/// Only a genuinely unborn HEAD with no enumerated refs permits first publish.
+/// Missing/malformed HEAD and ref-iterator errors remain unavailable evidence.
+fn head_tree_for_identity<'repo>(
+    repo: &'repo Repository,
+    budget: &mut CanonicalScanBudget<'_>,
+) -> crate::Result<Option<Tree<'repo>>> {
+    budget.checkpoint("git root")?;
+    match repo.head() {
+        Ok(head) => Ok(Some(head.peel_to_tree()?)),
+        Err(error) if error.code() == ErrorCode::UnbornBranch => {
+            budget.checkpoint("git unborn refs")?;
+            if repo.references()?.next().transpose()?.is_some() {
+                return Err(invalid(
+                    "archive HEAD is unborn but retained Git refs remain; repair refused",
+                ));
+            }
+            budget.checkpoint("git unborn result")?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Return whether this exact canonical payload is already recorded in HEAD.
 ///
 /// Missing or malformed objects and exhausted budgets never prove absence.
@@ -25,15 +52,9 @@ pub(super) fn preflight(
     message_files_missing: bool,
     budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<bool> {
-    budget.checkpoint("git root")?;
-    let head = match repo.head() {
-        Ok(head) => head,
-        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
-            return Ok(false);
-        }
-        Err(error) => return Err(error.into()),
+    let Some(tree) = head_tree_for_identity(repo, budget)? else {
+        return Ok(false);
     };
-    let tree = head.peel_to_tree()?;
     let canonical_committed = match tree.get_path(Path::new(canonical)) {
         Ok(entry)
             if entry.kind() == Some(ObjectType::Blob)
@@ -233,6 +254,142 @@ mod tests {
             std::fs::write(path, bytes).unwrap();
         }
         files
+    }
+
+    #[test]
+    fn fresh_unborn_head_without_refs_still_permits_first_publication() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut options = git2::RepositoryInitOptions::new();
+        options.initial_head("new-archive");
+        let repo = Repository::init_opts(dir.path(), &options).unwrap();
+        assert_eq!(repo.head().unwrap_err().code(), ErrorCode::UnbornBranch);
+        let mut budget = CanonicalScanBudget::default();
+        assert!(head_tree_for_identity(&repo, &mut budget).unwrap().is_none());
+        assert!(repo.references().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn missing_head_is_not_an_empty_identity_namespace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let head = repo.path().join("HEAD");
+        let evidence = dir.path().join("preserved-HEAD");
+        let before = std::fs::read(&head).unwrap();
+        // Retain the opened repository to exercise the exact head-read error,
+        // not merely Repository::open's earlier refusal of an invalid layout.
+        std::fs::rename(&head, &evidence).unwrap();
+        let mut budget = CanonicalScanBudget::default();
+        assert!(head_tree_for_identity(&repo, &mut budget).is_err());
+        assert!(!head.exists());
+        assert_eq!(std::fs::read(evidence).unwrap(), before);
+    }
+
+    #[test]
+    fn unborn_head_with_loose_or_packed_tag_authority_is_not_empty() {
+        for packed in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let repo = Repository::init(dir.path()).unwrap();
+            let oid = repo.blob(b"retained object authority").unwrap();
+            if packed {
+                std::fs::write(
+                    repo.path().join("packed-refs"),
+                    format!("{oid} refs/tags/retained-identity\n"),
+                )
+                .unwrap();
+            } else {
+                repo.reference("refs/tags/retained-identity", oid, false, "fixture")
+                    .unwrap();
+            }
+            assert_eq!(repo.head().unwrap_err().code(), ErrorCode::UnbornBranch);
+            let mut budget = CanonicalScanBudget::default();
+            let error = head_tree_for_identity(&repo, &mut budget).unwrap_err();
+            assert!(error.to_string().contains("retained Git refs"), "{error}");
+            assert_eq!(
+                repo.find_reference("refs/tags/retained-identity")
+                    .unwrap()
+                    .target(),
+                Some(oid)
+            );
+            assert_eq!(
+                repo.find_blob(oid).unwrap().content(),
+                b"retained object authority"
+            );
+        }
+    }
+
+    #[test]
+    fn unborn_head_cannot_hide_duplicate_identity_or_publish_partial_repairs() {
+        for interrupted in [false, true] {
+            let (_dir, config, archive, message, recipients) = fixture();
+            let source = archive.root.join("messages/2025/01/prior.md");
+            let prior = b"---json\n{\"id\": 42}\n---\n\nprior generation";
+            let before = commit_source(&archive, &config, &source, prior);
+            let evidence = config.storage_root.join("retained-prior-generation.md");
+            std::fs::rename(&source, &evidence).unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let original_ref = repo.head().unwrap().name().unwrap().to_string();
+            repo.set_head("refs/heads/unborn-recovery").unwrap();
+            let head_before = std::fs::read(repo.path().join("HEAD")).unwrap();
+            let files = if interrupted {
+                materialize_bundle(&archive, &message, &recipients)
+            } else {
+                Vec::new()
+            };
+            let paths =
+                crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                    .unwrap()
+                    .0;
+            let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+                .unwrap_err();
+            assert!(error.to_string().contains("retained Git refs"), "{error}");
+            assert_eq!(
+                repo.find_reference(&original_ref).unwrap().target(),
+                Some(before)
+            );
+            assert_eq!(std::fs::read(repo.path().join("HEAD")).unwrap(), head_before);
+            assert_eq!(std::fs::read(&evidence).unwrap(), prior);
+            if interrupted {
+                for (path, bytes) in files {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+            } else {
+                assert!(!paths.canonical.exists());
+                assert!(!paths.outbox.exists());
+                assert!(paths.inbox.iter().all(|path| !path.exists()));
+            }
+            // Restoring the known ref makes the original duplicate visible;
+            // the failed repair must not have established a new canonical ID.
+            repo.set_head(&original_ref).unwrap();
+            let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("canonical message id 42"),
+                "{error}"
+            );
+            assert_eq!(repo.head().unwrap().target(), Some(before));
+        }
+    }
+
+    #[test]
+    fn restoring_head_allows_nonconflicting_reconciliation_again() {
+        let (_dir, config, archive, message, recipients) = fixture();
+        let source = archive.root.join("messages/2025/01/unrelated.md");
+        let bytes = b"---json\n{\"id\": 99}\n---\n\nretained message";
+        commit_source(&archive, &config, &source, bytes);
+        std::fs::rename(&source, config.storage_root.join("retained-unrelated.md")).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let original_ref = repo.head().unwrap().name().unwrap().to_string();
+        repo.set_head("refs/heads/unborn-recovery").unwrap();
+        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_err());
+        repo.set_head(&original_ref).unwrap();
+        let result =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        assert_eq!(result.files_created, 4);
+        assert!(result.git_commit_needed);
+        assert_eq!(
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap(),
+            ReconcileResult::default()
+        );
     }
 
     #[test]
