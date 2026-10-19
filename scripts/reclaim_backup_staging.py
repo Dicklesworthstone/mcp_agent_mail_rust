@@ -10,9 +10,12 @@ Older binaries and explicit/manual exporters may not acquire that lease:
 detected every writer. No server is signalled and no SQLite file is opened as a
 database. No file is deleted, overwritten, or copied to another filesystem.
 
-Linux / Python 3.10+, standard library only. Atomic no-replace directory moves
-require libc renameat2 and filesystem RENAME_NOREPLACE support. Unsupported
-platforms fail closed. Quarantine remains resident under STORAGE_ROOT/doctor/
+Linux or macOS / Python 3.10+, standard library only. Atomic no-replace moves
+use renameat2(RENAME_NOREPLACE) on Linux and renameatx_np(RENAME_EXCL) on macOS.
+Unsupported platforms, libc entry points, and filesystems fail closed; there is
+no check-then-rename or copy fallback. Use physical paths on macOS (for example
+/private/tmp, not the /tmp symlink); symlinked components remain forbidden.
+Quarantine remains resident under STORAGE_ROOT/doctor/
 reclaimable; moving stages makes them leave admission's staging namespace, not
 the disk. Retry journals, verified backups, metadata, and live state are intact.
 
@@ -87,8 +90,8 @@ class Refused(RuntimeError):
 
 
 def require_platform() -> None:
-    if not sys.platform.startswith("linux"):
-        raise Refused("this recovery command requires Linux; no fallback move is permitted")
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        raise Refused("this recovery command requires Linux or macOS; no fallback move is permitted")
 
 
 def canonical_json(value: Any) -> bytes:
@@ -523,15 +526,27 @@ class Mailbox:
 
 
 def rename_noreplace(source_parent: int, source: str, target_parent: int, target: str) -> None:
+    """Move within retained directory descriptors, atomically refusing collisions.
+
+    macOS uses the fd-relative variant, not renamex_np with reconstructed paths.
+    RENAME_EXCL is 0x00000004 in Apple's bsd/sys/stdio.h; Linux's
+    RENAME_NOREPLACE is 1. Neither platform falls back to replacing a target,
+    checking existence first, or copying evidence to another filesystem.
+    """
     require_platform()
+    for name in (source, target):
+        if not isinstance(name, str) or not name or name in (".", "..") or "/" in name or "\0" in name:
+            raise Refused("rename names must be single ordinary components")
+    symbol, flags = ("renameatx_np", 0x00000004) if sys.platform == "darwin" else ("renameat2", 1)
     libc = ctypes.CDLL(None, use_errno=True)
-    rename = getattr(libc, "renameat2", None)
+    rename = getattr(libc, symbol, None)
     if rename is None:
-        raise Refused("libc renameat2 is unavailable; no unsafe fallback is allowed")
+        raise Refused(f"libc {symbol} is unavailable; no unsafe fallback is allowed")
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
-    if rename(source_parent, os.fsencode(source), target_parent, os.fsencode(target), 1) != 0:
-        code = ctypes.get_errno()
+    ctypes.set_errno(0)
+    if rename(source_parent, os.fsencode(source), target_parent, os.fsencode(target), flags) != 0:
+        code = ctypes.get_errno() or errno.EIO
         raise OSError(code, os.strerror(code), source)
 
 
