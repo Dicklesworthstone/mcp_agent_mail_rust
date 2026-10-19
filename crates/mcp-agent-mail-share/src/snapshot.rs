@@ -14,6 +14,8 @@ use sqlmodel_core::Value;
 
 use crate::ShareError;
 
+mod shared;
+
 const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -862,7 +864,9 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
             }
         }
     }
-    Ok(())
+    // Shared deliveries and lazy receipts are part of the same source read
+    // transaction, including the finalization rebuild of a prepared snapshot.
+    shared::transfer(src, dst)
 }
 
 /// Create a table in the destination database.
