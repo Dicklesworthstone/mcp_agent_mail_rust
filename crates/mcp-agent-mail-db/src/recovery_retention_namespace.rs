@@ -560,6 +560,86 @@ fn ensure_no_file_readers(
                 ));
             }
         }
+        ensure_no_mapped_file_readers(
+            &entry.path(),
+            pid,
+            effective_user,
+            retained_identity,
+            &mut charge,
+        )?;
+    }
+    Ok(())
+}
+
+/// Mappings retain an inode after the process closes its last descriptor.
+/// Match the kernel's device/inode record, including mappings through removed
+/// aliases, without opening a candidate or relying on a displayed pathname.
+#[cfg(target_os = "linux")]
+fn ensure_no_mapped_file_readers(
+    process: &Path,
+    process_id: u32,
+    effective_user: u32,
+    retained: &Metadata,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Read as _;
+
+    const MAX_PROCESS_MAP_BYTES: u64 = 8 * 1024 * 1024;
+    let maps_file = match File::open(process.join("maps")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && reader_inventory_denial_is_foreign(process, effective_user)? =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut maps = Vec::new();
+    maps_file
+        .take(MAX_PROCESS_MAP_BYTES + 1)
+        .read_to_end(&mut maps)?;
+    if u64::try_from(maps.len()).unwrap_or(u64::MAX) > MAX_PROCESS_MAP_BYTES {
+        return Err(invalid("open-reader mappings exceeded their bounded scan"));
+    }
+    for line in maps
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        charge()?;
+        // Only numeric fields are UTF-8: a mapped pathname may contain any
+        // non-NUL Unix bytes and is not part of this identity comparison.
+        let mut fields = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty());
+        let device = fields
+            .nth(3)
+            .ok_or_else(|| invalid("open-reader mapping has no device record"))?;
+        let inode = fields
+            .next()
+            .ok_or_else(|| invalid("open-reader mapping has no inode record"))?;
+        let inode = std::str::from_utf8(inode)
+            .map_err(io::Error::other)?
+            .parse::<u64>()
+            .map_err(io::Error::other)?;
+        if inode != retained.ino() {
+            continue;
+        }
+        let device = std::str::from_utf8(device).map_err(io::Error::other)?;
+        let (major, minor) = device
+            .split_once(':')
+            .ok_or_else(|| invalid("open-reader mapping has an invalid device record"))?;
+        let major = u64::from_str_radix(major, 16).map_err(io::Error::other)?;
+        let minor = u64::from_str_radix(minor, 16).map_err(io::Error::other)?;
+        if major == nix::sys::stat::major(retained.dev())
+            && minor == nix::sys::stat::minor(retained.dev())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("backup has an active memory mapping in process {process_id}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -990,6 +1070,89 @@ mod tests {
         assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
         assert!(source.exists());
         drop(reader);
+        assert_eq!(
+            delete_inventoried_file(&source, &inventoried)
+                .unwrap()
+                .logical_bytes,
+            inventoried.len()
+        );
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_retains_a_mapping_after_its_descriptor_and_alias_are_removed() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        const CONTENT: &[u8] = b"recovery bytes retained only by a memory mapping";
+        const READY: &str = "mapping without a descriptor ready";
+        const READER: &str = r#"
+import mmap
+import os
+import sys
+
+alias = sys.argv[1]
+with open(alias, "rb") as reader:
+    identity = os.fstat(reader.fileno())
+    mapping = mmap.mmap(reader.fileno(), 0, access=mmap.ACCESS_READ)
+# Python before 3.13 duplicates the descriptor inside mmap. Close every copy
+# explicitly, then avoid opening files until mapping.close() so its cleanup
+# cannot close a subsequently reused descriptor.
+for name in os.listdir("/proc/self/fd"):
+    descriptor = int(name)
+    try:
+        observed = os.fstat(descriptor)
+    except OSError:
+        continue
+    if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+        os.close(descriptor)
+os.unlink(alias)
+print("mapping without a descriptor ready", flush=True)
+assert sys.stdin.readline().strip() == "release"
+assert mapping[:] == b"recovery bytes retained only by a memory mapping"
+mapping.close()
+"#;
+
+        let root = fixture();
+        let source = root.join("generation");
+        let alias = root.join("mapped-reader-alias");
+        std::fs::write(&source, CONTENT).unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+        let mut child = std::process::Command::new("python3")
+            .args(["-u", "-c", READER])
+            .arg(&alias)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), READY);
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let child_descriptors = PathBuf::from(format!("/proc/{}/fd", child.id()));
+        let reader_has_descriptor = std::fs::read_dir(child_descriptors).unwrap().any(|entry| {
+            let observed = std::fs::metadata(entry.unwrap().path()).unwrap();
+            observed.dev() == inventoried.dev() && observed.ino() == inventoried.ino()
+        });
+
+        let preflight = preflight_inventoried_file_readers(&source, &inventoried);
+        let deletion = delete_inventoried_file(&source, &inventoried);
+        let retained = std::fs::read(&source);
+        writeln!(child.stdin.take().unwrap(), "release").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        assert!(!reader_has_descriptor, "fixture must hold only a mapping");
+        assert!(!alias.exists());
+        assert_eq!(inventoried.nlink(), 1);
+        for result in [preflight, deletion.map(|_| ())] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(error.to_string().contains("memory mapping"));
+            assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        }
+        assert_eq!(retained.unwrap(), CONTENT);
         assert_eq!(
             delete_inventoried_file(&source, &inventoried)
                 .unwrap()

@@ -454,9 +454,10 @@ timestamped periodic names, requires a fully verified newer restore point and
 a valid standalone candidate, and proves common mailbox scope through a
 matching nonempty database lineage or an exact byte-for-byte match to the
 verified restore point. These checks apply to resident and historical files.
-Companion recovery state, changed files, unsafe paths, or active readers cause
-refusal. A bad backup cannot become disposable merely because its filename
-looks old.
+Companion recovery state, changed files, unsafe paths, or observed active
+readers cause refusal. On Linux this includes memory mappings whose file
+descriptors have already closed. A bad backup cannot become disposable merely
+because its filename looks old.
 
 Retention inventories both resident backups and material already accumulated
 under `doctor/reclaimable/`. Native historical rotation files are eligible only
@@ -477,6 +478,10 @@ logical byte limit is the larger of 512 MiB and
 images and the full observed `doctor/reclaimable/` footprint count toward that
 byte limit; a proposed publication also reserves one current database-plus-WAL
 estimate. Separate staging admission and disk-headroom checks still apply.
+The resident retention window can shorten to restore count or byte capacity,
+while preserving the publication slot and verified recovery generation. Only
+confirmed removals reduce that calculation; a refused candidate cannot prevent
+cleanup from considering another safely superseded generation in the window.
 These are bounds on cooperating automatic producers, not a filesystem quota
 on operator exports or other programs.
 
@@ -491,10 +496,13 @@ without spending the allowance. Once export begins, a crash, failed backup
 validation, or failed metadata publication does not replenish that allowance.
 Further over-budget exports remain refused
 until an ordinary admission check observes sufficient retained count and byte
-capacity after cleanup. Existing failed-stage admission is checked first. Do
-not remove the journal or authority lock to bypass a refusal: inspect the
-preserved evidence and resolve the underlying retention, permission, or
-verification finding.
+capacity after cleanup. Existing failed-stage admission is checked first. A
+refused export still permits independently admitted, bounded reclamation of
+superseded backups, including when interrupted staging or an unavailable
+journal prevents publication. This leaves the preserved operation evidence
+and export retry state intact. Do not remove the journal or authority lock to
+bypass a refusal: inspect the preserved evidence and resolve the underlying
+retention, permission, or verification finding.
 
 Setting `AM_BACKUP_ROTATION_DELETE=false` explicitly preserves move-only
 retention and disables the extra repair export; automatic publication stops at

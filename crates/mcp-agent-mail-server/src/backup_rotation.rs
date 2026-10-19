@@ -338,6 +338,55 @@ fn periodic_byte_budget(primary: &Path, keep: usize) -> std::io::Result<(u64, u6
     Ok((generation, limit))
 }
 
+/// Publication admission and retention must use the same complete footprint.
+/// A planned or refused eviction does not create capacity for the producer.
+struct PeriodicPublicationBudget {
+    count: usize,
+    bytes: u64,
+    projected: u64,
+    count_limit: usize,
+    byte_limit: u64,
+}
+
+impl PeriodicPublicationBudget {
+    fn new(primary: &Path, keep: usize, count: usize, bytes: u64) -> std::io::Result<Self> {
+        let (projected, byte_limit) = periodic_byte_budget(primary, keep)?;
+        bytes
+            .checked_add(projected)
+            .ok_or_else(|| std::io::Error::other("projected backup size overflow"))?;
+        Ok(Self {
+            count,
+            bytes,
+            projected,
+            // Window + exact publication slot + an older verified pin + one
+            // spare publication. Admission needs one unoccupied count slot.
+            count_limit: keep.max(MIN_KEEP_PER_KIND).saturating_add(3),
+            byte_limit,
+        })
+    }
+
+    const fn exhausted(&self) -> bool {
+        self.count >= self.count_limit
+            || self.bytes.saturating_add(self.projected) > self.byte_limit
+    }
+
+    fn admit(&self) -> std::io::Result<()> {
+        if self.exhausted() {
+            return Err(std::io::Error::other(PeriodicBudgetExceeded(format!(
+                "periodic backup retention budget exhausted ({} images, {} retained bytes, {} projected bytes, {}-byte limit); restore verified snapshot authority or reclaim retained backups before publishing more",
+                self.count, self.bytes, self.projected, self.byte_limit
+            ))));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    const fn record_deletion(&mut self, bytes: u64) {
+        self.count = self.count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+}
+
 #[derive(Default)]
 struct HistoricalBackups {
     eligible: Vec<(PathBuf, fs::Metadata)>,
@@ -537,18 +586,7 @@ pub(crate) fn admit_periodic_publication(
     bytes = bytes
         .checked_add(history.bytes)
         .ok_or_else(|| std::io::Error::other("retained backup size overflow"))?;
-    let (projected, byte_limit) = periodic_byte_budget(primary, keep)?;
-    let projected_total = bytes
-        .checked_add(projected)
-        .ok_or_else(|| std::io::Error::other("projected backup size overflow"))?;
-    // Window + exact publication slot + an older verified pin + one spare
-    // publication. Do not deadlock a valid refresh on its own retained pin.
-    if count >= keep.max(MIN_KEEP_PER_KIND).saturating_add(3) || projected_total > byte_limit {
-        return Err(std::io::Error::other(PeriodicBudgetExceeded(format!(
-            "periodic backup retention budget exhausted ({count} images, {bytes} retained bytes, {projected} projected bytes, {byte_limit}-byte limit); restore verified snapshot authority or reclaim retained backups before publishing more"
-        ))));
-    }
-    Ok(())
+    PeriodicPublicationBudget::new(primary, keep, count, bytes)?.admit()
 }
 
 #[cfg(unix)]
@@ -556,6 +594,7 @@ struct ReclaimBudget {
     attempted: usize,
     bytes: u64,
     byte_limit: u64,
+    publication: Option<PeriodicPublicationBudget>,
 }
 
 #[cfg(unix)]
@@ -603,6 +642,9 @@ fn reclaim_periodic_file(
             summary.bytes_reclaimed = summary
                 .bytes_reclaimed
                 .saturating_add(bytes.allocated_bytes.unwrap_or(0));
+            if let Some(publication) = budget.publication.as_mut() {
+                publication.record_deletion(bytes.logical_bytes);
+            }
         }
         Err(error) => {
             let failure = RotationFailure::from_error(path, &error);
@@ -618,6 +660,10 @@ struct PendingReclaim {
     path: PathBuf,
     metadata: fs::Metadata,
     historical: bool,
+    /// Shorten the normal resident window only while the complete footprint
+    /// still prevents publication. The exact slot and verified pin never enter
+    /// this queue, and failed deletions never satisfy this condition.
+    within_window: bool,
 }
 
 #[cfg(unix)]
@@ -660,9 +706,15 @@ fn reclaim_pending(
     }
     let mut summary = RotateKindSummary::default();
     let mut last_attempted = None;
-    let mut stopped = false;
+    let mut stopped = report.admission_refused;
     for entry in pending {
-        if stopped {
+        if stopped
+            || (entry.within_window
+                && budget
+                    .publication
+                    .as_ref()
+                    .is_none_or(|publication| !publication.exhausted()))
+        {
             summary.kept = summary.kept.saturating_add(1);
             summary.bytes_kept = summary.bytes_kept.saturating_add(entry.metadata.len());
             continue;
@@ -1128,12 +1180,49 @@ where
         .flatten();
 
     #[cfg(unix)]
+    let publication_budget = if periodic_reclamation_enabled() {
+        let footprint = by_kind
+            .get(&BackupKind::ManualBackup)
+            .into_iter()
+            .flatten()
+            .filter(|(path, _, _)| {
+                path.file_name()
+                    .is_some_and(|name| is_periodic_backup(snapshot_primary, name))
+            })
+            .try_fold(
+                (history.periodic_count, history.bytes),
+                |(count, bytes), (_, _, metadata)| {
+                    bytes
+                        .checked_add(metadata.len())
+                        .map(|bytes| (count.saturating_add(1), bytes))
+                        .ok_or_else(|| std::io::Error::other("retained backup size overflow"))
+                },
+            )
+            .and_then(|(count, bytes)| {
+                PeriodicPublicationBudget::new(snapshot_primary, keep, count, bytes)
+            });
+        match footprint {
+            Ok(budget) => Some(budget),
+            Err(error) => {
+                report.admission_refused = true;
+                report
+                    .failures
+                    .push(RotationFailure::from_error(snapshot_primary, &error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(unix)]
     let mut reclaim_budget = ReclaimBudget {
         attempted: 0,
         bytes: 0,
         byte_limit: optional_regular_bytes(snapshot_primary)
             .unwrap_or(0)
             .max(PERIODIC_BYTES_FLOOR),
+        publication: publication_budget,
     };
     #[cfg(unix)]
     let mut pending_reclaims = Vec::new();
@@ -1205,67 +1294,46 @@ where
                 .then(collision_order)
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let mut to_evict = files
+        let to_evict = files
             .iter()
             .enumerate()
-            .filter(|(index, (path, _, _))| {
+            .filter_map(|(index, file @ (path, _, _))| {
                 if path == &mcp_agent_mail_db::snapshot::snapshot_bak_path(snapshot_primary) {
-                    return false;
-                }
-                if *index < keep {
-                    return false;
+                    return None;
                 }
                 let is_pinned = kind == BackupKind::ManualBackup
                     && pinned_verified_snapshot.as_ref().is_some_and(|pinned| {
                         fs::canonicalize(path)
                             .is_ok_and(|canonical| canonical.as_path() == pinned.as_path())
                     });
-                !is_pinned
-            })
-            .map(|(_, file)| file)
-            .collect::<Vec<_>>();
-
-        if kind == BackupKind::ManualBackup && periodic_reclamation_enabled() {
-            // Count alone can pin several enormous old databases after a
-            // mailbox shrinks. The byte rule may shorten the historical window,
-            // but can never select the publication slot or verified authority.
-            if let Ok((_, limit)) = periodic_byte_budget(snapshot_primary, keep) {
-                let mut retained = files
-                    .iter()
-                    .filter(|file| !to_evict.iter().any(|evicted| evicted.0 == file.0))
-                    .fold(0_u64, |bytes, file| bytes.saturating_add(file.2.len()));
-                for file in files.iter().rev() {
-                    if retained <= limit {
-                        break;
-                    }
-                    if to_evict.iter().any(|evicted| evicted.0 == file.0)
-                        || file.0
-                            == mcp_agent_mail_db::snapshot::snapshot_bak_path(snapshot_primary)
-                        || pinned_verified_snapshot.as_ref().is_some_and(|pin| {
-                            fs::canonicalize(&file.0).is_ok_and(|path| &path == pin)
-                        })
-                        || !file
-                            .0
-                            .file_name()
-                            .is_some_and(|name| is_periodic_backup(snapshot_primary, name))
-                    {
-                        continue;
-                    }
-                    retained = retained.saturating_sub(file.2.len());
-                    to_evict.push(file);
+                if is_pinned {
+                    return None;
                 }
-            }
-        }
+                let within_window = index < keep;
+                if within_window
+                    && !(kind == BackupKind::ManualBackup
+                        && periodic_reclamation_enabled()
+                        && path
+                            .file_name()
+                            .is_some_and(|name| is_periodic_backup(snapshot_primary, name)))
+                {
+                    return None;
+                }
+                Some((file, within_window))
+            })
+            .collect::<Vec<_>>();
 
         let mut summary = RotateKindSummary {
             kept: files.len().saturating_sub(to_evict.len()),
             bytes_kept: files
                 .iter()
-                .filter(|file| !to_evict.iter().any(|evicted| evicted.0 == file.0))
+                .filter(|file| !to_evict.iter().any(|(evicted, _)| evicted.0 == file.0))
                 .fold(0_u64, |bytes, file| bytes.saturating_add(file.2.len())),
             ..Default::default()
         };
-        for (path, _mtime, metadata) in to_evict {
+        for ((path, _mtime, metadata), within_window) in to_evict {
+            #[cfg(not(unix))]
+            let _ = within_window;
             let size = metadata.len();
             #[cfg(unix)]
             if let Err(error) = snapshot_guard.revalidate() {
@@ -1281,6 +1349,7 @@ where
                     path: path.clone(),
                     metadata: metadata.clone(),
                     historical: false,
+                    within_window,
                 });
                 continue;
             }
@@ -1399,6 +1468,7 @@ where
                 path,
                 metadata,
                 historical: true,
+                within_window: false,
             });
             continue;
         }
@@ -1584,6 +1654,147 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reclamation_shortens_the_window_using_confirmed_aggregate_capacity() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        for failed_oldest in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let live = fs::read(&primary).unwrap();
+            let generation_bytes = u64::try_from(live.len()).unwrap();
+            let oldest = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+            let newer = tmp.path().join("storage.sqlite3.bak.20000102_000000");
+            fs::copy(&primary, &oldest).unwrap();
+            fs::copy(&primary, &newer).unwrap();
+            if failed_oldest {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&oldest)
+                    .unwrap()
+                    .write_all(b"interrupted export")
+                    .unwrap();
+            }
+            let oldest_bytes = fs::read(&oldest).unwrap();
+            let valid_blocks = fs::metadata(if failed_oldest { &newer } else { &oldest })
+                .unwrap()
+                .blocks();
+
+            let history = tmp
+                .path()
+                .join("doctor/reclaimable/rotated-backups-recorded");
+            fs::create_dir_all(&history).unwrap();
+            let manifest = history.join("manifest.json");
+            let manifest_bytes = b"operator restore authority";
+            fs::write(&manifest, manifest_bytes).unwrap();
+            let evidence = history.join("recovery-evidence.bin");
+            let evidence_bytes = PERIODIC_BYTES_FLOOR
+                - 3 * generation_bytes
+                - u64::try_from(manifest_bytes.len()).unwrap();
+            fs::File::create(&evidence)
+                .unwrap()
+                .set_len(evidence_bytes)
+                .unwrap();
+            let evidence_inode = fs::metadata(&evidence).unwrap().ino();
+
+            // Resident bytes alone are small. The complete retained footprint
+            // exactly fills the byte ceiling, leaving no room for the next
+            // publication; count-based rotation would select no candidates.
+            let error = admit_periodic_publication(tmp.path(), &primary, 3).unwrap_err();
+            assert!(periodic_publication_budget_exhausted(&error));
+            assert!(error.to_string().contains("3 images"));
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "true")],
+                || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            );
+            assert_eq!(report.deleted, 1);
+            assert_eq!(report.bytes_deleted, generation_bytes);
+            assert_eq!(report.bytes_reclaimed, valid_blocks * 512);
+            assert_eq!(
+                report.bytes_retained(),
+                PERIODIC_BYTES_FLOOR - generation_bytes
+            );
+            assert_eq!(report.unconfirmed_deletions, 0);
+            assert!(!report.admission_refused);
+            if failed_oldest {
+                // A failed candidate cannot be subtracted from the quota or
+                // indefinitely starve a later valid generation in the window.
+                assert_eq!(fs::read(&oldest).unwrap(), oldest_bytes);
+                assert!(!newer.exists());
+                assert_eq!(report.failures.len(), 1);
+                assert_eq!(report.failures[0].source, oldest);
+            } else {
+                assert!(!oldest.exists());
+                assert_eq!(fs::read(&newer).unwrap(), live);
+                assert!(report.failures.is_empty());
+            }
+            admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
+            let next = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "true")],
+                || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            );
+            assert_eq!(
+                next.deleted, 0,
+                "restored capacity keeps the remaining window"
+            );
+            assert!(next.failures.is_empty(), "{:?}", next.failures);
+            assert_eq!(next.bytes_retained(), report.bytes_retained());
+            assert_eq!(fs::read(&manifest).unwrap(), manifest_bytes);
+            let retained_evidence = fs::metadata(&evidence).unwrap();
+            assert_eq!(retained_evidence.len(), evidence_bytes);
+            assert_eq!(retained_evidence.ino(), evidence_inode);
+            assert_eq!(fs::read(&primary).unwrap(), live);
+            assert_eq!(
+                fs::read(mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary)).unwrap(),
+                live
+            );
+            assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_history_count_can_shorten_the_resident_window() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        let oldest = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        let newer = tmp.path().join("storage.sqlite3.bak.20000102_000000");
+        fs::copy(&primary, &oldest).unwrap();
+        fs::copy(&primary, &newer).unwrap();
+        let history = tmp
+            .path()
+            .join("doctor/reclaimable/rotated-backups-recorded");
+        fs::create_dir_all(&history).unwrap();
+        fs::write(history.join("manifest.json"), b"restore authority").unwrap();
+        for day in 1..=3 {
+            fs::copy(
+                &primary,
+                history.join(format!("storage.sqlite3.bak.1999120{day}_000000")),
+            )
+            .unwrap();
+        }
+        let error = admit_periodic_publication(tmp.path(), &primary, 3).unwrap_err();
+        assert!(periodic_publication_budget_exhausted(&error));
+        assert!(error.to_string().contains("6 images"));
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "true")],
+            || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+        );
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.bytes_deleted, generation_bytes);
+        assert_eq!(report.bytes_retained(), 5 * generation_bytes + 17);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+        assert_eq!(fs::read_dir(&history).unwrap().count(), 4);
+        admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
     #[test]
     fn manual_and_sidecar_backups_do_not_consume_periodic_count_slots() {
         let tmp = TempDir::new().unwrap();
@@ -1728,6 +1939,7 @@ mod tests {
                     path: path.clone(),
                     metadata: fs::metadata(path).unwrap(),
                     historical: false,
+                    within_window: false,
                 })
                 .collect();
             // A zero byte allowance still admits one oversized candidate.
@@ -1736,6 +1948,7 @@ mod tests {
                 attempted: 0,
                 bytes: 0,
                 byte_limit: 0,
+                publication: None,
             };
             let mut report = RotateReport::default();
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
@@ -1777,12 +1990,14 @@ mod tests {
                     path: path.clone(),
                     metadata: fs::metadata(path).unwrap(),
                     historical: false,
+                    within_window: false,
                 })
                 .collect();
             let mut budget = ReclaimBudget {
                 attempted: 0,
                 bytes: 0,
                 byte_limit: 2,
+                publication: None,
             };
             let mut report = RotateReport::default();
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
