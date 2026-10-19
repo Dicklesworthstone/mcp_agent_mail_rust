@@ -9,6 +9,8 @@
 mod admission_tests;
 mod checkpoint;
 pub(crate) mod durability;
+#[cfg(test)]
+mod pressure_tests;
 mod source;
 mod staged;
 
@@ -80,13 +82,21 @@ impl From<String> for ReconcileFailure {
 
 impl From<crate::StorageError> for ReconcileFailure {
     fn from(error: crate::StorageError) -> Self {
+        use std::io::ErrorKind;
+
+        // Resource pressure cannot contradict message identity. Keep its ID
+        // in the ordinary bounded retry lane instead of discarding retry debt
+        // behind the history cursor. Do not infer retryability from error text
+        // or broaden cancellation, permission, path, or opaque Git failures.
         let transient = matches!(
             error,
             crate::StorageError::LockContention { .. }
                 | crate::StorageError::LockTimeout(_)
                 | crate::StorageError::GitIndexLock { .. }
         ) || matches!(&error, crate::StorageError::Io(error)
-            if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+            if matches!(error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ResourceBusy
+                    | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory));
         Self {
             detail: error.to_string(),
             transient,
@@ -219,6 +229,30 @@ pub struct ReconcileReport {
     /// `None` for an in-memory or pre-cancelled pass; false means progress is
     /// currently memory-only and a restart may replay an older bounded pass.
     pub checkpoint_saved: Option<bool>,
+}
+
+/// Record only a completed failure after cancellation and capacity admission.
+/// Resource retries retain IDs, never the failed payload or archive authority.
+fn record_failure(
+    id: i64,
+    error: ReconcileFailure,
+    cursor: &mut ReconcileCursor,
+    report: &mut ReconcileReport,
+    now: Instant,
+) {
+    report.deferred += 1;
+    if error.transient {
+        report.deferred_transient += 1;
+        cursor.defer_transient(id, now);
+    } else {
+        report.deferred_conflict += 1;
+        cursor.defer_conflict(id, now);
+    }
+    tracing::warn!(
+        target: "maintenance", event = "message_archive_reconcile_deferred",
+        message_id = id, reason = %error.detail, transient = error.transient,
+        "message archive repair deferred; source and conflicting evidence retained"
+    );
 }
 
 /// A finite retention round revisits unavailable archive evidence without
@@ -1014,21 +1048,7 @@ fn reconcile_message_batch_inner(
                 report.unchanged += 1;
                 cursor.forget_retry(id);
             }
-            Err(error) => {
-                report.deferred += 1;
-                if error.transient {
-                    report.deferred_transient += 1;
-                    cursor.defer_transient(id, now);
-                } else {
-                    report.deferred_conflict += 1;
-                    cursor.defer_conflict(id, now);
-                }
-                tracing::warn!(
-                    target: "maintenance", event = "message_archive_reconcile_deferred",
-                    message_id = id, reason = %error.detail, transient = error.transient,
-                    "message archive repair deferred; source and conflicting evidence retained"
-                );
-            }
+            Err(error) => record_failure(id, error, cursor, &mut report, now),
         }
         if let Some(tail) = tail {
             cursor.advance(id, tail);
