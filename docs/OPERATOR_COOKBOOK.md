@@ -437,6 +437,90 @@ If that reconciler is not running or has stopped making progress, health exits
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
+### Automatic backup retention and actual disk reclamation
+
+Successful automatic publication runs retention immediately, including during
+long-running server operation. On supported Unix systems the default policy
+physically removes superseded periodic backup generations when verification
+and filesystem checks establish that doing so preserves recovery. Rotation of
+incident evidence into `doctor/reclaimable/` remains a move: those bytes still
+occupy the filesystem.
+
+`AM_BACKUP_KEEP_COUNT` requests the newest three generations per backup kind by
+default, with a minimum of one. The current `.bak` publication slot and the
+exact verified recovery generation remain protected, even when an older verified
+generation falls outside that window. Automatic deletion accepts only strict
+timestamped periodic names, requires a fully verified newer restore point and
+a valid standalone candidate, and proves common mailbox scope through a
+matching nonempty database lineage or an exact byte-for-byte match to the
+verified restore point. These checks apply to resident and historical files.
+Companion recovery state, changed files, unsafe paths, or active readers cause
+refusal. A bad backup cannot become disposable merely because its filename
+looks old.
+
+Retention inventories both resident backups and material already accumulated
+under `doctor/reclaimable/`. Native historical rotation files are eligible only
+inside generated `rotation-YYYYMMDDTHHMMSSZ[-N]` directories, with the same
+verification and scope proof as resident candidates. A recreated mailbox's
+older lineage remains protected unless it is an exact duplicate. Recorded recovery
+runs, including the offline script's `rotated-backups-*` and
+`proactive-staging-*` directories, retain their complete manifest, action logs,
+and payloads for inspection, resume, or restore. Successful move receipts do
+not authorize deletion. Unrecognized material and failed or interrupted backup
+stages remain recovery evidence.
+
+Automatic exporters also have admission limits so refused reclamation cannot
+silently produce unlimited new copies. The periodic count limit is
+`keep_count + 3`, including retained historical periodic files. The projected
+logical byte limit is the larger of 512 MiB and
+`(keep_count + 3) × (current database bytes + WAL bytes)`. Existing periodic
+images and the full observed `doctor/reclaimable/` footprint count toward that
+byte limit; a proposed publication also reserves one current database-plus-WAL
+estimate. Separate staging admission and disk-headroom checks still apply.
+These are bounds on cooperating automatic producers, not a filesystem quota
+on operator exports or other programs.
+
+An old oversized backlog with missing or stale verification metadata may need
+a fresh verified publication before any safe deletion can proceed. The
+per-mailbox automatic-backup journal durably reserves **one** such repair export
+after live verification and exclusive snapshot admission, immediately before
+the first backup mutation. An ordinary export also passes its disk-headroom
+check first; preserving stale companion recovery files can spend the allowance
+before that later check. A reader or a failed live check can therefore defer
+without spending the allowance. Once export begins, a crash, failed backup
+validation, or failed metadata publication does not replenish that allowance.
+Further over-budget exports remain refused
+until an ordinary admission check observes sufficient retained count and byte
+capacity after cleanup. Existing failed-stage admission is checked first. Do
+not remove the journal or authority lock to bypass a refusal: inspect the
+preserved evidence and resolve the underlying retention, permission, or
+verification finding.
+
+Setting `AM_BACKUP_ROTATION_DELETE=false` explicitly preserves move-only
+retention and disables the extra repair export; automatic publication stops at
+the same admission limits when staging cannot release space. Leaving the
+variable unset enables the verified periodic reclamation policy. Setting it
+to `true` also enables the older incident-artifact deletion behavior, so it is
+broader than the default periodic policy.
+
+Startup and publication logs report `bytes_staged`, `bytes_deleted`,
+`bytes_reclaimed`, and `bytes_retained`. Staged and retained values are logical
+file lengths still occupying storage. Deleted bytes are the logical lengths
+of confirmed removals; reclaimed bytes count the allocated blocks associated
+with verified periodic unlinks. The latter is not a measurement of the
+filesystem's free-space delta: filesystem snapshots and shared storage can
+retain blocks independently. Refused operations retain their byte accounting.
+An incomplete inventory refuses mutations and marks totals as lower bounds;
+uncertain moves or unlinks have separate counters rather than being reported
+as successful reclamation. Each cleanup pass attempts at most 128 periodic
+candidates, with a candidate-byte budget of the larger of 512 MiB and the
+current database's size. One oversized candidate can still be attempted so a
+large mailbox can make progress. Verifying the pinned restore point adds I/O
+beyond that candidate budget. A shared progress cursor keeps refused older
+files from repeatedly preventing examination of the remaining backlog.
+Bounded cleanup passes can leave more work for a later attempt; the publication
+limit remains in force while that work is pending.
+
 ## 14. Plan archive pack maintenance [read-only]
 
 **Goal:** Measure mailbox archive bloat without changing the Git archive.
