@@ -755,10 +755,11 @@ fn publish_automatic_backup(
             })
             .map_err(|error| error.to_string()),
     };
-    // GH#355: startup rotation can precede the successful refresh that
-    // replaces obsolete snapshot authority. Reapply the existing policy
-    // after publication while both exporter leases remain held.
-    rotate_after_published_backup_with(result, || {
+    // GH#355: reapply retention after successful publication. An attempt that
+    // cannot publish must also allow independent reclamation: a headroom
+    // refusal below the periodic quota cannot create the stage/count pressure
+    // that otherwise retries cleanup. Both exporter leases remain held.
+    rotate_after_backup_attempt_with(result, || {
         crate::backup_rotation::rotate_storage_backups_with_exporter_lease(
             retention.storage_root,
             Path::new(pool.sqlite_path()),
@@ -804,21 +805,25 @@ fn prepare_periodic_publication(
     }
 }
 
-/// Rotation is a best-effort followup to an actual publication. Preserve the
-/// producer's result: a reclaim refusal cannot turn a durable backup into a
-/// failed export or alter verified-snapshot retry pacing.
-fn rotate_after_published_backup_with(
+/// Retention must prove its own verified replacement, including after an
+/// unsuccessful export or live verification. The producer's result grants no
+/// deletion authority and is preserved even if independent cleanup refuses.
+fn rotate_after_backup_attempt_with(
     result: Result<bool, String>,
     rotate: impl FnOnce() -> std::io::Result<crate::backup_rotation::RotateReport>,
 ) -> Result<bool, String> {
-    if matches!(&result, Ok(true)) {
-        match rotate() {
-            Ok(report) => report_backup_rotation(&report, "after automatic publication"),
-            Err(error) => tracing::warn!(
-                %error,
-                "integrity guard: backup published; backup rotation failed and will retry after a later publication"
-            ),
-        }
+    let phase = if matches!(&result, Ok(true)) {
+        "after automatic publication"
+    } else {
+        "after automatic backup attempt without publication"
+    };
+    match rotate() {
+        Ok(report) => report_backup_rotation(&report, phase),
+        Err(error) => tracing::warn!(
+            phase,
+            %error,
+            "integrity guard: backup retention failed; automatic backup outcome is unchanged"
+        ),
     }
     result
 }
@@ -1910,7 +1915,7 @@ mod tests {
             |kind, _before_export| {
                 assert_eq!(kind, BackupKind::Verified);
                 assert!(backup_budget::with_admission(&primary, || Ok(())).is_err());
-                rotate_after_published_backup_with(Ok(true), || {
+                rotate_after_backup_attempt_with(Ok(true), || {
                     assert!(backup_budget::with_admission(&primary, || Ok(())).is_err());
                     Ok(crate::backup_rotation::RotateReport::default())
                 })
@@ -1967,6 +1972,168 @@ mod tests {
         })
         .expect("create real backup pool");
         (primary, pool)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unpublished_automatic_attempts_reclaim_below_quota_and_preserve_verified_recovery() {
+        use std::io::{Read as _, Write as _};
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        for verified in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let (primary, pool) = retention_mailbox(&root);
+            let live = std::fs::read(&primary).unwrap();
+            let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
+            std::fs::copy(&primary, &backup).unwrap();
+            let metadata = mcp_agent_mail_db::snapshot::record_snapshot_metadata(
+                &primary,
+                chrono::Utc::now().timestamp_micros(),
+            )
+            .unwrap();
+            for day in 1..=4 {
+                std::fs::copy(
+                    &primary,
+                    root.join(format!("mail.sqlite3.bak.200001{day:02}_000000")),
+                )
+                .unwrap();
+            }
+
+            let mut expected_prefix = live.clone();
+            let mut source = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&primary)
+                .unwrap();
+            let expected_source_bytes = if verified {
+                // Failed live verification cannot replace the existing
+                // recovery generation or authorize deleting uncertain data.
+                source.write_all(b"broken!!").unwrap();
+                expected_prefix[..8].copy_from_slice(b"broken!!");
+                u64::try_from(live.len()).unwrap()
+            } else {
+                // A sparse length equal to the entire filesystem guarantees
+                // the real export headroom check refuses before staging,
+                // without consuming the filesystem's free blocks.
+                let bytes = fs2::total_space(&root).unwrap();
+                assert!(bytes > u64::try_from(live.len()).unwrap());
+                source.set_len(bytes).unwrap();
+                bytes
+            };
+            source.sync_all().unwrap();
+            drop(source);
+            let policy = PeriodicBackupPolicy {
+                storage_root: &root,
+                keep: 3,
+            };
+            crate::backup_rotation::admit_periodic_publication(&root, &primary, policy.keep)
+                .expect("this refusal must occur below the automatic count and byte quota");
+            assert_eq!(
+                crate::backup_rotation::inspect_storage_backups(&primary)
+                    .unwrap()
+                    .artifact_count,
+                5
+            );
+            assert!(!root.join("doctor/reclaimable").exists());
+
+            let now = Instant::now();
+            let mut schedule = AutomaticBackupSchedule::default();
+            if verified {
+                schedule.request_verified();
+            }
+            let kind = if verified {
+                BackupKind::Verified
+            } else {
+                BackupKind::Proactive
+            };
+            let followups = run_admitted_backup_with(
+                &primary,
+                &mut schedule,
+                || now,
+                Some(policy),
+                |actual_kind, before_export| {
+                    assert_eq!(actual_kind, kind);
+                    let result =
+                        publish_automatic_backup(&pool, policy, actual_kind, before_export);
+                    if verified {
+                        assert_eq!(
+                            result,
+                            Ok(false),
+                            "failed live verification must skip export"
+                        );
+                    } else {
+                        let error = result.as_ref().unwrap_err();
+                        assert!(error.contains("bytes are free"), "{error}");
+                        assert!(error.contains("at least"), "{error}");
+                    }
+                    result
+                },
+            );
+            assert_eq!(followups, !verified);
+            assert_eq!(schedule.consecutive_failures(), u32::from(!verified));
+            assert_eq!(
+                schedule.retry_remaining(now),
+                schedule::BACKUP_RETRY_INITIAL
+            );
+            assert_eq!(schedule.next_attempt(now), None);
+            assert_eq!(
+                schedule.next_attempt(now + schedule::BACKUP_RETRY_INITIAL),
+                Some(kind)
+            );
+
+            assert_eq!(
+                crate::backup_rotation::inspect_storage_backups(&primary)
+                    .unwrap()
+                    .artifact_count,
+                3,
+                "unsuccessful attempts must reclaim the two superseded generations"
+            );
+            for day in 1..=4 {
+                assert_eq!(
+                    root.join(format!("mail.sqlite3.bak.200001{day:02}_000000"))
+                        .exists(),
+                    day >= 3
+                );
+            }
+            assert!(
+                !root.join("doctor/reclaimable").exists(),
+                "reclamation must release bytes rather than stage another copy"
+            );
+            assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".mcp-agent-mail-proactive-backup-")
+            }));
+            assert_eq!(std::fs::read(&backup).unwrap(), live);
+            assert_eq!(
+                mcp_agent_mail_db::snapshot::read_snapshot_metadata(&primary),
+                Some(metadata),
+                "neither failed producer nor cleanup can replace verified authority"
+            );
+            assert!(
+                mcp_agent_mail_db::pool::sqlite_recovery_candidate_passes_full_integrity_check(
+                    &backup
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                std::fs::metadata(&primary).unwrap().len(),
+                expected_source_bytes
+            );
+            // Never read the sparse source in full; its original prefix also
+            // proves the failed verification's corruption evidence survived.
+            let mut retained_prefix = vec![0_u8; expected_prefix.len()];
+            std::fs::File::open(&primary)
+                .unwrap()
+                .read_exact(&mut retained_prefix)
+                .unwrap();
+            assert_eq!(retained_prefix, expected_prefix);
+        }
     }
 
     #[cfg(unix)]
@@ -2577,20 +2744,26 @@ mod tests {
     }
 
     #[test]
-    fn skipped_or_failed_automatic_backups_do_not_rotate() {
+    fn skipped_or_failed_automatic_backups_reclaim_without_changing_completion() {
         let now = Instant::now();
         for producer_result in [Ok(false), Err("export refused".to_string())] {
             let failed = producer_result.is_err();
             let mut schedule = AutomaticBackupSchedule::default();
             schedule.request_verified();
+            let rotated = std::cell::Cell::new(false);
             let followups = run_automatic_backup_with(
                 &mut schedule,
                 || now,
                 |_| {
-                    rotate_after_published_backup_with(producer_result, || {
-                        panic!("an unpublished backup must not authorize rotation")
+                    rotate_after_backup_attempt_with(producer_result, || {
+                        rotated.set(true);
+                        Ok(crate::backup_rotation::RotateReport::default())
                     })
                 },
+            );
+            assert!(
+                rotated.get(),
+                "cleanup must not depend on a new publication"
             );
             assert_eq!(
                 followups, failed,
@@ -2601,24 +2774,45 @@ mod tests {
     }
 
     #[test]
-    fn rotation_failure_preserves_published_backup_completion() {
+    fn rotation_failure_preserves_every_automatic_backup_outcome() {
         let now = Instant::now();
-        let mut schedule = AutomaticBackupSchedule::default();
-        schedule.request_verified();
-        let rotated = std::cell::Cell::new(false);
-        assert!(run_automatic_backup_with(
-            &mut schedule,
-            || now,
-            |_| {
-                rotate_after_published_backup_with(Ok(true), || {
-                    rotated.set(true);
-                    Err(std::io::Error::other("quarantine unavailable"))
-                })
-            }
-        ));
-        assert!(rotated.get());
-        assert_eq!(schedule.consecutive_failures(), 0);
-        assert_eq!(schedule.next_attempt(now), Some(BackupKind::Proactive));
+        for outcome in [
+            Ok(true),
+            Ok(false),
+            Err("original export refusal".to_string()),
+        ] {
+            let mut actual = AutomaticBackupSchedule::default();
+            let mut expected = AutomaticBackupSchedule::default();
+            actual.request_verified();
+            expected.request_verified();
+            let expected_followups =
+                run_automatic_backup_with(&mut expected, || now, |_| outcome.clone());
+            let rotated = std::cell::Cell::new(false);
+            let actual_followups = run_automatic_backup_with(
+                &mut actual,
+                || now,
+                |_| {
+                    let result = rotate_after_backup_attempt_with(outcome.clone(), || {
+                        rotated.set(true);
+                        Err(std::io::Error::other("retention unavailable"))
+                    });
+                    assert_eq!(result, outcome, "retain the exact original producer result");
+                    result
+                },
+            );
+            assert!(rotated.get());
+            assert_eq!(actual_followups, expected_followups);
+            assert_eq!(
+                actual.consecutive_failures(),
+                expected.consecutive_failures()
+            );
+            assert_eq!(actual.retry_remaining(now), expected.retry_remaining(now));
+            assert_eq!(actual.next_attempt(now), expected.next_attempt(now));
+            assert_eq!(
+                actual.next_attempt(now + schedule::BACKUP_RETRY_MAX),
+                expected.next_attempt(now + schedule::BACKUP_RETRY_MAX)
+            );
+        }
     }
 
     // GH#288: fingerprint + backoff for standing integrity defects.

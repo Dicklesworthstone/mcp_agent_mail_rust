@@ -1,6 +1,6 @@
 //! Admission for automatic backup staging (GH#326).
 //!
-//! Retry timing is process-local; retained staging directories are not. Inspect
+//! Retry timing is process-local; retained staging artifacts are not. Inspect
 //! the actual filesystem under a nonblocking, cross-process lease before each
 //! automatic export. Both proactive and verified backups use this boundary.
 //! Nothing here removes, relocates, opens with SQLite, or repairs old evidence.
@@ -18,13 +18,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const STAGING_PREFIX: &[u8] = b".mcp-agent-mail-proactive-backup-";
+// Older metadata verification used an unbudgeted NamedTempFile directly in
+// this parent. A crash could leave a partial or complete database image here.
+// Count those files as retained stages, without treating them as disposable.
+const LEGACY_INSPECTION_PREFIX: &[u8] = b".snapshot-inspect-";
+const LEGACY_INSPECTION_SUFFIX: &[u8] = b".sqlite3";
 const MAX_RETAINED_STAGES: usize = 3;
 const STAGING_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
 const MAX_INVENTORY_ENTRIES: usize = 16_384;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Inventory {
-    directories: usize,
+    /// Proactive stage directories plus legacy metadata inspection files.
+    stages: usize,
     /// Logical file lengths, not allocated blocks (sparse files count fully).
     bytes: u64,
 }
@@ -92,8 +98,9 @@ impl Admission {
         let inventory = inspect_staging(parent)?;
         check_budget(&inventory, projected_bytes, byte_limit).map_err(|error| {
             io::Error::new(error.kind(), format!(
-                "{}: {error}; inspect retained {prefix}* directories in this parent and reclaim evidence explicitly before retrying",
-                parent.display(), prefix = String::from_utf8_lossy(STAGING_PREFIX)
+                "{}: {error}; inspect retained {prefix}* directories and {legacy}* files in this parent and reclaim evidence explicitly before retrying",
+                parent.display(), prefix = String::from_utf8_lossy(STAGING_PREFIX),
+                legacy = String::from_utf8_lossy(LEGACY_INSPECTION_PREFIX)
             ))
         })?;
         validate_parent_lease(parent, &lease)?;
@@ -131,10 +138,10 @@ fn regular_file_bytes(path: &Path, missing_is_empty: bool) -> io::Result<u64> {
 }
 
 fn check_budget(inventory: &Inventory, projected_bytes: u64, byte_limit: u64) -> io::Result<()> {
-    if inventory.directories >= MAX_RETAINED_STAGES {
+    if inventory.stages >= MAX_RETAINED_STAGES {
         return Err(invalid(format!(
-            "{} retained staging directories reached the automatic limit of {MAX_RETAINED_STAGES}",
-            inventory.directories
+            "{} retained staging artifacts reached the automatic limit of {MAX_RETAINED_STAGES}",
+            inventory.stages
         )));
     }
     let projected_total = inventory
@@ -157,30 +164,45 @@ fn inspect_staging(parent: &Path) -> io::Result<Inventory> {
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
         visit_entry(&mut visited)?;
-        if !entry
-            .file_name()
-            .as_encoded_bytes()
-            .starts_with(STAGING_PREFIX)
-        {
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        let legacy_inspection = name.starts_with(LEGACY_INSPECTION_PREFIX);
+        if !name.starts_with(STAGING_PREFIX) && !legacy_inspection {
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.file_type().is_dir() {
+        if legacy_inspection {
+            if !metadata.file_type().is_file()
+                || !name.ends_with(LEGACY_INSPECTION_SUFFIX)
+                || name.len() <= LEGACY_INSPECTION_PREFIX.len() + LEGACY_INSPECTION_SUFFIX.len()
+            {
+                return Err(invalid(format!(
+                    "legacy snapshot inspection entry {} is not a recognized regular staging file; its footprint is unavailable",
+                    entry.path().display()
+                )));
+            }
+            inventory.bytes = inventory
+                .bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| invalid("staging inventory byte count overflow"))?;
+        } else if !metadata.file_type().is_dir() {
             return Err(invalid(format!(
                 "staging-shaped entry {} is not a real directory",
                 entry.path().display()
             )));
         }
-        inventory.directories = inventory
-            .directories
+        inventory.stages = inventory
+            .stages
             .checked_add(1)
-            .ok_or_else(|| invalid("staging directory count overflow"))?;
+            .ok_or_else(|| invalid("staging artifact count overflow"))?;
         // A saturated count already refuses admission; do not walk arbitrarily
         // many large trees merely to format the refusal's byte count.
-        if inventory.directories >= MAX_RETAINED_STAGES {
+        if inventory.stages >= MAX_RETAINED_STAGES {
             return Ok(inventory);
         }
-        pending.push(entry.path());
+        if !legacy_inspection {
+            pending.push(entry.path());
+        }
     }
     while let Some(directory) = pending.pop() {
         // Recheck at descent: do not intentionally traverse a symlink swapped
@@ -349,7 +371,7 @@ mod tests {
     #[test]
     fn budget_counts_the_next_attempt_and_rejects_overflow() {
         let inventory = Inventory {
-            directories: 2,
+            stages: 2,
             bytes: 60,
         };
         assert!(check_budget(&inventory, 40, 100).is_ok());
@@ -357,7 +379,7 @@ mod tests {
         assert!(
             check_budget(
                 &Inventory {
-                    directories: 3,
+                    stages: 3,
                     bytes: 0
                 },
                 0,
@@ -368,7 +390,7 @@ mod tests {
         assert!(
             check_budget(
                 &Inventory {
-                    directories: 0,
+                    stages: 0,
                     bytes: u64::MAX
                 },
                 1,
@@ -390,7 +412,7 @@ mod tests {
         assert_eq!(
             inspect_staging(&root).unwrap(),
             Inventory {
-                directories: 1,
+                stages: 1,
                 bytes: 13
             }
         );
@@ -416,16 +438,144 @@ mod tests {
             MAX_RETAINED_STAGES,
             "fresh process-local state cannot bypass retained inventory"
         );
-        assert_eq!(
-            inspect_staging(&root).unwrap().directories,
-            MAX_RETAINED_STAGES
-        );
+        assert_eq!(inspect_staging(&root).unwrap().stages, MAX_RETAINED_STAGES);
         for ordinal in 0..MAX_RETAINED_STAGES {
             let path = root.join(format!(
                 ".mcp-agent-mail-proactive-backup-{ordinal:06}/snapshot.sqlite3"
             ));
             assert_eq!(fs::read(path).unwrap(), b"preserved failed export");
         }
+    }
+
+    #[test]
+    fn legacy_inspection_images_share_the_stage_count_and_byte_budget() {
+        let root = fixture();
+        let primary = primary(&root);
+        let current = stage(&root, 0, b"current");
+        let legacy = root.join(".snapshot-inspect-legacy.sqlite3");
+        fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(
+            inspect_staging(&root).unwrap(),
+            Inventory {
+                stages: 2,
+                bytes: 20,
+            }
+        );
+        assert_eq!(with_admission(&primary, || Ok(17)).unwrap(), 17);
+
+        let interrupted = root.join(".snapshot-inspect-interrupted.sqlite3");
+        fs::write(&interrupted, b"partial inspection").unwrap();
+        let error = with_admission(&primary, || -> Result<(), String> {
+            panic!("mixed retained stages must refuse before the producer")
+        })
+        .unwrap_err();
+        assert!(error.contains("3 retained staging artifacts"));
+        assert!(error.contains(".snapshot-inspect-"));
+        assert_eq!(fs::read(legacy).unwrap(), b"legacy");
+        assert_eq!(fs::read(interrupted).unwrap(), b"partial inspection");
+        assert_eq!(
+            fs::read(current.join("snapshot.sqlite3")).unwrap(),
+            b"current"
+        );
+        assert_eq!(fs::read(primary).unwrap(), b"mailbox fixture");
+    }
+
+    #[test]
+    fn legacy_inspection_bytes_refuse_before_a_new_export() {
+        let root = fixture();
+        let primary = primary(&root);
+        let legacy = root.join(".snapshot-inspect-large.sqlite3");
+        fs::write(&legacy, b"partial database image").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&legacy)
+            .unwrap()
+            .set_len(STAGING_BYTES_FLOOR)
+            .unwrap();
+        let error = with_admission(&primary, || -> Result<(), String> {
+            panic!("legacy bytes must spend the automatic staging budget")
+        })
+        .unwrap_err();
+        assert!(error.contains("retained bytes"));
+        assert!(error.contains("exceed"));
+        assert_eq!(fs::metadata(legacy).unwrap().len(), STAGING_BYTES_FLOOR);
+        assert_eq!(fs::read_dir(root).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn repeated_interrupted_legacy_inspections_cannot_bypass_admission() {
+        let root = fixture();
+        let primary = primary(&root);
+        let calls = Cell::new(0);
+        for _ in 0..20 {
+            let _ = with_admission(&primary, || -> Result<(), String> {
+                let ordinal = calls.get();
+                fs::write(
+                    root.join(format!(".snapshot-inspect-{ordinal:06}.sqlite3")),
+                    b"unverified interrupted inspection",
+                )
+                .unwrap();
+                calls.set(ordinal + 1);
+                Err("metadata inspection was interrupted".into())
+            });
+        }
+        assert_eq!(calls.get(), MAX_RETAINED_STAGES);
+        for ordinal in 0..MAX_RETAINED_STAGES {
+            assert_eq!(
+                fs::read(root.join(format!(".snapshot-inspect-{ordinal:06}.sqlite3"))).unwrap(),
+                b"unverified interrupted inspection"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_inspection_entries_refuse_without_mutation() {
+        for name in [".snapshot-inspect-.sqlite3", ".snapshot-inspect-unknown"] {
+            let root = fixture();
+            let primary = primary(&root);
+            let evidence = root.join(name);
+            fs::write(&evidence, b"unclassified evidence").unwrap();
+            let error = with_admission(&primary, || -> Result<(), String> {
+                panic!("unclassified inspection evidence must refuse admission")
+            })
+            .unwrap_err();
+            assert!(error.contains("footprint is unavailable"));
+            assert_eq!(fs::read(evidence).unwrap(), b"unclassified evidence");
+        }
+        let root = fixture();
+        let primary = primary(&root);
+        let unexpected = root.join(".snapshot-inspect-directory.sqlite3");
+        fs::create_dir(&unexpected).unwrap();
+        fs::write(unexpected.join("evidence"), b"unknown directory").unwrap();
+        assert!(with_admission(&primary, || Ok(())).is_err());
+        assert_eq!(
+            fs::read(unexpected.join("evidence")).unwrap(),
+            b"unknown directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inspection_symlinks_are_preserved_and_never_followed() {
+        let root = fixture();
+        let outside = fixture();
+        let primary = primary(&root);
+        let evidence = outside.join("database.sqlite3");
+        fs::write(&evidence, b"external database").unwrap();
+        let alias = root.join(".snapshot-inspect-link.sqlite3");
+        std::os::unix::fs::symlink(&evidence, &alias).unwrap();
+        let error = with_admission(&primary, || -> Result<(), String> {
+            panic!("legacy aliases must refuse admission")
+        })
+        .unwrap_err();
+        assert!(error.contains("not a recognized regular staging file"));
+        assert!(
+            fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(evidence).unwrap(), b"external database");
     }
 
     #[test]
@@ -503,7 +653,7 @@ mod tests {
             fs::create_dir(kept.join("nested")).unwrap();
         }
         let inventory = inspect_staging(&root).unwrap();
-        assert_eq!(inventory.directories, MAX_RETAINED_STAGES);
+        assert_eq!(inventory.stages, MAX_RETAINED_STAGES);
         assert_eq!(
             inventory.bytes, 0,
             "the saturated count is sufficient to refuse"

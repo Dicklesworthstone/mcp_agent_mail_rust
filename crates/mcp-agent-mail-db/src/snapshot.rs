@@ -623,38 +623,99 @@ pub(crate) fn record_snapshot_metadata_admitted(
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut source =
-        mcp_agent_mail_core::disk::open_regular_file_no_follow(&bak).map_err(|error| {
-            DbError::Sqlite(format!(
-                "snapshot metadata: cannot open {}: {error}",
-                bak.display()
-            ))
-        })?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(".snapshot-inspect-")
-        .suffix(".sqlite3")
-        .tempfile_in(parent)
+    let source = mcp_agent_mail_core::disk::open_regular_file_no_follow(&bak).map_err(|error| {
+        DbError::Sqlite(format!(
+            "snapshot metadata: cannot open {}: {error}",
+            bak.display()
+        ))
+    })?;
+    with_snapshot_inspection_stage(parent, |staged_path| {
+        inspect_and_record_snapshot_metadata(
+            &primary,
+            &bak,
+            source,
+            staged_path,
+            created_us,
+            authority,
+        )
+    })
+}
+
+fn with_snapshot_inspection_stage<T>(
+    parent: &Path,
+    inspect: impl FnOnce(&Path) -> DbResult<T>,
+) -> DbResult<T> {
+    // Inspection writes another complete database image. Use the same parent-
+    // scoped staging namespace that automatic admission inventories, so a
+    // process killed during copying or verification cannot hide its footprint.
+    let staged_directory =
+        crate::pool::CanonicalSnapshotTempDir::new_in(".mcp-agent-mail-proactive-backup-", parent)
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "snapshot metadata: cannot create private inspection stage in {}: {error}",
+                    parent.display()
+                ))
+            })?;
+    let directory_path = staged_directory.path().to_path_buf();
+    let staged_path = directory_path.join("metadata-inspect.sqlite3");
+    let mut stage = SnapshotInspectionStage(Some(staged_directory));
+    match inspect(&staged_path) {
+        Ok(result) => {
+            // Only successful metadata publication permits ordinary TempDir
+            // cleanup. Errors and panic unwinds retain the inspection bytes.
+            drop(stage.0.take());
+            Ok(result)
+        }
+        Err(error) => Err(DbError::Sqlite(format!(
+            "{error}; snapshot metadata inspection stage {} was preserved for recovery",
+            directory_path.display()
+        ))),
+    }
+}
+
+struct SnapshotInspectionStage(Option<crate::pool::CanonicalSnapshotTempDir>);
+
+impl Drop for SnapshotInspectionStage {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.take() {
+            let _ = directory.preserve();
+        }
+    }
+}
+
+fn inspect_and_record_snapshot_metadata(
+    primary: &Path,
+    bak: &Path,
+    mut source: std::fs::File,
+    staged_path: &Path,
+    created_us: i64,
+    authority: &SnapshotPublicationGuard,
+) -> DbResult<VerifiedSnapshotMetadata> {
+    // A plain File keeps partial or failed verification bytes available when
+    // the caller preserves the directory after an inspection or publication
+    // error. NamedTempFile would erase the evidence before that handoff.
+    let mut staged = mcp_agent_mail_core::disk::create_new_private_file_no_follow(staged_path)
         .map_err(|error| {
             DbError::Sqlite(format!(
-                "snapshot metadata: cannot create private inspection stage in {}: {error}",
-                parent.display()
+                "snapshot metadata: cannot create inspection file {}: {error}",
+                staged_path.display()
             ))
         })?;
-    std::io::copy(&mut source, staged.as_file_mut()).map_err(|error| {
+    std::io::copy(&mut source, &mut staged).map_err(|error| {
         DbError::Sqlite(format!(
             "snapshot metadata: cannot stage {} for immutable inspection: {error}",
             bak.display()
         ))
     })?;
-    staged.as_file().sync_all().map_err(|error| {
+    staged.sync_all().map_err(|error| {
         DbError::Sqlite(format!(
             "snapshot metadata: cannot sync private inspection stage for {}: {error}",
             bak.display()
         ))
     })?;
     drop(source);
+    drop(staged);
 
-    let staged_path = staged.path();
     let identity_before = snapshot_file_identity(staged_path)?;
     if !crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(staged_path).map_err(
         |error| {
@@ -703,8 +764,8 @@ pub(crate) fn record_snapshot_metadata_admitted(
             bak.display()
         )));
     }
-    if !crate::pool::sqlite_recovery_candidate_is_standalone(&bak)
-        || snapshot_file_identity(&bak)? != identity_after
+    if !crate::pool::sqlite_recovery_candidate_is_standalone(bak)
+        || snapshot_file_identity(bak)? != identity_after
     {
         return Err(DbError::Sqlite(format!(
             "snapshot metadata: {} changed while its immutable generation was being verified",
@@ -725,8 +786,8 @@ pub(crate) fn record_snapshot_metadata_admitted(
         snapshot_sha256,
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    authority.revalidate(&primary)?;
-    write_snapshot_metadata(&primary, &meta)?;
+    authority.revalidate(primary)?;
+    write_snapshot_metadata(primary, &meta)?;
     Ok(meta)
 }
 
@@ -1037,6 +1098,21 @@ mod tests {
             .expect("checkpoint");
     }
 
+    fn inspection_stages(parent: &Path) -> Vec<PathBuf> {
+        let mut stages: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .as_encoded_bytes()
+                    .starts_with(b".mcp-agent-mail-proactive-backup-")
+            })
+            .collect();
+        stages.sort();
+        stages
+    }
+
     #[test]
     fn snapshot_paths_are_siblings_of_primary() {
         let primary = Path::new("/tmp/mailbox/storage.sqlite3");
@@ -1083,6 +1159,174 @@ mod tests {
             latest_verified_snapshot(&primary).as_ref(),
             Some(&meta),
             "a recorded + present snapshot is the latest verified one"
+        );
+    }
+
+    #[test]
+    fn metadata_inspection_success_cleans_only_its_own_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let primary_before = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let prior_stage = dir.path().join(".mcp-agent-mail-proactive-backup-retained");
+        std::fs::create_dir(&prior_stage).unwrap();
+        let partial = prior_stage.join("metadata-inspect.sqlite3");
+        std::fs::write(&partial, b"interrupted inspection evidence").unwrap();
+        let legacy = dir.path().join(".snapshot-inspect-retained.sqlite3");
+        std::fs::write(&legacy, b"legacy inspection evidence").unwrap();
+
+        let metadata = record_snapshot_metadata(&primary, 42).unwrap();
+
+        assert_eq!(read_snapshot_metadata(&primary), Some(metadata));
+        assert_eq!(inspection_stages(dir.path()), vec![prior_stage]);
+        assert_eq!(
+            std::fs::read(partial).unwrap(),
+            b"interrupted inspection evidence"
+        );
+        assert_eq!(
+            std::fs::read(legacy).unwrap(),
+            b"legacy inspection evidence"
+        );
+        assert_eq!(std::fs::read(primary).unwrap(), primary_before);
+        assert_eq!(std::fs::read(backup).unwrap(), primary_before);
+    }
+
+    #[test]
+    fn metadata_inspection_failure_preserves_copy_and_last_verified_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let primary_before = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let metadata = record_snapshot_metadata(&primary, 42).unwrap();
+        let metadata_before = std::fs::read(snapshot_meta_path(&primary)).unwrap();
+        let last_valid = primary.with_file_name("storage.sqlite3.bak.20261018_010000");
+        std::fs::rename(&backup, &last_valid).unwrap();
+        std::fs::write(&backup, b"incomplete backup generation").unwrap();
+
+        let error = record_snapshot_metadata(&primary, 43).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a fully valid Agent Mail database")
+        );
+        let stages = inspection_stages(dir.path());
+        assert_eq!(stages.len(), 1);
+        let preserved_path = stages[0].canonicalize().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains(&*preserved_path.to_string_lossy())
+        );
+        assert_eq!(
+            std::fs::read(stages[0].join("metadata-inspect.sqlite3")).unwrap(),
+            b"incomplete backup generation"
+        );
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"incomplete backup generation"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), primary_before);
+        assert_eq!(std::fs::read(&last_valid).unwrap(), primary_before);
+        assert_eq!(
+            std::fs::read(snapshot_meta_path(&primary)).unwrap(),
+            metadata_before
+        );
+        assert_eq!(latest_verified_snapshot(&primary), Some(metadata));
+        assert_eq!(verified_snapshot_source_path(&primary), Some(last_valid));
+    }
+
+    #[test]
+    fn metadata_inspection_publication_failure_preserves_verified_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        let primary_before = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let metadata = snapshot_meta_path(&primary);
+        std::fs::write(&metadata, b"unresolved metadata evidence").unwrap();
+
+        let error = record_snapshot_metadata(&primary, 42).unwrap_err();
+
+        assert!(error.to_string().contains("unrecognized regular file"));
+        let stages = inspection_stages(dir.path());
+        assert_eq!(stages.len(), 1);
+        let inspected = stages[0].join("metadata-inspect.sqlite3");
+        assert_eq!(std::fs::read(&inspected).unwrap(), primary_before);
+        assert!(
+            crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(&inspected).unwrap()
+        );
+        assert_eq!(std::fs::read(primary).unwrap(), primary_before);
+        assert_eq!(std::fs::read(backup).unwrap(), primary_before);
+        assert_eq!(
+            std::fs::read(metadata).unwrap(),
+            b"unresolved metadata evidence"
+        );
+    }
+
+    #[test]
+    fn snapshot_inspection_stage_survives_process_exit() {
+        use std::io::Write as _;
+
+        const CHILD_PARENT: &str = "MCP_AGENT_MAIL_SNAPSHOT_INSPECTION_CRASH_PARENT";
+        const PARTIAL: &[u8] = b"inspection copy interrupted before verification";
+        if let Some(parent) = std::env::var_os(CHILD_PARENT) {
+            let _ = with_snapshot_inspection_stage::<()>(Path::new(&parent), |path| {
+                let mut file =
+                    mcp_agent_mail_core::disk::create_new_private_file_no_follow(path).unwrap();
+                file.write_all(PARTIAL).unwrap();
+                file.sync_all().unwrap();
+                // A real abrupt exit bypasses both file and directory guards.
+                std::process::exit(91);
+            });
+            panic!("child should exit from the inspection stage");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let full_name = concat!(
+            module_path!(),
+            "::snapshot_inspection_stage_survives_process_exit"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", full_name.split_once("::").unwrap().1])
+            .env(CHILD_PARENT, dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(91), "{output:?}");
+        let stages = inspection_stages(dir.path());
+        assert_eq!(stages.len(), 1);
+        assert_eq!(
+            std::fs::read(stages[0].join("metadata-inspect.sqlite3")).unwrap(),
+            PARTIAL
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn snapshot_inspection_stage_survives_panic_unwind() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let _ = with_snapshot_inspection_stage::<()>(dir.path(), |path| {
+                let mut file =
+                    mcp_agent_mail_core::disk::create_new_private_file_no_follow(path).unwrap();
+                file.write_all(b"inspection evidence before panic").unwrap();
+                file.sync_all().unwrap();
+                panic!("inspection failed before metadata publication");
+            });
+        });
+        assert!(result.is_err());
+        let stages = inspection_stages(dir.path());
+        assert_eq!(stages.len(), 1);
+        assert_eq!(
+            std::fs::read(stages[0].join("metadata-inspect.sqlite3")).unwrap(),
+            b"inspection evidence before panic"
         );
     }
 

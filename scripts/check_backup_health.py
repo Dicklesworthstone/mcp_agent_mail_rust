@@ -10,7 +10,8 @@ exporters, not older or manual writers that ignore that lease. Physical paths
 are required on Linux/macOS. Output is one JSON object, including on failure.
 
 Native admission policy reference: integrity_guard_backup_budget.rs (GH#326).
-The stage count includes ALL mailboxes sharing the database parent. Logical
+The stage count includes ALL mailboxes sharing the database parent, including
+legacy .snapshot-inspect-*.sqlite3 files from interrupted inspections. Logical
 lengths, not allocated disk blocks, are used for the staging estimate. Snapshot
 metadata is accepted only after a bounded SHA-256 read of its exact candidate;
 its recorded integrity verdict is not rerun or promoted into a new verdict.
@@ -32,6 +33,8 @@ from typing import Any, Iterator
 
 SCHEMA = "am.backup-health.v1"
 STAGE_PREFIX = ".mcp-agent-mail-proactive-backup-"
+LEGACY_INSPECTION_PREFIX = ".snapshot-inspect-"
+LEGACY_INSPECTION_SUFFIX = ".sqlite3"
 MAX_ENTRIES = 16_384
 MAX_DEPTH = 64
 MAX_METADATA_BYTES = 64 * 1024
@@ -267,6 +270,7 @@ def inspect(database: str | Path, *, keep_backups: int = 3, max_age_seconds: int
         if stage_budget > MAX_U64 or projected > MAX_U64:
             raise Unavailable("native backup estimate overflows u64")
         candidates: dict[str, os.stat_result] = {}
+        legacy_inspections: dict[str, os.stat_result] = {}
         stages: list[dict[str, Any]] = []
         with os.scandir(parent) as entries:
             for entry in entries:
@@ -274,6 +278,13 @@ def inspect(database: str | Path, *, keep_backups: int = 3, max_age_seconds: int
                 name = entry.name
                 if name.startswith(STAGE_PREFIX):
                     stages.append({"name": name, "bytes": tree_bytes(parent, name, budget)})
+                elif name.startswith(LEGACY_INSPECTION_PREFIX):
+                    if (not name.endswith(LEGACY_INSPECTION_SUFFIX)
+                            or len(name) <= len(LEGACY_INSPECTION_PREFIX) + len(LEGACY_INSPECTION_SUFFIX)):
+                        raise Unavailable(f"legacy snapshot inspection entry {name!r} is unrecognized; preserve it")
+                    info = regular(metadata(parent, name), name)
+                    legacy_inspections[name] = info
+                    stages.append({"name": name, "bytes": info.st_size})
                 elif name == database.name + ".bak" or generation(database.name, name) is not None:
                     candidates[name] = regular(metadata(parent, name), name)
         retained_stage_bytes = sum(stage["bytes"] for stage in stages)
@@ -325,6 +336,10 @@ def inspect(database: str | Path, *, keep_backups: int = 3, max_age_seconds: int
             named = metadata(parent, name)
             if named is None or stamp(named) != stamp(info):
                 raise Unavailable("backup inventory changed before completion")
+        for name, info in legacy_inspections.items():
+            named = metadata(parent, name)
+            if named is None or stamp(named) != stamp(info):
+                raise Unavailable("legacy snapshot inspection evidence changed before completion")
         with directory(database.parent) as named_parent:
             if stamp(os.fstat(named_parent)) != stamp(parent_before):
                 raise Unavailable("database-parent namespace changed during inspection")

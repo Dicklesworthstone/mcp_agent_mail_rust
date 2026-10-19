@@ -176,6 +176,45 @@ class BackupHealthTests(unittest.TestCase):
         self.assertEqual(report["staging"]["bytes"], 7)
         self.assertEqual(report["staging"]["scope"], "database-parent")
 
+    def test_legacy_inspections_share_staging_count_and_preserve_all_evidence(self):
+        stage = self.stage(0, b"new stage")
+        inspections = [self.parent / f".snapshot-inspect-{index}.sqlite3" for index in range(2)]
+        for path in inspections:
+            path.write_bytes(b"interrupted inspection")
+        paths = [*inspections, stage / "live-export.sqlite3", self.database, self.backup, self.meta]
+        before = {path: (path.read_bytes(), health.stamp(path.stat())) for path in paths}
+        report = self.inspect()
+        self.assertIn("staging_count_blocked", self.codes(report))
+        self.assertEqual(report["staging"]["count"], 3)
+        self.assertEqual(report["staging"]["bytes"], len(b"new stage") + 2 * len(b"interrupted inspection"))
+        self.assertEqual(before, {path: (path.read_bytes(), health.stamp(path.stat())) for path in paths})
+
+    def test_legacy_inspection_bytes_cannot_report_a_ready_staging_budget(self):
+        path = self.parent / ".snapshot-inspect-large.sqlite3"
+        with path.open("wb") as image:
+            image.truncate(health.STAGE_FLOOR)
+        before = health.stamp(path.stat())
+        report = self.inspect()
+        self.assertIn("staging_bytes_blocked", self.codes(report))
+        self.assertEqual(report["staging"]["count"], 1)
+        self.assertEqual(report["staging"]["bytes"], health.STAGE_FLOOR)
+        self.assertEqual(health.stamp(path.stat()), before)
+
+    def test_unrecognized_and_symlinked_legacy_inspection_evidence_is_unavailable(self):
+        for name in (".snapshot-inspect-.sqlite3", ".snapshot-inspect-incomplete"):
+            with self.subTest(name=name):
+                path = self.parent / name
+                path.write_bytes(b"unclassified evidence")
+                with self.assertRaisesRegex(health.Unavailable, "unrecognized"):
+                    self.inspect()
+                self.assertEqual(path.read_bytes(), b"unclassified evidence")
+                path.rename(self.root / name)
+        alias = self.parent / ".snapshot-inspect-linked.sqlite3"
+        alias.symlink_to(self.backup)
+        with self.assertRaisesRegex(health.Unavailable, "regular, singly linked"):
+            self.inspect()
+        self.assertTrue(alias.is_symlink())
+
     def test_sparse_staging_exhausts_logical_byte_budget(self):
         stage = self.stage(0)
         with (stage / "snapshot.sqlite3").open("wb") as image:
