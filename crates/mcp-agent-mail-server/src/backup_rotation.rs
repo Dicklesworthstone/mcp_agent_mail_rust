@@ -288,6 +288,18 @@ fn is_periodic_backup(primary: &Path, name: &std::ffi::OsStr) -> bool {
         })
 }
 
+/// Whether a file of one backup kind occupies that kind's resident window and
+/// can be evicted from it. Under periodic reclamation the manual-backup kind
+/// counts only its strict periodic generations. Operator exports and WAL/SHM
+/// backup copies stay where they are: the deletion guard refuses them on every
+/// pass, and staging them would charge their bytes to the publication budget.
+fn occupies_rotation_window(primary: &Path, path: &Path, periodic_reclaim: bool) -> bool {
+    !periodic_reclaim
+        || path
+            .file_name()
+            .is_some_and(|name| is_periodic_backup(primary, name))
+}
+
 fn is_native_rotation_directory(name: &std::ffi::OsStr) -> bool {
     let Some(suffix) = name
         .to_str()
@@ -1134,6 +1146,83 @@ where
     if by_kind.is_empty() && history.eligible.is_empty() {
         return Ok(report);
     }
+
+    #[cfg(unix)]
+    let publication_budget = if periodic_reclamation_enabled() {
+        let footprint = by_kind
+            .get(&BackupKind::ManualBackup)
+            .into_iter()
+            .flatten()
+            .filter(|(path, _, _)| {
+                path.file_name()
+                    .is_some_and(|name| is_periodic_backup(snapshot_primary, name))
+            })
+            .try_fold(
+                (history.periodic_count, history.bytes),
+                |(count, bytes), (_, _, metadata)| {
+                    bytes
+                        .checked_add(metadata.len())
+                        .map(|bytes| (count.saturating_add(1), bytes))
+                        .ok_or_else(|| std::io::Error::other("retained backup size overflow"))
+                },
+            )
+            .and_then(|(count, bytes)| {
+                PeriodicPublicationBudget::new(snapshot_primary, keep, count, bytes)
+            });
+        match footprint {
+            Ok(budget) => Some(budget),
+            Err(error) => {
+                report.admission_refused = true;
+                report
+                    .failures
+                    .push(RotationFailure::from_error(snapshot_primary, &error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // The guard runs retention after every automatic backup attempt, so on
+    // every quick integrity cycle. Selecting the verified pin below re-hashes
+    // the backup and runs a full integrity check on it, so a pass that cannot
+    // evict anything stops here. Candidates exist only beyond a kind's
+    // resident window, in native rotation staging, or inside the periodic
+    // window while the publication footprint is exhausted. The exact slot and
+    // the pin only remove candidates, so this bound never skips real work.
+    #[cfg(unix)]
+    let window_may_shorten = publication_budget
+        .as_ref()
+        .is_some_and(PeriodicPublicationBudget::exhausted);
+    #[cfg(not(unix))]
+    let window_may_shorten = false;
+    if !window_may_shorten
+        && history.eligible.is_empty()
+        && by_kind.iter().all(|(kind, files)| {
+            let periodic_reclaim =
+                *kind == BackupKind::ManualBackup && periodic_reclamation_enabled();
+            files
+                .iter()
+                .filter(|(path, _, _)| {
+                    occupies_rotation_window(snapshot_primary, path, periodic_reclaim)
+                })
+                .count()
+                <= keep
+        })
+    {
+        for (kind, files) in by_kind {
+            let summary = RotateKindSummary {
+                kept: files.len(),
+                bytes_kept: files
+                    .iter()
+                    .fold(0_u64, |bytes, file| bytes.saturating_add(file.2.len())),
+                ..Default::default()
+            };
+            report.add_kind(kind.label(), &summary);
+        }
+        return Ok(report);
+    }
+
     #[cfg(unix)]
     let (_retained_parent, snapshot_guard) = match parent_admission.and_then(|parent| {
         mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(snapshot_primary)
@@ -1178,42 +1267,6 @@ where
     let pinned_verified_snapshot = snapshot_authority_occupied
         .then(|| mcp_agent_mail_db::snapshot::verified_snapshot_source_path(snapshot_primary))
         .flatten();
-
-    #[cfg(unix)]
-    let publication_budget = if periodic_reclamation_enabled() {
-        let footprint = by_kind
-            .get(&BackupKind::ManualBackup)
-            .into_iter()
-            .flatten()
-            .filter(|(path, _, _)| {
-                path.file_name()
-                    .is_some_and(|name| is_periodic_backup(snapshot_primary, name))
-            })
-            .try_fold(
-                (history.periodic_count, history.bytes),
-                |(count, bytes), (_, _, metadata)| {
-                    bytes
-                        .checked_add(metadata.len())
-                        .map(|bytes| (count.saturating_add(1), bytes))
-                        .ok_or_else(|| std::io::Error::other("retained backup size overflow"))
-                },
-            )
-            .and_then(|(count, bytes)| {
-                PeriodicPublicationBudget::new(snapshot_primary, keep, count, bytes)
-            });
-        match footprint {
-            Ok(budget) => Some(budget),
-            Err(error) => {
-                report.admission_refused = true;
-                report
-                    .failures
-                    .push(RotationFailure::from_error(snapshot_primary, &error));
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     #[cfg(unix)]
     let mut reclaim_budget = ReclaimBudget {
@@ -1294,8 +1347,12 @@ where
                 .then(collision_order)
                 .then_with(|| left.0.cmp(&right.0))
         });
+        let periodic_reclaim = kind == BackupKind::ManualBackup && periodic_reclamation_enabled();
         let to_evict = files
             .iter()
+            .filter(|(path, _, _)| {
+                occupies_rotation_window(snapshot_primary, path, periodic_reclaim)
+            })
             .enumerate()
             .filter_map(|(index, file @ (path, _, _))| {
                 if path == &mcp_agent_mail_db::snapshot::snapshot_bak_path(snapshot_primary) {
@@ -1310,13 +1367,7 @@ where
                     return None;
                 }
                 let within_window = index < keep;
-                if within_window
-                    && !(kind == BackupKind::ManualBackup
-                        && periodic_reclamation_enabled()
-                        && path
-                            .file_name()
-                            .is_some_and(|name| is_periodic_backup(snapshot_primary, name)))
-                {
+                if within_window && !periodic_reclaim {
                     return None;
                 }
                 Some((file, within_window))
@@ -2145,6 +2196,102 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(old).unwrap(), b"old recovery evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_with_nothing_to_evict_leaves_snapshot_authority_alone() {
+        // Retention follows every automatic backup attempt, so it runs on each
+        // quick guard cycle. When the inventory fits the resident window, a pass
+        // must not take exclusive snapshot authority: selecting the pin
+        // re-verifies the whole backup, and is refused while another holder
+        // (a restore, a publisher, or another retention pass) has it.
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let previous = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        fs::copy(&primary, &previous).unwrap();
+        let rotate_while_held = |keep: usize| {
+            let holder =
+                mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+            let report = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                            &[],
+                            || rotate_storage_backups(tmp.path(), &primary, keep).unwrap(),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            });
+            drop(holder);
+            report
+        };
+        let idle = rotate_while_held(3);
+        assert!(!idle.admission_refused, "{:?}", idle.failures);
+        assert!(idle.failures.is_empty(), "{:?}", idle.failures);
+        assert_eq!(idle.kept, 2);
+        assert_eq!(idle.evicted(), 0);
+        // A real candidate still needs authority, so it waits for the holder.
+        let contended = rotate_while_held(1);
+        assert!(contended.admission_refused);
+        assert_eq!(contended.evicted(), 0);
+        assert!(previous.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_reclamation_leaves_operator_exports_and_wal_copies_in_place() {
+        // Only strict periodic generations are reclaimable. Under the default
+        // policy and the delete opt-in, manual exports and WAL backup copies
+        // beyond the window are neither refused deletions on every pass nor
+        // moved into staging, where they would count against the budget.
+        let policies: [&[(&str, &str)]; 2] = [&[], &[("AM_BACKUP_ROTATION_DELETE", "true")]];
+        for policy in policies {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let mut operator_files = Vec::new();
+            for day in 1..=4 {
+                for name in [
+                    format!("storage.sqlite3.manual-backup-2000010{day}_000000"),
+                    format!("storage.sqlite3-wal.bak.2000010{day}_000000"),
+                ] {
+                    let path = tmp.path().join(name);
+                    fs::write(&path, b"operator evidence").unwrap();
+                    operator_files.push(path);
+                }
+            }
+            let rotate = |keep: usize| {
+                mcp_agent_mail_core::config::with_process_env_overrides_for_test(policy, || {
+                    rotate_storage_backups(tmp.path(), &primary, keep).unwrap()
+                })
+            };
+            // The exact slot is the only periodic generation, so these files
+            // do not fill the one-slot window and the pass has no candidates.
+            let idle = rotate(1);
+            assert!(idle.failures.is_empty(), "{policy:?}: {:?}", idle.failures);
+            assert!(!idle.admission_refused, "{policy:?}");
+            assert_eq!(idle.evicted(), 0, "{policy:?}");
+            // A superseded periodic generation makes the pass run in full; the
+            // operator files are still neither attempted nor moved.
+            fs::copy(
+                &primary,
+                tmp.path().join("storage.sqlite3.bak.20000101_000000"),
+            )
+            .unwrap();
+            let full = rotate(1);
+            assert!(
+                full.failures
+                    .iter()
+                    .all(|failure| !operator_files.contains(&failure.source)),
+                "{policy:?}: {:?}",
+                full.failures
+            );
+            for path in &operator_files {
+                assert_eq!(fs::read(path).unwrap(), b"operator evidence", "{policy:?}");
+            }
+            assert!(!tmp.path().join("doctor").exists(), "{policy:?}");
+        }
     }
     use std::io::Write;
     use std::thread::sleep;
