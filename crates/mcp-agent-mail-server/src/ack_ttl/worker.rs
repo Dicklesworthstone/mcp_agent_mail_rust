@@ -252,7 +252,10 @@ mod tests {
             );
             let conn = block_on(control.acquire(&cx)).into_result().unwrap();
             let generation = conn
-                .query_sync("SELECT generation_id FROM db_identity WHERE singleton = 0", &[])
+                .query_sync(
+                    "SELECT generation_id FROM db_identity WHERE singleton = 0",
+                    &[],
+                )
                 .unwrap()[0]
                 .get_named::<String>("generation_id")
                 .unwrap();
@@ -262,10 +265,15 @@ mod tests {
                 .get_named::<i64>("id")
                 .unwrap();
             let filename = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
-                Some(&generation), id,
+                Some(&generation),
+                id,
             );
-            let path = config.storage_root.join("projects/ack-worker/file_reservations").join(filename);
-            let artifact: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let path = config
+                .storage_root
+                .join("projects/ack-worker/file_reservations")
+                .join(filename);
+            let artifact: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             assert_eq!(artifact["db_generation"], generation);
             assert_eq!(artifact["id"], id);
         });
@@ -577,12 +585,21 @@ mod tests {
             previous = restart_delay(previous, Duration::ZERO);
             assert_eq!(previous, Duration::from_secs(seconds));
         }
-        assert_eq!(restart_delay(Duration::MAX, Duration::ZERO), MAX_RESTART_DELAY);
         assert_eq!(
-            restart_delay(MAX_RESTART_DELAY, MAX_RESTART_DELAY - Duration::from_nanos(1)),
+            restart_delay(Duration::MAX, Duration::ZERO),
             MAX_RESTART_DELAY
         );
-        assert_eq!(restart_delay(MAX_RESTART_DELAY, MAX_RESTART_DELAY), MIN_RESTART_DELAY);
+        assert_eq!(
+            restart_delay(
+                MAX_RESTART_DELAY,
+                MAX_RESTART_DELAY.saturating_sub(Duration::from_nanos(1))
+            ),
+            MAX_RESTART_DELAY
+        );
+        assert_eq!(
+            restart_delay(MAX_RESTART_DELAY, MAX_RESTART_DELAY),
+            MIN_RESTART_DELAY
+        );
     }
 
     #[test]
@@ -809,11 +826,24 @@ mod tests {
             assert_eq!(attempts.get(), 2);
             let conn = block_on(control.acquire(&cx)).into_result().unwrap();
             let receipts = conn
-                .query_sync("SELECT message_id, ack_ts FROM message_recipients ORDER BY message_id", &[])
+                .query_sync(
+                    "SELECT message_id, ack_ts FROM message_recipients ORDER BY message_id",
+                    &[],
+                )
                 .unwrap();
             assert_eq!(receipts.len(), 2);
-            assert!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap().is_some());
-            assert!(receipts[1].get_named::<Option<i64>>("ack_ts").unwrap().is_none());
+            assert!(
+                receipts[0]
+                    .get_named::<Option<i64>>("ack_ts")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                receipts[1]
+                    .get_named::<Option<i64>>("ack_ts")
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -855,8 +885,7 @@ mod tests {
             let mut pool = None;
             let mut state = AckScanState::default();
             assert_eq!(
-                run_pass(&config, &selected, &mut pool, &mut state, &stop, || false)
-                    .unwrap(),
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || false).unwrap(),
                 (3, 1)
             );
             let engine = pool.as_ref().unwrap().engine_identity_key();
@@ -868,14 +897,9 @@ mod tests {
             let promotion =
                 mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle()
                     .expect("isolated process has no active writer");
-            let result = run_pass(
-                &config,
-                &selected,
-                &mut pool,
-                &mut state,
-                &stop,
-                || panic!("admission refusal must not process a row"),
-            );
+            let result = run_pass(&config, &selected, &mut pool, &mut state, &stop, || {
+                panic!("admission refusal must not process a row")
+            });
             drop(promotion);
             let error = result.expect_err("promotion must refuse the scan");
             assert_eq!(error, "ACK scan deferred: recovery write admission is busy");
@@ -890,8 +914,7 @@ mod tests {
                 Duration::from_secs(60)
             );
             assert_eq!(
-                run_pass(&config, &selected, &mut pool, &mut state, &stop, || true)
-                    .unwrap(),
+                run_pass(&config, &selected, &mut pool, &mut state, &stop, || true).unwrap(),
                 (2, 2)
             );
             assert_eq!(pool.as_ref().unwrap().engine_identity_key(), engine);

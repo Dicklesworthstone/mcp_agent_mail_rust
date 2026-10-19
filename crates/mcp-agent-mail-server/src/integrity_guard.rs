@@ -828,10 +828,7 @@ fn rotate_after_backup_attempt_with(
     result
 }
 
-pub(crate) fn report_backup_rotation(
-    report: &crate::backup_rotation::RotateReport,
-    phase: &'static str,
-) {
+pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, phase: &'static str) {
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete

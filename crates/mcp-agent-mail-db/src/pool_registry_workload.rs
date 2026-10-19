@@ -1,19 +1,19 @@
 //! GH#353: exercise the real pool, engine, writer admission and retirement.
 
 use super::{DbPoolConfig, WRITE_POOL_RESIDENT_CAPACITY, WRITE_POOL_RESIDENTS};
-use super::{create_pool, get_cached_pool, get_or_create_pool};
 use super::{
     RUNTIME_POOL_CONSTRUCTIONS, RUNTIME_POOL_INITIALIZERS, RuntimePoolInitialization,
     create_runtime_pool, get_or_reuse_compatible_memory_pool, resolve_mailbox_sqlite_path,
 };
-use crate::error::{DbError, DbResult};
+use super::{create_pool, get_cached_pool, get_or_create_pool};
 use crate::DbPool;
+use crate::error::{DbError, DbResult};
 use crate::write_barrier::{self, DrainOutcome};
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::sync::{Arc, Barrier};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 // Both admission and residency are process-global. A child isolates this test
@@ -309,9 +309,8 @@ fn cold_factories_refuse_aliases_and_other_shapes_before_opening_an_engine() {
     drop(activity);
 
     let mut independent = config.clone();
-    independent.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
-        &temp.path().join("independent.sqlite3"),
-    );
+    independent.database_url =
+        mcp_agent_mail_core::disk::sqlite_url_from_path(&temp.path().join("independent.sqlite3"));
     drop(create_pool(&independent).expect("another mailbox must remain available"));
     assert!(!temp.path().join("factory.sqlite3").exists());
     drop(owner);
@@ -408,6 +407,9 @@ fn mixed_cold_factories_and_steady_writes_keep_one_engine_until_recovery() {
     let before = RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed);
     let start = Arc::new(Barrier::new(8));
     let pools = std::thread::scope(|scope| {
+        // Collecting spawns all eight workers before the first join; joining
+        // lazily would leave the first worker waiting on the barrier forever.
+        #[allow(clippy::needless_collect)]
         let tasks = (0..8)
             .map(|worker| {
                 let config = config.clone();
@@ -434,10 +436,17 @@ fn mixed_cold_factories_and_steady_writes_keep_one_engine_until_recovery() {
             .collect::<Vec<_>>()
     });
     let engine = pools[0].engine_identity_key();
-    assert!(pools.iter().all(|pool| pool.engine_identity_key() == engine));
+    assert!(
+        pools
+            .iter()
+            .all(|pool| pool.engine_identity_key() == engine)
+    );
     // Equal returned identities alone would miss redundant, losing engine
     // constructions. Count actual calls into the original factories too.
-    assert_eq!(RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed) - before, 1);
+    assert_eq!(
+        RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed) - before,
+        1
+    );
     {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let cx = Cx::for_testing();
@@ -504,7 +513,10 @@ fn mixed_cold_factories_and_steady_writes_keep_one_engine_until_recovery() {
             task.join().unwrap();
         }
     });
-    assert_eq!(RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed) - before, 1);
+    assert_eq!(
+        RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed) - before,
+        1
+    );
     let pool = get_cached_pool(&config).unwrap();
     assert_factory_payloads(&pool);
     let (failed, drain) =
@@ -526,7 +538,10 @@ fn mixed_cold_factories_and_steady_writes_keep_one_engine_until_recovery() {
     let replacement = create_pool(&config).unwrap();
     assert_ne!(replacement.engine_identity_key(), engine);
     assert_factory_payloads(&replacement);
-    assert_eq!(RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed) - before, 2);
+    assert_eq!(
+        RUNTIME_POOL_CONSTRUCTIONS.load(Ordering::Relaxed) - before,
+        2
+    );
     assert!(write_barrier::try_begin_write_activity().is_none());
     drop(promotion);
     assert!(
@@ -557,7 +572,10 @@ fn memory_compatibility_selection_bypasses_file_initialization_admission() {
     assert_eq!(pool.engine_identity_key(), reused.engine_identity_key());
     drop(pool);
     drop(reused);
-    assert!(get_cached_pool(&config).is_none(), "memory session was pinned");
+    assert!(
+        get_cached_pool(&config).is_none(),
+        "memory session was pinned"
+    );
     drop(owner);
     assert!(registry.lock().unwrap().is_empty());
 }

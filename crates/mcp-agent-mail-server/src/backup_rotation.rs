@@ -1729,7 +1729,7 @@ mod tests {
             } else {
                 assert!(!oldest.exists());
                 assert_eq!(fs::read(&newer).unwrap(), live);
-                assert!(report.failures.is_empty());
+                assert_eq!(report.failures.len(), 0);
             }
             admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
             let next = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
@@ -1918,7 +1918,7 @@ mod tests {
         assert!(report.inventory_incomplete);
         assert!(report.admission_refused);
         assert_eq!(report.bytes_reclaimed, 0);
-        assert!(!report.failures.is_empty());
+        assert_ne!(report.failures.len(), 0);
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
@@ -2085,10 +2085,11 @@ mod tests {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "0")],
             || {
-                let mut published = 0;
+                // Each completed iteration publishes exactly one generation, so
+                // `cycle` is also the number of publications admitted so far.
                 for cycle in 0..720 {
                     if admit_periodic_publication(tmp.path(), &primary, 3).is_err() {
-                        assert_eq!(published, 5);
+                        assert_eq!(cycle, 5);
                         return;
                     }
                     fs::write(
@@ -2099,8 +2100,7 @@ mod tests {
                     .unwrap();
                     let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
                     assert_eq!(report.deleted, 0);
-                    assert!(report.failures.is_empty());
-                    published += 1;
+                    assert_eq!(report.failures.len(), 0);
                 }
                 panic!("move-only rotation must not permit endless publication");
             },
