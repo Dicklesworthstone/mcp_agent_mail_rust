@@ -134,6 +134,22 @@ mod issue353_bootstrap_tests {
             1
         );
     }
+
+    #[test]
+    fn gh353_factory_admission_contention_stays_retryable() {
+        // A maintenance worker cold-building the same mailbox makes the shared
+        // pool factory refuse with ResourceBusy after this caller already won
+        // the gate. Clients must see retryable contention, as for the gate.
+        let busy =
+            super::tool_util::pool_bootstrap_error(mcp_agent_mail_db::DbError::ResourceBusy(
+                "runtime pool initialization for this mailbox is in progress".into(),
+            ));
+        assert_eq!(crate::tool_error_code(&busy), Some("RESOURCE_BUSY"));
+        let failed = super::tool_util::pool_bootstrap_error(mcp_agent_mail_db::DbError::Sqlite(
+            "disk I/O error".into(),
+        ));
+        assert_eq!(failed.code, fastmcp::McpErrorCode::InternalError);
+    }
 }
 
 pub mod build_slots;
@@ -943,6 +959,16 @@ pub mod tool_util {
     pub(super) static DB_POOL_BOOTSTRAP_PROMOTIONS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
+    /// A maintenance worker cold-building the same mailbox makes the pool
+    /// factory refuse with `ResourceBusy`. That is the same retryable
+    /// contention as losing the initializer gate, not an internal failure.
+    pub(super) fn pool_bootstrap_error(error: DbError) -> McpError {
+        match error {
+            DbError::ResourceBusy(_) => db_error_to_mcp_error(error),
+            error => McpError::internal_error(error.to_string()),
+        }
+    }
+
     pub(super) fn bootstrap_db_pool_with_barrier_handoff(
         cfg: &DbPoolConfig,
         storage_root: &Path,
@@ -983,8 +1009,7 @@ pub mod tool_util {
                 "database pool bootstrap deferred because {remaining_writers} writer(s) did not drain before the recovery barrier timeout"
             )));
         }
-        let pool =
-            get_or_create_pool(cfg).map_err(|error| McpError::internal_error(error.to_string()))?;
+        let pool = get_or_create_pool(cfg).map_err(pool_bootstrap_error)?;
         // Atomic handoff: register the caller as a writer while the promotion
         // barrier is still closed, then release the barrier. No promotion can
         // enter between cold bootstrap/recovery and the operation using this
