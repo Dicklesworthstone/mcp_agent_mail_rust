@@ -1,4 +1,4 @@
-name: Land verified GH355 snapshot authority fix
+name: Land and verify message-first unified inbox
 
 on:
   push:
@@ -6,55 +6,90 @@ on:
     paths: [.github/workflows/land-atc-reliability-20260918.yml]
 permissions: {}
 concurrency:
-  group: land-gh355-core-20261016
+  group: land-unified-inbox-20261019
   cancel-in-progress: false
 jobs:
   land:
-    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' && contains(github.event.head_commit.message, '[land-gh355-core-20261016]')
+    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' && contains(github.event.head_commit.message, '[land-unified-inbox-20261019]')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     permissions:
       contents: write
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 2
           clean: false
-      - name: Verify exact tested patch and apply with no force push
+      - name: Apply exact reviewed implementation and restore landing workflow
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           workflow=.github/workflows/land-atc-reliability-20260918.yml
+          parent=crates/mcp-agent-mail-server/src/mail_ui.rs
+          module=crates/mcp-agent-mail-server/src/mail_ui/unified.rs
           test -z "$(git status --porcelain)"
-          test "$(git rev-parse HEAD:crates/mcp-agent-mail-db/src/pool.rs)" = 6dcfb4b1d0c3ec6eeae4a3aec1dbfb5c321f83a5
-          test "$(git rev-parse HEAD:crates/mcp-agent-mail-db/src/snapshot.rs)" = 76c12c12e02fbdba45edcfaebfb25c3a3ac1aa68
-          test "$(git rev-parse "HEAD^:$workflow")" = a2f02267589a9a69e474d26cd5124314cf3ad9b8
-          gh api repos/Dicklesworthstone/mcp_agent_mail_rust/git/blobs/92fa740c40d997bd80647ae9c3cec62f2b6f6309 > "$RUNNER_TEMP/gh355-core.json"
-          python3 - <<'PY'
-          import base64, hashlib, json, lzma, os, pathlib
-          root = pathlib.Path(os.environ['RUNNER_TEMP'])
-          record = json.loads((root / 'gh355-core.json').read_text())
-          packed = base64.b64decode(record['content'])
-          assert len(packed) == 10008
-          assert hashlib.sha1(f'blob {len(packed)}\0'.encode() + packed).hexdigest() == '92fa740c40d997bd80647ae9c3cec62f2b6f6309'
-          patch = lzma.decompress(packed)
-          assert len(patch) == 43669
-          assert hashlib.sha256(patch).hexdigest() == '9892fd4a0fd9d6689fe945fc26584a3a75a1196b1d0cd39a15806d05dc9740ed'
-          (root / 'gh355-core.patch').write_bytes(patch)
-          PY
-          git apply --check "$RUNNER_TEMP/gh355-core.patch"
-          git apply --index "$RUNNER_TEMP/gh355-core.patch"
+          test "$(git rev-parse HEAD:$parent)" = 333f1c106fa36007524b17b5e1585bcccacb90f2
+          test "$(git rev-parse "HEAD^:$workflow")" = 08cf00c7110244694f1bb692ae8204720c8ac9e9
+          test ! -e "$module"
+          packed="$RUNNER_TEMP/unified-inbox.patch.gz"
+          : > "$packed"
+          for blob in 7fde92b8acb1c9619aa327bf973d2671b8075d17 5eefd6433a9e818b872ecc7cfecf3bfda457283c 1564f5086e7ad2ea026a6bc84e6b74fd47c2a18f; do
+            gh api "repos/${GITHUB_REPOSITORY}/git/blobs/$blob" --jq .content | base64 --decode >> "$packed"
+          done
+          echo "b5df5e09a17536fe97005898334cdc6c22e1def1d1cac7fd2e4af41ec64aa55c  $packed" | sha256sum --check
+          patch="$RUNNER_TEMP/unified-inbox.patch"
+          gzip --decompress --stdout "$packed" > "$patch"
+          echo "05f61c5f318dfe44ee6a3825daeec3f957d7f80310a80ae5baa992b5fc28e582  $patch" | sha256sum --check
+          git apply --recount --check "$patch"
+          git apply --recount --index "$patch"
+          # Parse both changed Rust sources; format only the new module rather
+          # than mixing unrelated parent formatting into this functional batch.
+          rustup run stable rustfmt --edition 2024 "$module"
+          rustup run stable rustfmt --edition 2024 --config skip_children=true --emit stdout "$parent" > /dev/null
           git show "HEAD^:$workflow" > "$workflow"
-          git add -- "$workflow"
+          git add -- "$parent" "$module" "$workflow"
           git diff --cached --check
-          expected=$(printf '%s\n' "$workflow" crates/mcp-agent-mail-db/src/pool.rs crates/mcp-agent-mail-db/src/snapshot.rs crates/mcp-agent-mail-db/src/snapshot_authority.rs crates/mcp-agent-mail-db/tests/fixtures/snapshot-v0.3.30.json crates/mcp-agent-mail-db/tests/fixtures/snapshot-v0.3.30.README.md | LC_ALL=C sort)
+          expected=$(printf '%s\n' "$workflow" "$parent" "$module" | LC_ALL=C sort)
           actual=$(git diff --cached --name-only | LC_ALL=C sort)
           test "$actual" = "$expected"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(snapshot): migrate corroborated legacy authority and stop blocked exports (GH355)' -m 'Preserve legacy JSON durably; require strict namespace, complete legacy shape, fresh full integrity and unique byte identity. Reject foreign, malformed, ambiguous, symlinked and hard-linked authority candidates. Gate both producer routes before staging; support explicit evidence-preserving legacy candidate selection. Serialize metadata publication and compare exact revisions. Verified in isolated pinned-nightly build: snapshot 31, backup 44, recovery_retention 58, integrity 101, recovery 224 tests passed (filters overlap). Restore the original one-shot workflow verbatim.'
+          git commit -m 'fix(mail-ui): replace per-agent unified inbox fan-out with message-first projection' -m 'Select the global newest window after exact importance and delivery eligibility filtering. Preserve all visible recipient read/ACK state, direct precedence, shared eligibility, operator BCC display and existing thread links. Scan bounded header pages once and hydrate bodies only for final messages through one snapshot and checkout. Retire failed or cancelled checkouts, and keep existing agent-roster selection rather than expanding scope. Add eleven native regressions including a real migrated-mailbox comparison against the original collector and a filter match behind more than 10000 normal deliveries. Header scan work remains history-dependent; no measured speedup or native test pass is claimed by this commit. The following workflow steps record native verification. Restore the original one-shot workflow verbatim.'
           git push origin HEAD:refs/heads/main
-          printf 'Landed %s\n' "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Functional commit: %s\n' "$(git rev-parse HEAD)" | tee "$RUNNER_TEMP/unified-inbox-result.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain landed sources for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-inbox-landed-sources
+          path: |
+            crates/mcp-agent-mail-server/src/mail_ui.rs
+            crates/mcp-agent-mail-server/src/mail_ui/unified.rs
+          retention-days: 7
+      - name: Check production feature graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 720 cargo check --locked -p mcp-agent-mail-server --lib 2>&1 | tee "$RUNNER_TEMP/unified-inbox-production.log"
+      - name: Run native unified inbox regressions
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900 cargo test --locked -p mcp-agent-mail-server --lib mail_ui::unified::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/unified-inbox-tests.log"
+      - name: Retain verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-inbox-native-verification
+          path: ${{ runner.temp }}/unified-inbox-*.log
+          if-no-files-found: ignore
+          retention-days: 7
