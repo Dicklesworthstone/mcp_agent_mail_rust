@@ -4,6 +4,8 @@
 //! carrying the same ID. Inspect one immutable HEAD tree, within this project's
 //! canonical namespace, before publishing files or first committing a bundle.
 
+mod staged;
+
 use std::path::Path;
 
 use git2::{ErrorCode, ObjectType, Oid, Repository, Tree};
@@ -53,6 +55,7 @@ pub(super) fn preflight(
     budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<bool> {
     let Some(tree) = head_tree_for_identity(repo, budget)? else {
+        staged::preflight(repo, archive, message_id, canonical, expected, None, budget)?;
         return Ok(false);
     };
     let canonical_committed = match tree.get_path(Path::new(canonical)) {
@@ -71,6 +74,17 @@ pub(super) fn preflight(
         Err(error) if error.code() == ErrorCode::NotFound => false,
         Err(error) => return Err(error.into()),
     };
+    // Even a complete committed bundle can coexist with conflicting staged
+    // evidence. A failed Git commit must not make that identity invisible.
+    staged::preflight(
+        repo,
+        archive,
+        message_id,
+        canonical,
+        expected,
+        Some(&tree),
+        budget,
+    )?;
     // A fully materialized, already-recorded message (including an attachment-
     // only repair) introduces no canonical path. Do not rescan history on every
     // unchanged maintenance visit. Missing message copies still require proof.
@@ -546,9 +560,19 @@ mod tests {
                 preflight(&repo, &archive, 42, &relative, oid, true, &mut budget).unwrap_err();
             assert!(error.to_string().contains("budget"), "{error}");
         }
+        // Retain the same HEAD allowance after charging the real index snapshot.
+        let index_path = repo.path().join("index");
+        let (index_bytes, index_entries) = if index_path.exists() {
+            (
+                std::fs::metadata(&index_path).unwrap().len(),
+                repo.index().unwrap().len(),
+            )
+        } else {
+            (0, 0)
+        };
         let mut budget = CanonicalScanBudget {
-            entries_left: 10,
-            bytes_left: 2048,
+            entries_left: 10 + index_entries,
+            bytes_left: 2048 + index_bytes,
             ..Default::default()
         };
         assert!(!preflight(&repo, &archive, 42, &relative, oid, true, &mut budget).unwrap());
