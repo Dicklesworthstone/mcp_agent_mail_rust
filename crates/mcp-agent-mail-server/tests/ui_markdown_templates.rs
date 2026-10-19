@@ -96,6 +96,7 @@ fn templates_render_mail_index() {
 struct ProjectCtx {
     project: ProjectView,
     agents: Vec<AgentView>,
+    retired_agents: Vec<AgentView>,
     static_export: bool,
 }
 
@@ -115,6 +116,19 @@ struct AgentView {
     model: String,
     task_description: String,
     last_active: String,
+    retired_at: String,
+}
+
+fn template_agent(id: i64, name: &str, retired_at: &str) -> AgentView {
+    AgentView {
+        id,
+        name: name.to_string(),
+        program: "claude-code".to_string(),
+        model: "opus-4.6".to_string(),
+        task_description: "Working on tests".to_string(),
+        last_active: "2026-02-06T12:00:00Z".to_string(),
+        retired_at: retired_at.to_string(),
+    }
 }
 
 #[test]
@@ -126,20 +140,19 @@ fn templates_render_mail_project() {
             human_key: "/data/my-proj".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
-        agents: vec![AgentView {
-            id: 10,
-            name: "GreenLake".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus-4.6".to_string(),
-            task_description: "Working on tests".to_string(),
-            last_active: "2026-02-06T12:00:00Z".to_string(),
-        }],
+        agents: vec![template_agent(10, "GreenLake", "")],
+        retired_agents: vec![],
         static_export: false,
     };
     let out =
         templates::render_template("mail_project.html", ctx).expect("render mail_project.html");
     assert!(out.contains("GreenLake"), "should contain agent name");
     assert!(out.contains("my-proj"), "should contain project slug");
+    assert!(out.contains("1 active"), "header counts active agents");
+    assert!(
+        !out.contains("data-retired-agents"),
+        "no retired section without retired agents"
+    );
     assert!(
         !out.contains("Prioritize subject matches in rankings"),
         "live project page should not advertise static-only subject boost"
@@ -148,6 +161,74 @@ fn templates_render_mail_project() {
         !out.contains("__static_export"),
         "live project page should not submit static-export markers"
     );
+}
+
+#[test]
+fn templates_render_mail_project_sets_retired_agents_apart() {
+    let ctx = ProjectCtx {
+        project: ProjectView {
+            id: 1,
+            slug: "my-proj".to_string(),
+            human_key: "/data/my-proj".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+        agents: vec![template_agent(10, "GreenLake", "")],
+        retired_agents: vec![
+            template_agent(11, "SilverFern", "2026-03-01 10:00:00 UTC"),
+            template_agent(12, "AmberCove", "2026-03-02 10:00:00 UTC"),
+        ],
+        static_export: false,
+    };
+    let out = templates::render_template("mail_project.html", ctx)
+        .expect("render mail_project.html with retired agents");
+    assert!(
+        out.contains("1 active · 2 retired"),
+        "header counts both lists"
+    );
+    let retired_section = out
+        .find("data-retired-agents")
+        .expect("retired agents get their own section");
+    let active_card = out.find("GreenLake").expect("active agent card");
+    assert!(
+        active_card < retired_section,
+        "active agents come before the retired section"
+    );
+    for name in ["SilverFern", "AmberCove"] {
+        let position = out.find(name).expect("retired agent listed");
+        assert!(
+            position > retired_section,
+            "{name} is listed in the retired section only"
+        );
+    }
+    assert!(out.contains("retired 2026-03-01 10:00:00 UTC"));
+    assert!(
+        out.contains("<details"),
+        "retired agents are collapsed by default"
+    );
+}
+
+#[test]
+fn templates_render_mail_project_with_only_retired_agents() {
+    let ctx = ProjectCtx {
+        project: ProjectView {
+            id: 1,
+            slug: "quiet-proj".to_string(),
+            human_key: "/data/quiet-proj".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+        agents: vec![],
+        retired_agents: vec![template_agent(11, "SilverFern", "2026-03-01 10:00:00 UTC")],
+        static_export: false,
+    };
+    let out = templates::render_template("mail_project.html", ctx)
+        .expect("render mail_project.html with only retired agents");
+    assert!(out.contains("0 active · 1 retired"));
+    assert!(out.contains("No active agents. Retired agents are listed below."));
+    assert!(
+        !out.contains("No agents registered yet"),
+        "a project with retired agents is not empty"
+    );
+    assert!(out.contains("SilverFern"));
 }
 
 #[test]
@@ -160,6 +241,7 @@ fn templates_render_mail_project_static_export_search_controls() {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
         agents: vec![],
+        retired_agents: vec![],
         static_export: true,
     };
     let out = templates::render_template("mail_project.html", ctx)
@@ -797,10 +879,13 @@ fn templates_render_project_no_agents() {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
         agents: vec![],
+        retired_agents: vec![],
         static_export: false,
     };
     let out = templates::render_template("mail_project.html", ctx).expect("render empty project");
     assert!(out.contains("empty-proj"), "slug present");
+    assert!(out.contains("No agents registered yet"), "empty state");
+    assert!(!out.contains("data-retired-agents"));
 }
 
 #[test]

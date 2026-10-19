@@ -318,12 +318,12 @@
         <div class="w-1 h-10 bg-gradient-to-b from-success-600 to-success-800 rounded-full"></div>
         <div>
           <h2 class="text-2xl font-bold text-slate-900 dark:text-white">Registered Agents</h2>
-          <p class="text-sm text-slate-600 dark:text-slate-400">Everyone registered in this project, retired agents included</p>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Active agents first; retired agents are listed separately below</p>
         </div>
       </div>
-      {% if agents %}
+      {% if agents or retired_agents %}
         <span class="px-4 py-2 bg-success-100 dark:bg-success-900/30 text-success-700 dark:text-success-300 text-sm font-bold rounded-full flex items-center gap-2">
-          {{ agents|length }} registered
+          {{ agents|length }} active{% if retired_agents %} · {{ retired_agents|length }} retired{% endif %}
         </span>
       {% endif %}
     </div>
@@ -373,6 +373,11 @@
         {% endfor %}
       </div>
 
+    {% elif retired_agents %}
+      <div class="bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-soft border border-slate-200 dark:border-slate-700 text-center text-sm text-slate-600 dark:text-slate-400">
+        No active agents. Retired agents are listed below.
+      </div>
+
     {% else %}
       <!-- Premium Empty State for Agents -->
       <div class="bg-gradient-to-br from-white to-slate-50 dark:from-slate-800 dark:to-slate-800/50 rounded-2xl p-16 shadow-soft border border-slate-200 dark:border-slate-700 text-center">
@@ -397,6 +402,41 @@
           <span>Use <code class="px-2 py-0.5 bg-white dark:bg-slate-900 rounded font-mono text-xs">register_agent</code> to add agents</span>
         </div>
       </div>
+    {% endif %}
+
+    {% if retired_agents %}
+      <!-- Retired agents: collapsed by default so they never crowd out active ones -->
+      <details class="mt-6 bg-white dark:bg-slate-800 rounded-2xl shadow-soft border border-slate-200 dark:border-slate-700" data-retired-agents>
+        <summary class="cursor-pointer select-none px-6 py-4 flex items-center justify-between gap-3 text-slate-700 dark:text-slate-300">
+          <span class="flex items-center gap-2 text-sm font-semibold">
+            <i data-lucide="archive" class="w-4 h-4"></i>
+            Retired agents
+          </span>
+          <span class="px-3 py-1 bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 text-xs font-bold rounded-full">
+            {{ retired_agents|length }} retired
+          </span>
+        </summary>
+        <div class="px-6 pb-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {% for a in retired_agents %}
+            <div class="flex items-center gap-3 p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                  <span class="font-semibold text-slate-700 dark:text-slate-200 truncate">{{ a.name }}</span>
+                  <span class="px-2 py-0.5 text-xs font-bold uppercase tracking-wide rounded bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300">Retired</span>
+                </div>
+                <div class="text-xs text-slate-500 dark:text-slate-400 truncate mt-1">
+                  {{ a.program }} • {{ a.model }}{% if a.retired_at %} • retired {{ a.retired_at }}{% endif %}
+                </div>
+              </div>
+              <a href="/mail/{{ project.slug }}/inbox/{{ a.name }}"
+                 class="px-3 py-1.5 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-semibold rounded-lg border border-slate-200 dark:border-slate-700 transition-colors"
+                 aria-label="Inbox of retired agent {{ a.name }}">
+                Inbox
+              </a>
+            </div>
+          {% endfor %}
+        </div>
+      </details>
     {% endif %}
   </div>
 </div>

@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod unified;
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -1013,6 +1015,64 @@ first body
         assert!(
             !html.contains(OVERSEER_AGENT_NAME),
             "the overseer does not write to itself"
+        );
+    }
+
+    #[test]
+    fn project_page_hides_deregistered_agents_and_sets_retired_ones_apart() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("project-page-roster");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-project-roster-{}", unique_nonce()),
+        )));
+        let pid = project.id.unwrap_or(0);
+        let register = |name: &str| {
+            outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, pid, name, "test", "test", None, None, None,
+            )))
+        };
+        register("CopperHawk");
+        let retired = register("SilverFern");
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            retired.id.unwrap_or(0),
+            Some(1),
+        )));
+        let gone = register("AmberCove");
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            gone.id.unwrap_or(0),
+            Some(2),
+        )));
+        outcome_ok(block_on(queries::deregister_agent(
+            &cx,
+            &pool,
+            gone.id.unwrap_or(0),
+            3,
+        )));
+
+        let html = render_project(&cx, &pool, &project.slug, false)
+            .expect("project page should render")
+            .expect("project page returns html");
+        assert!(
+            !html.contains("AmberCove"),
+            "deregistered agents never return, so the page does not list them"
+        );
+        assert!(html.contains("1 active · 1 retired"), "{html}");
+        let retired_section = html
+            .find("data-retired-agents")
+            .expect("retired agents get their own section");
+        let active = html.find("CopperHawk").expect("active agent listed");
+        let retired = html.find("SilverFern").expect("retired agent listed");
+        assert!(active < retired_section, "active agents come first");
+        assert!(
+            retired > retired_section,
+            "retired agents are listed in the retired section"
         );
     }
 
@@ -3380,6 +3440,17 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
+    unified::collect(cx, pool, projects_rows, limit, filter_importance)
+}
+
+#[cfg(test)]
+fn reference_collect_unified_message_aggregates(
+    cx: &Cx,
+    pool: &DbPool,
+    projects_rows: &[ProjectRow],
+    limit: usize,
+    filter_importance: Option<&str>,
+) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
     // Applying the importance filter after a tight per-agent inbox window can
     // hide matching messages behind newer non-matching rows. Over-fetch when a
     // server-side importance filter is active so the filtered unified view stays
@@ -3547,7 +3618,11 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
 #[derive(Serialize)]
 struct ProjectCtx {
     project: ProjectView,
+    /// Agents that are not retired, most recently active first.
     agents: Vec<AgentView>,
+    /// Retired agents, listed apart from the active ones. Deregistered agents
+    /// appear in neither list (GH#358).
+    retired_agents: Vec<AgentView>,
     static_export: bool,
 }
 
@@ -3567,6 +3642,8 @@ struct AgentView {
     model: String,
     task_description: String,
     last_active: String,
+    /// Display timestamp of retirement; empty for an active agent.
+    retired_at: String,
 }
 
 fn project_view(p: &ProjectRow) -> ProjectView {
@@ -3610,6 +3687,7 @@ fn agent_view(a: &AgentRow) -> AgentView {
         model: a.model.clone(),
         task_description: a.task_description.clone(),
         last_active: ts_display(a.last_active_ts),
+        retired_at: ts_display_opt(a.retired_at),
     }
 }
 
@@ -3620,12 +3698,18 @@ fn render_project(
     static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
+    // The roster keeps retired agents but drops permanent deregistrations,
+    // which can never return (GH#358). It is ordered most recently active
+    // first, and the partition below keeps that order within each list.
+    let roster = block_on_outcome(cx, queries::list_agent_roster(cx, pool, p.id.unwrap_or(0)))?;
+    let (retired, active): (Vec<_>, Vec<_>) =
+        roster.iter().partition(|agent| agent.retired_at.is_some());
     render(
         "mail_project.html",
         ProjectCtx {
             project: project_view(&p),
-            agents: agents.iter().map(agent_view).collect(),
+            agents: active.into_iter().map(agent_view).collect(),
+            retired_agents: retired.into_iter().map(agent_view).collect(),
             static_export,
         },
     )
