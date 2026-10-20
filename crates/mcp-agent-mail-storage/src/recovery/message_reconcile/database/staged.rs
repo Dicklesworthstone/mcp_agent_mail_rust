@@ -46,7 +46,9 @@ impl StagedMessages {
     fn open(repo: &Repository) -> Result<Option<Self>, ReconcileFailure> {
         let path = repo.path().join("index");
         if crate::path_existing_prefix_has_symlink(&path).map_err(|error| error.to_string())? {
-            return Err("staged archive index has a symlinked authority".to_string().into());
+            return Err("staged archive index has a symlinked authority"
+                .to_string()
+                .into());
         }
         let bytes = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
             &path,
@@ -55,18 +57,25 @@ impl StagedMessages {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(index_io_failure("staged archive index is unavailable", error));
+                return Err(index_io_failure(
+                    "staged archive index is unavailable",
+                    error,
+                ));
             }
         };
         let header = bytes
             .get(..12)
             .ok_or_else(|| "staged archive index has an incomplete header".to_string())?;
         if &header[..4] != b"DIRC" {
-            return Err("staged archive index has an invalid signature".to_string().into());
+            return Err("staged archive index has an invalid signature"
+                .to_string()
+                .into());
         }
         let version = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
         if !matches!(version, 2..=4) {
-            return Err("staged archive index has an unsupported version".to_string().into());
+            return Err("staged archive index has an unsupported version"
+                .to_string()
+                .into());
         }
         let count = usize::try_from(u32::from_be_bytes([
             header[8], header[9], header[10], header[11],
@@ -77,7 +86,9 @@ impl StagedMessages {
         // are longer. The admitted input, not unrelated recipient fanout,
         // bounds native allocation even when a tiny header forges its count.
         if count > bytes.len().saturating_sub(12) / 64 {
-            return Err("staged archive index decode entry budget exceeded".to_string().into());
+            return Err("staged archive index decode entry budget exceeded"
+                .to_string()
+                .into());
         }
         let mut snapshot = tempfile::Builder::new()
             .prefix(".message-reconcile-index-")
@@ -92,7 +103,9 @@ impl StagedMessages {
         let index = Index::open_ext(snapshot.path(), repo.object_format())
             .map_err(|error| format!("staged archive index cannot be decoded: {error}"))?;
         if index.len() != count {
-            return Err("staged archive index decoded entry count changed".to_string().into());
+            return Err("staged archive index decoded entry count changed"
+                .to_string()
+                .into());
         }
         Ok(Some(Self {
             index,
@@ -314,8 +327,13 @@ mod tests {
             (ErrorKind::NotFound, false),
             (ErrorKind::Other, false),
         ] {
-            for context in ["staged index read", "staged snapshot creation", "staged snapshot write"] {
-                let failure = index_io_failure(context, Error::new(kind, "disk full; quota exceeded"));
+            for context in [
+                "staged index read",
+                "staged snapshot creation",
+                "staged snapshot write",
+            ] {
+                let failure =
+                    index_io_failure(context, Error::new(kind, "disk full; quota exceeded"));
                 assert_eq!(failure.transient, transient, "{kind:?}: {failure:?}");
                 assert!(failure.detail.starts_with(context));
                 // The old String boundary discarded even a typed pressure error.
@@ -328,8 +346,8 @@ mod tests {
     #[test]
     fn actual_snapshot_enospc_retains_staged_reply_until_live_retry_commits_it() {
         use super::super::{
-            ReconcileCursor, ReconcileReport, outcome, prepare_message,
-            reconcile_message_batch, record_failure,
+            ReconcileCursor, ReconcileReport, outcome, prepare_message, reconcile_message_batch,
+            record_failure,
         };
         use fastmcp_core::block_on;
         use std::sync::atomic::AtomicBool;
@@ -345,15 +363,25 @@ mod tests {
             let archive = crate::ensure_archive(config, "project").unwrap();
             let repo = Repository::open(&archive.repo_root).unwrap();
             let paths = crate::message_paths_for_bundle(
-                &archive, &original.message, &original.sender, &original.recipients,
-            ).unwrap().0;
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
             let mut full = original.message.clone();
             full["reply_to"] = json!(700);
             full["future_metadata"] = json!({"retain": "index-only extension"});
             let inbox = crate::redact_message_bcc_for_inbox(&full);
             let evidence = config.storage_root.join("retained-enospc-inbox.md");
             let bytes = stage_and_retain(
-                &repo, &archive, &paths.inbox[0], &inbox, &original.body, &evidence,
+                &repo,
+                &archive,
+                &paths.inbox[0],
+                &inbox,
+                &original.body,
+                &evidence,
             );
             let index_before = std::fs::read(repo.path().join("index")).unwrap();
             let before = mailbox_evidence(cx, pool);
@@ -366,46 +394,69 @@ mod tests {
                 ..Default::default()
             };
             let stop = AtomicBool::new(false);
-            let without_retry = reconcile_message_batch(
-                cx, pool, config, &mut cursor_past_message(), &stop,
-            ).unwrap();
+            let without_retry =
+                reconcile_message_batch(cx, pool, config, &mut cursor_past_message(), &stop)
+                    .unwrap();
             assert_eq!((without_retry.scanned, without_retry.repaired), (0, 0));
 
             // The actual production snapshot-write helper receives the kernel's
             // ENOSPC, not a fabricated successful index or archive result. The
             // live archive filesystem is not filled by this fixture.
-            let mut full_device = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+            let mut full_device = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
             let failure = write_index_snapshot(&mut full_device, &index_before).unwrap_err();
             assert!(failure.transient, "{failure:?}");
-            assert!(failure.detail.contains("staged archive index snapshot write failed"));
+            assert!(
+                failure
+                    .detail
+                    .contains("staged archive index snapshot write failed")
+            );
             let mut cursor = cursor_past_message();
             let mut failed = ReconcileReport::default();
             record_failure(901, failure, &mut cursor, &mut failed, Instant::now());
-            assert_eq!((failed.deferred_transient, failed.deferred_conflict), (1, 0));
+            assert_eq!(
+                (failed.deferred_transient, failed.deferred_conflict),
+                (1, 0)
+            );
             assert_eq!(cursor.retries.front().unwrap().id, 901);
-            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
-            let cancelled = reconcile_message_batch(
-                cx, pool, config, &mut cursor, &AtomicBool::new(true),
-            ).unwrap();
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                index_before
+            );
+            let cancelled =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(true))
+                    .unwrap();
             assert!(cancelled.interrupted);
             assert_eq!(cursor.retries.len(), 1);
 
             let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!((repaired.repaired, repaired.files_created, repaired.retry_len, repaired.deferred),
-                (1, 4, 0, 0));
+            assert_eq!(
+                (
+                    repaired.repaired,
+                    repaired.files_created,
+                    repaired.retry_len,
+                    repaired.deferred
+                ),
+                (1, 4, 0, 0)
+            );
             assert_eq!(mailbox_evidence(cx, pool), before);
             let verified = Repository::open(&archive.repo_root).unwrap();
             let tree = verified.head().unwrap().peel_to_tree().unwrap();
             for (path, expected) in [(&paths.canonical, &full), (&paths.outbox, &full)]
-                .into_iter().chain(paths.inbox.iter().map(|path| (path, &inbox)))
+                .into_iter()
+                .chain(paths.inbox.iter().map(|path| (path, &inbox)))
             {
                 let (message, body) = read_surviving_message(path).unwrap().unwrap();
                 assert_eq!(&message, expected);
                 assert_eq!(body, original.body);
                 let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
                 let entry = tree.get_path(Path::new(&relative)).unwrap();
-                assert_eq!(verified.find_blob(entry.id()).unwrap().content(),
-                    std::fs::read(path).unwrap());
+                assert_eq!(
+                    verified.find_blob(entry.id()).unwrap().content(),
+                    std::fs::read(path).unwrap()
+                );
             }
             assert_eq!(inbox["bcc"], json!([]));
             assert_eq!(full["bcc"], json!(["RedFox"]));
@@ -424,14 +475,21 @@ mod tests {
         let repo = Repository::open(&archive.repo_root).unwrap();
         let path = repo.path().join("index");
         if path.exists() {
-            std::fs::rename(&path, config.storage_root.join("retained-before-invalid-index")).unwrap();
+            std::fs::rename(
+                &path,
+                config.storage_root.join("retained-before-invalid-index"),
+            )
+            .unwrap();
         }
         assert!(StagedMessages::open(&repo).unwrap().is_none());
         assert!(!path.exists());
         let malformed = b"DIRC\0\0\0\x02\xff\xff\xff\xffdisk full; quota exceeded";
         std::fs::write(&path, malformed).unwrap();
         let error = StagedMessages::open(&repo).err().unwrap();
-        assert!(!error.transient, "malformed authority is not pressure: {error:?}");
+        assert!(
+            !error.transient,
+            "malformed authority is not pressure: {error:?}"
+        );
         assert!(error.detail.contains("entry budget"));
         assert_eq!(std::fs::read(&path).unwrap(), malformed);
     }
@@ -443,10 +501,8 @@ mod tests {
         // Real Git index entries, not 100,001 working-tree files. Their path
         // population must not prevent recovery of a small canonical namespace.
         for number in 0..100_001 {
-            entry.path = format!(
-                "projects/other/agents/BlueLake/inbox/2026/10/{number:06}.md"
-            )
-            .into_bytes();
+            entry.path =
+                format!("projects/other/agents/BlueLake/inbox/2026/10/{number:06}.md").into_bytes();
             index.add(&entry).unwrap();
         }
         index.write().unwrap();
@@ -456,13 +512,22 @@ mod tests {
 
     fn mailbox_evidence(cx: &asupersync::Cx, pool: &mcp_agent_mail_db::DbPool) -> Value {
         let conn = super::super::outcome(fastmcp_core::block_on(pool.acquire(cx))).unwrap();
-        let messages = conn.query_sync(
-            "SELECT id, body_md, archive_metadata_json FROM messages ORDER BY id", &[],
-        ).unwrap().iter().map(|row| json!([
-            row.get_named::<i64>("id").unwrap(),
-            row.get_named::<String>("body_md").unwrap(),
-            row.get_named::<Option<String>>("archive_metadata_json").unwrap(),
-        ])).collect::<Vec<_>>();
+        let messages = conn
+            .query_sync(
+                "SELECT id, body_md, archive_metadata_json FROM messages ORDER BY id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| {
+                json!([
+                    row.get_named::<i64>("id").unwrap(),
+                    row.get_named::<String>("body_md").unwrap(),
+                    row.get_named::<Option<String>>("archive_metadata_json")
+                        .unwrap(),
+                ])
+            })
+            .collect::<Vec<_>>();
         let receipts = conn.query_sync(
             "SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id", &[],
         ).unwrap().iter().map(|row| json!([
@@ -483,7 +548,8 @@ mod tests {
 
         super::super::tests::retention_fixture(3, |cx, pool, config| {
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE messages SET archive_metadata_json = NULL").unwrap();
+            conn.execute_raw("UPDATE messages SET archive_metadata_json = NULL")
+                .unwrap();
             drop(conn);
             let before = mailbox_evidence(cx, pool);
             let archive = crate::ensure_archive(config, "project").unwrap();
@@ -493,8 +559,13 @@ mod tests {
                 let prepared = prepare_message(cx, pool, id).unwrap();
                 assert!(!prepared.archive_metadata_known);
                 let paths = crate::message_paths_for_bundle(
-                    &archive, &prepared.message, &prepared.sender, &prepared.recipients,
-                ).unwrap().0;
+                    &archive,
+                    &prepared.message,
+                    &prepared.sender,
+                    &prepared.recipients,
+                )
+                .unwrap()
+                .0;
                 let mut full = prepared.message.clone();
                 full["reply_to"] = json!(700 + id - 901);
                 full["future_metadata"] = json!({"source": source, "retain": [id, "λ"]});
@@ -505,45 +576,69 @@ mod tests {
                     _ => (&paths.inbox[0], &inbox),
                 };
                 let evidence = config.storage_root.join(format!("retained-{source}.md"));
-                let bytes = stage_and_retain(
-                    &repo, &archive, path, message, &prepared.body, &evidence,
+                let bytes =
+                    stage_and_retain(&repo, &archive, path, message, &prepared.body, &evidence);
+                assert!(
+                    super::super::CommittedMessages::open(&archive)
+                        .unwrap()
+                        .read(&archive, path)
+                        .unwrap()
+                        .is_none()
                 );
-                assert!(super::super::CommittedMessages::open(&archive).unwrap()
-                    .read(&archive, path).unwrap().is_none());
                 expected.push((prepared, full, inbox, paths, evidence, bytes));
             }
             add_recipient_index_entries(&repo, &archive, &expected[0].3.canonical);
             let index_before = std::fs::read(repo.path().join("index")).unwrap();
             let head_before = repo.head().ok().and_then(|head| head.target());
             for (prepared, full, _, paths, _, _) in &expected {
-                assert_eq!(read_metadata(
-                    &repo, &archive, prepared, &paths.canonical, &paths.outbox, &paths.inbox,
-                ).unwrap().as_ref(), Some(full));
+                assert_eq!(
+                    read_metadata(
+                        &repo,
+                        &archive,
+                        prepared,
+                        &paths.canonical,
+                        &paths.outbox,
+                        &paths.inbox,
+                    )
+                    .unwrap()
+                    .as_ref(),
+                    Some(full)
+                );
                 assert!(!paths.canonical.exists());
                 assert!(!paths.outbox.exists());
                 assert!(paths.inbox.iter().all(|path| !path.exists()));
             }
-            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                index_before
+            );
             assert_eq!(repo.head().ok().and_then(|head| head.target()), head_before);
 
             let stop = AtomicBool::new(false);
             let mut cursor = ReconcileCursor::default();
             let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!((repaired.repaired, repaired.files_created, repaired.deferred), (3, 12, 0));
+            assert_eq!(
+                (repaired.repaired, repaired.files_created, repaired.deferred),
+                (3, 12, 0)
+            );
             assert_eq!(mailbox_evidence(cx, pool), before);
             let verified = Repository::open(&archive.repo_root).unwrap();
             let tree = verified.head().unwrap().peel_to_tree().unwrap();
             for (prepared, full, inbox, paths, evidence, bytes) in &expected {
                 for (path, expected_message) in [(&paths.canonical, full), (&paths.outbox, full)]
-                    .into_iter().chain(paths.inbox.iter().map(|path| (path, inbox)))
+                    .into_iter()
+                    .chain(paths.inbox.iter().map(|path| (path, inbox)))
                 {
                     let (message, body) = read_surviving_message(path).unwrap().unwrap();
                     assert_eq!(&message, expected_message);
                     assert_eq!(body, prepared.body);
-                    let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                    let relative =
+                        crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
                     let object = tree.get_path(Path::new(&relative)).unwrap();
-                    assert_eq!(verified.find_blob(object.id()).unwrap().content(),
-                        std::fs::read(path).unwrap());
+                    assert_eq!(
+                        verified.find_blob(object.id()).unwrap().content(),
+                        std::fs::read(path).unwrap()
+                    );
                 }
                 assert_eq!(full["bcc"], json!(["RedFox"]));
                 assert_eq!(inbox["bcc"], json!([]));
@@ -551,7 +646,10 @@ mod tests {
             }
             let head = verified.head().unwrap().target();
             let again = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!((again.repaired, again.files_created, again.deferred), (0, 0, 0));
+            assert_eq!(
+                (again.repaired, again.files_created, again.deferred),
+                (0, 0, 0)
+            );
             assert_eq!(verified.head().unwrap().target(), head);
             assert_eq!(mailbox_evidence(cx, pool), before);
         });
@@ -561,14 +659,25 @@ mod tests {
     fn large_recipient_index_does_not_hide_a_staged_duplicate_identity() {
         let (_temp, config, original, archive) = git_fixture();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let repo = Repository::open(&archive.repo_root).unwrap();
         let mut full = original.message.clone();
         full["reply_to"] = json!(7);
         let redacted = crate::redact_message_bcc_for_inbox(&full);
-        stage_and_retain(&repo, &archive, &paths.inbox[0], &redacted, &original.body,
-            &config.storage_root.join("retained-index-inbox.md"));
+        stage_and_retain(
+            &repo,
+            &archive,
+            &paths.inbox[0],
+            &redacted,
+            &original.body,
+            &config.storage_root.join("retained-index-inbox.md"),
+        );
         let other = archive.root.join("messages/9999/12/duplicate.md");
         let evidence = config.storage_root.join("retained-duplicate.md");
         let bytes = stage_and_retain(&repo, &archive, &other, &full, &original.body, &evidence);
@@ -576,7 +685,10 @@ mod tests {
         let before = std::fs::read(repo.path().join("index")).unwrap();
         let head = repo.head().ok().and_then(|head| head.target());
         let error = reconcile_prepared(&config, &original).unwrap_err();
-        assert!(error.contains("canonical message id 9 already staged"), "{error}");
+        assert!(
+            error.contains("canonical message id 9 already staged"),
+            "{error}"
+        );
         assert!(!paths.canonical.exists());
         assert!(!paths.outbox.exists());
         assert!(paths.inbox.iter().all(|path| !path.exists()));
@@ -590,8 +702,14 @@ mod tests {
         let (_temp, config, original, archive) = git_fixture();
         let repo = Repository::open(&archive.repo_root).unwrap();
         let canonical = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0.canonical;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0
+        .canonical;
         let mut expected_bytes = 0;
         for (number, relative) in [
             "projects/project/messages/2025/01/a.md",
@@ -599,29 +717,54 @@ mod tests {
             "projects/project/messages-other/2025/01/c.md",
             "projects/project-other/messages/2025/01/d.md",
             "projects/Project/messages/2025/01/e.md",
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut message = original.message.clone();
-            message["id"] = if number < 2 { json!(77 + number) } else { json!(9) };
+            message["id"] = if number < 2 {
+                json!(77 + number)
+            } else {
+                json!(9)
+            };
             let path = archive.repo_root.join(relative);
-            let bytes = stage_and_retain(&repo, &archive, &path, &message, &original.body,
-                &config.storage_root.join(format!("retained-prefix-{number}.md")));
-            if number < 2 { expected_bytes += bytes.len(); }
+            let bytes = stage_and_retain(
+                &repo,
+                &archive,
+                &path,
+                &message,
+                &original.body,
+                &config
+                    .storage_root
+                    .join(format!("retained-prefix-{number}.md")),
+            );
+            if number < 2 {
+                expected_bytes += bytes.len();
+            }
         }
         let snapshot = StagedMessages::open(&repo).unwrap().unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
         let mut remaining = expected_bytes;
         let mut entries = 2;
-        snapshot.reject_other_canonical_id(&repo, &archive, &canonical, 9,
-            &mut remaining, &mut entries).unwrap();
+        snapshot
+            .reject_other_canonical_id(&repo, &archive, &canonical, 9, &mut remaining, &mut entries)
+            .unwrap();
         assert_eq!((remaining, entries), (0, 0));
         for (mut bytes, mut entries) in [(expected_bytes, 1), (expected_bytes - 1, 2)] {
-            let error = snapshot.reject_other_canonical_id(&repo, &archive, &canonical, 9,
-                &mut bytes, &mut entries).unwrap_err();
+            let error = snapshot
+                .reject_other_canonical_id(&repo, &archive, &canonical, 9, &mut bytes, &mut entries)
+                .unwrap_err();
             assert!(error.contains("budget"), "{error}");
         }
-        let wrong = archive.repo_root.join("projects/project-other/messages/2025/01/new.md");
-        assert!(snapshot.reject_other_canonical_id(&repo, &archive, &wrong, 9,
-            &mut expected_bytes, &mut 2).unwrap_err().contains("outside its project"));
+        let wrong = archive
+            .repo_root
+            .join("projects/project-other/messages/2025/01/new.md");
+        assert!(
+            snapshot
+                .reject_other_canonical_id(&repo, &archive, &wrong, 9, &mut expected_bytes, &mut 2)
+                .unwrap_err()
+                .contains("outside its project")
+        );
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         assert!(!canonical.exists());
     }
@@ -631,19 +774,40 @@ mod tests {
         let (_temp, config, original, archive) = git_fixture();
         let repo = Repository::open(&archive.repo_root).unwrap();
         let paths = crate::message_paths_for_bundle(
-            &archive, &original.message, &original.sender, &original.recipients,
-        ).unwrap().0;
+            &archive,
+            &original.message,
+            &original.sender,
+            &original.recipients,
+        )
+        .unwrap()
+        .0;
         let mut full = original.message.clone();
         full["reply_to"] = json!(7);
-        stage_and_retain(&repo, &archive, &paths.outbox, &full, &original.body,
-            &config.storage_root.join("retained-version-outbox.md"));
+        stage_and_retain(
+            &repo,
+            &archive,
+            &paths.outbox,
+            &full,
+            &original.body,
+            &config.storage_root.join("retained-version-outbox.md"),
+        );
         for version in [2, 3, 4] {
             let mut index = repo.index().unwrap();
             index.set_version(version).unwrap();
             index.write().unwrap();
             let before = std::fs::read(repo.path().join("index")).unwrap();
-            assert_eq!(read_metadata(&repo, &archive, &original, &paths.canonical,
-                &paths.outbox, &paths.inbox).unwrap(), Some(full.clone()));
+            assert_eq!(
+                read_metadata(
+                    &repo,
+                    &archive,
+                    &original,
+                    &paths.canonical,
+                    &paths.outbox,
+                    &paths.inbox
+                )
+                .unwrap(),
+                Some(full.clone())
+            );
             assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         }
         let path = repo.path().join("index");
@@ -654,8 +818,14 @@ mod tests {
             forged.extend_from_slice(&u32::MAX.to_be_bytes());
             std::fs::write(&path, &forged).unwrap();
             let error = StagedMessages::open(&repo).err().unwrap();
-            assert!(error.detail.contains(if version == 5 { "unsupported version" } else { "budget" }),
-                "{error:?}");
+            assert!(
+                error.detail.contains(if version == 5 {
+                    "unsupported version"
+                } else {
+                    "budget"
+                }),
+                "{error:?}"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), forged);
         }
         assert!(!paths.canonical.exists());

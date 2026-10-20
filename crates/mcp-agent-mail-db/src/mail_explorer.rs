@@ -14,20 +14,20 @@
 #[cfg(test)]
 #[path = "mail_explorer_regression_tests.rs"]
 mod regression_tests;
+#[path = "mail_explorer_shared.rs"]
+mod shared;
 #[cfg(test)]
 #[path = "mail_explorer_snapshot_tests.rs"]
 mod snapshot_tests;
-#[path = "mail_explorer_shared.rs"]
-mod shared;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::DbConn;
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::tracking::record_query;
-use crate::DbConn;
 
 use asupersync::{CancelReason, Cx, Outcome};
 use sqlmodel_core::{Row as SqlRow, Value};
@@ -234,7 +234,10 @@ pub async fn fetch_explorer_page(
         connection: Some(connection),
         reusable: false,
     };
-    let conn = &**checkout.connection.as_ref().expect("live explorer checkout");
+    let conn = &**checkout
+        .connection
+        .as_ref()
+        .expect("live explorer checkout");
     if cx.checkpoint().is_err() {
         return cancelled(cx);
     }
@@ -302,7 +305,8 @@ async fn fetch_page_in_snapshot(
             {
                 continue;
             }
-            let (source, conditions, params) = lane_query(project, agent, query, shared_mailbox, inbound);
+            let (source, conditions, params) =
+                lane_query(project, agent, query, shared_mailbox, inbound);
             let counts = match count_lane(cx, conn, &source, &conditions, &params, inbound).await {
                 Outcome::Ok(counts) => counts,
                 Outcome::Err(error) => return Outcome::Err(error),
@@ -323,10 +327,16 @@ async fn fetch_page_in_snapshot(
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             };
             if rows.len() > window_limit {
-                return Outcome::Err(DbError::Internal("explorer candidate query exceeded its limit".into()));
+                return Outcome::Err(DbError::Internal(
+                    "explorer candidate query exceeded its limit".into(),
+                ));
             }
             for row in &rows {
-                let entry = match if inbound { map_inbound_row(row) } else { map_outbound_row(row) } {
+                let entry = match if inbound {
+                    map_inbound_row(row)
+                } else {
+                    map_outbound_row(row)
+                } {
                     Ok(entry) => entry,
                     Err(error) => return Outcome::Err(error),
                 };
@@ -353,7 +363,11 @@ async fn fetch_page_in_snapshot(
     stats.unread_count = totals.unread;
     stats.pending_ack_count = totals.pending_ack;
     // Move the selected rows; do not clone discarded prefixes or payloads.
-    let mut entries: Vec<_> = candidates.into_iter().skip(query.offset).take(query.limit).collect();
+    let mut entries: Vec<_> = candidates
+        .into_iter()
+        .skip(query.offset)
+        .take(query.limit)
+        .collect();
     match hydrate_page_bodies(cx, conn, &mut entries).await {
         Outcome::Ok(()) => {}
         Outcome::Err(error) => return Outcome::Err(error),
@@ -365,7 +379,12 @@ async fn fetch_page_in_snapshot(
     } else {
         build_groups(&entries, query.group)
     };
-    Outcome::Ok(ExplorerPage { entries, groups, total_count, stats })
+    Outcome::Ok(ExplorerPage {
+        entries,
+        groups,
+        total_count,
+        stats,
+    })
 }
 
 /// (`project_id`, `agent_id`) pairs for the named agent across projects.
@@ -393,7 +412,11 @@ async fn resolve_agent_ids(
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    match rows.iter().map(map_agent_row).collect::<Result<AgentIds, _>>() {
+    match rows
+        .iter()
+        .map(map_agent_row)
+        .collect::<Result<AgentIds, _>>()
+    {
         Ok(ids) => Outcome::Ok(ids),
         Err(error) => Outcome::Err(error),
     }
@@ -406,9 +429,18 @@ fn lane_query(
     shared_mailbox: bool,
     inbound: bool,
 ) -> (String, String, Vec<Value>) {
-    let source = if inbound { shared::inbound_source(shared_mailbox) } else { "messages m" };
+    let source = if inbound {
+        shared::inbound_source(shared_mailbox)
+    } else {
+        "messages m"
+    };
     let mut conditions = vec![
-        if inbound { "r.agent_id = ?1" } else { "m.sender_id = ?1" }.to_string(),
+        if inbound {
+            "r.agent_id = ?1"
+        } else {
+            "m.sender_id = ?1"
+        }
+        .to_string(),
         "m.project_id = ?2".to_string(),
     ];
     let mut params = vec![Value::BigInt(agent), Value::BigInt(project)];
@@ -417,10 +449,19 @@ fn lane_query(
 }
 
 #[derive(Default, Clone, Copy)]
-struct LaneCounts { total: usize, unread: usize, pending_ack: usize }
+struct LaneCounts {
+    total: usize,
+    unread: usize,
+    pending_ack: usize,
+}
 
 #[derive(Default)]
-struct DeliveryCounts { inbound: usize, outbound: usize, unread: usize, pending_ack: usize }
+struct DeliveryCounts {
+    inbound: usize,
+    outbound: usize,
+    unread: usize,
+    pending_ack: usize,
+}
 
 fn count_overflow() -> DbError {
     DbError::Serialization("mail explorer total count exceeds usize".to_string())
@@ -428,10 +469,20 @@ fn count_overflow() -> DbError {
 
 impl DeliveryCounts {
     fn add(&mut self, counts: LaneCounts, inbound: bool) -> Result<(), DbError> {
-        let total = if inbound { &mut self.inbound } else { &mut self.outbound };
+        let total = if inbound {
+            &mut self.inbound
+        } else {
+            &mut self.outbound
+        };
         *total = total.checked_add(counts.total).ok_or_else(count_overflow)?;
-        self.unread = self.unread.checked_add(counts.unread).ok_or_else(count_overflow)?;
-        self.pending_ack = self.pending_ack.checked_add(counts.pending_ack).ok_or_else(count_overflow)?;
+        self.unread = self
+            .unread
+            .checked_add(counts.unread)
+            .ok_or_else(count_overflow)?;
+        self.pending_ack = self
+            .pending_ack
+            .checked_add(counts.pending_ack)
+            .ok_or_else(count_overflow)?;
         Ok(())
     }
 }
@@ -440,7 +491,9 @@ fn count_sql(source: &str, conditions: &str, inbound: bool) -> String {
     let actionable = if inbound {
         "COUNT(DISTINCT CASE WHEN r.read_ts IS NULL THEN m.id END) AS unread, \
          COUNT(DISTINCT CASE WHEN m.ack_required <> 0 AND r.ack_ts IS NULL THEN m.id END) AS pending_ack"
-    } else { "0 AS unread, 0 AS pending_ack" };
+    } else {
+        "0 AS unread, 0 AS pending_ack"
+    };
     format!("SELECT COUNT(DISTINCT m.id) AS cnt, {actionable} FROM {source} WHERE {conditions}")
 }
 
@@ -466,7 +519,11 @@ async fn count_lane(
             let value = row.get_named::<i64>(name).map_err(explorer_decode_error)?;
             usize::try_from(value).map_err(|_| count_overflow())
         };
-        Ok(LaneCounts { total, unread: decode("unread")?, pending_ack: decode("pending_ack")? })
+        Ok(LaneCounts {
+            total,
+            unread: decode("unread")?,
+            pending_ack: decode("pending_ack")?,
+        })
     })();
     match decoded {
         Ok(counts) => Outcome::Ok(counts),
@@ -474,10 +531,20 @@ async fn count_lane(
     }
 }
 
-fn candidate_sql(source: &str, conditions: &str, query: &ExplorerQuery, shared_mailbox: bool, inbound: bool) -> String {
+fn candidate_sql(
+    source: &str,
+    conditions: &str,
+    query: &ExplorerQuery,
+    shared_mailbox: bool,
+    inbound: bool,
+) -> String {
     let recipient_join = shared::recipient_join(shared_mailbox);
     let to_agents = shared::recipient_projection(shared_mailbox, inbound);
-    let receipt_columns = if inbound { "r.kind, r.read_ts, r.ack_ts," } else { "" };
+    let receipt_columns = if inbound {
+        "r.kind, r.read_ts, r.ack_ts,"
+    } else {
+        ""
+    };
     let direct_join = if inbound {
         "LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id AND mr2.kind IN ('to', 'cc') \
          LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id"
@@ -502,11 +569,24 @@ fn candidate_sql(source: &str, conditions: &str, query: &ExplorerQuery, shared_m
     )
 }
 
-async fn hydrate_page_bodies(cx: &Cx, conn: &DbConn, entries: &mut [ExplorerEntry]) -> Outcome<(), DbError> {
-    let ids: Vec<_> = entries.iter().map(|entry| entry.message_id).collect::<BTreeSet<_>>().into_iter().collect();
+async fn hydrate_page_bodies(
+    cx: &Cx,
+    conn: &DbConn,
+    entries: &mut [ExplorerEntry],
+) -> Outcome<(), DbError> {
+    let ids: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.message_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mut bodies = HashMap::new();
     for chunk in ids.chunks(BODY_LOOKUP_BATCH) {
-        let (sql, params) = crate::sync::inbox::lookup_query("messages", "id, project_id, created_ts, body_md", chunk);
+        let (sql, params) = crate::sync::inbox::lookup_query(
+            "messages",
+            "id, project_id, created_ts, body_md",
+            chunk,
+        );
         let rows = match map_sql_outcome(raw_query(cx, conn, &sql, &params).await) {
             Outcome::Ok(rows) => rows,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -518,9 +598,12 @@ async fn hydrate_page_bodies(cx: &Cx, conn: &DbConn, entries: &mut [ExplorerEntr
                 Ok((
                     row.get_named::<i64>("id").map_err(explorer_decode_error)?,
                     (
-                        row.get_named::<i64>("project_id").map_err(explorer_decode_error)?,
-                        row.get_named::<i64>("created_ts").map_err(explorer_decode_error)?,
-                        row.get_named::<String>("body_md").map_err(explorer_decode_error)?,
+                        row.get_named::<i64>("project_id")
+                            .map_err(explorer_decode_error)?,
+                        row.get_named::<i64>("created_ts")
+                            .map_err(explorer_decode_error)?,
+                        row.get_named::<String>("body_md")
+                            .map_err(explorer_decode_error)?,
                     ),
                 ))
             })();
@@ -529,31 +612,46 @@ async fn hydrate_page_bodies(cx: &Cx, conn: &DbConn, entries: &mut [ExplorerEntr
                 Err(error) => return Outcome::Err(error),
             };
             if chunk.binary_search(&id).is_err() || bodies.insert(id, body).is_some() {
-                return Outcome::Err(DbError::Internal("unrequested or duplicate explorer body".into()));
+                return Outcome::Err(DbError::Internal(
+                    "unrequested or duplicate explorer body".into(),
+                ));
             }
         }
     }
     for entry in entries {
         let Some((project, created, body)) = bodies.get(&entry.message_id) else {
-            return Outcome::Err(DbError::Internal("explorer body disappeared inside its snapshot".into()));
+            return Outcome::Err(DbError::Internal(
+                "explorer body disappeared inside its snapshot".into(),
+            ));
         };
         if *project != entry.project_id || *created != entry.created_ts {
-            return Outcome::Err(DbError::Internal("explorer body identity changed inside its snapshot".into()));
+            return Outcome::Err(DbError::Internal(
+                "explorer body identity changed inside its snapshot".into(),
+            ));
         }
         entry.body_md.clone_from(body);
     }
     Outcome::Ok(())
 }
 
-fn apply_filters(conditions: &mut Vec<String>, params: &mut Vec<Value>, query: &ExplorerQuery, inbound: bool) {
+fn apply_filters(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    query: &ExplorerQuery,
+    inbound: bool,
+) {
     let mut idx = params.len() + 1;
     if !query.importance_filter.is_empty() {
-        let placeholders: Vec<String> = query.importance_filter.iter().map(|imp| {
-            params.push(Value::Text(imp.clone()));
-            let p = format!("?{idx}");
-            idx += 1;
-            p
-        }).collect();
+        let placeholders: Vec<String> = query
+            .importance_filter
+            .iter()
+            .map(|imp| {
+                params.push(Value::Text(imp.clone()));
+                let p = format!("?{idx}");
+                idx += 1;
+                p
+            })
+            .collect();
         conditions.push(format!("m.importance IN ({})", placeholders.join(",")));
     }
     match query.ack_filter {
@@ -571,24 +669,39 @@ fn apply_filters(conditions: &mut Vec<String>, params: &mut Vec<Value>, query: &
         }
     }
     if !query.text_filter.is_empty() {
-        let escaped = query.text_filter.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = query
+            .text_filter
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         params.push(Value::Text(format!("%{escaped}%")));
-        conditions.push(format!("(m.subject LIKE ?{idx} ESCAPE '\\' OR m.body_md LIKE ?{idx} ESCAPE '\\')"));
+        conditions.push(format!(
+            "(m.subject LIKE ?{idx} ESCAPE '\\' OR m.body_md LIKE ?{idx} ESCAPE '\\')"
+        ));
     }
 }
 
 fn explorer_decode_error(error: sqlmodel_core::Error) -> DbError {
-    DbError::Serialization(format!("invalid mail explorer database projection: {error}"))
+    DbError::Serialization(format!(
+        "invalid mail explorer database projection: {error}"
+    ))
 }
 
 fn map_agent_row(row: &SqlRow) -> Result<(i64, i64), DbError> {
-    Ok((row.get_named("project_id").map_err(explorer_decode_error)?, row.get_named("id").map_err(explorer_decode_error)?))
+    Ok((
+        row.get_named("project_id").map_err(explorer_decode_error)?,
+        row.get_named("id").map_err(explorer_decode_error)?,
+    ))
 }
 
 fn map_count_rows(rows: &[SqlRow]) -> Result<usize, DbError> {
-    let row = rows.first().ok_or_else(|| DbError::Serialization("mail explorer count query returned no row".to_string()))?;
+    let row = rows.first().ok_or_else(|| {
+        DbError::Serialization("mail explorer count query returned no row".to_string())
+    })?;
     let count = row.get_named::<i64>("cnt").map_err(explorer_decode_error)?;
-    usize::try_from(count).map_err(|_| DbError::Serialization("mail explorer count is negative or exceeds usize".to_string()))
+    usize::try_from(count).map_err(|_| {
+        DbError::Serialization("mail explorer count is negative or exceeds usize".to_string())
+    })
 }
 
 fn map_inbound_row(row: &SqlRow) -> Result<ExplorerEntry, DbError> {
@@ -601,13 +714,19 @@ fn map_inbound_row(row: &SqlRow) -> Result<ExplorerEntry, DbError> {
         to_agents: row.get_as(14).map_err(explorer_decode_error)?,
         subject: row.get_as(4).map_err(explorer_decode_error)?,
         body_md: row.get_as(5).map_err(explorer_decode_error)?,
-        thread_id: row.get_as::<Option<String>>(3).map_err(explorer_decode_error)?,
+        thread_id: row
+            .get_as::<Option<String>>(3)
+            .map_err(explorer_decode_error)?,
         importance: row.get_as(6).map_err(explorer_decode_error)?,
         ack_required: row.get_as::<i64>(7).map_err(explorer_decode_error)? != 0,
         created_ts: row.get_as(8).map_err(explorer_decode_error)?,
         kind: Some(row.get_as(9).map_err(explorer_decode_error)?),
-        read_ts: row.get_as::<Option<i64>>(10).map_err(explorer_decode_error)?,
-        ack_ts: row.get_as::<Option<i64>>(11).map_err(explorer_decode_error)?,
+        read_ts: row
+            .get_as::<Option<i64>>(10)
+            .map_err(explorer_decode_error)?,
+        ack_ts: row
+            .get_as::<Option<i64>>(11)
+            .map_err(explorer_decode_error)?,
         direction: Direction::Inbound,
     })
 }
@@ -622,7 +741,9 @@ fn map_outbound_row(row: &SqlRow) -> Result<ExplorerEntry, DbError> {
         to_agents: row.get_as(11).map_err(explorer_decode_error)?,
         subject: row.get_as(4).map_err(explorer_decode_error)?,
         body_md: row.get_as(5).map_err(explorer_decode_error)?,
-        thread_id: row.get_as::<Option<String>>(3).map_err(explorer_decode_error)?,
+        thread_id: row
+            .get_as::<Option<String>>(3)
+            .map_err(explorer_decode_error)?,
         importance: row.get_as(6).map_err(explorer_decode_error)?,
         ack_required: row.get_as::<i64>(7).map_err(explorer_decode_error)? != 0,
         created_ts: row.get_as(8).map_err(explorer_decode_error)?,
@@ -638,18 +759,28 @@ fn sql_order_by(mode: SortMode, inbound: bool) -> &'static str {
     match mode {
         SortMode::DateDesc => "m.created_ts DESC, m.id DESC",
         SortMode::DateAsc => "m.created_ts ASC, m.id ASC",
-        SortMode::ImportanceDesc => "CASE m.importance COLLATE BINARY WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, m.created_ts DESC, m.id DESC",
-        SortMode::AgentAlpha if inbound => "sender_name COLLATE NOCASE ASC, m.created_ts DESC, m.id DESC",
+        SortMode::ImportanceDesc => {
+            "CASE m.importance COLLATE BINARY WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, m.created_ts DESC, m.id DESC"
+        }
+        SortMode::AgentAlpha if inbound => {
+            "sender_name COLLATE NOCASE ASC, m.created_ts DESC, m.id DESC"
+        }
         SortMode::AgentAlpha => "to_agents COLLATE NOCASE ASC, m.created_ts DESC, m.id DESC",
     }
 }
 
 fn candidate_limit(query: &ExplorerQuery) -> Result<i64, DbError> {
-    if query.limit == 0 { return Ok(0); }
-    query.offset.checked_add(query.limit).and_then(|limit| i64::try_from(limit).ok()).ok_or_else(|| DbError::InvalidArgument {
-        field: "pagination",
-        message: "offset + limit exceeds the supported SQLite integer range".to_string(),
-    })
+    if query.limit == 0 {
+        return Ok(0);
+    }
+    query
+        .offset
+        .checked_add(query.limit)
+        .and_then(|limit| i64::try_from(limit).ok())
+        .ok_or_else(|| DbError::InvalidArgument {
+            field: "pagination",
+            message: "offset + limit exceeds the supported SQLite integer range".to_string(),
+        })
 }
 
 fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
@@ -657,45 +788,94 @@ fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
         let primary = match mode {
             SortMode::DateDesc => b.created_ts.cmp(&a.created_ts),
             SortMode::DateAsc => a.created_ts.cmp(&b.created_ts),
-            SortMode::ImportanceDesc => importance_rank(&b.importance).cmp(&importance_rank(&a.importance)).then_with(|| b.created_ts.cmp(&a.created_ts)),
+            SortMode::ImportanceDesc => importance_rank(&b.importance)
+                .cmp(&importance_rank(&a.importance))
+                .then_with(|| b.created_ts.cmp(&a.created_ts)),
             SortMode::AgentAlpha => {
-                let agent_a = if a.direction == Direction::Inbound { &a.sender_name } else { &a.to_agents };
-                let agent_b = if b.direction == Direction::Inbound { &b.sender_name } else { &b.to_agents };
-                agent_a.bytes().map(|byte| byte.to_ascii_lowercase()).cmp(agent_b.bytes().map(|byte| byte.to_ascii_lowercase())).then_with(|| b.created_ts.cmp(&a.created_ts))
+                let agent_a = if a.direction == Direction::Inbound {
+                    &a.sender_name
+                } else {
+                    &a.to_agents
+                };
+                let agent_b = if b.direction == Direction::Inbound {
+                    &b.sender_name
+                } else {
+                    &b.to_agents
+                };
+                agent_a
+                    .bytes()
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .cmp(agent_b.bytes().map(|byte| byte.to_ascii_lowercase()))
+                    .then_with(|| b.created_ts.cmp(&a.created_ts))
             }
         };
-        primary.then_with(|| if mode == SortMode::DateAsc { a.message_id.cmp(&b.message_id) } else { b.message_id.cmp(&a.message_id) }).then_with(|| {
-            let rank = |direction| match direction { Direction::Inbound => 0_u8, Direction::Outbound => 1, Direction::All => 2 };
-            rank(a.direction).cmp(&rank(b.direction))
-        })
+        primary
+            .then_with(|| {
+                if mode == SortMode::DateAsc {
+                    a.message_id.cmp(&b.message_id)
+                } else {
+                    b.message_id.cmp(&a.message_id)
+                }
+            })
+            .then_with(|| {
+                let rank = |direction| match direction {
+                    Direction::Inbound => 0_u8,
+                    Direction::Outbound => 1,
+                    Direction::All => 2,
+                };
+                rank(a.direction).cmp(&rank(b.direction))
+            })
     });
 }
 
 fn importance_rank(imp: &str) -> u8 {
-    match imp { "urgent" => 4, "high" => 3, "normal" => 2, "low" => 1, _ => 0 }
+    match imp {
+        "urgent" => 4,
+        "high" => 3,
+        "normal" => 2,
+        "low" => 1,
+        _ => 0,
+    }
 }
 
 fn build_groups(entries: &[ExplorerEntry], mode: GroupMode) -> Vec<ExplorerGroup> {
-    let mut map: std::collections::BTreeMap<String, Vec<ExplorerEntry>> = std::collections::BTreeMap::new();
+    let mut map: std::collections::BTreeMap<String, Vec<ExplorerEntry>> =
+        std::collections::BTreeMap::new();
     for entry in entries {
         let key = match mode {
             GroupMode::None => unreachable!(),
             GroupMode::Project => entry.project_slug.clone(),
-            GroupMode::Thread => entry.thread_id.clone().unwrap_or_else(|| "(no thread)".to_string()),
-            GroupMode::Agent => if entry.direction == Direction::Inbound { entry.sender_name.clone() } else { entry.to_agents.clone() },
+            GroupMode::Thread => entry
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| "(no thread)".to_string()),
+            GroupMode::Agent => {
+                if entry.direction == Direction::Inbound {
+                    entry.sender_name.clone()
+                } else {
+                    entry.to_agents.clone()
+                }
+            }
         };
         map.entry(key).or_default().push(entry.clone());
     }
-    map.into_iter().map(|(key, entries)| {
-        let count = entries.len();
-        let label = match mode {
-            GroupMode::Project => format!("Project: {key}"),
-            GroupMode::Thread => format!("Thread: {key}"),
-            GroupMode::Agent => format!("Agent: {key}"),
-            GroupMode::None => key.clone(),
-        };
-        ExplorerGroup { key, label, count, entries }
-    }).collect()
+    map.into_iter()
+        .map(|(key, entries)| {
+            let count = entries.len();
+            let label = match mode {
+                GroupMode::Project => format!("Project: {key}"),
+                GroupMode::Thread => format!("Thread: {key}"),
+                GroupMode::Agent => format!("Agent: {key}"),
+                GroupMode::None => key.clone(),
+            };
+            ExplorerGroup {
+                key,
+                label,
+                count,
+                entries,
+            }
+        })
+        .collect()
 }
 
 /// Keeps the existing candidate-scoped distinct statistics without keeping
@@ -711,14 +891,22 @@ struct StatsAccumulator {
 impl StatsAccumulator {
     fn observe(&mut self, entry: &ExplorerEntry) {
         self.projects.insert(entry.project_id);
-        if let Some(thread) = &entry.thread_id { self.threads.insert(thread.clone()); }
+        if let Some(thread) = &entry.thread_id {
+            self.threads.insert(thread.clone());
+        }
         collect_agent_names(&mut self.agents, &entry.sender_name);
         collect_agent_names(&mut self.agents, &entry.to_agents);
         if entry.direction == Direction::Inbound {
             self.counts.inbound_count += 1;
-            if entry.read_ts.is_none() { self.counts.unread_count += 1; }
-            if entry.ack_required && entry.ack_ts.is_none() { self.counts.pending_ack_count += 1; }
-        } else { self.counts.outbound_count += 1; }
+            if entry.read_ts.is_none() {
+                self.counts.unread_count += 1;
+            }
+            if entry.ack_required && entry.ack_ts.is_none() {
+                self.counts.pending_ack_count += 1;
+            }
+        } else {
+            self.counts.outbound_count += 1;
+        }
     }
 
     fn finish(mut self) -> ExplorerStats {
@@ -732,14 +920,17 @@ impl StatsAccumulator {
 #[cfg(test)]
 fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
     let mut stats = StatsAccumulator::default();
-    for entry in entries { stats.observe(entry); }
+    for entry in entries {
+        stats.observe(entry);
+    }
     stats.finish()
 }
 
 fn collect_agent_names(agents: &mut HashSet<String>, names_csv: &str) {
     for raw in names_csv.split(',') {
         let name = raw.trim();
-        if !name.is_empty() && crate::project_mailbox::parse_project_mailbox_address(name).is_none() {
+        if !name.is_empty() && crate::project_mailbox::parse_project_mailbox_address(name).is_none()
+        {
             agents.insert(name.to_string());
         }
     }
@@ -763,13 +954,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direction_default_is_all() { assert_eq!(Direction::default(), Direction::All); }
+    fn direction_default_is_all() {
+        assert_eq!(Direction::default(), Direction::All);
+    }
     #[test]
-    fn sort_mode_default_is_date_desc() { assert_eq!(SortMode::default(), SortMode::DateDesc); }
+    fn sort_mode_default_is_date_desc() {
+        assert_eq!(SortMode::default(), SortMode::DateDesc);
+    }
     #[test]
-    fn group_mode_default_is_none() { assert_eq!(GroupMode::default(), GroupMode::None); }
+    fn group_mode_default_is_none() {
+        assert_eq!(GroupMode::default(), GroupMode::None);
+    }
     #[test]
-    fn ack_filter_default_is_all() { assert_eq!(AckFilter::default(), AckFilter::All); }
+    fn ack_filter_default_is_all() {
+        assert_eq!(AckFilter::default(), AckFilter::All);
+    }
 
     #[test]
     fn importance_rank_ordering() {
@@ -781,7 +980,11 @@ mod tests {
 
     #[test]
     fn sort_entries_date_desc() {
-        let mut entries = vec![test_entry(1, 100, Direction::Inbound), test_entry(2, 300, Direction::Outbound), test_entry(3, 200, Direction::Inbound)];
+        let mut entries = vec![
+            test_entry(1, 100, Direction::Inbound),
+            test_entry(2, 300, Direction::Outbound),
+            test_entry(3, 200, Direction::Inbound),
+        ];
         sort_entries(&mut entries, SortMode::DateDesc);
         assert_eq!(entries[0].message_id, 2);
         assert_eq!(entries[1].message_id, 3);
@@ -790,7 +993,11 @@ mod tests {
 
     #[test]
     fn sort_entries_date_asc() {
-        let mut entries = vec![test_entry(1, 100, Direction::Inbound), test_entry(2, 300, Direction::Outbound), test_entry(3, 200, Direction::Inbound)];
+        let mut entries = vec![
+            test_entry(1, 100, Direction::Inbound),
+            test_entry(2, 300, Direction::Outbound),
+            test_entry(3, 200, Direction::Inbound),
+        ];
         sort_entries(&mut entries, SortMode::DateAsc);
         assert_eq!(entries[0].message_id, 1);
         assert_eq!(entries[1].message_id, 3);
@@ -799,7 +1006,11 @@ mod tests {
 
     #[test]
     fn sort_entries_importance() {
-        let mut entries = vec![test_entry_with_importance(1, 100, "normal"), test_entry_with_importance(2, 200, "urgent"), test_entry_with_importance(3, 300, "high")];
+        let mut entries = vec![
+            test_entry_with_importance(1, 100, "normal"),
+            test_entry_with_importance(2, 200, "urgent"),
+            test_entry_with_importance(3, 300, "high"),
+        ];
         sort_entries(&mut entries, SortMode::ImportanceDesc);
         assert_eq!(entries[0].message_id, 2);
         assert_eq!(entries[1].message_id, 3);
@@ -808,7 +1019,11 @@ mod tests {
 
     #[test]
     fn compute_stats_basic() {
-        let entries = vec![test_entry(1, 100, Direction::Inbound), test_entry(2, 200, Direction::Outbound), test_entry(3, 300, Direction::Inbound)];
+        let entries = vec![
+            test_entry(1, 100, Direction::Inbound),
+            test_entry(2, 200, Direction::Outbound),
+            test_entry(3, 300, Direction::Inbound),
+        ];
         let stats = compute_stats(&entries);
         assert_eq!(stats.inbound_count, 2);
         assert_eq!(stats.outbound_count, 1);
@@ -888,7 +1103,12 @@ mod tests {
 
     #[test]
     fn explorer_page_empty() {
-        let page = ExplorerPage { entries: Vec::new(), groups: Vec::new(), total_count: 0, stats: ExplorerStats::default() };
+        let page = ExplorerPage {
+            entries: Vec::new(),
+            groups: Vec::new(),
+            total_count: 0,
+            stats: ExplorerStats::default(),
+        };
         assert_eq!(page.total_count, 0);
         assert!(page.entries.is_empty());
     }
@@ -897,7 +1117,10 @@ mod tests {
     fn apply_filters_importance() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { importance_filter: vec!["high".to_string(), "urgent".to_string()], ..Default::default() };
+        let query = ExplorerQuery {
+            importance_filter: vec!["high".to_string(), "urgent".to_string()],
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 2);
         assert!(conditions[1].contains("m.importance IN"));
@@ -908,34 +1131,65 @@ mod tests {
     fn apply_filters_text() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { text_filter: "hello%world".to_string(), ..Default::default() };
+        let query = ExplorerQuery {
+            text_filter: "hello%world".to_string(),
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 2);
         assert!(conditions[1].contains("LIKE"));
-        if let Value::Text(ref s) = params[1] { assert!(s.contains("hello\\%world")); }
-        else { panic!("expected text param"); }
+        if let Value::Text(ref s) = params[1] {
+            assert!(s.contains("hello\\%world"));
+        } else {
+            panic!("expected text param");
+        }
     }
 
     fn test_entry(id: i64, ts: i64, direction: Direction) -> ExplorerEntry {
         ExplorerEntry {
-            message_id: id, project_id: 1, project_slug: "test-project".to_string(),
-            sender_name: "TestAgent".to_string(), to_agents: "OtherAgent".to_string(),
-            subject: format!("Subject {id}"), body_md: String::new(), thread_id: None,
-            importance: "normal".to_string(), ack_required: false, created_ts: ts,
-            kind: None, read_ts: None, ack_ts: None, direction,
+            message_id: id,
+            project_id: 1,
+            project_slug: "test-project".to_string(),
+            sender_name: "TestAgent".to_string(),
+            to_agents: "OtherAgent".to_string(),
+            subject: format!("Subject {id}"),
+            body_md: String::new(),
+            thread_id: None,
+            importance: "normal".to_string(),
+            ack_required: false,
+            created_ts: ts,
+            kind: None,
+            read_ts: None,
+            ack_ts: None,
+            direction,
         }
     }
 
     fn test_entry_with_importance(id: i64, ts: i64, importance: &str) -> ExplorerEntry {
-        ExplorerEntry { importance: importance.to_string(), ..test_entry(id, ts, Direction::Inbound) }
+        ExplorerEntry {
+            importance: importance.to_string(),
+            ..test_entry(id, ts, Direction::Inbound)
+        }
     }
 
     #[test]
     fn sort_entries_agent_alpha() {
         let mut entries = vec![
-            { let mut e = test_entry(1, 100, Direction::Inbound); e.sender_name = "ZuluFox".to_string(); e },
-            { let mut e = test_entry(2, 200, Direction::Outbound); e.to_agents = "AlphaWolf".to_string(); e },
-            { let mut e = test_entry(3, 300, Direction::Inbound); e.sender_name = "MidLake".to_string(); e },
+            {
+                let mut e = test_entry(1, 100, Direction::Inbound);
+                e.sender_name = "ZuluFox".to_string();
+                e
+            },
+            {
+                let mut e = test_entry(2, 200, Direction::Outbound);
+                e.to_agents = "AlphaWolf".to_string();
+                e
+            },
+            {
+                let mut e = test_entry(3, 300, Direction::Inbound);
+                e.sender_name = "MidLake".to_string();
+                e
+            },
         ];
         sort_entries(&mut entries, SortMode::AgentAlpha);
         assert_eq!(entries[0].message_id, 2);
@@ -946,8 +1200,16 @@ mod tests {
     #[test]
     fn sort_entries_agent_alpha_tiebreak_by_date() {
         let mut entries = vec![
-            { let mut e = test_entry(1, 100, Direction::Inbound); e.sender_name = "RedFox".to_string(); e },
-            { let mut e = test_entry(2, 300, Direction::Inbound); e.sender_name = "RedFox".to_string(); e },
+            {
+                let mut e = test_entry(1, 100, Direction::Inbound);
+                e.sender_name = "RedFox".to_string();
+                e
+            },
+            {
+                let mut e = test_entry(2, 300, Direction::Inbound);
+                e.sender_name = "RedFox".to_string();
+                e
+            },
         ];
         sort_entries(&mut entries, SortMode::AgentAlpha);
         assert_eq!(entries[0].message_id, 2);
@@ -956,7 +1218,11 @@ mod tests {
 
     #[test]
     fn sort_entries_importance_tiebreak_by_date() {
-        let entries_before = vec![test_entry_with_importance(1, 100, "urgent"), test_entry_with_importance(2, 300, "urgent"), test_entry_with_importance(3, 200, "urgent")];
+        let entries_before = vec![
+            test_entry_with_importance(1, 100, "urgent"),
+            test_entry_with_importance(2, 300, "urgent"),
+            test_entry_with_importance(3, 200, "urgent"),
+        ];
         let mut entries = entries_before;
         sort_entries(&mut entries, SortMode::ImportanceDesc);
         assert_eq!(entries[0].message_id, 2);
@@ -975,7 +1241,10 @@ mod tests {
     fn apply_filters_ack_pending() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { ack_filter: AckFilter::PendingAck, ..Default::default() };
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::PendingAck,
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
         assert!(conditions.iter().any(|c| c.contains("m.ack_required = 1")));
         assert!(conditions.iter().any(|c| c.contains("r.ack_ts IS NULL")));
@@ -985,17 +1254,27 @@ mod tests {
     fn apply_filters_ack_acknowledged() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { ack_filter: AckFilter::Acknowledged, ..Default::default() };
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::Acknowledged,
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
         assert!(conditions.iter().any(|c| c.contains("m.ack_required = 1")));
-        assert!(conditions.iter().any(|c| c.contains("r.ack_ts IS NOT NULL")));
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c.contains("r.ack_ts IS NOT NULL"))
+        );
     }
 
     #[test]
     fn apply_filters_unread_adds_read_condition() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { ack_filter: AckFilter::Unread, ..Default::default() };
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::Unread,
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
         assert!(conditions.iter().any(|c| c.contains("r.read_ts IS NULL")));
         assert_eq!(params.len(), 1);
@@ -1005,7 +1284,10 @@ mod tests {
     fn apply_filters_outbound_ack_filter_returns_no_rows() {
         let mut conditions = vec!["m.sender_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { ack_filter: AckFilter::PendingAck, ..Default::default() };
+        let query = ExplorerQuery {
+            ack_filter: AckFilter::PendingAck,
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, false);
         assert!(conditions.iter().any(|c| c == "0"));
     }
@@ -1014,27 +1296,49 @@ mod tests {
     fn apply_filters_text_escapes_underscore() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { text_filter: "hello_world".to_string(), ..Default::default() };
+        let query = ExplorerQuery {
+            text_filter: "hello_world".to_string(),
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
-        if let Value::Text(ref s) = params[1] { assert!(s.contains("hello\\_world"), "underscore should be escaped: {s}"); }
-        else { panic!("expected text param"); }
+        if let Value::Text(ref s) = params[1] {
+            assert!(
+                s.contains("hello\\_world"),
+                "underscore should be escaped: {s}"
+            );
+        } else {
+            panic!("expected text param");
+        }
     }
 
     #[test]
     fn apply_filters_text_escapes_backslash() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { text_filter: r"folder\name".to_string(), ..Default::default() };
+        let query = ExplorerQuery {
+            text_filter: r"folder\name".to_string(),
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
-        if let Value::Text(ref s) = params[1] { assert!(s.contains(r"folder\\name"), "backslash should be escaped for LIKE/ESCAPE: {s}"); }
-        else { panic!("expected text param"); }
+        if let Value::Text(ref s) = params[1] {
+            assert!(
+                s.contains(r"folder\\name"),
+                "backslash should be escaped for LIKE/ESCAPE: {s}"
+            );
+        } else {
+            panic!("expected text param");
+        }
     }
 
     #[test]
     fn apply_filters_combined_importance_and_text() {
         let mut conditions = vec!["r.agent_id = ?1".to_string()];
         let mut params: Vec<Value> = vec![Value::BigInt(1)];
-        let query = ExplorerQuery { importance_filter: vec!["urgent".to_string()], text_filter: "auth".to_string(), ..Default::default() };
+        let query = ExplorerQuery {
+            importance_filter: vec!["urgent".to_string()],
+            text_filter: "auth".to_string(),
+            ..Default::default()
+        };
         apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 3);
         assert!(conditions[1].contains("m.importance IN"));
@@ -1055,102 +1359,170 @@ mod tests {
     #[test]
     fn compute_stats_empty() {
         let stats = compute_stats(&[]);
-        assert_eq!(stats.inbound_count, 0); assert_eq!(stats.outbound_count, 0);
-        assert_eq!(stats.unread_count, 0); assert_eq!(stats.pending_ack_count, 0);
-        assert_eq!(stats.unique_threads, 0); assert_eq!(stats.unique_projects, 0); assert_eq!(stats.unique_agents, 0);
+        assert_eq!(stats.inbound_count, 0);
+        assert_eq!(stats.outbound_count, 0);
+        assert_eq!(stats.unread_count, 0);
+        assert_eq!(stats.pending_ack_count, 0);
+        assert_eq!(stats.unique_threads, 0);
+        assert_eq!(stats.unique_projects, 0);
+        assert_eq!(stats.unique_agents, 0);
     }
 
     #[test]
     fn compute_stats_unique_counting() {
         let mut e1 = test_entry(1, 100, Direction::Inbound);
-        e1.project_id = 10; e1.sender_name = "RedFox".to_string(); e1.thread_id = Some("t1".to_string());
+        e1.project_id = 10;
+        e1.sender_name = "RedFox".to_string();
+        e1.thread_id = Some("t1".to_string());
         let mut e2 = test_entry(2, 200, Direction::Outbound);
-        e2.project_id = 20; e2.sender_name = "BlueLake".to_string(); e2.thread_id = Some("t1".to_string());
+        e2.project_id = 20;
+        e2.sender_name = "BlueLake".to_string();
+        e2.thread_id = Some("t1".to_string());
         let mut e3 = test_entry(3, 300, Direction::Inbound);
-        e3.project_id = 10; e3.sender_name = "RedFox".to_string(); e3.thread_id = Some("t2".to_string());
+        e3.project_id = 10;
+        e3.sender_name = "RedFox".to_string();
+        e3.thread_id = Some("t2".to_string());
         let stats = compute_stats(&[e1, e2, e3]);
-        assert_eq!(stats.unique_projects, 2); assert_eq!(stats.unique_threads, 2); assert_eq!(stats.unique_agents, 3);
+        assert_eq!(stats.unique_projects, 2);
+        assert_eq!(stats.unique_threads, 2);
+        assert_eq!(stats.unique_agents, 3);
     }
 
     #[test]
     fn compute_stats_parses_multiple_recipient_agents() {
         let mut e = test_entry(1, 100, Direction::Outbound);
-        e.sender_name = "BlueLake".to_string(); e.to_agents = "GreenCastle, RedFox, BlueLake".to_string();
-        let stats = compute_stats(&[e]); assert_eq!(stats.unique_agents, 3);
+        e.sender_name = "BlueLake".to_string();
+        e.to_agents = "GreenCastle, RedFox, BlueLake".to_string();
+        let stats = compute_stats(&[e]);
+        assert_eq!(stats.unique_agents, 3);
     }
 
     #[test]
     fn compute_stats_outbound_not_counted_as_unread() {
         let e = test_entry(1, 100, Direction::Outbound);
-        let stats = compute_stats(&[e]); assert_eq!(stats.unread_count, 0); assert_eq!(stats.outbound_count, 1);
+        let stats = compute_stats(&[e]);
+        assert_eq!(stats.unread_count, 0);
+        assert_eq!(stats.outbound_count, 1);
     }
 
     #[test]
-    fn build_groups_empty() { assert!(build_groups(&[], GroupMode::Project).is_empty()); }
+    fn build_groups_empty() {
+        assert!(build_groups(&[], GroupMode::Project).is_empty());
+    }
     #[test]
     fn build_groups_label_format() {
-        let mut e = test_entry(1, 100, Direction::Inbound); e.project_slug = "my-project".to_string();
-        let groups = build_groups(&[e], GroupMode::Project); assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "Project: my-project"); assert_eq!(groups[0].key, "my-project");
+        let mut e = test_entry(1, 100, Direction::Inbound);
+        e.project_slug = "my-project".to_string();
+        let groups = build_groups(&[e], GroupMode::Project);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "Project: my-project");
+        assert_eq!(groups[0].key, "my-project");
     }
     #[test]
     fn build_groups_thread_label_format() {
-        let mut e = test_entry(1, 100, Direction::Inbound); e.thread_id = Some("bd-123".to_string());
-        let groups = build_groups(&[e], GroupMode::Thread); assert_eq!(groups[0].label, "Thread: bd-123");
+        let mut e = test_entry(1, 100, Direction::Inbound);
+        e.thread_id = Some("bd-123".to_string());
+        let groups = build_groups(&[e], GroupMode::Thread);
+        assert_eq!(groups[0].label, "Thread: bd-123");
     }
     #[test]
     fn build_groups_agent_label_format() {
-        let mut e = test_entry(1, 100, Direction::Inbound); e.sender_name = "RedFox".to_string();
-        let groups = build_groups(&[e], GroupMode::Agent); assert_eq!(groups[0].label, "Agent: RedFox");
+        let mut e = test_entry(1, 100, Direction::Inbound);
+        e.sender_name = "RedFox".to_string();
+        let groups = build_groups(&[e], GroupMode::Agent);
+        assert_eq!(groups[0].label, "Agent: RedFox");
     }
 
     #[test]
     fn direction_serde_roundtrip() {
         for dir in [Direction::Inbound, Direction::Outbound, Direction::All] {
-            let json = serde_json::to_string(&dir).unwrap(); let parsed: Direction = serde_json::from_str(&json).unwrap(); assert_eq!(parsed, dir);
+            let json = serde_json::to_string(&dir).unwrap();
+            let parsed: Direction = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, dir);
         }
     }
     #[test]
     fn sort_mode_serde_roundtrip() {
-        for mode in [SortMode::DateDesc, SortMode::DateAsc, SortMode::ImportanceDesc, SortMode::AgentAlpha] {
-            let json = serde_json::to_string(&mode).unwrap(); let parsed: SortMode = serde_json::from_str(&json).unwrap(); assert_eq!(parsed, mode);
+        for mode in [
+            SortMode::DateDesc,
+            SortMode::DateAsc,
+            SortMode::ImportanceDesc,
+            SortMode::AgentAlpha,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: SortMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
         }
     }
     #[test]
     fn group_mode_serde_roundtrip() {
-        for mode in [GroupMode::None, GroupMode::Project, GroupMode::Thread, GroupMode::Agent] {
-            let json = serde_json::to_string(&mode).unwrap(); let parsed: GroupMode = serde_json::from_str(&json).unwrap(); assert_eq!(parsed, mode);
+        for mode in [
+            GroupMode::None,
+            GroupMode::Project,
+            GroupMode::Thread,
+            GroupMode::Agent,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: GroupMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
         }
     }
     #[test]
     fn ack_filter_serde_roundtrip() {
-        for filter in [AckFilter::All, AckFilter::PendingAck, AckFilter::Acknowledged, AckFilter::Unread] {
-            let json = serde_json::to_string(&filter).unwrap(); let parsed: AckFilter = serde_json::from_str(&json).unwrap(); assert_eq!(parsed, filter);
+        for filter in [
+            AckFilter::All,
+            AckFilter::PendingAck,
+            AckFilter::Acknowledged,
+            AckFilter::Unread,
+        ] {
+            let json = serde_json::to_string(&filter).unwrap();
+            let parsed: AckFilter = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, filter);
         }
     }
     #[test]
     fn explorer_entry_serde_roundtrip() {
-        let entry = test_entry(42, 1_000_000, Direction::Inbound); let json = serde_json::to_string(&entry).unwrap();
-        let parsed: ExplorerEntry = serde_json::from_str(&json).unwrap(); assert_eq!(parsed.message_id, 42); assert_eq!(parsed.created_ts, 1_000_000);
+        let entry = test_entry(42, 1_000_000, Direction::Inbound);
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: ExplorerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.message_id, 42);
+        assert_eq!(parsed.created_ts, 1_000_000);
     }
     #[test]
     fn explorer_stats_default() {
-        let stats = ExplorerStats::default(); assert_eq!(stats.inbound_count, 0); assert_eq!(stats.outbound_count, 0);
-        assert_eq!(stats.unread_count, 0); assert_eq!(stats.pending_ack_count, 0); assert_eq!(stats.unique_threads, 0);
-        assert_eq!(stats.unique_projects, 0); assert_eq!(stats.unique_agents, 0);
+        let stats = ExplorerStats::default();
+        assert_eq!(stats.inbound_count, 0);
+        assert_eq!(stats.outbound_count, 0);
+        assert_eq!(stats.unread_count, 0);
+        assert_eq!(stats.pending_ack_count, 0);
+        assert_eq!(stats.unique_threads, 0);
+        assert_eq!(stats.unique_projects, 0);
+        assert_eq!(stats.unique_agents, 0);
     }
     #[test]
     fn explorer_page_serde_roundtrip() {
         let page = ExplorerPage {
             entries: vec![test_entry(1, 100, Direction::Inbound)],
-            groups: vec![ExplorerGroup { key: "proj-a".to_string(), label: "Project: proj-a".to_string(), count: 1, entries: vec![test_entry(1, 100, Direction::Inbound)] }],
-            total_count: 1, stats: ExplorerStats::default(),
+            groups: vec![ExplorerGroup {
+                key: "proj-a".to_string(),
+                label: "Project: proj-a".to_string(),
+                count: 1,
+                entries: vec![test_entry(1, 100, Direction::Inbound)],
+            }],
+            total_count: 1,
+            stats: ExplorerStats::default(),
         };
-        let json = serde_json::to_string(&page).unwrap(); let parsed: ExplorerPage = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.total_count, 1); assert_eq!(parsed.entries.len(), 1); assert_eq!(parsed.groups.len(), 1); assert_eq!(parsed.groups[0].count, 1);
+        let json = serde_json::to_string(&page).unwrap();
+        let parsed: ExplorerPage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_count, 1);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.groups.len(), 1);
+        assert_eq!(parsed.groups[0].count, 1);
     }
     #[test]
     fn importance_rank_unknown_returns_zero() {
-        assert_eq!(importance_rank(""), 0); assert_eq!(importance_rank("critical"), 0); assert_eq!(importance_rank("URGENT"), 0);
+        assert_eq!(importance_rank(""), 0);
+        assert_eq!(importance_rank("critical"), 0);
+        assert_eq!(importance_rank("URGENT"), 0);
     }
 }

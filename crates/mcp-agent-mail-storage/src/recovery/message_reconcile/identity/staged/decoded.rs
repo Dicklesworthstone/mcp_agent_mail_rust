@@ -203,12 +203,18 @@ fn open_with_cache(
     if let Some(decoded) = cache.find(&bytes, format) {
         budget.checkpoint("staged index decode")?;
         if decoded.entries.len() != count {
-            return Err(invalid("staged canonical index decoded entry count changed"));
+            return Err(invalid(
+                "staged canonical index decoded entry count changed",
+            ));
         }
-        return Ok(ObservedIndex { view: View::Cached(decoded) });
+        return Ok(ObservedIndex {
+            view: View::Cached(decoded),
+        });
     }
     #[cfg(test)]
-    cache.decodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache
+        .decodes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut snapshot = tempfile::Builder::new()
         .prefix(".canonical-identity-index-")
         .tempfile()?;
@@ -216,7 +222,9 @@ fn open_with_cache(
     budget.checkpoint("staged index decode")?;
     let index = Index::open_ext(snapshot.path(), format)?;
     if index.len() != count {
-        return Err(invalid("staged canonical index decoded entry count changed"));
+        return Err(invalid(
+            "staged canonical index decoded entry count changed",
+        ));
     }
     if let Some(entries) = cache.copy_entries(&index, bytes.len(), budget)? {
         let decoded = Arc::new(Decoded {
@@ -228,9 +236,16 @@ fn open_with_cache(
         // Neither the native index nor the private file is retained by a hit.
         drop(index);
         drop(snapshot);
-        Ok(ObservedIndex { view: View::Cached(decoded) })
+        Ok(ObservedIndex {
+            view: View::Cached(decoded),
+        })
     } else {
-        Ok(ObservedIndex { view: View::Native { index, _snapshot: snapshot } })
+        Ok(ObservedIndex {
+            view: View::Native {
+                index,
+                _snapshot: snapshot,
+            },
+        })
     }
 }
 
@@ -243,13 +258,25 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Repository, Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        for name in ["Alpha", "alpha", "folder-file", "folder-neighbor/file", "folder/file"] {
+        for name in [
+            "Alpha",
+            "alpha",
+            "folder-file",
+            "folder-neighbor/file",
+            "folder/file",
+        ] {
             let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, name.as_bytes()).unwrap();
         }
         let mut index = repo.index().unwrap();
-        for name in ["Alpha", "alpha", "folder-file", "folder-neighbor/file", "folder/file"] {
+        for name in [
+            "Alpha",
+            "alpha",
+            "folder-file",
+            "folder-neighbor/file",
+            "folder/file",
+        ] {
             index.add_path(Path::new(name)).unwrap();
         }
         index.write().unwrap();
@@ -275,13 +302,22 @@ mod tests {
         };
         assert!(Arc::ptr_eq(left, right));
         let native = Index::open_ext(&repo.path().join("index"), repo.object_format()).unwrap();
-        for prefix in ["", "A", "Alpha", "alpha", "folder", "folder/", "folder-", "missing"] {
-            assert_eq!(second.find_prefix(prefix).unwrap(), native.find_prefix(prefix).ok(), "{prefix}");
+        for prefix in [
+            "", "A", "Alpha", "alpha", "folder", "folder/", "folder-", "missing",
+        ] {
+            assert_eq!(
+                second.find_prefix(prefix).unwrap(),
+                native.find_prefix(prefix).ok(),
+                "{prefix}"
+            );
         }
         for position in 0..native.len() {
             let entry = native.get(position).unwrap();
             let cached = second.get(position).unwrap();
-            assert_eq!((cached.path, cached.id, cached.mode, cached.flags), (entry.path, entry.id, entry.mode, entry.flags));
+            assert_eq!(
+                (cached.path, cached.id, cached.mode, cached.flags),
+                (entry.path, entry.id, entry.mode, entry.flags)
+            );
         }
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), bytes);
     }
@@ -300,7 +336,8 @@ mod tests {
         let changed = std::fs::read(repo.path().join("index")).unwrap();
         assert_eq!(changed.len(), bytes.len());
         assert_ne!(changed, bytes);
-        let next = open_with_cache(&repo, changed.clone(), count(&changed), &budget, &cache).unwrap();
+        let next =
+            open_with_cache(&repo, changed.clone(), count(&changed), &budget, &cache).unwrap();
         assert_eq!(cache.decodes.load(Ordering::Relaxed), 2);
         assert_ne!(next.get(0).unwrap().id, original);
         assert_eq!(first.get(0).unwrap().id, original);
@@ -329,9 +366,14 @@ mod tests {
         let (_dir, repo, bytes) = fixture();
         let budget = CanonicalScanBudget::default();
         for (input, retained) in [(0, usize::MAX), (usize::MAX, 0), (usize::MAX, bytes.len())] {
-            let cache = Cache { max_input_bytes: input, max_retained_bytes: retained, ..Cache::new() };
+            let cache = Cache {
+                max_input_bytes: input,
+                max_retained_bytes: retained,
+                ..Cache::new()
+            };
             for _ in 0..2 {
-                let observed = open_with_cache(&repo, bytes.clone(), count(&bytes), &budget, &cache).unwrap();
+                let observed =
+                    open_with_cache(&repo, bytes.clone(), count(&bytes), &budget, &cache).unwrap();
                 assert!(matches!(&observed.view, View::Native { .. }));
                 assert_eq!(observed.len(), count(&bytes));
                 assert!(observed.find_prefix("Alpha").unwrap().is_some());
@@ -346,7 +388,14 @@ mod tests {
         let (_dir, repo, bytes) = fixture();
         let cache = Cache::new();
         let held = cache.slot.lock().unwrap();
-        let observed = open_with_cache(&repo, bytes.clone(), count(&bytes), &CanonicalScanBudget::default(), &cache).unwrap();
+        let observed = open_with_cache(
+            &repo,
+            bytes.clone(),
+            count(&bytes),
+            &CanonicalScanBudget::default(),
+            &cache,
+        )
+        .unwrap();
         assert_eq!(observed.len(), count(&bytes));
         assert_eq!(cache.decodes.load(Ordering::Relaxed), 1);
         assert!(held.is_none());
@@ -358,7 +407,14 @@ mod tests {
     fn warm_cache_cannot_override_the_callers_declared_entry_count() {
         let (_dir, repo, bytes) = fixture();
         let cache = Cache::new();
-        open_with_cache(&repo, bytes.clone(), count(&bytes), &CanonicalScanBudget::default(), &cache).unwrap();
+        open_with_cache(
+            &repo,
+            bytes.clone(),
+            count(&bytes),
+            &CanonicalScanBudget::default(),
+            &cache,
+        )
+        .unwrap();
         assert!(cache.find(&bytes, repo.object_format()).is_some());
         let rejected = open_with_cache(
             &repo,

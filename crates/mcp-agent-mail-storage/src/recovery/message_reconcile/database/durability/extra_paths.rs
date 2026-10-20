@@ -79,8 +79,8 @@ pub(super) fn covered_by_message(project: &str, message: &Value, extra: &[String
 mod tests {
     use super::super::super as database;
     use super::super::{
-        Config, Cx, DbPool, PreparedMessage, ReconcileCursor, WriteOp, clear_by_operator,
-        ledger, outcome, prepare_message_classified, record_failures,
+        Config, Cx, DbPool, PreparedMessage, ReconcileCursor, WriteOp, clear_by_operator, ledger,
+        outcome, prepare_message_classified, record_failures,
     };
     use super::*;
     use fastmcp_core::block_on;
@@ -126,12 +126,18 @@ mod tests {
             "projects/project/agents/BlueLake/profile.json",
             "projects/other/attachments/files/data.bin",
         ] {
-            assert!(!covered_by_message("project", &message, &[path.into()]), "{path}");
+            assert!(
+                !covered_by_message("project", &message, &[path.into()]),
+                "{path}"
+            );
         }
         for kind in ["external", "unknown"] {
-            let message = json!({"attachments": [{"type": kind, "path": RAW, "original_path": ORIGINAL}]});
+            let message =
+                json!({"attachments": [{"type": kind, "path": RAW, "original_path": ORIGINAL}]});
             assert!(!covered_by_message(
-                "project", &message, &[RAW.into(), ORIGINAL.into()]
+                "project",
+                &message,
+                &[RAW.into(), ORIGINAL.into()]
             ));
         }
     }
@@ -151,9 +157,15 @@ mod tests {
             "projects/project-two/attachments/files/data.bin",
         ] {
             let message = json!({"attachments": [{"type": "file", "path": path}]});
-            assert!(!covered_by_message("project", &message, &[path.into()]), "{path:?}");
+            assert!(
+                !covered_by_message("project", &message, &[path.into()]),
+                "{path:?}"
+            );
         }
-        let path = format!("projects/project/attachments/{}", "x".repeat(MAX_PATH_BYTES));
+        let path = format!(
+            "projects/project/attachments/{}",
+            "x".repeat(MAX_PATH_BYTES)
+        );
         let message = json!({"attachments": [{"type": "file", "path": path}]});
         assert!(!covered_by_message("project", &message, &[path]));
     }
@@ -169,13 +181,23 @@ mod tests {
             json!([{"type":"inline","original_path":false}]),
         ] {
             assert!(!covered_by_message(
-                "project", &json!({"attachments": attachments}), &[RAW.into()]
+                "project",
+                &json!({"attachments": attachments}),
+                &[RAW.into()]
             ));
         }
         let record = json!({"type":"file", "path":RAW, "original_path":ORIGINAL});
         let message = json!({"attachments": vec![record.clone(); MAX_RECORDS]});
-        assert!(covered_by_message("project", &message, &vec![RAW.into(); MAX_PATHS]));
-        assert!(!covered_by_message("project", &message, &vec![RAW.into(); MAX_PATHS + 1]));
+        assert!(covered_by_message(
+            "project",
+            &message,
+            &vec![RAW.into(); MAX_PATHS]
+        ));
+        assert!(!covered_by_message(
+            "project",
+            &message,
+            &vec![RAW.into(); MAX_PATHS + 1]
+        ));
         let message = json!({"attachments": vec![record; MAX_RECORDS + 1]});
         assert!(!covered_by_message("project", &message, &[RAW.into()]));
     }
@@ -183,7 +205,8 @@ mod tests {
     fn seed(cx: &Cx, pool: &DbPool) -> PreparedMessage {
         let conn = outcome(block_on(pool.acquire(cx))).unwrap();
         conn.execute_raw(&format!(
-            "UPDATE messages SET attachments = '{}' WHERE id = 901", metadata()
+            "UPDATE messages SET attachments = '{}' WHERE id = 901",
+            metadata()
         ))
         .unwrap();
         drop(conn);
@@ -224,7 +247,10 @@ mod tests {
     fn assert_archive(config: &Config, prepared: &PreparedMessage) {
         let archive = crate::ensure_archive(config, "project").unwrap();
         let paths = crate::message_paths_for_bundle(
-            &archive, &prepared.message, &prepared.sender, &prepared.recipients,
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
         )
         .unwrap()
         .0;
@@ -250,7 +276,10 @@ mod tests {
         for relative in [RAW, ORIGINAL] {
             let entry = tree.get_path(std::path::Path::new(relative)).unwrap();
             assert_eq!(repo.find_blob(entry.id()).unwrap().content(), BYTES);
-            assert_eq!(std::fs::read(config.storage_root.join(relative)).unwrap(), BYTES);
+            assert_eq!(
+                std::fs::read(config.storage_root.join(relative)).unwrap(),
+                BYTES
+            );
         }
     }
 
@@ -260,9 +289,15 @@ mod tests {
             .query_sync("SELECT attachments FROM messages WHERE id = 901", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get_named::<String>("attachments").unwrap(), metadata().to_string());
+        assert_eq!(
+            rows[0].get_named::<String>("attachments").unwrap(),
+            metadata().to_string()
+        );
         let rows = conn
-            .query_sync("SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901", &[])
+            .query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901",
+                &[],
+            )
             .unwrap();
         assert_eq!(rows.len(), 2);
         for row in rows {
@@ -279,7 +314,10 @@ mod tests {
             write_attachments(config);
             let archive = crate::ensure_archive(config, "project").unwrap();
             let paths = crate::message_paths_for_bundle(
-                &archive, &prepared.message, &prepared.sender, &prepared.recipients,
+                &archive,
+                &prepared.message,
+                &prepared.sender,
+                &prepared.recipients,
             )
             .unwrap()
             .0;
@@ -303,7 +341,10 @@ mod tests {
             assert_eq!(failed.unrecoverable_errors, before.unrecoverable_errors + 1);
             assert!(crate::durability_degraded());
             assert_eq!(ledger().entries.len(), 1);
-            assert!(!ledger().unknown_failure, "referenced attachments have repair authority");
+            assert!(
+                !ledger().unknown_failure,
+                "referenced attachments have repair authority"
+            );
             std::fs::rename(
                 &paths.canonical,
                 config.storage_root.join("held-attachment-obstruction"),
@@ -318,7 +359,10 @@ mod tests {
             let head = repo.head().unwrap().target();
             assert_eq!(drive(cx, pool, config).repaired, 0);
             assert_eq!(repo.head().unwrap().target(), head);
-            assert_eq!(crate::wbq_stats().unrecoverable_errors, failed.unrecoverable_errors);
+            assert_eq!(
+                crate::wbq_stats().unrecoverable_errors,
+                failed.unrecoverable_errors
+            );
         });
     }
 
@@ -331,7 +375,9 @@ mod tests {
                 std::fs::write(config.storage_root.join(RAW), b"conflicting bytes").unwrap();
             }
             record_failures(std::iter::once(&op(
-                config, &prepared, vec![RAW.into(), ORIGINAL.into()],
+                config,
+                &prepared,
+                vec![RAW.into(), ORIGINAL.into()],
             )));
             assert_eq!(ledger().entries.len(), 1);
             assert!(!ledger().unknown_failure);
@@ -380,7 +426,9 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"unverified obligation").unwrap();
             record_failures(std::iter::once(&op(
-                config, &prepared, vec![RAW.into(), unknown.into()],
+                config,
+                &prepared,
+                vec![RAW.into(), unknown.into()],
             )));
             assert!(ledger().unknown_failure);
             assert_eq!(drive(cx, pool, config).repaired, 1);

@@ -9,8 +9,6 @@ mod decoded;
 
 use std::path::Path;
 
-#[cfg(test)]
-use git2::Index;
 use git2::{ErrorCode, ObjectType, Oid, Repository, Tree};
 
 use decoded::ObservedIndex;
@@ -104,7 +102,9 @@ pub(super) fn preflight(
     ]))
     .map_err(|_| invalid("staged canonical index entry count overflow"))?;
     if count > decoded_entry_limit(bytes.len()) {
-        return Err(invalid("staged canonical index decode entry budget exceeded"));
+        return Err(invalid(
+            "staged canonical index decode entry budget exceeded",
+        ));
     }
     // Reuse only the interpretation of byte-identical, freshly read input.
     // Every budget, ancestor, HEAD, object and message check below still runs.
@@ -113,7 +113,9 @@ pub(super) fn preflight(
     let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
     let prefix = format!("{relative}/");
     if !canonical.starts_with(&prefix) {
-        return Err(invalid("staged canonical target is outside its project namespace"));
+        return Err(invalid(
+            "staged canonical target is outside its project namespace",
+        ));
     }
     reject_ancestor_entries(&index, canonical, budget)?;
     // This bare private index has no repository's ignore-case configuration.
@@ -235,21 +237,43 @@ mod tests {
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)
-            .unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
         for _ in 0..2 {
-            preflight(&repo, &archive, 42, &canonical, expected, None, &mut CanonicalScanBudget::default())
-                .unwrap();
+            preflight(
+                &repo,
+                &archive,
+                42,
+                &canonical,
+                expected,
+                None,
+                &mut CanonicalScanBudget::default(),
+            )
+            .unwrap();
             // Exactly the same encoded index, but now a different requested
             // message ID. A previous successful observation grants nothing.
-            let error = preflight(&repo, &archive, 99, &canonical, expected, None, &mut CanonicalScanBudget::default())
-                .unwrap_err();
+            let error = preflight(
+                &repo,
+                &archive,
+                99,
+                &canonical,
+                expected,
+                None,
+                &mut CanonicalScanBudget::default(),
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("already staged"), "{error}");
             for mut budget in [
-                CanonicalScanBudget { entries_left: 0, ..Default::default() },
-                CanonicalScanBudget { bytes_left: 1, ..Default::default() },
+                CanonicalScanBudget {
+                    entries_left: 0,
+                    ..Default::default()
+                },
+                CanonicalScanBudget {
+                    bytes_left: 1,
+                    ..Default::default()
+                },
             ] {
                 let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
                     .unwrap_err();
@@ -269,15 +293,28 @@ mod tests {
         let (_dir, _config, archive, message, recipients) = fixture();
         let repo = Repository::open(&archive.repo_root).unwrap();
         let source = archive.root.join("messages/2025/01/other.md");
-        let oid = stage(&repo, &archive, &source, b"---json\n{\"id\":99}\n---\n\nunique retained content");
+        let oid = stage(
+            &repo,
+            &archive,
+            &source,
+            b"---json\n{\"id\":99}\n---\n\nunique retained content",
+        );
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)
-            .unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
-        preflight(&repo, &archive, 42, &canonical, expected, None, &mut CanonicalScanBudget::default())
-            .unwrap();
+        preflight(
+            &repo,
+            &archive,
+            42,
+            &canonical,
+            expected,
+            None,
+            &mut CanonicalScanBudget::default(),
+        )
+        .unwrap();
         let bytes = std::fs::read(repo.path().join("index")).unwrap();
 
         let (_other_dir, other_config, other_archive, _, _) = fixture();
@@ -285,11 +322,25 @@ mod tests {
         assert!(!other.odb().unwrap().exists(oid));
         let other_index = other.path().join("index");
         if other_index.exists() {
-            std::fs::rename(&other_index, other_config.storage_root.join("retained-original-index"))
-                .unwrap();
+            std::fs::rename(
+                &other_index,
+                other_config.storage_root.join("retained-original-index"),
+            )
+            .unwrap();
         }
         std::fs::write(&other_index, &bytes).unwrap();
-        assert!(preflight(&other, &other_archive, 42, &canonical, expected, None, &mut CanonicalScanBudget::default()).is_err());
+        assert!(
+            preflight(
+                &other,
+                &other_archive,
+                42,
+                &canonical,
+                expected,
+                None,
+                &mut CanonicalScanBudget::default()
+            )
+            .is_err()
+        );
         assert!(!other.odb().unwrap().exists(oid));
         assert_eq!(std::fs::read(other_index).unwrap(), bytes);
     }
@@ -301,25 +352,24 @@ mod tests {
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let full = crate::render_message_bundle_content(
-            &message,
-            entry(&message, &recipients).body_md,
-        )
-        .unwrap();
+        let full =
+            crate::render_message_bundle_content(&message, entry(&message, &recipients).body_md)
+                .unwrap();
         let expected = stage(&repo, &archive, &paths.canonical, full.as_bytes());
         std::fs::rename(
             &paths.canonical,
             config.storage_root.join("retained-large-index-message.md"),
         )
         .unwrap();
-        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let mut index = repo.index().unwrap();
         let mut copy = index.get_path(Path::new(&relative), 0).unwrap();
         // Real native index entries, but no 100,001-file filesystem fixture.
         // These are recipient copies, not canonical identities to enumerate.
         for number in 0..100_001 {
-            copy.path = format!("projects/other/agents/BlueLake/inbox/2026/10/{number:06}.md")
-                .into_bytes();
+            copy.path =
+                format!("projects/other/agents/BlueLake/inbox/2026/10/{number:06}.md").into_bytes();
             index.add(&copy).unwrap();
         }
         index.write().unwrap();
@@ -328,7 +378,10 @@ mod tests {
         let before = std::fs::read(repo.path().join("index")).unwrap();
         assert!(before.len() as u64 <= MAX_INDEX_BYTES);
         let head = repo.head().ok().and_then(|head| head.target());
-        let mut budget = CanonicalScanBudget { entries_left: 1, ..Default::default() };
+        let mut budget = CanonicalScanBudget {
+            entries_left: 1,
+            ..Default::default()
+        };
         let available = budget.bytes_left;
         preflight(&repo, &archive, 42, &relative, expected, None, &mut budget).unwrap();
         assert_eq!(budget.entries_left, 0);
@@ -336,13 +389,16 @@ mod tests {
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         assert_eq!(repo.head().ok().and_then(|head| head.target()), head);
         assert!(!paths.canonical.exists());
-        let repaired = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
-            .unwrap();
+        let repaired =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
         assert_eq!(repaired.files_created, 4);
         assert!(repaired.git_commit_needed);
         let committed = Repository::open(&archive.repo_root).unwrap();
         let tree = committed.head().unwrap().peel_to_tree().unwrap();
-        for path in [&paths.canonical, &paths.outbox].into_iter().chain(&paths.inbox) {
+        for path in [&paths.canonical, &paths.outbox]
+            .into_iter()
+            .chain(&paths.inbox)
+        {
             let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
             let object = tree.get_path(Path::new(&relative)).unwrap();
             assert_eq!(
@@ -351,7 +407,9 @@ mod tests {
             );
         }
         for path in &paths.inbox {
-            let (copy, _) = super::super::super::read_surviving_message(path).unwrap().unwrap();
+            let (copy, _) = super::super::super::read_surviving_message(path)
+                .unwrap()
+                .unwrap();
             assert_eq!(copy["bcc"], json!([]));
         }
     }
@@ -362,25 +420,33 @@ mod tests {
         let repo = Repository::open(&archive.repo_root).unwrap();
         let source = archive.root.join("messages/2025/01/source.md");
         let expected = stage(&repo, &archive, &source, b"---json\n{\"id\":99}\n---\n\n");
-        let source_relative = crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
+        let source_relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let mut index = repo.index().unwrap();
         let mut obstruction = index.get_path(Path::new(&source_relative), 0).unwrap();
         for (end, _) in canonical.match_indices('/') {
             for merge_stage in 0..=3_u16 {
                 index.clear().unwrap();
-                obstruction.path = canonical[..end].as_bytes().to_vec();
+                obstruction.path = canonical.as_bytes()[..end].to_vec();
                 obstruction.flags = (obstruction.flags & !0x3000) | (merge_stage << 12);
                 index.add(&obstruction).unwrap();
                 index.write().unwrap();
                 let before = std::fs::read(repo.path().join("index")).unwrap();
-                let mut budget = CanonicalScanBudget { entries_left: 0, ..Default::default() };
+                let mut budget = CanonicalScanBudget {
+                    entries_left: 0,
+                    ..Default::default()
+                };
                 let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
                     .unwrap_err();
-                assert!(error.to_string().contains("obstructs"), "{canonical} {end}: {error}");
+                assert!(
+                    error.to_string().contains("obstructs"),
+                    "{canonical} {end}: {error}"
+                );
                 assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
                 assert!(!paths.canonical.exists());
             }
@@ -392,20 +458,37 @@ mod tests {
         let (_dir, _config, archive, message, recipients) = fixture();
         let repo = Repository::open(&archive.repo_root).unwrap();
         let source = archive.root.join("messages/2025/01/duplicate.md");
-        stage(&repo, &archive, &source, b"---json\n{\"id\":42}\n---\n\nprior");
+        stage(
+            &repo,
+            &archive,
+            &source,
+            b"---json\n{\"id\":42}\n---\n\nprior",
+        );
         for suffix in ["messages-old", "messages2", "messagesX", "MESSAGES"] {
-            stage(&repo, &archive, &archive.root.join(suffix).join("opaque.md"), b"unrelated");
+            stage(
+                &repo,
+                &archive,
+                &archive.root.join(suffix).join("opaque.md"),
+                b"unrelated",
+            );
         }
-        repo.config().unwrap().set_bool("core.ignorecase", true).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
-        let mut budget = CanonicalScanBudget { entries_left: 1, ..Default::default() };
-        let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
-            .unwrap_err();
+        let mut budget = CanonicalScanBudget {
+            entries_left: 1,
+            ..Default::default()
+        };
+        let error =
+            preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget).unwrap_err();
         assert!(error.to_string().contains("already staged"), "{error}");
         assert_eq!(budget.entries_left, 0);
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
@@ -419,17 +502,26 @@ mod tests {
             ("one.md", b"---json\n{\"id\":99}\n---\n\n".as_slice()),
             ("two.md", b"---json\n{\"id\":100}\n---\n\n".as_slice()),
         ] {
-            stage(&repo, &archive, &archive.root.join("messages/2025/01").join(name), bytes);
+            stage(
+                &repo,
+                &archive,
+                &archive.root.join("messages/2025/01").join(name),
+                bytes,
+            );
         }
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
-        let mut budget = CanonicalScanBudget { entries_left: 1, ..Default::default() };
-        let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
-            .unwrap_err();
+        let mut budget = CanonicalScanBudget {
+            entries_left: 1,
+            ..Default::default()
+        };
+        let error =
+            preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget).unwrap_err();
         assert!(error.to_string().contains("entry budget"), "{error}");
         assert_eq!(budget.entries_left, 0);
         assert!(!paths.canonical.exists());
@@ -445,7 +537,8 @@ mod tests {
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         for version in [2, 3, 4] {
             let mut index = repo.index().unwrap();
@@ -453,7 +546,10 @@ mod tests {
             index.write().unwrap();
             let before = std::fs::read(repo.path().join("index")).unwrap();
             assert!(index.len() <= decoded_entry_limit(before.len()));
-            let mut budget = CanonicalScanBudget { entries_left: 0, ..Default::default() };
+            let mut budget = CanonicalScanBudget {
+                entries_left: 0,
+                ..Default::default()
+            };
             let available = budget.bytes_left;
             preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget).unwrap();
             assert_eq!(budget.entries_left, 0);
@@ -473,14 +569,21 @@ mod tests {
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         let mut bytes = b"DIRC\0\0\0\x04".to_vec();
         bytes.extend(u32::MAX.to_be_bytes());
         bytes.extend([0_u8; 20]);
         std::fs::write(repo.path().join("index"), &bytes).unwrap();
         let error = preflight(
-            &repo, &archive, 42, &canonical, expected, None, &mut CanonicalScanBudget::default(),
+            &repo,
+            &archive,
+            42,
+            &canonical,
+            expected,
+            None,
+            &mut CanonicalScanBudget::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("decode entry budget"), "{error}");
@@ -497,9 +600,10 @@ mod tests {
             let oid = stage(&repo, &archive, &source, bytes);
             let evidence = config.storage_root.join("retained-staged-message.md");
             std::fs::rename(&source, &evidence).unwrap();
-            let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
-                .unwrap()
-                .0;
+            let paths =
+                crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+                    .unwrap()
+                    .0;
             if interrupted {
                 let full = crate::render_message_bundle_content(
                     &message,
@@ -515,7 +619,10 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("already staged"), "{error}");
             assert_eq!(repo.head().ok().and_then(|head| head.target()), head);
-            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+            assert_eq!(
+                std::fs::read(repo.path().join("index")).unwrap(),
+                index_before
+            );
             assert_eq!(std::fs::read(evidence).unwrap(), bytes);
             assert_eq!(repo.find_blob(oid).unwrap().content(), bytes);
             assert_eq!(paths.canonical.exists(), interrupted);
@@ -542,9 +649,14 @@ mod tests {
         let evidence = config.storage_root.join("retained-conflicting-parent.md");
         std::fs::rename(&paths.canonical, &evidence).unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
-        let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
-            .unwrap_err();
-        assert!(error.to_string().contains("staged canonical payload conflicts"), "{error}");
+        let error =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("staged canonical payload conflicts"),
+            "{error}"
+        );
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         assert_eq!(repo.find_blob(oid).unwrap().content(), bytes.as_bytes());
         assert_eq!(std::fs::read(evidence).unwrap(), bytes.as_bytes());
@@ -559,16 +671,14 @@ mod tests {
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let bytes = crate::render_message_bundle_content(
-            &message,
-            entry(&message, &recipients).body_md,
-        )
-        .unwrap();
+        let bytes =
+            crate::render_message_bundle_content(&message, entry(&message, &recipients).body_md)
+                .unwrap();
         stage(&repo, &archive, &paths.canonical, bytes.as_bytes());
         let evidence = config.storage_root.join("retained-exact-message.md");
         std::fs::rename(&paths.canonical, &evidence).unwrap();
-        let result = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
-            .unwrap();
+        let result =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
         assert_eq!(result.files_created, 4);
         assert!(result.git_commit_needed);
         assert_eq!(std::fs::read(&paths.canonical).unwrap(), bytes.as_bytes());
@@ -585,12 +695,17 @@ mod tests {
         reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
         let repo = Repository::open(&archive.repo_root).unwrap();
         let source = archive.root.join("messages/2025/01/prior.md");
-        stage(&repo, &archive, &source, b"---json\n{\"id\":42}\n---\n\nprior");
+        stage(
+            &repo,
+            &archive,
+            &source,
+            b"---json\n{\"id\":42}\n---\n\nprior",
+        );
         std::fs::rename(&source, config.storage_root.join("prior-evidence.md")).unwrap();
         let head = repo.head().unwrap().target();
         let before = std::fs::read(repo.path().join("index")).unwrap();
-        let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
-            .unwrap_err();
+        let error =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap_err();
         assert!(error.to_string().contains("already staged"), "{error}");
         assert_eq!(repo.head().unwrap().target(), head);
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
@@ -604,33 +719,44 @@ mod tests {
         let bytes = b"---json\n{\"id\":99}\n---\n\nunrelated";
         let oid = stage(&repo, &archive, &source, bytes);
         std::fs::rename(&source, config.storage_root.join("unrelated-evidence.md")).unwrap();
-        let foreign = archive.repo_root.join("projects/other/messages/2025/01/unknown.md");
-        stage(&repo, &archive, &foreign, b"foreign evidence without frontmatter");
+        let foreign = archive
+            .repo_root
+            .join("projects/other/messages/2025/01/unknown.md");
+        stage(
+            &repo,
+            &archive,
+            &foreign,
+            b"foreign evidence without frontmatter",
+        );
         let before = std::fs::read(repo.path().join("index")).unwrap();
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"not-yet-published").unwrap();
         let mut budget = CanonicalScanBudget::default();
         preflight(&repo, &archive, 42, &relative, expected, None, &mut budget).unwrap();
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         assert_eq!(repo.find_blob(oid).unwrap().content(), bytes);
-        assert!(
-            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_ok()
-        );
+        assert!(reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_ok());
     }
 
     #[test]
     fn malformed_staged_evidence_and_unmerged_entries_never_prove_absence() {
-        for bytes in [b"broken".as_slice(), b"---json\n{\"id\":0}\n---\n\n".as_slice()] {
+        for bytes in [
+            b"broken".as_slice(),
+            b"---json\n{\"id\":0}\n---\n\n".as_slice(),
+        ] {
             let (_dir, config, archive, message, recipients) = fixture();
             let repo = Repository::open(&archive.repo_root).unwrap();
             let source = archive.root.join("messages/2025/01/uncertain.md");
             stage(&repo, &archive, &source, bytes);
             std::fs::rename(&source, config.storage_root.join("uncertain-evidence.md")).unwrap();
             let before = std::fs::read(repo.path().join("index")).unwrap();
-            assert!(reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_err());
+            assert!(
+                reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).is_err()
+            );
             assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         }
         let (_dir, config, archive, message, recipients) = fixture();
@@ -646,8 +772,8 @@ mod tests {
         index.write().unwrap();
         std::fs::rename(&source, config.storage_root.join("merge-evidence.md")).unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
-        let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
-            .unwrap_err();
+        let error =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap_err();
         assert!(error.to_string().contains("merge stages"), "{error}");
         assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
     }
@@ -662,19 +788,29 @@ mod tests {
         let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
             .unwrap()
             .0;
-        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
         // Only the one canonical source is enumerated, not bootstrap files
         // or recipient copies elsewhere in the repository-wide index.
         let count = 1;
         for mut budget in [
-            CanonicalScanBudget { entries_left: 0, ..Default::default() },
-            CanonicalScanBudget { bytes_left: 1, ..Default::default() },
-            CanonicalScanBudget { bytes_left: before.len() as u64, ..Default::default() },
+            CanonicalScanBudget {
+                entries_left: 0,
+                ..Default::default()
+            },
+            CanonicalScanBudget {
+                bytes_left: 1,
+                ..Default::default()
+            },
+            CanonicalScanBudget {
+                bytes_left: before.len() as u64,
+                ..Default::default()
+            },
         ] {
-            let error = preflight(&repo, &archive, 42, &relative, expected, None, &mut budget)
-                .unwrap_err();
+            let error =
+                preflight(&repo, &archive, 42, &relative, expected, None, &mut budget).unwrap_err();
             assert!(error.to_string().contains("budget"), "{error}");
             assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         }
@@ -683,7 +819,10 @@ mod tests {
         let available = budget.bytes_left;
         preflight(&repo, &archive, 42, &relative, expected, None, &mut budget).unwrap();
         assert_eq!(budget.entries_left, entries - count);
-        assert_eq!(budget.bytes_left, available - before.len() as u64 - bytes.len() as u64);
+        assert_eq!(
+            budget.bytes_left,
+            available - before.len() as u64 - bytes.len() as u64
+        );
     }
 
     #[test]
@@ -692,7 +831,11 @@ mod tests {
         let repo = Repository::open(&archive.repo_root).unwrap();
         let index_path = repo.path().join("index");
         if index_path.exists() {
-            std::fs::rename(&index_path, config.storage_root.join("retained-original-index")).unwrap();
+            std::fs::rename(
+                &index_path,
+                config.storage_root.join("retained-original-index"),
+            )
+            .unwrap();
         }
         std::fs::write(&index_path, b"DIRC\0\0\0\x02\0\0\0\0broken checksum").unwrap();
         let before = std::fs::read(&index_path).unwrap();
@@ -725,7 +868,11 @@ mod tests {
             let before = std::fs::read(repo.path().join("index")).unwrap();
             let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
                 .unwrap_err();
-            let expected = if obstruction { "obstructs" } else { "regular-file" };
+            let expected = if obstruction {
+                "obstructs"
+            } else {
+                "regular-file"
+            };
             assert!(error.to_string().contains(expected), "{error}");
             assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
         }
@@ -743,8 +890,8 @@ mod tests {
         std::fs::rename(&index, &evidence).unwrap();
         std::os::unix::fs::symlink(&evidence, &index).unwrap();
         let before = std::fs::read(&evidence).unwrap();
-        let error = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
-            .unwrap_err();
+        let error =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap_err();
         assert!(error.to_string().contains("symlinked authority"), "{error}");
         assert_eq!(std::fs::read_link(index).unwrap(), evidence);
         assert_eq!(std::fs::read(evidence).unwrap(), before);

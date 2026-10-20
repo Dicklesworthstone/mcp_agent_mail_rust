@@ -146,9 +146,17 @@ fn labels(
     let mut names = HashMap::new();
     for chunk in ids.chunks(LOOKUP_BATCH) {
         let (table, columns, id_column) = if agents {
-            ("agents", "id AS raw_agent_id, name AS agent_name", "raw_agent_id")
+            (
+                "agents",
+                "id AS raw_agent_id, name AS agent_name",
+                "raw_agent_id",
+            )
         } else {
-            ("projects", "id AS raw_project_id, slug AS project_slug", "raw_project_id")
+            (
+                "projects",
+                "id AS raw_project_id, slug AS project_slug",
+                "raw_project_id",
+            )
         };
         for row in lookup_rows(conn, table, "id", columns, chunk, "")? {
             let id = integer(&row, id_column)?;
@@ -158,7 +166,10 @@ fn labels(
                 super::read_project_slug(&row, "project_slug", id_column)
             };
             if chunk.binary_search(&id).is_err() || names.insert(id, label).is_some() {
-                return Err("Explorer recipient label lookup returned an unrequested or duplicate ID".to_string());
+                return Err(
+                    "Explorer recipient label lookup returned an unrequested or duplicate ID"
+                        .to_string(),
+                );
             }
         }
     }
@@ -172,7 +183,12 @@ fn recipient_names_in_snapshot(
 ) -> Result<HashMap<i64, String>, String> {
     let shared = ExplorerQuery::shared_mailbox_schema_available(conn)
         .map_err(|error| format!("Explorer recipient schema: {error}"))?;
-    let ids: Vec<_> = message_ids.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+    let ids: Vec<_> = message_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mut grouped: HashMap<i64, Vec<String>> = HashMap::new();
     for chunk in ids.chunks(LOOKUP_BATCH) {
         let suffix = if include_bcc {
@@ -180,7 +196,14 @@ fn recipient_names_in_snapshot(
         } else {
             " AND kind IN ('to', 'cc') ORDER BY message_id ASC, CASE kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 ELSE 3 END ASC, agent_id ASC"
         };
-        let rows = lookup_rows(conn, "message_recipients", "message_id", "message_id, agent_id", chunk, suffix)?;
+        let rows = lookup_rows(
+            conn,
+            "message_recipients",
+            "message_id",
+            "message_id, agent_id",
+            chunk,
+            suffix,
+        )?;
         let mut deliveries = Vec::with_capacity(rows.len());
         let mut agents = BTreeSet::new();
         for row in rows {
@@ -194,7 +217,10 @@ fn recipient_names_in_snapshot(
         }
         let names = labels(conn, &agents, true)?;
         for (message, agent) in deliveries {
-            let name = names.get(&agent).cloned().unwrap_or_else(|| format!("[unknown-agent-{agent}]"));
+            let name = names
+                .get(&agent)
+                .cloned()
+                .unwrap_or_else(|| format!("[unknown-agent-{agent}]"));
             let recipients = grouped.entry(message).or_default();
             if !recipients.contains(&name) {
                 recipients.push(name);
@@ -204,7 +230,10 @@ fn recipient_names_in_snapshot(
             append_shared_addresses(conn, chunk, &mut grouped)?;
         }
     }
-    Ok(grouped.into_iter().map(|(id, names)| (id, names.join(", "))).collect())
+    Ok(grouped
+        .into_iter()
+        .map(|(id, names)| (id, names.join(", ")))
+        .collect())
 }
 
 fn append_shared_addresses(
@@ -213,17 +242,32 @@ fn append_shared_addresses(
     grouped: &mut HashMap<i64, Vec<String>>,
 ) -> Result<(), String> {
     let mut deliveries = HashMap::new();
-    for row in lookup_rows(conn, "project_mailbox_deliveries", "message_id", "message_id, project_id", ids, "")? {
+    for row in lookup_rows(
+        conn,
+        "project_mailbox_deliveries",
+        "message_id",
+        "message_id, project_id",
+        ids,
+        "",
+    )? {
         let id = integer(&row, "message_id")?;
         let project = integer(&row, "project_id")?;
         if ids.binary_search(&id).is_err() || deliveries.insert(id, project).is_some() {
-            return Err("Explorer shared recipient lookup returned an unrequested or duplicate message".to_string());
+            return Err(
+                "Explorer shared recipient lookup returned an unrequested or duplicate message"
+                    .to_string(),
+            );
         }
     }
     if deliveries.is_empty() {
         return Ok(());
     }
-    let selected: Vec<_> = deliveries.keys().copied().collect::<BTreeSet<_>>().into_iter().collect();
+    let selected: Vec<_> = deliveries
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mut matched = Vec::new();
     let mut projects = BTreeSet::new();
     let mut observed = HashSet::new();
@@ -231,7 +275,10 @@ fn append_shared_addresses(
         let id = integer(&row, "id")?;
         let project = integer(&row, "project_id")?;
         if selected.binary_search(&id).is_err() || !observed.insert(id) {
-            return Err("Explorer shared recipient message lookup returned an unrequested or duplicate ID".to_string());
+            return Err(
+                "Explorer shared recipient message lookup returned an unrequested or duplicate ID"
+                    .to_string(),
+            );
         }
         // Match the original join's scope check. Orphaned or cross-project
         // deliveries cannot manufacture an address for an unrelated message.
@@ -242,7 +289,10 @@ fn append_shared_addresses(
     }
     let names = labels(conn, &projects, false)?;
     for (id, project) in matched {
-        let slug = names.get(&project).cloned().unwrap_or_else(|| format!("[unknown-project-{project}]"));
+        let slug = names
+            .get(&project)
+            .cloned()
+            .unwrap_or_else(|| format!("[unknown-project-{project}]"));
         let address = mcp_agent_mail_db::project_mailbox::project_mailbox_address(&slug);
         let recipients = grouped.entry(id).or_default();
         if !recipients.contains(&address) {
@@ -296,10 +346,18 @@ mod tests {
     #[test]
     fn terminal_inbox_includes_shared_mail_with_direct_precedence_and_private_receipts() {
         fixture(|conn| {
-            let rows = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap();
-            assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), [102, 101, 200, 100]);
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101, 200, 100]
+            );
             assert_eq!(rows[0].ack_ts, None, "direct receipt must win");
-            assert_eq!(rows[2].read_ts, None, "foreign identity's receipt is not the viewer's");
+            assert_eq!(
+                rows[2].read_ts, None,
+                "foreign identity's receipt is not the viewer's"
+            );
             assert_eq!(rows[3].ack_ts, Some(8));
             assert_eq!(rows[3].topic.as_deref(), Some("topic-a"));
             assert_eq!(rows[3].body_md, "shared body");
@@ -315,16 +373,45 @@ mod tests {
     #[test]
     fn terminal_shared_mail_honors_viewer_eligibility_and_candidate_bindings() {
         fixture(|conn| {
-            for name in ["AmberFox", "ZebraFox", "LateFox", "BlockedFox", "RetiredFox", "MissingFox"] {
-                assert!(screen(name).fetch_inbound(conn, Some(&candidates())).unwrap().is_empty(), "{name}");
+            for name in [
+                "AmberFox",
+                "ZebraFox",
+                "LateFox",
+                "BlockedFox",
+                "RetiredFox",
+                "MissingFox",
+            ] {
+                assert!(
+                    screen(name)
+                        .fetch_inbound(conn, Some(&candidates()))
+                        .unwrap()
+                        .is_empty(),
+                    "{name}"
+                );
             }
             let selected = HashSet::from([100, 200]);
-            let rows = screen("BlueLake").fetch_inbound(conn, Some(&selected)).unwrap();
-            assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), [200, 100]);
-            assert!(screen("BlueLake").fetch_inbound(conn, Some(&HashSet::new())).unwrap().is_empty());
-            conn.execute_raw("UPDATE agents SET retired_at=10 WHERE id=11").unwrap();
-            let rows = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap();
-            assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), [102, 101, 200]);
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&selected))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [200, 100]
+            );
+            assert!(
+                screen("BlueLake")
+                    .fetch_inbound(conn, Some(&HashSet::new()))
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute_raw("UPDATE agents SET retired_at=10 WHERE id=11")
+                .unwrap();
+            let rows = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101, 200]
+            );
         });
     }
 
@@ -339,11 +426,17 @@ mod tests {
                 let mut screen = screen("BlueLake");
                 screen.ack_filter = filter;
                 let rows = screen.fetch_inbound(conn, Some(&candidates())).unwrap();
-                assert_eq!(rows.iter().map(|row| row.message_id).collect::<Vec<_>>(), expected);
+                assert_eq!(
+                    rows.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                    expected
+                );
             }
             let global = screen("").fetch_inbound(conn, Some(&candidates())).unwrap();
             let shared = global.iter().find(|row| row.message_id == 100).unwrap();
-            assert_eq!(shared.ack_ts, None, "unsettled direct BCC recipient still owes an ack");
+            assert_eq!(
+                shared.ack_ts, None,
+                "unsettled direct BCC recipient still owes an ack"
+            );
         });
     }
 
@@ -357,10 +450,19 @@ mod tests {
             assert_eq!(rows[0].message_id, 200);
             assert_eq!(rows[0].to_agents, "project:beta");
             assert_eq!(rows[0].direction, Direction::Outbound);
-            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (200,21,50,60)").unwrap();
-            assert!(sender.fetch_outbound(conn, Some(&candidates())).unwrap().is_empty());
+            conn.execute_raw("INSERT INTO project_mailbox_receipts VALUES (200,21,50,60)")
+                .unwrap();
+            assert!(
+                sender
+                    .fetch_outbound(conn, Some(&candidates()))
+                    .unwrap()
+                    .is_empty()
+            );
             sender.ack_filter = AckFilter::Acknowledged;
-            assert_eq!(sender.fetch_outbound(conn, Some(&candidates())).unwrap()[0].message_id, 200);
+            assert_eq!(
+                sender.fetch_outbound(conn, Some(&candidates())).unwrap()[0].message_id,
+                200
+            );
         });
     }
 
@@ -373,9 +475,17 @@ mod tests {
             let outgoing = recipient_names(conn, &[100, 102], true).unwrap();
             assert_eq!(outgoing[&100], "HiddenFox, project:alpha");
             assert_eq!(outgoing[&102], "BlueLake, project:alpha");
-            let rows = screen("AmberFox").fetch_outbound(conn, Some(&candidates())).unwrap();
+            let rows = screen("AmberFox")
+                .fetch_outbound(conn, Some(&candidates()))
+                .unwrap();
             assert_eq!(rows.len(), 3);
-            assert_eq!(rows.iter().find(|row| row.message_id == 100).unwrap().to_agents, outgoing[&100]);
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.message_id == 100)
+                    .unwrap()
+                    .to_agents,
+                outgoing[&100]
+            );
         });
     }
 
@@ -383,18 +493,37 @@ mod tests {
     fn terminal_shared_queries_are_read_only_and_do_not_invent_empty_partial_schema() {
         fixture(|conn| {
             conn.execute_raw("PRAGMA query_only=ON").unwrap();
-            assert_eq!(screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap().len(), 4);
+            assert_eq!(
+                screen("BlueLake")
+                    .fetch_inbound(conn, Some(&candidates()))
+                    .unwrap()
+                    .len(),
+                4
+            );
             for table in ["message_recipients", "project_mailbox_receipts"] {
-                let rows = conn.query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[]).unwrap();
+                let rows = conn
+                    .query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                    .unwrap();
                 assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 3);
             }
             conn.execute_raw("PRAGMA query_only=OFF").unwrap();
-            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts").unwrap();
-            let error = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap_err();
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts")
+                .unwrap();
+            let error = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap_err();
             assert!(error.contains("incomplete project mailbox schema"));
-            conn.execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries").unwrap();
-            let legacy = screen("BlueLake").fetch_inbound(conn, Some(&candidates())).unwrap();
-            assert_eq!(legacy.iter().map(|row| row.message_id).collect::<Vec<_>>(), [102, 101]);
+            conn.execute_raw(
+                "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+            )
+            .unwrap();
+            let legacy = screen("BlueLake")
+                .fetch_inbound(conn, Some(&candidates()))
+                .unwrap();
+            assert_eq!(
+                legacy.iter().map(|row| row.message_id).collect::<Vec<_>>(),
+                [102, 101]
+            );
         });
     }
 
@@ -405,8 +534,14 @@ mod tests {
     }
 
     impl SyncQuery for Recording<'_> {
-        fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, mcp_agent_mail_db::sqlmodel_core::Error> {
-            self.queries.borrow_mut().push((sql.to_string(), params.len()));
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, mcp_agent_mail_db::sqlmodel_core::Error> {
+            self.queries
+                .borrow_mut()
+                .push((sql.to_string(), params.len()));
             if sql.contains("FROM agents WHERE") && self.fail_labels.replace(false) {
                 return Err(mcp_agent_mail_db::sqlmodel_core::Error::Cancelled);
             }
@@ -440,32 +575,53 @@ mod tests {
             for include_bcc in [false, true] {
                 let result = recipient_names(&observed, &ids, include_bcc).unwrap();
                 assert_eq!(result.len(), 603);
-                assert!(!result.contains_key(&201), "cross-project delivery acquired an address");
+                assert!(
+                    !result.contains_key(&201),
+                    "cross-project delivery acquired an address"
+                );
                 for id in 1000..1600 {
                     assert_eq!(result[&id], "BlueLake");
                 }
                 let mut names: Vec<_> = (1000..1600).map(|id| format!("Reader{id}")).collect();
-                if include_bcc { names.push("HiddenFox".to_string()); }
+                if include_bcc {
+                    names.push("HiddenFox".to_string());
+                }
                 names.push("project:alpha".to_string());
                 assert_eq!(result[&100], names.join(", "));
                 assert_eq!(result[&200], "project:beta");
             }
             let queries = observed.queries.borrow();
-            assert!(queries.iter().filter(|(sql, _)| sql.contains("FROM agents WHERE")).count() >= 6);
+            assert!(
+                queries
+                    .iter()
+                    .filter(|(sql, _)| sql.contains("FROM agents WHERE"))
+                    .count()
+                    >= 6
+            );
             assert!(queries.iter().all(|(_, count)| *count <= LOOKUP_BATCH));
-            assert!(queries.iter().all(|(sql, _)| !sql.to_ascii_lowercase().contains(" join ")));
+            assert!(
+                queries
+                    .iter()
+                    .all(|(sql, _)| !sql.to_ascii_lowercase().contains(" join "))
+            );
         });
     }
 
     #[test]
     fn missing_and_blank_labels_keep_unknown_identity_placeholders() {
         fixture(|conn| {
-            conn.execute_raw("PRAGMA foreign_keys=OFF; UPDATE agents SET name='   ' WHERE id=11; \
+            conn.execute_raw(
+                "PRAGMA foreign_keys=OFF; UPDATE agents SET name='   ' WHERE id=11; \
                 UPDATE projects SET slug='   ' WHERE id=1; \
-                INSERT INTO message_recipients VALUES(101,99999,'cc',NULL,NULL)").unwrap();
+                INSERT INTO message_recipients VALUES(101,99999,'cc',NULL,NULL)",
+            )
+            .unwrap();
             let result = recipient_names(conn, &[101, 102, 201], true).unwrap();
             assert_eq!(result[&101], "[unknown-agent-11], [unknown-agent-99999]");
-            assert_eq!(result[&102], "[unknown-agent-11], project:[unknown-project-1]");
+            assert_eq!(
+                result[&102],
+                "[unknown-agent-11], project:[unknown-project-1]"
+            );
             assert!(!result.contains_key(&201));
         });
     }
@@ -473,16 +629,24 @@ mod tests {
     #[test]
     fn failed_lookup_releases_only_its_nested_scope() {
         fixture(|conn| {
-            conn.execute_raw("BEGIN; UPDATE agents SET name='ChangedFox' WHERE id=11").unwrap();
+            conn.execute_raw("BEGIN; UPDATE agents SET name='ChangedFox' WHERE id=11")
+                .unwrap();
             let observed = Recording {
                 conn,
                 queries: std::cell::RefCell::new(Vec::new()),
                 fail_labels: std::cell::Cell::new(true),
             };
             assert!(recipient_names(&observed, &[101], false).is_err());
-            assert_eq!(recipient_names(conn, &[101], false).unwrap()[&101], "ChangedFox");
-            conn.execute_raw("ROLLBACK").expect("recipient reader must not commit the caller's transaction");
-            assert_eq!(recipient_names(conn, &[101], false).unwrap()[&101], "BlueLake");
+            assert_eq!(
+                recipient_names(conn, &[101], false).unwrap()[&101],
+                "ChangedFox"
+            );
+            conn.execute_raw("ROLLBACK")
+                .expect("recipient reader must not commit the caller's transaction");
+            assert_eq!(
+                recipient_names(conn, &[101], false).unwrap()[&101],
+                "BlueLake"
+            );
         });
     }
 
@@ -494,26 +658,50 @@ mod tests {
             changed: std::cell::Cell<bool>,
         }
         impl SyncQuery for Rename<'_> {
-            fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, mcp_agent_mail_db::sqlmodel_core::Error> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<Row>, mcp_agent_mail_db::sqlmodel_core::Error> {
                 if sql.contains("FROM agents WHERE") && !self.changed.replace(true) {
-                    self.writer.execute_raw("UPDATE agents SET name='NewFox' WHERE id=11")?;
+                    self.writer
+                        .execute_raw("UPDATE agents SET name='NewFox' WHERE id=11")?;
                 }
                 self.reader.query_sync(sql, params)
             }
-            fn execute_raw(&self, sql: &str) -> Result<(), mcp_agent_mail_db::sqlmodel_core::Error> {
+            fn execute_raw(
+                &self,
+                sql: &str,
+            ) -> Result<(), mcp_agent_mail_db::sqlmodel_core::Error> {
                 self.reader.execute_raw(sql)
             }
         }
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("rename.sqlite3");
-        let reader = mcp_agent_mail_db::guard_db_conn(DbConn::open_file(path.to_str().unwrap()).unwrap(), "recipient reader");
+        let reader = mcp_agent_mail_db::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "recipient reader",
+        );
         reader.execute_raw("PRAGMA journal_mode=WAL; CREATE TABLE agents(id INTEGER PRIMARY KEY,name TEXT); \
             CREATE TABLE message_recipients(message_id INTEGER,agent_id INTEGER,kind TEXT); \
             INSERT INTO agents VALUES(11,'OldFox'); INSERT INTO message_recipients VALUES(101,11,'to')").unwrap();
-        let writer = mcp_agent_mail_db::guard_db_conn(DbConn::open_file(path.to_str().unwrap()).unwrap(), "recipient writer");
-        let interleaved = Rename { reader: &reader, writer: &writer, changed: std::cell::Cell::new(false) };
-        assert_eq!(recipient_names(&interleaved, &[101], false).unwrap()[&101], "OldFox");
+        let writer = mcp_agent_mail_db::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "recipient writer",
+        );
+        let interleaved = Rename {
+            reader: &reader,
+            writer: &writer,
+            changed: std::cell::Cell::new(false),
+        };
+        assert_eq!(
+            recipient_names(&interleaved, &[101], false).unwrap()[&101],
+            "OldFox"
+        );
         assert!(interleaved.changed.get(), "writer interleaving did not run");
-        assert_eq!(recipient_names(&*reader, &[101], false).unwrap()[&101], "NewFox");
+        assert_eq!(
+            recipient_names(&*reader, &[101], false).unwrap()[&101],
+            "NewFox"
+        );
     }
 }

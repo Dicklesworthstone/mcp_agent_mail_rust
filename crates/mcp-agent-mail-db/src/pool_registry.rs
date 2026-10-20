@@ -77,10 +77,7 @@ struct RuntimePoolInitialization<'registry> {
 }
 
 impl<'registry> RuntimePoolInitialization<'registry> {
-    fn try_begin(
-        registry: &'registry Mutex<HashSet<String>>,
-        identity: String,
-    ) -> DbResult<Self> {
+    fn try_begin(registry: &'registry Mutex<HashSet<String>>, identity: String) -> DbResult<Self> {
         // This mutex protects bookkeeping only. No filesystem resolution,
         // pool construction, promotion wait or engine destructor runs here.
         let mut active = registry.lock().unwrap_or_else(PoisonError::into_inner);
@@ -108,25 +105,24 @@ fn create_runtime_pool(
     config: &DbPoolConfig,
     create: impl FnOnce(&DbPoolConfig) -> DbResult<DbPool>,
 ) -> DbResult<DbPool> {
-    let initializer = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
-        &config.database_url,
-    ) {
-        // Memory compatibility selection and caller-owned lifetimes are an
-        // existing, separate contract. Do not merge anonymous sessions under
-        // a shared ':memory:' construction key or change their factory.
-        None
-    } else {
-        if let Some(pool) = get_cached_pool(config) {
-            return Ok(pool);
-        }
-        // Canonical path, not URL spelling or pool shape: maintenance and
-        // request pools of different sizes still initialize the same file.
-        // This key controls scheduling ONLY. The original factory continues
-        // to resolve and validate the configured SQLite/archive authority.
-        let identity = resolve_mailbox_sqlite_path(&config.database_url)?.canonical_path;
-        let registry = RUNTIME_POOL_INITIALIZERS.get_or_init(|| Mutex::new(HashSet::new()));
-        Some(RuntimePoolInitialization::try_begin(registry, identity)?)
-    };
+    let initializer =
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+            // Memory compatibility selection and caller-owned lifetimes are an
+            // existing, separate contract. Do not merge anonymous sessions under
+            // a shared ':memory:' construction key or change their factory.
+            None
+        } else {
+            if let Some(pool) = get_cached_pool(config) {
+                return Ok(pool);
+            }
+            // Canonical path, not URL spelling or pool shape: maintenance and
+            // request pools of different sizes still initialize the same file.
+            // This key controls scheduling ONLY. The original factory continues
+            // to resolve and validate the configured SQLite/archive authority.
+            let identity = resolve_mailbox_sqlite_path(&config.database_url)?.canonical_path;
+            let registry = RUNTIME_POOL_INITIALIZERS.get_or_init(|| Mutex::new(HashSet::new()));
+            Some(RuntimePoolInitialization::try_begin(registry, identity)?)
+        };
     // A predecessor can publish between our first lookup and permit
     // acquisition. Never rebuild that now-hot pool, even on this slow path.
     if initializer.is_some()
@@ -191,7 +187,10 @@ pub fn create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
 
 /// Preserve compatible-memory-pool selection without pinning memory sessions.
 pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
-    create_runtime_pool(config, crate::pool_impl::get_or_reuse_compatible_memory_pool)
+    create_runtime_pool(
+        config,
+        crate::pool_impl::get_or_reuse_compatible_memory_pool,
+    )
 }
 
 #[cfg(test)]
@@ -309,8 +308,7 @@ mod tests {
         let other = RuntimePoolInitialization::try_begin(&registry, "mail-b".into()).unwrap();
         assert_eq!(registry.lock().unwrap().len(), 2);
         drop(first);
-        let successor =
-            RuntimePoolInitialization::try_begin(&registry, "mail-a".into()).unwrap();
+        let successor = RuntimePoolInitialization::try_begin(&registry, "mail-a".into()).unwrap();
         drop(other);
         drop(successor);
         assert!(registry.lock().unwrap().is_empty());
@@ -321,7 +319,9 @@ mod tests {
         let registry = Mutex::new(HashSet::new());
         let failed: Result<(), DbError> = (|| {
             let _owner = RuntimePoolInitialization::try_begin(&registry, "mail".into())?;
-            Err(DbError::ResourceBusy("injected initialization failure".into()))
+            Err(DbError::ResourceBusy(
+                "injected initialization failure".into(),
+            ))
         })();
         assert!(failed.is_err());
         assert!(registry.lock().unwrap().is_empty());

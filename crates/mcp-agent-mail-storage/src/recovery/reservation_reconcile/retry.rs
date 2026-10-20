@@ -433,7 +433,10 @@ mod tests {
             ErrorKind::QuotaExceeded,
             ErrorKind::OutOfMemory,
         ] {
-            assert!(transient(&Error::new(kind, "opaque I/O failure").into()), "{kind:?}");
+            assert!(
+                transient(&Error::new(kind, "opaque I/O failure").into()),
+                "{kind:?}"
+            );
         }
         for kind in [
             ErrorKind::PermissionDenied,
@@ -449,7 +452,9 @@ mod tests {
             );
         }
         assert!(!transient(&invalid("disk full; foreign generation")));
-        assert!(!transient(&StorageError::Git(git2::Error::from_str("disk full"))));
+        assert!(!transient(&StorageError::Git(git2::Error::from_str(
+            "disk full"
+        ))));
     }
 
     #[test]
@@ -463,13 +468,31 @@ mod tests {
             ErrorKind::StorageFull,
             ErrorKind::QuotaExceeded,
             ErrorKind::OutOfMemory,
-        ].into_iter().enumerate() {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let id = 401 + i64::try_from(index).unwrap();
-            let mut report = ReservationReconcileReport { attempted: 1, ..Default::default() };
-            assert!(record_result(id, Err(Error::from(kind).into()), &mut queue, &mut report, now));
+            let mut report = ReservationReconcileReport {
+                attempted: 1,
+                ..Default::default()
+            };
+            assert!(record_result(
+                id,
+                Err(Error::from(kind).into()),
+                &mut queue,
+                &mut report,
+                now
+            ));
             let report = finish(report, &queue);
-            assert_eq!((report.scanned, report.deferred, report.deferred_transient), (1, 1, 1));
-            assert_eq!((report.attempted, report.repaired, report.unchanged), (1, 0, 0));
+            assert_eq!(
+                (report.scanned, report.deferred, report.deferred_transient),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (report.attempted, report.repaired, report.unchanged),
+                (1, 0, 0)
+            );
             assert_eq!(report.retry_len, index + 1);
             assert!(!report.budget_exhausted);
             assert!(!report.interrupted);
@@ -477,15 +500,30 @@ mod tests {
         assert_eq!(queue.due(now), [401, 402, 403, 404]);
         for _ in 0..100 {
             let mut report = ReservationReconcileReport::default();
-            assert!(record_result(401, Err(Error::from(ErrorKind::StorageFull).into()), &mut queue, &mut report, now));
+            assert!(record_result(
+                401,
+                Err(Error::from(ErrorKind::StorageFull).into()),
+                &mut queue,
+                &mut report,
+                now
+            ));
         }
         assert_eq!(queue.pending.len(), 4);
         assert_eq!(queue.due(now), [402, 403, 404]);
         assert_eq!(queue.pending.back().unwrap().id, 401);
         assert_eq!(queue.pending.back().unwrap().ready_at, now + MAX_BACKOFF);
         let mut report = ReservationReconcileReport::default();
-        assert!(record_result(401, Ok(true), &mut queue, &mut report, now + MAX_BACKOFF));
-        assert_eq!((report.scanned, report.repaired, report.deferred), (1, 1, 0));
+        assert!(record_result(
+            401,
+            Ok(true),
+            &mut queue,
+            &mut report,
+            now + MAX_BACKOFF
+        ));
+        assert_eq!(
+            (report.scanned, report.repaired, report.deferred),
+            (1, 1, 0)
+        );
         assert!(!queue.contains(401));
         assert_eq!(queue.pending.len(), 3);
     }
@@ -509,7 +547,10 @@ mod tests {
         assert_eq!(report.deferred_transient, 1);
         assert_eq!(queue.pending.len(), MAX_RETRY_IDS);
         assert_eq!(queue.pending.front().unwrap().id, 1);
-        assert_eq!(queue.pending.back().unwrap().id, i64::try_from(MAX_RETRY_IDS).unwrap());
+        assert_eq!(
+            queue.pending.back().unwrap().id,
+            i64::try_from(MAX_RETRY_IDS).unwrap()
+        );
         assert!(!queue.contains(50_000));
     }
 
@@ -520,8 +561,17 @@ mod tests {
         assert!(queue.defer(401, now));
         assert!(queue.defer(402, now));
         let mut report = ReservationReconcileReport::default();
-        assert!(record_result(401, Err(invalid("resource busy; foreign generation")), &mut queue, &mut report, now));
-        assert_eq!((report.deferred, report.deferred_transient, report.repaired), (1, 0, 0));
+        assert!(record_result(
+            401,
+            Err(invalid("resource busy; foreign generation")),
+            &mut queue,
+            &mut report,
+            now
+        ));
+        assert_eq!(
+            (report.deferred, report.deferred_transient, report.repaired),
+            (1, 0, 0)
+        );
         assert!(!queue.contains(401));
         assert!(queue.contains(402));
     }
@@ -541,41 +591,97 @@ mod tests {
             let (path, before) = super::super::tests::seed_artifact(config, &source, "aabb", false);
             let mut cursor = ReservationReconcileCursor {
                 source_identity: pool.sqlite_identity_key(),
-                history: ScanPosition { after: 432, ceiling: Some(481) },
+                history: ScanPosition {
+                    after: 432,
+                    ceiling: Some(481),
+                },
                 ..Default::default()
             };
             // Exercise a genuine kernel ENOSPC at the outcome-recording seam.
             // This is not a claim that the archive filesystem itself was full.
             // The resumed pass below uses the real source and Git publisher.
-            let error = std::fs::OpenOptions::new().write(true).open("/dev/full")
-                .unwrap().write_all(b"release witness").unwrap_err();
+            let error = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap()
+                .write_all(b"release witness")
+                .unwrap_err();
             assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSPC));
             assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
             let mut failed = ReservationReconcileReport::default();
-            assert!(record_result(401, Err(error.into()), &mut cursor.retries, &mut failed, Instant::now()));
+            assert!(record_result(
+                401,
+                Err(error.into()),
+                &mut cursor.retries,
+                &mut failed,
+                Instant::now()
+            ));
             assert_eq!((failed.deferred, failed.deferred_transient), (1, 1));
             assert_eq!(cursor.retries.due(Instant::now()), [401]);
             assert_eq!(fs::read(&path).unwrap(), before);
 
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            conn.execute_raw("UPDATE file_reservations SET reason='after disk recovery' WHERE id=401").unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET reason='after disk recovery' WHERE id=401",
+            )
+            .unwrap();
             drop(conn);
             let resumed = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
-            assert_eq!((resumed.repaired, resumed.retry_len, resumed.deferred), (1, 0, 0));
+            assert_eq!(
+                (resumed.repaired, resumed.retry_len, resumed.deferred),
+                (1, 0, 0)
+            );
             assert!(cursor.history.after > 432 && cursor.history.after < 481);
             assert!(resumed.scanned <= usize::try_from(IDS_PER_BATCH).unwrap());
             assert!(resumed.attempted <= MAX_REPAIRS_PER_BATCH);
             let artifact = read_artifact(&path).unwrap().unwrap();
             assert_eq!(artifact.value["reason"], "after disk recovery");
             assert_eq!(artifact.value["operator_note"], "preserve this note");
-            assert_eq!(artifact.value["released_ts"], source.artifact["released_ts"]);
+            assert_eq!(
+                artifact.value["released_ts"],
+                source.artifact["released_ts"]
+            );
             let repo = Repository::open(&config.storage_root).unwrap();
             let tree = head_tree(&repo).unwrap().unwrap();
-            assert_eq!(committed_artifact(&repo, Some(&tree), "projects/project/file_reservations/id-401-gaabb.json").unwrap().unwrap().bytes, artifact.bytes);
+            assert_eq!(
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-401-gaabb.json"
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
+                artifact.bytes
+            );
             let conn = outcome(block_on(pool.acquire(cx))).unwrap();
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservations WHERE id=401", &[]).unwrap()[0].get_as::<Option<i64>>(0).unwrap(), None);
-            assert_eq!(conn.query_sync("SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 5_000_000);
-            assert_eq!(conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 81);
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservations WHERE id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<Option<i64>>(0)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                5_000_000
+            );
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                81
+            );
         });
     }
 

@@ -499,7 +499,10 @@ mod tests {
                 Outcome::Err(_)
             ));
             assert_eq!(
-                count(conn, "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"),
+                count(
+                    conn,
+                    "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                ),
                 1
             );
         });
@@ -540,31 +543,43 @@ mod tests {
             let original_cursor = cursor.clone();
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             mark_reader(&conn);
-            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO unavailable_ack_receipts")
-                .unwrap();
+            conn.execute_raw(
+                "ALTER TABLE project_mailbox_receipts RENAME TO unavailable_ack_receipts",
+            )
+            .unwrap();
             drop(conn);
 
             // This fails in the real SQL driver, not in a replacement decoder.
             let failed = run(overdue_ack_page(cx, pool, Some(&cursor), i64::MAX, 128));
             assert!(matches!(failed, Outcome::Err(_)), "{failed:?}");
-            assert_eq!(cursor, original_cursor, "an error must not consume the page");
+            assert_eq!(
+                cursor, original_cursor,
+                "an error must not consume the page"
+            );
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             assert_ne!(
                 count(&conn, "SELECT last_insert_rowid()"),
                 READER_MARKER,
                 "the next checkout must not recycle the failed reader"
             );
-            assert_eq!(count(&conn, "SELECT id FROM ack_reader_witness"), READER_MARKER);
-            conn.execute_raw("ALTER TABLE unavailable_ack_receipts RENAME TO project_mailbox_receipts")
-                .unwrap();
+            assert_eq!(
+                count(&conn, "SELECT id FROM ack_reader_witness"),
+                READER_MARKER
+            );
+            conn.execute_raw(
+                "ALTER TABLE unavailable_ack_receipts RENAME TO project_mailbox_receipts",
+            )
+            .unwrap();
             // Receipt changes after the failure must be read afresh. New mail
             // cannot extend the original lap's high-water mark or cutoff.
             conn.execute_raw("INSERT INTO project_mailbox_receipts(message_id, agent_id, read_ts, ack_ts) VALUES(901, 103, 77, 88)")
                 .unwrap();
             conn.execute_raw("INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts, ack_required) VALUES(902, 101, 101, 'Later mail', 'Keep later body', 1000001, 1)")
                 .unwrap();
-            conn.execute_raw("INSERT INTO project_mailbox_deliveries VALUES(902, 101, 'to', 1000001)")
-                .unwrap();
+            conn.execute_raw(
+                "INSERT INTO project_mailbox_deliveries VALUES(902, 101, 'to', 1000001)",
+            )
+            .unwrap();
             drop(conn);
             let resumed = run(overdue_ack_page(cx, pool, Some(&cursor), i64::MAX, 128))
                 .into_result()
@@ -598,10 +613,22 @@ mod tests {
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_reservations"), 1);
             assert_eq!(count(&conn, "SELECT agent_id FROM file_reservations"), 104);
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM message_recipients"), 0);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"), 2);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 1);
-            assert_eq!(count(&conn, "SELECT read_ts FROM project_mailbox_receipts"), 77);
-            assert_eq!(count(&conn, "SELECT ack_ts FROM project_mailbox_receipts"), 88);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                2
+            );
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                1
+            );
+            assert_eq!(
+                count(&conn, "SELECT read_ts FROM project_mailbox_receipts"),
+                77
+            );
+            assert_eq!(
+                count(&conn, "SELECT ack_ts FROM project_mailbox_receipts"),
+                88
+            );
         });
     }
 
@@ -624,7 +651,10 @@ mod tests {
                 .unwrap();
             drop(conn);
             let bad = run(overdue_ack_page(cx, pool, None, 1_000_000, 1));
-            assert!(matches!(bad, Outcome::Err(_)), "invalid metadata must remain refused");
+            assert!(
+                matches!(bad, Outcome::Err(_)),
+                "invalid metadata must remain refused"
+            );
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             assert_eq!(
                 count(&conn, "SELECT last_insert_rowid()"),
@@ -649,7 +679,10 @@ mod tests {
             assert_eq!(keys(&again), keys(&first));
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             assert_eq!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
         });
     }
 
@@ -677,9 +710,15 @@ mod tests {
             drop(future);
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             assert_ne!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
-            assert_eq!(count(&conn, "SELECT id FROM ack_reader_witness"), READER_MARKER);
+            assert_eq!(
+                count(&conn, "SELECT id FROM ack_reader_witness"),
+                READER_MARKER
+            );
             assert_eq!(count(&conn, "SELECT COUNT(*) FROM messages"), 1);
-            assert_eq!(count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"), 0);
+            assert_eq!(
+                count(&conn, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
         });
     }
 
@@ -698,7 +737,10 @@ mod tests {
             assert!(unwound.is_err());
             let conn = run(pool.acquire(cx)).into_result().unwrap();
             assert_ne!(count(&conn, "SELECT last_insert_rowid()"), READER_MARKER);
-            assert_eq!(count(&conn, "SELECT id FROM ack_reader_witness"), READER_MARKER);
+            assert_eq!(
+                count(&conn, "SELECT id FROM ack_reader_witness"),
+                READER_MARKER
+            );
             drop(conn);
             let page = run(overdue_ack_page(cx, pool, None, 1_000_000, 128))
                 .into_result()
