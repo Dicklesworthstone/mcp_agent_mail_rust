@@ -13638,7 +13638,8 @@ const ADD_NEW_MESSAGE_TO_INBOX_STATS_SQL: &str = "UPDATE inbox_stats SET \
 /// exact, as the recount counts rows. Agents without a row yet, and
 /// recipients whose insert was a no-op, get the full recount instead. The
 /// row is looked up rather than inferred from the UPDATE's affected-row
-/// count, which older engines reported unreliably.
+/// count, which older engines reported unreliably. A legacy insert trigger
+/// also requires a recount because it may already have counted the delivery.
 async fn add_new_message_to_inbox_stats_in_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -13648,6 +13649,37 @@ async fn add_new_message_to_inbox_stats_in_tx(
     created_ts: i64,
 ) -> Outcome<(), DbError> {
     let mut recount = recount_agent_ids.to_vec();
+    if delivered_agent_ids.is_empty() {
+        return rebuild_agents_inbox_stats_in_tx(cx, tracked, &recount).await;
+    }
+
+    // A migration/import can restore the compatibility trigger after pool
+    // startup removed it. Check inside the same write transaction as the
+    // recipient inserts, so concurrent schema changes cannot invalidate the
+    // answer; caching it across sends would let the trigger and this path both
+    // count a delivery. Recount just the affected agents when the trigger owns
+    // inserts, also recovering rows that the trigger could only partly repair.
+    let insert_trigger = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' \
+             AND name = 'trg_inbox_stats_insert' \
+             AND tbl_name = 'message_recipients' LIMIT 1",
+            &[],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    };
+    if !insert_trigger.is_empty() {
+        recount.extend_from_slice(delivered_agent_ids);
+        return rebuild_agents_inbox_stats_in_tx(cx, tracked, &recount).await;
+    }
+
     for &agent_id in delivered_agent_ids {
         let existing = match map_sql_outcome(
             traw_query(
@@ -29324,6 +29356,178 @@ mod tests {
                 stored_b[3], third_ts,
                 "last_message_ts follows the newest message"
             );
+        });
+    }
+
+    /// A migration on an already-running mailbox can restore the standalone
+    /// import trigger. Sends must not count its delivery a second time, nor
+    /// trust a trigger-created row that omits an agent's older messages.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn create_message_recounts_when_migration_restores_inbox_insert_trigger() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        fn assert_stats(path: &str, agent_id: i64, expected: [i64; 3]) {
+            let conn = crate::DbConn::open_file(path.to_string()).expect("open verify connection");
+            let conn = crate::guard_db_conn(
+                conn,
+                "queries::tests live migration inbox stats verification",
+            );
+            let read = |sql: &str| {
+                let rows = conn
+                    .query_sync(sql, &[Value::BigInt(agent_id)])
+                    .expect("query inbox stats");
+                let row = rows.first().expect("inbox stats row");
+                [
+                    row.get_named::<i64>("total").expect("total"),
+                    row.get_named::<i64>("unread").expect("unread"),
+                    row.get_named::<i64>("ack_pending").expect("ack pending"),
+                    row.get_named::<i64>("last_ts").expect("last timestamp"),
+                ]
+            };
+            let stored = read(
+                "SELECT total_count AS total, unread_count AS unread, \
+                 ack_pending_count AS ack_pending, last_message_ts AS last_ts \
+                 FROM inbox_stats WHERE agent_id = ?",
+            );
+            let recounted = read(
+                "SELECT COUNT(*) AS total, \
+                 SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread, \
+                 SUM(CASE WHEN mr.ack_ts IS NULL AND m.ack_required = 1 THEN 1 ELSE 0 END) AS ack_pending, \
+                 MAX(m.created_ts) AS last_ts \
+                 FROM message_recipients mr JOIN messages m ON m.id = mr.message_id \
+                 WHERE mr.agent_id = ?",
+            );
+            assert_eq!(
+                stored, recounted,
+                "agent {agent_id}: stored stats vs recount"
+            );
+            assert_eq!(stored[..3], expected, "agent {agent_id}: expected counters");
+        }
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("inbox_stats_migrate_live_pool.db");
+        let path = pool.sqlite_path().to_string();
+
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs message test context");
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-inbox-migrate-live-{}", now_micros()),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let mut ids = Vec::new();
+            for name in ["BlueLake", "GreenStone", "RedCastle", "PinkHarbor"] {
+                let agent = create_agent(
+                    &cx,
+                    &pool,
+                    project_id,
+                    name,
+                    "e2e-test",
+                    "test-model",
+                    Some("inbox stats migration"),
+                    Some("auto"),
+                )
+                .await
+                .into_result()
+                .expect("create agent");
+                ids.push(agent.id.expect("agent id"));
+            }
+            let (sender, a, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+            let send = |subject: &'static str, ack: bool, recipients: Vec<(i64, &'static str)>| {
+                let (cx, pool) = (&cx, &pool);
+                async move {
+                    create_message_with_recipients(
+                        cx,
+                        pool,
+                        project_id,
+                        sender,
+                        subject,
+                        "body",
+                        Some("THREAD-INBOX-MIGRATE-LIVE"),
+                        "urgent",
+                        ack,
+                        "[]",
+                        &recipients,
+                    )
+                    .await
+                    .into_result()
+                    .expect("create message")
+                    .id
+                    .expect("message id")
+                }
+            };
+
+            let first = send("before migration", true, vec![(a, "to"), (b, "cc")]).await;
+            assert_stats(&path, a, [1, 1, 1]);
+            assert_stats(&path, b, [1, 1, 1]);
+
+            // Use the real migration entry point while retaining the initialized
+            // pool. Restarting it would drop the trigger and hide this regression.
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire migration connection");
+            crate::schema::migrate_to_latest_base(&cx, &**conn)
+                .await
+                .into_result()
+                .expect("migrate initialized mailbox");
+            let triggers = conn
+                .query_sync(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                     AND name = 'trg_inbox_stats_insert'",
+                    &[],
+                )
+                .expect("query restored insert trigger");
+            assert_eq!(triggers.len(), 1, "migration must restore the trigger");
+            drop(conn);
+
+            send(
+                "after migration",
+                false,
+                vec![(a, "to"), (a, "cc"), (c, "bcc")],
+            )
+            .await;
+            assert_stats(&path, a, [2, 2, 1]);
+            assert_stats(&path, b, [1, 1, 1]);
+            assert_stats(&path, c, [1, 1, 0]);
+
+            mark_message_read(&cx, &pool, a, first)
+                .await
+                .into_result()
+                .expect("mark read");
+            acknowledge_message(&cx, &pool, b, first)
+                .await
+                .into_result()
+                .expect("acknowledge");
+            assert_stats(&path, a, [2, 1, 1]);
+            assert_stats(&path, b, [1, 0, 0]);
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire stats repair connection");
+            conn.execute_sync(
+                "DELETE FROM inbox_stats WHERE agent_id = ?",
+                &[Value::BigInt(c)],
+            )
+            .expect("remove derived row to exercise trigger partial repair");
+            drop(conn);
+            send(
+                "after read and ack",
+                true,
+                vec![(a, "to"), (b, "to"), (c, "to")],
+            )
+            .await;
+            assert_stats(&path, a, [3, 2, 2]);
+            assert_stats(&path, b, [2, 1, 1]);
+            assert_stats(&path, c, [2, 2, 1]);
         });
     }
 
