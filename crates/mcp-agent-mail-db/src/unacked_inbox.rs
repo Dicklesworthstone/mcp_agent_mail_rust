@@ -222,7 +222,10 @@ fn selection_query(shared: bool, limit: usize, before_ts: Option<i64>) -> Result
     // The pinned engine's compound SELECT outer LIMIT does not reliably use
     // bound parameters. Only this checked internal integer is interpolated;
     // every identity and cutoff remains an explicitly indexed binding.
-    sql.push_str(&format!(" ORDER BY created_ts ASC, id ASC LIMIT {limit}"));
+    {
+        use std::fmt::Write as _;
+        let _ = write!(sql, " ORDER BY created_ts ASC, id ASC LIMIT {limit}");
+    }
     Ok(sql)
 }
 
