@@ -868,7 +868,7 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
     }
 }
 
-fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot) -> bool {
+const fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot) -> bool {
     lag.backlog_depth > 0
         || lag.coalescer_pending > 0
         || lag.wbq_depth > 0
