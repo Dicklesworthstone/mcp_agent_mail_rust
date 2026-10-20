@@ -15,6 +15,47 @@ use crate::ProjectArchive;
 
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Versions 2/3 pad each SHA-1 entry to at least 64 bytes. Version 4
+/// needs the 62-byte fixed fields, a prefix varint and a terminating NUL.
+/// SHA-256 entries are longer. Bound native decoding by the bytes actually
+/// admitted, independently of this project's canonical enumeration budget.
+/// Even a tiny forged header cannot request an arbitrarily large index.
+fn decoded_entry_limit(bytes: usize) -> usize {
+    bytes.saturating_sub(12) / 64
+}
+
+fn reject_ancestor_entries(
+    index: &Index,
+    canonical: &str,
+    budget: &CanonicalScanBudget<'_>,
+) -> crate::Result<()> {
+    // A prefix seek cannot see an entry replacing one of the directories
+    // above it. Inspect every ancestor explicitly, including merge stages
+    // and sparse-directory spellings, before accepting an empty namespace.
+    for (end, _) in canonical.match_indices('/') {
+        budget.checkpoint("staged canonical ancestor")?;
+        for name in [&canonical[..end], &canonical[..=end]] {
+            let position = match index.find_prefix(name) {
+                Ok(position) => position,
+                Err(error) if error.code() == ErrorCode::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let entry = index
+                .get(position)
+                .ok_or_else(|| invalid("staged canonical ancestor lost its index entry"))?;
+            // Prefix lookup returns the first stage of an exact name before
+            // any descendants. Compare raw bytes so sparse trailing slashes
+            // are not normalized away by platform Path conversion.
+            if entry.path == name.as_bytes() {
+                return Err(invalid(
+                    "staged entry obstructs the canonical namespace; repair refused",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn preflight(
     repo: &Repository,
     archive: &ProjectArchive,
@@ -51,9 +92,16 @@ pub(super) fn preflight(
     if &header[..4] != b"DIRC" {
         return Err(invalid("staged canonical index has an invalid signature"));
     }
-    let count = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-    if u64::from(count) > budget.entries_left as u64 {
-        return Err(invalid("staged canonical index entry budget exceeded"));
+    let version = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    if !matches!(version, 2..=4) {
+        return Err(invalid("staged canonical index has an unsupported version"));
+    }
+    let count = usize::try_from(u32::from_be_bytes([
+        header[8], header[9], header[10], header[11],
+    ]))
+    .map_err(|_| invalid("staged canonical index entry count overflow"))?;
+    if count > decoded_entry_limit(bytes.len()) {
+        return Err(invalid("staged canonical index decode entry budget exceeded"));
     }
     budget.checkpoint("staged index snapshot")?;
     let mut snapshot = tempfile::Builder::new()
@@ -66,27 +114,36 @@ pub(super) fn preflight(
     // indexes without their authority and corrupt/unsupported formats fail
     // closed rather than becoming proof of an empty staged namespace.
     let index = Index::open_ext(snapshot.path(), repo.object_format())?;
-    if index.len() > budget.entries_left {
-        return Err(invalid("staged canonical index decoded entry budget exceeded"));
+    if index.len() != count {
+        return Err(invalid("staged canonical index decoded entry count changed"));
     }
     let root = crate::archive_project_root_checked(archive)?.join("messages");
     let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
     let prefix = format!("{relative}/");
-    for entry in index.iter() {
-        budget.visit()?;
-        let component = entry.path.strip_suffix(b"/").unwrap_or(&entry.path);
-        if canonical
-            .as_bytes()
-            .strip_prefix(component)
-            .is_some_and(|tail| tail.starts_with(b"/"))
-        {
-            return Err(invalid(
-                "staged entry obstructs the canonical namespace; repair refused",
-            ));
+    if !canonical.starts_with(&prefix) {
+        return Err(invalid("staged canonical target is outside its project namespace"));
+    }
+    reject_ancestor_entries(&index, canonical, budget)?;
+    // This bare private index has no repository's ignore-case configuration.
+    // Git's sorted path range allows one seek instead of enumerating every
+    // inbox, attachment and foreign project. Charge every visited namespace
+    // entry, even non-message paths; raw index bytes were charged in full.
+    let start = match index.find_prefix(prefix.as_str()) {
+        Ok(start) => start,
+        Err(error) if error.code() == ErrorCode::NotFound => {
+            return budget.checkpoint("staged canonical result");
         }
+        Err(error) => return Err(error.into()),
+    };
+    for position in start..index.len() {
+        budget.checkpoint("staged canonical entry")?;
+        let entry = index
+            .get(position)
+            .ok_or_else(|| invalid("staged canonical index lost a decoded entry"))?;
         let Some(suffix) = entry.path.strip_prefix(prefix.as_bytes()) else {
-            continue;
+            break;
         };
+        budget.visit()?;
         if entry.mode == 0o040000 {
             return Err(invalid(
                 "staged canonical namespace contains an unexpanded sparse directory",
@@ -178,6 +235,199 @@ mod tests {
         index.add_path(Path::new(&relative)).unwrap();
         index.write().unwrap();
         index.get_path(Path::new(&relative), 0).unwrap().id
+    }
+
+    #[test]
+    fn large_recipient_index_does_not_disable_small_canonical_repair() {
+        let (_dir, config, archive, message, recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let full = crate::render_message_bundle_content(
+            &message,
+            entry(&message, &recipients).body_md,
+        )
+        .unwrap();
+        let expected = stage(&repo, &archive, &paths.canonical, full.as_bytes());
+        std::fs::rename(
+            &paths.canonical,
+            config.storage_root.join("retained-large-index-message.md"),
+        )
+        .unwrap();
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let mut index = repo.index().unwrap();
+        let mut copy = index.get_path(Path::new(&relative), 0).unwrap();
+        // Real native index entries, but no 100,001-file filesystem fixture.
+        // These are recipient copies, not canonical identities to enumerate.
+        for number in 0..100_001 {
+            copy.path = format!("projects/other/agents/BlueLake/inbox/2026/10/{number:06}.md")
+                .into_bytes();
+            index.add(&copy).unwrap();
+        }
+        index.write().unwrap();
+        assert!(index.len() > CanonicalScanBudget::default().entries_left);
+        drop(index);
+        let before = std::fs::read(repo.path().join("index")).unwrap();
+        assert!(before.len() as u64 <= MAX_INDEX_BYTES);
+        let head = repo.head().ok().and_then(|head| head.target());
+        let mut budget = CanonicalScanBudget { entries_left: 1, ..Default::default() };
+        let available = budget.bytes_left;
+        preflight(&repo, &archive, 42, &relative, expected, None, &mut budget).unwrap();
+        assert_eq!(budget.entries_left, 0);
+        assert_eq!(budget.bytes_left, available - before.len() as u64);
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+        assert_eq!(repo.head().ok().and_then(|head| head.target()), head);
+        assert!(!paths.canonical.exists());
+        let repaired = reconcile_message_bundle(&archive, &config, entry(&message, &recipients))
+            .unwrap();
+        assert_eq!(repaired.files_created, 4);
+        assert!(repaired.git_commit_needed);
+        let committed = Repository::open(&archive.repo_root).unwrap();
+        let tree = committed.head().unwrap().peel_to_tree().unwrap();
+        for path in [&paths.canonical, &paths.outbox].into_iter().chain(&paths.inbox) {
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+            let object = tree.get_path(Path::new(&relative)).unwrap();
+            assert_eq!(
+                committed.find_blob(object.id()).unwrap().content(),
+                std::fs::read(path).unwrap(),
+            );
+        }
+        for path in &paths.inbox {
+            let (copy, _) = super::super::super::read_surviving_message(path).unwrap().unwrap();
+            assert_eq!(copy["bcc"], json!([]));
+        }
+    }
+
+    #[test]
+    fn prefix_seek_checks_every_ancestor_even_when_no_descendant_exists() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let source = archive.root.join("messages/2025/01/source.md");
+        let expected = stage(&repo, &archive, &source, b"---json\n{\"id\":99}\n---\n\n");
+        let source_relative = crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let mut index = repo.index().unwrap();
+        let mut obstruction = index.get_path(Path::new(&source_relative), 0).unwrap();
+        for (end, _) in canonical.match_indices('/') {
+            for merge_stage in 0..=3_u16 {
+                index.clear().unwrap();
+                obstruction.path = canonical[..end].as_bytes().to_vec();
+                obstruction.flags = (obstruction.flags & !0x3000) | (merge_stage << 12);
+                index.add(&obstruction).unwrap();
+                index.write().unwrap();
+                let before = std::fs::read(repo.path().join("index")).unwrap();
+                let mut budget = CanonicalScanBudget { entries_left: 0, ..Default::default() };
+                let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
+                    .unwrap_err();
+                assert!(error.to_string().contains("obstructs"), "{canonical} {end}: {error}");
+                assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+                assert!(!paths.canonical.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn neighbouring_prefixes_cannot_hide_a_staged_duplicate() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let source = archive.root.join("messages/2025/01/duplicate.md");
+        stage(&repo, &archive, &source, b"---json\n{\"id\":42}\n---\n\nprior");
+        for suffix in ["messages-old", "messages2", "messagesX", "MESSAGES"] {
+            stage(&repo, &archive, &archive.root.join(suffix).join("opaque.md"), b"unrelated");
+        }
+        repo.config().unwrap().set_bool("core.ignorecase", true).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
+        let before = std::fs::read(repo.path().join("index")).unwrap();
+        let mut budget = CanonicalScanBudget { entries_left: 1, ..Default::default() };
+        let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("already staged"), "{error}");
+        assert_eq!(budget.entries_left, 0);
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+    }
+
+    #[test]
+    fn canonical_range_still_exhausts_its_own_entry_budget() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        for (name, bytes) in [
+            ("one.md", b"---json\n{\"id\":99}\n---\n\n".as_slice()),
+            ("two.md", b"---json\n{\"id\":100}\n---\n\n".as_slice()),
+        ] {
+            stage(&repo, &archive, &archive.root.join("messages/2025/01").join(name), bytes);
+        }
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
+        let before = std::fs::read(repo.path().join("index")).unwrap();
+        let mut budget = CanonicalScanBudget { entries_left: 1, ..Default::default() };
+        let error = preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("entry budget"), "{error}");
+        assert_eq!(budget.entries_left, 0);
+        assert!(!paths.canonical.exists());
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+    }
+
+    #[test]
+    fn compact_index_versions_and_empty_namespace_keep_bounded_decode() {
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let source = archive.root.join("agents/BlueLake/profile.json");
+        stage(&repo, &archive, &source, b"{}");
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
+        for version in [2, 3, 4] {
+            let mut index = repo.index().unwrap();
+            index.set_version(version).unwrap();
+            index.write().unwrap();
+            let before = std::fs::read(repo.path().join("index")).unwrap();
+            assert!(index.len() <= decoded_entry_limit(before.len()));
+            let mut budget = CanonicalScanBudget { entries_left: 0, ..Default::default() };
+            let available = budget.bytes_left;
+            preflight(&repo, &archive, 42, &canonical, expected, None, &mut budget).unwrap();
+            assert_eq!(budget.entries_left, 0);
+            assert_eq!(budget.bytes_left, available - before.len() as u64);
+            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn tiny_forged_index_cannot_request_unbounded_native_allocation() {
+        assert_eq!(decoded_entry_limit(0), 0);
+        assert_eq!(decoded_entry_limit(12), 0);
+        assert_eq!(decoded_entry_limit(75), 0);
+        assert_eq!(decoded_entry_limit(76), 1);
+        let (_dir, _config, archive, message, recipients) = fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
+        let mut bytes = b"DIRC\0\0\0\x04".to_vec();
+        bytes.extend(u32::MAX.to_be_bytes());
+        bytes.extend([0_u8; 20]);
+        std::fs::write(repo.path().join("index"), &bytes).unwrap();
+        let error = preflight(
+            &repo, &archive, 42, &canonical, expected, None, &mut CanonicalScanBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("decode entry budget"), "{error}");
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), bytes);
     }
 
     #[test]
@@ -358,7 +608,9 @@ mod tests {
         let relative = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
         let expected = Oid::hash_object(ObjectType::Blob, b"new").unwrap();
         let before = std::fs::read(repo.path().join("index")).unwrap();
-        let count = repo.index().unwrap().len();
+        // Only the one canonical source is enumerated, not bootstrap files
+        // or recipient copies elsewhere in the repository-wide index.
+        let count = 1;
         for mut budget in [
             CanonicalScanBudget { entries_left: 0, ..Default::default() },
             CanonicalScanBudget { bytes_left: 1, ..Default::default() },
