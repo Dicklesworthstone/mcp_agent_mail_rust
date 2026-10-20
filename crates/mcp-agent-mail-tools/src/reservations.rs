@@ -567,10 +567,10 @@ fn reservation_rows_needing_archive_heal(
 /// authoritative active DB reservations, healing any that are missing or stale
 /// (F1 reconcile-on-read). Returns the number of artifacts re-emitted.
 ///
-/// Cheap and safe on the reservation read path: it reads only the *active* rows'
-/// own `id-<id>.json` artifacts (bounded by the active set, not the project's
-/// full reservation history), and dispatches an archive write only when genuine
-/// drift is found — so the steady state costs a handful of stats. This is what
+/// Cheap and safe on the reservation read path: it parses only the *active*
+/// rows' artifacts, using direct lookups for current-generation files and one
+/// shared directory scan for any legacy or missing names. It dispatches an
+/// archive write only when genuine drift is found. This is what
 /// makes F1's acceptance hold — a crash between a reservation's DB-commit and its
 /// archive-write converges to a consistent archive (no wrong holder) on the next
 /// `file_reservation_paths` call, with no operator action.
@@ -584,21 +584,12 @@ fn reconcile_active_reservation_archive(
     if active_rows.is_empty() {
         return 0;
     }
-    // Look up only the active reservations' artifacts — never the whole archive.
-    let mut present = BTreeMap::new();
-    for row in active_rows {
-        if let Some(id) = row.id
-            && let Some(view) =
-                crate::reservation_parity::read_project_archive_reservation_for_generation(
-                    &config.storage_root,
-                    &project.slug,
-                    id,
-                    db_generation,
-                )
-        {
-            present.insert(id, view);
-        }
-    }
+    let present = crate::reservation_parity::read_project_archive_reservations_for_generation(
+        &config.storage_root,
+        &project.slug,
+        active_rows.iter().filter_map(|row| row.id),
+        db_generation,
+    );
     let heal = reservation_rows_needing_archive_heal(
         &project.human_key,
         active_rows,
@@ -711,21 +702,12 @@ fn reconcile_released_reservation_archive(
     if released_rows.is_empty() {
         return 0;
     }
-    // Look up only the released reservations' artifacts — never the whole archive.
-    let mut present = BTreeMap::new();
-    for row in released_rows {
-        if let Some(id) = row.id
-            && let Some(view) =
-                crate::reservation_parity::read_project_archive_reservation_for_generation(
-                    &config.storage_root,
-                    &project.slug,
-                    id,
-                    db_generation,
-                )
-        {
-            present.insert(id, view);
-        }
-    }
+    let present = crate::reservation_parity::read_project_archive_reservations_for_generation(
+        &config.storage_root,
+        &project.slug,
+        released_rows.iter().filter_map(|row| row.id),
+        db_generation,
+    );
     let heal = released_rows_needing_archive_heal(
         &project.human_key,
         released_rows,
@@ -1866,9 +1848,9 @@ pub async fn file_reservation_paths(
     // that reservation's DB-commit and its archive-write — GH#112). This is the
     // "next access converges" guarantee: the pre-commit guard reads the artifacts
     // directly, so without this a wrong/absent holder would slip through. The
-    // healer fires an archive write only on genuine drift, so the steady state is
-    // just one directory scan. Best-effort: a failed agent lookup never fails the
-    // reserve. The released-row half (br-74sxo) rewrites stale-ACTIVE artifacts
+    // healer fires an archive write only on genuine drift. Exact files need no
+    // directory scan; fallback IDs share one scan per pass. A failed agent
+    // lookup never fails the reserve. The released-row half (br-74sxo) rewrites stale-ACTIVE artifacts
     // whose release write was skipped (disk-critical) or lost (crash-gap), so
     // the guard stops honoring a released holder before `expires_ts`.
     if replayed_rows.is_none()
