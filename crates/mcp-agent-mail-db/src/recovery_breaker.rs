@@ -272,17 +272,44 @@ pub fn breaker_lock_path(db_path: &Path) -> PathBuf {
 /// Held advisory lock serializing one database's durable breaker transition.
 #[derive(Debug)]
 pub(crate) struct RecoveryBreakerFileLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl RecoveryBreakerFileLock {
+    /// A retained flock is authority only while its original name still refers
+    /// to the same private, unaliased inode. Retention rechecks this before
+    /// reclaiming evidence, so replacement cannot create two recovery owners.
+    pub(crate) fn revalidate(&self) -> std::io::Result<()> {
+        crate::pool::validate_sqlite_target_path(&self.path, "recovery election lock")
+            .map_err(std::io::Error::other)?;
+        ensure_exclusive_breaker_authority_file(&self.file, &self.path)?;
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.path)?;
+        ensure_exclusive_breaker_authority_file(&current, &self.path)?;
+        let retained_identity = same_file::Handle::from_file(self.file.try_clone()?)?;
+        let current_identity = same_file::Handle::from_file(current)?;
+        if retained_identity != current_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery election lock identity or ownership changed",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Try to become the sole process evaluating and updating this database's
 /// breaker state. The lock is held across the admitted recovery operation and
 /// terminal state write; process death releases it automatically.
 pub(crate) fn try_acquire_file_lock(db_path: &Path) -> std::io::Result<RecoveryBreakerFileLock> {
-    let path = breaker_lock_path(db_path);
+    let path = std::path::absolute(breaker_lock_path(db_path))?;
+    crate::pool::validate_sqlite_target_path(&path, "recovery election lock")
+        .map_err(std::io::Error::other)?;
     let file = open_breaker_lock_file(&path)?;
     fs2::FileExt::try_lock_exclusive(&file)?;
-    Ok(RecoveryBreakerFileLock { _file: file })
+    let guard = RecoveryBreakerFileLock { file, path };
+    guard.revalidate()?;
+    Ok(guard)
 }
 
 fn breaker_authority_link_count(file: &std::fs::File) -> std::io::Result<u64> {
@@ -1265,6 +1292,25 @@ mod tests {
             0o600,
             "an existing lock authority file must not retain group/world access"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_breaker_lock_refuses_replaced_or_aliased_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let db = root.join("storage.sqlite3");
+        let lock = breaker_lock_path(&db);
+        let owner = try_acquire_file_lock(&db).unwrap();
+        owner.revalidate().unwrap();
+        let displaced = root.join("displaced-lock");
+        std::fs::rename(&lock, &displaced).unwrap();
+        let replacement_owner = try_acquire_file_lock(&db).unwrap();
+        assert!(owner.revalidate().is_err());
+        replacement_owner.revalidate().unwrap();
+        std::fs::hard_link(&lock, root.join("aliased-lock")).unwrap();
+        assert!(replacement_owner.revalidate().is_err());
+        assert!(displaced.exists());
     }
 
     #[cfg(unix)]

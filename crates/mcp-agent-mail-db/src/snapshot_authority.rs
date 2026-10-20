@@ -27,15 +27,20 @@ pub(super) struct SnapshotAuthority {
 
 /// Exclusive snapshot admission retained from pin selection through eviction.
 ///
-/// This coordinates retention with metadata publishers and verified readers.
-/// It neither opens the live database nor enters database recovery admission.
-/// The caller must still validate each inventoried file before moving it.
+/// This coordinates retention with metadata publishers, verified readers, and
+/// the durable recovery election. Holding the election excludes candidate
+/// selection/staging without recording a recovery attempt or opening the live
+/// database. The caller must still validate each inventoried file before moving it.
 #[must_use]
 pub struct SnapshotRetentionGuard {
     authority: SnapshotAuthority,
+    primary: PathBuf,
     metadata_path: PathBuf,
     metadata: RetentionMetadata,
     selected: Option<super::SelectedVerifiedSnapshot>,
+    selected_identity: Option<std::fs::Metadata>,
+    // Drop recovery last, after releasing the snapshot authority and source.
+    recovery: crate::recovery_breaker::RecoveryBreakerFileLock,
 }
 
 #[derive(PartialEq, Eq)]
@@ -66,10 +71,15 @@ impl SnapshotRetentionGuard {
     /// An unreadable or malformed sidecar stays occupied, never absent.
     ///
     /// # Errors
-    /// Refuses live readers/publishers, unsafe lock paths, or changed authority.
+    /// Refuses recovery, live readers/publishers, pending recovery intents,
+    /// unsafe lock paths, or changed authority.
     pub fn acquire(primary: &Path) -> io::Result<Self> {
         let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
+        // Recovery owns this election before selecting a snapshot. Use the
+        // same ordering, and never acquire recovery's outcome/backoff state.
+        let recovery = crate::recovery_breaker::try_acquire_file_lock(&primary)?;
         let authority = SnapshotAuthority::acquire(&primary, true)?;
+        ensure_no_recovery_references(&primary)?;
         let metadata_path = super::snapshot_meta_path(&primary);
         let metadata = retention_metadata(&metadata_path);
         let selected = if matches!(metadata, RetentionMetadata::Bytes(_)) {
@@ -79,11 +89,18 @@ impl SnapshotRetentionGuard {
         } else {
             None
         };
+        let selected_identity = selected
+            .as_ref()
+            .map(|selected| selected.source.metadata())
+            .transpose()?;
         let guard = Self {
+            recovery,
             authority,
+            primary,
             metadata_path,
             metadata,
             selected,
+            selected_identity,
         };
         guard.revalidate()?;
         Ok(guard)
@@ -117,7 +134,7 @@ impl SnapshotRetentionGuard {
         path: &Path,
         inventoried: &std::fs::Metadata,
     ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
-        self.delete_superseded_generation_with(primary, path, inventoried)
+        self.delete_superseded_generation_with(primary, path, inventoried, false)
     }
 
     /// Historical quarantine names do not prove which database produced them.
@@ -133,7 +150,24 @@ impl SnapshotRetentionGuard {
         path: &Path,
         inventoried: &std::fs::Metadata,
     ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
-        self.delete_superseded_generation_with(primary, path, inventoried)
+        self.delete_superseded_generation_with(primary, path, inventoried, false)
+    }
+
+    /// Apply an explicit operator deletion policy to a superseded incident
+    /// image. Opt-in changes eligible naming, never recovery verification or
+    /// ownership safety. Unverified incident evidence stays available.
+    ///
+    /// # Errors
+    /// Refuses live/pinned images, incomplete SQLite families, readers, aliases,
+    /// changed inventory, and incident images without a verified successor.
+    /// Archive-reconcile evidence remains owned by its separate recovery path.
+    pub fn delete_superseded_incident_generation(
+        &self,
+        primary: &Path,
+        path: &Path,
+        inventoried: &std::fs::Metadata,
+    ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
+        self.delete_superseded_generation_with(primary, path, inventoried, true)
     }
 
     fn delete_superseded_generation_with(
@@ -141,10 +175,8 @@ impl SnapshotRetentionGuard {
         primary: &Path,
         path: &Path,
         inventoried: &std::fs::Metadata,
+        incident_opted_in: bool,
     ) -> io::Result<crate::recovery_retention::ReclaimedFileBytes> {
-        use mcp_agent_mail_core::disk::{
-            SqliteRecoveryCandidateKind, classify_sqlite_recovery_candidate_name,
-        };
         self.revalidate()?;
         let primary = super::normalized_snapshot_primary(primary).map_err(io::Error::other)?;
         if super::snapshot_meta_path(&primary) != self.metadata_path {
@@ -154,21 +186,18 @@ impl SnapshotRetentionGuard {
             .selected
             .as_ref()
             .ok_or_else(|| invalid("no verified replacement"))?;
-        let candidate = primary
-            .file_name()
-            .zip(path.file_name())
-            .and_then(|(db, name)| classify_sqlite_recovery_candidate_name(db, name))
-            .ok_or_else(|| invalid("not a strict periodic generation"))?;
-        if candidate.kind() != SqliteRecoveryCandidateKind::TimestampedBak
-            || candidate.generation_micros().is_none_or(|created| {
-                created.saturating_add(1_000_000) > selected.metadata.created_us
-            })
+        let created = retention_generation_created(&primary, path, inventoried, incident_opted_in)?;
+        if created
+            .is_none_or(|created| created.saturating_add(1_000_000) > selected.metadata.created_us)
         {
             return Err(invalid("generation is not superseded by verified snapshot"));
         }
         let pinned = selected.source.metadata()?;
         if pinned.dev() == inventoried.dev() && pinned.ino() == inventoried.ino() {
             return Err(invalid("cannot reclaim the verified snapshot"));
+        }
+        if inventoried.nlink() != 1 || std::fs::symlink_metadata(path)?.nlink() != 1 {
+            return Err(invalid("cannot reclaim an aliased backup generation"));
         }
         if !crate::pool::sqlite_recovery_candidate_is_standalone(path) {
             return Err(invalid("generation has companion recovery state"));
@@ -179,10 +208,10 @@ impl SnapshotRetentionGuard {
         // remain evidence even when a newer healthy restore point exists.
         match crate::pool::sqlite_recovery_candidate_passes_full_integrity_check(path) {
             Ok(true) => {}
-            Ok(false) => return Err(invalid("periodic generation failed full verification")),
+            Ok(false) => return Err(invalid("backup generation failed full verification")),
             Err(error) => {
                 return Err(io::Error::other(format!(
-                    "periodic generation verification unavailable: {error}"
+                    "backup generation verification unavailable: {error}"
                 )));
             }
         }
@@ -232,14 +261,103 @@ impl SnapshotRetentionGuard {
     /// Participating writers are excluded; changed external evidence refuses
     /// further work rather than allowing a stale pin to authorize eviction.
     pub fn revalidate(&self) -> io::Result<()> {
+        self.recovery.revalidate()?;
         self.authority.revalidate()?;
+        ensure_no_recovery_references(&self.primary)?;
         if retention_metadata(&self.metadata_path) != self.metadata {
             return Err(invalid(
                 "snapshot metadata changed during retention; rescan required",
             ));
         }
+        if let (Some(selected), Some(expected)) = (&self.selected, &self.selected_identity) {
+            let retained = selected.source.metadata()?;
+            let current = std::fs::symlink_metadata(&selected.actual_path)?;
+            for actual in [&retained, &current] {
+                if !actual.is_file()
+                    || actual.nlink() != 1
+                    || actual.dev() != expected.dev()
+                    || actual.ino() != expected.ino()
+                    || actual.len() != expected.len()
+                    || actual.mtime() != expected.mtime()
+                    || actual.mtime_nsec() != expected.mtime_nsec()
+                    || actual.ctime() != expected.ctime()
+                    || actual.ctime_nsec() != expected.ctime_nsec()
+                {
+                    return Err(invalid("verified snapshot pin changed during retention"));
+                }
+            }
+            if !crate::pool::sqlite_recovery_candidate_is_standalone(&selected.actual_path) {
+                return Err(invalid(
+                    "verified snapshot pin gained companion recovery state",
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn retention_generation_created(
+    primary: &Path,
+    path: &Path,
+    inventoried: &std::fs::Metadata,
+    incident_opted_in: bool,
+) -> io::Result<Option<i64>> {
+    use mcp_agent_mail_core::disk::{
+        SqliteRecoveryCandidateKind, SqliteRecoveryCandidateName,
+        classify_sqlite_recovery_candidate_name,
+    };
+
+    let candidate = primary
+        .file_name()
+        .zip(path.file_name())
+        .and_then(|(db, name)| classify_sqlite_recovery_candidate_name(db, name));
+    if candidate
+        .is_some_and(|candidate| candidate.kind() == SqliteRecoveryCandidateKind::TimestampedBak)
+    {
+        return Ok(candidate.and_then(SqliteRecoveryCandidateName::generation_micros));
+    }
+    if incident_opted_in
+        && super::normalized_snapshot_primary(path)
+            .map_err(io::Error::other)?
+            .parent()
+            == primary.parent()
+        && path.file_name() != super::snapshot_bak_path(primary).file_name()
+        && primary
+            .file_name()
+            .zip(path.file_name())
+            .is_some_and(|(db, name)| {
+                crate::recovery_retention::classify_backup_file(db, name).is_some_and(|kind| {
+                    kind != crate::recovery_retention::BackupKind::ArchiveReconcile
+                })
+            })
+    {
+        // Incident names have several historical grammars. Treat a
+        // copied/unknown mtime conservatively and still demand full
+        // verification plus proven lineage before any unlink.
+        return Ok(inventoried
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|age| i64::try_from(age.as_micros()).ok()));
+    }
+    Err(invalid("not an eligible superseded backup generation"))
+}
+
+fn ensure_no_recovery_references(primary: &Path) -> io::Result<()> {
+    let legacy_lock = crate::pool::sqlite_path_with_suffix(primary, ".recovery.lock");
+    match std::fs::symlink_metadata(&legacy_lock) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            // Older processes do not participate in the durable election.
+            // Invalid or stale-looking PID text cannot authorize evidence loss.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "legacy recovery lock remains occupied; preserving recovery evidence",
+            ));
+        }
+    }
+    crate::forensics::ensure_no_pending_recovery_receipts(primary)
 }
 
 /// Read only through immutable canonical SQLite; never seed or repair a
@@ -493,5 +611,175 @@ mod tests {
                 .exists()
         );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn retention_excludes_recovery_for_the_entire_candidate_construction() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("mail.sqlite3");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let recovery_primary = primary.clone();
+        let recovery = std::thread::spawn(move || {
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+            crate::pool::with_automatic_recovery_admission(
+                &recovery_primary,
+                "retention concurrency fixture",
+                || -> io::Result<()> {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = SnapshotRetentionGuard::acquire(&primary).err().unwrap();
+        release_tx.send(()).unwrap();
+        recovery.join().unwrap().unwrap();
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+
+        let retention = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let staged = root.join("candidate-construction-must-not-run");
+        let candidate = staged.clone();
+        let recovery_primary = primary.clone();
+        let refused = std::thread::spawn(move || {
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+            crate::pool::with_automatic_recovery_admission(
+                &recovery_primary,
+                "retention construction contender",
+                || std::fs::write(&candidate, b"candidate"),
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(
+            refused,
+            Err(crate::pool::AutomaticRecoveryRunError::Admission { .. })
+        ));
+        assert!(
+            !staged.exists(),
+            "recovery must refuse before constructing a candidate"
+        );
+        retention.revalidate().unwrap();
+        drop(retention);
+        crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+    }
+
+    #[test]
+    fn refused_snapshot_admission_releases_the_recovery_election() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().canonicalize().unwrap().join("mail.sqlite3");
+        let _reader = SnapshotAuthority::acquire(&primary, false).unwrap();
+        assert!(SnapshotRetentionGuard::acquire(&primary).is_err());
+        crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+        assert!(!crate::recovery_breaker::breaker_sidecar_path(&primary).exists());
+    }
+
+    #[test]
+    fn legacy_recovery_references_refuse_retention_and_remain_intact() {
+        for shape in ["live", "stale", "unknown", "directory", "dangling"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let primary = root.join("mail.sqlite3");
+            let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+            let legacy = root.join("mail.sqlite3.recovery.lock");
+            match shape {
+                "live" => std::fs::write(&legacy, std::process::id().to_string()).unwrap(),
+                "stale" => std::fs::write(&legacy, b"0").unwrap(),
+                "unknown" => std::fs::write(&legacy, b"incomplete owner").unwrap(),
+                "directory" => std::fs::create_dir(&legacy).unwrap(),
+                _ => std::os::unix::fs::symlink(root.join("missing-owner"), &legacy).unwrap(),
+            }
+            assert!(guard.revalidate().is_err(), "{shape}");
+            drop(guard);
+            assert!(
+                SnapshotRetentionGuard::acquire(&primary).is_err(),
+                "{shape}"
+            );
+            assert!(std::fs::symlink_metadata(&legacy).is_ok(), "{shape}");
+            crate::recovery_breaker::try_acquire_file_lock(&primary).unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_recovery_receipts_pin_generations_after_the_owner_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("mail.sqlite3");
+        let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let receipts = root.join(".mcp-agent-mail-recovery-receipts/mail.sqlite3");
+        std::fs::create_dir_all(&receipts).unwrap();
+        let pending = receipts.join("recovery-admission.receipt.pending");
+        std::fs::write(&pending, b"interrupted promotion intent").unwrap();
+        assert!(guard.revalidate().is_err());
+        drop(guard);
+        assert!(SnapshotRetentionGuard::acquire(&primary).is_err());
+        assert_eq!(
+            std::fs::read(&pending).unwrap(),
+            b"interrupted promotion intent"
+        );
+        std::fs::rename(
+            &pending,
+            receipts.join("recovery-admission.receipt.aborted"),
+        )
+        .unwrap();
+        drop(SnapshotRetentionGuard::acquire(&primary).unwrap());
+    }
+
+    #[test]
+    fn verified_pin_revalidation_rejects_source_replacement_aliases_and_companions() {
+        for change in ["replacement", "hardlink", "contents", "wal"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let primary = root.join("mail.sqlite3");
+            let connection =
+                crate::CanonicalDbConn::open_file(primary.display().to_string()).unwrap();
+            connection
+                .execute_raw(&crate::schema::init_schema_sql_base())
+                .unwrap();
+            drop(connection);
+            let backup = super::super::snapshot_bak_path(&primary);
+            std::fs::copy(&primary, &backup).unwrap();
+            super::super::record_snapshot_metadata(&primary, 1_000_000).unwrap();
+            let guard = SnapshotRetentionGuard::acquire(&primary).unwrap();
+            assert_eq!(guard.verified_source_path(), Some(backup.as_path()));
+            let metadata_before =
+                std::fs::read(super::super::snapshot_meta_path(&primary)).unwrap();
+            match change {
+                "replacement" => {
+                    let original = root.join("preserved-pin");
+                    std::fs::rename(&backup, &original).unwrap();
+                    std::fs::copy(&original, &backup).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(&backup, root.join("pin-alias")).unwrap(),
+                "contents" => {
+                    use std::io::{Seek as _, Write as _};
+                    let original_mtime = std::fs::metadata(&backup).unwrap().modified().unwrap();
+                    let mut writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&backup)
+                        .unwrap();
+                    writer.seek(std::io::SeekFrom::End(-1)).unwrap();
+                    writer.write_all(b"x").unwrap();
+                    writer
+                        .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+                        .unwrap();
+                }
+                _ => std::fs::write(
+                    crate::pool::sqlite_path_with_suffix(&backup, "-wal"),
+                    b"live WAL",
+                )
+                .unwrap(),
+            }
+            assert!(guard.revalidate().is_err(), "{change}");
+            assert!(backup.exists());
+            assert_eq!(
+                std::fs::read(super::super::snapshot_meta_path(&primary)).unwrap(),
+                metadata_before
+            );
+        }
     }
 }

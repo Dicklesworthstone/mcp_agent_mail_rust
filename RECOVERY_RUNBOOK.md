@@ -36,17 +36,34 @@ exact `.bak` publication slot and the verified source are always retained.
 Old `rotation-*` directories are swept with the same checks, one strict periodic
 file at a time; incident files, unknown names, nested directories, symlinks and
 hard-linked aliases are never automatically removed by this sweep.
+Empty native rotation directories are removed separately in bounded passes,
+including previously accumulated empty directories. Active staging leases,
+unknown directories, nested trees and recorded recovery evidence are preserved.
+
+Retention shares recovery's durable election. An active recovery, any occupied
+legacy `.recovery.lock`, or an unresolved `.pending` recovery receipt prevents
+reclamation. Explicit CLI restore acquires the election before staging its
+source. These references are recovery evidence even when the original process
+has exited; resolve the interrupted operation before retrying cleanup.
 
 Unset `AM_BACKUP_ROTATION_DELETE` enables this periodic reclamation. Explicit
-false preserves move-only retention. Explicit true also enables the existing
-incident-deletion policy. Without safe reclamation (including on non-Unix),
+false preserves move-only retention. Explicit true also permits verified
+incident deletion, requiring a fully verified successor, matching mailbox
+lineage or duplicate bytes, and no live readers, aliases or companion state.
+Unsupported platforms preserve incident evidence. Without safe reclamation,
 automatic publication refuses at `max(1, AM_BACKUP_KEEP_COUNT) + 3` existing
-backup images, including prior rotation staging. An admitted cycle can add at
-most one image. Thus the periodic producer cannot grow indefinitely even with
-bad metadata, busy recovery readers, or a no-delete policy. Existing over-budget
-evidence is preserved, and explicit operator backups remain outside this bound.
-This is a count bound for periodic images, not a total filesystem byte quota:
-database growth, incident evidence and operator exports have separate ownership.
+periodic images, including prior rotation staging, or when retained logical
+bytes plus the estimated new export exceed the larger of 512 MiB and
+`(max(1, AM_BACKUP_KEEP_COUNT) + 3) × (current database bytes + WAL bytes)`.
+The full observed reclaimable directory footprint spends that byte allowance.
+A durable journal permits at most one extra repair export to restore missing
+verification authority; a crash or failed export does not reset that allowance.
+The periodic producer therefore stops adding copies when safe reclamation
+cannot progress. Existing over-budget evidence is preserved. These admission
+bounds apply to cooperating automatic exporters; they are not a filesystem
+quota covering database growth, operator exports, or other programs. See the
+[operator cookbook](docs/OPERATOR_COOKBOOK.md#13-run-doctor-checks-and-inspect-backups-read-only)
+for the complete retention and repair policy.
 When admission warns that its retention budget is exhausted, repair snapshot
 authority or explicitly reclaim retained backups; the guard backs off without
 classifying the mailbox as corrupt or stopping message writes.

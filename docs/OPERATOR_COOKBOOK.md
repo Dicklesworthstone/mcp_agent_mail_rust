@@ -470,6 +470,18 @@ and payloads for inspection, resume, or restore. Successful move receipts do
 not authorize deletion. Unrecognized material and failed or interrupted backup
 stages remain recovery evidence.
 
+Empty native rotation directories are also removed, including directories
+emptied by the current reclamation pass. This releases directory inodes as well
+as backup-file storage. Cleanup inspects only immediate, strictly named native
+rotation directories and uses an empty-directory removal through retained
+directory handles. Unknown directories, nested trees, manifests, and active
+directory readers or staging operations remain protected. A bounded empty-only
+sweep runs before the full backup inventory, so an old installation with more
+than 16,384 empty rotation directories can drain over successive passes instead
+of remaining permanently blocked by the inventory limit. Each rotation removes
+at most 128 empty directories across its pre-inventory and post-reclamation
+sweeps. Explicit `AM_BACKUP_ROTATION_DELETE=false` also disables this cleanup.
+
 Automatic exporters also have admission limits so refused reclamation cannot
 silently produce unlimited new copies. The periodic count limit is
 `keep_count + 3`, including retained historical periodic files. The projected
@@ -515,24 +527,44 @@ Setting `AM_BACKUP_ROTATION_DELETE=false` explicitly preserves move-only
 retention and disables the extra repair export; automatic publication stops at
 the same admission limits when staging cannot release space. Leaving the
 variable unset enables the verified periodic reclamation policy. Setting it
-to `true` also enables the older incident-artifact deletion behavior, so it is
-broader than the default periodic policy.
+to `true` also allows incident-backup reclamation. On Unix, this requires an
+older, standalone SQLite image with a fully verified successor, matching
+mailbox lineage or exact duplicate bytes, and the same pin, reader, hardlink,
+and namespace checks used for periodic generations. Corrupt or insufficiently
+verified incident evidence stays available even with explicit deletion enabled.
+Platforms without the verified descriptor-bound deletion boundary preserve
+incident evidence. Explicit opt-in never falls back to unchecked pathname deletion.
+
+Retention also holds the existing database recovery election from selection
+through reclamation. A live recovery, an occupied legacy `.recovery.lock`, or
+an unresolved recovery receipt ending in `.pending` prevents cleanup. The
+verified survivor's inode, links, timestamps, and companion state are checked
+again before each destructive operation. Explicit CLI restore holds the same
+election before copying its backup, so retention cannot remove its source
+during staging. Resolve pending recovery operations through recovery tooling;
+removing their markers does not establish that their evidence is disposable.
 
 Startup and publication logs report `bytes_staged`, `bytes_deleted`,
-`bytes_reclaimed`, and `bytes_retained`. Staged and retained values are logical
-file lengths still occupying storage. Deleted bytes are the logical lengths
-of confirmed removals; reclaimed bytes count the allocated blocks associated
-with verified periodic unlinks. The latter is not a measurement of the
+`bytes_reclaimed`, and `bytes_retained`; scheduled retention also reports
+`empty_directories_deleted` separately from backup payload counts and bytes.
+Staged and retained values are logical file lengths still occupying storage.
+Deleted bytes are the logical lengths of confirmed removals; reclaimed bytes
+count the allocated blocks associated with verified backup unlinks. The latter
+is not a measurement of the
 filesystem's free-space delta: filesystem snapshots and shared storage can
 retain blocks independently. Refused operations retain their byte accounting.
-An incomplete inventory refuses mutations and marks totals as lower bounds;
-uncertain moves or unlinks have separate counters rather than being reported
+An incomplete inventory refuses backup-file mutations and marks totals as lower
+bounds; the separately admitted empty-directory sweep can still make progress.
+Uncertain moves or unlinks have separate counters rather than being reported
 as successful reclamation. Each cleanup pass attempts at most 128 periodic
 candidates, with a candidate-byte budget of the larger of 512 MiB and the
 current database's size. One oversized candidate can still be attempted so a
 large mailbox can make progress. Verifying the pinned restore point adds I/O
 beyond that candidate budget. A shared progress cursor keeps refused older
 files from repeatedly preventing examination of the remaining backlog.
+Explicit incident reclamation has a separate 128-candidate allowance and the
+same candidate-byte limit, so incident verification cannot spend the periodic
+queue's entire cleanup allowance.
 Bounded cleanup passes can leave more work for a later attempt; the publication
 limit remains in force while that work is pending.
 

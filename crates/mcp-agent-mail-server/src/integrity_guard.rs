@@ -837,6 +837,7 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
     {
         tracing::warn!(
             phase,
+            empty_directories_deleted = report.empty_directories_deleted,
             staged = report.staged,
             deleted = report.deleted,
             kept = report.kept,
@@ -854,9 +855,10 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             first_failure = ?report.failures.first(),
             "backup retention completed with refusals or uncertain operations; retained bytes remain on disk"
         );
-    } else if report.evicted() > 0 {
+    } else if report.evicted() > 0 || report.empty_directories_deleted > 0 {
         tracing::info!(
             phase,
+            empty_directories_deleted = report.empty_directories_deleted,
             staged = report.staged,
             deleted = report.deleted,
             kept = report.kept,
@@ -2227,10 +2229,15 @@ mod tests {
                         assert_eq!(std::fs::read(stage).unwrap(), evidence);
                     }
                 }
+                let historical_count = match std::fs::read_dir(&history) {
+                    Ok(entries) => entries.map(Result::unwrap).count(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => panic!("failed to inspect retained history: {error}"),
+                };
                 let remaining = crate::backup_rotation::inspect_storage_backups(&primary)
                     .unwrap()
                     .artifact_count
-                    + std::fs::read_dir(&history).unwrap().count();
+                    + historical_count;
                 match pass {
                     0 => {
                         assert_eq!(remaining, 161, "active readers retain every generation");
@@ -2240,7 +2247,10 @@ mod tests {
                         (4..161).contains(&remaining),
                         "one bounded pass must make progress and leave work: {remaining}"
                     ),
-                    _ => assert_eq!(remaining, 3, "later refused attempts finish reclamation"),
+                    _ => {
+                        assert_eq!(remaining, 3, "later refused attempts finish reclamation");
+                        assert!(!history.exists(), "reclaimed history leaves no empty batch");
+                    }
                 }
                 assert_eq!(std::fs::read(&primary).unwrap(), live);
                 assert_eq!(std::fs::read(&backup).unwrap(), live);
@@ -2323,7 +2333,10 @@ mod tests {
                     .artifact_count
                     <= 4
             );
-            assert_eq!(std::fs::read_dir(&staged).unwrap().count(), 0);
+            assert!(
+                !staged.exists(),
+                "repair reclaims payloads and the empty batch"
+            );
             assert_eq!(std::fs::read(&primary).unwrap(), live);
         }
     }
@@ -2529,6 +2542,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn repeated_hourly_real_publication_keeps_verified_recovery_and_disk_usage_bounded() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -2551,6 +2565,8 @@ mod tests {
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.request_verified();
         let mut last_verified_us = 0;
+        let reclaimable = root.join("doctor/reclaimable");
+        std::fs::create_dir_all(&reclaimable).unwrap();
         for hour in 0..24 {
             if hour != 0 {
                 // Export filenames use the real clock at second resolution.
@@ -2558,6 +2574,16 @@ mod tests {
                 // scheduling clocks by an hour, without forging metadata.
                 std::thread::sleep(Duration::from_millis(1_100));
             }
+            // Model old move-only installations continuously supplying a
+            // native historical generation. Reclaiming its payload must not
+            // leave one new directory inode behind after each real export.
+            let historical = reclaimable.join(format!("rotation-20000101T{hour:02}0000Z"));
+            std::fs::create_dir(&historical).unwrap();
+            std::fs::copy(
+                &primary,
+                historical.join(format!("mail.sqlite3.bak.20000101_{hour:02}0000")),
+            )
+            .unwrap();
             let now = start + Duration::from_secs(hour * 3600);
             let requested = schedule.next_attempt(now).expect("hourly work is due");
             assert_eq!(requested, BackupKind::Verified);
@@ -2602,6 +2628,10 @@ mod tests {
                 .map(|artifact| std::fs::metadata(&artifact.path).unwrap().blocks())
                 .sum();
             assert!(blocks <= current.blocks() * 4);
+            assert!(
+                std::fs::read_dir(&reclaimable).unwrap().next().is_none(),
+                "hour {hour}: historical payloads and their empty directory inodes must both be reclaimed"
+            );
             assert_eq!(std::fs::read(&primary).unwrap(), live);
             crate::backup_rotation::admit_periodic_publication(&root, &primary, policy.keep)
                 .expect("normal publication remains within count and byte budgets");

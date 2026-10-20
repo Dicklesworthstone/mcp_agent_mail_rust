@@ -23189,6 +23189,24 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     }
     ensure_real_file_target_path(db_path, "restore destination")?;
 
+    // Retention holds this same election. Cover the source copy as well as
+    // promotion so a selected generic backup cannot be reclaimed mid-restore.
+    // Same-path nested promotion reuses admission; an operator's surrounding
+    // breaker bypass still keeps the cross-process election exclusive.
+    match mcp_agent_mail_db::pool::with_automatic_recovery_admission(
+        db_path,
+        "CLI backup restore",
+        || restore_db_from_backup_admitted(db_path, backup_path),
+    ) {
+        Ok(()) => Ok(()),
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Admission { error, .. }) => {
+            Err(CliError::Other(error.to_string()))
+        }
+        Err(mcp_agent_mail_db::pool::AutomaticRecoveryRunError::Operation(error)) => Err(error),
+    }
+}
+
+fn restore_db_from_backup_admitted(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     let restore_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let staged_restore =
         next_doctor_artifact_path_with_timestamp(db_path, "restore", "sqlite3", &restore_ts);
@@ -53699,6 +53717,41 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(std::fs::read(&backup_journal).unwrap(), b"backup-journal");
         assert_eq!(std::fs::read(&backup_wal).unwrap(), b"backup-wal");
         assert_eq!(std::fs::read(&backup_shm).unwrap(), b"backup-shm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_db_from_backup_defers_before_staging_while_retention_owns_election() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let backup = root.join("storage.sqlite3.bak.20260102_000000");
+        write_marker_db(&primary, "live-db");
+        std::fs::copy(&primary, &backup).unwrap();
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let names = || {
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = names();
+        let bytes = std::fs::read(&backup).unwrap();
+        // Explicit operator bypass must still respect retention's election.
+        let _bypass = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+        let error = restore_db_from_backup(&primary, &backup).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery-breaker election lock"),
+            "{error}"
+        );
+        assert_eq!(
+            names(),
+            before,
+            "no restore stage or rollback may be constructed"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+        assert_eq!(std::fs::read(&primary).unwrap(), bytes);
+        guard.revalidate().unwrap();
     }
 
     #[test]
