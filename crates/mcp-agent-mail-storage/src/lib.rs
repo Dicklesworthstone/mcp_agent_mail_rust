@@ -9118,6 +9118,31 @@ pub fn message_paths(
     })
 }
 
+/// Keys of a message's archive envelope, in the order every writer emits them;
+/// a reply appends `reply_to`.
+///
+/// The canonical file is the pretty-printed envelope (key order preserved), and
+/// the canonical-id collision check refuses a same-path file with different
+/// bytes. The tool-side writers and the DB-to-archive reconciler must therefore
+/// render a message identically. Otherwise a reconciler repair that races a
+/// still-queued write turns that write into a durability failure.
+pub const MESSAGE_ARCHIVE_ENVELOPE_KEYS: [&str; 14] = [
+    "id",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "created",
+    "thread_id",
+    "topic",
+    "project",
+    "project_slug",
+    "importance",
+    "ack_required",
+    "attachments",
+];
+
 fn render_message_bundle_content(message: &serde_json::Value, body_md: &str) -> Result<String> {
     let frontmatter = serde_json::to_string_pretty(message)?;
     Ok(format!("---json\n{frontmatter}\n---\n\n{body_md}"))

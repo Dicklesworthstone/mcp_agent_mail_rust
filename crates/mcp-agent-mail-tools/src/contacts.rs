@@ -559,24 +559,15 @@ async fn send_contact_notice(
 
     // Write message to archive
     let config = mcp_agent_mail_core::Config::get();
-    let message_id = message.id.unwrap_or(0);
     let all_recipient_names = vec![to_row.name.clone()];
 
-    let msg_json = serde_json::json!({
-        "id": message_id,
-        "from": &from_row.name,
-        "to": &all_recipient_names,
-        "cc": [],
-        "bcc": [],
-        "subject": &message.subject,
-        "created": micros_to_iso(message.created_ts),
-        "thread_id": &message.thread_id,
-        "project": &target_project.human_key,
-        "project_slug": &target_project.slug,
-        "importance": &message.importance,
-        "ack_required": message.ack_required != 0,
-        "attachments": [],
-    });
+    let msg_json = crate::messaging::notice_archive_json(
+        &message,
+        &from_row.name,
+        &all_recipient_names,
+        &target_project.human_key,
+        &target_project.slug,
+    );
 
     try_write_message_archive(
         &config,

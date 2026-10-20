@@ -112,6 +112,42 @@ pub(crate) fn signal_direct_recipient(
     tracing::debug!(recipient, ?outcome, "direct message notification signal");
 }
 
+/// Archive envelope of a system notice (contact request, contact approval,
+/// reservation notice): one sender, TO recipients only, no attachments.
+///
+/// It must carry the keys `send_message` writes, in the same order, because
+/// the DB-to-archive reconciler renders that envelope for any message it finds
+/// missing from the archive, and key order is part of the file bytes
+/// (`preserve_order`). Notices written without `topic` differed from the
+/// reconciler's copy of the same message. When the reconciler repaired a
+/// notice whose queued write had not drained yet, that write met a same-path
+/// file with different content and was refused as a canonical-id collision.
+/// That latched archive durability, after which every write was refused.
+pub(crate) fn notice_archive_json(
+    message: &mcp_agent_mail_db::MessageRow,
+    from: &str,
+    to: &[String],
+    project_key: &str,
+    project_slug: &str,
+) -> serde_json::Value {
+    json!({
+        "id": message.id.unwrap_or(0),
+        "from": from,
+        "to": to,
+        "cc": [],
+        "bcc": [],
+        "subject": &message.subject,
+        "created": micros_to_iso(message.created_ts),
+        "thread_id": &message.thread_id,
+        "topic": &message.topic,
+        "project": project_key,
+        "project_slug": project_slug,
+        "importance": &message.importance,
+        "ack_required": message.ack_required != 0,
+        "attachments": [],
+    })
+}
+
 /// Write a message bundle to the git archive (best-effort).
 /// Failures are logged but never fail the tool call.
 ///
@@ -10564,6 +10600,43 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn notice_archive_envelope_matches_the_shared_key_order() {
+        let message = mcp_agent_mail_db::MessageRow {
+            id: Some(1261),
+            project_id: 2,
+            sender_id: 14,
+            thread_id: None,
+            topic: None,
+            subject: "Contact approved: SageCastle -> CrimsonLake".to_string(),
+            body_md: "approved".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: 1_792_519_750_137_117,
+            recipients_json: String::new(),
+            attachments: "[]".to_string(),
+        };
+        let envelope = notice_archive_json(
+            &message,
+            "SageCastle",
+            &["CrimsonLake".to_string()],
+            "/proj2",
+            "proj2",
+        );
+        let keys: Vec<&str> = envelope
+            .as_object()
+            .expect("envelope object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // The DB-to-archive reconciler renders exactly these keys (pinned in
+        // mcp-agent-mail-storage); a notice without `topic` once collided with
+        // its repaired copy and latched archive durability.
+        assert_eq!(keys, mcp_agent_mail_storage::MESSAGE_ARCHIVE_ENVELOPE_KEYS);
+        assert_eq!(envelope["topic"], Value::Null);
+        assert_eq!(envelope["created"], "2026-10-20T18:09:10.137117Z");
     }
 
     #[test]

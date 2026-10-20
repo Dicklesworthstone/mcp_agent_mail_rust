@@ -1255,4 +1255,34 @@ mod tests {
             );
         });
     }
+
+    /// The reconciler renders the shared envelope key for key, in order; a
+    /// reply appends `reply_to`. Tool-side writers are pinned to the same
+    /// constant, so a repaired copy matches a queued write byte for byte.
+    #[test]
+    fn prepared_envelope_uses_the_shared_archive_key_order() {
+        fixture(|cx, pool, _config| {
+            let keys = |message: &Value| -> Vec<String> {
+                message
+                    .as_object()
+                    .expect("envelope object")
+                    .keys()
+                    .cloned()
+                    .collect()
+            };
+            let plain = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(keys(&plain.message), crate::MESSAGE_ARCHIVE_ENVELOPE_KEYS);
+
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET thread_id = 'root', archive_metadata_json = '{\"reply_to\":7}' WHERE id = 901",
+            )
+            .unwrap();
+            drop(conn);
+            let reply = prepare_message(cx, pool, 901).unwrap();
+            let mut expected: Vec<&str> = crate::MESSAGE_ARCHIVE_ENVELOPE_KEYS.to_vec();
+            expected.push("reply_to");
+            assert_eq!(keys(&reply.message), expected);
+        });
+    }
 }
