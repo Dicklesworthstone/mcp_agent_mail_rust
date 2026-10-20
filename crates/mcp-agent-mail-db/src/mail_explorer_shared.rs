@@ -7,9 +7,9 @@
 use crate::error::DbError;
 use crate::pool::SyncQuery;
 
-/// Read the selected database's catalog once per explorer request. Only the
-/// complete absence of both tables is a legacy mailbox, not a partial upgrade
-/// or a broken view. Never silently hide existing delivery or receipt state.
+/// Inspect shared authority before choosing the explorer's delivery lanes.
+/// Missing tables are legacy only when no retained project delivery events
+/// contradict that conclusion. The caller supplies one consistent read scope.
 pub(super) fn schema_available(conn: &impl SyncQuery) -> Result<bool, DbError> {
     let rows = conn
         .query_sync(
@@ -19,6 +19,25 @@ pub(super) fn schema_available(conn: &impl SyncQuery) -> Result<bool, DbError> {
         )
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     if rows.is_empty() {
+        // Obtain the real missing-table error for the ordinary inbox's absence
+        // proof. In particular, retained project events rule out legacy
+        // absence even when both tables have been lost. A successful probe
+        // contradicts the catalog (for example a shadowing TEMP table); do
+        // not manufacture a missing-table error or return direct-only success.
+        match conn.query_sync(
+            "SELECT message_id FROM project_mailbox_deliveries LIMIT 0",
+            &[],
+        ) {
+            Err(error) => {
+                crate::project_mailbox::allow_absent_shared_schema(conn, &error.to_string())?;
+            }
+            Ok(_) => {
+                return Err(DbError::Sqlite(
+                    "project mailbox authority disagrees with its catalog; retry on an intact schema"
+                        .to_string(),
+                ));
+            }
+        }
         return Ok(false);
     }
     let mut deliveries = false;
@@ -374,6 +393,180 @@ mod tests {
                 }
             });
         });
+    }
+
+    fn legacy_authority_probe(statements: &[&str]) -> crate::DbConnGuard {
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(":memory:").unwrap(),
+            "shared schema authority regression",
+        );
+        for statement in statements {
+            conn.execute_raw(statement).unwrap();
+        }
+        conn
+    }
+
+    const AUTHORITY_EVENT_TABLE: &str =
+        "CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, project_id INTEGER, \
+         agent_id INTEGER, message_id INTEGER, kind TEXT, delivered_ts INTEGER)";
+
+    #[test]
+    fn schema_catalog_fallback_refuses_retained_project_events() {
+        for recipient in ["NULL", "0"] {
+            let conn = legacy_authority_probe(&[AUTHORITY_EVENT_TABLE]);
+            conn.execute_raw(&format!(
+                "INSERT INTO inbox_delivery_events VALUES (1, 2, {recipient}, 200, 'project', 150)"
+            ))
+            .unwrap();
+            let error = super::schema_available(&*conn).unwrap_err();
+            assert!(error.to_string().contains("retained project delivery events"));
+            assert!(!error.to_string().contains("no such table"));
+        }
+    }
+
+    #[test]
+    fn schema_catalog_fallback_allows_genuine_legacy_mailboxes() {
+        for statements in [
+            vec![],
+            vec![AUTHORITY_EVENT_TABLE],
+            vec![
+                AUTHORITY_EVENT_TABLE,
+                "INSERT INTO inbox_delivery_events VALUES (1, 1, 11, 101, 'to', 10)",
+            ],
+        ] {
+            let conn = legacy_authority_probe(&statements);
+            assert!(!super::schema_available(&*conn).unwrap());
+        }
+    }
+
+    #[test]
+    fn schema_catalog_fallback_refuses_unreadable_event_authority() {
+        for definition in [
+            "CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY)",
+            "CREATE TABLE inbox_delivery_events (kind TEXT)",
+            "CREATE VIEW inbox_delivery_events AS SELECT seq, kind FROM unavailable_events",
+        ] {
+            let conn = legacy_authority_probe(&[definition]);
+            assert!(super::schema_available(&*conn).is_err(), "{definition}");
+        }
+    }
+
+    #[test]
+    fn complete_shared_tables_do_not_require_legacy_event_inspection() {
+        let conn = legacy_authority_probe(&[
+            "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, \
+             project_id INTEGER, kind TEXT, delivered_ts INTEGER)",
+            "CREATE TABLE project_mailbox_receipts (message_id INTEGER, agent_id INTEGER, \
+             read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+            "CREATE VIEW inbox_delivery_events AS SELECT seq, kind FROM unavailable_events",
+        ]);
+        assert!(super::schema_available(&*conn).unwrap());
+    }
+
+    #[test]
+    fn lost_shared_schema_refusal_preserves_query_only_evidence() {
+        let conn = legacy_authority_probe(&[
+            AUTHORITY_EVENT_TABLE,
+            "INSERT INTO inbox_delivery_events VALUES (1, 1, NULL, 100, 'project', 10)",
+            "CREATE TABLE retained_receipts (message_id INTEGER, agent_id INTEGER, ack_ts INTEGER)",
+            "INSERT INTO retained_receipts VALUES (100, 11, 17)",
+            "PRAGMA query_only = ON",
+        ]);
+        let events_before = conn
+            .query_sync("SELECT * FROM inbox_delivery_events", &[])
+            .unwrap();
+        let receipts_before = conn
+            .query_sync("SELECT * FROM retained_receipts", &[])
+            .unwrap();
+        assert!(super::schema_available(&*conn).is_err());
+        let events_after = conn
+            .query_sync("SELECT * FROM inbox_delivery_events", &[])
+            .unwrap();
+        let receipts_after = conn
+            .query_sync("SELECT * FROM retained_receipts", &[])
+            .unwrap();
+        assert_eq!(format!("{events_before:?}"), format!("{events_after:?}"));
+        assert_eq!(format!("{receipts_before:?}"), format!("{receipts_after:?}"));
+    }
+
+    #[test]
+    fn lost_shared_tables_block_explorer_and_pending_ack_readers() {
+        // Each failure may retire its checkout. An in-memory fixture must not
+        // reuse that failed pool as evidence for a different public reader.
+        for operation in 0..3 {
+            fixture(|runtime, pool| {
+                execute(
+                    runtime,
+                    pool,
+                    "INSERT INTO inbox_delivery_events \
+                     (project_id, agent_id, message_id, kind, delivered_ts) \
+                     VALUES (2, NULL, 200, 'project', 150)",
+                );
+                execute(
+                    runtime,
+                    pool,
+                    "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+                );
+                execute(
+                    runtime,
+                    pool,
+                    "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+                );
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("runtime context");
+                    if operation == 0 {
+                        let selected = ExplorerQuery {
+                            project_id: Some(1),
+                            ..query()
+                        };
+                        match fetch_explorer_page(&cx, pool, &selected).await {
+                            Outcome::Err(error) => {
+                                assert!(error.to_string().contains("retained project delivery events"));
+                            }
+                            _ => panic!("lost shared authority must not become a direct-only page"),
+                        }
+                    } else {
+                        let result = if operation == 1 {
+                            crate::unacked_inbox::fetch_metadata(&cx, pool, 1, 11, 20, Some(1_000)).await
+                        } else {
+                            crate::unacked_inbox::fetch(&cx, pool, 1, 11, 20).await
+                        };
+                        match result {
+                            Outcome::Err(error) => {
+                                assert!(error.to_string().contains("retained project delivery events"));
+                            }
+                            _ => panic!("lost shared authority must not hide shared ACK obligations"),
+                        }
+                    }
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn absent_catalog_with_successful_probe_is_not_legacy() {
+        struct ContradictoryCatalog(crate::DbConnGuard);
+        impl crate::pool::SyncQuery for ContradictoryCatalog {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[sqlmodel_core::Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if sql.starts_with("SELECT name, type FROM sqlite_master") {
+                    return Ok(Vec::new());
+                }
+                self.0.query_sync(sql, params)
+            }
+
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+        }
+        let conn = ContradictoryCatalog(legacy_authority_probe(&[
+            "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY)",
+        ]));
+        let error = super::schema_available(&conn).unwrap_err();
+        assert!(error.to_string().contains("disagrees with its catalog"));
     }
 
     #[test]
