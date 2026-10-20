@@ -78,6 +78,9 @@ struct Receipt {
     ack_ts: Option<i64>,
 }
 
+/// The newest inbox rows kept so far, ordered by `(created_ts, id)`.
+type NewestWindow = BTreeMap<(i64, i64), Receipt>;
+
 fn query(conn: &impl SyncQuery, sql: &str, params: &[Value]) -> Result<Vec<Row>, DbError> {
     conn.query_sync(sql, params).map_err(db_error)
 }
@@ -94,6 +97,241 @@ pub(super) fn fetch_direct(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let walked = match newest_first_budget(conn, agent_id, limit, options)? {
+        Some(budget) => {
+            newest_first_window(conn, project_id, agent_id, since_ts, limit, options, budget)?
+        }
+        None => None,
+    };
+    let newest = match walked {
+        Some(newest) => newest,
+        None => receipt_window(conn, project_id, agent_id, since_ts, limit, options)?,
+    };
+    hydrate(conn, project_id, newest, options.body_policy)
+}
+
+/// Direct inboxes that span more than one receipt page (`PAGE_SIZE`) may try
+/// the newest-first walk (br-kp1in.40).
+const NEWEST_FIRST_MIN_INBOX: i64 = 256;
+pub const INBOX_STATS_HINT_SQL: &str = "SELECT total_count FROM inbox_stats WHERE agent_id = ?";
+
+/// Without a read/ACK-state filter the receipt scan reads one receipt and one
+/// header per inbox row, so its cost grows with the whole inbox. Walking the
+/// project's newest headers costs the same per row read but can stop once
+/// the window is complete, which pays when the agent receives a good share
+/// of the project's recent mail. `inbox_stats` only chooses the plan and caps
+/// the walk at a quarter of the receipt count; both plans are exact, so a
+/// stale count costs time, never rows. A missing count, or a mailbox without
+/// the table, keeps the receipt scan. Read/ACK-state filters keep it too: it
+/// skips their header lookups, while their rows can sit anywhere in history.
+fn newest_first_budget(
+    conn: &impl SyncQuery,
+    agent_id: i64,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<Option<usize>, DbError> {
+    if options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some() {
+        return Ok(None);
+    }
+    let rows = match conn.query_sync(INBOX_STATS_HINT_SQL, &[Value::BigInt(agent_id)]) {
+        Ok(rows) => rows,
+        Err(error) if super::is_missing_inbox_stats_table_error(&error.to_string()) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(db_error(error)),
+    };
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let total = row.get_named::<i64>("total_count").map_err(db_error)?;
+    let wanted = i64::try_from(limit).unwrap_or(i64::MAX);
+    if total < NEWEST_FIRST_MIN_INBOX || wanted.saturating_mul(4) > total {
+        return Ok(None);
+    }
+    Ok(usize::try_from(total / 4).ok())
+}
+
+/// A page's receipts as one index range read. IDs usually follow creation
+/// time, so a header page spans few of the agent's other receipts; IDs that
+/// do not (imported or re-elected mail) fill this bound instead. No ORDER BY:
+/// with one, the pinned engine seeks on `agent_id` alone and walks the whole
+/// inbox. Every row in range is used or the page falls back, so row order and
+/// which rows a full read returns do not matter.
+pub const RECIPIENT_RANGE_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
+    FROM message_recipients WHERE agent_id = ? AND message_id >= ? AND message_id <= ? \
+    LIMIT 256";
+const RECIPIENT_RANGE_LIMIT: usize = 2 * SHARED_PAGE_SIZE;
+
+/// The agent's receipts for one page of candidate headers, and the number of
+/// receipt rows read. Rows outside the candidates belong to other pages or
+/// were filtered there; each page reads its own range.
+fn page_receipts(
+    conn: &impl SyncQuery,
+    agent_id: i64,
+    candidates: &HashMap<i64, i64>,
+) -> Result<(Vec<(i64, Receipt)>, usize), DbError> {
+    let (Some(low), Some(high)) = (
+        candidates.keys().copied().min(),
+        candidates.keys().copied().max(),
+    ) else {
+        return Ok((Vec::new(), 0));
+    };
+    let mut rows = query(
+        conn,
+        RECIPIENT_RANGE_SQL,
+        &[
+            Value::BigInt(agent_id),
+            Value::BigInt(low),
+            Value::BigInt(high),
+        ],
+    )?;
+    // A full read may have cut off rows of this page: use key batches.
+    if rows.len() >= RECIPIENT_RANGE_LIMIT {
+        let ids: Vec<i64> = candidates.keys().copied().collect();
+        rows = shared_receipt_rows(
+            conn,
+            "message_recipients",
+            "message_id, kind, read_ts, ack_ts",
+            &ids,
+            agent_id,
+        )?;
+    }
+    let read = rows.len();
+    let mut out = Vec::new();
+    for row in rows {
+        let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+        if !candidates.contains_key(&id) {
+            continue;
+        }
+        out.push((
+            id,
+            Receipt {
+                kind: row.get_named("kind").map_err(db_error)?,
+                read_ts: row.get_named("read_ts").map_err(db_error)?,
+                ack_ts: row.get_named("ack_ts").map_err(db_error)?,
+            },
+        ));
+    }
+    Ok((out, read))
+}
+
+/// The newest window from the project's headers, newest first, or `None` once
+/// `budget` rows have been read without completing it. Only header filters
+/// apply here; [`newest_first_budget`] keeps read/ACK-state filters off it.
+/// A page below a timestamp ceiling costs its position, not its size: the
+/// pinned engine seeks the project's newest header and steps back past every
+/// newer one before the first row it returns, so page `k` is charged `k` pages.
+fn newest_first_window(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+    budget: usize,
+) -> Result<Option<NewestWindow>, DbError> {
+    if options.unread_only || options.ack_required_only || options.ack_overdue_before.is_some() {
+        return Err(DbError::Internal(
+            "read/ACK-state filters need the receipt scan".into(),
+        ));
+    }
+    let mut newest = NewestWindow::new();
+    let mut ceiling = None;
+    let mut skip_at_ceiling = 0_i64;
+    let mut work = 0_usize;
+    let mut pages = 0_usize;
+    loop {
+        let (sql, params) = shared_page_query(project_id, ceiling, skip_at_ceiling);
+        let rows = query(conn, &sql, &params)?;
+        if rows.len() > SHARED_PAGE_SIZE {
+            return Err(DbError::Internal(
+                "direct inbox header page exceeded its bound".into(),
+            ));
+        }
+        let finished = rows.len() < SHARED_PAGE_SIZE;
+        pages += 1;
+        work = work.saturating_add(pages.saturating_mul(SHARED_PAGE_SIZE));
+        let mut last_ts = ceiling;
+        let mut trailing_count = skip_at_ceiling;
+        let mut candidates = HashMap::new();
+        let mut lower_bound_reached = false;
+        for row in rows {
+            let id = row.get_named::<i64>("id").map_err(db_error)?;
+            let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
+            if last_ts.is_some_and(|previous| created > previous) {
+                return Err(DbError::Internal(
+                    "direct inbox timestamps are not descending".into(),
+                ));
+            }
+            if last_ts == Some(created) {
+                trailing_count = trailing_count.checked_add(1).ok_or_else(|| {
+                    DbError::Internal("direct inbox timestamp offset overflow".into())
+                })?;
+            } else {
+                last_ts = Some(created);
+                trailing_count = 1;
+            }
+            if since_ts.is_some_and(|ts| created <= ts) {
+                lower_bound_reached = true;
+                continue;
+            }
+            if row.get_named::<i64>("project_id").map_err(db_error)? != project_id {
+                return Err(DbError::Internal(
+                    "direct inbox returned a foreign project header".into(),
+                ));
+            }
+            let importance = row.get_named::<String>("importance").map_err(db_error)?;
+            let topic = row.get_named::<Option<String>>("topic").map_err(db_error)?;
+            if (options.urgent_only && !matches!(importance.as_str(), "high" | "urgent"))
+                || options.topic.is_some_and(|wanted| {
+                    !topic
+                        .as_deref()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
+                })
+            {
+                continue;
+            }
+            if candidates.insert(id, created).is_some() {
+                return Err(DbError::Internal("duplicate direct inbox candidate".into()));
+            }
+        }
+        let (receipts, read) = page_receipts(conn, agent_id, &candidates)?;
+        work = work.saturating_add(read);
+        for (id, receipt) in receipts {
+            let key = (candidates[&id], id);
+            if newest.len() < limit || newest.first_key_value().is_some_and(|(old, _)| key > *old) {
+                newest.insert(key, receipt);
+                if newest.len() > limit {
+                    newest.pop_first();
+                }
+            }
+        }
+        // Finish the boundary timestamp even after collecting `limit` rows.
+        // Otherwise a later page could contain a larger ID at the same time.
+        let window_complete = newest.len() == limit
+            && newest
+                .first_key_value()
+                .is_some_and(|((oldest, _), _)| last_ts.is_some_and(|last| last < *oldest));
+        if finished || lower_bound_reached || window_complete {
+            return Ok(Some(newest));
+        }
+        if work >= budget {
+            return Ok(None);
+        }
+        ceiling = last_ts;
+        skip_at_ceiling = trailing_count;
+    }
+}
+
+/// The newest window from every one of the agent's receipts.
+fn receipt_window(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<NewestWindow, DbError> {
     let mut after = None;
     let mut newest: BTreeMap<(i64, i64), Receipt> = BTreeMap::new();
     loop {
@@ -182,7 +420,7 @@ pub(super) fn fetch_direct(
             break;
         }
     }
-    hydrate(conn, project_id, newest, options.body_policy)
+    Ok(newest)
 }
 
 fn hydrate(
@@ -678,6 +916,9 @@ mod tests {
     #[test]
     fn indexed_pipeline_bounds_each_lookup_and_hydrates_only_selected_bodies() {
         let conn = seed(600);
+        // Pin the receipt scan this test bounds: without a count the
+        // newest-first walk is not tried (its bounds are asserted below).
+        conn.execute_raw("DELETE FROM inbox_stats").unwrap();
         let recording = Recording {
             conn: &conn,
             calls: RefCell::new(Vec::new()),
@@ -861,12 +1102,306 @@ mod tests {
             .join("\n");
         assert!(details.contains("PRIMARY KEY"), "{details}");
         assert!(!details.contains("SCAN messages"), "{details}");
+        assert!(RECIPIENT_RANGE_SQL.ends_with(&format!("LIMIT {RECIPIENT_RANGE_LIMIT}")));
+        // The plan label cannot tell a two-column seek from an agent_id-only
+        // seek that walks the inbox, and without ORDER BY it even reads SCAN.
+        // It still names the index; the program decides the rest: one SeekGE
+        // whose key record holds both columns, and no Rewind/Last history walk.
+        let plan = conn
+            .query_sync(
+                &format!("EXPLAIN QUERY PLAN {RECIPIENT_RANGE_SQL}"),
+                &[2_i64.into(), 1_i64.into(), 5_i64.into()],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get_as::<String>(3).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("USING INDEX idx_message_recipients_agent_message"),
+            "{plan}"
+        );
+        let program = conn
+            .query_sync(
+                &format!("EXPLAIN {RECIPIENT_RANGE_SQL}"),
+                &[2_i64.into(), 1_i64.into(), 5_i64.into()],
+            )
+            .unwrap();
+        let ops: Vec<(String, i64, i64)> = program
+            .iter()
+            .map(|row| {
+                (
+                    row.get_as::<String>(1).unwrap(),
+                    row.get_as::<i64>(3).unwrap_or(0),
+                    row.get_as::<i64>(4).unwrap_or(0),
+                )
+            })
+            .collect();
+        let seeks: Vec<i64> = ops
+            .iter()
+            .filter(|(op, _, _)| op == "SeekGE")
+            .map(|(_, _, key)| *key)
+            .collect();
+        assert_eq!(seeks.len(), 1, "{ops:?}");
+        assert!(
+            ops.iter()
+                .any(|(op, fields, out)| op == "MakeRecord" && *out == seeks[0] && *fields >= 2),
+            "the receipt range must seek on (agent_id, message_id): {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|(op, _, _)| !matches!(op.as_str(), "Rewind" | "Last")),
+            "the receipt range must not walk the receipt history: {ops:?}"
+        );
+        let hint = conn
+            .query_sync(
+                &format!("EXPLAIN QUERY PLAN {INBOX_STATS_HINT_SQL}"),
+                &[2_i64.into()],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get_as::<String>(3).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            hint.contains("SEARCH inbox_stats USING INTEGER PRIMARY KEY"),
+            "{hint}"
+        );
+    }
+
+    pub(super) fn walk_conn() -> DbConn {
+        let conn = super::super::tests::test_conn();
+        conn.execute_raw("INSERT INTO projects(id,slug,human_key,created_at) VALUES \
+            (1,'one','/one',0),(2,'two','/two',0); \
+            INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+            (1,1,'BlueLake','test','test',0,0),(2,1,'GreenStone','test','test',0,0), \
+            (3,1,'RedFox','test','test',0,0),(4,2,'GoldFox','test','test',0,0)").unwrap();
+        conn
+    }
+
+    /// Messages `first..=last` in project 1 from BlueLake. Every `every`-th is
+    /// GreenStone's (agent 2) and the rest RedFox's, so other mail interleaves
+    /// the inbox. Receipt state varies like [`seed`]; agent 2's `inbox_stats`
+    /// row is rebuilt afterwards.
+    pub(super) fn seed_walk(
+        conn: &DbConn,
+        (first, last): (i64, i64),
+        every: i64,
+        created: fn(i64) -> i64,
+        importance: fn(i64) -> &'static str,
+    ) {
+        conn.execute_raw("BEGIN").unwrap();
+        for start in (first..=last).step_by(128) {
+            let end = (start + 127).min(last);
+            let messages = (start..=end)
+                .map(|id| {
+                    format!(
+                        "({id},1,1,'subject-{id}','body-{id}',{},'{}',{},'thread','{}')",
+                        created(id),
+                        importance(id),
+                        i64::from(id % 3 != 0),
+                        ["Handoffs", "other", "é", "É"][usize::try_from(id % 4).unwrap()],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let receipts = (start..=end)
+                .map(|id| {
+                    format!(
+                        "({id},{},'{}',{},{})",
+                        if id % every == 0 { 2 } else { 3 },
+                        ["to", "cc", "bcc"][usize::try_from(id % 3).unwrap()],
+                        if id % 5 == 0 { "2000000" } else { "NULL" },
+                        if id % 7 == 0 { "2500000" } else { "NULL" },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts, \
+                    importance,ack_required,thread_id,topic) VALUES {messages}; \
+                 INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+                    VALUES {receipts}"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        super::super::rebuild_agent_inbox_stats_sync(conn, 2).unwrap();
+    }
+
+    /// A fixture's `created_ts` for a message ID.
+    type Created = fn(i64) -> i64;
+
+    fn mixed_importance(id: i64) -> &'static str {
+        ["normal", "high", "urgent", "low"][usize::try_from((id / 2) % 4).unwrap()]
+    }
+
+    /// The reference query orders by `created_ts` alone, so the engine breaks
+    /// timestamp ties in any order. The defined window is newest
+    /// `(created_ts, id)` first: take the whole filtered inbox and cut it.
+    fn newest_reference(
+        conn: &DbConn,
+        since: Option<i64>,
+        limit: usize,
+        filters: InboxFetchOptions<'_>,
+    ) -> Vec<InboxRow> {
+        let mut rows =
+            reference_inbox_rows_from_conn_impl(conn, 1, 2, since, 1_000_000, filters).unwrap();
+        rows.sort_by_key(|row| std::cmp::Reverse((row.message.created_ts, row.message.id)));
+        rows.truncate(limit);
+        rows
+    }
+
+    fn query_counts(calls: &[(String, usize, usize)]) -> (usize, usize, usize) {
+        let count =
+            |wanted: &dyn Fn(&str) -> bool| calls.iter().filter(|(sql, _, _)| wanted(sql)).count();
+        (
+            count(&|sql| sql.contains("ORDER BY created_ts DESC LIMIT 128")),
+            count(&|sql| sql == RECIPIENT_PAGE_SQL || sql == RECIPIENT_NEXT_SQL),
+            count(&|sql| sql.contains("FROM message_recipients WHERE message_id IN (")),
+        )
+    }
+
+    #[test]
+    fn newest_first_walk_matches_reference_on_dense_scrambled_and_tied_inboxes() {
+        let fixtures: [(&str, Created); 3] = [
+            ("monotone", |id| 1_000_000 + id * 1000),
+            // Message IDs that do not follow creation time.
+            ("scrambled", |id| 1_000_000 + ((id * 17) % 1025) * 1000),
+            // Equal-timestamp runs longer than a header page.
+            ("tied", |id| 1_000_000 + (id / 300) * 1000),
+        ];
+        for (name, created) in fixtures {
+            let conn = walk_conn();
+            seed_walk(&conn, (1, 1024), 2, created, mixed_importance);
+            conn.execute_raw(
+                "UPDATE messages SET project_id = 2 WHERE id = 1000; \
+                PRAGMA foreign_keys = OFF; \
+                INSERT INTO message_recipients(message_id,agent_id,kind) VALUES (50000,2,'to')",
+            )
+            .unwrap();
+            for urgent_only in [false, true] {
+                for since in [None, Some(created(700))] {
+                    for topic in [None, Some("HANDOFFS")] {
+                        for limit in [1, 20, 100] {
+                            let filters = InboxFetchOptions {
+                                urgent_only,
+                                topic,
+                                ..options()
+                            };
+                            let expected = newest_reference(&conn, since, limit, filters);
+                            let actual =
+                                fetch_inbox_rows_from_conn_impl(&conn, 1, 2, since, limit, filters)
+                                    .unwrap();
+                            same_rows(&actual, &expected);
+                        }
+                    }
+                }
+            }
+            // The walk, not the receipt scan, served the default window.
+            let recording = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let rows = with_snapshot(&recording, || {
+                fetch_direct(&recording, 1, 2, None, 20, options())
+            })
+            .unwrap();
+            assert_eq!(rows.len(), 20, "{name}");
+            same_rows(&rows, &newest_reference(&conn, None, 20, options()));
+            assert!(
+                recording
+                    .calls
+                    .borrow()
+                    .iter()
+                    .all(|(sql, binds, rows)| !sql.contains("JOIN")
+                        && *binds <= PAGE_SIZE
+                        && *rows <= PAGE_SIZE),
+                "{name}: every walk lookup stays bounded"
+            );
+            let (pages, receipt_pages, batches) = query_counts(&recording.calls.borrow());
+            assert!(pages >= 1, "{name}: no header page was read");
+            assert_eq!(receipt_pages, 0, "{name}: the receipt scan ran");
+            if name == "scrambled" {
+                assert!(batches > 0, "{name}: wide ID ranges must use key batches");
+            } else {
+                assert_eq!(batches, 0, "{name}: one range read covers a page");
+            }
+        }
+    }
+
+    #[test]
+    fn walk_cap_stale_or_missing_counts_and_state_filters_keep_exact_rows() {
+        let conn = walk_conn();
+        // GreenStone receives 1 in 40: a 20-row window needs ~800 headers.
+        seed_walk(
+            &conn,
+            (1, 4096),
+            40,
+            |id| 1_000_000 + id * 1000,
+            mixed_importance,
+        );
+        let run = |limit, filters: InboxFetchOptions<'_>| {
+            let recording = Recording {
+                conn: &conn,
+                calls: RefCell::new(Vec::new()),
+            };
+            let actual = with_snapshot(&recording, || {
+                fetch_direct(&recording, 1, 2, None, limit, filters)
+            })
+            .unwrap();
+            let expected = newest_reference(&conn, None, limit, filters);
+            same_rows(&actual, &expected);
+            (expected.len(), query_counts(&recording.calls.borrow()))
+        };
+        // An understated count caps the walk at 64 rows: one header page, then
+        // the exact receipt scan. Returning the walk's partial window would
+        // come back short of the reference.
+        conn.execute_raw("UPDATE inbox_stats SET total_count = 256 WHERE agent_id = 2")
+            .unwrap();
+        for limit in [20, 60] {
+            let (len, (pages, receipt_pages, _)) = run(limit, options());
+            assert_eq!(len, limit);
+            assert_eq!((pages, receipt_pages > 0), (1, true), "limit {limit}");
+        }
+        // An overstated count lets the walk read the whole project history.
+        conn.execute_raw("UPDATE inbox_stats SET total_count = 100000 WHERE agent_id = 2")
+            .unwrap();
+        let (len, (pages, receipt_pages, _)) = run(20, options());
+        assert_eq!((len, pages, receipt_pages), (20, 7, 0));
+        // Read/ACK-state filters keep the receipt scan whatever the count says.
+        for filters in [
+            InboxFetchOptions {
+                unread_only: true,
+                ..options()
+            },
+            InboxFetchOptions {
+                ack_required_only: true,
+                ..options()
+            },
+            InboxFetchOptions {
+                ack_overdue_before: Some(3_000_000),
+                ..options()
+            },
+        ] {
+            let (_, (pages, receipt_pages, _)) = run(20, filters);
+            assert_eq!((pages, receipt_pages > 0), (0, true));
+        }
+        // No count row, then no table: the receipt scan, without an error.
+        conn.execute_raw("DELETE FROM inbox_stats WHERE agent_id = 2")
+            .unwrap();
+        let (_, (pages, _, _)) = run(20, options());
+        assert_eq!(pages, 0);
+        conn.execute_raw("DROP TABLE inbox_stats").unwrap();
+        let (_, (pages, _, _)) = run(20, options());
+        assert_eq!(pages, 0);
     }
 }
 
 #[cfg(test)]
 mod scaling_tests {
     use super::*;
+    use crate::DbConn;
     use crate::sync::{fetch_inbox_rows_from_conn_impl, reference_inbox_rows_from_conn_impl};
     use std::time::Instant;
 
@@ -943,5 +1478,108 @@ mod scaling_tests {
             candidate_medians[1] <= 2 * candidate_medians[0],
             "unrelated delivery history still grows inbox cost: {candidate_medians:?}"
         );
+    }
+
+    /// Median microseconds of the newest-first plan and of the receipt scan
+    /// alone, five alternating rounds, asserting identical rows every round.
+    fn direct_plans_us(
+        conn: &DbConn,
+        limit: usize,
+        filters: InboxFetchOptions<'_>,
+    ) -> (u128, u128) {
+        let mut candidate = Vec::new();
+        let mut reference = Vec::new();
+        for round in 0..5 {
+            let new = || {
+                let start = Instant::now();
+                let rows =
+                    with_snapshot(conn, || fetch_direct(conn, 1, 2, None, limit, filters)).unwrap();
+                (rows, start.elapsed().as_micros())
+            };
+            let old = || {
+                let start = Instant::now();
+                let rows = with_snapshot(conn, || {
+                    let window = receipt_window(conn, 1, 2, None, limit, filters)?;
+                    hydrate(conn, 1, window, filters.body_policy)
+                })
+                .unwrap();
+                (rows, start.elapsed().as_micros())
+            };
+            let (actual, expected) = if round % 2 == 0 {
+                let actual = new();
+                (actual, old())
+            } else {
+                let expected = old();
+                (new(), expected)
+            };
+            assert_eq!(format!("{:?}", actual.0), format!("{:?}", expected.0));
+            candidate.push(actual.1);
+            reference.push(expected.1);
+        }
+        candidate.sort_unstable();
+        reference.sort_unstable();
+        (candidate[2], reference[2])
+    }
+
+    #[test]
+    #[ignore = "explicit same-invocation direct inbox newest-first vs receipt-scan measurement (br-kp1in.40)"]
+    fn direct_inbox_newest_first_vs_receipt_scan_dense_sparse_and_filtered() {
+        use super::tests::{seed_walk, walk_conn};
+        let filters = InboxFetchOptions {
+            urgent_only: false,
+            unread_only: false,
+            ack_required_only: false,
+            ack_overdue_before: None,
+            topic: None,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        };
+        let created: fn(i64) -> i64 = |id| 1_000_000 + id * 1000;
+        let report = |case: &str, own: i64, (new, old): (u128, u128)| {
+            let ratio = new as f64 / old.max(1) as f64;
+            println!(
+                "{{\"case\":\"{case}\",\"own_inbox\":{own},\"newest_first_median_us\":{new},\"receipt_scan_median_us\":{old},\"ratio\":{ratio:.3}}}"
+            );
+            ratio
+        };
+        // M1/M2: GreenStone receives 1 in 4 of the project's mail.
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 4_000), 4, created, |_| "normal");
+        let small = direct_plans_us(&conn, 20, filters);
+        report("dense", 1_000, small);
+        seed_walk(&conn, (4_001, 40_000), 4, created, |_| "normal");
+        let large = direct_plans_us(&conn, 20, filters);
+        let m1 = report("dense", 10_000, large);
+        // G1: 1 in 100, so a 20-row window needs ~2,000 headers; the cap is 250.
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 100_000), 100, created, |_| "normal");
+        let g1 = report("sparse", 1_000, direct_plans_us(&conn, 20, filters));
+        // G2': 1 in 50 of GreenStone's mail is urgent; urgent_only exhausts the cap.
+        let conn = walk_conn();
+        seed_walk(&conn, (1, 8_000), 4, created, |id| {
+            if (id / 4) % 50 == 0 {
+                "urgent"
+            } else {
+                "normal"
+            }
+        });
+        let urgent = InboxFetchOptions {
+            urgent_only: true,
+            ..filters
+        };
+        let g2 = report("urgent_rare", 2_000, direct_plans_us(&conn, 20, urgent));
+        assert!(
+            m1 <= 0.50,
+            "M1 dense 10k newest-first/receipt-scan {m1:.3} > 0.50"
+        );
+        // Pre-registered M2. It failed both recorded runs (2.04x, 3.19x): each
+        // new-plan sample pays the cleanup left by the preceding 10k receipt
+        // scan, while back-to-back new-plan reads were flat. Landed on the
+        // owner's override; see the 2026-10-19 br-kp1in.40 evidence file.
+        assert!(
+            large.0 <= 2 * small.0,
+            "M2 newest-first grows with the inbox: {small:?} -> {large:?}"
+        );
+        assert!(g1 <= 1.35, "G1 sparse {g1:.3} > 1.35");
+        assert!(g2 <= 1.35, "G2' rare urgent {g2:.3} > 1.35");
     }
 }
