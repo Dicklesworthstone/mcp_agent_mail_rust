@@ -1523,6 +1523,7 @@ fn reservation_archive_failure(
 ) -> McpError {
     let committed_ids: Vec<i64> = committed_rows.iter().filter_map(|row| row.id).collect();
     let recovery_ids = current_ids.unwrap_or(&committed_ids);
+    #[allow(clippy::option_if_let_else)] // three-way choice; map_or_else would bury the else-if
     let (recovery, guidance) = if let Some(key) = request.idempotency_key {
         (
             json!({
