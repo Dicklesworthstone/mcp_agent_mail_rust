@@ -1,4 +1,4 @@
-name: Land and verify bounded shared acknowledgements
+name: Land and verify message-first unified inbox
 
 on:
   push:
@@ -6,17 +6,17 @@ on:
     paths: [.github/workflows/land-atc-reliability-20260918.yml]
 permissions: {}
 concurrency:
-  group: land-shared-ack-20261020
+  group: land-unified-inbox-20261019
   cancel-in-progress: false
 jobs:
   land:
-    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' && contains(github.event.head_commit.message, '[land-shared-ack-20261020]')
+    if: github.repository == 'Dicklesworthstone/mcp_agent_mail_rust' && contains(github.event.head_commit.message, '[land-unified-inbox-20261019]')
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 30
     permissions:
       contents: write
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 1
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -26,90 +26,70 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 2
           clean: false
-      - name: Land the exact reviewed ACK reader and resource integration
-        id: land
+      - name: Apply exact reviewed implementation and restore landing workflow
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           workflow=.github/workflows/land-atc-reliability-20260918.yml
-          queries=crates/mcp-agent-mail-db/src/queries.rs
-          shared=crates/mcp-agent-mail-db/src/project_mailbox.rs
-          reader=crates/mcp-agent-mail-db/src/unacked_inbox.rs
-          resources=crates/mcp-agent-mail-tools/src/resources.rs
+          parent=crates/mcp-agent-mail-server/src/mail_ui.rs
+          module=crates/mcp-agent-mail-server/src/mail_ui/unified.rs
           test -z "$(git status --porcelain)"
-          test "$(git rev-parse HEAD:$queries)" = 631b45e9cd8f87e833d68a758fff5cafb831e57f
-          test "$(git rev-parse HEAD:$shared)" = 1a54d2e1f07711dc72bb39cc143535e5a36b3131
-          test "$(git rev-parse HEAD:$resources)" = 07a4549925651b22712ff479da505b1b1921e831
-          test "$(git rev-parse "HEAD^:$workflow")" = d0e061884b1e52711bbaa29c804aa78d084e22c6
-          test ! -e "$reader"
-          original=$(git rev-parse HEAD^)
-          packed="$RUNNER_TEMP/shared-ack.patch.gz"
+          test "$(git rev-parse HEAD:$parent)" = 333f1c106fa36007524b17b5e1585bcccacb90f2
+          test "$(git rev-parse "HEAD^:$workflow")" = 08cf00c7110244694f1bb692ae8204720c8ac9e9
+          test ! -e "$module"
+          packed="$RUNNER_TEMP/unified-inbox.patch.gz"
           : > "$packed"
-          for blob in 625d4ad5b0c2f80a69503a8278ac6cc96ac0fe4e 294af773f63b67d7b78d0d8f487649676ceb9c41 fb10ff7c0a0f5de3f18940abefc2df24c640e480; do
+          for blob in 7fde92b8acb1c9619aa327bf973d2671b8075d17 5eefd6433a9e818b872ecc7cfecf3bfda457283c 1564f5086e7ad2ea026a6bc84e6b74fd47c2a18f; do
             gh api "repos/${GITHUB_REPOSITORY}/git/blobs/$blob" --jq .content | base64 --decode >> "$packed"
           done
-          echo "23ee774127315f809f1a97e31c33801c18a3335bcb69ece6a1cae005ef1a6eb0  $packed" | sha256sum --check
-          patch="$RUNNER_TEMP/shared-ack.patch"
+          echo "b5df5e09a17536fe97005898334cdc6c22e1def1d1cac7fd2e4af41ec64aa55c  $packed" | sha256sum --check
+          patch="$RUNNER_TEMP/unified-inbox.patch"
           gzip --decompress --stdout "$packed" > "$patch"
-          echo "7124a491100c04059989552bcee06f83821b267210df8774efc4c685063e49f0  $patch" | sha256sum --check
+          echo "05f61c5f318dfe44ee6a3825daeec3f957d7f80310a80ae5baa992b5fc28e582  $patch" | sha256sum --check
           git apply --recount --check "$patch"
-          git apply --recount --index --include='crates/mcp-agent-mail-db/src/*' "$patch"
-          rustup run stable rustfmt --edition 2024 "$reader"
-          for source in "$queries" "$shared"; do
-            rustup run stable rustfmt --edition 2024 --config skip_children=true --emit stdout "$source" > /dev/null
-          done
-          git add -- "$queries" "$shared" "$reader"
+          git apply --recount --index "$patch"
+          # Parse both changed Rust sources; format only the new module rather
+          # than mixing unrelated parent formatting into this functional batch.
+          rustup run stable rustfmt --edition 2024 "$module"
+          rustup run stable rustfmt --edition 2024 --config skip_children=true --emit stdout "$parent" > /dev/null
+          git show "HEAD^:$workflow" > "$workflow"
+          git add -- "$parent" "$module" "$workflow"
           git diff --cached --check
-          expected=$(printf '%s\n' "$queries" "$shared" "$reader" | LC_ALL=C sort)
-          test "$(git diff --cached --name-only | LC_ALL=C sort)" = "$expected"
+          expected=$(printf '%s\n' "$workflow" "$parent" "$module" | LC_ALL=C sort)
+          actual=$(git diff --cached --name-only | LC_ALL=C sort)
+          test "$actual" = "$expected"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(db): include shared-project obligations in bounded oldest-first ACK reads' -m 'Replace the direct-only pending acknowledgement helper with snapshot-consistent, join-free direct and shared candidate readers. Scan 256-row direct receipt pages and 128-row shared timestamp pages, complete timestamp ties, retain one globally limited oldest window, and hydrate only selected payloads. Preserve direct precedence even after ACK, per-viewer receipt authority, project scope, registration time and retirement/contact rules. Fail cancelled or uncertain reads without returning partial success. Add the metadata-only inclusive-cutoff API and 21 native regressions. All 41 Python/SQLite tests passed before submission, but those are not native Rust/FrankenSQLite execution; native verification follows in this workflow. No measured production speedup is claimed.'
+          git commit -m 'fix(mail-ui): replace per-agent unified inbox fan-out with message-first projection' -m 'Select the global newest window after exact importance and delivery eligibility filtering. Preserve all visible recipient read/ACK state, direct precedence, shared eligibility, operator BCC display and existing thread links. Scan bounded header pages once and hydrate bodies only for final messages through one snapshot and checkout. Retire failed or cancelled checkouts, and keep existing agent-roster selection rather than expanding scope. Add eleven native regressions including a real migrated-mailbox comparison against the original collector and a filter match behind more than 10000 normal deliveries. Header scan work remains history-dependent; no measured speedup or native test pass is claimed by this commit. The following workflow steps record native verification. Restore the original one-shot workflow verbatim.'
           git push origin HEAD:refs/heads/main
-          printf 'ACK reader commit: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-          git apply --recount --index --include='crates/mcp-agent-mail-tools/src/resources.rs' "$patch"
-          rustup run stable rustfmt --edition 2024 --config skip_children=true --emit stdout "$resources" > /dev/null
-          git show "$original:$workflow" > "$workflow"
-          git add -- "$resources" "$workflow"
-          git diff --cached --check
-          expected=$(printf '%s\n' "$resources" "$workflow" | LC_ALL=C sort)
-          test "$(git diff --cached --name-only | LC_ALL=C sort)" = "$expected"
-          git commit -m 'fix(resources): read stale and overdue ACK metadata without full-body overfetch' -m 'Apply the inclusive age cutoff to both delivery routes before the global oldest-first limit. Use the actual requested limit and the new body-free API for both resource views. Keep per-viewer read state and exact TTL-boundary inclusion. Restore the pre-existing one-shot landing workflow byte-for-byte. Native validation results are recorded separately rather than presumed by this commit.'
-          git push origin HEAD:refs/heads/main
-          printf 'ACK resources commit: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-          echo "landed_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Preserve applied sources and patch
+          printf 'Functional commit: %s\n' "$(git rev-parse HEAD)" | tee "$RUNNER_TEMP/unified-inbox-result.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain landed sources for inspection
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bounded-ack-applied-sources
+          name: unified-inbox-landed-sources
           path: |
-            crates/mcp-agent-mail-db/src/queries.rs
-            crates/mcp-agent-mail-db/src/project_mailbox.rs
-            crates/mcp-agent-mail-db/src/unacked_inbox.rs
-            crates/mcp-agent-mail-tools/src/resources.rs
-            ${{ runner.temp }}/shared-ack.patch
+            crates/mcp-agent-mail-server/src/mail_ui.rs
+            crates/mcp-agent-mail-server/src/mail_ui/unified.rs
           retention-days: 7
-      - name: Check the production database and tools feature graph
-        if: steps.land.outcome == 'success'
+      - name: Check production feature graph
         shell: bash
         run: |
           set -euo pipefail
-          timeout 900 cargo check --locked -p mcp-agent-mail-db -p mcp-agent-mail-tools --lib --no-default-features 2>&1 | tee "$RUNNER_TEMP/shared-ack-production.log"
-      - name: Run all native acknowledgement reader regressions
-        if: success() && steps.land.outcome == 'success'
+          timeout 720 cargo check --locked -p mcp-agent-mail-server --lib 2>&1 | tee "$RUNNER_TEMP/unified-inbox-production.log"
+      - name: Run native unified inbox regressions
+        if: success()
         shell: bash
         run: |
           set -euo pipefail
-          timeout 900 cargo test --locked -p mcp-agent-mail-db --lib --no-default-features queries::unacked_inbox::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/shared-ack-native.log"
-          grep -Eq 'test result: ok\. 21 passed; 0 failed' "$RUNNER_TEMP/shared-ack-native.log"
-      - name: Preserve actual native verification logs
+          timeout 900 cargo test --locked -p mcp-agent-mail-server --lib mail_ui::unified::tests -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/unified-inbox-tests.log"
+      - name: Retain verification logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bounded-ack-native-verification
-          path: ${{ runner.temp }}/shared-ack-*.log
+          name: unified-inbox-native-verification
+          path: ${{ runner.temp }}/unified-inbox-*.log
           if-no-files-found: ignore
           retention-days: 7

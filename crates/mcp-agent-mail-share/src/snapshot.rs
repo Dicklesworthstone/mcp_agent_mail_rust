@@ -792,28 +792,13 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
             continue;
         }
         let insert_sql = build_insert(table.name, table.columns);
-        let select_columns = quoted_column_list(&available_columns);
-        let page_by_column = table
-            .page_by_column
-            .filter(|column| source_columns.contains(*column));
-        let mut last_page_value: i64 = -1;
+        let page_keys = snapshot_page_keys(src, table, &source_columns)?;
+        // None is the first page, not an invented -1 identity. Imported
+        // databases and previous snapshots can contain any signed SQLite ID.
+        let mut after: Option<Vec<SnapshotKey>> = None;
         loop {
-            let (select_sql, params): (String, Vec<Value>) =
-                if let Some(page_by_column) = page_by_column {
-                    (
-                        format!(
-                            "SELECT {select_columns} FROM \"{}\" WHERE \"{page_by_column}\" > ?1 \
-                         ORDER BY \"{page_by_column}\" ASC LIMIT 1000",
-                            table.name
-                        ),
-                        vec![Value::BigInt(last_page_value)],
-                    )
-                } else {
-                    (
-                        format!("SELECT {select_columns} FROM \"{}\"", table.name),
-                        vec![],
-                    )
-                };
+            let (select_sql, params) =
+                snapshot_page_query(table, &available_columns, &page_keys, after.as_deref());
 
             let rows =
                 src.query_snapshot(&select_sql, &params)
@@ -821,6 +806,11 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                         message: format!("SELECT from {} failed: {e}", table.name),
                     })?;
 
+            if rows.len() > SNAPSHOT_PAGE_ROWS {
+                return Err(ShareError::Validation {
+                    message: format!("snapshot {} page exceeded its row bound", table.name),
+                });
+            }
             if rows.is_empty() {
                 break;
             }
@@ -834,6 +824,12 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                     message: format!("BEGIN for {} page failed: {e}", table.name),
                 })?;
             for row in &rows {
+                let key = snapshot_row_key(row, table.name, &page_keys)?;
+                if after.as_ref().is_some_and(|previous| key <= *previous) {
+                    return Err(ShareError::Validation {
+                        message: format!("snapshot {} cursor did not advance", table.name),
+                    });
+                }
                 let values: Vec<Value> = table
                     .columns
                     .iter()
@@ -847,21 +843,16 @@ fn transfer_tables<S: SnapshotSource>(src: &S, dst: &CanonicalDbConn) -> Result<
                         )
                     })
                     .collect();
-                if let Some(page_by_column) = page_by_column {
-                    last_page_value = extract_page_value(row, table.name, page_by_column)?;
-                }
                 dst.execute_sync(&insert_sql, &values)
                     .map_err(|e| ShareError::Sqlite {
                         message: format!("INSERT into {} failed: {e}", table.name),
                     })?;
+                after = Some(key);
             }
             dst.execute_sync("COMMIT", &[])
                 .map_err(|e| ShareError::Sqlite {
                     message: format!("COMMIT for {} page failed: {e}", table.name),
                 })?;
-            if page_by_column.is_none() {
-                break;
-            }
         }
     }
     // Shared deliveries and lazy receipts are part of the same source read
@@ -886,14 +877,14 @@ fn create_dst_table(dst: &CanonicalDbConn, table: &KnownTable) -> Result<(), Sha
         })
 }
 
-/// Build INSERT OR REPLACE SQL for a destination table.
+/// Build an insert that cannot silently overwrite a previously copied row.
 fn build_insert(table: &str, columns: &[&str]) -> String {
     let col_list = quoted_column_list(columns);
     let placeholders = (0..columns.len())
         .map(|i| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT OR REPLACE INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
+    format!("INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
 }
 
 fn quoted_column_list(columns: &[&str]) -> String {
@@ -917,32 +908,126 @@ fn source_columns<S: SnapshotSource>(src: &S, table: &str) -> Result<HashSet<Str
         .map_err(|e| ShareError::Sqlite {
             message: format!("PRAGMA table_info({table}) failed: {e}"),
         })?;
-    Ok(extract_column_names(&rows))
+    extract_column_names(&rows)
 }
 
-fn extract_column_names(rows: &[sqlmodel_core::Row]) -> HashSet<String> {
+fn extract_column_names(rows: &[sqlmodel_core::Row]) -> Result<HashSet<String>, ShareError> {
     rows.iter()
-        .filter_map(|row| row.get_named::<String>("name").ok())
+        .map(|row| {
+            row.get_named::<String>("name")
+                .map(|name| name.to_ascii_lowercase())
+                .map_err(|error| ShareError::Sqlite {
+                    message: format!("cannot decode snapshot source column: {error}"),
+                })
+        })
         .collect()
 }
 
-fn extract_page_value(
+const SNAPSHOT_PAGE_ROWS: usize = 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SnapshotKey {
+    Integer(i64),
+    Text(String),
+}
+
+/// A keyset page needs an actual uniqueness constraint, not a promising column
+/// name. Otherwise duplicate identities can straddle a page boundary and the
+/// continuation would silently skip the second row. Runtime recipients use a
+/// two-column PK; legacy recipients can add kind. Both fit the three-key walk.
+fn snapshot_page_keys<'a>(
+    src: &impl SnapshotSource,
+    table: &'a KnownTable,
+    columns: &HashSet<String>,
+) -> Result<Vec<&'a str>, ShareError> {
+    let keys = table.page_by_column.map_or_else(
+        || table.primary_key_columns.to_vec(),
+        |column| vec![column],
+    );
+    if keys.is_empty() || keys.iter().any(|key| !columns.contains(*key)) {
+        return Err(ShareError::Validation {
+            message: format!("snapshot {} lacks its complete pagination key", table.name),
+        });
+    }
+    let rows = src
+        .query_snapshot(&format!("PRAGMA table_info(\"{}\")", table.name), &[])
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("inspect snapshot {} key: {error}", table.name),
+        })?;
+    let mut primary = std::collections::BTreeMap::new();
+    for row in rows {
+        let name = row.get_named::<String>("name").map_err(|error| ShareError::Sqlite {
+            message: format!("decode snapshot {} key name: {error}", table.name),
+        })?.to_ascii_lowercase();
+        let position = row.get_named::<i64>("pk").map_err(|error| ShareError::Sqlite {
+            message: format!("decode snapshot {} key position: {error}", table.name),
+        })?;
+        if position < 0 || (position > 0 && primary.insert(position, name).is_some()) {
+            return Err(ShareError::Validation {
+                message: format!("snapshot {} has an ambiguous primary key", table.name),
+            });
+        }
+    }
+    if primary.is_empty() || primary.iter().enumerate().any(|(index, (position, name))| {
+        *position != i64::try_from(index + 1).unwrap_or(i64::MAX)
+            || !keys.contains(&name.as_str())
+    }) {
+        return Err(ShareError::Validation {
+            message: format!("snapshot {} pagination key is not uniquely constrained", table.name),
+        });
+    }
+    Ok(keys)
+}
+
+fn snapshot_page_query(
+    table: &KnownTable,
+    columns: &[&str],
+    keys: &[&str],
+    after: Option<&[SnapshotKey]>,
+) -> (String, Vec<Value>) {
+    // Alias the projection so upper-case imported column declarations do not
+    // change the names returned by the driver. Identifiers are known constants.
+    let projection = columns.iter().map(|column| format!("\"{column}\" AS \"{column}\""))
+        .collect::<Vec<_>>().join(", ");
+    let order_keys = keys.iter().map(|key| {
+        if *key == "kind" { format!("\"{key}\" COLLATE BINARY") } else { format!("\"{key}\"") }
+    }).collect::<Vec<_>>();
+    let mut sql = format!("SELECT {projection} FROM \"{}\"", table.name);
+    let mut params = Vec::new();
+    if let Some(after) = after {
+        debug_assert_eq!(after.len(), keys.len());
+        let continuation = (0..keys.len()).map(|index| {
+            let mut terms = (0..index).map(|equal| format!("{} = ?{}", order_keys[equal], equal + 1))
+                .collect::<Vec<_>>();
+            terms.push(format!("{} > ?{}", order_keys[index], index + 1));
+            format!("({})", terms.join(" AND "))
+        }).collect::<Vec<_>>().join(" OR ");
+        sql.push_str(&format!(" WHERE {continuation}"));
+        params.extend(after.iter().map(|key| match key {
+            SnapshotKey::Integer(value) => Value::BigInt(*value),
+            SnapshotKey::Text(value) => Value::Text(value.clone()),
+        }));
+    }
+    sql.push_str(&format!(" ORDER BY {} LIMIT {SNAPSHOT_PAGE_ROWS}", order_keys.join(", ")));
+    (sql, params)
+}
+
+fn snapshot_row_key(
     row: &sqlmodel_core::Row,
     table: &str,
-    page_by_column: &str,
-) -> Result<i64, ShareError> {
-    let Some(val) = row.get_by_name(page_by_column) else {
-        return Err(ShareError::Sqlite {
-            message: format!("missing pagination column {page_by_column} while copying {table}"),
-        });
-    };
-    match val {
-        Value::BigInt(v) => Ok(*v),
-        Value::Int(v) => Ok(i64::from(*v)),
-        _ => Err(ShareError::Sqlite {
-            message: format!("unexpected non-integer pagination column {table}.{page_by_column}"),
+    keys: &[&str],
+) -> Result<Vec<SnapshotKey>, ShareError> {
+    keys.iter().map(|key| match (*key, row.get_by_name(key)) {
+        ("kind", Some(Value::Text(value))) => Ok(SnapshotKey::Text(value.clone())),
+        ("kind", _) => Err(ShareError::Validation {
+            message: format!("unexpected non-text pagination column {table}.{key}"),
         }),
-    }
+        (_, Some(Value::BigInt(value))) => Ok(SnapshotKey::Integer(*value)),
+        (_, Some(Value::Int(value))) => Ok(SnapshotKey::Integer(i64::from(*value))),
+        _ => Err(ShareError::Sqlite {
+            message: format!("unexpected non-integer pagination column {table}.{key}"),
+        }),
+    }).collect()
 }
 
 fn available_columns<'a>(table: &'a KnownTable, source_columns: &HashSet<String>) -> Vec<&'a str> {
@@ -1076,6 +1161,206 @@ pub struct SnapshotContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_source(path: &Path) -> CanonicalDbConn {
+        CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn snapshot_pagination_preserves_the_entire_signed_identity_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("signed-source.sqlite3");
+        let copied = dir.path().join("signed-copy.sqlite3");
+        let rebuilt = dir.path().join("signed-rebuilt.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)").unwrap();
+        let ids = [i64::MIN, -1001, -1, 0, 1, i64::MAX];
+        for id in ids {
+            conn.execute_sync("INSERT INTO projects VALUES(?1, ?2, ?3, 0)", &[
+                Value::BigInt(id), Value::Text(format!("p-{id}")), Value::Text(format!("/p-{id}")),
+            ]).unwrap();
+        }
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &copied, false).unwrap();
+        create_private_canonical_sqlite_snapshot(&copied, &rebuilt, false).unwrap();
+        for path in [&source, &copied, &rebuilt] {
+            let rows = private_source(path).query_sync("SELECT id FROM projects ORDER BY id", &[]).unwrap();
+            assert_eq!(rows.iter().map(|row| row.get_named::<i64>("id").unwrap()).collect::<Vec<_>>(), ids);
+        }
+    }
+
+    #[test]
+    fn snapshot_recipient_pages_preserve_one_messages_large_population() {
+        use std::cell::Cell;
+        struct Recorded<'a> { source: &'a CanonicalDbConn, pages: Cell<usize> }
+        impl SnapshotSource for Recorded<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.source.execute_raw(sql)
+            }
+            fn query_snapshot(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.source.query_sync(sql, params)?;
+                if sql.contains("FROM \"message_recipients\"") {
+                    assert!(sql.ends_with("LIMIT 1000"), "{sql}");
+                    assert!(rows.len() <= SNAPSHOT_PAGE_ROWS);
+                    self.pages.set(self.pages.get() + 1);
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("many-recipients.sqlite3"));
+        let target = private_source(&dir.path().join("many-recipients-copy.sqlite3"));
+        source.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id, kind)); BEGIN").unwrap();
+        for agent in -500..650 {
+            for kind in ["to", "cc", "bcc"] {
+                source.execute_sync("INSERT INTO message_recipients VALUES(-1, ?1, ?2, ?3, NULL)", &[
+                    Value::BigInt(agent), Value::Text(kind.into()), Value::BigInt(agent + 1000),
+                ]).unwrap();
+            }
+        }
+        source.execute_raw("COMMIT").unwrap();
+        let recorded = Recorded { source: &source, pages: Cell::new(0) };
+        transfer_tables_in_consistent_read(&recorded, &target).unwrap();
+        assert_eq!(recorded.pages.get(), 5);
+        let rows = target.query_sync("SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id, kind", &[]).unwrap();
+        assert_eq!(rows.len(), 3450);
+        for (row, (agent, kind)) in rows.iter().zip((-500..650).flat_map(|agent| ["bcc", "cc", "to"].map(|kind| (agent, kind)))) {
+            assert_eq!(row.get_named::<i64>("message_id").unwrap(), -1);
+            assert_eq!(row.get_named::<i64>("agent_id").unwrap(), agent);
+            assert_eq!(row.get_named::<String>("kind").unwrap(), kind);
+            assert_eq!(row.get_named::<String>("read_ts").unwrap(), (agent + 1000).to_string());
+            assert_eq!(row.get_named::<Option<i64>>("ack_ts").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn snapshot_pagination_accepts_uppercase_imported_key_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("uppercase-source.sqlite3");
+        let target = dir.path().join("uppercase-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE PROJECTS(ID INTEGER PRIMARY KEY, SLUG TEXT, HUMAN_KEY TEXT, CREATED_AT INTEGER); INSERT INTO PROJECTS VALUES(-7, 'upper', '/upper', 17)").unwrap();
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap();
+        let rows = private_source(&target).query_sync("SELECT id, slug, created_at FROM projects", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("id").unwrap(), -7);
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "upper");
+        assert_eq!(rows[0].get_named::<String>("created_at").unwrap(), "17");
+    }
+
+    #[test]
+    fn snapshot_refuses_unconstrained_keys_before_boundary_duplicates_are_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("duplicate-source.sqlite3");
+        let target = dir.path().join("duplicate-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE projects(id INTEGER, slug TEXT, human_key TEXT, created_at INTEGER); BEGIN").unwrap();
+        for n in 1..=1001 {
+            let id = n.min(1000);
+            conn.execute_sync("INSERT INTO projects VALUES(?1, ?2, '/duplicate', 0)", &[
+                Value::BigInt(id), Value::Text(format!("original-{n}")),
+            ]).unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        drop(conn);
+        let error = create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap_err();
+        assert!(error.to_string().contains("not uniquely constrained"), "{error}");
+        assert!(!target.exists());
+        assert_eq!(private_source(&source).query_sync("SELECT count(*) AS n FROM projects", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 1001);
+    }
+
+    #[test]
+    fn snapshot_refuses_null_composite_keys_instead_of_skipping_a_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("null-recipient.sqlite3");
+        let target = dir.path().join("null-recipient-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind)); INSERT INTO message_recipients VALUES(1, 2, NULL, 17, 19)").unwrap();
+        drop(conn);
+        let error = create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap_err();
+        assert!(error.to_string().contains("non-text pagination column message_recipients.kind"));
+        assert!(!target.exists());
+        assert_eq!(private_source(&source).query_sync("SELECT ack_ts FROM message_recipients", &[]).unwrap()[0].get_named::<i64>("ack_ts").unwrap(), 19);
+    }
+
+    #[test]
+    fn snapshot_composite_cursor_uses_binary_order_even_on_nocase_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("nocase-source.sqlite3");
+        let target = dir.path().join("nocase-copy.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT COLLATE NOCASE, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind)); BEGIN").unwrap();
+        let kinds = (0..1100).map(|n| format!("{}-{n:04}", if n % 2 == 0 { "B" } else { "a" }))
+            .collect::<Vec<_>>();
+        for kind in &kinds {
+            conn.execute_sync("INSERT INTO message_recipients VALUES(1, 2, ?1, NULL, 19)", &[Value::Text(kind.clone())]).unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap();
+        let rows = private_source(&target).query_sync("SELECT kind FROM message_recipients ORDER BY kind COLLATE BINARY", &[]).unwrap();
+        let mut expected = kinds;
+        expected.sort();
+        assert_eq!(rows.iter().map(|row| row.get_named::<String>("kind").unwrap()).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn snapshot_refuses_nonadvancing_source_pages_and_releases_its_read() {
+        struct Reversed<'a>(&'a CanonicalDbConn);
+        impl SnapshotSource for Reversed<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+            fn query_snapshot(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let mut rows = self.0.query_sync(sql, params)?;
+                if sql.contains("FROM \"projects\"") { rows.reverse(); }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = private_source(&dir.path().join("reversed-source.sqlite3"));
+        let target = private_source(&dir.path().join("reversed-copy.sqlite3"));
+        source.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER); INSERT INTO projects VALUES(1,'one','/one',0),(2,'two','/two',0)").unwrap();
+        let error = transfer_tables_in_consistent_read(&Reversed(&source), &target).unwrap_err();
+        assert!(error.to_string().contains("cursor did not advance"));
+        source.execute_raw("BEGIN; ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn snapshot_recipient_paging_keeps_one_wal_snapshot_across_peer_commits() {
+        use std::cell::Cell;
+        struct Interleaved<'a> { source: &'a CanonicalDbConn, writer: &'a CanonicalDbConn, fired: Cell<bool> }
+        impl SnapshotSource for Interleaved<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.source.execute_raw(sql)
+            }
+            fn query_snapshot(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.source.query_sync(sql, params)?;
+                if sql.contains("FROM \"message_recipients\"") && !self.fired.replace(true) {
+                    self.writer.execute_raw("BEGIN IMMEDIATE; UPDATE message_recipients SET ack_ts = 999 WHERE agent_id = 2000; INSERT INTO message_recipients VALUES(1,9999,'to',NULL,777); COMMIT")?;
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paged-wal.sqlite3");
+        let source = private_source(&path);
+        source.execute_raw("PRAGMA journal_mode=WAL; CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); BEGIN").unwrap();
+        for agent in 1..=2300 {
+            source.execute_sync("INSERT INTO message_recipients VALUES(1,?1,'to',NULL,NULL)", &[Value::BigInt(agent)]).unwrap();
+        }
+        source.execute_raw("COMMIT").unwrap();
+        let writer = private_source(&path);
+        let target = private_source(&dir.path().join("paged-wal-copy.sqlite3"));
+        let interleaved = Interleaved { source: &source, writer: &writer, fired: Cell::new(false) };
+        transfer_tables_in_consistent_read(&interleaved, &target).unwrap();
+        assert!(interleaved.fired.get());
+        assert_eq!(target.query_sync("SELECT count(*) AS n FROM message_recipients", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 2300);
+        assert_eq!(target.query_sync("SELECT ack_ts FROM message_recipients WHERE agent_id=2000", &[]).unwrap()[0].get_named::<Option<String>>("ack_ts").unwrap(), None);
+        assert_eq!(source.query_sync("SELECT count(*) AS n FROM message_recipients", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 2301);
+        assert_eq!(source.query_sync("SELECT ack_ts FROM message_recipients WHERE agent_id=2000", &[]).unwrap()[0].get_named::<i64>("ack_ts").unwrap(), 999);
+    }
 
     struct InterleavingSnapshotSource {
         inner: DbConn,
