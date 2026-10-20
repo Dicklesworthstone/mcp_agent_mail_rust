@@ -215,6 +215,7 @@ pub mod search_two_tier;
 pub mod search_vector_index;
 pub mod timestamps;
 pub mod tracking;
+pub mod unacked_inbox;
 
 pub use atc_queries::{
     CompactSummary, ExperienceStream, ExpiredExperienceCandidate, OpenExperienceFilter,
