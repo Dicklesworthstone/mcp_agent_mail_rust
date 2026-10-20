@@ -364,10 +364,14 @@ impl SnapshotAuthority {
                 "snapshot authority must be an empty private single-link regular file",
             ));
         }
+        // Compare the entry with the retained file in the same `Stat` types:
+        // `st_dev` is i32 on macOS but u64 on Linux, while std's `Metadata`
+        // always widens to u64, so mixing the two does not compile on macOS.
         let entry = rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let retained_stat = rustix::fs::fstat(&self.file)?;
         if FileType::from_raw_mode(entry.st_mode) != FileType::RegularFile
-            || entry.st_dev != retained.dev()
-            || entry.st_ino != retained.ino()
+            || entry.st_dev != retained_stat.st_dev
+            || entry.st_ino != retained_stat.st_ino
         {
             return Err(invalid("snapshot authority lock identity changed"));
         }
