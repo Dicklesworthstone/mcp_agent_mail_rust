@@ -101,6 +101,7 @@ proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
 mcp-agent-mail-test-helpers.workspace = true
+mcp-agent-mail-guard.workspace = true
 
 [[bench]]
 name = "widget_bench"
