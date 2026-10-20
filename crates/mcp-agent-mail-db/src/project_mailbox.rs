@@ -120,9 +120,11 @@ fn missing_table_name(message: &str) -> Option<&str> {
 
 /// Only a genuinely pre-upgrade shared schema may use the empty-mailbox
 /// fallback. Run this catalog check on a missing-table error, not on healthy
-/// reads. An incomplete schema, failed inspection or broken view stays an
-/// error; callers must not mistake it for a successfully observed empty inbox.
-fn allow_absent_shared_schema(
+/// reads. Surviving project delivery events prove this is an upgraded mailbox
+/// even when both shared tables are gone. An incomplete schema, failed
+/// inspection or broken view stays an error; callers must not mistake it for
+/// a successfully observed empty inbox.
+pub(crate) fn allow_absent_shared_schema(
     conn: &impl crate::pool::SyncQuery,
     error: &str,
 ) -> Result<(), DbError> {
@@ -136,15 +138,40 @@ fn allow_absent_shared_schema(
     let objects = conn
         .query_sync(
             "SELECT name FROM sqlite_master WHERE name COLLATE NOCASE \
-             IN ('project_mailbox_deliveries', 'project_mailbox_receipts')",
+             IN ('project_mailbox_deliveries', 'project_mailbox_receipts', 'inbox_delivery_events')",
             &[],
         )
         .map_err(|failure| DbError::Sqlite(failure.to_string()))?;
-    if !objects.is_empty() {
+    let mut has_events = false;
+    for row in objects {
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|failure| DbError::Sqlite(failure.to_string()))?;
+        if name.eq_ignore_ascii_case("inbox_delivery_events") {
+            has_events = true;
+            continue;
+        }
         // Do not echo a missing-table signature that an outer legacy reader
         // could catch again and turn into an empty result.
         return Err(DbError::Sqlite(
             "incomplete project mailbox schema; delivery and receipt tables must be repaired"
+                .to_string(),
+        ));
+    }
+    if has_events
+        && !conn
+            .query_sync(
+                "SELECT seq FROM inbox_delivery_events WHERE kind = 'project' LIMIT 1",
+                &[],
+            )
+            .map_err(|failure| DbError::Sqlite(failure.to_string()))?
+            .is_empty()
+    {
+        // Schema authority is global: even a delivery in another project
+        // rules out the pre-upgrade exception for these missing tables.
+        // The explicit kind also recognizes historical agent_id=0 events.
+        return Err(DbError::Sqlite(
+            "incomplete project mailbox schema; retained project delivery events require delivery and receipt tables to be repaired"
                 .to_string(),
         ));
     }
@@ -1180,6 +1207,172 @@ mod tests {
                 77
             );
         });
+    }
+
+    #[test]
+    fn surviving_shared_events_refuse_missing_tables_across_read_and_receipt_surfaces() {
+        let conn = crate::guard_db_conn(test_conn(), "shared schema loss regression");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'direct', '/direct', 0), (2, 'shared', '/shared', 0);
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (10, 1, 'DirectSender', 'test', 'test', 0, 0),
+                    (20, 1, 'DirectReader', 'test', 'test', 0, 0),
+                    (30, 2, 'SharedSender', 'test', 'test', 0, 0),
+                    (40, 2, 'SharedReader', 'test', 'test', 0, 0);
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
+             VALUES (100, 1, 10, 'Direct message', 'direct body', 100),
+                    (200, 2, 30, 'Shared message', 'shared body', 200);
+             INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (100, 20, 'to');
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (200, 2, 'to', 200);
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+             VALUES (200, 40, 300, 400);",
+        )
+        .unwrap();
+        conn.execute_sync(
+            INSERT_PROJECT_MAILBOX_EVENT_SQL,
+            &[Value::BigInt(2), Value::BigInt(200), Value::BigInt(200)],
+        )
+        .unwrap();
+        assert_eq!(visible_ids(&conn, 2, 40), vec![200]);
+        conn.execute_raw(
+            "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;
+             ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;
+             PRAGMA query_only = ON;",
+        )
+        .unwrap();
+
+        // A project event anywhere proves these global tables were installed.
+        // Even a direct-only project must not receive a partial-success claim.
+        let error =
+            crate::sync::fetch_inbox_filtered_rows_from_conn(&conn, 1, 20, None, 10, options())
+                .expect_err("direct rows do not authorize a partial inbox");
+        assert!(
+            error
+                .to_string()
+                .contains("retained project delivery events")
+        );
+        let error = fetch_project_mailbox_rows_from_conn(&*conn, 2, 40, None, 10, options())
+            .expect_err("shared messages must not disappear as an empty inbox");
+        assert!(
+            error
+                .to_string()
+                .contains("retained project delivery events")
+        );
+        let error = project_mailbox_delivery_from_conn(&*conn, 200)
+            .expect_err("delivery reports must not erase the shared address");
+        assert!(
+            error
+                .to_string()
+                .contains("retained project delivery events")
+        );
+        assert!(!is_missing_project_mailbox_table_error(&error.to_string()));
+        let error = crate::sync::inbox_delivery_events_from_conn(&*conn, 1, 20, None, 10)
+            .expect_err("the global schema witness also protects delivery cursors");
+        assert!(
+            error
+                .to_string()
+                .contains("retained project delivery events")
+        );
+        conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        let error = mark_project_mailbox_read_batch_sync_conn(&conn, 40, &[200])
+            .expect_err("a missing authority cannot become a successful no-op receipt");
+        assert!(
+            error
+                .to_string()
+                .contains("retained project delivery events")
+        );
+        assert_receipt_writer_released(&conn);
+
+        conn.execute_raw(
+            "ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries;
+             ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts;",
+        )
+        .unwrap();
+        assert_eq!(visible_ids(&conn, 2, 40), vec![200]);
+        assert_eq!(
+            visible_receipts(&*conn, 40, &[200]).unwrap(),
+            vec![(200, Some(300), Some(400))],
+            "failed reads and receipt attempts retain the original state"
+        );
+        let direct =
+            crate::sync::fetch_inbox_filtered_rows_from_conn(&conn, 1, 20, None, 10, options())
+                .unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].message.id, Some(100));
+    }
+
+    #[test]
+    fn direct_only_event_history_still_allows_a_legacy_shared_schema() {
+        let conn = crate::guard_db_conn(test_conn(), "legacy shared schema regression");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'legacy', '/legacy', 0);
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (10, 1, 'Sender', 'test', 'test', 0, 0), (20, 1, 'Reader', 'test', 'test', 0, 0);
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
+             VALUES (100, 1, 10, 'Direct legacy message', 'body', 100);
+             INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (100, 20, 'to');
+             INSERT OR IGNORE INTO inbox_delivery_events (project_id, agent_id, message_id, kind, delivered_ts)
+             VALUES (1, 20, 100, 'to', 100);
+             ALTER TABLE project_mailbox_receipts RENAME TO retained_empty_receipts;
+             ALTER TABLE project_mailbox_deliveries RENAME TO retained_empty_deliveries;
+             PRAGMA query_only = ON;",
+        )
+        .unwrap();
+        let rows =
+            crate::sync::fetch_inbox_filtered_rows_from_conn(&conn, 1, 20, None, 10, options())
+                .expect("direct-only event history is not evidence of shared mail");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.id, Some(100));
+        assert!(
+            fetch_project_mailbox_rows_from_conn(&*conn, 1, 20, None, 10, options())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            project_mailbox_delivery_from_conn(&*conn, 100).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_schema_fallback_requires_a_readable_ledger_and_explicit_project_marker() {
+        let conn = crate::guard_db_conn(
+            DbConn::open_memory().unwrap(),
+            "legacy delivery marker regression",
+        );
+        conn.execute_raw(
+            "CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, agent_id INTEGER, kind TEXT);
+             INSERT INTO inbox_delivery_events VALUES (1, NULL, 'to');",
+        )
+        .unwrap();
+        assert!(
+            fetch_project_mailbox_rows_from_conn(&*conn, 1, 1, None, 10, options())
+                .unwrap()
+                .is_empty()
+        );
+        for agent_id in [Some(0_i64), None] {
+            conn.execute_sync(
+                "UPDATE inbox_delivery_events SET agent_id = ?, kind = 'project'",
+                &[agent_id.map_or(Value::Null, Value::BigInt)],
+            )
+            .unwrap();
+            assert!(
+                fetch_project_mailbox_rows_from_conn(&*conn, 1, 1, None, 10, options())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retained project delivery events")
+            );
+        }
+        // The event catalog entry is present but its contents cannot be
+        // inspected. This is unavailable evidence, never an empty mailbox.
+        conn.execute_raw(
+            "ALTER TABLE inbox_delivery_events RENAME TO retained_events;
+             CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        assert!(fetch_project_mailbox_rows_from_conn(&*conn, 1, 1, None, 10, options()).is_err());
     }
 
     #[test]

@@ -11079,12 +11079,19 @@ async fn fetch_inbox_for_product_agent_impl(
 
     let rows = match map_sql_outcome(traw_query(cx, &tracked, &compound, &compound_params).await) {
         Outcome::Ok(rows) => rows,
-        // A mailbox read before its schema upgrade has no shared mailbox.
+        // Only a mailbox with no surviving shared authority can use the
+        // pre-upgrade fallback. Missing delivery tables must not hide retained
+        // receipts or shared delivery events behind a direct-only success.
         Outcome::Err(error)
             if crate::project_mailbox::is_missing_project_mailbox_table_error(
                 &error.to_string(),
             ) =>
         {
+            if let Err(error) =
+                crate::project_mailbox::allow_absent_shared_schema(&**conn, &error.to_string())
+            {
+                return Outcome::Err(error);
+            }
             let direct = format!("{sql} ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
             let mut direct_params = arm_params;
             direct_params.push(Value::BigInt(limit_i64));

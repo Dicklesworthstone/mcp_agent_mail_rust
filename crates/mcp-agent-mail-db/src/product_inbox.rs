@@ -499,6 +499,162 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn product_readers_refuse_lost_shared_authority_but_keep_legacy_direct_mail() {
+        for retain_shared_events in [false, true] {
+            let (_directory, conn, pool) = fixture();
+            conn.execute_raw(
+                "INSERT OR IGNORE INTO inbox_delivery_events
+                 (project_id, agent_id, message_id, kind, delivered_ts)
+                 VALUES (1, 12, 10002, 'bcc', 2010)",
+            )
+            .unwrap();
+            if retain_shared_events {
+                conn.execute_raw(
+                    "INSERT OR IGNORE INTO inbox_delivery_events
+                     (project_id, agent_id, message_id, kind, delivered_ts)
+                     SELECT project_id, NULL, message_id, 'project', delivered_ts
+                     FROM project_mailbox_deliveries",
+                )
+                .unwrap();
+            }
+            run(async {
+                let cx = Cx::current().expect("runtime-backed product reader context");
+                let original = fetch_inbox_for_product_agent_scoped(
+                    &cx,
+                    &pool,
+                    1,
+                    "BlueLake",
+                    &[12, 22],
+                    false,
+                    None,
+                    100,
+                    true,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert!(original.iter().any(|row| row.kind == "project"));
+                assert!(original.iter().any(|row| row.kind == "bcc"));
+                conn.execute_raw(
+                    "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;
+                     ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;",
+                )
+                .unwrap();
+
+                for bodies in [false, true] {
+                    let indexed = fetch_inbox_for_product_agent_scoped(
+                        &cx,
+                        &pool,
+                        1,
+                        "BlueLake",
+                        &[12, 22],
+                        false,
+                        None,
+                        100,
+                        bodies,
+                    )
+                    .await
+                    .into_result();
+                    let compound = crate::queries::fetch_inbox_for_product_agent_scoped(
+                        &cx,
+                        &pool,
+                        1,
+                        "BlueLake",
+                        &[12, 22],
+                        false,
+                        None,
+                        100,
+                        bodies,
+                    )
+                    .await
+                    .into_result();
+                    for result in [indexed, compound] {
+                        if retain_shared_events {
+                            let error =
+                                result.expect_err("lost shared mail is not partial success");
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("retained project delivery events")
+                            );
+                        } else {
+                            let rows = result.expect("legacy direct-only ledger remains readable");
+                            assert_eq!(rows.len(), 40);
+                            assert!(rows.iter().all(|row| row.kind == "bcc"));
+                            assert!(
+                                rows.iter()
+                                    .all(|row| row.message.body_md.is_empty() != bodies)
+                            );
+                        }
+                    }
+                }
+
+                // Receipt authority alone is enough to rule out the legacy
+                // exception, even without any surviving project event.
+                conn.execute_raw(
+                    "ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts",
+                )
+                .unwrap();
+                for result in [
+                    fetch_inbox_for_product_agent_scoped(
+                        &cx,
+                        &pool,
+                        1,
+                        "BlueLake",
+                        &[12, 22],
+                        false,
+                        None,
+                        100,
+                        true,
+                    )
+                    .await
+                    .into_result(),
+                    crate::queries::fetch_inbox_for_product_agent_scoped(
+                        &cx,
+                        &pool,
+                        1,
+                        "BlueLake",
+                        &[12, 22],
+                        false,
+                        None,
+                        100,
+                        true,
+                    )
+                    .await
+                    .into_result(),
+                ] {
+                    assert!(
+                        result
+                            .expect_err("retained receipts require their delivery authority")
+                            .to_string()
+                            .contains("incomplete project mailbox schema")
+                    );
+                }
+                conn.execute_raw(
+                    "ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries",
+                )
+                .unwrap();
+                let restored = fetch_inbox_for_product_agent_scoped(
+                    &cx,
+                    &pool,
+                    1,
+                    "BlueLake",
+                    &[12, 22],
+                    false,
+                    None,
+                    100,
+                    true,
+                )
+                .await
+                .into_result()
+                .unwrap();
+                assert_eq!(format!("{restored:?}"), format!("{original:?}"));
+            });
+        }
+    }
+
+    #[test]
     fn membership_name_and_exact_preflight_ids_limit_the_scope() {
         let (_directory, conn, _pool) = fixture();
         let cx = Cx::for_testing();

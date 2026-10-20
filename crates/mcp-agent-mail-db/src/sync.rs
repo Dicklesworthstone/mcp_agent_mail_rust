@@ -725,35 +725,11 @@ fn inbox_delivery_events_in_snapshot(
                 &error.to_string(),
             ) =>
         {
-            // Only a wholly absent pre-upgrade shared schema is empty.
-            // A remaining receipt table or broken delivery view is an
-            // authority failure, not permission to publish direct-only
-            // success and let a monitor advance past lost shared mail.
-            let objects = conn
-                .query_sync(
-                    "SELECT name FROM sqlite_master WHERE name COLLATE NOCASE \
-                     IN ('project_mailbox_deliveries', 'project_mailbox_receipts')",
-                    &[],
-                )
-                .map_err(|error| {
-                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                })?;
-            let shared_events = conn
-                .query_sync(
-                    "SELECT seq FROM inbox_delivery_events WHERE project_id = ? \
-                 AND agent_id IS NULL AND kind = 'project' LIMIT 1",
-                    &[Value::BigInt(project_id)],
-                )
-                .map_err(|error| {
-                    InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
-                })?;
-            // Shared ledger entries also prove this is not a pre-upgrade
-            // mailbox, even when both shared tables have disappeared.
-            if !objects.is_empty() || !shared_events.is_empty() {
-                return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
-                        "incomplete project mailbox schema; delivery and receipt tables must be repaired".into(),
-                    )));
-            }
+            // Use the same global schema authority as snapshot inboxes and
+            // receipt writers. A partial page must never let a monitor advance
+            // its cursor past shared delivery history whose tables are gone.
+            crate::project_mailbox::allow_absent_shared_schema(conn, &error.to_string())
+                .map_err(InboxDeliveryEventError::Database)?;
         }
         Err(error) => {
             return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
