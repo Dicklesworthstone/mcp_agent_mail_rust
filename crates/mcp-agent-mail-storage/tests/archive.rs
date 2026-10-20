@@ -119,7 +119,7 @@ fn archive_commits_still_apply_gitattributes_line_ending_normalization()
 
     let repo = git2::Repository::open(&archive.repo_root)?;
     let head = repo.head()?.peel_to_commit()?;
-    assert_eq!(head.summary(), Some("eol normalization check"));
+    assert_eq!(head.summary()?, Some("eol normalization check"));
     let entry = head.tree()?.get_path(Path::new(&rel_path))?;
     let blob = repo.find_blob(entry.id())?;
     assert_eq!(blob.content(), b"line one\nline two\n");
