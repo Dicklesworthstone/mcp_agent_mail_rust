@@ -16,9 +16,21 @@ use crate::pool::SyncQuery;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 
 const PAGE_SIZE: usize = 256;
+/// Receipt pages carry no ORDER BY: with one, the pinned engine seeks on
+/// `agent_id` alone and walks the agent's whole receipt history for every
+/// page. [`receipt_page`] sorts the rows and proves a full page is the lowest
+/// 256 IDs with an index count, re-reading it ordered when it is not.
 pub const RECIPIENT_PAGE_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
-    FROM message_recipients WHERE agent_id = ? ORDER BY message_id ASC LIMIT 256";
+    FROM message_recipients WHERE agent_id = ? LIMIT 256";
 pub const RECIPIENT_NEXT_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
+    FROM message_recipients WHERE agent_id = ? AND message_id > ? LIMIT 256";
+pub const RECIPIENT_PAGE_COUNT_SQL: &str =
+    "SELECT COUNT(*) AS n FROM message_recipients WHERE agent_id = ? AND message_id <= ?";
+pub const RECIPIENT_NEXT_COUNT_SQL: &str = "SELECT COUNT(*) AS n FROM message_recipients \
+    WHERE agent_id = ? AND message_id > ? AND message_id <= ?";
+const RECIPIENT_PAGE_ORDERED_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
+    FROM message_recipients WHERE agent_id = ? ORDER BY message_id ASC LIMIT 256";
+const RECIPIENT_NEXT_ORDERED_SQL: &str = "SELECT message_id, kind, read_ts, ack_ts \
     FROM message_recipients WHERE agent_id = ? AND message_id > ? \
     ORDER BY message_id ASC LIMIT 256";
 pub const HEADER_COLUMNS: &str =
@@ -323,6 +335,61 @@ fn newest_first_window(
     }
 }
 
+/// The agent's next receipt page after `after`, ascending by message ID. An
+/// unordered page shorter than `PAGE_SIZE` already holds every remaining
+/// receipt. A full one is used only when the index count over its ID range
+/// equals its size, i.e. it is exactly the lowest remaining IDs; under a plan
+/// that returns rows in any other order the page is re-read with ORDER BY.
+fn receipt_page(
+    conn: &impl SyncQuery,
+    agent_id: i64,
+    after: Option<i64>,
+) -> Result<Vec<(i64, Row)>, DbError> {
+    let (sql, count_sql, ordered_sql, mut params) = match after {
+        None => (
+            RECIPIENT_PAGE_SQL,
+            RECIPIENT_PAGE_COUNT_SQL,
+            RECIPIENT_PAGE_ORDERED_SQL,
+            vec![Value::BigInt(agent_id)],
+        ),
+        Some(id) => (
+            RECIPIENT_NEXT_SQL,
+            RECIPIENT_NEXT_COUNT_SQL,
+            RECIPIENT_NEXT_ORDERED_SQL,
+            vec![Value::BigInt(agent_id), Value::BigInt(id)],
+        ),
+    };
+    let page = keyed_by_message_id(query(conn, sql, &params)?)?;
+    let Some(&(max, _)) = page.last().filter(|_| page.len() == PAGE_SIZE) else {
+        return Ok(page);
+    };
+    params.push(Value::BigInt(max));
+    let counted = query(conn, count_sql, &params)?
+        .first()
+        .map(|row| row.get_named::<i64>("n"))
+        .transpose()
+        .map_err(db_error)?;
+    if counted.and_then(|n| usize::try_from(n).ok()) == Some(page.len()) {
+        return Ok(page);
+    }
+    params.pop();
+    keyed_by_message_id(query(conn, ordered_sql, &params)?)
+}
+
+fn keyed_by_message_id(rows: Vec<Row>) -> Result<Vec<(i64, Row)>, DbError> {
+    if rows.len() > PAGE_SIZE {
+        return Err(DbError::Internal(
+            "inbox recipient page exceeded its bound".into(),
+        ));
+    }
+    let mut page = rows
+        .into_iter()
+        .map(|row| Ok((row.get_named::<i64>("message_id").map_err(db_error)?, row)))
+        .collect::<Result<Vec<_>, DbError>>()?;
+    page.sort_unstable_by_key(|(id, _)| *id);
+    Ok(page)
+}
+
 /// The newest window from every one of the agent's receipts.
 fn receipt_window(
     conn: &impl SyncQuery,
@@ -333,28 +400,15 @@ fn receipt_window(
     options: InboxFetchOptions<'_>,
 ) -> Result<NewestWindow, DbError> {
     let mut after = None;
-    let mut newest: BTreeMap<(i64, i64), Receipt> = BTreeMap::new();
+    let mut newest = NewestWindow::new();
+    // Receipts that passed the read/ACK filters, awaiting one header lookup
+    // of up to PAGE_SIZE IDs: one statement per page costs more than the
+    // rows it returns when most receipts are filtered out.
+    let mut pending: HashMap<i64, Receipt> = HashMap::new();
     loop {
-        let (sql, params) = after.map_or_else(
-            || (RECIPIENT_PAGE_SQL, vec![Value::BigInt(agent_id)]),
-            |id| {
-                (
-                    RECIPIENT_NEXT_SQL,
-                    vec![Value::BigInt(agent_id), Value::BigInt(id)],
-                )
-            },
-        );
-        let rows = query(conn, sql, &params)?;
-        if rows.len() > PAGE_SIZE {
-            return Err(DbError::Internal(
-                "inbox recipient page exceeded its bound".into(),
-            ));
-        }
+        let rows = receipt_page(conn, agent_id, after)?;
         let finished = rows.len() < PAGE_SIZE;
-        let mut receipts = HashMap::new();
-        let mut ids = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+        for (id, row) in rows {
             if after.is_some_and(|previous| id <= previous) {
                 return Err(DbError::Internal(
                     "inbox recipient cursor did not advance".into(),
@@ -372,55 +426,88 @@ fn receipt_window(
             {
                 continue;
             }
-            ids.push(id);
-            receipts.insert(id, receipt);
-        }
-        if !ids.is_empty() {
-            let (sql, params) = lookup_query("messages", HEADER_COLUMNS, &ids);
-            for row in query(conn, &sql, &params)? {
-                let id = row.get_named::<i64>("id").map_err(db_error)?;
-                let receipt = receipts.remove(&id).ok_or_else(|| {
-                    DbError::Internal("message lookup returned an unrequested inbox ID".into())
-                })?;
-                if row.get_named::<i64>("project_id").map_err(db_error)? != project_id {
-                    continue;
-                }
-                let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
-                let ack_required = row.get_named::<i64>("ack_required").map_err(db_error)?;
-                let importance = row.get_named::<String>("importance").map_err(db_error)?;
-                let topic = row.get_named::<Option<String>>("topic").map_err(db_error)?;
-                if (options.urgent_only && !matches!(importance.as_str(), "high" | "urgent"))
-                    || (options.ack_required_only && ack_required != 1)
-                    || options
-                        .ack_overdue_before
-                        .is_some_and(|ts| ack_required != 1 || created >= ts)
-                    || since_ts.is_some_and(|ts| created <= ts)
-                    || options.topic.is_some_and(|wanted| {
-                        !topic
-                            .as_deref()
-                            .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
-                    })
-                {
-                    continue;
-                }
-                let key = (created, id);
-                if newest.len() < limit
-                    || newest.first_key_value().is_some_and(|(old, _)| key > *old)
-                {
-                    newest.insert(key, receipt);
-                    if newest.len() > limit {
-                        newest.pop_first();
-                    }
-                }
+            pending.insert(id, receipt);
+            if pending.len() == PAGE_SIZE {
+                admit_headers(
+                    conn,
+                    project_id,
+                    since_ts,
+                    limit,
+                    options,
+                    &mut pending,
+                    &mut newest,
+                )?;
             }
-            // Missing message rows are orphan recipients, excluded by the old
-            // inner join too. They still advance the recipient scan above.
         }
         if finished {
             break;
         }
     }
+    admit_headers(
+        conn,
+        project_id,
+        since_ts,
+        limit,
+        options,
+        &mut pending,
+        &mut newest,
+    )?;
     Ok(newest)
+}
+
+/// Looks up the headers of the pending receipts, applies the header filters
+/// and keeps the newest `limit`. Missing message rows are orphan recipients,
+/// excluded by the old inner join too; their receipts are dropped.
+fn admit_headers(
+    conn: &impl SyncQuery,
+    project_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+    pending: &mut HashMap<i64, Receipt>,
+    newest: &mut NewestWindow,
+) -> Result<(), DbError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = pending.keys().copied().collect();
+    let (sql, params) = lookup_query("messages", HEADER_COLUMNS, &ids);
+    for row in query(conn, &sql, &params)? {
+        let id = row.get_named::<i64>("id").map_err(db_error)?;
+        let receipt = pending.remove(&id).ok_or_else(|| {
+            DbError::Internal("message lookup returned an unrequested inbox ID".into())
+        })?;
+        if row.get_named::<i64>("project_id").map_err(db_error)? != project_id {
+            continue;
+        }
+        let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
+        let ack_required = row.get_named::<i64>("ack_required").map_err(db_error)?;
+        let importance = row.get_named::<String>("importance").map_err(db_error)?;
+        let topic = row.get_named::<Option<String>>("topic").map_err(db_error)?;
+        if (options.urgent_only && !matches!(importance.as_str(), "high" | "urgent"))
+            || (options.ack_required_only && ack_required != 1)
+            || options
+                .ack_overdue_before
+                .is_some_and(|ts| ack_required != 1 || created >= ts)
+            || since_ts.is_some_and(|ts| created <= ts)
+            || options.topic.is_some_and(|wanted| {
+                !topic
+                    .as_deref()
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(wanted))
+            })
+        {
+            continue;
+        }
+        let key = (created, id);
+        if newest.len() < limit || newest.first_key_value().is_some_and(|(old, _)| key > *old) {
+            newest.insert(key, receipt);
+            if newest.len() > limit {
+                newest.pop_first();
+            }
+        }
+    }
+    pending.clear();
+    Ok(())
 }
 
 fn hydrate(
@@ -940,10 +1027,12 @@ mod tests {
                 .sum::<usize>(),
             7
         );
+        // Every receipt read once; the full-page index counts return one row each.
         assert_eq!(
             calls
                 .iter()
-                .filter(|(sql, _, _)| sql.contains("FROM message_recipients"))
+                .filter(|(sql, _, _)| sql.contains("FROM message_recipients")
+                    && !sql.contains("COUNT(*)"))
                 .map(|(_, _, rows)| rows)
                 .sum::<usize>(),
             600
@@ -1069,28 +1158,65 @@ mod tests {
         );
     }
 
+    /// `(opcode, p2, p3)` of every instruction in the statement's program.
+    fn explain_ops(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<(String, i64, i64)> {
+        conn.query_sync(&format!("EXPLAIN {sql}"), params)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.get_as::<String>(1).unwrap(),
+                    row.get_as::<i64>(3).unwrap_or(0),
+                    row.get_as::<i64>(4).unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
+    /// The program seeks once with a key of at least `fields` columns and
+    /// walks a table or index from one end only on the engine's fallback for a
+    /// key value that is not an integer, which sits behind an `IsType` check.
+    fn assert_bounded_seek(conn: &DbConn, sql: &str, params: &[Value], fields: i64) {
+        let ops = explain_ops(conn, sql, params);
+        let seeks: Vec<i64> = ops
+            .iter()
+            .filter(|(op, _, _)| op == "SeekGE")
+            .map(|(_, _, key)| *key)
+            .collect();
+        assert_eq!(seeks.len(), 1, "{sql}: {ops:?}");
+        assert!(
+            ops.iter()
+                .any(|(op, n, out)| op == "MakeRecord" && *out == seeks[0] && *n >= fields),
+            "{sql} must seek on {fields} index columns: {ops:?}"
+        );
+        let guard = ops.iter().position(|(op, _, _)| op == "IsType");
+        assert!(
+            ops.iter().enumerate().all(|(at, (op, _, _))| {
+                !matches!(op.as_str(), "Rewind" | "Last") || guard.is_some_and(|g| g < at)
+            }),
+            "{sql} must not walk a history on its integer-key path: {ops:?}"
+        );
+    }
+
     #[test]
     fn indexed_queries_use_recipient_range_and_message_primary_keys() {
         let conn = seed(5);
-        for sql in [RECIPIENT_PAGE_SQL, RECIPIENT_NEXT_SQL] {
-            let rows = conn
-                .query_sync(
-                    &format!("EXPLAIN QUERY PLAN {sql}"),
-                    &[2_i64.into(), 0_i64.into()],
-                )
-                .unwrap();
-            let details = rows
-                .iter()
-                .map(|row| row.get_as::<String>(3).unwrap())
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                details.contains(
-                    "SEARCH message_recipients USING INDEX idx_message_recipients_agent_message"
-                ),
-                "{details}"
-            );
-        }
+        // Plan labels read SCAN for these unordered seeks; check the programs.
+        let (agent, after, max) = (Value::BigInt(2), Value::BigInt(0), Value::BigInt(9));
+        assert_bounded_seek(&conn, RECIPIENT_PAGE_SQL, std::slice::from_ref(&agent), 1);
+        assert_bounded_seek(
+            &conn,
+            RECIPIENT_NEXT_SQL,
+            &[agent.clone(), after.clone()],
+            2,
+        );
+        assert_bounded_seek(
+            &conn,
+            RECIPIENT_PAGE_COUNT_SQL,
+            &[agent.clone(), max.clone()],
+            1,
+        );
+        assert_bounded_seek(&conn, RECIPIENT_NEXT_COUNT_SQL, &[agent, after, max], 2);
         let (sql, params) = lookup_query("messages", HEADER_COLUMNS, &[1, 2, 3]);
         let rows = conn
             .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
@@ -1121,37 +1247,11 @@ mod tests {
             plan.contains("USING INDEX idx_message_recipients_agent_message"),
             "{plan}"
         );
-        let program = conn
-            .query_sync(
-                &format!("EXPLAIN {RECIPIENT_RANGE_SQL}"),
-                &[2_i64.into(), 1_i64.into(), 5_i64.into()],
-            )
-            .unwrap();
-        let ops: Vec<(String, i64, i64)> = program
-            .iter()
-            .map(|row| {
-                (
-                    row.get_as::<String>(1).unwrap(),
-                    row.get_as::<i64>(3).unwrap_or(0),
-                    row.get_as::<i64>(4).unwrap_or(0),
-                )
-            })
-            .collect();
-        let seeks: Vec<i64> = ops
-            .iter()
-            .filter(|(op, _, _)| op == "SeekGE")
-            .map(|(_, _, key)| *key)
-            .collect();
-        assert_eq!(seeks.len(), 1, "{ops:?}");
-        assert!(
-            ops.iter()
-                .any(|(op, fields, out)| op == "MakeRecord" && *out == seeks[0] && *fields >= 2),
-            "the receipt range must seek on (agent_id, message_id): {ops:?}"
-        );
-        assert!(
-            ops.iter()
-                .all(|(op, _, _)| !matches!(op.as_str(), "Rewind" | "Last")),
-            "the receipt range must not walk the receipt history: {ops:?}"
+        assert_bounded_seek(
+            &conn,
+            RECIPIENT_RANGE_SQL,
+            &[2_i64.into(), 1_i64.into(), 5_i64.into()],
+            2,
         );
         let hint = conn
             .query_sync(
@@ -1396,6 +1496,95 @@ mod tests {
         let (_, (pages, _, _)) = run(20, options());
         assert_eq!(pages, 0);
     }
+
+    /// Stands in for a plan that ignores index order: unordered receipt pages
+    /// come back as the highest 256 IDs after the cursor, newest first.
+    struct HighestFirst<'a> {
+        conn: &'a DbConn,
+        ordered_rereads: std::cell::Cell<usize>,
+    }
+
+    impl SyncQuery for HighestFirst<'_> {
+        fn query_sync(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<Vec<Row>, sqlmodel_core::Error> {
+            if sql == RECIPIENT_PAGE_SQL || sql == RECIPIENT_NEXT_SQL {
+                let highest = sql.replace(" LIMIT 256", " ORDER BY message_id DESC LIMIT 256");
+                return self.conn.query_sync(&highest, params);
+            }
+            if sql == RECIPIENT_PAGE_ORDERED_SQL || sql == RECIPIENT_NEXT_ORDERED_SQL {
+                self.ordered_rereads.set(self.ordered_rereads.get() + 1);
+            }
+            self.conn.query_sync(sql, params)
+        }
+        fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+            self.conn.execute_raw(sql)
+        }
+    }
+
+    #[test]
+    fn receipt_pages_out_of_index_order_are_reread_in_order() {
+        let conn = walk_conn();
+        // 1,024 receipts: four full pages, then an empty one.
+        seed_walk(
+            &conn,
+            (1, 2048),
+            2,
+            |id| 1_000_000 + id * 1000,
+            mixed_importance,
+        );
+        for filters in [
+            InboxFetchOptions {
+                unread_only: true,
+                ..options()
+            },
+            InboxFetchOptions {
+                ack_required_only: true,
+                ..options()
+            },
+            InboxFetchOptions {
+                ack_overdue_before: Some(1_900_000),
+                ..options()
+            },
+            InboxFetchOptions {
+                unread_only: true,
+                urgent_only: true,
+                topic: Some("HANDOFFS"),
+                ..options()
+            },
+        ] {
+            for since in [None, Some(1_700_000)] {
+                let expected = newest_reference(&conn, since, 1000, filters);
+                // Trusting a full unordered page would stop after the highest
+                // 256 receipts and come back short of the reference.
+                let perturbed = HighestFirst {
+                    conn: &conn,
+                    ordered_rereads: std::cell::Cell::new(0),
+                };
+                let actual = with_snapshot(&perturbed, || {
+                    fetch_direct(&perturbed, 1, 2, since, 1000, filters)
+                })
+                .unwrap();
+                same_rows(&actual, &expected);
+                assert_eq!(perturbed.ordered_rereads.get(), 3, "pages 1-3 are re-read");
+                // An index-ordered plan never needs the ordered re-read.
+                let recording = Recording {
+                    conn: &conn,
+                    calls: RefCell::new(Vec::new()),
+                };
+                let honest = with_snapshot(&recording, || {
+                    fetch_direct(&recording, 1, 2, since, 1000, filters)
+                })
+                .unwrap();
+                same_rows(&honest, &expected);
+                assert!(recording.calls.borrow().iter().all(|(sql, _, _)| {
+                    sql != RECIPIENT_PAGE_ORDERED_SQL && sql != RECIPIENT_NEXT_ORDERED_SQL
+                }));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1581,5 +1770,135 @@ mod scaling_tests {
         );
         assert!(g1 <= 1.35, "G1 sparse {g1:.3} > 1.35");
         assert!(g2 <= 1.35, "G2' rare urgent {g2:.3} > 1.35");
+    }
+
+    /// The receipt scan before this change, statement for statement: ordered
+    /// pages, which the pinned engine serves by walking the agent's receipts
+    /// from the start each time, and one header lookup per page.
+    fn original_receipt_window(
+        conn: &DbConn,
+        filters: InboxFetchOptions<'_>,
+    ) -> Result<NewestWindow, DbError> {
+        let mut after = None;
+        let mut newest = NewestWindow::new();
+        loop {
+            let (sql, params) = match after {
+                None => (RECIPIENT_PAGE_ORDERED_SQL, vec![Value::BigInt(2)]),
+                Some(id) => (
+                    RECIPIENT_NEXT_ORDERED_SQL,
+                    vec![Value::BigInt(2), Value::BigInt(id)],
+                ),
+            };
+            let rows = query(conn, sql, &params)?;
+            let finished = rows.len() < PAGE_SIZE;
+            let mut page = HashMap::new();
+            for row in rows {
+                let id = row.get_named::<i64>("message_id").map_err(db_error)?;
+                after = Some(id);
+                let receipt = Receipt {
+                    kind: row.get_named("kind").map_err(db_error)?,
+                    read_ts: row.get_named("read_ts").map_err(db_error)?,
+                    ack_ts: row.get_named("ack_ts").map_err(db_error)?,
+                };
+                if (filters.unread_only && receipt.read_ts.is_some())
+                    || ((filters.ack_required_only || filters.ack_overdue_before.is_some())
+                        && receipt.ack_ts.is_some())
+                {
+                    continue;
+                }
+                page.insert(id, receipt);
+            }
+            admit_headers(conn, 1, None, 20, filters, &mut page, &mut newest)?;
+            if finished {
+                return Ok(newest);
+            }
+        }
+    }
+
+    /// Median microseconds of the unordered and the ordered receipt scan, five
+    /// alternating rounds, asserting identical rows every round.
+    fn receipt_scans_us(conn: &DbConn, filters: InboxFetchOptions<'_>) -> (u128, u128) {
+        let mut candidate = Vec::new();
+        let mut reference = Vec::new();
+        for round in 0..5 {
+            let new = || {
+                let start = Instant::now();
+                let rows = with_snapshot(conn, || {
+                    let window = receipt_window(conn, 1, 2, None, 20, filters)?;
+                    hydrate(conn, 1, window, filters.body_policy)
+                })
+                .unwrap();
+                (rows, start.elapsed().as_micros())
+            };
+            let old = || {
+                let start = Instant::now();
+                let rows = with_snapshot(conn, || {
+                    let window = original_receipt_window(conn, filters)?;
+                    hydrate(conn, 1, window, filters.body_policy)
+                })
+                .unwrap();
+                (rows, start.elapsed().as_micros())
+            };
+            let (actual, expected) = if round % 2 == 0 {
+                let actual = new();
+                (actual, old())
+            } else {
+                let expected = old();
+                (new(), expected)
+            };
+            assert_eq!(format!("{:?}", actual.0), format!("{:?}", expected.0));
+            candidate.push(actual.1);
+            reference.push(expected.1);
+        }
+        candidate.sort_unstable();
+        reference.sort_unstable();
+        (candidate[2], reference[2])
+    }
+
+    #[test]
+    #[ignore = "explicit same-invocation unordered vs ordered receipt scan measurement (rscan_rule)"]
+    fn receipt_scan_unordered_vs_ordered_pages() {
+        use super::tests::{seed_walk, walk_conn};
+        let filters = InboxFetchOptions {
+            urgent_only: false,
+            unread_only: true,
+            ack_required_only: false,
+            ack_overdue_before: None,
+            topic: None,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        };
+        let created: fn(i64) -> i64 = |id| 1_000_000 + id * 1000;
+        // GreenStone receives 1 in 4 of the project's mail; 1 in 10 of hers is unread.
+        let measure = |messages: i64| {
+            let conn = walk_conn();
+            seed_walk(&conn, (1, messages), 4, created, |_| "normal");
+            conn.execute_raw(
+                "UPDATE message_recipients SET read_ts = 1 WHERE agent_id = 2 AND message_id % 40 != 0; \
+                 UPDATE message_recipients SET read_ts = NULL WHERE agent_id = 2 AND message_id % 40 = 0",
+            )
+            .unwrap();
+            let (new, old) = receipt_scans_us(&conn, filters);
+            let ratio = new as f64 / old.max(1) as f64;
+            println!(
+                "{{\"own_inbox\":{},\"unordered_median_us\":{new},\"ordered_median_us\":{old},\"ratio\":{ratio:.3}}}",
+                messages / 4
+            );
+            (new, ratio)
+        };
+        let (_, two_page_ratio) = measure(1_200);
+        let (small, _) = measure(4_000);
+        let (large, large_ratio) = measure(40_000);
+        assert!(
+            large_ratio <= 0.25,
+            "R1 own 10k unordered/ordered {large_ratio:.3} > 0.25"
+        );
+        assert!(
+            large <= 15 * small,
+            "R2 unordered scan grows faster than linear: {small} -> {large} us"
+        );
+        assert!(
+            two_page_ratio <= 1.25,
+            "R3 own 300 unordered/ordered {two_page_ratio:.3} > 1.25"
+        );
     }
 }
