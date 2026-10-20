@@ -7,7 +7,7 @@
 //! on data changes plus periodic heartbeat intervals.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -102,7 +102,7 @@ struct AgentReservationStats {
     active: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AgentContactStats {
     respected_count: u64,
     violation_count: u64,
@@ -2029,6 +2029,14 @@ fn fetch_agent_reservation_stats(
         .unwrap_or_default()
 }
 
+/// Per-recipient contact-policy outcomes over the health window.
+///
+/// The approved links are read once and the recipient rows are grouped by
+/// (recipient, sender, policy) with no subqueries; the respected/violation
+/// classification runs in Rust. Expressing the link check as a correlated
+/// `EXISTS` over a CTE made the engine re-run the CTE for every recipient row
+/// in the 30-day window, which pegged the poller thread at a full core once
+/// the window held enough mail (br-bdo5g).
 fn fetch_agent_contact_stats(
     conn: &DbConn,
     agent_ids_sql: &str,
@@ -2038,71 +2046,106 @@ fn fetch_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
-    let message_created_expr = timestamp_sort_expr("m.created_ts");
+    let Some(approved_links) = fetch_approved_contact_links(conn, now) else {
+        return HashMap::new();
+    };
+    conn.query_sync(&contact_policy_rows_sql(agent_ids_sql, window_start), &[])
+        .ok()
+        .map(|rows| {
+            let mut stats: HashMap<i64, AgentContactStats> = HashMap::new();
+            for row in rows {
+                let Some(recipient_id) = parse_raw_i64(&row, "agent_id") else {
+                    continue;
+                };
+                let sender_id = parse_raw_i64(&row, "sender_id");
+                let policy = row.get_named::<String>("contact_policy").ok();
+                let row_count =
+                    nonnegative_i64_to_u64(parse_raw_i64(&row, "row_count").unwrap_or(0));
+                let (respected, violation) = classify_contact_policy_rows(
+                    policy.as_deref(),
+                    sender_id,
+                    recipient_id,
+                    &approved_links,
+                );
+                let entry = stats.entry(recipient_id).or_default();
+                if respected {
+                    entry.respected_count += row_count;
+                }
+                if violation {
+                    entry.violation_count += row_count;
+                }
+            }
+            stats
+        })
+        .unwrap_or_default()
+}
+
+/// Directed (sender, recipient) pairs allowed by an approved, unexpired link.
+/// A link permits messages in both directions. `None` when the query fails.
+fn fetch_approved_contact_links(conn: &DbConn, now: i64) -> Option<HashSet<(i64, i64)>> {
     let link_expires_expr = timestamp_sort_expr("al.expires_ts");
-    let sql = format!(
-        "WITH approved_links AS ( \
-            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
-            FROM agent_links al \
-            WHERE status IN ('approved', 'accepted') \
-              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
-            UNION \
-            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
-            FROM agent_links al \
-            WHERE status IN ('approved', 'accepted') \
-              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
-         ) \
-         SELECT \
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT a_agent_id AS a_agent_id, b_agent_id AS b_agent_id \
+                 FROM agent_links al \
+                 WHERE status IN ('approved', 'accepted') \
+                   AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now})"
+            ),
+            &[],
+        )
+        .ok()?;
+    let mut pairs = HashSet::with_capacity(rows.len() * 2);
+    for row in rows {
+        if let (Some(a), Some(b)) = (
+            parse_raw_i64(&row, "a_agent_id"),
+            parse_raw_i64(&row, "b_agent_id"),
+        ) {
+            pairs.insert((a, b));
+            pairs.insert((b, a));
+        }
+    }
+    Some(pairs)
+}
+
+fn contact_policy_rows_sql(agent_ids_sql: &str, window_start: i64) -> String {
+    let message_created_expr = timestamp_sort_expr("m.created_ts");
+    format!(
+        "SELECT \
             mr.agent_id AS agent_id, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
-                    WHEN m.sender_id = mr.agent_id THEN 1 \
-                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
-                    ELSE 0 END) AS respected_count, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy = 'contacts_only' \
-                     AND m.sender_id != mr.agent_id \
-                     AND NOT EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
-                    WHEN recipient.contact_policy = 'block_all' \
-                     AND m.sender_id != mr.agent_id \
-                    THEN 1 \
-                    ELSE 0 END) AS violation_count \
+            m.sender_id AS sender_id, \
+            recipient.contact_policy AS contact_policy, \
+            COUNT(*) AS row_count \
          FROM message_recipients mr \
          JOIN messages m ON m.id = mr.message_id \
          JOIN agents recipient ON recipient.id = mr.agent_id \
          WHERE mr.agent_id IN ({agent_ids_sql}) \
            AND {message_created_expr} >= {window_start} \
-         GROUP BY mr.agent_id"
-    );
-    conn.query_sync(&sql, &[])
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let agent_id = parse_raw_i64(&row, "agent_id")?;
-                    Some((
-                        agent_id,
-                        AgentContactStats {
-                            respected_count: nonnegative_i64_to_u64(
-                                parse_raw_i64(&row, "respected_count").unwrap_or(0),
-                            ),
-                            violation_count: nonnegative_i64_to_u64(
-                                parse_raw_i64(&row, "violation_count").unwrap_or(0),
-                            ),
-                        },
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+         GROUP BY mr.agent_id, m.sender_id, recipient.contact_policy"
+    )
+}
+
+/// `(respected, violation)` for messages from `sender_id` to `recipient_id`
+/// under the recipient's contact policy. Mirrors SQL comparison semantics: a
+/// NULL sender matches neither the self-send nor the link rules.
+fn classify_contact_policy_rows(
+    policy: Option<&str>,
+    sender_id: Option<i64>,
+    recipient_id: i64,
+    approved_links: &HashSet<(i64, i64)>,
+) -> (bool, bool) {
+    let self_send = sender_id == Some(recipient_id);
+    let linked = sender_id.is_some_and(|sender| approved_links.contains(&(sender, recipient_id)));
+    let foreign_sender = sender_id.is_some_and(|sender| sender != recipient_id);
+    let respected = matches!(policy, Some("open" | "auto"))
+        || self_send
+        || (policy == Some("contacts_only") && linked);
+    let violation = match policy {
+        Some("contacts_only") => foreign_sender && !linked,
+        Some("block_all") => foreign_sender,
+        _ => false,
+    };
+    (respected, violation)
 }
 
 fn fetch_agent_decision_counts(agents: &[AgentListRow], window_start: i64) -> HashMap<String, u64> {
@@ -6750,6 +6793,246 @@ first body
         assert_eq!(input.reservation_active_count, 0);
         assert_eq!(input.contact_policy_respected_count, None);
         assert!(input.last_active_age_micros.is_some());
+    }
+
+    /// The pre-br-bdo5g query (correlated `EXISTS` over a CTE), kept as the
+    /// oracle the subquery-free implementation must agree with.
+    fn legacy_contact_stats(
+        conn: &DbConn,
+        agent_ids_sql: &str,
+        window_start: i64,
+        now: i64,
+    ) -> HashMap<i64, AgentContactStats> {
+        let message_created_expr = timestamp_sort_expr("m.created_ts");
+        let link_expires_expr = timestamp_sort_expr("al.expires_ts");
+        let sql = format!(
+            "WITH approved_links AS ( \
+                SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
+                FROM agent_links al \
+                WHERE status IN ('approved', 'accepted') \
+                  AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+                UNION \
+                SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
+                FROM agent_links al \
+                WHERE status IN ('approved', 'accepted') \
+                  AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+             ) \
+             SELECT \
+                mr.agent_id AS agent_id, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                        WHEN m.sender_id = mr.agent_id THEN 1 \
+                        WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
+                            SELECT 1 FROM approved_links link \
+                            WHERE link.sender_id = m.sender_id \
+                              AND link.recipient_id = mr.agent_id \
+                        ) THEN 1 \
+                        ELSE 0 END) AS respected_count, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy = 'contacts_only' \
+                         AND m.sender_id != mr.agent_id \
+                         AND NOT EXISTS ( \
+                            SELECT 1 FROM approved_links link \
+                            WHERE link.sender_id = m.sender_id \
+                              AND link.recipient_id = mr.agent_id \
+                        ) THEN 1 \
+                        WHEN recipient.contact_policy = 'block_all' \
+                         AND m.sender_id != mr.agent_id \
+                        THEN 1 \
+                        ELSE 0 END) AS violation_count \
+             FROM message_recipients mr \
+             JOIN messages m ON m.id = mr.message_id \
+             JOIN agents recipient ON recipient.id = mr.agent_id \
+             WHERE mr.agent_id IN ({agent_ids_sql}) \
+               AND {message_created_expr} >= {window_start} \
+             GROUP BY mr.agent_id"
+        );
+        conn.query_sync(&sql, &[])
+            .expect("legacy contact stats query")
+            .into_iter()
+            .map(|row| {
+                (
+                    parse_raw_i64(&row, "agent_id").expect("agent_id"),
+                    AgentContactStats {
+                        respected_count: nonnegative_i64_to_u64(
+                            parse_raw_i64(&row, "respected_count").unwrap_or(0),
+                        ),
+                        violation_count: nonnegative_i64_to_u64(
+                            parse_raw_i64(&row, "violation_count").unwrap_or(0),
+                        ),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn contact_stats(respected_count: u64, violation_count: u64) -> AgentContactStats {
+        AgentContactStats {
+            respected_count,
+            violation_count,
+        }
+    }
+
+    #[test]
+    fn fetch_agent_contact_stats_matches_legacy_correlated_query() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, contact_policy TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER, created_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create recipients");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_agent_id INTEGER, b_agent_id INTEGER, status TEXT, expires_ts INTEGER)",
+            &[],
+        )
+        .expect("create agent_links");
+
+        let now = now_micros();
+        let window_start = now.saturating_sub(86_400_000_000);
+        let inside = now.saturating_sub(3_600_000_000);
+        let outside = now.saturating_sub(2 * 86_400_000_000);
+
+        // Recipients 1-8 cover every policy branch; 10-12 are plain senders.
+        conn.execute_sync(
+            "INSERT INTO agents (id, contact_policy) VALUES \
+             (1, 'auto'), (2, 'open'), (3, 'contacts_only'), (4, 'block_all'), \
+             (5, 'contacts_only'), (6, 'contacts_only'), (7, 'contacts_only'), (8, NULL), \
+             (10, 'auto'), (11, 'auto'), (12, 'auto')",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES (?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(10),
+                Value::BigInt(3),
+                Value::Text("approved".into()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert never-expiring link 10<->3");
+        conn.execute_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES (?, ?, ?, ?, NULL)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(5),
+                Value::BigInt(11),
+                Value::Text("accepted".into()),
+            ],
+        )
+        .expect("insert reverse-direction link 5<->11");
+        for (id, a, b, status, expires) in [
+            (3, 10, 6, "pending", 0),
+            (4, 11, 6, "approved", now.saturating_sub(1_000)),
+            (5, 12, 6, "approved", now.saturating_add(1_000_000_000)),
+            (6, 10, 7, "rejected", 0),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(a),
+                    Value::BigInt(b),
+                    Value::Text(status.into()),
+                    Value::BigInt(expires),
+                ],
+            )
+            .expect("insert link");
+        }
+        for (id, sender, created) in [
+            (1, 10, inside),
+            (2, 11, inside),
+            (3, 12, inside),
+            (4, 3, inside),
+            (5, 4, inside),
+            (6, 10, outside),
+            (7, 11, inside),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO messages (id, sender_id, created_ts) VALUES (?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(sender),
+                    Value::BigInt(created),
+                ],
+            )
+            .expect("insert message");
+        }
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id) VALUES \
+             (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8), \
+             (2, 3), (2, 5), (2, 6), \
+             (3, 6), (3, 4), \
+             (4, 3), (5, 4), (6, 3), (7, 1)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let ids = "1,2,3,4,5,6,7,8";
+        let current = fetch_agent_contact_stats(&conn, ids, window_start, now);
+        let legacy = legacy_contact_stats(&conn, ids, window_start, now);
+        assert_eq!(
+            current, legacy,
+            "subquery-free stats diverged from the legacy query"
+        );
+
+        let expected: HashMap<i64, AgentContactStats> = [
+            (1, contact_stats(2, 0)), // auto: everything respected
+            (2, contact_stats(1, 0)), // open
+            (3, contact_stats(2, 1)), // linked 10, self-send; unlinked 11; out-of-window 10 ignored
+            (4, contact_stats(1, 2)), // block_all: self-send respected, others violate
+            (5, contact_stats(1, 1)), // link stored as (5, 11) admits 11 -> 5; 10 unlinked
+            (6, contact_stats(1, 2)), // pending and expired links do not count; future expiry does
+            (7, contact_stats(0, 1)), // rejected link does not count
+            (8, contact_stats(0, 0)), // NULL policy: neither respected nor violated
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(current, expected);
+    }
+
+    #[test]
+    fn classify_contact_policy_rows_treats_null_sender_like_sql() {
+        let links: HashSet<(i64, i64)> = [(10, 3), (3, 10)].into_iter().collect();
+        assert_eq!(
+            classify_contact_policy_rows(Some("auto"), None, 3, &links),
+            (true, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("contacts_only"), None, 3, &links),
+            (false, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("block_all"), None, 3, &links),
+            (false, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("contacts_only"), Some(10), 3, &links),
+            (true, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("Contacts_Only"), Some(11), 3, &links),
+            (false, false),
+            "policy comparison is exact, like SQLite's BINARY collation"
+        );
+    }
+
+    #[test]
+    fn contact_policy_rows_sql_has_no_subquery() {
+        let sql = contact_policy_rows_sql("1,2", 0);
+        assert!(!sql.contains("EXISTS"), "{sql}");
+        assert_eq!(sql.matches("SELECT").count(), 1, "{sql}");
     }
 
     // GH#354: the clock is injected, but database/version probes and the
