@@ -7,12 +7,15 @@ use std::path::Path;
 fn ok<T>(outcome: Outcome<T, impl std::fmt::Debug>) -> T {
     match outcome {
         Outcome::Ok(value) => value,
-        other => panic!("mailbox operation failed: {:?}", match other {
-            Outcome::Err(error) => format!("{error:?}"),
-            Outcome::Cancelled(_) => "cancelled".into(),
-            Outcome::Panicked(_) => "panicked".into(),
-            Outcome::Ok(_) => unreachable!(),
-        }),
+        other => panic!(
+            "mailbox operation failed: {:?}",
+            match other {
+                Outcome::Err(error) => format!("{error:?}"),
+                Outcome::Cancelled(_) => "cancelled".into(),
+                Outcome::Panicked(_) => "panicked".into(),
+                Outcome::Ok(_) => unreachable!(),
+            }
+        ),
     }
 }
 
@@ -35,7 +38,8 @@ fn fixture(test: impl FnOnce(&Runtime, &DbPool, &Path)) {
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         for sql in [
             "INSERT INTO projects(id,slug,human_key,created_at) VALUES(1,'alpha','/alpha',1),(2,'beta','/beta',1)",
@@ -52,7 +56,12 @@ fn fixture(test: impl FnOnce(&Runtime, &DbPool, &Path)) {
 }
 
 fn query() -> ExplorerQuery {
-    ExplorerQuery { agent_name: "BlueLake".into(), direction: Direction::Inbound, limit: 50, ..Default::default() }
+    ExplorerQuery {
+        agent_name: "BlueLake".into(),
+        direction: Direction::Inbound,
+        limit: 50,
+        ..Default::default()
+    }
 }
 
 fn page(runtime: &Runtime, pool: &DbPool, query: &ExplorerQuery) -> ExplorerPage {
@@ -72,7 +81,12 @@ fn actual_candidates_never_return_message_bodies() {
         runtime.block_on(async {
             let cx = Cx::current().expect("runtime context");
             let conn = ok(pool.acquire(&cx).await);
-            for sort in [SortMode::DateDesc, SortMode::DateAsc, SortMode::ImportanceDesc, SortMode::AgentAlpha] {
+            for sort in [
+                SortMode::DateDesc,
+                SortMode::DateAsc,
+                SortMode::ImportanceDesc,
+                SortMode::AgentAlpha,
+            ] {
                 for inbound in [true, false] {
                     let query = ExplorerQuery { sort, ..query() };
                     let (source, conditions, params) = lane_query(1, 11, &query, true, inbound);
@@ -92,19 +106,53 @@ fn actual_candidates_never_return_message_bodies() {
 fn all_modes_and_filters_keep_the_same_page_as_the_complete_query() {
     fixture(|runtime, pool, _| {
         for direction in [Direction::Inbound, Direction::Outbound, Direction::All] {
-            for sort in [SortMode::DateDesc, SortMode::DateAsc, SortMode::ImportanceDesc, SortMode::AgentAlpha] {
-                for ack_filter in [AckFilter::All, AckFilter::Unread, AckFilter::PendingAck, AckFilter::Acknowledged] {
+            for sort in [
+                SortMode::DateDesc,
+                SortMode::DateAsc,
+                SortMode::ImportanceDesc,
+                SortMode::AgentAlpha,
+            ] {
+                for ack_filter in [
+                    AckFilter::All,
+                    AckFilter::Unread,
+                    AckFilter::PendingAck,
+                    AckFilter::Acknowledged,
+                ] {
                     for importance_filter in [vec![], vec!["high".into(), "urgent".into()]] {
-                        let base = ExplorerQuery { direction, sort, ack_filter, importance_filter, limit: 100, ..query() };
+                        let base = ExplorerQuery {
+                            direction,
+                            sort,
+                            ack_filter,
+                            importance_filter,
+                            limit: 100,
+                            ..query()
+                        };
                         let complete = page(runtime, pool, &base);
                         for offset in [0, 1, 3, 20] {
                             for limit in [0, 1, 2, 7] {
-                                let window = page(runtime, pool, &ExplorerQuery { offset, limit, ..base.clone() });
-                                let expected: Vec<_> = complete.entries.iter().skip(offset).take(limit).cloned().collect();
+                                let window = page(
+                                    runtime,
+                                    pool,
+                                    &ExplorerQuery {
+                                        limit,
+                                        offset,
+                                        ..base.clone()
+                                    },
+                                );
+                                let expected: Vec<_> = complete
+                                    .entries
+                                    .iter()
+                                    .skip(offset)
+                                    .take(limit)
+                                    .cloned()
+                                    .collect();
                                 assert_eq!(entry_values(&window.entries), entry_values(&expected));
                                 assert_eq!(window.total_count, complete.total_count);
                                 assert_eq!(window.stats.unread_count, complete.stats.unread_count);
-                                assert_eq!(window.stats.pending_ack_count, complete.stats.pending_ack_count);
+                                assert_eq!(
+                                    window.stats.pending_ack_count,
+                                    complete.stats.pending_ack_count
+                                );
                             }
                         }
                     }
@@ -118,14 +166,30 @@ fn all_modes_and_filters_keep_the_same_page_as_the_complete_query() {
 fn actionable_counts_include_unreturned_direct_and_shared_deliveries() {
     fixture(|runtime, pool, _| {
         for (limit, offset) in [(0, 0), (1, 0), (2, 2), (1, 100)] {
-            let result = page(runtime, pool, &ExplorerQuery { limit, offset, ..query() });
+            let result = page(
+                runtime,
+                pool,
+                &ExplorerQuery {
+                    limit,
+                    offset,
+                    ..query()
+                },
+            );
             assert_eq!(result.total_count, 5);
             assert_eq!(result.stats.inbound_count, 5);
             assert_eq!(result.stats.outbound_count, 0);
             assert_eq!(result.stats.unread_count, 4);
             assert_eq!(result.stats.pending_ack_count, 2);
         }
-        let pending = page(runtime, pool, &ExplorerQuery { ack_filter: AckFilter::PendingAck, limit: 1, ..query() });
+        let pending = page(
+            runtime,
+            pool,
+            &ExplorerQuery {
+                ack_filter: AckFilter::PendingAck,
+                limit: 1,
+                ..query()
+            },
+        );
         assert_eq!(pending.total_count, 2);
         assert_eq!(pending.stats.pending_ack_count, 2);
         assert_eq!(pending.stats.unread_count, 2);
@@ -136,19 +200,51 @@ fn actionable_counts_include_unreturned_direct_and_shared_deliveries() {
 fn discarded_body_does_not_poison_a_valid_global_page() {
     fixture(|runtime, pool, _| {
         // This is a candidate in beta's lane but loses the global newest page.
-        execute(runtime, pool, "UPDATE messages SET body_md = X'FFFE' WHERE id = 200");
-        let result = page(runtime, pool, &ExplorerQuery { limit: 1, ..query() });
+        execute(
+            runtime,
+            pool,
+            "UPDATE messages SET body_md = X'FFFE' WHERE id = 200",
+        );
+        let result = page(
+            runtime,
+            pool,
+            &ExplorerQuery {
+                limit: 1,
+                ..query()
+            },
+        );
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].message_id, 102);
         assert_eq!(result.entries[0].body_md, "body-102");
         // It is not silently accepted when the caller actually selects it.
         let failed = runtime.block_on(async {
             let cx = Cx::current().expect("runtime context");
-            fetch_explorer_page(&cx, pool, &ExplorerQuery { project_id: Some(2), limit: 1, ..query() }).await
+            fetch_explorer_page(
+                &cx,
+                pool,
+                &ExplorerQuery {
+                    project_id: Some(2),
+                    limit: 1,
+                    ..query()
+                },
+            )
+            .await
         });
         assert!(matches!(failed, Outcome::Err(_)));
-        execute(runtime, pool, "UPDATE messages SET body_md = 'repaired' WHERE id = 200");
-        let restored = page(runtime, pool, &ExplorerQuery { project_id: Some(2), limit: 1, ..query() });
+        execute(
+            runtime,
+            pool,
+            "UPDATE messages SET body_md = 'repaired' WHERE id = 200",
+        );
+        let restored = page(
+            runtime,
+            pool,
+            &ExplorerQuery {
+                project_id: Some(2),
+                limit: 1,
+                ..query()
+            },
+        );
         assert_eq!(restored.entries[0].body_md, "repaired");
     });
 }
@@ -157,7 +253,15 @@ fn discarded_body_does_not_poison_a_valid_global_page() {
 fn zero_limit_only_counts_even_when_no_body_is_decodable() {
     fixture(|runtime, pool, _| {
         execute(runtime, pool, "UPDATE messages SET body_md = X'FFFE'");
-        let result = page(runtime, pool, &ExplorerQuery { limit: 0, offset: usize::MAX, ..query() });
+        let result = page(
+            runtime,
+            pool,
+            &ExplorerQuery {
+                limit: 0,
+                offset: usize::MAX,
+                ..query()
+            },
+        );
         assert!(result.entries.is_empty());
         assert_eq!(result.total_count, 5);
         assert_eq!(result.stats.unread_count, 4);
@@ -168,7 +272,10 @@ fn zero_limit_only_counts_even_when_no_body_is_decodable() {
 #[test]
 fn body_receipts_and_counts_stay_on_one_snapshot_while_another_connection_writes() {
     fixture(|runtime, pool, path| {
-        let writer = crate::guard_db_conn(DbConn::open_file(path.to_str().unwrap()).unwrap(), "explorer snapshot writer");
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "explorer snapshot writer",
+        );
         runtime.block_on(async {
             let cx = Cx::current().expect("runtime context");
             let connection = ok(pool.acquire(&cx).await);
@@ -198,13 +305,36 @@ fn query_only_exploration_preserves_private_receipts_and_bcc_policy() {
     fixture(|runtime, pool, _| {
         execute(runtime, pool, "PRAGMA query_only = ON");
         let result = page(runtime, pool, &query());
-        assert!(result.entries.iter().all(|entry| !entry.to_agents.contains("HiddenFox")));
-        assert_eq!(result.entries.iter().find(|entry| entry.message_id == 102).unwrap().ack_ts, None);
-        assert_eq!(result.entries.iter().find(|entry| entry.message_id == 200).unwrap().read_ts, None);
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| !entry.to_agents.contains("HiddenFox"))
+        );
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .find(|entry| entry.message_id == 102)
+                .unwrap()
+                .ack_ts,
+            None
+        );
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .find(|entry| entry.message_id == 200)
+                .unwrap()
+                .read_ts,
+            None
+        );
         runtime.block_on(async {
             let cx = Cx::current().expect("runtime context");
             let conn = ok(pool.acquire(&cx).await);
-            let rows = conn.query_sync("SELECT COUNT(*) AS cnt FROM project_mailbox_receipts", &[]).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS cnt FROM project_mailbox_receipts", &[])
+                .unwrap();
             assert_eq!(map_count_rows(&rows).unwrap(), 3);
         });
     });
@@ -213,7 +343,9 @@ fn query_only_exploration_preserves_private_receipts_and_bcc_policy() {
 #[test]
 fn expired_request_returns_cancellation_instead_of_a_page() {
     fixture(|runtime, pool, _| {
-        let cx = Cx::for_request_with_budget(asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO));
+        let cx = Cx::for_request_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO),
+        );
         let result = runtime.block_on(fetch_explorer_page(&cx, pool, &query()));
         assert!(matches!(result, Outcome::Cancelled(_)));
         assert_eq!(page(runtime, pool, &query()).total_count, 5);
