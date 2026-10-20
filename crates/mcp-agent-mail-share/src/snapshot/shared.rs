@@ -45,6 +45,7 @@ fn query(
 /// A missing receipt table is not permission to export every delivery as
 /// unacknowledged. Only the wholly absent pre-mailbox schema may be skipped.
 /// Inspect both schemas even when the delivery table currently has no rows.
+/// Retained project delivery events contradict the pre-mailbox exception.
 fn source_has_shared_schema(src: &impl SnapshotSource) -> Result<bool, ShareError> {
     let objects = query(
         src,
@@ -53,6 +54,7 @@ fn source_has_shared_schema(src: &impl SnapshotSource) -> Result<bool, ShareErro
         &[],
     )?;
     if objects.is_empty() {
+        verify_legacy_shared_absence(src)?;
         return Ok(false);
     }
     let mut present = HashSet::new();
@@ -109,6 +111,41 @@ fn source_has_shared_schema(src: &impl SnapshotSource) -> Result<bool, ShareErro
         }
     }
     Ok(true)
+}
+
+/// A known-table export deliberately omits the delivery event ledger. Check
+/// its evidence before omitting missing shared tables, or the output erases
+/// the last indication that shared routing and acknowledgements were lost.
+/// This executes in the parent's source read transaction and never repairs it.
+fn verify_legacy_shared_absence(src: &impl SnapshotSource) -> Result<(), ShareError> {
+    let objects = query(
+        src,
+        "SELECT type FROM sqlite_master WHERE name = 'inbox_delivery_events' COLLATE NOCASE",
+        &[],
+    )?;
+    if objects.is_empty() {
+        return Ok(());
+    }
+    if objects.len() != 1
+        || objects[0]
+            .get_named::<String>("type")
+            .map_err(|_| invalid("shared snapshot event catalog type is not text"))?
+            != "table"
+    {
+        return Err(invalid("shared snapshot event authority must be a real table"));
+    }
+    if !query(
+        src,
+        "SELECT seq FROM inbox_delivery_events WHERE kind = 'project' LIMIT 1",
+        &[],
+    )?
+    .is_empty()
+    {
+        return Err(invalid(
+            "shared snapshot tables are missing but retained project delivery events exist; refusing lossy copy",
+        ));
+    }
+    Ok(())
 }
 
 fn page_query(table: &KnownTable, after: Option<(i64, i64)>) -> (String, Vec<Value>) {
@@ -466,5 +503,166 @@ mod tests {
         let copied = open(&copy);
         assert_eq!(scalar(&copied, "SELECT COUNT(*) FROM projects"), 1);
         assert_eq!(scalar(&copied, "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('project_mailbox_deliveries','project_mailbox_receipts')"), 0);
+    }
+
+    const EVENT_TABLE: &str =
+        "CREATE TABLE inbox_delivery_events(seq INTEGER PRIMARY KEY, project_id INTEGER, \
+         agent_id INTEGER, message_id INTEGER, kind TEXT, delivered_ts INTEGER)";
+
+    fn retain_event_after_shared_table_loss(conn: &impl SnapshotSource, historical: bool) {
+        seed(conn);
+        conn.execute_snapshot(EVENT_TABLE).unwrap();
+        let recipient = if historical { "0" } else { "NULL" };
+        conn.execute_snapshot(&format!(
+            "INSERT INTO inbox_delivery_events VALUES(1,2,{recipient},201,'project',3000)"
+        ))
+        .unwrap();
+        conn.execute_snapshot(
+            "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+        )
+        .unwrap();
+        conn.execute_snapshot(
+            "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lost_shared_tables_never_publish_live_or_private_snapshots() {
+        for runtime in [false, true] {
+            for historical in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("source.sqlite3");
+                let destination = directory.path().join("refused.sqlite3");
+                if runtime {
+                    let conn = DbConn::open_file(source.to_str().unwrap()).unwrap();
+                    retain_event_after_shared_table_loss(&conn, historical);
+                    drop(conn);
+                } else {
+                    retain_event_after_shared_table_loss(&open(&source), historical);
+                }
+                let before = std::fs::read(&source).unwrap();
+                let result = if runtime {
+                    create_sqlite_snapshot(&source, &destination, false)
+                } else {
+                    create_private_canonical_sqlite_snapshot(&source, &destination, false)
+                };
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("retained project delivery events"));
+                assert!(!destination.exists());
+                assert_eq!(std::fs::read(&source).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_event_ledgers_without_shared_deliveries_still_copy() {
+        for direct_event in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("legacy.sqlite3");
+            let destination = directory.path().join("copy.sqlite3");
+            let conn = open(&source);
+            conn.execute_raw(
+                "CREATE TABLE projects(id INTEGER PRIMARY KEY,slug TEXT,human_key TEXT,created_at INTEGER); \
+                 INSERT INTO projects VALUES(1,'old','/old',0)",
+            )
+            .unwrap();
+            conn.execute_raw(EVENT_TABLE).unwrap();
+            if direct_event {
+                conn.execute_raw(
+                    "INSERT INTO inbox_delivery_events VALUES(1,1,11,101,'to',10)",
+                )
+                .unwrap();
+            }
+            drop(conn);
+            create_private_canonical_sqlite_snapshot(&source, &destination, false).unwrap();
+            let copied = open(&destination);
+            assert_eq!(scalar(&copied, "SELECT COUNT(*) FROM projects"), 1);
+            assert_eq!(
+                scalar(&copied, "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'project_mailbox_%'"),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_event_authority_cannot_publish_a_legacy_snapshot() {
+        for definition in [
+            "CREATE TABLE inbox_delivery_events(seq INTEGER PRIMARY KEY)",
+            "CREATE TABLE inbox_delivery_events(kind TEXT)",
+            "CREATE VIEW inbox_delivery_events AS SELECT seq,kind FROM unavailable_events",
+            "CREATE VIEW inbox_delivery_events AS SELECT 1 AS seq,'to' AS kind",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.sqlite3");
+            let destination = directory.path().join("refused.sqlite3");
+            open(&source).execute_raw(definition).unwrap();
+            let before = std::fs::read(&source).unwrap();
+            assert!(
+                create_private_canonical_sqlite_snapshot(&source, &destination, false).is_err(),
+                "{definition}",
+            );
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&source).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn complete_shared_snapshot_does_not_consult_unrelated_event_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite3");
+        let destination = directory.path().join("copy.sqlite3");
+        let conn = open(&source);
+        seed(&conn);
+        conn.execute_raw(
+            "CREATE VIEW inbox_delivery_events AS SELECT seq,kind FROM unavailable_events",
+        )
+        .unwrap();
+        drop(conn);
+        create_private_canonical_sqlite_snapshot(&source, &destination, false).unwrap();
+        assert_original_shared(&open(&destination));
+    }
+
+    #[test]
+    fn legacy_event_proof_uses_the_same_wal_snapshot_as_the_table_catalog() {
+        struct EventRace<'a> {
+            reader: &'a CanonicalDbConn,
+            writer: &'a CanonicalDbConn,
+            fired: Cell<bool>,
+        }
+        impl SnapshotSource for EventRace<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.reader.execute_raw(sql)
+            }
+
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.reader.query_sync(sql, params)?;
+                if sql.starts_with("SELECT name, type FROM sqlite_master")
+                    && !self.fired.replace(true)
+                {
+                    self.writer.execute_raw(
+                        "INSERT INTO inbox_delivery_events VALUES(1,2,NULL,201,'project',3000)",
+                    )?;
+                }
+                Ok(rows)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.sqlite3");
+        let writer = open(&path);
+        writer.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        writer.execute_raw(EVENT_TABLE).unwrap();
+        let reader = open(&path);
+        let source = EventRace { reader: &reader, writer: &writer, fired: Cell::new(false) };
+        reader.execute_raw("BEGIN").unwrap();
+        assert!(!source_has_shared_schema(&source).unwrap());
+        assert!(source.fired.get());
+        assert_eq!(scalar(&writer, "SELECT COUNT(*) FROM inbox_delivery_events"), 1);
+        reader.execute_raw("COMMIT").unwrap();
+        assert!(source_has_shared_schema(&reader).is_err());
     }
 }
