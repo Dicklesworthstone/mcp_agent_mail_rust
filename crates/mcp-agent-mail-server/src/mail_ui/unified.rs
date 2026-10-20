@@ -1,10 +1,10 @@
 //! Message-first projection for the operator's HTML/JSON unified inbox.
 //!
 //! The roster remains the one selected by the existing project/agent readers.
-//! Receipt and body reads share one checkout and snapshot. Scan message headers
-//! once, not an entire inbox for every agent, and hydrate only the final window.
-//! Header scan work still grows with message history; memory does not retain
-//! history-sized bodies. No cache, receipt write, or replacement pool is used.
+//! Receipt and body reads share one checkout and snapshot. Read newest-first
+//! header pages until the visible window is full, then hydrate only that window.
+//! Sparse filters can still scan history, without retaining history-sized bodies.
+//! No cache, receipt write, or replacement pool is used.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -23,8 +23,10 @@ use super::{
 const PAGE_SIZE: usize = 256;
 const SAVEPOINT: &str = "SAVEPOINT am_unified_inbox_read";
 const RELEASE: &str = "RELEASE SAVEPOINT am_unified_inbox_read";
-const FIRST_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages ORDER BY id ASC LIMIT 256";
-const NEXT_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE id > ? ORDER BY id ASC LIMIT 256";
+// Both ordering terms let the runtime use a reverse timestamp-index range seek.
+// The first page's inclusive bound retains even the largest valid timestamp.
+const FIRST_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE created_ts <= 9223372036854775807 ORDER BY created_ts DESC, id DESC LIMIT 256";
+const NEXT_HEADERS: &str = "SELECT id, project_id, sender_id, created_ts, importance FROM messages WHERE created_ts <= ? ORDER BY created_ts DESC, id DESC LIMIT 256 OFFSET ?";
 
 type Roster = BTreeMap<i64, BTreeSet<i64>>;
 
@@ -403,11 +405,18 @@ fn read(
     }
     let shared = ExplorerQuery::shared_mailbox_schema_available(conn)?;
     let mut window: BTreeMap<(i64, i64), Candidate> = BTreeMap::new();
-    let mut after = None;
+    let mut ceiling = None;
+    let mut skip_at_ceiling = 0_i64;
+    let mut last_key = None;
     loop {
-        let (sql, params) = after.map_or_else(
+        let (sql, params) = ceiling.map_or_else(
             || (FIRST_HEADERS, Vec::new()),
-            |id| (NEXT_HEADERS, vec![Value::BigInt(id)]),
+            |created| {
+                (
+                    NEXT_HEADERS,
+                    vec![Value::BigInt(created), Value::BigInt(skip_at_ceiling)],
+                )
+            },
         );
         let rows = conn.query_sync(sql, &params).map_err(database_error)?;
         if rows.len() > PAGE_SIZE {
@@ -417,14 +426,28 @@ fn read(
         }
         let finished = rows.len() < PAGE_SIZE;
         let mut candidates = BTreeMap::new();
+        let mut last_ts = ceiling;
+        let mut trailing_count = skip_at_ceiling;
         for row in rows {
             let id = integer(&row, "id")?;
-            if after.is_some_and(|previous| id <= previous) {
+            let created = integer(&row, "created_ts")?;
+            let key = (created, id);
+            if last_key.is_some_and(|previous| key >= previous) {
                 return Err(DbError::Internal(
                     "unified inbox header cursor did not advance".into(),
                 ));
             }
-            after = Some(id);
+            last_key = Some(key);
+            // Count every header before visibility filtering. The next range
+            // starts at this timestamp and skips only its already visited ties.
+            if last_ts == Some(created) {
+                trailing_count = trailing_count.checked_add(1).ok_or_else(|| {
+                    DbError::Internal("unified inbox timestamp cursor overflow".into())
+                })?;
+            } else {
+                last_ts = Some(created);
+                trailing_count = 1;
+            }
             let project = integer(&row, "project_id")?;
             if !viewers.contains_key(&project) {
                 continue;
@@ -433,7 +456,6 @@ fn read(
             if !matches_importance_filter(&importance_value, importance) {
                 continue;
             }
-            let created = integer(&row, "created_ts")?;
             if window.len() == limit
                 && window
                     .first_key_value()
@@ -467,9 +489,13 @@ fn read(
                 }
             }
         }
-        if finished {
+        // Later pages contain strictly smaller (timestamp, id) keys, including
+        // within a timestamp cohort. A full visible window is already final.
+        if finished || window.len() == limit {
             break;
         }
+        ceiling = last_ts;
+        skip_at_ceiling = trailing_count;
     }
     hydrate(conn, window.into_values().rev().collect())
 }
@@ -705,6 +731,7 @@ mod tests {
             "PRAGMA journal_mode=WAL",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, inception_ts INTEGER, retired_at INTEGER, contact_policy TEXT)",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, created_ts INTEGER, importance TEXT, thread_id TEXT, topic TEXT, subject TEXT DEFAULT 'subject', body_md TEXT DEFAULT 'body', ack_required INTEGER DEFAULT 1, recipients_json TEXT DEFAULT '{}', attachments TEXT DEFAULT '[]')",
+            "CREATE INDEX idx_messages_created_ts ON messages(created_ts)",
             "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
             "CREATE INDEX recipients_by_message ON message_recipients(message_id)",
             "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY, project_id INTEGER)",
@@ -840,6 +867,150 @@ mod tests {
         fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
             self.conn.execute_raw(sql)
         }
+    }
+
+    #[test]
+    fn newest_header_pages_seek_the_timestamp_index_and_stop_at_the_visible_limit() {
+        let (_dir, conn) = fixture();
+        for (sql, params) in [
+            (FIRST_HEADERS, Vec::new()),
+            (
+                NEXT_HEADERS,
+                vec![Value::BigInt(i64::MAX), Value::BigInt(0)],
+            ),
+        ] {
+            let plan: Vec<_> = conn
+                .query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+                .unwrap()
+                .iter()
+                .map(|row| row.get_as::<String>(3).unwrap())
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_messages_created_ts")),
+                "header page must use the timestamp index: {plan:?}"
+            );
+            let opcodes: Vec<_> = conn
+                .query_sync(&format!("EXPLAIN {sql}"), &params)
+                .unwrap()
+                .iter()
+                .map(|row| row.get_as::<String>(1).unwrap())
+                .collect();
+            assert!(
+                opcodes.iter().any(|opcode| opcode == "SeekLE"),
+                "header page must seek its range boundary: {opcodes:?}"
+            );
+            assert!(
+                opcodes
+                    .iter()
+                    .all(|opcode| opcode != "SorterOpen" && opcode != "Sort"),
+                "header page must not sort the entire message history: {opcodes:?}"
+            );
+        }
+        conn.execute_raw("BEGIN").unwrap();
+        for id in 100..701 {
+            conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,created_ts,importance) VALUES({id},1,10,{id}+100000,'normal'); INSERT INTO message_recipients VALUES({id},11,'to',NULL,NULL)")).unwrap();
+        }
+        conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,created_ts,importance) VALUES(9001,1,10,{},'normal'); INSERT INTO message_recipients VALUES(9001,11,'to',NULL,NULL)", i64::MAX)).unwrap();
+        conn.execute_raw("COMMIT").unwrap();
+        let traced = Traced {
+            conn: &conn,
+            statements: RefCell::new(Vec::new()),
+        };
+        let scope = BTreeMap::from([(1, BTreeSet::from([11]))]);
+        assert_eq!(
+            ids(&page(&traced, &scope, 7, None)),
+            [9001, 700, 699, 698, 697, 696, 695]
+        );
+        assert_eq!(
+            traced
+                .statements
+                .borrow()
+                .iter()
+                .filter(|(sql, _)| sql == FIRST_HEADERS || sql == NEXT_HEADERS)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn timestamp_ties_cross_pages_without_reordering_or_scanning_the_whole_cohort() {
+        let (_dir, conn) = fixture();
+        conn.execute_raw("BEGIN").unwrap();
+        for id in 100..702 {
+            conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,created_ts,importance) VALUES({id},1,10,9000,'normal'); INSERT INTO message_recipients VALUES({id},11,'to',NULL,NULL)")).unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        let scope = BTreeMap::from([(1, BTreeSet::from([11]))]);
+        for limit in [7, 520] {
+            let traced = Traced {
+                conn: &conn,
+                statements: RefCell::new(Vec::new()),
+            };
+            let expected: Vec<i64> = (100..702).rev().take(limit).collect();
+            assert_eq!(ids(&page(&traced, &scope, limit, None)), expected);
+            let statements = traced.statements.borrow();
+            let headers: Vec<_> = statements
+                .iter()
+                .filter(|(sql, _)| sql == FIRST_HEADERS || sql == NEXT_HEADERS)
+                .collect();
+            assert_eq!(headers.len(), if limit == 7 { 1 } else { 3 });
+            if limit == 520 {
+                assert!(matches!(
+                    headers[1].1.as_slice(),
+                    [Value::BigInt(9000), Value::BigInt(256)]
+                ));
+                assert!(matches!(
+                    headers[2].1.as_slice(),
+                    [Value::BigInt(9000), Value::BigInt(512)]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn invisible_header_pages_do_not_hide_later_visible_mail() {
+        let (_dir, conn) = fixture();
+        conn.execute_raw("BEGIN").unwrap();
+        for id in 100..868 {
+            let project = if id >= 612 { 2 } else { 1 };
+            conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,created_ts,importance) VALUES({id},{project},10,{id}+100000,'urgent')")).unwrap();
+            let recipient = if id >= 612 {
+                Some(21)
+            } else if id < 356 {
+                Some(12)
+            } else {
+                None
+            };
+            if let Some(agent) = recipient {
+                conn.execute_raw(&format!(
+                    "INSERT INTO message_recipients VALUES({id},{agent},'to',NULL,NULL)"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        let traced = Traced {
+            conn: &conn,
+            statements: RefCell::new(Vec::new()),
+        };
+        let scope = BTreeMap::from([(1, BTreeSet::from([11]))]);
+        assert_eq!(ids(&page(&traced, &scope, 1, Some("urgent"))), [1]);
+        let statements = traced.statements.borrow();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|(sql, _)| sql == FIRST_HEADERS || sql == NEXT_HEADERS)
+                .count(),
+            4,
+            "foreign projects, undelivered mail and unselected recipients must all advance the cursor"
+        );
+        let body_reads: Vec<_> = statements
+            .iter()
+            .filter(|(sql, _)| sql.contains("body_md"))
+            .collect();
+        assert_eq!(body_reads.len(), 1);
+        assert!(matches!(body_reads[0].1.as_slice(), [Value::BigInt(1)]));
     }
 
     #[test]
