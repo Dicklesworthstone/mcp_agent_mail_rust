@@ -70,6 +70,9 @@ pub enum StorageError {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    #[error("Reservation {id} archive publication refused: {message}")]
+    ReservationPublicationConflict { id: i64, message: String },
+
     #[error("Archive not initialized")]
     NotInitialized,
 }
@@ -1480,7 +1483,14 @@ pub fn write_op_sync(op: &WriteOp) -> Result<()> {
         .storage
         .archive_direct_write_latency_us
         .record(duration_as_micros_u64(started.elapsed()));
-    note_archive_write_outcome(op, result.is_err());
+    // A version refusal preserves newer reservation evidence; it is not a
+    // broken Git repository and must not trigger automatic archive repair.
+    if !matches!(
+        &result,
+        Err(StorageError::ReservationPublicationConflict { .. })
+    ) {
+        note_archive_write_outcome(op, result.is_err());
+    }
     if result.is_err() {
         metrics.storage.archive_direct_write_errors_total.add(1);
     }
@@ -1560,7 +1570,12 @@ fn write_op_sync_direct_with_cancel(
         .storage
         .archive_direct_write_latency_us
         .record(duration_as_micros_u64(started.elapsed()));
-    note_archive_write_outcome(op, result.is_err());
+    if !matches!(
+        &result,
+        Err(StorageError::ReservationPublicationConflict { .. })
+    ) {
+        note_archive_write_outcome(op, result.is_err());
+    }
     match result {
         Ok(()) => DirectArchiveWrite::Written,
         Err(error) => {
@@ -3411,6 +3426,10 @@ fn wbq_drain_loop(
                 wbq_execute_op(&envelopes[0].op, "wbq-drain")
             };
             let group_failed = result.is_err();
+            let reservation_version_refused = matches!(
+                &result,
+                Err(StorageError::ReservationPublicationConflict { .. })
+            );
             for envelope in envelopes {
                 let latency_us = u64::try_from(
                     envelope
@@ -3454,7 +3473,12 @@ fn wbq_drain_loop(
             // failures on one archive trips a bounded boot-check self-heal +
             // actionable escalation instead of degrading silently; a success
             // resets that archive's counter. (br-bvq1x.9.8 Part 3)
-            note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
+            // Version refusal is not Git corruption. Keep the durability
+            // failure above: a refused mixed reservation batch may include
+            // other accepted rows that still lack archive coverage.
+            if !reservation_version_refused {
+                note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
+            }
             idx = end;
         }
 
@@ -8588,14 +8612,222 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
     format!("{subject}\n\n{}", lines.join("\n"))
 }
 
+fn reservation_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value.as_str().and_then(|text| {
+            let text = text.trim();
+            mcp_agent_mail_core::timestamps::iso_to_micros(text)
+                .or_else(|| text.parse::<i64>().ok())
+        })
+    })
+}
+
+/// Match the guard's release-marker semantics, including legacy zero sentinels.
+/// An unrecognized nonempty textual marker already makes the guard ignore the
+/// artifact, so an ordinary ACTIVE write must not erase it either.
+fn reservation_publication_is_released(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().is_some_and(|value| value > 0.0),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty()
+                || text.eq_ignore_ascii_case("null")
+                || text.eq_ignore_ascii_case("none")
+                || text == "0"
+            {
+                return false;
+            }
+            if text
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-'))
+            {
+                return text.parse::<f64>().is_ok_and(|value| value > 0.0);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn reservation_publication_conflict(id: i64, message: impl Into<String>) -> StorageError {
+    StorageError::ReservationPublicationConflict {
+        id,
+        message: message.into(),
+    }
+}
+
+// Match the guard's artifact bound on both sides of a replacement. Do not
+// publish a generation-stamped artifact that future release validation (or
+// the guard itself) cannot read.
+const MAX_RESERVATION_PUBLICATION_BYTES: u64 = 1024 * 1024;
+
+/// A generation-stamped row has an immutable owner and creation identity.
+/// Expiry only increases; release is terminal. Reacquisition can change the
+/// reason and exclusive mode without increasing expiry, so neither field can
+/// serve as an immutable identity or a revision number here.
+fn validate_reservation_publication_version(
+    id: i64,
+    incoming: &serde_json::Value,
+    published: &serde_json::Value,
+) -> Result<()> {
+    for field in ["id", "project", "agent", "path_pattern", "db_generation"] {
+        if let (Some(before), Some(after)) = (published.get(field), incoming.get(field)) {
+            if !before.is_null() && !after.is_null() && before != after {
+                return Err(reservation_publication_conflict(
+                    id,
+                    format!("immutable {field} conflicts with the published generation; retained"),
+                ));
+            }
+        }
+    }
+    fn owner(record: &serde_json::Value) -> Option<&str> {
+        record["agent_name"]
+            .as_str()
+            .or_else(|| record["agent"].as_str())
+            .map(str::trim)
+    }
+    fn pattern(record: &serde_json::Value) -> Option<&str> {
+        record["path_pattern"]
+            .as_str()
+            .or_else(|| record["path"].as_str())
+            .map(str::trim)
+    }
+    for (field, before, after) in [
+        ("guard owner", owner(published), owner(incoming)),
+        ("guard path", pattern(published), pattern(incoming)),
+    ] {
+        if let (Some(before), Some(after)) = (before, after)
+            && before != after
+        {
+            return Err(reservation_publication_conflict(
+                id,
+                format!("immutable {field} conflicts with the published generation; retained"),
+            ));
+        }
+    }
+    if let (Some(before), Some(after)) = (published.get("created_ts"), incoming.get("created_ts")) {
+        let same = match (
+            reservation_publication_timestamp(before),
+            reservation_publication_timestamp(after),
+        ) {
+            (Some(before), Some(after)) => before == after,
+            _ => before == after || before.is_null() || after.is_null(),
+        };
+        if !same {
+            return Err(reservation_publication_conflict(
+                id,
+                "creation identity conflicts with the published generation; retained",
+            ));
+        }
+    }
+    let incoming_released = reservation_publication_is_released(&incoming["released_ts"]);
+    if reservation_publication_is_released(&published["released_ts"]) && !incoming_released {
+        return Err(reservation_publication_conflict(
+            id,
+            "a terminal release is already published; refusing the stale active snapshot",
+        ));
+    }
+    // A terminal release must win even if its captured expiry predates a
+    // concurrent renewal. Only two ACTIVE versions are ordered by expiry.
+    if !incoming_released
+        && let (Some(before), Some(after)) = (
+            reservation_publication_timestamp(&published["expires_ts"]),
+            reservation_publication_timestamp(&incoming["expires_ts"]),
+        )
+        && after < before
+    {
+        return Err(reservation_publication_conflict(
+            id,
+            "a later active expiry is already published; refusing to shorten guard coverage",
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck the whole batch while holding both publication locks, before any
+/// stable artifact or reusable digest alias is replaced. Repeated IDs in the
+/// same batch are checked against the preceding candidate as well as disk.
+fn validate_reservation_publications(checks: &[(PathBuf, i64, serde_json::Value)]) -> Result<()> {
+    let mut previous: HashMap<&Path, &serde_json::Value> = HashMap::new();
+    for (path, id, incoming) in checks {
+        if let Some(published) = previous.get(path.as_path()) {
+            validate_reservation_publication_version(*id, incoming, published)?;
+        } else {
+            match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                path,
+                MAX_RESERVATION_PUBLICATION_BYTES,
+            ) {
+                Ok(bytes) => {
+                    // A malformed old artifact has no usable lifecycle
+                    // evidence. Preserve the existing repair behavior for it.
+                    if let Ok(published) = serde_json::from_slice(&bytes) {
+                        validate_reservation_publication_version(*id, incoming, &published)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    return Err(reservation_publication_conflict(
+                        *id,
+                        format!(
+                            "existing stable artifact cannot be safely read; retained: {error}"
+                        ),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        previous.insert(path.as_path(), incoming);
+    }
+    Ok(())
+}
+
+fn publish_reservation_writes(
+    archive: &ProjectArchive,
+    staged: StagedArchiveWrites,
+    checks: &[(PathBuf, i64, serde_json::Value)],
+) -> Result<()> {
+    let root = archive_project_root_checked(archive)?;
+    let _mutation = ArchiveMutationGuard::begin_at(&root);
+    // The fence serializes threads in this process; the ordinary project
+    // lock also excludes a terminal reconciler or writer in another process.
+    // Never add a 60-second project-lock wait to the direct request path.
+    let process_lock = archive_process_lock(archive)?;
+    let _process = match process_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(StorageError::LockContention {
+                message: "reservation publication project lock busy".to_string(),
+            });
+        }
+    };
+    let mut lock = FileLock::new(root.join(".archive.lock"))
+        .with_timeout(Duration::ZERO)
+        .with_max_retries(0);
+    lock.acquire()?;
+    validate_reservation_publications(checks)?;
+    let result = staged.publish();
+    lock.release()?;
+    result
+}
+
 /// Write file reservation records to the archive and commit.
 ///
-/// Every artifact is written and synced under a temp name before the archive
-/// publication fence is taken; the fence covers only the renames that publish
-/// them (br-9bwnb). The fence serializes every archive writer in the process,
-/// so syncing inside it queued each agent's reservation behind every other
-/// agent's. Durability on return is unchanged: the data is synced before the
-/// rename, exactly as `atomic_write_bytes` does it.
+/// Every artifact is written and synced under a temp name before this writer
+/// takes its publication window; callers can still retain an outer window.
+/// This writer's fence covers version validation and the publication renames
+/// (br-9bwnb). Durability on return is unchanged: data is synced before rename,
+/// exactly as `atomic_write_bytes` does it.
+/// Canonical generation-stamped working artifacts are checked under the
+/// project lock as well: a delayed ACTIVE snapshot cannot erase a terminal
+/// release or shorten a published renewal. This does not order equal-expiry
+/// intent changes, reconstruct missing working artifacts from Git, or make
+/// the separate database mutation atomic with publication.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -8608,6 +8840,7 @@ pub fn write_file_reservation_records(
     let repo_root = archive_repo_root_checked(archive)?;
     let mut rel_paths = Vec::new();
     let mut entries = Vec::new();
+    let mut publication_checks = Vec::new();
     let mut normalized_reservations = Vec::with_capacity(reservations.len());
     for res in reservations {
         let path_pattern = res
@@ -8674,13 +8907,35 @@ pub fn write_file_reservation_records(
                     generation, id,
                 ),
             );
+            // Unversioned rows can reuse IDs after a legacy DB rebuild. Only
+            // canonical generation-stamped paths carry enough identity for
+            // lifecycle ordering; legacy/no-ID writes keep their semantics.
+            if id_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(
+                    mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename,
+                )
+                .is_some_and(|parsed| parsed.generation.is_some() && parsed.id == id)
+            {
+                if u64::try_from(content.len()).unwrap_or(u64::MAX)
+                    > MAX_RESERVATION_PUBLICATION_BYTES
+                {
+                    return Err(reservation_publication_conflict(
+                        id,
+                        "candidate exceeds the guard's artifact size limit; nothing published",
+                    ));
+                }
+                publication_checks.push((id_path.clone(), id, normalized.clone()));
+            }
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
             files.push((id_path, content));
         }
 
         entries.push((agent_name, path_pattern));
     }
-    StagedArchiveWrites::stage(files)?.publish()?;
+    let staged = StagedArchiveWrites::stage(files)?;
+    publish_reservation_writes(archive, staged, &publication_checks)?;
 
     let commit_msg = build_file_reservation_commit_message(&entries);
     enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
@@ -15379,6 +15634,337 @@ mod tests {
                 "failed reservation batches must not leave partial archive artifacts"
             );
         }
+    }
+
+    fn publication_test_reservation(id: i64, generation: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "project": "/repo",
+            "agent": "GreenCastle",
+            "path_pattern": format!("src/{id}.rs"),
+            "exclusive": true,
+            "reason": "editing",
+            "created_ts": "2026-10-01T00:00:00Z",
+            "expires_ts": "2030-10-01T00:00:00Z",
+            "db_generation": generation,
+        })
+    }
+
+    fn publication_test_paths(
+        archive: &ProjectArchive,
+        record: &serde_json::Value,
+    ) -> (PathBuf, PathBuf) {
+        let dir = archive.root.join("file_reservations");
+        let stable = dir.join(
+            mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                record["db_generation"].as_str(),
+                record["id"].as_i64().unwrap(),
+            ),
+        );
+        let alias = dir.join(format!(
+            "{}.json",
+            hex::encode(sha1::Sha1::digest(
+                record["path_pattern"].as_str().unwrap().as_bytes()
+            ))
+        ));
+        (stable, alias)
+    }
+
+    #[test]
+    fn reservation_publication_never_reactivates_a_published_terminal_generation() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-terminal").unwrap();
+        let active = publication_test_reservation(7, "AABBccdd");
+        write_file_reservation_record(&archive, &config, &active).unwrap();
+        let mut released = active.clone();
+        released["released_ts"] = serde_json::json!("2026-10-02T00:00:00Z");
+        write_file_reservation_record(&archive, &config, &released).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        let terminal = fs::read(&stable).unwrap();
+        let error = write_file_reservation_record(&archive, &config, &active).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ReservationPublicationConflict { id: 7, .. }
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+
+        // Reusing an ID in a different database generation is a different
+        // lease. The former generation remains untouched.
+        let mut replacement = active;
+        replacement["db_generation"] = serde_json::json!("11223344");
+        replacement["agent"] = serde_json::json!("BlueLake");
+        write_file_reservation_record(&archive, &config, &replacement).unwrap();
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert!(publication_test_paths(&archive, &replacement).0.exists());
+    }
+
+    #[test]
+    fn reservation_publication_preserves_renewals_but_accepts_an_older_expiry_release() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-renewal").unwrap();
+        let active = publication_test_reservation(8, "aabbccdd");
+        let mut renewed = active.clone();
+        renewed["expires_ts"] = serde_json::json!("2030-10-02T00:00:00Z");
+        write_file_reservation_record(&archive, &config, &renewed).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        let latest = fs::read(&stable).unwrap();
+        let error = write_file_reservation_record(&archive, &config, &active).unwrap_err();
+        assert!(error.to_string().contains("shorten guard coverage"));
+        assert_eq!(fs::read(&stable).unwrap(), latest);
+        assert_eq!(fs::read(&alias).unwrap(), latest);
+
+        // Reacquisition can change intent with the same expiry. No revision
+        // number exists for ordering those changes, so they remain supported.
+        renewed["exclusive"] = serde_json::json!(false);
+        renewed["reason"] = serde_json::json!("observe");
+        renewed["created_ts"] = serde_json::json!(
+            mcp_agent_mail_core::timestamps::iso_to_micros("2026-10-01T00:00:00Z").unwrap()
+        );
+        write_file_reservation_record(&archive, &config, &renewed).unwrap();
+
+        let mut released = active;
+        released["released_ts"] = serde_json::json!(42);
+        write_file_reservation_record(&archive, &config, &released).unwrap();
+        let published: serde_json::Value =
+            serde_json::from_slice(&fs::read(&stable).unwrap()).unwrap();
+        assert_eq!(published["released_ts"], 42);
+        assert_eq!(fs::read(&alias).unwrap(), fs::read(&stable).unwrap());
+    }
+
+    #[test]
+    fn reservation_publication_checks_the_entire_batch_and_repeated_ids_before_renaming() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-batch").unwrap();
+        let active = publication_test_reservation(9, "aabbccdd");
+        let mut released = active.clone();
+        released["released_ts"] = serde_json::json!("released");
+        write_file_reservation_record(&archive, &config, &released).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        let terminal = fs::read(&stable).unwrap();
+        let fresh = publication_test_reservation(10, "aabbccdd");
+        let (fresh_stable, fresh_alias) = publication_test_paths(&archive, &fresh);
+        write_file_reservation_records(&archive, &config, &[fresh.clone(), active]).unwrap_err();
+        assert!(!fresh_stable.exists());
+        assert!(!fresh_alias.exists());
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+
+        let mut renewed = fresh.clone();
+        renewed["expires_ts"] = serde_json::json!("2031-10-01T00:00:00Z");
+        write_file_reservation_records(&archive, &config, &[renewed, fresh]).unwrap_err();
+        assert!(!fresh_stable.exists());
+        assert!(!fresh_alias.exists());
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn reservation_publication_preserves_immutable_and_guard_visible_identity() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-identity").unwrap();
+        let original = publication_test_reservation(11, "aabbccdd");
+        write_file_reservation_record(&archive, &config, &original).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &original);
+        let bytes = fs::read(&stable).unwrap();
+        for (field, replacement) in [
+            ("project", "/different"),
+            ("agent", "BlueLake"),
+            ("agent_name", "BlueLake"),
+            ("path_pattern", "other.rs"),
+            ("created_ts", "2026-10-02T00:00:00Z"),
+        ] {
+            let mut conflicting = original.clone();
+            conflicting[field] = serde_json::json!(replacement);
+            let error = write_file_reservation_record(&archive, &config, &conflicting).unwrap_err();
+            assert!(matches!(
+                error,
+                StorageError::ReservationPublicationConflict { id: 11, .. }
+            ));
+            assert_eq!(fs::read(&stable).unwrap(), bytes, "{field}");
+            assert_eq!(fs::read(&alias).unwrap(), bytes, "{field}");
+        }
+        // Old spellings are interpreted like the guard, not silently ignored.
+        let mut previous = original.clone();
+        previous.as_object_mut().unwrap().remove("path_pattern");
+        previous["path"] = serde_json::json!("a/different/path");
+        fs::write(&stable, serde_json::to_vec(&previous).unwrap()).unwrap();
+        write_file_reservation_record(&archive, &config, &original).unwrap_err();
+        previous = original.clone();
+        previous["agent_name"] = serde_json::json!("BlueLake");
+        fs::write(&stable, serde_json::to_vec(&previous).unwrap()).unwrap();
+        write_file_reservation_record(&archive, &config, &original).unwrap_err();
+    }
+
+    #[test]
+    fn reservation_publication_keeps_legacy_repairs_and_zero_release_sentinels() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-legacy").unwrap();
+        let original = publication_test_reservation(12, "aabbccdd");
+        for marker in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("0.0"),
+            serde_json::json!("None"),
+        ] {
+            let mut active = original.clone();
+            active["released_ts"] = marker;
+            write_file_reservation_record(&archive, &config, &active).unwrap();
+            write_file_reservation_record(&archive, &config, &original).unwrap();
+        }
+        let (stable, _) = publication_test_paths(&archive, &original);
+        fs::write(&stable, b"{malformed").unwrap();
+        write_file_reservation_record(&archive, &config, &original).unwrap();
+
+        for generation in [None, Some("historic-generation")] {
+            let mut legacy = publication_test_reservation(13, "aabbccdd");
+            legacy["db_generation"] = serde_json::json!(generation);
+            legacy["released_ts"] = serde_json::json!("released");
+            write_file_reservation_record(&archive, &config, &legacy).unwrap();
+            legacy["released_ts"] = serde_json::Value::Null;
+            legacy["agent"] = serde_json::json!("BlueLake");
+            write_file_reservation_record(&archive, &config, &legacy).unwrap();
+        }
+        let mut no_id = original;
+        no_id.as_object_mut().unwrap().remove("id");
+        no_id["released_ts"] = serde_json::json!("released");
+        write_file_reservation_record(&archive, &config, &no_id).unwrap();
+        no_id["released_ts"] = serde_json::Value::Null;
+        write_file_reservation_record(&archive, &config, &no_id).unwrap();
+    }
+
+    #[test]
+    fn reservation_publication_rechecks_a_release_that_wins_during_staging() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-race").unwrap();
+        let active = publication_test_reservation(14, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        ensure_dir(stable.parent().unwrap()).unwrap();
+        // The stale writer must sync its real files while this thread holds
+        // the fence. Publish a terminal release before admitting its rename.
+        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        let writer_archive = archive.clone();
+        let writer_config = config.clone();
+        let writer_record = active.clone();
+        let writer = std::thread::spawn(move || {
+            write_file_reservation_record(&writer_archive, &writer_config, &writer_record)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while staged_temp_files(stable.parent().unwrap()).len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let staged = staged_temp_files(stable.parent().unwrap()).len();
+        let mut released = active;
+        released["released_ts"] = serde_json::json!("2026-10-02T00:00:00Z");
+        let release = write_file_reservation_record(&archive, &config, &released);
+        let terminal = fs::read(&stable);
+        drop(fence);
+        let result = writer.join().unwrap();
+        assert_eq!(staged, 2, "staging must precede publication admission");
+        release.unwrap();
+        let terminal = terminal.unwrap();
+        assert!(matches!(
+            result,
+            Err(StorageError::ReservationPublicationConflict { id: 14, .. })
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn reservation_publication_defers_while_another_process_owns_the_project() {
+        use fs2::FileExt;
+        const CHILD_ROOT: &str = "AM_TEST_RESERVATION_PUBLICATION_LOCK_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(root.join(".archive.lock"))
+                .unwrap();
+            lock.try_lock_exclusive().unwrap();
+            fs::write(root.join("publication-lock-ready"), b"held").unwrap();
+            let mut byte = [0_u8; 1];
+            let _ = std::io::stdin().read(&mut byte).unwrap();
+            lock.unlock().unwrap();
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-foreign-lock").unwrap();
+        let current = std::thread::current();
+        let test_name = current.name().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ROOT, &archive.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = archive.root.join("publication-lock-ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let observed = ready.exists();
+        let record = publication_test_reservation(15, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &record);
+        let started = Instant::now();
+        let result = observed.then(|| write_file_reservation_record(&archive, &config, &record));
+        let elapsed = started.elapsed();
+        let no_publication = !stable.exists() && !alias.exists();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "lock holder failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(observed, "child must hold the real project flock");
+        assert!(matches!(result, Some(Err(StorageError::LockTimeout(_)))));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "foreign lock wait: {elapsed:?}"
+        );
+        assert!(
+            no_publication,
+            "no artifact may publish without the project lock"
+        );
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+        write_file_reservation_record(&archive, &config, &record).unwrap();
+        assert!(stable.exists());
+        assert!(alias.exists());
+    }
+
+    #[test]
+    fn reservation_publication_bounds_candidates_before_any_file_is_staged() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-bound").unwrap();
+        let fresh = publication_test_reservation(16, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &fresh);
+        let mut oversized = publication_test_reservation(17, "aabbccdd");
+        oversized["reason"] = serde_json::json!("x".repeat(1024 * 1024));
+        let error =
+            write_file_reservation_records(&archive, &config, &[fresh, oversized]).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ReservationPublicationConflict { id: 17, .. }
+        ));
+        assert!(!stable.exists());
+        assert!(!alias.exists());
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
     }
 
     fn staged_temp_files(dir: &Path) -> Vec<String> {
