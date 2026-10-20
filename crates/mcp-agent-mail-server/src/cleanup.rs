@@ -18,7 +18,7 @@ use mcp_agent_mail_db::{
     queries::{
         self, get_agent_last_mail_activity, list_unreleased_file_reservations,
         project_ids_with_active_reservations, prune_released_file_reservations,
-        release_expired_reservations, release_reservations_by_ids_returning_ids,
+        release_expired_reservations,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -461,6 +461,50 @@ fn detect_and_release_stale(
     project_id: i64,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<Vec<i64>, String> {
+    collect_stale_reservations(config, pool, cx, project_id, probe_cache)?
+        .release(cx, pool, project_id)
+}
+
+struct StaleReservationScan {
+    candidates: Vec<queries::StaleReservationCandidate>,
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+}
+
+impl StaleReservationScan {
+    fn release(self, cx: &Cx, pool: &DbPool, project_id: i64) -> Result<Vec<i64>, String> {
+        // No database connection is held across filesystem or git probes. The
+        // release transaction must therefore revalidate the captured evidence,
+        // including activity committed after the last probe and before admission.
+        match block_on(queries::release_stale_reservations(
+            cx,
+            pool,
+            project_id,
+            &self.candidates,
+            self.observed_at,
+            self.inactivity_us,
+            self.grace_us,
+        )) {
+            Outcome::Ok(released_ids) => Ok(released_ids),
+            other => Err(format!("failed to release stale reservations: {other:?}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StaleAgentObservation {
+    last_active_ts: i64,
+    last_mail_activity_ts: Option<i64>,
+}
+
+fn collect_stale_reservations(
+    config: &Config,
+    pool: &DbPool,
+    cx: &Cx,
+    project_id: i64,
+    probe_cache: &mut CleanupProbeCache,
+) -> Result<StaleReservationScan, String> {
     let inactivity_us = i64::try_from(config.file_reservation_inactivity_seconds)
         .unwrap_or(1800)
         .saturating_mul(1_000_000);
@@ -468,10 +512,16 @@ fn detect_and_release_stale(
         .unwrap_or(900)
         .saturating_mul(1_000_000);
     let now = now_micros();
+    let mut scan = StaleReservationScan {
+        candidates: Vec::new(),
+        observed_at: now,
+        inactivity_us,
+        grace_us,
+    };
 
     let active = active_reservations_for_stale_cleanup(cx, pool, project_id, now)?;
     if active.is_empty() {
-        return Ok(Vec::new());
+        return Ok(scan);
     }
 
     // Project workspace is identical for every reservation in this cycle.
@@ -480,69 +530,32 @@ fn detect_and_release_stale(
 
     // Many reservations share the same agent and/or path pattern. Cache activity
     // checks within a cycle to avoid repeated DB + git process work.
-    let mut inactive_agent_cache: HashMap<i64, bool> = HashMap::new();
-    let mut recent_mail_cache: HashMap<i64, bool> = HashMap::new();
+    let mut stale_agent_cache: HashMap<i64, Option<StaleAgentObservation>> = HashMap::new();
     let mut recent_path_activity_cache: HashMap<String, bool> = HashMap::new();
-    let mut stale_ids = Vec::new();
 
-    for res in &active {
-        // Check agent inactivity, cached by agent id.
-        let agent_inactive = inactive_agent_cache
+    for res in active {
+        // Retain the actual observation, not just an inactive flag: a fresh
+        // heartbeat or mail action during a later path probe cancels this scan's
+        // authority to revoke the holder's leases.
+        let observation = stale_agent_cache
             .get(&res.agent_id)
             .copied()
             .unwrap_or_else(|| {
-                let computed = match block_on(async {
-                    // Cleanup may revoke a live claim. A process-local cached
-                    // profile cannot establish inactivity after another writer
-                    // refreshed the heartbeat or enabled reaper exemption.
-                    queries::get_agent_by_id_fresh(cx, pool, res.agent_id).await
-                }) {
-                    Outcome::Ok(agent) => {
-                        agent.id == Some(res.agent_id)
-                            && agent.project_id == project_id
-                            && agent.reaper_exempt == 0
-                            && now.saturating_sub(agent.last_active_ts) > inactivity_us
-                    }
-                    _ => false, // Skip stale classification when agent lookup fails.
-                };
-                inactive_agent_cache.insert(res.agent_id, computed);
+                let computed = stale_agent_observation(
+                    cx,
+                    pool,
+                    project_id,
+                    res.agent_id,
+                    now,
+                    inactivity_us,
+                    grace_us,
+                );
+                stale_agent_cache.insert(res.agent_id, computed);
                 computed
             });
-        if !agent_inactive {
-            continue; // Agent is recently active, not stale.
-        }
-
-        // Check mail activity grace period, cached by agent id.
-        let recent_mail = recent_mail_cache
-            .get(&res.agent_id)
-            .copied()
-            .unwrap_or_else(|| {
-                let computed = match block_on(async {
-                    get_agent_last_mail_activity(cx, pool, res.agent_id, project_id).await
-                }) {
-                    Outcome::Ok(last_mail) => {
-                        last_mail.is_some_and(|ts| now.saturating_sub(ts) <= grace_us)
-                    }
-                    other => {
-                        // Unavailable evidence is not a negative activity
-                        // signal. Keep this agent's claims for this cycle and
-                        // retry the read on the next cycle, including after
-                        // cancellation or a database worker panic.
-                        warn!(
-                            project_id,
-                            agent_id = res.agent_id,
-                            outcome = ?other,
-                            "cleanup: mail activity unavailable; preserving reservations"
-                        );
-                        true
-                    }
-                };
-                recent_mail_cache.insert(res.agent_id, computed);
-                computed
-            });
-        if recent_mail {
-            continue; // Recent mail activity, not stale.
-        }
+        let Some(observation) = observation else {
+            continue;
+        };
 
         // Check filesystem/git activity, cached by path pattern.
         let normalized_pattern = normalize_path_pattern_key(&res.path_pattern);
@@ -566,21 +579,62 @@ fn detect_and_release_stale(
             continue;
         }
 
-        // All checks negative — reservation is stale.
-        if let Some(id) = res.id {
-            stale_ids.push(id);
+        // The external probes found no activity. Retain the complete database
+        // proof for validation under the release transaction's writer lock.
+        if res.id.is_some() {
+            scan.candidates.push(queries::StaleReservationCandidate {
+                reservation: res,
+                agent_last_active_ts: observation.last_active_ts,
+                last_mail_activity_ts: observation.last_mail_activity_ts,
+            });
         }
     }
 
-    if stale_ids.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(scan)
+}
 
-    // Bulk-release stale reservations.
-    match block_on(async { release_reservations_by_ids_returning_ids(cx, pool, &stale_ids).await })
-    {
-        Outcome::Ok(released_ids) => Ok(released_ids),
-        other => Err(format!("failed to release stale reservations: {other:?}")),
+fn stale_agent_observation(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    now: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+) -> Option<StaleAgentObservation> {
+    // Cleanup may revoke a live claim. A process-local cached profile cannot
+    // establish inactivity after another writer refreshes the heartbeat or
+    // enables reaper exemption.
+    let agent = match block_on(queries::get_agent_by_id_fresh(cx, pool, agent_id)) {
+        Outcome::Ok(agent)
+            if agent.id == Some(agent_id)
+                && agent.project_id == project_id
+                && agent.reaper_exempt == 0
+                && now.saturating_sub(agent.last_active_ts) > inactivity_us =>
+        {
+            agent
+        }
+        _ => return None,
+    };
+    match block_on(get_agent_last_mail_activity(cx, pool, agent_id, project_id)) {
+        Outcome::Ok(last_mail) if last_mail.is_none_or(|ts| now.saturating_sub(ts) > grace_us) => {
+            Some(StaleAgentObservation {
+                last_active_ts: agent.last_active_ts,
+                last_mail_activity_ts: last_mail,
+            })
+        }
+        Outcome::Ok(_) => None,
+        other => {
+            // Unavailable evidence is not a negative activity signal. Retry
+            // next cycle, including after cancellation or a DB worker panic.
+            warn!(
+                project_id,
+                agent_id,
+                outcome = ?other,
+                "cleanup: mail activity unavailable; preserving reservations"
+            );
+            None
+        }
     }
 }
 
@@ -2017,6 +2071,74 @@ mod tests {
             row.released_ts.is_some(),
             "inactive agent reservation should be released"
         );
+    }
+
+    #[test]
+    fn stale_cleanup_revalidates_activity_after_real_filesystem_scan() {
+        for case in ["unchanged", "renewed", "heartbeat"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pool, cx, project_id, agent_id, reservation_id, _, _) =
+                seed_active_reservation(&tmp);
+            let config = stale_cleanup_test_config(&tmp);
+            let mut probe_cache = CleanupProbeCache::default();
+            let scan =
+                collect_stale_reservations(&config, &pool, &cx, project_id, &mut probe_cache)
+                    .expect("real stale filesystem/git scan");
+            assert_eq!(scan.candidates.len(), 1, "{case}");
+            assert_eq!(scan.candidates[0].reservation.id, Some(reservation_id));
+
+            // This is the exact production boundary between the completed
+            // external probe and the DB release transaction, without a timing
+            // race or a substitute query implementation in the test.
+            match case {
+                "renewed" => {
+                    let renewed = block_on(queries::renew_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        7200,
+                        None,
+                        Some(&[reservation_id]),
+                    ))
+                    .into_result()
+                    .expect("renew after classification");
+                    assert!(renewed[0].expires_ts > scan.candidates[0].reservation.expires_ts);
+                }
+                "heartbeat" => {
+                    assert!(
+                        block_on(queries::touch_agent(&cx, &pool, agent_id))
+                            .into_result()
+                            .expect("heartbeat after classification")
+                    );
+                }
+                _ => {}
+            }
+            let released = scan
+                .release(&cx, &pool, project_id)
+                .expect("guarded release");
+            if case == "unchanged" {
+                assert_eq!(released, vec![reservation_id]);
+            } else {
+                assert!(
+                    released.is_empty(),
+                    "{case}: no terminal artifact may be requested"
+                );
+                assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+                let conn = match block_on(pool.acquire(&cx)) {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("ledger connection: {error}"),
+                    Outcome::Cancelled(reason) => panic!("ledger cancelled: {reason:?}"),
+                    Outcome::Panicked(payload) => panic!("ledger panicked: {payload:?}"),
+                };
+                assert!(
+                    conn.query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                        .expect("release ledger")
+                        .is_empty(),
+                    "{case}: no release marker"
+                );
+            }
+        }
     }
 
     #[test]
