@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use git2::{Index, ObjectType, Oid, Repository};
+use git2::{ErrorCode, Index, ObjectType, Oid, Repository};
 use serde_json::Value;
 
 use super::{
@@ -16,6 +16,8 @@ use super::{
 use crate::ProjectArchive;
 
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+// Recipient copies and other projects must not consume this project's
+// canonical scan allowance. Native decoding is bounded separately by bytes.
 const MAX_INDEX_ENTRIES: u32 = 100_000;
 
 struct StagedMessages {
@@ -44,9 +46,20 @@ impl StagedMessages {
         if &header[..4] != b"DIRC" {
             return Err("staged archive index has an invalid signature".to_string());
         }
-        let count = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-        if count > MAX_INDEX_ENTRIES {
-            return Err("staged archive index entry budget exceeded".to_string());
+        let version = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        if !matches!(version, 2..=4) {
+            return Err("staged archive index has an unsupported version".to_string());
+        }
+        let count = usize::try_from(u32::from_be_bytes([
+            header[8], header[9], header[10], header[11],
+        ]))
+        .map_err(|_| "staged archive index entry count overflow".to_string())?;
+        // SHA-1 index v2/v3 entries occupy at least 64 encoded bytes; v4
+        // needs 62 fixed bytes plus a prefix varint and NUL. SHA-256 entries
+        // are longer. The admitted input, not unrelated recipient fanout,
+        // bounds native allocation even when a tiny header forges its count.
+        if count > bytes.len().saturating_sub(12) / 64 {
+            return Err("staged archive index decode entry budget exceeded".to_string());
         }
         let mut snapshot = tempfile::Builder::new()
             .prefix(".message-reconcile-index-")
@@ -60,8 +73,8 @@ impl StagedMessages {
         // are errors, not an empty index or permission to invent reply fields.
         let index = Index::open_ext(snapshot.path(), repo.object_format())
             .map_err(|error| format!("staged archive index cannot be decoded: {error}"))?;
-        if index.len() > MAX_INDEX_ENTRIES as usize {
-            return Err("staged archive index decoded entry budget exceeded".to_string());
+        if index.len() != count {
+            return Err("staged archive index decoded entry count changed".to_string());
         }
         Ok(Some(Self {
             index,
@@ -133,6 +146,7 @@ impl StagedMessages {
         canonical: &Path,
         message_id: i64,
         remaining: &mut usize,
+        entries_left: &mut u32,
     ) -> Result<(), String> {
         let root = crate::archive_project_root_checked(archive)
             .map_err(|error| error.to_string())?
@@ -142,12 +156,34 @@ impl StagedMessages {
             crate::rel_path_cached(&archive.canonical_repo_root, &root)
                 .map_err(|error| error.to_string())?,
         );
-        // The snapshot's decoded entry count is already bounded. Canonical
-        // objects share the metadata byte budget rather than getting a new one.
-        for entry in self.index.iter() {
+        let canonical_relative = crate::rel_path_cached(&archive.canonical_repo_root, canonical)
+            .map_err(|error| error.to_string())?;
+        if !canonical_relative.starts_with(&prefix) {
+            return Err("staged canonical target is outside its project namespace".to_string());
+        }
+        // The private index uses Git's case-sensitive sorted path order.
+        // Seek once; unrelated projects and inbox/outbox copies do not spend
+        // canonical enumeration or object-read budgets. This selects metadata,
+        // not publication authority: the later mandatory identity preflight
+        // still checks HEAD, all target ancestors, and staged obstructions.
+        let start = match self.index.find_prefix(prefix.as_str()) {
+            Ok(start) => start,
+            Err(error) if error.code() == ErrorCode::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        for position in start..self.index.len() {
+            let entry = self
+                .index
+                .get(position)
+                .ok_or_else(|| "staged canonical scan lost its index entry".to_string())?;
             let Some(suffix) = entry.path.strip_prefix(prefix.as_bytes()) else {
-                continue;
+                break;
             };
+            // Charge every entry in the selected namespace, even non-message
+            // files. Canonical blobs still share the metadata byte budget.
+            *entries_left = entries_left
+                .checked_sub(1)
+                .ok_or_else(|| "staged canonical scan entry budget exceeded".to_string())?;
             let suffix = std::str::from_utf8(suffix)
                 .map_err(|_| "staged canonical path is not UTF-8".to_string())?;
             let mut parts = suffix.split('/');
@@ -223,7 +259,15 @@ pub(super) fn read_metadata(
     if surviving.is_some() {
         let id = crate::positive_message_id(&prepared.message)
             .ok_or_else(|| "staged recovery requires a positive source ID".to_string())?;
-        snapshot.reject_other_canonical_id(repo, archive, canonical, id, &mut remaining)?;
+        let mut entries_left = MAX_INDEX_ENTRIES;
+        snapshot.reject_other_canonical_id(
+            repo,
+            archive,
+            canonical,
+            id,
+            &mut remaining,
+            &mut entries_left,
+        )?;
     }
     Ok(surviving)
 }
@@ -234,6 +278,232 @@ mod tests {
     use super::super::{ReconcileResult, read_surviving_message, reconcile_prepared};
     use super::*;
     use serde_json::json;
+
+    fn add_recipient_index_entries(repo: &Repository, archive: &ProjectArchive, source: &Path) {
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, source).unwrap();
+        let mut index = repo.index().unwrap();
+        let mut entry = index.get_path(Path::new(&relative), 0).unwrap();
+        // Real Git index entries, not 100,001 working-tree files. Their path
+        // population must not prevent recovery of a small canonical namespace.
+        for number in 0..100_001 {
+            entry.path = format!(
+                "projects/other/agents/BlueLake/inbox/2026/10/{number:06}.md"
+            )
+            .into_bytes();
+            index.add(&entry).unwrap();
+        }
+        index.write().unwrap();
+        assert!(index.len() > usize::try_from(MAX_INDEX_ENTRIES).unwrap());
+        assert!(std::fs::metadata(repo.path().join("index")).unwrap().len() <= MAX_INDEX_BYTES);
+    }
+
+    fn mailbox_evidence(cx: &asupersync::Cx, pool: &mcp_agent_mail_db::DbPool) -> Value {
+        let conn = super::super::outcome(fastmcp_core::block_on(pool.acquire(cx))).unwrap();
+        let messages = conn.query_sync(
+            "SELECT id, body_md, archive_metadata_json FROM messages ORDER BY id", &[],
+        ).unwrap().iter().map(|row| json!([
+            row.get_named::<i64>("id").unwrap(),
+            row.get_named::<String>("body_md").unwrap(),
+            row.get_named::<Option<String>>("archive_metadata_json").unwrap(),
+        ])).collect::<Vec<_>>();
+        let receipts = conn.query_sync(
+            "SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id", &[],
+        ).unwrap().iter().map(|row| json!([
+            row.get_named::<i64>("message_id").unwrap(),
+            row.get_named::<i64>("agent_id").unwrap(),
+            row.get_named::<String>("kind").unwrap(),
+            row.get_named::<Option<i64>>("read_ts").unwrap(),
+            row.get_named::<Option<i64>>("ack_ts").unwrap(),
+        ])).collect::<Vec<_>>();
+        json!({"messages": messages, "receipts": receipts})
+    }
+
+    #[test]
+    fn large_index_staged_replies_recover_through_live_mailbox_without_redelivery() {
+        use super::super::{ReconcileCursor, outcome, prepare_message, reconcile_message_batch};
+        use fastmcp_core::block_on;
+        use std::sync::atomic::AtomicBool;
+
+        super::super::tests::retention_fixture(3, |cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET archive_metadata_json = NULL").unwrap();
+            drop(conn);
+            let before = mailbox_evidence(cx, pool);
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let mut expected = Vec::new();
+            for (id, source) in [(901, "canonical"), (902, "outbox"), (903, "inbox")] {
+                let prepared = prepare_message(cx, pool, id).unwrap();
+                assert!(!prepared.archive_metadata_known);
+                let paths = crate::message_paths_for_bundle(
+                    &archive, &prepared.message, &prepared.sender, &prepared.recipients,
+                ).unwrap().0;
+                let mut full = prepared.message.clone();
+                full["reply_to"] = json!(700 + id - 901);
+                full["future_metadata"] = json!({"source": source, "retain": [id, "λ"]});
+                let inbox = crate::redact_message_bcc_for_inbox(&full);
+                let (path, message) = match source {
+                    "canonical" => (&paths.canonical, &full),
+                    "outbox" => (&paths.outbox, &full),
+                    _ => (&paths.inbox[0], &inbox),
+                };
+                let evidence = config.storage_root.join(format!("retained-{source}.md"));
+                let bytes = stage_and_retain(
+                    &repo, &archive, path, message, &prepared.body, &evidence,
+                );
+                assert!(super::super::CommittedMessages::open(&archive).unwrap()
+                    .read(&archive, path).unwrap().is_none());
+                expected.push((prepared, full, inbox, paths, evidence, bytes));
+            }
+            add_recipient_index_entries(&repo, &archive, &expected[0].3.canonical);
+            let index_before = std::fs::read(repo.path().join("index")).unwrap();
+            let head_before = repo.head().ok().and_then(|head| head.target());
+            for (prepared, full, _, paths, _, _) in &expected {
+                assert_eq!(read_metadata(
+                    &repo, &archive, prepared, &paths.canonical, &paths.outbox, &paths.inbox,
+                ).unwrap().as_ref(), Some(full));
+                assert!(!paths.canonical.exists());
+                assert!(!paths.outbox.exists());
+                assert!(paths.inbox.iter().all(|path| !path.exists()));
+            }
+            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index_before);
+            assert_eq!(repo.head().ok().and_then(|head| head.target()), head_before);
+
+            let stop = AtomicBool::new(false);
+            let mut cursor = ReconcileCursor::default();
+            let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((repaired.repaired, repaired.files_created, repaired.deferred), (3, 12, 0));
+            assert_eq!(mailbox_evidence(cx, pool), before);
+            let verified = Repository::open(&archive.repo_root).unwrap();
+            let tree = verified.head().unwrap().peel_to_tree().unwrap();
+            for (prepared, full, inbox, paths, evidence, bytes) in &expected {
+                for (path, expected_message) in [(&paths.canonical, full), (&paths.outbox, full)]
+                    .into_iter().chain(paths.inbox.iter().map(|path| (path, inbox)))
+                {
+                    let (message, body) = read_surviving_message(path).unwrap().unwrap();
+                    assert_eq!(&message, expected_message);
+                    assert_eq!(body, prepared.body);
+                    let relative = crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                    let object = tree.get_path(Path::new(&relative)).unwrap();
+                    assert_eq!(verified.find_blob(object.id()).unwrap().content(),
+                        std::fs::read(path).unwrap());
+                }
+                assert_eq!(full["bcc"], json!(["RedFox"]));
+                assert_eq!(inbox["bcc"], json!([]));
+                assert_eq!(&std::fs::read(evidence).unwrap(), bytes);
+            }
+            let head = verified.head().unwrap().target();
+            let again = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((again.repaired, again.files_created, again.deferred), (0, 0, 0));
+            assert_eq!(verified.head().unwrap().target(), head);
+            assert_eq!(mailbox_evidence(cx, pool), before);
+        });
+    }
+
+    #[test]
+    fn large_recipient_index_does_not_hide_a_staged_duplicate_identity() {
+        let (_temp, config, original, archive) = git_fixture();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let mut full = original.message.clone();
+        full["reply_to"] = json!(7);
+        let redacted = crate::redact_message_bcc_for_inbox(&full);
+        stage_and_retain(&repo, &archive, &paths.inbox[0], &redacted, &original.body,
+            &config.storage_root.join("retained-index-inbox.md"));
+        let other = archive.root.join("messages/9999/12/duplicate.md");
+        let evidence = config.storage_root.join("retained-duplicate.md");
+        let bytes = stage_and_retain(&repo, &archive, &other, &full, &original.body, &evidence);
+        add_recipient_index_entries(&repo, &archive, &paths.inbox[0]);
+        let before = std::fs::read(repo.path().join("index")).unwrap();
+        let head = repo.head().ok().and_then(|head| head.target());
+        let error = reconcile_prepared(&config, &original).unwrap_err();
+        assert!(error.contains("canonical message id 9 already staged"), "{error}");
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+        assert_eq!(repo.head().ok().and_then(|head| head.target()), head);
+        assert_eq!(std::fs::read(evidence).unwrap(), bytes);
+    }
+
+    #[test]
+    fn scoped_metadata_scan_keeps_entry_and_blob_bounds_and_exact_prefixes() {
+        let (_temp, config, original, archive) = git_fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let canonical = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0.canonical;
+        let mut expected_bytes = 0;
+        for (number, relative) in [
+            "projects/project/messages/2025/01/a.md",
+            "projects/project/messages/2025/01/b.md",
+            "projects/project/messages-other/2025/01/c.md",
+            "projects/project-other/messages/2025/01/d.md",
+            "projects/Project/messages/2025/01/e.md",
+        ].into_iter().enumerate() {
+            let mut message = original.message.clone();
+            message["id"] = if number < 2 { json!(77 + number) } else { json!(9) };
+            let path = archive.repo_root.join(relative);
+            let bytes = stage_and_retain(&repo, &archive, &path, &message, &original.body,
+                &config.storage_root.join(format!("retained-prefix-{number}.md")));
+            if number < 2 { expected_bytes += bytes.len(); }
+        }
+        let snapshot = StagedMessages::open(&repo).unwrap().unwrap();
+        let before = std::fs::read(repo.path().join("index")).unwrap();
+        let mut remaining = expected_bytes;
+        let mut entries = 2;
+        snapshot.reject_other_canonical_id(&repo, &archive, &canonical, 9,
+            &mut remaining, &mut entries).unwrap();
+        assert_eq!((remaining, entries), (0, 0));
+        for (mut bytes, mut entries) in [(expected_bytes, 1), (expected_bytes - 1, 2)] {
+            let error = snapshot.reject_other_canonical_id(&repo, &archive, &canonical, 9,
+                &mut bytes, &mut entries).unwrap_err();
+            assert!(error.contains("budget"), "{error}");
+        }
+        let wrong = archive.repo_root.join("projects/project-other/messages/2025/01/new.md");
+        assert!(snapshot.reject_other_canonical_id(&repo, &archive, &wrong, 9,
+            &mut expected_bytes, &mut 2).unwrap_err().contains("outside its project"));
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+        assert!(!canonical.exists());
+    }
+
+    #[test]
+    fn native_index_versions_preserve_metadata_and_forged_decode_counts_refuse() {
+        let (_temp, config, original, archive) = git_fixture();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive, &original.message, &original.sender, &original.recipients,
+        ).unwrap().0;
+        let mut full = original.message.clone();
+        full["reply_to"] = json!(7);
+        stage_and_retain(&repo, &archive, &paths.outbox, &full, &original.body,
+            &config.storage_root.join("retained-version-outbox.md"));
+        for version in [2, 3, 4] {
+            let mut index = repo.index().unwrap();
+            index.set_version(version).unwrap();
+            index.write().unwrap();
+            let before = std::fs::read(repo.path().join("index")).unwrap();
+            assert_eq!(read_metadata(&repo, &archive, &original, &paths.canonical,
+                &paths.outbox, &paths.inbox).unwrap(), Some(full.clone()));
+            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), before);
+        }
+        let path = repo.path().join("index");
+        std::fs::rename(&path, config.storage_root.join("retained-version-index")).unwrap();
+        for version in [2_u32, 3, 4, 5] {
+            let mut forged = b"DIRC".to_vec();
+            forged.extend_from_slice(&version.to_be_bytes());
+            forged.extend_from_slice(&u32::MAX.to_be_bytes());
+            std::fs::write(&path, &forged).unwrap();
+            let error = StagedMessages::open(&repo).err().unwrap();
+            assert!(error.contains(if version == 5 { "unsupported version" } else { "budget" }),
+                "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), forged);
+        }
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+    }
 
     fn stage_and_retain(
         repo: &Repository,
