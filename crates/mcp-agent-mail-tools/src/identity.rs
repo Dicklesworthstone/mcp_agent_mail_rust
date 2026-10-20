@@ -680,6 +680,11 @@ const HEALTH_CHECK_REQUIRED_TABLES: &[&str] =
 pub struct SemanticReadinessResponse {
     pub status: String,
     pub detail: String,
+    /// Observed excess of SQLite messages over canonical archive messages.
+    /// This is an inventory count, not proof of which message IDs are missing.
+    /// Absent when parity was skipped or the inventory could not be inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_message_gap: Option<u64>,
 }
 
 /// One independent health verdict (br-bvq1x.3.1 / C1).
@@ -863,6 +868,73 @@ fn probe_doctor_readiness(config: &Config) -> Result<(), String> {
     }
 }
 
+fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot) -> bool {
+    lag.backlog_depth > 0
+        || lag.coalescer_pending > 0
+        || lag.wbq_depth > 0
+        || lag.wbq_inflight_oldest_age_us > 0
+        || lag.wbq_inflight_execution_us > 0
+        || lag.oldest_unmaterialized_us > 0
+}
+
+fn archive_parity_health_verdict(
+    semantic: &SemanticReadinessResponse,
+    kind: SemanticVerdictKind,
+    archive_drain_stall: Option<&str>,
+    archive_pending: bool,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
+
+    if kind == SemanticVerdictKind::ArchiveParity {
+        HealthVerdict::new(Red, true, semantic.detail.clone())
+    } else if let Some(stall) = archive_drain_stall {
+        // br-kp1in.23: write-behind lag is tolerable only while it converges.
+        // A drain that completes nothing leaves every queued write without an
+        // archive copy indefinitely, so parity is broken, not lagging.
+        HealthVerdict::new(
+            Red,
+            true,
+            format!(
+                "archive write-behind drain stalled ({stall}); queued archive writes will not \
+                 land until the drain recovers ({})",
+                semantic.detail
+            ),
+        )
+    } else if let Some(gap) = semantic.archive_message_gap.filter(|gap| *gap > 0)
+        && !archive_pending
+    {
+        // Inventory and queue observations are not atomic: a writer can finish
+        // between the probes. Report unverified convergence, not corruption.
+        // A later aligned inventory clears this observation without retaining
+        // a process-local failure that could outlive the actual repair.
+        HealthVerdict::new(
+            Yellow,
+            true,
+            format!(
+                "sqlite inventory exceeds the canonical archive by {gap} message(s) with no \
+                 pending archive writes observed; convergence is unverified; inspect message \
+                 reconciliation before archive-only recovery ({})",
+                semantic.detail
+            ),
+        )
+    } else {
+        // Never assert bare alignment: the git archive legitimately trails the
+        // live SQLite index under write-behind flush, so a green parity verdict
+        // must DISCLOSE the actual inventory (carried in the semantic readiness
+        // detail) instead of claiming "aligned" over counts an operator can see
+        // disagree (bead hfdt-p311n). Green stays correct for within-tolerance
+        // write-behind drift; it just no longer hides it behind a false claim.
+        HealthVerdict::new(
+            Green,
+            true,
+            format!(
+                "git archive/sqlite index within write-behind tolerance ({})",
+                semantic.detail
+            ),
+        )
+    }
+}
+
 fn archive_drain_stall_detail(
     lag: &mcp_agent_mail_storage::ArchiveLagSnapshot,
     critical_us: u64,
@@ -900,6 +972,7 @@ fn compute_health_verdicts(
     semantic: &SemanticReadinessResponse,
     integrity: &mcp_agent_mail_db::IntegrityMetrics,
     archive_drain_stall: Option<&str>,
+    archive_pending: bool,
 ) -> HealthVerdicts {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     let kind = classify_semantic_failure(&semantic.status, &semantic.detail);
@@ -934,37 +1007,8 @@ fn compute_health_verdicts(
         HealthVerdict::new(Green, true, "write path schema present and writable")
     };
 
-    let archive_db_parity = if kind == SemanticVerdictKind::ArchiveParity {
-        HealthVerdict::new(Red, true, semantic.detail.clone())
-    } else if let Some(stall) = archive_drain_stall {
-        // br-kp1in.23: write-behind lag is tolerable only while it converges.
-        // A drain that completes nothing leaves every queued write without an
-        // archive copy indefinitely, so parity is broken, not lagging.
-        HealthVerdict::new(
-            Red,
-            true,
-            format!(
-                "archive write-behind drain stalled ({stall}); queued archive writes will not \
-                 land until the drain recovers ({})",
-                semantic.detail
-            ),
-        )
-    } else {
-        // Never assert bare alignment: the git archive legitimately trails the
-        // live SQLite index under write-behind flush, so a green parity verdict
-        // must DISCLOSE the actual inventory (carried in the semantic readiness
-        // detail) instead of claiming "aligned" over counts an operator can see
-        // disagree (bead hfdt-p311n). Green stays correct for within-tolerance
-        // write-behind drift; it just no longer hides it behind a false claim.
-        HealthVerdict::new(
-            Green,
-            true,
-            format!(
-                "git archive/sqlite index within write-behind tolerance ({})",
-                semantic.detail
-            ),
-        )
-    };
+    let archive_db_parity =
+        archive_parity_health_verdict(semantic, kind, archive_drain_stall, archive_pending);
 
     let transport_health = match probe_transport_decode() {
         Ok(()) => HealthVerdict::new(Green, true, "JSON-RPC decode path functional"),
@@ -1154,6 +1198,7 @@ fn semantic_readiness_response(
     SemanticReadinessResponse {
         status: status.to_string(),
         detail: detail.into(),
+        archive_message_gap: None,
     }
 }
 
@@ -1250,16 +1295,6 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
     }
 
     let archive = mcp_agent_mail_db::scan_archive_message_inventory(&config.storage_root);
-    if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
-        return semantic_readiness_response(
-            "ok",
-            format!(
-                "No canonical archive content found under {}",
-                config.storage_root.join("projects").display()
-            ),
-        );
-    }
-
     let rows = match conn.query_sync(
         "SELECT \
             (SELECT COUNT(*) FROM projects) AS project_count, \
@@ -1366,7 +1401,7 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
              writes that never landed; compare queues.archive_lag)"
         )
     };
-    semantic_readiness_response(
+    let mut readiness = semantic_readiness_response(
         "ok",
         format!(
             "{alignment}: archive projects={}, agents={}, messages={}, db projects={}, agents={}, messages={}",
@@ -1377,7 +1412,9 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
             db_agent_count,
             db_message_count
         ),
-    )
+    );
+    readiness.archive_message_gap = Some(db_ahead_by);
+    readiness
 }
 
 /// Try to write an agent profile to the git archive. Failures are logged
@@ -2083,6 +2120,10 @@ pub struct WhoisResponse {
     #[serde(flatten)]
     pub agent: AgentResponse,
     pub recent_commits: Vec<CommitInfo>,
+    /// Present when history enrichment exhausted its budget; older matching
+    /// commits may exist even if the returned list is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_commits_truncated: Option<bool>,
 }
 
 /// Git commit information
@@ -2176,6 +2217,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         &semantic_readiness,
         &integrity_metrics,
         archive_drain_stall.as_deref(),
+        archive_writes_pending(&archive_lag),
     );
     let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
@@ -3531,7 +3573,7 @@ pub fn is_valid_attachments_policy(policy: &str) -> bool {
 /// # Parameters
 /// - `project_key`: Project human key or slug
 /// - `agent_name`: Agent name to look up
-/// - `include_recent_commits`: Include recent Git commits (default: true)
+/// - `include_recent_commits`: Include bounded recent Git history (default: true)
 /// - `commit_limit`: Max commits to include (default: 5)
 ///
 /// # Returns
@@ -3540,7 +3582,7 @@ pub fn is_valid_attachments_policy(policy: &str) -> bool {
 /// # Conformance
 /// Python-parity.
 #[tool(
-    description = "Return enriched profile details for an agent, optionally including recent archive commits.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nagent_name : str\n    Agent name to look up (use resource://agents/{project_key} to discover names).\ninclude_recent_commits : bool\n    If true, include latest commits touching the project archive authored by the configured git author.\ncommit_limit : int\n    Maximum number of recent commits to include.\n\nReturns\n-------\ndict\n    Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested."
+    description = "Return enriched profile details for an agent, optionally including recent archive commits.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nagent_name : str\n    Agent name to look up (use resource://agents/{project_key} to discover names).\ninclude_recent_commits : bool\n    If true (the default), include recent commits touching this agent's archive directory. History enrichment has a bounded scan so large archives cannot delay the profile indefinitely.\ncommit_limit : int\n    Maximum number of recent commits to include.\n\nReturns\n-------\ndict\n    Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested. If a scan budget is reached, recent_commits_truncated is true and older matching commits may exist. Commit traversal starts at HEAD; imported merges or skewed commit clocks do not guarantee global timestamp ordering."
 )]
 pub async fn whois(
     ctx: &McpContext,
@@ -3580,27 +3622,34 @@ pub async fn whois(
         other => db_outcome_to_mcp_result(other)?,
     };
 
-    // Fetch recent commits from the git archive if requested
+    // Fetch recent commits from the git archive if requested. Budget exhaustion
+    // is explicit so an empty partial scan cannot imply the agent has no history.
+    let mut recent_commits_truncated = None;
     let recent_commits = if include_commits && limit > 0 {
+        ctx.checkpoint()?;
         let config = &Config::get();
         match mcp_agent_mail_storage::open_archive(config, &project.slug) {
             Ok(Some(archive)) => {
                 // Project-relative: get_recent_commits applies the
                 // projects/<slug>/ repo prefix itself.
                 let path_filter = format!("agents/{}", agent_row.name);
-                match mcp_agent_mail_storage::get_recent_commits(
+                match mcp_agent_mail_storage::get_recent_commit_history(
                     &archive,
                     limit,
                     Some(&path_filter),
                 ) {
-                    Ok(commits) => commits
-                        .into_iter()
-                        .map(|c| CommitInfo {
-                            hexsha: c.sha,
-                            summary: c.summary,
-                            authored_ts: c.date,
-                        })
-                        .collect(),
+                    Ok(history) => {
+                        recent_commits_truncated = history.truncated.then_some(true);
+                        history
+                            .commits
+                            .into_iter()
+                            .map(|c| CommitInfo {
+                                hexsha: c.sha,
+                                summary: c.summary,
+                                authored_ts: c.date,
+                            })
+                            .collect()
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to get recent commits: {e}");
                         Vec::new()
@@ -3647,6 +3696,7 @@ pub async fn whois(
             deregistered_at: deregistered_at.map(micros_to_iso),
         },
         recent_commits,
+        recent_commits_truncated,
     };
 
     serde_json::to_string(&response)
@@ -4089,6 +4139,7 @@ mod tests {
         SemanticReadinessResponse {
             status: status.into(),
             detail: detail.into(),
+            archive_message_gap: None,
         }
     }
 
@@ -4261,6 +4312,7 @@ mod tests {
             ),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.write_health.status, "red");
         assert!(verdicts.write_health.critical);
@@ -4287,6 +4339,7 @@ mod tests {
             ),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -4307,6 +4360,7 @@ mod tests {
             ),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert_eq!(
@@ -4324,6 +4378,7 @@ mod tests {
             &semantic("fail", "database pool bootstrap failed"),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.db_health.status, "red");
         assert_eq!(
@@ -4341,6 +4396,7 @@ mod tests {
             &semantic("ok", "aligned"),
             &healthy_integrity_metrics(),
             None,
+            false,
         );
         assert_eq!(verdicts.db_health.status, "green");
         assert_eq!(verdicts.write_health.status, "green");
@@ -4357,6 +4413,180 @@ mod tests {
     }
 
     #[test]
+    fn archive_parity_tracks_drain_and_inventory_convergence() {
+        let mut observation = semantic("ok", "archive messages=1, db messages=3");
+        observation.archive_message_gap = Some(2);
+        let pending = mcp_agent_mail_storage::ArchiveLagSnapshot {
+            wbq_inflight_execution_us: 1,
+            ..Default::default()
+        };
+        let live = archive_parity_health_verdict(
+            &observation,
+            SemanticVerdictKind::Ok,
+            None,
+            archive_writes_pending(&pending),
+        );
+        assert_eq!(live.status, "green");
+        assert!(live.detail.contains(&observation.detail));
+
+        let idle =
+            archive_parity_health_verdict(&observation, SemanticVerdictKind::Ok, None, false);
+        assert_eq!(idle.status, "yellow");
+        assert!(idle.critical);
+        assert!(idle.detail.contains("by 2 message(s)"));
+        assert!(idle.detail.contains("convergence is unverified"));
+
+        let stalled = archive_parity_health_verdict(
+            &observation,
+            SemanticVerdictKind::Ok,
+            Some("no completed op for 900000 ms"),
+            true,
+        );
+        assert_eq!(stalled.status, "red");
+        assert!(stalled.critical);
+        assert!(stalled.detail.contains("drain stalled"));
+
+        observation.archive_message_gap = Some(0);
+        observation.detail = "Archive and sqlite inventory are aligned".into();
+        let converged =
+            archive_parity_health_verdict(&observation, SemanticVerdictKind::Ok, None, false);
+        assert_eq!(converged.status, "green");
+
+        let ahead = semantic("fail", "archive inventory is ahead of the sqlite index");
+        let unsafe_index = archive_parity_health_verdict(
+            &ahead,
+            classify_semantic_failure(&ahead.status, &ahead.detail),
+            Some("drain stalled"),
+            true,
+        );
+        assert_eq!(unsafe_index.status, "red");
+        assert_eq!(unsafe_index.detail, ahead.detail);
+    }
+
+    #[test]
+    fn semantic_archive_gap_wire_format_preserves_skipped_and_legacy_responses() {
+        let legacy = json!({"status": "ok", "detail": "parity skipped"});
+        let mut response: SemanticReadinessResponse =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(response.archive_message_gap, None);
+        assert_eq!(serde_json::to_value(&response).unwrap(), legacy);
+
+        response.archive_message_gap = Some(0);
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["archive_message_gap"],
+            0
+        );
+        response.archive_message_gap = Some(2);
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["archive_message_gap"], 2);
+        let decoded: SemanticReadinessResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.archive_message_gap, Some(2));
+    }
+
+    #[test]
+    fn idle_archive_gap_is_critical_yellow_until_inventory_converges() {
+        let config = Config::default();
+        let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+        observation.archive_message_gap = Some(2);
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+        assert!(verdicts.archive_db_parity.critical);
+        assert!(
+            verdicts
+                .archive_db_parity
+                .detail
+                .contains("no pending archive writes")
+        );
+        assert!(
+            verdicts
+                .archive_db_parity
+                .detail
+                .contains("convergence is unverified")
+        );
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+        assert_eq!(
+            verdicts.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Yellow
+        );
+        assert!(
+            verdicts
+                .failing_names()
+                .iter()
+                .any(|name| name == "archive_db_parity")
+        );
+
+        observation.archive_message_gap = Some(0);
+        observation.detail = "Archive and sqlite inventory are aligned".into();
+        let converged = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(converged.archive_db_parity.status, "green");
+        assert_eq!(
+            converged.rollup_level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn pending_archive_work_includes_dequeued_and_coalescing_writes() {
+        use mcp_agent_mail_storage::ArchiveLagSnapshot;
+        for lag in [
+            ArchiveLagSnapshot {
+                backlog_depth: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                coalescer_pending: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                wbq_depth: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                wbq_inflight_oldest_age_us: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                wbq_inflight_execution_us: 1,
+                ..Default::default()
+            },
+            ArchiveLagSnapshot {
+                oldest_unmaterialized_us: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                archive_writes_pending(&lag),
+                "live archive work must tolerate the inventory gap"
+            );
+        }
+        assert!(!archive_writes_pending(&ArchiveLagSnapshot::default()));
+        assert!(
+            !archive_writes_pending(&ArchiveLagSnapshot {
+                enqueued_total: 10,
+                drained_total: 8,
+                dropped_total: 2,
+                ..Default::default()
+            }),
+            "historical failures cannot excuse an idle archive gap indefinitely"
+        );
+    }
+
+    #[test]
     fn green_archive_parity_discloses_inventory_not_bare_aligned() {
         // bead hfdt-p311n: a green archive_db_parity verdict must never hide
         // visibly unequal archive/db counts behind a bare "aligned" claim. The
@@ -4365,12 +4595,15 @@ mod tests {
         let config = Config::from_env();
         let drift_detail = "archive projects=13, agents=332, messages=1496, \
              db projects=13, agents=338, messages=1498";
+        let mut observation = semantic("ok", drift_detail);
+        observation.archive_message_gap = Some(2);
         let verdicts = compute_health_verdicts(
             &config,
             true,
-            &semantic("ok", drift_detail),
+            &observation,
             &healthy_integrity_metrics(),
             None,
+            true,
         );
         assert_eq!(verdicts.archive_db_parity.status, "green");
         assert!(
@@ -4392,12 +4625,15 @@ mod tests {
         // with zero drain progress while every critical verdict stayed green.
         let config = Config::from_env();
         let drift_detail = "sqlite is ahead of the archive by 3235 message(s)";
+        let mut observation = semantic("ok", drift_detail);
+        observation.archive_message_gap = Some(3235);
         let stalled = compute_health_verdicts(
             &config,
             true,
-            &semantic("ok", drift_detail),
+            &observation,
             &healthy_integrity_metrics(),
             Some("wbq depth 3453, no completed op for 900000 ms"),
+            true,
         );
         assert_eq!(stalled.archive_db_parity.status, "red");
         assert!(stalled.archive_db_parity.critical);
@@ -4422,9 +4658,10 @@ mod tests {
         let draining = compute_health_verdicts(
             &config,
             true,
-            &semantic("ok", drift_detail),
+            &observation,
             &healthy_integrity_metrics(),
             None,
+            true,
         );
         assert_eq!(draining.archive_db_parity.status, "green");
         assert_eq!(
@@ -4449,6 +4686,7 @@ mod tests {
             &semantic("ok", "archive files and sqlite messages are aligned"),
             &healthy_integrity_metrics(),
             Some(&detail),
+            archive_writes_pending(&lag),
         );
         assert_eq!(verdicts.archive_db_parity.status, "red");
         assert!(verdicts.archive_db_parity.critical);
@@ -4904,6 +5142,7 @@ mod tests {
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "aligned".into(),
+                archive_message_gap: Some(0),
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
@@ -5029,6 +5268,7 @@ mod tests {
                 summary: "test commit".into(),
                 authored_ts: "2026-02-06T00:00:00Z".into(),
             }],
+            recent_commits_truncated: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -5037,6 +5277,7 @@ mod tests {
         assert_eq!(json["program"], "codex-cli");
         // Commits are nested
         assert_eq!(json["recent_commits"][0]["hexsha"], "abc123");
+        assert!(json.get("recent_commits_truncated").is_none());
     }
 
     #[test]
@@ -5062,6 +5303,7 @@ mod tests {
                 deregistered_at: None,
             },
             recent_commits: vec![],
+            recent_commits_truncated: Some(true),
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
@@ -5069,6 +5311,7 @@ mod tests {
             json["recent_commits"].as_array().unwrap().as_slice(),
             [] as [serde_json::Value; 0]
         );
+        assert_eq!(json["recent_commits_truncated"], true);
     }
 
     // ── Path validation (ensure_project logic) ──
@@ -5452,6 +5695,7 @@ mod tests {
             semantic_readiness: SemanticReadinessResponse {
                 status: "ok".into(),
                 detail: "memory".into(),
+                archive_message_gap: None,
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
@@ -5562,6 +5806,65 @@ mod tests {
             !value.to_string().contains("null"),
             "retention block must be null-free: {value}"
         );
+    }
+
+    #[test]
+    fn health_check_detects_unarchived_messages_even_with_an_empty_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("mailbox");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = storage_root.join("storage.sqlite3");
+        let config = Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'gap-project', '/gap-project', 1);\n\
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1);\n\
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, attachments, recipients_json) VALUES (1, 1, 1, 'Persisted', 'body', 1, '[]', '{\"to\":[],\"cc\":[],\"bcc\":[]}');"
+        ).expect("persist a message before its archive copy");
+        drop(conn);
+
+        let before = health_check_semantic_readiness(&config);
+        assert_eq!(before.status, "ok", "{}", before.detail);
+        assert_eq!(before.archive_message_gap, Some(1));
+        let verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &before,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+
+        let project = storage_root.join("projects/gap-project");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).expect("create canonical directory");
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"gap-project","human_key":"/gap-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            messages.join("2026-10-01T00-00-00Z__persisted__1.md"),
+            "---json\n{\"id\":1,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Persisted\",\"importance\":\"normal\",\"created_ts\":\"2026-10-01T00:00:00Z\"}\n---\n\nbody\n",
+        ).expect("materialize canonical message");
+        let after = health_check_semantic_readiness(&config);
+        assert_eq!(after.archive_message_gap, Some(0), "{}", after.detail);
+        let repaired = compute_health_verdicts(
+            &config,
+            true,
+            &after,
+            &healthy_integrity_metrics(),
+            None,
+            false,
+        );
+        assert_eq!(repaired.archive_db_parity.status, "green");
     }
 
     #[test]

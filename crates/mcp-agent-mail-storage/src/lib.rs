@@ -10997,12 +10997,43 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
 ///
 /// `path_filter` is relative to the project's archive root (e.g.
 /// `agents/BlueLake`); the `projects/<slug>/` repo prefix is applied
-/// internally.
+/// internally. This is best-effort history enrichment: the scan is bounded by
+/// work and elapsed time. Use [`get_recent_commit_history`] when the caller
+/// needs to distinguish a budget-limited result from exhausted history.
+///
+/// Commits follow the lazy traversal from HEAD, which is newest-first for the
+/// archive's append-only history. Imported merges retain all-parent traversal;
+/// neither merges nor skewed commit clocks imply a global timestamp ordering.
 pub fn get_recent_commits(
     archive: &ProjectArchive,
     limit: usize,
     path_filter: Option<&str>,
 ) -> Result<Vec<CommitInfo>> {
+    get_recent_commit_history(archive, limit, path_filter).map(|history| history.commits)
+}
+
+/// The completed portion of a recent-commit scan.
+#[derive(Debug, Default)]
+pub struct RecentCommitHistory {
+    pub commits: Vec<CommitInfo>,
+    /// Commits examined, including those that did not match the path filter.
+    pub scanned_commits: usize,
+    /// A work/time budget stopped the scan before the requested limit or the
+    /// end of history. Older matching commits may exist.
+    pub truncated: bool,
+}
+
+/// Get recent archive commits together with the scan's completion status.
+///
+/// Path and ordering semantics are the same as [`get_recent_commits`]. The time
+/// budget is cooperative: a single filesystem or libgit2 call cannot be
+/// interrupted, but no further object load is started after the deadline.
+pub fn get_recent_commit_history(
+    archive: &ProjectArchive,
+    limit: usize,
+    path_filter: Option<&str>,
+) -> Result<RecentCommitHistory> {
+    let started = Instant::now();
     let repo = open_archive_repo_checked(archive)?;
     // The filter is PROJECT-relative (e.g. `agents/BlueLake`). The shared
     // archive repo nests every project under `projects/<slug>/`, so the tree
@@ -11016,53 +11047,95 @@ pub fn get_recent_commits(
                 .map(|filter| format!("projects/{}/{}", archive.slug, filter))
         })
         .transpose()?;
-    let path_filter = path_filter.as_deref();
+    let history = collect_recent_commits(
+        &repo,
+        limit,
+        path_filter.as_deref(),
+        recent_commits_scan_budget(),
+        &mut || started.elapsed() < RECENT_COMMITS_TIME_BUDGET,
+    )?;
+    if history.truncated {
+        tracing::debug!(
+            scanned_commits = history.scanned_commits,
+            returned_commits = history.commits.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Recent archive history enrichment reached its scan budget"
+        );
+    }
+    Ok(history)
+}
+
+fn collect_recent_commits(
+    repo: &Repository,
+    limit: usize,
+    path_filter: Option<&str>,
+    scan_budget: usize,
+    within_time_budget: &mut impl FnMut() -> bool,
+) -> Result<RecentCommitHistory> {
+    let mut history = RecentCommitHistory::default();
+    if limit == 0 {
+        return Ok(history);
+    }
+    if !within_time_budget() {
+        history.truncated = true;
+        return Ok(history);
+    }
+
+    // push_head() reports a generic reference error for an unborn branch in
+    // libgit2 1.9. Use head() to distinguish an empty repository from a broken
+    // reference without treating corrupt or missing commit objects as empty.
+    match repo.head() {
+        Ok(_) => {}
+        Err(error) if error.code() == ErrorCode::UnbornBranch => return Ok(history),
+        Err(error) => return Err(error.into()),
+    }
+    if !within_time_budget() {
+        history.truncated = true;
+        return Ok(history);
+    }
 
     let mut revwalk = repo.revwalk()?;
-    revwalk.push_head()?;
-    // The archive is a first-parent append-only history. TIME sorting makes
-    // libgit2 pre-walk the entire repository before yielding the first commit,
-    // defeating the bounded scan on long-lived mailboxes (GH#361).
+    // TIME sorting makes libgit2 pre-walk the whole repository before yielding
+    // the first commit. NONE is lazy and retains merged side histories. A
+    // first-parent-only walk would silently lose imported archive activity.
     revwalk.set_sorting(git2::Sort::NONE)?;
+    revwalk.push_head()?;
+    let mut path_filter = path_filter.map(CommitPathFilter::new);
 
-    let mut commits = Vec::new();
-
-    // Hard ceiling on how many commits we will examine when a path filter is
-    // present. Without it, a filter that matches fewer than `limit` commits
-    // (e.g. a freshly registered agent whose archive path barely appears in
-    // history) forces a walk over the *entire* archive history — the whois CPU
-    // bomb in #200. The per-commit check below is O(path-depth) tree lookups,
-    // so this budget bounds worst-case work to a small, quick scan while still
-    // finding recent matches for any active agent. Best-effort enrichment only;
-    // truncation just yields fewer "recent commits", never incorrect data.
-    let scan_budget = path_filter.map(|_| recent_commits_scan_budget());
-    let mut scanned: usize = 0;
-
-    for oid_result in revwalk {
-        if commits.len() >= limit {
+    while history.commits.len() < limit {
+        // Check BEFORE next(): a for loop fetches another Git object before
+        // its body can notice the limit/deadline.
+        if history.scanned_commits >= scan_budget || !within_time_budget() {
+            history.truncated = true;
             break;
         }
-        if let Some(budget) = scan_budget {
-            if scanned >= budget {
-                break;
-            }
-            scanned += 1;
-        }
+        let Some(oid_result) = revwalk.next() else {
+            break;
+        };
         let oid = oid_result?;
+        if !within_time_budget() {
+            history.truncated = true;
+            break;
+        }
         let commit = repo.find_commit(oid)?;
+        history.scanned_commits += 1;
 
-        // Optional path filter
-        if let Some(filter) = path_filter {
-            let dominated = commit_touches_path(&repo, &commit, filter);
-            if !dominated {
-                continue;
+        if let Some(filter) = path_filter.as_mut() {
+            match filter.commit_touches_path(repo, &commit, within_time_budget)? {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    history.truncated = true;
+                    break;
+                }
             }
         }
 
         let author = commit.author();
-        commits.push(CommitInfo {
-            sha: oid.to_string(),
-            short_sha: oid.to_string()[..7.min(oid.to_string().len())].to_string(),
+        let sha = oid.to_string();
+        history.commits.push(CommitInfo {
+            short_sha: sha[..7.min(sha.len())].to_string(),
+            sha,
             author: author.name().unwrap_or("unknown").to_string(),
             email: author.email().unwrap_or("").to_string(),
             date: {
@@ -11080,12 +11153,14 @@ pub fn get_recent_commits(
         });
     }
 
-    Ok(commits)
+    Ok(history)
 }
 
-/// Default hard ceiling on commits examined by [`get_recent_commits`] when a
-/// path filter is present. Overridable via `AM_RECENT_COMMITS_SCAN_BUDGET`.
+/// Default hard ceiling on commits examined by [`get_recent_commits`].
+/// Overridable via `AM_RECENT_COMMITS_SCAN_BUDGET`; the independent time budget
+/// still applies even when an operator allows a deeper history window.
 const DEFAULT_RECENT_COMMITS_SCAN_BUDGET: usize = 1_000;
+const RECENT_COMMITS_TIME_BUDGET: Duration = Duration::from_millis(100);
 
 fn recent_commits_scan_budget() -> usize {
     mcp_agent_mail_core::config::env_value("AM_RECENT_COMMITS_SCAN_BUDGET")
@@ -11094,42 +11169,122 @@ fn recent_commits_scan_budget() -> usize {
         .unwrap_or(DEFAULT_RECENT_COMMITS_SCAN_BUDGET)
 }
 
-/// Check if a commit touches files under a given path prefix.
-///
-/// Fast path (non-root commits): compare the object id of the tree/blob entry
-/// at `path_prefix` between this commit and its first parent. Anything that
-/// changes under a directory changes that directory's subtree oid, so an
-/// unchanged oid means nothing under the path was touched — an O(path-depth)
-/// check that loads only the trees along the path. The previous implementation
-/// ran a full, un-pathspec'd `diff_tree_to_tree` per commit, which loads every
-/// tree in the commit and was the dominant cost in the whois CPU storm (#200).
-fn commit_touches_path(_repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
-    let filter = Path::new(path_prefix);
-    let tree = match commit.tree() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CommitPathEntry {
+    oid: git2::Oid,
+    mode: i32,
+}
 
-    // Root commit: no parent to diff against; inspect the tree directly.
-    if commit.parent_count() == 0 {
-        return tree_contains_prefix(&tree, filter);
+/// A request-local cache of tiny tree-entry identities, not tree objects.
+/// Comparing every common ancestor first avoids expanding an unchanged large
+/// project/agents subtree. Memoizing entries also avoids reading each parent
+/// tree again when it becomes the next commit in an append-only history.
+struct CommitPathFilter<'a> {
+    components: Vec<&'a str>,
+    entries: HashMap<(git2::Oid, usize), Option<CommitPathEntry>>,
+    tree_loads: usize,
+}
+
+impl<'a> CommitPathFilter<'a> {
+    fn new(path_prefix: &'a str) -> Self {
+        Self {
+            components: Path::new(path_prefix)
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect(),
+            entries: HashMap::new(),
+            tree_loads: 0,
+        }
     }
 
-    let Ok(parent) = commit.parent(0) else {
-        return false;
-    };
-    let Ok(parent_tree) = parent.tree() else {
-        return false;
-    };
+    // None means the cooperative time budget expired. A false result always
+    // means an actual unchanged/absent path, never an interrupted comparison.
+    fn commit_touches_path(
+        &mut self,
+        repo: &Repository,
+        commit: &git2::Commit<'_>,
+        within_time_budget: &mut impl FnMut() -> bool,
+    ) -> Result<Option<bool>> {
+        if !within_time_budget() {
+            return Ok(None);
+        }
+        let parent = if commit.parent_count() == 0 {
+            None
+        } else {
+            Some(commit.parent(0)?.tree_id())
+        };
+        let as_tree = |oid| CommitPathEntry {
+            oid,
+            mode: 0o040_000,
+        };
+        let mut current = Some(as_tree(commit.tree_id()));
+        let mut parent = parent.map(as_tree);
+        for depth in 0..self.components.len() {
+            if current == parent {
+                return Ok(Some(false));
+            }
+            let std::ops::ControlFlow::Continue(next_current) =
+                self.child_entry(repo, current, depth, within_time_budget)?
+            else {
+                return Ok(None);
+            };
+            let std::ops::ControlFlow::Continue(next_parent) =
+                self.child_entry(repo, parent, depth, within_time_budget)?
+            else {
+                return Ok(None);
+            };
+            current = next_current;
+            parent = next_parent;
+        }
+        // Include additions, deletions, content changes, and file-mode-only
+        // changes. Comparing only blob ids misses chmod on an exact file path.
+        Ok(Some(current != parent))
+    }
 
-    // `get_path` resolves the entry (blob or subtree) at the exact path,
-    // returning Err when absent. Presence-or-oid change ⇒ the path was touched.
-    // This matches the prior component-wise prefix semantics: a directory's
-    // subtree oid captures every descendant, and sibling names that merely
-    // share a textual prefix (`name` vs `name2`) resolve to distinct entries.
-    let current = tree.get_path(filter).ok().map(|entry| entry.id());
-    let parent = parent_tree.get_path(filter).ok().map(|entry| entry.id());
-    current != parent
+    fn child_entry(
+        &mut self,
+        repo: &Repository,
+        entry: Option<CommitPathEntry>,
+        depth: usize,
+        within_time_budget: &mut impl FnMut() -> bool,
+    ) -> Result<std::ops::ControlFlow<(), Option<CommitPathEntry>>> {
+        if !within_time_budget() {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+        let Some(entry) = entry.filter(|entry| entry.mode == 0o040_000) else {
+            return Ok(std::ops::ControlFlow::Continue(None));
+        };
+        let key = (entry.oid, depth);
+        if let Some(cached) = self.entries.get(&key) {
+            return Ok(std::ops::ControlFlow::Continue(*cached));
+        }
+        let tree = repo.find_tree(entry.oid)?;
+        self.tree_loads += 1;
+        let child = tree
+            .get_name(self.components[depth])
+            .map(|child| CommitPathEntry {
+                oid: child.id(),
+                mode: child.filemode(),
+            });
+        // Bound memory even if the caller raises the work budget or supplies a
+        // very deep path. Cached values contain no blobs or tree contents.
+        if self.entries.len() >= 256 {
+            self.entries.clear();
+        }
+        self.entries.insert(key, child);
+        Ok(std::ops::ControlFlow::Continue(child))
+    }
+}
+
+/// Compare a path against the first parent, including its creation in a root
+/// commit. The recent-history scanner reuses the matcher across commits and
+/// supplies a time budget; callers here retain their existing boolean API.
+fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
+    CommitPathFilter::new(path_prefix)
+        .commit_touches_path(repo, commit, &mut || true)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 /// Find the commit that introduced a specific file path.
@@ -12322,31 +12477,6 @@ pub fn read_agent_profile(
     let content = fs::read_to_string(&profile_path)?;
     let value = serde_json::from_str(&content)?;
     Ok(Some(value))
-}
-
-fn repo_path_matches_filter(candidate: &Path, filter: &Path) -> bool {
-    candidate == filter || candidate.starts_with(filter)
-}
-
-/// Check if a tree has any entry with the given repo-relative path prefix.
-fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &Path) -> bool {
-    let mut found = false;
-    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        let Ok(name) = entry.name() else {
-            return git2::TreeWalkResult::Ok;
-        };
-        let candidate = if root.is_empty() {
-            PathBuf::from(name)
-        } else {
-            Path::new(root).join(name)
-        };
-        if repo_path_matches_filter(&candidate, prefix) {
-            found = true;
-            return git2::TreeWalkResult::Abort;
-        }
-        git2::TreeWalkResult::Ok
-    });
-    found
 }
 
 /// Collect lock status information for diagnostics.
@@ -23546,12 +23676,9 @@ mod tests {
             r#"{"a":1}"#,
             "touch AgentA",
         );
-        // Commit times have one-second resolution and the budget walk below
-        // relies on Sort::TIME ordering; same-second ties break arbitrarily
-        // (on fast hosts all six commits land in one second and the AgentA
-        // commit can be visited inside the budget window). Guarantee the
-        // AgentB commits are strictly newer.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // The lazy append-only walk follows ancestry even when all commits
+        // have the same one-second timestamp. No sleep or process-global
+        // environment override is needed to make this fixture deterministic.
         for i in 0..5 {
             commit_file(
                 "agents/AgentB",
@@ -23569,7 +23696,19 @@ mod tests {
         // AgentB filter returns its commits and never the AgentA one.
         let b_hits = get_recent_commits(&archive, 10, Some("agents/AgentB")).unwrap();
         assert_eq!(b_hits.len(), 5, "all five AgentB commits match");
-        assert!(b_hits.iter().all(|c| c.summary.starts_with("touch AgentB")));
+        assert_eq!(
+            b_hits
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "touch AgentB 4",
+                "touch AgentB 3",
+                "touch AgentB 2",
+                "touch AgentB 1",
+                "touch AgentB 0"
+            ]
+        );
 
         // A never-committed path yields nothing (and, crucially, returns).
         let ghost = get_recent_commits(&archive, 10, Some("agents/Ghost")).unwrap();
@@ -23578,16 +23717,426 @@ mod tests {
         // Tight budget: only the 3 newest commits (all AgentB) are examined, so
         // the older AgentA commit falls outside the scan window and is skipped —
         // proving the budget bounds the walk instead of scanning all history.
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("AM_RECENT_COMMITS_SCAN_BUDGET", "3")],
-            || {
-                let bounded = get_recent_commits(&archive, 10, Some("agents/AgentA")).unwrap();
-                assert!(
-                    bounded.is_empty(),
-                    "budget=3 must stop before reaching the older AgentA commit"
-                );
-            },
+        let bounded = collect_recent_commits(
+            &repo,
+            10,
+            Some("projects/recent-commits-filter/agents/AgentA"),
+            3,
+            &mut || true,
+        )
+        .unwrap();
+        assert!(
+            bounded.commits.is_empty(),
+            "budget=3 must stop before reaching the older AgentA commit"
         );
+        assert_eq!(bounded.scanned_commits, 3);
+        assert!(bounded.truncated);
+    }
+
+    /// Construct real Git objects with explicit ancestry/timestamps, independent
+    /// of the archive commit queue, filesystem mtimes, and process environment.
+    fn recent_history_fixture_commit(
+        repo: &Repository,
+        parents: &[git2::Oid],
+        updates: &[(&str, Option<&str>)],
+        timestamp: i64,
+        message: &str,
+    ) -> git2::Oid {
+        let parents: Vec<_> = parents
+            .iter()
+            .map(|oid| repo.find_commit(*oid).unwrap())
+            .collect();
+        let base = parents.first().map(|parent| parent.tree().unwrap());
+        let updates: Vec<_> = updates
+            .iter()
+            .map(|(path, body)| {
+                (
+                    path.to_string(),
+                    body.map(|body| repo.blob(body.as_bytes()).unwrap()),
+                )
+            })
+            .collect();
+        let tree_oid = build_tree_with_updates(repo, base.as_ref(), &updates).unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::new(
+            "HistoryTest",
+            "history@example.test",
+            &git2::Time::new(timestamp, 0),
+        )
+        .unwrap();
+        let parent_refs: Vec<_> = parents.iter().collect();
+        repo.commit(None, &signature, &signature, message, &tree, &parent_refs)
+            .unwrap()
+    }
+
+    fn recent_history_fixture_head(repo: &Repository, oid: git2::Oid) {
+        repo.reference("refs/heads/main", oid, true, "recent history fixture")
+            .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+    }
+
+    #[test]
+    fn recent_commit_history_bounds_unrelated_work_and_keeps_deletions() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("agents/BlueLake/profile.json", Some("base"))],
+            1_000,
+            "root profile",
+        );
+        let deletion = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/BlueLake/profile.json", None)],
+            2_000,
+            "delete profile",
+        );
+        let mut tip = deletion;
+        for number in 0..8 {
+            tip = recent_history_fixture_commit(
+                &repo,
+                &[tip],
+                &[("agents/RedFox/profile.json", Some(&format!("{number}")))],
+                3_000 + number,
+                &format!("unrelated activity {number}"),
+            );
+        }
+        recent_history_fixture_head(&repo, tip);
+        let bounded = collect_recent_commits(
+            &repo,
+            5,
+            Some("agents/BlueLake/profile.json"),
+            3,
+            &mut || true,
+        )
+        .unwrap();
+        assert_eq!(bounded.scanned_commits, 3);
+        assert!(bounded.commits.is_empty());
+        assert!(bounded.truncated);
+
+        let complete = collect_recent_commits(
+            &repo,
+            5,
+            Some("agents/BlueLake/profile.json"),
+            20,
+            &mut || true,
+        )
+        .unwrap();
+        assert_eq!(complete.scanned_commits, 10);
+        assert!(!complete.truncated);
+        assert_eq!(
+            complete
+                .commits
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect::<Vec<_>>(),
+            [deletion.to_string(), root.to_string()],
+        );
+        let unfiltered = collect_recent_commits(&repo, 5, None, 3, &mut || true).unwrap();
+        assert_eq!(unfiltered.commits.len(), 3);
+        assert!(unfiltered.truncated);
+    }
+
+    #[test]
+    fn recent_commit_history_preserves_ancestry_with_skewed_timestamps() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("agents/BlueLake/profile.json", Some("root"))],
+            3_000,
+            "root with a future clock",
+        );
+        let middle = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/BlueLake/profile.json", Some("middle"))],
+            1_000,
+            "middle with an older clock",
+        );
+        let tip = recent_history_fixture_commit(
+            &repo,
+            &[middle],
+            &[("agents/BlueLake/profile.json", Some("tip"))],
+            1_000,
+            "tip with a tied clock",
+        );
+        recent_history_fixture_head(&repo, tip);
+
+        let history =
+            collect_recent_commits(&repo, 10, Some("agents/BlueLake"), 10, &mut || true).unwrap();
+        assert_eq!(
+            history
+                .commits
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect::<Vec<_>>(),
+            [tip.to_string(), middle.to_string(), root.to_string()],
+        );
+        assert!(!history.truncated);
+        assert_eq!(history.scanned_commits, 3);
+
+        let limited =
+            collect_recent_commits(&repo, 1, Some("agents/BlueLake"), 10, &mut || true).unwrap();
+        assert_eq!(limited.commits.len(), 1);
+        assert_eq!(limited.commits[0].sha, tip.to_string());
+        assert_eq!(limited.scanned_commits, 1);
+        assert!(
+            !limited.truncated,
+            "fulfilling the requested limit is a complete result"
+        );
+    }
+
+    #[test]
+    fn recent_commit_history_keeps_merge_side_activity_and_first_parent_diff() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("agents/BlueLake/profile.json", Some("base"))],
+            1_000,
+            "root",
+        );
+        let main = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/RedFox/profile.json", Some("main"))],
+            2_000,
+            "main activity",
+        );
+        let side = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/BlueLake/profile.json", Some("side"))],
+            2_001,
+            "side activity",
+        );
+        let merge = recent_history_fixture_commit(
+            &repo,
+            &[main, side],
+            &[("agents/BlueLake/profile.json", Some("side"))],
+            3_000,
+            "merge side activity",
+        );
+        recent_history_fixture_head(&repo, merge);
+
+        let history =
+            collect_recent_commits(&repo, 10, Some("agents/BlueLake"), 10, &mut || true).unwrap();
+        assert_eq!(history.commits[0].sha, merge.to_string());
+        let shas: BTreeSet<_> = history
+            .commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect();
+        assert_eq!(
+            shas,
+            BTreeSet::from([merge.to_string(), side.to_string(), root.to_string()])
+        );
+        assert_eq!(
+            history.commits.len(),
+            3,
+            "shared merge ancestors must not be duplicated"
+        );
+        assert_eq!(history.scanned_commits, 4);
+        assert!(!history.truncated);
+    }
+
+    #[test]
+    fn recent_commit_history_deadline_keeps_completed_matches() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let unborn = collect_recent_commits(&repo, 8, None, 100, &mut || true).unwrap();
+        assert!(unborn.commits.is_empty());
+        assert!(!unborn.truncated);
+        let mut parent = None;
+        let mut oids = Vec::new();
+        for number in 0..8 {
+            let oid = recent_history_fixture_commit(
+                &repo,
+                &parent.into_iter().collect::<Vec<_>>(),
+                &[("profile.json", Some(&format!("{number}")))],
+                1_000 + number,
+                &format!("activity {number}"),
+            );
+            parent = Some(oid);
+            oids.push(oid);
+        }
+        recent_history_fixture_head(&repo, *oids.last().unwrap());
+
+        // A deterministic clock advancing at every cooperative checkpoint.
+        // Git object reads and history traversal remain real; only the clock
+        // is controlled so this cannot depend on CI speed or thread sleeps.
+        let mut elapsed = Duration::ZERO;
+        let history = collect_recent_commits(&repo, 8, None, 100, &mut || {
+            elapsed += Duration::from_millis(20);
+            elapsed < RECENT_COMMITS_TIME_BUDGET
+        })
+        .unwrap();
+        assert!(history.truncated);
+        assert!(
+            !history.commits.is_empty(),
+            "completed matches must survive deadline exhaustion"
+        );
+        assert!(history.commits.len() < oids.len());
+        for (actual, expected) in history.commits.iter().zip(oids.iter().rev()) {
+            assert_eq!(actual.sha, expected.to_string());
+        }
+
+        let expired = collect_recent_commits(&repo, 8, None, 100, &mut || false).unwrap();
+        assert!(expired.truncated);
+        assert!(expired.commits.is_empty());
+        assert_eq!(expired.scanned_commits, 0);
+        let zero_limit = collect_recent_commits(&repo, 0, None, 100, &mut || false).unwrap();
+        assert!(!zero_limit.truncated);
+        assert!(zero_limit.commits.is_empty());
+        assert_eq!(zero_limit.scanned_commits, 0);
+    }
+
+    #[test]
+    fn recent_commit_history_deadline_interrupts_tree_descent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("projects/p/agents/BlueLake/profile.json", Some("profile"))],
+            1_000,
+            "root",
+        );
+        let commit = repo.find_commit(root).unwrap();
+        let mut filter = CommitPathFilter::new("projects/p/agents/BlueLake/profile.json");
+        let mut elapsed = Duration::ZERO;
+        let interrupted = filter
+            .commit_touches_path(&repo, &commit, &mut || {
+                elapsed += Duration::from_millis(25);
+                elapsed < RECENT_COMMITS_TIME_BUDGET
+            })
+            .unwrap();
+        assert_eq!(
+            interrupted, None,
+            "an incomplete tree lookup must not report a non-match"
+        );
+        assert_eq!(
+            filter.tree_loads, 1,
+            "no deeper Git tree may be loaded past the deadline"
+        );
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &commit, &mut || true)
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn recent_commit_path_filter_skips_large_unchanged_subtrees() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let paths: Vec<_> = (0..2_048)
+            .map(|number| format!("agents/Agent{number:04}/profile.json"))
+            .collect();
+        let updates: Vec<_> = paths
+            .iter()
+            .map(|path| (path.as_str(), Some("profile")))
+            .collect();
+        let root = recent_history_fixture_commit(&repo, &[], &updates, 1_000, "large root");
+        let tip = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("unrelated.json", Some("change"))],
+            2_000,
+            "unrelated change",
+        );
+        let commit = repo.find_commit(tip).unwrap();
+        let mut filter = CommitPathFilter::new("agents/Agent1024/profile.json");
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            filter.tree_loads, 2,
+            "only the two root trees are needed; agents is unchanged"
+        );
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            filter.tree_loads, 2,
+            "a repeated parent/tree identity must reuse the local entry cache"
+        );
+
+        let root_commit = repo.find_commit(root).unwrap();
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &root_commit, &mut || true)
+                .unwrap(),
+            Some(true)
+        );
+        let mut missing = CommitPathFilter::new("agents/Ghost/profile.json");
+        assert_eq!(
+            missing
+                .commit_touches_path(&repo, &root_commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            missing.tree_loads, 2,
+            "a root commit lookup must not recursively walk 2,048 profiles"
+        );
+        let mut sibling = CommitPathFilter::new("agents/Agent102/profile.json");
+        assert_eq!(
+            sibling
+                .commit_touches_path(&repo, &root_commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn recent_commit_path_filter_includes_file_mode_changes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("profile.json", Some("same bytes"))],
+            1_000,
+            "root",
+        );
+        let parent = repo.find_commit(root).unwrap();
+        let tree = parent.tree().unwrap();
+        let blob = tree.get_name("profile.json").unwrap().id();
+        let mut builder = repo.treebuilder(Some(&tree)).unwrap();
+        builder.insert("profile.json", blob, 0o100_755).unwrap();
+        let changed_tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::new(
+            "HistoryTest",
+            "history@example.test",
+            &git2::Time::new(2_000, 0),
+        )
+        .unwrap();
+        let changed = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "mode only",
+                &changed_tree,
+                &[&parent],
+            )
+            .unwrap();
+        let commit = repo.find_commit(changed).unwrap();
+        assert!(commit_touches_path(&repo, &commit, "profile.json"));
+        assert!(!commit_touches_path(&repo, &commit, "profile.json/child"));
     }
 
     /// br-bvq1x.9.7 (ts2): an interrupted gc/repack can leave the branch tip
