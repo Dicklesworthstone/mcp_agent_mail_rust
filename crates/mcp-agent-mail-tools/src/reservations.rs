@@ -4103,10 +4103,10 @@ mod tests {
                 let winner_cx = cx.clone();
                 AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
                     *hook = Some(Box::pin(async move {
-                        let winner_ctx = McpContext::new(winner_cx, 2);
+                        let request_context = McpContext::new(winner_cx, 2);
                         let pressure = ReservationDiskPressure::critical();
                         let winner_error = file_reservation_paths(
-                            &winner_ctx,
+                            &request_context,
                             winner_project,
                             winner_agent,
                             vec!["src/lib.rs".to_string()],
