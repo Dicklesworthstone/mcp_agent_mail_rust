@@ -1,0 +1,99 @@
+{
+ "schema": "br-kp1in.40 closing addendum v1",
+ "arms": {
+  "A": {
+   "am_sha256": "171713fa43e891f8a3430fc4f0218ff966c78465f53a79eb65253370762dfe3c"
+  },
+  "B": {
+   "am_sha256": "c2bd8ff0a0042af7565f8ac019dcf7d5ecae7d2589182d08c931aa7c338edd3c"
+  }
+ },
+ "run_logs": {
+  "kp140_din2": "M1 P A start 2026-10-19T21:47:25Z load=1.99 3.40 3.51 df=7397M sha=171713fa43e891f8\nM1 P A exit=0 end 2026-10-19T21:52:33Z\nM2 P B start 2026-10-19T21:52:33Z load=6.06 5.64 4.50 df=5971M sha=c2bd8ff0a0042af7\nM2 P B exit=0 end 2026-10-19T21:57:41Z\nM3 P C start 2026-10-19T21:57:41Z load=7.58 6.35 5.10 df=5733M sha=d95049190da9cc5f\nM3 P C exit=0 end 2026-10-19T22:02:47Z\nM4 P C start 2026-10-19T22:02:47Z load=9.23 7.47 5.90 df=5023M sha=d95049190da9cc5f\nM4 P C exit=0 end 2026-10-19T22:07:55Z\nM5 P B start 2026-10-19T22:07:55Z load=11.90 10.13 7.49 df=3183M sha=c2bd8ff0a0042af7\nM5 P B exit=0 end 2026-10-19T22:13:02Z\nM6 P A start 2026-10-19T22:13:02Z load=8.34 8.87 7.69 df=1264M sha=171713fa43e891f8\nM6 P A exit=0 end 2026-10-19T22:18:10Z\nM7 R A start 2026-10-19T22:18:10Z load=7.93 9.44 8.34 df=1581M sha=171713fa43e891f8\n",
+  "kp140_din2X": "M1 P A start 2026-10-20T06:10:43Z load=4.96 3.36 2.84 df=68240M sha=171713fa43e891f8\nM1 P A exit=0 end 2026-10-20T06:15:51Z\nM2 P B start 2026-10-20T06:15:51Z load=6.97 5.58 3.97 df=67646M sha=c2bd8ff0a0042af7\nM2 P B exit=0 end 2026-10-20T06:20:58Z\nM3 P A start 2026-10-20T06:20:58Z load=6.34 6.49 4.85 df=68022M sha=171713fa43e891f8\nM3 P A exit=0 end 2026-10-20T06:26:06Z\nM4 P A start 2026-10-20T06:26:06Z load=11.57 9.51 6.59 df=67765M sha=171713fa43e891f8\nM4 P A exit=0 end 2026-10-20T06:31:13Z\ndone 2026-10-20T06:31:13Z\n"
+ },
+ "pairs_mode_P": [
+  {
+   "run": "kp140_din2/1-P-A",
+   "arm": "A",
+   "reads": 80765,
+   "read_p50_s": 0.00707,
+   "read_p99_s": 0.01495,
+   "sends_ok": 1200,
+   "errors": 0
+  },
+  {
+   "run": "kp140_din2/2-P-B",
+   "arm": "B",
+   "reads": 119104,
+   "read_p50_s": 0.00479,
+   "read_p99_s": 0.00837,
+   "sends_ok": 1200,
+   "errors": 0
+  },
+  {
+   "run": "kp140_din2/5-P-B",
+   "arm": "B",
+   "reads": 122610,
+   "read_p50_s": 0.00463,
+   "read_p99_s": 0.00936,
+   "sends_ok": 1200,
+   "errors": 0
+  },
+  {
+   "run": "kp140_din2/6-P-A",
+   "arm": "A",
+   "reads": 82651,
+   "read_p50_s": 0.00692,
+   "read_p99_s": 0.0139,
+   "sends_ok": 1181,
+   "errors": 55
+  },
+  {
+   "run": "kp140_din2X/1-P-A",
+   "arm": "A",
+   "reads": 82997,
+   "read_p50_s": 0.00683,
+   "read_p99_s": 0.01426,
+   "sends_ok": 1200,
+   "errors": 0
+  },
+  {
+   "run": "kp140_din2X/2-P-B",
+   "arm": "B",
+   "reads": 122180,
+   "read_p50_s": 0.00473,
+   "read_p99_s": 0.00746,
+   "sends_ok": 1200,
+   "errors": 0
+  }
+ ],
+ "aa_null_mode_P": [
+  {
+   "run": "kp140_din2X/3-P-A",
+   "arm": "A",
+   "reads": 79767,
+   "read_p50_s": 0.00703,
+   "read_p99_s": 0.01464,
+   "sends_ok": 1200,
+   "errors": 0
+  },
+  {
+   "run": "kp140_din2X/4-P-A",
+   "arm": "A",
+   "reads": 80480,
+   "read_p50_s": 0.00692,
+   "read_p99_s": 0.01464,
+   "sends_ok": 1200,
+   "errors": 0
+  }
+ ],
+ "pooled_three_pairs": {
+  "reads_B_over_A": 1.477,
+  "read_p99_B_over_A": 0.574,
+  "read_p50_B_over_A": 0.68
+ },
+ "aa_null_reads_ratio": 1.009,
+ "all_runs_valid": true,
+ "verdict": "READS NOT SLOWER"
+}
