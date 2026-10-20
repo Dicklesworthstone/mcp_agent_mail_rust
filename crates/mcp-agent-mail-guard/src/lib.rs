@@ -1317,27 +1317,6 @@ def is_expired(value, now):
             return False
     return False
 
-def artifact_stamp(name, record, mtime):
-    """(reservation id, database generation, mtime) of an artifact named
-    `id-<id>[-g<generation>].json`; the generation falls back to the record's
-    `db_generation`. None for any other name. Mirrors the Rust reader."""
-    stem = name[:-5] if name.endswith(".json") else name
-    if not stem.startswith("id-"):
-        return None
-    rest = stem[3:]
-    id_text, generation = rest, None
-    if "-g" in rest:
-        head, tail = rest.split("-g", 1)
-        if tail:
-            id_text, generation = head, tail
-    if not id_text.isdigit():
-        return None
-    if generation is None:
-        stored = record.get("db_generation")
-        if isinstance(stored, str) and stored.strip():
-            generation = stored.strip()
-    return (int(id_text), generation, mtime)
-
 def get_active_reservations():
     """Read active file reservations directly from the archive.
 
@@ -1393,7 +1372,12 @@ def get_active_reservations():
         # but through the GH#224 path that honors warn mode + names bypass.
         fail_closed("mcp-agent-mail: guard failed to read reservations: " + str(exc))
 
-    loaded = []
+    # Reservation identity is (database generation, id). Rebuilds reuse ids,
+    # and delayed old-generation releases can overwrite the shared path alias.
+    # A release in another file cannot retire an active stable artifact:
+    # filesystem mtimes do not identify the live database generation. Unlike
+    # the former GH#299 shortcut, ambiguous historical active files keep
+    # blocking until expiry or authoritative archive-normalize quarantine.
     for entry in entries:
         try:
             if not entry.is_file(follow_symlinks=False):
@@ -1407,31 +1391,12 @@ def get_active_reservations():
         try:
             with open(entry.path, "r", encoding="utf-8") as handle:
                 record = json.load(handle)
-            mtime = entry.stat(follow_symlinks=False).st_mtime
         except Exception:
             continue
-        if isinstance(record, dict):
-            loaded.append((entry.name, record, mtime))
-
-    # GH#299, as the Rust reader does: after a mailbox rebuild one reservation
-    # id can have an unreleased artifact from the previous database generation
-    # and a released one from the current generation. The newest released
-    # artifact per id supersedes an unreleased twin of another generation.
-    released_by_id = {}
-    for name, record, mtime in loaded:
-        if released_ts_marks_released(record.get("released_ts")):
-            stamp = artifact_stamp(name, record, mtime)
-            if stamp and (stamp[0] not in released_by_id or mtime > released_by_id[stamp[0]][2]):
-                released_by_id[stamp[0]] = stamp
-
-    for name, record, mtime in loaded:
+        if not isinstance(record, dict):
+            continue
         if released_ts_marks_released(record.get("released_ts")):
             continue
-        stamp = artifact_stamp(name, record, mtime)
-        if stamp and stamp[0] in released_by_id:
-            released = released_by_id[stamp[0]]
-            if released[1] != stamp[1] and released[2] >= stamp[2]:
-                continue
         if is_expired(record.get("expires_ts"), now):
             continue
 
@@ -2493,24 +2458,17 @@ fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
-/// Unreleased reservation artifacts plus, per reservation id, the newest
-/// released artifact seen (GH#299).
-type ReservationArtifactScan = (
-    Vec<(std::path::PathBuf, serde_json::Value)>,
-    std::collections::HashMap<u64, ReservationArtifactStamp>,
-);
-
-fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<ReservationArtifactScan> {
-    // GH#299: after a mailbox rebuild the archive can hold two generation
-    // stamped artifacts for one reservation id: `id-<id>-g<old>.json` with
-    // `released_ts: null` from the previous database generation and
-    // `id-<id>-g<current>.json` released under the current one. The old
-    // artifact is history, not an active reservation. Track, per id, the
-    // newest released artifact so a superseded foreign-generation active
-    // twin is skipped below.
-    let mut candidates: Vec<(std::path::PathBuf, serde_json::Value)> = Vec::new();
-    let mut released_by_id: std::collections::HashMap<u64, ReservationArtifactStamp> =
-        std::collections::HashMap::new();
+/// Scan unreleased artifacts independently. Reservation identity is the pair
+/// `(database generation, id)`; a rebuilt database can reuse the numeric id for
+/// another lease. A delayed old-generation release can also overwrite the
+/// shared path alias, leaving the active stable artifact as its only protection.
+///
+/// The archive-only guard cannot identify the live generation from filesystem
+/// mtimes. Unlike the former GH#299 shortcut, a foreign-generation release never
+/// suppresses an active artifact. Historical active artifacts left by recovery
+/// therefore block until expiry or authoritative archive-normalize quarantine.
+fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<Vec<serde_json::Value>> {
+    let mut candidates = Vec::new();
 
     let entries = std::fs::read_dir(reservations_dir)?;
     for entry in entries {
@@ -2545,25 +2503,14 @@ fn scan_reservation_artifacts(reservations_dir: &Path) -> GuardResult<Reservatio
             continue;
         };
 
-        // Skip released reservations, remembering them per reservation id.
         // Older archive artifacts sometimes persisted zero-like sentinels for
         // still-active reservations, and the DB layer still treats those as active.
         if released_ts_marks_record_released(&val["released_ts"]) {
-            if let Some(stamp) = reservation_artifact_stamp(&path, &val, metadata.as_ref()) {
-                released_by_id
-                    .entry(stamp.id)
-                    .and_modify(|existing| {
-                        if stamp.modified > existing.modified {
-                            *existing = stamp.clone();
-                        }
-                    })
-                    .or_insert(stamp);
-            }
             continue;
         }
-        candidates.push((path, val));
+        candidates.push(val);
     }
-    Ok((candidates, released_by_id))
+    Ok(candidates)
 }
 
 /// Read active file reservations from the archive's `file_reservations/` directory.
@@ -2583,21 +2530,7 @@ fn read_active_reservations_from_archive(
 
     let now = chrono::Utc::now();
     let mut records = Vec::new();
-    let (candidates, released_by_id) = scan_reservation_artifacts(&reservations_dir)?;
-
-    for (path, val) in candidates {
-        // GH#299: an unreleased artifact from another database generation is
-        // superseded by a released twin of the same id that is at least as
-        // recent (the current generation's release), and never blocks delivery.
-        if let Some(stamp) =
-            reservation_artifact_stamp(&path, &val, std::fs::metadata(&path).ok().as_ref())
-            && let Some(released) = released_by_id.get(&stamp.id)
-            && released.generation != stamp.generation
-            && released.modified >= stamp.modified
-        {
-            continue;
-        }
-
+    for val in scan_reservation_artifacts(&reservations_dir)? {
         // Parse expires_ts and check expiry
         let expires_str = match val["expires_ts"].as_str() {
             Some(s) => s.to_string(),
@@ -2667,45 +2600,6 @@ fn read_active_reservations_from_archive(
     }
 
     Ok(records)
-}
-
-/// Identity of one reservation artifact: numeric reservation id, the
-/// database generation it was written under (from the `id-<id>-g<gen>.json`
-/// name, else the record's `db_generation`, else none), and its mtime.
-#[derive(Clone, Debug)]
-struct ReservationArtifactStamp {
-    id: u64,
-    generation: Option<String>,
-    modified: std::time::SystemTime,
-}
-
-fn reservation_artifact_stamp(
-    path: &Path,
-    record: &serde_json::Value,
-    metadata: Option<&std::fs::Metadata>,
-) -> Option<ReservationArtifactStamp> {
-    let stem = path.file_stem()?.to_str()?;
-    let rest = stem.strip_prefix("id-")?;
-    let (id_text, name_generation) = match rest.split_once("-g") {
-        Some((id, generation)) if !generation.is_empty() => (id, Some(generation.to_string())),
-        _ => (rest, None),
-    };
-    let id = id_text.parse::<u64>().ok()?;
-    let generation = name_generation.or_else(|| {
-        record["db_generation"]
-            .as_str()
-            .map(str::trim)
-            .filter(|generation| !generation.is_empty())
-            .map(str::to_string)
-    });
-    let modified = metadata
-        .and_then(|meta| meta.modified().ok())
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    Some(ReservationArtifactStamp {
-        id,
-        generation,
-        modified,
-    })
 }
 
 fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
@@ -4127,57 +4021,111 @@ mod tests {
         }
     }
 
-    /// GH#299: after a mailbox rebuild, an unreleased artifact from the previous
-    /// database generation must not block delivery when the same reservation
-    /// id has a released artifact under the current generation.
+    struct ReservationGenerationFixture {
+        active: serde_json::Value,
+        active_path: PathBuf,
+        foreign_path: PathBuf,
+        alias_path: PathBuf,
+    }
+
+    impl ReservationGenerationFixture {
+        fn write(archive: &Path, foreign_owner: &str) -> Self {
+            let dir = archive.join("file_reservations");
+            std::fs::create_dir_all(&dir).expect("mkdir reservations");
+            let active = serde_json::json!({
+                "id": 123,
+                "project": archive.to_string_lossy(),
+                "path_pattern": "main.rs",
+                "agent": "BlueLake",
+                "exclusive": true,
+                "created_ts": "2026-10-01T00:00:00Z",
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": null,
+                "db_generation": "11223344",
+            });
+            let active_path = dir.join("id-123-g11223344.json");
+            let foreign_path = dir.join("id-123-gaabbccdd.json");
+            // SHA1("main.rs"): the same legacy path alias written by storage.
+            let alias_path = dir.join("d28144c4832d52a64a74ddd6d29c1c182d228e1f.json");
+            std::fs::write(&active_path, active.to_string()).expect("write active stable artifact");
+            std::fs::write(&alias_path, active.to_string()).expect("write active path alias");
+
+            // An old cleanup publication arrives after a rebuild reused the
+            // row id and path. It owns a different stable filename but replaces
+            // the shared alias, leaving only the current stable file active.
+            let mut released = active.clone();
+            released["db_generation"] = serde_json::json!("aabbccdd");
+            released["agent"] = serde_json::json!(foreign_owner);
+            released["released_ts"] = serde_json::json!("2026-10-02T00:00:00Z");
+            std::fs::write(&foreign_path, released.to_string())
+                .expect("write foreign terminal artifact");
+            std::fs::write(&alias_path, released.to_string()).expect("overwrite shared path alias");
+            Self {
+                active,
+                active_path,
+                foreign_path,
+                alias_path,
+            }
+        }
+
+        fn set_foreign_mtime(&self, foreign_seconds: u64) {
+            let epoch = std::time::SystemTime::UNIX_EPOCH;
+            for (path, seconds) in [
+                (&self.active_path, 1_700_000_200),
+                (&self.foreign_path, foreign_seconds),
+                (&self.alias_path, foreign_seconds),
+            ] {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open artifact for deterministic timestamp")
+                    .set_modified(epoch + Duration::from_secs(seconds))
+                    .expect("set artifact timestamp");
+            }
+        }
+
+        fn release_current(&self) {
+            let mut released = self.active.clone();
+            released["released_ts"] = serde_json::json!("2026-10-03T00:00:00Z");
+            for path in [&self.active_path, &self.alias_path] {
+                std::fs::write(path, released.to_string()).expect("publish current release");
+            }
+        }
+    }
+
+    /// The former GH#299 shortcut confused publication order with database
+    /// authority. Even identical owners cannot establish generation identity;
+    /// historical active files require expiry or authoritative normalization.
     #[test]
-    fn foreign_generation_active_artifact_is_superseded_by_released_current_twin() {
-        let td = tempfile::TempDir::new().expect("tempdir");
-        let archive = td.path().join("archive");
-        let res_dir = archive.join("file_reservations");
-        std::fs::create_dir_all(&res_dir).expect("mkdir");
-        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    fn foreign_generation_release_never_suppresses_an_active_artifact() {
+        for foreign_owner in ["BlueLake", "GreenLake"] {
+            for foreign_seconds in [1_700_000_100, 1_700_000_200, 1_700_000_300] {
+                let td = tempfile::TempDir::new().expect("tempdir");
+                let fixture = ReservationGenerationFixture::write(td.path(), foreign_owner);
+                fixture.set_foreign_mtime(foreign_seconds);
 
-        // Old generation: still "active" on disk.
-        let old = serde_json::json!({
-            "path_pattern": "src/lib.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": future,
-            "released_ts": null,
-            "db_generation": "oldgen00"
-        });
-        std::fs::write(res_dir.join("id-123-goldgen00.json"), old.to_string()).expect("write");
-        // Current generation: released. Written afterwards, so at least as recent.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let current = serde_json::json!({
-            "path_pattern": "src/lib.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": future,
-            "released_ts": "2026-09-02T00:00:00Z",
-            "db_generation": "curgen11"
-        });
-        std::fs::write(res_dir.join("id-123-gcurgen11.json"), current.to_string()).expect("write");
-        // A different id with only an old-generation active artifact stays active:
-        // nothing in the current generation says it was released.
-        let lone = serde_json::json!({
-            "path_pattern": "src/other.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": future,
-            "released_ts": null,
-            "db_generation": "oldgen00"
-        });
-        std::fs::write(res_dir.join("id-124-goldgen00.json"), lone.to_string()).expect("write");
+                let active = read_active_reservations_from_archive(td.path(), false).expect("read");
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "the stable artifact is the sole active copy"
+                );
+                let paths = vec!["main.rs".to_string()];
+                let conflicts = check_path_conflicts(&paths, &active, "PinkStone", false)
+                    .expect("check protected path");
+                assert_eq!(conflicts.len(), 1, "{foreign_owner}, {foreign_seconds}");
+                assert_eq!(conflicts[0].holder, "BlueLake");
 
-        let active = read_active_reservations_from_archive(&archive, false).expect("read");
-        let patterns: Vec<&str> = active.iter().map(|r| r.path_pattern.as_str()).collect();
-        assert_eq!(
-            patterns,
-            vec!["src/other.rs"],
-            "the superseded foreign-generation artifact must be skipped: {patterns:?}"
-        );
+                fixture.release_current();
+                let active = read_active_reservations_from_archive(td.path(), false).expect("read");
+                assert!(
+                    check_path_conflicts(&paths, &active, "PinkStone", false)
+                        .expect("check released path")
+                        .is_empty(),
+                    "the current generation's own release must unblock the path"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6067,11 +6015,10 @@ mod tests {
         assert!(script.contains("sys.exit(2)"));
     }
 
-    /// GH#299 in the installed hook, as in the Rust reader: an unreleased
-    /// artifact from the previous database generation is superseded by a
-    /// released twin of the same id, and alone it still blocks.
+    /// The installed hook must preserve the same generation boundary as the
+    /// Rust reader, including when a foreign release replaces the path alias.
     #[test]
-    fn guard_plugin_skips_a_previous_generation_twin_of_a_released_reservation() {
+    fn guard_plugin_keeps_active_reservations_across_foreign_generation_releases() {
         let Some(python) = python_executable() else {
             return;
         };
@@ -6081,65 +6028,52 @@ mod tests {
         run_git(&repo_dir, &["init", "-q"]);
         std::fs::write(repo_dir.join("main.rs"), "fn main() {}\n").expect("write staged");
         run_git(&repo_dir, &["add", "main.rs"]);
-        let reservations_dir = repo_dir.join("file_reservations");
-        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
-        let active = serde_json::json!({
-            "path_pattern": "main.rs",
-            "agent_name": "OtherAgent",
-            "exclusive": true,
-            "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            "released_ts": serde_json::Value::Null,
-        });
-        std::fs::write(
-            reservations_dir.join("id-123-goldgen00.json"),
-            active.to_string(),
-        )
-        .expect("write previous-generation artifact");
         let script_path = td.path().join("guard.py");
         std::fs::write(
             &script_path,
             render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
         )
         .expect("write guard script");
-        let run = || {
+        let run = |mode: &str| {
             Command::new(&python)
                 .current_dir(&repo_dir)
                 .env("AGENT_NAME", "PinkStone")
+                .env("AGENT_MAIL_GUARD_MODE", mode)
+                .env("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", "true")
+                .env_remove("AGENT_MAIL_BYPASS")
                 .arg(&script_path)
                 .output()
                 .expect("run guard script")
         };
 
-        assert_eq!(
-            run().status.code(),
-            Some(1),
-            "alone, the stale artifact blocks"
-        );
-        // Warn mode is read like `am guard check` reads it: trimmed, any case.
-        let warned = Command::new(&python)
-            .current_dir(&repo_dir)
-            .env("AGENT_NAME", "PinkStone")
-            .env("AGENT_MAIL_GUARD_MODE", " Warn ")
-            .arg(&script_path)
-            .output()
-            .expect("run guard script in warn mode");
-        assert_eq!(warned.status.code(), Some(0));
-        assert!(String::from_utf8_lossy(&warned.stderr).contains("WARNING"));
+        for foreign_owner in ["BlueLake", "GreenLake"] {
+            for foreign_seconds in [1_700_000_100, 1_700_000_200, 1_700_000_300] {
+                let fixture = ReservationGenerationFixture::write(&repo_dir, foreign_owner);
+                fixture.set_foreign_mtime(foreign_seconds);
+                let output = run("block");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "foreign release must not unblock: {foreign_owner}, {foreign_seconds}: {stderr}"
+                );
+                assert!(stderr.contains("held by BlueLake"), "{stderr}");
 
-        let mut released = active;
-        released["released_ts"] = serde_json::json!("2026-10-07T00:00:00Z");
-        std::fs::write(
-            reservations_dir.join("id-123-gcurgen11.json"),
-            released.to_string(),
-        )
-        .expect("write current-generation release");
-        let output = run();
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "a released current-generation twin supersedes it: stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+                // Warn mode remains trimmed and case-insensitive.
+                let warned = run(" Warn ");
+                assert_eq!(warned.status.code(), Some(0));
+                assert!(String::from_utf8_lossy(&warned.stderr).contains("WARNING"));
+
+                fixture.release_current();
+                let output = run("block");
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "the current generation's own release must unblock: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 
     /// A `STORAGE_ROOT` configured at install time (the installer writes it to
