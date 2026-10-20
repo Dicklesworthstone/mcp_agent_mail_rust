@@ -19,9 +19,7 @@ use serde_json::{Value, json};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::degraded_intents::{
     QueuedReleaseIntentView as QueuedReleaseIntent, append_jsonl as append_degraded_intent_jsonl,
@@ -275,6 +273,29 @@ fn validate_conflict_check_paths(paths: &[String]) -> McpResult<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ReservationArchivePublicationError {
+    #[error("reservation archive publication was skipped because disk pressure is critical")]
+    DiskCritical,
+    #[error("reservation archive publication failed: {0}")]
+    WriteFailed(String),
+    #[error("current active reservations do not have confirmed guard-visible archive coverage")]
+    CoverageUnconfirmed,
+    #[error("current reservation archive coverage could not be verified: {0}")]
+    VerificationFailed(String),
+}
+
+impl ReservationArchivePublicationError {
+    const fn cause(&self) -> &'static str {
+        match self {
+            Self::DiskCritical => "disk_critical",
+            Self::WriteFailed(_) => "archive_write_failed",
+            Self::CoverageUnconfirmed => "archive_coverage_unconfirmed",
+            Self::VerificationFailed(_) => "archive_verification_failed",
+        }
+    }
+}
+
 /// The single chokepoint every reservation mutation (acquire / renew / release /
 /// force-release) and the reconcile-on-read healer funnel their archive write
 /// through, so `SQLite` and the Git/JSON archive cannot drift independently (F1,
@@ -295,7 +316,7 @@ fn dispatch_reservation_archive_write_inner(
     op: mcp_agent_mail_storage::WriteOp,
     context: &str,
     cx: Option<&asupersync::Cx>,
-) {
+) -> Result<(), ReservationArchivePublicationError> {
     // GH#178: the reservation JSON artifact (`id-<id>.json`) must be durable on
     // return because the pre-commit guard reads it directly; a stale artifact
     // yields the *wrong holder* (GH#112). The previous implementation enqueued
@@ -318,15 +339,12 @@ fn dispatch_reservation_archive_write_inner(
         |cx| mcp_agent_mail_storage::write_op_sync_direct_cancellable(cx, &op),
     );
     match outcome {
-        // Written: the guard-visible artifact is durable. SkippedDiskCritical:
-        // intended disk-pressure behavior — DB stays authoritative and
-        // reconcile-on-read heals the archive once pressure clears (the WBQ
-        // also refuses enqueue at disk-critical, so a retry queue cannot help
-        // here). Active rows heal via the active pass; released rows whose
-        // artifact still claims ACTIVE heal via the released-row pass
-        // (br-74sxo) on the next reservation access.
-        mcp_agent_mail_storage::DirectArchiveWrite::Written
-        | mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {}
+        mcp_agent_mail_storage::DirectArchiveWrite::Written => Ok(()),
+        // The DB lease is already committed, but the guard cannot consult it.
+        // A skip must not be reported as successful acquire/renew admission.
+        mcp_agent_mail_storage::DirectArchiveWrite::SkippedDiskCritical => {
+            Err(ReservationArchivePublicationError::DiskCritical)
+        }
         // The direct write failed (e.g. ENOSPC, FD exhaustion). The DB state is
         // authoritative and the archive is best-effort — but the fallback must
         // not reorder history. A queued op's content is frozen at enqueue time,
@@ -339,6 +357,7 @@ fn dispatch_reservation_archive_write_inner(
         // background retry; active ops rely on reconcile-on-read, exactly like
         // the disk-critical skip above.
         mcp_agent_mail_storage::DirectArchiveWrite::Failed(error) => {
+            let failure = ReservationArchivePublicationError::WriteFailed(error.to_string());
             if reservation_op_is_terminal_release(&op) {
                 tracing::warn!(
                     error = %error,
@@ -353,20 +372,24 @@ fn dispatch_reservation_archive_write_inner(
                      rewrite could shadow a newer release)"
                 );
             }
+            Err(failure)
         }
     }
 }
 
-fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
-    dispatch_reservation_archive_write_inner(op, context, None);
+fn dispatch_reservation_archive_write(
+    op: mcp_agent_mail_storage::WriteOp,
+    context: &str,
+) -> Result<(), ReservationArchivePublicationError> {
+    dispatch_reservation_archive_write_inner(op, context, None)
 }
 
 fn dispatch_reservation_archive_write_cancellable(
     ctx: &McpContext,
     op: mcp_agent_mail_storage::WriteOp,
     context: &str,
-) {
-    dispatch_reservation_archive_write_inner(op, context, Some(ctx.cx()));
+) -> Result<(), ReservationArchivePublicationError> {
+    dispatch_reservation_archive_write_inner(op, context, Some(ctx.cx()))
 }
 
 /// Is every record in this archive op a TERMINAL release artifact (`released_ts`
@@ -464,6 +487,158 @@ async fn fetch_db_generation(ctx: &McpContext, pool: &mcp_agent_mail_db::DbPool)
         asupersync::Outcome::Ok(value) => value,
         _ => None,
     }
+}
+
+/// Certification is stricter than the parity healer: omitted guard fields and
+/// malformed release markers must never count as proof of coverage. Require
+/// the canonical fields emitted by acquire/renew, including the live expiry.
+fn active_artifact_confirms_guard_coverage(
+    record: &Value,
+    project_human_key: &str,
+    agent_name: &str,
+    row: &mcp_agent_mail_db::FileReservationRow,
+    generation: &str,
+) -> bool {
+    row.id.is_some_and(|id| id > 0)
+        && row.expires_ts > mcp_agent_mail_db::now_micros()
+        && !ts_is_positive(row.released_ts)
+        && record.get("id").and_then(Value::as_i64) == row.id
+        && record.get("project").and_then(Value::as_str) == Some(project_human_key)
+        && record.get("agent").and_then(Value::as_str) == Some(agent_name)
+        // The guard prefers agent_name when both spellings are present.
+        && record
+            .get("agent_name")
+            .is_none_or(|value| value.as_str() == Some(agent_name))
+        && record.get("path_pattern").and_then(Value::as_str) == Some(row.path_pattern.as_str())
+        && record.get("exclusive").and_then(Value::as_bool) == Some(row.exclusive != 0)
+        && record.get("expires_ts").and_then(Value::as_str)
+            == Some(micros_to_iso(row.expires_ts).as_str())
+        && record.get("db_generation").and_then(Value::as_str) == Some(generation)
+        && record.get("released_ts").is_none_or(Value::is_null)
+}
+
+fn read_guard_coverage_artifact(path: &Path) -> Option<(Value, std::fs::Metadata)> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    // Match the guard's regular-file and size admission rules.
+    if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
+        return None;
+    }
+    let record = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    Some((record, metadata))
+}
+
+/// Read-only certification for the current active subset of an idempotent
+/// grant. Never re-emit these snapshots: a release may commit after the read.
+/// Foreign-generation terminal siblings can suppress an otherwise valid file
+/// in the guard, so selected IDs share one filename inventory to detect them.
+fn replay_guard_coverage_confirmed(
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent_name: &str,
+    current_rows: &[mcp_agent_mail_db::FileReservationRow],
+    config: &Config,
+    db_generation: Option<&str>,
+) -> bool {
+    if current_rows.is_empty() {
+        return true;
+    }
+    let Some(generation) = db_generation.filter(|generation| {
+        !generation.is_empty()
+            && generation.len() <= 128
+            && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) else {
+        return false;
+    };
+    let reservation_dir = config
+        .storage_root
+        .join("projects")
+        .join(&project.slug)
+        .join("file_reservations");
+    if !std::fs::symlink_metadata(&reservation_dir)
+        .is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        return false;
+    }
+
+    let mut current_modified = HashMap::with_capacity(current_rows.len());
+    for row in current_rows {
+        let Some(id) = row.id.filter(|id| *id > 0) else {
+            return false;
+        };
+        let path = reservation_dir.join(
+            mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                Some(generation),
+                id,
+            ),
+        );
+        let Some((record, metadata)) = read_guard_coverage_artifact(&path) else {
+            return false;
+        };
+        if !active_artifact_confirms_guard_coverage(
+            &record,
+            &project.human_key,
+            agent_name,
+            row,
+            generation,
+        ) {
+            return false;
+        }
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        current_modified.insert(id, modified);
+    }
+
+    let Ok(entries) = std::fs::read_dir(&reservation_dir) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(stem) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("id-"))
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        // Mirror the guard here: unlike the canonical filename parser it also
+        // attributes non-hex generation spellings in historical artifacts.
+        let (id_text, named_generation) = match stem.split_once("-g") {
+            Some((id, token)) if !token.is_empty() => (id, Some(token)),
+            _ => (stem, None),
+        };
+        let Some(modified) = id_text
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| current_modified.get(&id))
+        else {
+            continue;
+        };
+        if named_generation == Some(generation) {
+            continue;
+        }
+        let Some((record, metadata)) = read_guard_coverage_artifact(&entry.path()) else {
+            continue;
+        };
+        let sibling_generation = named_generation.or_else(|| {
+            record
+                .get("db_generation")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+        if sibling_generation != Some(generation)
+            && record
+                .get("released_ts")
+                .is_some_and(|value| !value.is_null())
+            && metadata.modified().is_ok_and(|value| value >= *modified)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn ts_is_positive(ts: Option<i64>) -> bool {
@@ -601,21 +776,25 @@ fn reconcile_active_reservation_archive(
         return 0;
     }
     let healed = heal.len();
-    tracing::debug!(
-        "reconcile-on-read healed {healed} stale/missing reservation archive artifact(s) for project={}",
-        project.slug
-    );
     let op = mcp_agent_mail_storage::WriteOp::FileReservation {
         project_slug: project.slug.clone(),
         config: config.clone(),
         reservations: heal,
     };
-    dispatch_reservation_archive_write(
+    if dispatch_reservation_archive_write(
         op,
         &format!(
             "reservation archive reconcile-on-read project={}",
             project.slug
         ),
+    )
+    .is_err()
+    {
+        return 0;
+    }
+    tracing::debug!(
+        "reconcile-on-read healed {healed} stale/missing reservation archive artifact(s) for project={}",
+        project.slug
     );
     healed
 }
@@ -719,21 +898,25 @@ fn reconcile_released_reservation_archive(
         return 0;
     }
     let healed = heal.len();
-    tracing::debug!(
-        "reconcile-on-read healed {healed} stale-active artifact(s) for released reservation(s) in project={}",
-        project.slug
-    );
     let op = mcp_agent_mail_storage::WriteOp::FileReservation {
         project_slug: project.slug.clone(),
         config: config.clone(),
         reservations: heal,
     };
-    dispatch_reservation_archive_write(
+    if dispatch_reservation_archive_write(
         op,
         &format!(
             "reservation archive released-row reconcile-on-read project={}",
             project.slug
         ),
+    )
+    .is_err()
+    {
+        return 0;
+    }
+    tracing::debug!(
+        "reconcile-on-read healed {healed} stale-active artifact(s) for released reservation(s) in project={}",
+        project.slug
     );
     healed
 }
@@ -1083,7 +1266,7 @@ fn dispatch_release_archive_write(
         config: config.clone(),
         reservations: res_jsons,
     };
-    dispatch_reservation_archive_write_cancellable(
+    let _ = dispatch_reservation_archive_write_cancellable(
         ctx,
         op,
         &format!("reservation release archive write project={}", project.slug),
@@ -1316,6 +1499,109 @@ fn collect_previous_expiries(
         .filter(|row| renewal_filter_matches(row, agent_id, paths, reservation_ids))
         .filter_map(|row| row.id.map(|id| (id, row.expires_ts)))
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct ReservationArchiveRequest<'a> {
+    operation: &'static str,
+    idempotency_key: Option<&'a str>,
+    idempotent_replay: bool,
+}
+
+/// Publication can fail after the authoritative mutation commits. Keep that
+/// distinction visible so callers neither edit without guard coverage nor
+/// assume the committed leases were rolled back. A batch may be partially
+/// published, so this reports unconfirmed coverage rather than no publication.
+fn reservation_archive_failure(
+    request: ReservationArchiveRequest<'_>,
+    project: &mcp_agent_mail_db::ProjectRow,
+    agent: &mcp_agent_mail_db::AgentRow,
+    requested_paths: &[String],
+    committed_rows: &[mcp_agent_mail_db::FileReservationRow],
+    current_ids: Option<&[i64]>,
+    failure: &ReservationArchivePublicationError,
+) -> McpError {
+    let committed_ids: Vec<i64> = committed_rows.iter().filter_map(|row| row.id).collect();
+    let recovery_ids = current_ids.unwrap_or(&committed_ids);
+    let (recovery, guidance) = if let Some(key) = request.idempotency_key {
+        (
+            json!({
+                "tool": "renew_file_reservations",
+                "arguments": {
+                    "project_key": project.human_key,
+                    "agent_name": agent.name,
+                    "file_reservation_ids": recovery_ids,
+                    "extend_seconds": 60,
+                },
+                "then_retry": {
+                    "tool": "file_reservation_paths",
+                    "idempotency_key": key,
+                    "reuse_original_arguments": true,
+                },
+            }),
+            "Do NOT edit the requested paths. The database leases remain committed, but \
+             guard-visible archive coverage is unconfirmed and may be partial. After the \
+             reported publication problem clears, call renew_file_reservations with the \
+             listed IDs, then retry the original request with the SAME idempotency \
+             key and arguments. Renewal publishes authoritative lease state and extends \
+             live leases by 60 seconds; released or expired IDs are not reacquired. A \
+             keyed replay only verifies coverage and does not repair archive artifacts.",
+        )
+    } else if request.operation == "renew_file_reservations" {
+        (
+            json!({
+                "tool": "renew_file_reservations",
+                "arguments": {
+                    "project_key": project.human_key,
+                    "agent_name": agent.name,
+                    "file_reservation_ids": recovery_ids,
+                    "extend_seconds": 60,
+                },
+            }),
+            "Do NOT edit the requested paths. The renewal already committed in the \
+             database, but guard-visible archive coverage is unconfirmed and may be \
+             partial. After the reported publication problem clears, renew the listed \
+             current IDs to publish their current state. This recovery renewal adds \
+             another 60 seconds to live leases; it does not reacquire released or expired IDs.",
+        )
+    } else {
+        (
+            json!({
+                "tool": "file_reservation_paths",
+                "reuse_original_arguments": true,
+                "existing_reservation_ids": recovery_ids,
+            }),
+            "Do NOT edit the requested paths. The database leases remain committed, but \
+             guard-visible archive coverage is unconfirmed and may be partial. After the \
+             reported publication problem clears, retry the same request and arguments. \
+             An unkeyed retry reuses this agent's still-active exact-path lease IDs. If a \
+             lease has expired or been released, normal conflict checks apply to a new \
+             acquisition; the old lease is not resurrected.",
+        )
+    };
+    legacy_tool_error(
+        "RESERVATION_ARCHIVE_UNAVAILABLE",
+        "Reservation database change committed, but guard-visible archive coverage is unconfirmed.",
+        true,
+        json!({
+            "operation": request.operation,
+            "phase": "archive_publication",
+            "db_committed": true,
+            "guard_coverage_confirmed": false,
+            "fail_closed": true,
+            "blocks_edits": true,
+            "safe_to_continue_read_only": true,
+            "requested_paths": requested_paths,
+            "do_not_edit": requested_paths,
+            "committed_reservation_ids": committed_ids,
+            "current_reservation_ids": current_ids,
+            "idempotent_replay": request.idempotent_replay,
+            "cause": failure.cause(),
+            "detail": failure.to_string(),
+            "recovery": recovery,
+            "guidance": guidance,
+        }),
+    )
 }
 
 /// F5 (br-bvq1x.6.5): build a fail-closed envelope for a reservation ACQUIRE
@@ -2232,27 +2518,101 @@ pub async fn file_reservation_paths(
         })
         .collect();
 
-    // Write reservation artifacts to git archive (best-effort, via WBQ).
-    // Skipped on an idempotent replay: the original grant already produced the
-    // archive artifacts, so a retry must not enqueue a second bundle.
-    if !granted_rows.is_empty() && !idempotent_replay {
+    let archive_request = ReservationArchiveRequest {
+        operation: "file_reservation_paths",
+        idempotency_key: idempotency_key.as_deref(),
+        idempotent_replay,
+    };
+    let committed_ids: Vec<i64> = granted_rows.iter().filter_map(|row| row.id).collect();
+    if !granted_rows.is_empty() && idempotent_replay {
+        // Refresh AFTER the create transaction has reported a replay: a
+        // concurrent winner may not have existed in the precheck snapshot.
+        // Keep the historical response, but certify only original IDs that
+        // are still active now. Never publish either snapshot here; a release
+        // can race this read, and replay must not resurrect its artifact.
+        let current_rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
+        )
+        .map_err(|error| {
+            reservation_archive_failure(
+                archive_request,
+                &project,
+                &agent,
+                &paths,
+                &granted_rows,
+                None,
+                &ReservationArchivePublicationError::VerificationFailed(error.to_string()),
+            )
+        })?;
+        let original_by_id: HashMap<i64, &mcp_agent_mail_db::FileReservationRow> = granted_rows
+            .iter()
+            .filter_map(|row| row.id.map(|id| (id, row)))
+            .collect();
+        let current_rows: Vec<mcp_agent_mail_db::FileReservationRow> = current_rows
+            .into_iter()
+            .filter(|row| row.id.is_some_and(|id| original_by_id.contains_key(&id)))
+            .collect();
+        if !current_rows.is_empty() {
+            let current_ids: Vec<i64> = current_rows.iter().filter_map(|row| row.id).collect();
+            let db_generation = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::db_generation_id(ctx.cx(), &pool).await,
+            )
+            .map_err(|error| {
+                reservation_archive_failure(
+                    archive_request,
+                    &project,
+                    &agent,
+                    &paths,
+                    &granted_rows,
+                    Some(&current_ids),
+                    &ReservationArchivePublicationError::VerificationFailed(error.to_string()),
+                )
+            })?;
+            let same_leases = current_rows.iter().all(|row| {
+                row.id
+                    .and_then(|id| original_by_id.get(&id))
+                    .is_some_and(|original| {
+                        row.project_id == original.project_id
+                            && row.agent_id == agent_id
+                            && row.agent_id == original.agent_id
+                            && row.path_pattern == original.path_pattern
+                            && row.created_ts == original.created_ts
+                    })
+            });
+            if !same_leases
+                || !replay_guard_coverage_confirmed(
+                    &project,
+                    &agent.name,
+                    &current_rows,
+                    &Config::get(),
+                    db_generation.as_deref(),
+                )
+            {
+                return Err(reservation_archive_failure(
+                    archive_request,
+                    &project,
+                    &agent,
+                    &paths,
+                    &granted_rows,
+                    Some(&current_ids),
+                    &ReservationArchivePublicationError::CoverageUnconfirmed,
+                ));
+            }
+        }
+    } else if !granted_rows.is_empty() {
+        // The DB grant has committed, but admission is not successful until
+        // its guard-visible JSON is published. Git commits remain coalesced.
         let config = &Config::get();
         let db_generation = fetch_db_generation(ctx, &pool).await;
         let res_jsons: Vec<serde_json::Value> = granted_rows
             .iter()
-            .map(|r| {
-                let mut value = serde_json::json!({
-                    "id": r.id.unwrap_or(0),
-                    "project": &project.human_key,
-                    "agent": &agent.name,
-                    "path_pattern": &r.path_pattern,
-                    "exclusive": r.exclusive != 0,
-                    "reason": &r.reason,
-                    "created_ts": micros_to_iso(r.created_ts),
-                    "expires_ts": micros_to_iso(r.expires_ts),
-                });
-                stamp_db_generation(&mut value, db_generation.as_deref());
-                value
+            .map(|row| {
+                active_reservation_artifact_json(
+                    &project.human_key,
+                    &agent.name,
+                    row,
+                    db_generation.as_deref(),
+                )
             })
             .collect();
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -2264,7 +2624,18 @@ pub async fn file_reservation_paths(
             ctx,
             op,
             &format!("reservation archive write project={}", project.slug),
-        );
+        )
+        .map_err(|failure| {
+            reservation_archive_failure(
+                archive_request,
+                &project,
+                &agent,
+                &paths,
+                &granted_rows,
+                Some(&committed_ids),
+                &failure,
+            )
+        })?;
     }
 
     let conflicts_len = conflicts.len();
@@ -2648,19 +3019,13 @@ pub async fn renew_file_reservations(
         let db_generation = fetch_db_generation(ctx, &pool).await;
         let res_jsons: Vec<serde_json::Value> = renewed_rows
             .iter()
-            .map(|r| {
-                let mut value = serde_json::json!({
-                    "id": r.id.unwrap_or(0),
-                    "project": &project.human_key,
-                    "agent": &agent.name,
-                    "path_pattern": &r.path_pattern,
-                    "exclusive": r.exclusive != 0,
-                    "reason": &r.reason,
-                    "created_ts": micros_to_iso(r.created_ts),
-                    "expires_ts": micros_to_iso(r.expires_ts),
-                });
-                stamp_db_generation(&mut value, db_generation.as_deref());
-                value
+            .map(|row| {
+                active_reservation_artifact_json(
+                    &project.human_key,
+                    &agent.name,
+                    row,
+                    db_generation.as_deref(),
+                )
             })
             .collect();
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
@@ -2672,7 +3037,27 @@ pub async fn renew_file_reservations(
             ctx,
             op,
             &format!("reservation renewal archive write project={}", project.slug),
-        );
+        )
+        .map_err(|failure| {
+            let paths: Vec<String> = renewed_rows
+                .iter()
+                .map(|row| row.path_pattern.clone())
+                .collect();
+            let ids: Vec<i64> = renewed_rows.iter().filter_map(|row| row.id).collect();
+            reservation_archive_failure(
+                ReservationArchiveRequest {
+                    operation: "renew_file_reservations",
+                    idempotency_key: None,
+                    idempotent_replay: false,
+                },
+                &project,
+                &agent,
+                &paths,
+                &renewed_rows,
+                Some(&ids),
+                &failure,
+            )
+        })?;
     }
 
     let extend_micros = extend.saturating_mul(1_000_000);
@@ -2977,7 +3362,7 @@ pub async fn force_release_file_reservation(
             config: Config::get(),
             reservations: vec![res_json],
         };
-        dispatch_reservation_archive_write_cancellable(
+        let _ = dispatch_reservation_archive_write_cancellable(
             ctx,
             op,
             &format!(
@@ -3471,6 +3856,78 @@ mod tests {
         })
     }
 
+    struct ReservationDiskPressure(u64);
+
+    impl ReservationDiskPressure {
+        fn critical() -> Self {
+            let pressure = &mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level;
+            let previous = pressure.load();
+            pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+            Self(previous)
+        }
+    }
+
+    impl Drop for ReservationDiskPressure {
+        fn drop(&mut self) {
+            mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .set(self.0);
+        }
+    }
+
+    struct HeldReservationArchiveFence {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldReservationArchiveFence {
+        fn acquire() -> Self {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                mcp_agent_mail_storage::with_archive_snapshot_publication_fence(|| {
+                    ready_tx.send(()).expect("signal held archive fence");
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+                });
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("archive fence acquired by competing writer");
+            Self {
+                release: Some(release_tx),
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for HeldReservationArchiveFence {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("archive fence holder exits");
+            }
+        }
+    }
+
+    fn archive_failure_data(error: McpError) -> Value {
+        let data = error.data.expect("typed publication error");
+        assert_eq!(data["error"]["type"], "RESERVATION_ARCHIVE_UNAVAILABLE");
+        assert_eq!(data["error"]["recoverable"], true);
+        let payload = data["error"]["data"].clone();
+        assert_eq!(payload["phase"], "archive_publication");
+        assert_eq!(payload["db_committed"], true);
+        assert_eq!(payload["guard_coverage_confirmed"], false);
+        assert_eq!(payload["fail_closed"], true);
+        assert_eq!(payload["blocks_edits"], true);
+        assert_eq!(payload["do_not_edit"], payload["requested_paths"]);
+        payload
+    }
+
     async fn ensure_project(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
         match queries::ensure_project(cx, pool, human_key).await {
             Outcome::Ok(project) => project,
@@ -3550,6 +4007,391 @@ mod tests {
             .expect("reservation tool succeeds"),
         )
         .expect("reservation response JSON")
+    }
+
+    #[test]
+    fn reservation_fence_failure_keeps_unkeyed_lease_for_retry() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-fence-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let fence = HeldReservationArchiveFence::acquire();
+                let failure = file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    agent.name.clone(),
+                    vec!["src/lib.rs".to_string()],
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("held archive fence must not produce a successful grant");
+                let payload = archive_failure_data(failure);
+                assert_eq!(payload["cause"], "archive_write_failed");
+                assert_eq!(payload["idempotent_replay"], false);
+                assert_eq!(payload["do_not_edit"], json!(["src/lib.rs"]));
+                assert_eq!(payload["recovery"]["tool"], "file_reservation_paths");
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("authoritative committed lease");
+                assert_eq!(active.len(), 1);
+                let id = active[0].id.expect("committed ID");
+                assert_eq!(payload["committed_reservation_ids"], json!([id]));
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                assert!(
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        id,
+                    )
+                    .is_none(),
+                    "the failed direct writer must not pretend an artifact exists"
+                );
+                drop(fence);
+
+                // The ordinary retry's precheck may heal the missing artifact.
+                // Drain that real commit before testing its subsequent grant
+                // publication, so this case isolates the injected fence fault.
+                AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
+                    *hook = Some(Box::pin(async {
+                        mcp_agent_mail_storage::flush_async_commits();
+                    }));
+                });
+                let retry = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &agent.name,
+                    &["src/lib.rs"],
+                    None,
+                )
+                .await;
+                assert_eq!(retry["granted"][0]["id"], id);
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("leases after retry");
+                assert_eq!(active.len(), 1, "retry must not duplicate the lease");
+                assert_eq!(active[0].id, Some(id));
+                let generation = fetch_db_generation(&ctx, &pool).await;
+                assert!(replay_guard_coverage_confirmed(
+                    &project,
+                    &agent.name,
+                    &active,
+                    &Config::get(),
+                    generation.as_deref(),
+                ));
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_key_race_rejects_unpublished_winner_then_recovers_by_renewal() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-unpublished-race-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let observed = std::sync::Arc::new(Mutex::new(None));
+                let winner_observed = observed.clone();
+                let winner_project = project_key.clone();
+                let winner_agent = agent.name.clone();
+                let winner_cx = cx.clone();
+                AFTER_RESERVATION_PRECHECK.with_borrow_mut(|hook| {
+                    *hook = Some(Box::pin(async move {
+                        let winner_ctx = McpContext::new(winner_cx, 2);
+                        let pressure = ReservationDiskPressure::critical();
+                        let winner_error = file_reservation_paths(
+                            &winner_ctx,
+                            winner_project,
+                            winner_agent,
+                            vec!["src/lib.rs".to_string()],
+                            None,
+                            None,
+                            None,
+                            Some("unpublished-winner".to_string()),
+                        )
+                        .await
+                        .expect_err("disk pressure leaves a committed but unpublished winner");
+                        drop(pressure);
+                        let payload = archive_failure_data(winner_error);
+                        assert_eq!(payload["cause"], "disk_critical");
+                        assert_eq!(payload["idempotent_replay"], false);
+                        *winner_observed.lock().expect("record winner") = Some(payload);
+                    }));
+                });
+                let ctx = McpContext::new(cx.clone(), 1);
+                let loser_error = file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    agent.name.clone(),
+                    vec!["src/lib.rs".to_string()],
+                    None,
+                    None,
+                    None,
+                    Some("unpublished-winner".to_string()),
+                )
+                .await
+                .expect_err("replay must refresh after the concurrent winner commits");
+                let loser = archive_failure_data(loser_error);
+                let winner = observed.lock().expect("winner witness").take().unwrap();
+                assert_eq!(loser["cause"], "archive_coverage_unconfirmed");
+                assert_eq!(loser["idempotent_replay"], true);
+                assert_eq!(
+                    loser["committed_reservation_ids"],
+                    winner["committed_reservation_ids"]
+                );
+                let active = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("winner's actual lease");
+                assert_eq!(active.len(), 1);
+                let row = &active[0];
+                let id = row.id.expect("winner ID");
+                let historical_grants = json!([{
+                    "id": id,
+                    "path_pattern": row.path_pattern,
+                    "exclusive": row.exclusive != 0,
+                    "reason": row.reason,
+                    "expires_ts": micros_to_iso(row.expires_ts),
+                }]);
+                assert_eq!(loser["current_reservation_ids"], json!([id]));
+                assert_eq!(loser["recovery"]["tool"], "renew_file_reservations");
+                assert_eq!(
+                    loser["recovery"]["arguments"]["file_reservation_ids"],
+                    json!([id])
+                );
+                assert_eq!(
+                    loser["recovery"]["then_retry"]["idempotency_key"],
+                    "unpublished-winner"
+                );
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                assert!(
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        id,
+                    )
+                    .is_none(),
+                    "replay must not republish its captured active snapshot"
+                );
+
+                renew_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    agent.name.clone(),
+                    Some(60),
+                    None,
+                    Some(vec![id]),
+                )
+                .await
+                .expect("explicit current-state renewal publishes the lease");
+                let artifact_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        id,
+                    )
+                    .expect("renewal produced guard-visible artifact");
+                let artifact_before = std::fs::read(&artifact_path).expect("renewed artifact");
+                let artifact: Value =
+                    serde_json::from_slice(&artifact_before).expect("artifact JSON");
+                assert_ne!(artifact["expires_ts"], historical_grants[0]["expires_ts"]);
+                let replay = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &agent.name,
+                    &["src/lib.rs"],
+                    Some("unpublished-winner"),
+                )
+                .await;
+                assert_eq!(replay["idempotent_replay"], true);
+                assert_eq!(replay["granted"], historical_grants);
+                assert_eq!(
+                    std::fs::read(&artifact_path).expect("artifact after replay"),
+                    artifact_before
+                );
+
+                // The guard honors non-hex historical generation names too.
+                // A terminal sibling at the same mtime suppresses this active
+                // stable file even when its own JSON is otherwise complete.
+                let shadow = reservation_dir.join(format!("id-{id}-gprior-generation.json"));
+                std::fs::write(
+                    &shadow,
+                    json!({"id": id, "released_ts": "released"}).to_string(),
+                )
+                .expect("foreign terminal artifact");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&shadow)
+                    .expect("open foreign artifact")
+                    .set_modified(
+                        std::fs::metadata(&artifact_path)
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                    )
+                    .expect("equal artifact mtimes");
+                let shadowed = file_reservation_paths(
+                    &ctx,
+                    project_key,
+                    agent.name,
+                    vec!["src/lib.rs".to_string()],
+                    None,
+                    None,
+                    None,
+                    Some("unpublished-winner".to_string()),
+                )
+                .await
+                .expect_err("guard-suppressed coverage cannot certify a replay");
+                assert_eq!(
+                    archive_failure_data(shadowed)["cause"],
+                    "archive_coverage_unconfirmed"
+                );
+                assert_eq!(
+                    std::fs::read(artifact_path).expect("active artifact stays unchanged"),
+                    artifact_before
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn reservation_renewal_failure_rejects_stale_coverage_but_replays_released_history() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/reservation-renew-publication-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.expect("project id");
+                let agent = register_agent(&cx, &pool, project_id, "GreenCastle").await;
+                let peer = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let ctx = McpContext::new(cx.clone(), 1);
+                let first = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &agent.name,
+                    &["src/lib.rs"],
+                    Some("renew-failure"),
+                )
+                .await;
+                mcp_agent_mail_storage::flush_async_commits();
+                let id = first["granted"][0]["id"].as_i64().expect("grant ID");
+                let reservation_dir = Config::get()
+                    .storage_root
+                    .join("projects")
+                    .join(&project.slug)
+                    .join("file_reservations");
+                let artifact_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        id,
+                    )
+                    .expect("original artifact");
+                let before = std::fs::read(&artifact_path).expect("original artifact bytes");
+                let pressure = ReservationDiskPressure::critical();
+                let renewal_error = renew_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    agent.name.clone(),
+                    Some(60),
+                    None,
+                    Some(vec![id]),
+                )
+                .await
+                .expect_err("unpublished renewal must fail closed");
+                drop(pressure);
+                let payload = archive_failure_data(renewal_error);
+                assert_eq!(payload["operation"], "renew_file_reservations");
+                assert_eq!(payload["cause"], "disk_critical");
+                assert_eq!(payload["committed_reservation_ids"], json!([id]));
+                assert_eq!(
+                    payload["recovery"]["arguments"]["file_reservation_ids"],
+                    json!([id])
+                );
+                let current = queries::get_active_reservations(&cx, &pool, project_id)
+                    .await
+                    .into_result()
+                    .expect("renewal committed in DB");
+                assert_eq!(current.len(), 1);
+                assert_ne!(
+                    json!(micros_to_iso(current[0].expires_ts)),
+                    first["granted"][0]["expires_ts"]
+                );
+                assert_eq!(std::fs::read(&artifact_path).unwrap(), before);
+
+                let replay_error = file_reservation_paths(
+                    &ctx,
+                    project_key.clone(),
+                    agent.name.clone(),
+                    vec!["src/lib.rs".to_string()],
+                    None,
+                    None,
+                    None,
+                    Some("renew-failure".to_string()),
+                )
+                .await
+                .expect_err("old artifact expiry cannot certify the current renewed lease");
+                let replay_error = archive_failure_data(replay_error);
+                assert_eq!(replay_error["idempotent_replay"], true);
+                assert_eq!(replay_error["cause"], "archive_coverage_unconfirmed");
+                assert_eq!(std::fs::read(&artifact_path).unwrap(), before);
+
+                release_file_reservations(
+                    &ctx,
+                    project_key.clone(),
+                    agent.name.clone(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("release the unpublished renewal");
+                mcp_agent_mail_storage::wbq_flush();
+                mcp_agent_mail_storage::flush_async_commits();
+                let peer_grant = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &peer.name,
+                    &["src/lib.rs"],
+                    None,
+                )
+                .await;
+                let peer_path =
+                    mcp_agent_mail_core::reservation_artifact::find_reservation_artifact(
+                        &reservation_dir,
+                        peer_grant["granted"][0]["id"].as_i64().unwrap(),
+                    )
+                    .expect("peer artifact");
+                let released_bytes = std::fs::read(&artifact_path).unwrap();
+                let peer_bytes = std::fs::read(&peer_path).unwrap();
+                let historical = keyed_reservation_response(
+                    &ctx,
+                    &project_key,
+                    &agent.name,
+                    &["src/lib.rs"],
+                    Some("renew-failure"),
+                )
+                .await;
+                assert_eq!(historical["idempotent_replay"], true);
+                assert_eq!(historical["granted"], first["granted"]);
+                assert_eq!(historical["conflicts"][0]["holders"][0]["agent"], peer.name);
+                assert_eq!(std::fs::read(artifact_path).unwrap(), released_bytes);
+                assert_eq!(std::fs::read(peer_path).unwrap(), peer_bytes);
+            });
+        });
     }
 
     fn grant_peer_after_precheck(cx: &Cx, project_id: i64, peer_id: i64, path: &'static str) {
@@ -4782,6 +5624,74 @@ mod tests {
         ])));
         // An empty op has nothing terminal about it.
         assert!(!reservation_op_is_terminal_release(&fr_op(Vec::new())));
+    }
+
+    #[test]
+    fn replay_certificate_requires_complete_live_guard_fields() {
+        let row = reservation_row(
+            1,
+            7,
+            "src/**",
+            mcp_agent_mail_db::now_micros() + 60_000_000,
+            None,
+        );
+        let canonical =
+            active_reservation_artifact_json("/abs/proj", "GreenCastle", &row, Some("aabbccdd"));
+        let confirms = |record: &Value, row: &mcp_agent_mail_db::FileReservationRow| {
+            active_artifact_confirms_guard_coverage(
+                record,
+                "/abs/proj",
+                "GreenCastle",
+                row,
+                "aabbccdd",
+            )
+        };
+        assert!(confirms(&canonical, &row));
+        for field in [
+            "id",
+            "project",
+            "agent",
+            "path_pattern",
+            "exclusive",
+            "expires_ts",
+            "db_generation",
+        ] {
+            let mut incomplete = canonical.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                !confirms(&incomplete, &row),
+                "missing {field} cannot certify coverage"
+            );
+        }
+        for (field, value) in [
+            ("agent_name", json!("BlueLake")),
+            ("released_ts", json!("unparseable release marker")),
+            ("exclusive", json!(false)),
+            ("db_generation", json!("eeff")),
+            ("expires_ts", json!(micros_to_iso(row.expires_ts - 1))),
+        ] {
+            let mut divergent = canonical.clone();
+            divergent[field] = value;
+            assert!(
+                !confirms(&divergent, &row),
+                "divergent {field} cannot certify coverage"
+            );
+        }
+        let mut expired = row.clone();
+        expired.expires_ts = mcp_agent_mail_db::now_micros() - 1;
+        let expired_record = active_reservation_artifact_json(
+            "/abs/proj",
+            "GreenCastle",
+            &expired,
+            Some("aabbccdd"),
+        );
+        assert!(
+            !confirms(&expired_record, &expired),
+            "matching expired timestamps do not confer coverage"
+        );
+        let mut released = row;
+        released.released_ts = Some(mcp_agent_mail_db::now_micros());
+        assert!(!confirms(&canonical, &released));
     }
 
     #[test]
