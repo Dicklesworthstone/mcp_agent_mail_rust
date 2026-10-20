@@ -23,7 +23,9 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// One newly claimed quarantine, retained across all moves in a batch.
-/// Dropping it closes the handle; it never removes the directory or evidence.
+/// Dropping it releases the directory lease and closes the handle; it never
+/// removes the directory or evidence. Empty-directory reclamation must acquire
+/// this same lease, so a newly claimed batch remains live before its first move.
 #[derive(Debug)]
 pub struct ReclaimDirectory {
     file: File,
@@ -266,12 +268,16 @@ pub(super) fn claim_reclaim_directory(path: &Path) -> io::Result<ReclaimDirector
         .parent()
         .ok_or_else(|| invalid("quarantine has no parent"))?;
     let parent = open_directory(parent_path, true)?;
+    // Serialize the mkdir/open/lease window with empty-directory reclamation
+    // by other databases sharing this quarantine parent.
+    fs2::FileExt::try_lock_exclusive(&parent)?;
     validate_directory(parent_path, &parent)?;
     rustix::fs::mkdirat(&parent, name, Mode::RWXU).map_err(io::Error::from)?;
     let file = File::from(
         rustix::fs::openat(&parent, name, DIRECTORY_FLAGS, Mode::empty())
             .map_err(io::Error::from)?,
     );
+    fs2::FileExt::try_lock_exclusive(&file)?;
     // Preserve the newly created directory on every error. No cleanup by
     // pathname is safe once the namespace might have been replaced.
     parent.sync_all()?;
@@ -378,6 +384,71 @@ fn validate_delete_inventory(file: &File, expected: &Metadata) -> io::Result<()>
     // ctime catches in-place edits even if an external writer restores mtime.
     if expected.ctime() != current.ctime() || expected.ctime_nsec() != current.ctime_nsec() {
         return Err(invalid("backup changed after deletion inventory"));
+    }
+    Ok(())
+}
+
+/// Remove an inventoried, empty native rotation directory. The caller owns
+/// naming/policy admission; this boundary refuses live leases, open readers,
+/// replaced inodes and symlinked ancestors. `rmdir` atomically refuses any
+/// child added after inventory, so this can never remove recovery evidence.
+pub fn delete_empty_reclaim_directory(source: &Path, inventoried: &Metadata) -> io::Result<()> {
+    delete_empty_reclaim_directory_with(
+        source,
+        inventoried,
+        |parent, name| {
+            rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+        },
+        File::sync_all,
+    )
+}
+
+fn delete_empty_reclaim_directory_with<U, S>(
+    source: &Path,
+    inventoried: &Metadata,
+    mut unlink: U,
+    mut sync: S,
+) -> io::Result<()>
+where
+    U: FnMut(&File, &OsStr) -> io::Result<()>,
+    S: FnMut(&File) -> io::Result<()>,
+{
+    let source = absolute_spelling(source)?;
+    let parent_path = source
+        .parent()
+        .ok_or_else(|| invalid("reclaim directory has no parent"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| invalid("reclaim directory has no name"))?;
+    let parent = open_directory(parent_path, false)?;
+    fs2::FileExt::try_lock_exclusive(&parent)?;
+    let directory = File::from(rustix::fs::openat(
+        &parent,
+        name,
+        DIRECTORY_FLAGS,
+        Mode::empty(),
+    )?);
+    let current = directory.metadata()?;
+    if !inventoried.file_type().is_dir()
+        || inventoried.dev() != current.dev()
+        || inventoried.ino() != current.ino()
+    {
+        return Err(invalid("empty rotation directory changed after inventory"));
+    }
+    fs2::FileExt::try_lock_exclusive(&directory)?;
+    ensure_no_other_file_readers(&source, &directory)?;
+    let expected = rustix::fs::fstat(&directory)?;
+    sync(&parent)?;
+    validate_directory(parent_path, &parent)?;
+    validate_source_entry(&parent, name, &expected)?;
+    unlink(&parent, name)?;
+    if let Err(error) = sync(&parent).and_then(|()| validate_directory(parent_path, &parent)) {
+        return Err(io::Error::other(CompletedReclaimDelete {
+            source,
+            // Directory removal is accounted separately from payload bytes.
+            bytes: ReclaimedFileBytes::default(),
+            error,
+        }));
     }
     Ok(())
 }
@@ -560,13 +631,15 @@ fn ensure_no_file_readers(
                 ));
             }
         }
-        ensure_no_mapped_file_readers(
-            &entry.path(),
-            pid,
-            effective_user,
-            retained_identity,
-            &mut charge,
-        )?;
+        if retained_identity.file_type().is_file() {
+            ensure_no_mapped_file_readers(
+                &entry.path(),
+                pid,
+                effective_user,
+                retained_identity,
+                &mut charge,
+            )?;
+        }
     }
     Ok(())
 }
@@ -940,6 +1013,144 @@ mod tests {
 
     fn fixture() -> PathBuf {
         tempfile::tempdir().unwrap().keep().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn empty_directory_reclamation_excludes_live_batches_and_parent_claims() {
+        let root = fixture();
+        let path = root.join("rotation");
+        let batch = ReclaimDirectory::claim(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        assert!(delete_empty_reclaim_directory(&path, &inventoried).is_err());
+        assert!(path.is_dir());
+        drop(batch);
+
+        let parent = File::open(&root).unwrap();
+        fs2::FileExt::try_lock_exclusive(&parent).unwrap();
+        assert!(delete_empty_reclaim_directory(&path, &inventoried).is_err());
+        let new_batch = root.join("not-yet-claimed");
+        assert!(ReclaimDirectory::claim(&new_batch).is_err());
+        assert!(!new_batch.exists());
+        drop(parent);
+
+        delete_empty_reclaim_directory(&path, &inventoried).unwrap();
+        assert!(!path.exists());
+        let batch = ReclaimDirectory::claim(&new_batch).unwrap();
+        assert!(batch.path().is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_directory_reclamation_preserves_an_ordinary_open_reader() {
+        let root = fixture();
+        let path = root.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let reader = File::open(&path).unwrap();
+        let error = delete_empty_reclaim_directory(&path, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(reader);
+        delete_empty_reclaim_directory(&path, &inventoried).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn empty_directory_reclamation_rejects_replacement_symlinks_and_new_evidence() {
+        let root = fixture();
+        let path = root.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let original = root.join("original");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(delete_empty_reclaim_directory(&path, &inventoried).is_err());
+        assert!(path.is_dir());
+        assert!(original.is_dir());
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        assert!(delete_empty_reclaim_directory(&link, &inventoried).is_err());
+        let parent_link = root.join("parent-link");
+        std::os::unix::fs::symlink(&root, &parent_link).unwrap();
+        assert!(
+            delete_empty_reclaim_directory(&parent_link.join("original"), &inventoried).is_err()
+        );
+
+        let error = delete_empty_reclaim_directory_with(
+            &original,
+            &inventoried,
+            |parent, name| {
+                // A recovery writer arrives after the last empty-directory
+                // inventory and identity check, immediately before rmdir.
+                std::fs::write(original.join("recovery-receipt.json"), b"keep").unwrap();
+                rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+            },
+            File::sync_all,
+        )
+        .unwrap_err();
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert_eq!(
+            std::fs::read(original.join("recovery-receipt.json")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn empty_directory_reclamation_reports_completed_unconfirmed_removal() {
+        let root = fixture();
+        let path = root.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let mut syncs = 0;
+        let error = delete_empty_reclaim_directory_with(
+            &path,
+            &inventoried,
+            |parent, name| {
+                rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+            },
+            |parent| {
+                syncs += 1;
+                if syncs == 2 {
+                    Err(io::Error::other("injected directory sync failure"))
+                } else {
+                    parent.sync_all()
+                }
+            },
+        )
+        .unwrap_err();
+        let completed = CompletedReclaimDelete::from_io_error(&error).unwrap();
+        assert_eq!(completed.source(), path);
+        assert_eq!(completed.bytes(), ReclaimedFileBytes::default());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn empty_directory_reclamation_never_follows_a_replaced_parent() {
+        let root = fixture();
+        let parent_path = root.join("reclaimable");
+        std::fs::create_dir(&parent_path).unwrap();
+        let path = parent_path.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let old_parent = root.join("retained-parent");
+        let error = delete_empty_reclaim_directory_with(
+            &path,
+            &inventoried,
+            |parent, name| {
+                std::fs::rename(&parent_path, &old_parent).unwrap();
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("evidence"), b"keep replacement").unwrap();
+                rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+            },
+            File::sync_all,
+        )
+        .unwrap_err();
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_some());
+        assert!(!old_parent.join("rotation").exists());
+        assert_eq!(
+            std::fs::read(path.join("evidence")).unwrap(),
+            b"keep replacement"
+        );
     }
 
     #[test]

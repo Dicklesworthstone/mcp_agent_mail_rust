@@ -29,6 +29,7 @@ mod namespace;
 #[cfg(unix)]
 pub use namespace::{
     CompletedReclaimDelete, CompletedReclaimMove, ReclaimDirectory, ReclaimedFileBytes,
+    delete_empty_reclaim_directory,
 };
 
 #[cfg(unix)]
