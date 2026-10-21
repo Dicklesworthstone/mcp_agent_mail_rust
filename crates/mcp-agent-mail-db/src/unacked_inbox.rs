@@ -13,7 +13,7 @@ use asupersync::{CancelReason, Cx, Outcome};
 use sqlmodel_core::{Error as SqlError, Row, Value};
 
 use crate::pool::SyncQuery;
-use crate::queries::{UnackedInboxRow, UNKNOWN_SENDER_DISPLAY};
+use crate::queries::{UNKNOWN_SENDER_DISPLAY, UnackedInboxRow};
 use crate::sync::inbox;
 use crate::{DbConn, DbError, DbPool};
 
@@ -114,7 +114,10 @@ pub async fn fetch_metadata(
         project_id,
         agent_id,
         limit,
-        ReadOptions { before_ts, include_bodies: false },
+        ReadOptions {
+            before_ts,
+            include_bodies: false,
+        },
     )
     .await
 }
@@ -126,7 +129,10 @@ struct ReadOptions {
 }
 
 impl ReadOptions {
-    const FULL: Self = Self { before_ts: None, include_bodies: true };
+    const FULL: Self = Self {
+        before_ts: None,
+        include_bodies: true,
+    };
 }
 
 async fn fetch_with_options(
@@ -158,7 +164,10 @@ async fn fetch_with_options(
     };
     let result = read_with_options(
         cx,
-        &**checkout.connection.as_ref().expect("live acknowledgement checkout"),
+        &**checkout
+            .connection
+            .as_ref()
+            .expect("live acknowledgement checkout"),
         project_id,
         agent_id,
         limit,
@@ -209,11 +218,15 @@ impl<C: SyncQuery> SyncQuery for CancellableRead<'_, C> {
 
 #[cfg(test)]
 fn selection_query(shared: bool, limit: usize, before_ts: Option<i64>) -> Result<String, DbError> {
-    let limit = i64::try_from(limit)
-        .map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
+    let limit =
+        i64::try_from(limit).map_err(|_| DbError::invalid("limit", "limit exceeds i64::MAX"))?;
     // Filter BOTH lanes before their shared oldest-first limit. The timestamp
     // remains bound; appending it only after UNION would filter just shared mail.
-    let cutoff = if before_ts.is_some() { " AND m.created_ts <= ?3" } else { "" };
+    let cutoff = if before_ts.is_some() {
+        " AND m.created_ts <= ?3"
+    } else {
+        ""
+    };
     let mut sql = format!("{DIRECT_SELECTION}{cutoff}");
     if shared {
         sql.push_str(SHARED_SELECTION);
@@ -269,7 +282,14 @@ fn read_with_options(
         let shared = shared_deliveries_available(&checked, project_id)?;
         let mut selected = direct_window(&checked, project_id, agent_id, limit, options.before_ts)?;
         if shared {
-            extend_shared_window(&checked, project_id, agent_id, limit, options.before_ts, &mut selected)?;
+            extend_shared_window(
+                &checked,
+                project_id,
+                agent_id,
+                limit,
+                options.before_ts,
+                &mut selected,
+            )?;
         }
         hydrate(&checked, project_id, selected, options)
     });
@@ -285,10 +305,7 @@ fn read_with_options(
     }
 }
 
-fn shared_deliveries_available(
-    conn: &impl SyncQuery,
-    project_id: i64,
-) -> Result<bool, DbError> {
+fn shared_deliveries_available(conn: &impl SyncQuery, project_id: i64) -> Result<bool, DbError> {
     if !crate::mail_explorer::ExplorerQuery::shared_mailbox_schema_available(conn)? {
         return Ok(false);
     }
@@ -321,7 +338,9 @@ fn receipt_timestamp(row: &Row, column: &str) -> Result<Option<i64>, DbError> {
         Some(Value::Null) => Ok(None),
         Some(Value::Int(value)) => Ok(Some(i64::from(*value))),
         Some(Value::BigInt(value)) => Ok(Some(*value)),
-        _ => Err(DbError::Sqlite(format!("invalid pending acknowledgement receipt {column}"))),
+        _ => Err(DbError::Sqlite(format!(
+            "invalid pending acknowledgement receipt {column}"
+        ))),
     }
 }
 
@@ -346,25 +365,37 @@ fn direct_window(
     loop {
         let (sql, params) = after.map_or_else(
             || (DIRECT_PAGE_SQL, vec![Value::BigInt(agent_id)]),
-            |id| (DIRECT_NEXT_SQL, vec![Value::BigInt(agent_id), Value::BigInt(id)]),
+            |id| {
+                (
+                    DIRECT_NEXT_SQL,
+                    vec![Value::BigInt(agent_id), Value::BigInt(id)],
+                )
+            },
         );
         let rows = conn.query_sync(sql, &params).map_err(db_error)?;
         if rows.len() > HYDRATE_BATCH {
-            return Err(DbError::Internal("pending acknowledgement receipt page exceeded its bound".into()));
+            return Err(DbError::Internal(
+                "pending acknowledgement receipt page exceeded its bound".into(),
+            ));
         }
         let finished = rows.len() < HYDRATE_BATCH;
         let mut pending = BTreeMap::new();
         for row in rows {
             let id = row.get_named::<i64>("message_id").map_err(db_error)?;
             if after.is_some_and(|previous| id <= previous) {
-                return Err(DbError::Internal("pending acknowledgement receipt cursor did not advance".into()));
+                return Err(DbError::Internal(
+                    "pending acknowledgement receipt cursor did not advance".into(),
+                ));
             }
             after = Some(id);
             if receipt_timestamp(&row, "ack_ts")?.is_none() {
-                pending.insert(id, Receipt {
-                    kind: row.get_named("kind").map_err(db_error)?,
-                    read_ts: receipt_timestamp(&row, "read_ts")?,
-                });
+                pending.insert(
+                    id,
+                    Receipt {
+                        kind: row.get_named("kind").map_err(db_error)?,
+                        read_ts: receipt_timestamp(&row, "read_ts")?,
+                    },
+                );
             }
         }
         if !pending.is_empty() {
@@ -372,12 +403,16 @@ fn direct_window(
             let (sql, params) = inbox::lookup_query("messages", ACK_HEADER_COLUMNS, &ids);
             let headers = conn.query_sync(&sql, &params).map_err(db_error)?;
             if headers.len() > ids.len() {
-                return Err(DbError::Internal("pending acknowledgement header batch exceeded its bound".into()));
+                return Err(DbError::Internal(
+                    "pending acknowledgement header batch exceeded its bound".into(),
+                ));
             }
             for row in headers {
                 let id = row.get_named::<i64>("id").map_err(db_error)?;
                 let receipt = pending.remove(&id).ok_or_else(|| {
-                    DbError::Internal("unrequested or duplicate pending acknowledgement header".into())
+                    DbError::Internal(
+                        "unrequested or duplicate pending acknowledgement header".into(),
+                    )
                 })?;
                 let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
                 if row.get_named::<i64>("project_id").map_err(db_error)? == project_id
@@ -402,7 +437,9 @@ fn shared_page_query(
     skip_at_floor: i64,
     before_ts: Option<i64>,
 ) -> (String, Vec<Value>) {
-    let mut sql = format!("SELECT {ACK_HEADER_COLUMNS} FROM messages WHERE project_id = ? AND created_ts >= ?");
+    let mut sql = format!(
+        "SELECT {ACK_HEADER_COLUMNS} FROM messages WHERE project_id = ? AND created_ts >= ?"
+    );
     let mut params = vec![Value::BigInt(project_id), Value::BigInt(floor)];
     if let Some(cutoff) = before_ts {
         sql.push_str(" AND created_ts <= ?");
@@ -428,16 +465,28 @@ fn keyed_receipts(
     // pinned engine's composite-index plan. Names/projections are constants;
     // identities and cutoffs never interpolate user-provided text.
     for chunk in ids.chunks(8) {
-        let keys = chunk.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT {columns} FROM {table} WHERE message_id IN ({keys}) AND agent_id = ? LIMIT 9");
-        let rows = conn.query_sync(&sql, &[Value::BigInt(agent_id)]).map_err(db_error)?;
+        let keys = chunk
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {columns} FROM {table} WHERE message_id IN ({keys}) AND agent_id = ? LIMIT 9"
+        );
+        let rows = conn
+            .query_sync(&sql, &[Value::BigInt(agent_id)])
+            .map_err(db_error)?;
         if rows.len() > chunk.len() {
-            return Err(DbError::Internal("pending acknowledgement receipt lookup exceeded its bound".into()));
+            return Err(DbError::Internal(
+                "pending acknowledgement receipt lookup exceeded its bound".into(),
+            ));
         }
         for row in rows {
             let id = row.get_named::<i64>("message_id").map_err(db_error)?;
             if !chunk.contains(&id) || out.insert(id, row).is_some() {
-                return Err(DbError::Internal("unrequested or duplicate pending acknowledgement receipt".into()));
+                return Err(DbError::Internal(
+                    "unrequested or duplicate pending acknowledgement receipt".into(),
+                ));
             }
         }
     }
@@ -455,19 +504,30 @@ fn extend_shared_window(
 ) -> Result<(), DbError> {
     // Validate receipt authority even for a retired viewer or an empty page.
     // Neither case is permission to hide a partially upgraded schema.
-    conn.query_sync("SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0", &[])
+    conn.query_sync(
+        "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts LIMIT 0",
+        &[],
+    )
+    .map_err(db_error)?;
+    let viewers = conn
+        .query_sync(
+            "SELECT project_id, inception_ts, retired_at, contact_policy FROM agents WHERE id = ?",
+            &[Value::BigInt(agent_id)],
+        )
         .map_err(db_error)?;
-    let viewers = conn.query_sync(
-        "SELECT project_id, inception_ts, retired_at, contact_policy FROM agents WHERE id = ?",
-        &[Value::BigInt(agent_id)],
-    ).map_err(db_error)?;
     if viewers.len() > 1 {
-        return Err(DbError::Internal("duplicate pending acknowledgement viewer".into()));
+        return Err(DbError::Internal(
+            "duplicate pending acknowledgement viewer".into(),
+        ));
     }
-    let Some(viewer) = viewers.first() else { return Ok(()); };
+    let Some(viewer) = viewers.first() else {
+        return Ok(());
+    };
     if viewer.get_named::<i64>("project_id").map_err(db_error)? != project_id
         || receipt_timestamp(viewer, "retired_at")?.is_some()
-        || viewer.get_named::<Option<String>>("contact_policy").map_err(db_error)?
+        || viewer
+            .get_named::<Option<String>>("contact_policy")
+            .map_err(db_error)?
             .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all"))
     {
         return Ok(());
@@ -478,7 +538,9 @@ fn extend_shared_window(
         let (sql, params) = shared_page_query(project_id, floor, skip_at_floor, before_ts);
         let rows = conn.query_sync(&sql, &params).map_err(db_error)?;
         if rows.len() > SHARED_PAGE_SIZE {
-            return Err(DbError::Internal("pending acknowledgement shared page exceeded its bound".into()));
+            return Err(DbError::Internal(
+                "pending acknowledgement shared page exceeded its bound".into(),
+            ));
         }
         let finished = rows.len() < SHARED_PAGE_SIZE;
         let mut last = floor;
@@ -488,35 +550,55 @@ fn extend_shared_window(
         for row in rows {
             let id = row.get_named::<i64>("id").map_err(db_error)?;
             let created = row.get_named::<i64>("created_ts").map_err(db_error)?;
-            if created < last || before_ts.is_some_and(|cutoff| created > cutoff)
+            if created < last
+                || before_ts.is_some_and(|cutoff| created > cutoff)
                 || row.get_named::<i64>("project_id").map_err(db_error)? != project_id
                 || !seen.insert(id)
             {
-                return Err(DbError::Internal("invalid pending acknowledgement shared page".into()));
+                return Err(DbError::Internal(
+                    "invalid pending acknowledgement shared page".into(),
+                ));
             }
             trailing = if created == last {
-                trailing.checked_add(1).ok_or_else(|| DbError::Internal("pending acknowledgement timestamp offset overflow".into()))?
-            } else { 1 };
+                trailing.checked_add(1).ok_or_else(|| {
+                    DbError::Internal("pending acknowledgement timestamp offset overflow".into())
+                })?
+            } else {
+                1
+            };
             last = created;
             if row.get_named::<i64>("sender_id").map_err(db_error)? != agent_id
                 && row.get_named::<i64>("ack_required").map_err(db_error)? == 1
-                && (window.len() < limit || window.last_key_value().is_some_and(|(old, _)| (created, id) < *old))
+                && (window.len() < limit
+                    || window
+                        .last_key_value()
+                        .is_some_and(|(old, _)| (created, id) < *old))
             {
                 headers.insert(id, created);
             }
         }
         if !headers.is_empty() {
-            let keys = std::iter::repeat_n("?", headers.len()).collect::<Vec<_>>().join(",");
-            let sql = format!("SELECT message_id, project_id FROM project_mailbox_deliveries WHERE message_id IN ({keys})");
+            let keys = std::iter::repeat_n("?", headers.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT message_id, project_id FROM project_mailbox_deliveries WHERE message_id IN ({keys})"
+            );
             let params: Vec<Value> = headers.keys().copied().map(Value::BigInt).collect();
             let rows = conn.query_sync(&sql, &params).map_err(db_error)?;
             if rows.len() > headers.len() {
-                return Err(DbError::Internal("pending acknowledgement delivery lookup exceeded its bound".into()));
+                return Err(DbError::Internal(
+                    "pending acknowledgement delivery lookup exceeded its bound".into(),
+                ));
             }
             let mut deliveries = BTreeMap::new();
             for row in rows {
                 let id = row.get_named::<i64>("message_id").map_err(db_error)?;
-                let created = headers.remove(&id).ok_or_else(|| DbError::Internal("unrequested or duplicate pending acknowledgement delivery".into()))?;
+                let created = headers.remove(&id).ok_or_else(|| {
+                    DbError::Internal(
+                        "unrequested or duplicate pending acknowledgement delivery".into(),
+                    )
+                })?;
                 if row.get_named::<i64>("project_id").map_err(db_error)? == project_id {
                     deliveries.insert(id, created);
                 }
@@ -524,26 +606,50 @@ fn extend_shared_window(
             let ids: Vec<i64> = deliveries.keys().copied().collect();
             // Check existence, not pending status: an acknowledged direct row
             // must still suppress a second obligation through shared delivery.
-            for id in keyed_receipts(conn, "message_recipients", "message_id", &ids, agent_id)?.keys() {
+            for id in
+                keyed_receipts(conn, "message_recipients", "message_id", &ids, agent_id)?.keys()
+            {
                 deliveries.remove(id);
             }
             let ids: Vec<i64> = deliveries.keys().copied().collect();
-            let mut receipts = keyed_receipts(conn, "project_mailbox_receipts", "message_id, read_ts, ack_ts", &ids, agent_id)?;
+            let mut receipts = keyed_receipts(
+                conn,
+                "project_mailbox_receipts",
+                "message_id, read_ts, ack_ts",
+                &ids,
+                agent_id,
+            )?;
             for (id, created) in deliveries {
                 let read_ts = if let Some(receipt) = receipts.remove(&id) {
-                    if receipt_timestamp(&receipt, "ack_ts")?.is_some() { continue; }
+                    if receipt_timestamp(&receipt, "ack_ts")?.is_some() {
+                        continue;
+                    }
                     receipt_timestamp(&receipt, "read_ts")?
-                } else { None };
-                keep_oldest(window, (created, id), Receipt {
-                    kind: crate::project_mailbox::PROJECT_MAILBOX_KIND.into(), read_ts,
-                }, limit);
+                } else {
+                    None
+                };
+                keep_oldest(
+                    window,
+                    (created, id),
+                    Receipt {
+                        kind: crate::project_mailbox::PROJECT_MAILBOX_KIND.into(),
+                        read_ts,
+                    },
+                    limit,
+                );
             }
         }
         let complete = window.len() == limit
-            && window.last_key_value().is_some_and(|((created, _), _)| last > *created);
-        if finished || complete { return Ok(()); }
+            && window
+                .last_key_value()
+                .is_some_and(|((created, _), _)| last > *created);
+        if finished || complete {
+            return Ok(());
+        }
         if last == floor && trailing <= skip_at_floor {
-            return Err(DbError::Internal("pending acknowledgement shared cursor did not advance".into()));
+            return Err(DbError::Internal(
+                "pending acknowledgement shared cursor did not advance".into(),
+            ));
         }
         floor = last;
         skip_at_floor = trailing;
@@ -561,12 +667,16 @@ fn hydrate(
     let mut ids = Vec::with_capacity(selected.len());
     for ((created, id), Receipt { kind, read_ts }) in selected {
         if options.before_ts.is_some_and(|cutoff| created > cutoff) {
-            return Err(DbError::Internal("pending acknowledgement lies beyond its cutoff".into()));
+            return Err(DbError::Internal(
+                "pending acknowledgement lies beyond its cutoff".into(),
+            ));
         }
         if previous.is_some_and(|old| (created, id) <= old)
             || state.insert(id, (created, kind, read_ts)).is_some()
         {
-            return Err(DbError::Internal("pending acknowledgements are duplicated or unordered".into()));
+            return Err(DbError::Internal(
+                "pending acknowledgements are duplicated or unordered".into(),
+            ));
         }
         previous = Some((created, id));
         ids.push(id);
@@ -574,7 +684,11 @@ fn hydrate(
     let mut out = Vec::with_capacity(ids.len());
     // Hydrate ONLY the winning global window, not a newest-first window later
     // reversed or limit rows independently taken from each delivery lane.
-    let body = if options.include_bodies { "body_md" } else { "'' AS body_md" };
+    let body = if options.include_bodies {
+        "body_md"
+    } else {
+        "'' AS body_md"
+    };
     let columns = format!(
         "id, project_id, sender_id, thread_id, topic, subject, {body}, \
          importance, ack_required, created_ts, recipients_json, attachments"
@@ -604,7 +718,9 @@ fn hydrate(
                 || message.created_ts != created
                 || message.ack_required != 1
             {
-                return Err(DbError::Internal("pending acknowledgement source changed inside its snapshot".into()));
+                return Err(DbError::Internal(
+                    "pending acknowledgement source changed inside its snapshot".into(),
+                ));
             }
             out.push(UnackedInboxRow {
                 message,
@@ -615,7 +731,9 @@ fn hydrate(
         }
     }
     if !state.is_empty() {
-        return Err(DbError::Internal("selected pending acknowledgement message disappeared".into()));
+        return Err(DbError::Internal(
+            "selected pending acknowledgement message disappeared".into(),
+        ));
     }
     let mut senders: Vec<i64> = out.iter().map(|row| row.message.sender_id).collect();
     senders.sort_unstable();
@@ -626,9 +744,13 @@ fn hydrate(
         for row in conn.query_sync(&sql, &params).map_err(db_error)? {
             let id = row.get_named::<i64>("id").map_err(db_error)?;
             if chunk.binary_search(&id).is_err()
-                || names.insert(id, row.get_named::<String>("name").map_err(db_error)?).is_some()
+                || names
+                    .insert(id, row.get_named::<String>("name").map_err(db_error)?)
+                    .is_some()
             {
-                return Err(DbError::Internal("invalid acknowledgement sender lookup".into()));
+                return Err(DbError::Internal(
+                    "invalid acknowledgement sender lookup".into(),
+                ));
             }
         }
     }
@@ -734,12 +856,14 @@ mod tests {
         )
         .unwrap()
         .iter()
-        .map(|row| (
-            row.get_named("message_id").unwrap(),
-            row.get_named("agent_id").unwrap(),
-            row.get_named("read_ts").unwrap(),
-            row.get_named("ack_ts").unwrap(),
-        ))
+        .map(|row| {
+            (
+                row.get_named("message_id").unwrap(),
+                row.get_named("agent_id").unwrap(),
+                row.get_named("read_ts").unwrap(),
+                row.get_named("ack_ts").unwrap(),
+            )
+        })
         .collect()
     }
 
@@ -747,7 +871,14 @@ mod tests {
     fn receipt_state_comparison_detects_changed_values_and_membership() {
         let (_directory, conn, _pool) = fixture();
         let before = shared_receipt_state(&conn);
-        assert_eq!(before, vec![(1, 3, Some(888), Some(888)), (3, 2, Some(456), None), (4, 2, Some(777), Some(777))]);
+        assert_eq!(
+            before,
+            vec![
+                (1, 3, Some(888), Some(888)),
+                (3, 2, Some(456), None),
+                (4, 2, Some(777), Some(777))
+            ]
+        );
         for sql in [
             "UPDATE project_mailbox_receipts SET read_ts=457 WHERE message_id=3 AND agent_id=2",
             "UPDATE project_mailbox_receipts SET ack_ts=999 WHERE message_id=3 AND agent_id=2",
@@ -767,17 +898,28 @@ mod tests {
     fn fixture_keeps_microsecond_timestamps_after_pooled_checkout() {
         let (_directory, conn, pool) = fixture();
         let timestamps = |connection: &DbConn| -> Vec<(i64, i64)> {
-            connection.query_sync(
-                "SELECT id, created_ts FROM messages ORDER BY id",
-                &[],
-            ).unwrap().iter().map(|row| (
-                row.get_named("id").unwrap(),
-                row.get_named("created_ts").unwrap(),
-            )).collect()
+            connection
+                .query_sync("SELECT id, created_ts FROM messages ORDER BY id", &[])
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get_named("id").unwrap(),
+                        row.get_named("created_ts").unwrap(),
+                    )
+                })
+                .collect()
         };
         let expected = vec![
-            (1, 100), (2, 200), (3, 200), (4, 300), (5, 400),
-            (6, 99), (7, 100), (8, 100), (9, 50),
+            (1, 100),
+            (2, 200),
+            (3, 200),
+            (4, 300),
+            (5, 400),
+            (6, 99),
+            (7, 100),
+            (8, 100),
+            (9, 50),
         ];
         assert_eq!(timestamps(&conn), expected);
         run(async {
@@ -790,7 +932,9 @@ mod tests {
             let full = fetch(&cx, &pool, 1, 2, 1).await.into_result().unwrap();
             assert_eq!(ids(&full), [1]);
             let metadata = fetch_metadata(&cx, &pool, 1, 2, 20, Some(100))
-                .await.into_result().unwrap();
+                .await
+                .into_result()
+                .unwrap();
             assert_eq!(ids(&metadata), [1]);
         });
         assert_eq!(timestamps(&conn), expected);
@@ -803,13 +947,13 @@ mod tests {
         run(async {
             let cx = Cx::for_testing();
             for limit in [0, 1, 2, 3, 4, 100] {
-                let rows = fetch(&cx, &pool, 1, 2, limit)
-                    .await
-                    .into_result()
-                    .unwrap();
+                let rows = fetch(&cx, &pool, 1, 2, limit).await.into_result().unwrap();
                 assert_eq!(ids(&rows), [1, 2, 3, 4][..limit.min(4)]);
                 for row in rows {
-                    assert_eq!(row.message.body_md, format!("body-{}", row.message.id.unwrap()));
+                    assert_eq!(
+                        row.message.body_md,
+                        format!("body-{}", row.message.id.unwrap())
+                    );
                     assert_eq!(row.sender_name, "BlueLake");
                 }
             }
@@ -841,7 +985,10 @@ mod tests {
     fn acknowledging_shared_mail_removes_only_that_obligation() {
         let (_directory, conn, _pool) = fixture();
         for (sql, params) in crate::project_mailbox::receipt_write_statements(
-            crate::project_mailbox::ReceiptUpdate::Acknowledge, 3, 2, 999,
+            crate::project_mailbox::ReceiptUpdate::Acknowledge,
+            3,
+            2,
+            999,
         ) {
             conn.execute_sync(sql, &params).unwrap();
         }
@@ -852,14 +999,27 @@ mod tests {
     #[test]
     fn late_join_retirement_blocked_sender_and_foreign_project_do_not_create_shared_debt() {
         let (_directory, conn, _pool) = fixture();
-        assert!(!ids(&read(&*conn, 2, 100)).iter().any(|id| [6, 7, 8, 9].contains(id)));
-        assert!(read(&*conn, 1, 100).iter().all(|row| row.message.sender_id != 1));
+        assert!(
+            !ids(&read(&*conn, 2, 100))
+                .iter()
+                .any(|id| [6, 7, 8, 9].contains(id))
+        );
+        assert!(
+            read(&*conn, 1, 100)
+                .iter()
+                .all(|row| row.message.sender_id != 1)
+        );
         assert!(read(&*conn, 4, 100).is_empty());
-        conn.execute_raw("UPDATE agents SET retired_at=1000 WHERE id=2").unwrap();
+        conn.execute_raw("UPDATE agents SET retired_at=1000 WHERE id=2")
+            .unwrap();
         assert_eq!(ids(&read(&*conn, 2, 100)), [2, 4]);
-        conn.execute_raw("UPDATE agents SET retired_at=NULL, contact_policy='BLOCK_ALL' WHERE id=2").unwrap();
+        conn.execute_raw(
+            "UPDATE agents SET retired_at=NULL, contact_policy='BLOCK_ALL' WHERE id=2",
+        )
+        .unwrap();
         assert_eq!(ids(&read(&*conn, 2, 100)), [2, 4]);
-        conn.execute_raw("UPDATE agents SET contact_policy='auto', inception_ts=1000 WHERE id=2").unwrap();
+        conn.execute_raw("UPDATE agents SET contact_policy='auto', inception_ts=1000 WHERE id=2")
+            .unwrap();
         assert_eq!(ids(&read(&*conn, 2, 100)), [2, 4]);
     }
 
@@ -869,10 +1029,12 @@ mod tests {
             let (_directory, conn, _pool) = fixture();
             conn.execute_raw("PRAGMA foreign_keys=OFF").unwrap();
             if missing != "deliveries" {
-                conn.execute_raw("DROP TABLE project_mailbox_receipts").unwrap();
+                conn.execute_raw("DROP TABLE project_mailbox_receipts")
+                    .unwrap();
             }
             if missing != "receipts" {
-                conn.execute_raw("DROP TABLE project_mailbox_deliveries").unwrap();
+                conn.execute_raw("DROP TABLE project_mailbox_deliveries")
+                    .unwrap();
             }
             let result = read_from_conn(&Cx::for_testing(), &*conn, 1, 2, 100);
             if missing == "both" {
@@ -887,16 +1049,25 @@ mod tests {
     fn failure_releases_only_the_readers_nested_scope() {
         let (_directory, conn, _pool) = fixture();
         conn.execute_raw("BEGIN IMMEDIATE").unwrap();
-        conn.execute_raw("UPDATE messages SET body_md='uncommitted outer write' WHERE id=2").unwrap();
-        assert_eq!(read(&*conn, 2, 100)[1].message.body_md, "uncommitted outer write");
-        conn.execute_raw("UPDATE project_mailbox_receipts SET read_ts='bad' WHERE message_id=3 AND agent_id=2").unwrap();
+        conn.execute_raw("UPDATE messages SET body_md='uncommitted outer write' WHERE id=2")
+            .unwrap();
+        assert_eq!(
+            read(&*conn, 2, 100)[1].message.body_md,
+            "uncommitted outer write"
+        );
+        conn.execute_raw(
+            "UPDATE project_mailbox_receipts SET read_ts='bad' WHERE message_id=3 AND agent_id=2",
+        )
+        .unwrap();
         assert!(matches!(
             read_from_conn(&Cx::for_testing(), &*conn, 1, 2, 100),
             Outcome::Err(_)
         ));
         assert_eq!(
-            conn.query_sync("SELECT body_md FROM messages WHERE id=2", &[]).unwrap()[0]
-                .get_named::<String>("body_md").unwrap(),
+            conn.query_sync("SELECT body_md FROM messages WHERE id=2", &[])
+                .unwrap()[0]
+                .get_named::<String>("body_md")
+                .unwrap(),
             "uncommitted outer write"
         );
         conn.execute_raw("ROLLBACK").unwrap();
@@ -911,7 +1082,9 @@ mod tests {
     impl SyncQuery for Recording<'_> {
         fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
             let rows = self.conn.query_sync(sql, params)?;
-            self.calls.borrow_mut().push((sql.into(), params.len(), rows.len()));
+            self.calls
+                .borrow_mut()
+                .push((sql.into(), params.len(), rows.len()));
             Ok(rows)
         }
         fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
@@ -932,11 +1105,17 @@ mod tests {
             )).unwrap();
         }
         conn.execute_raw("COMMIT").unwrap();
-        let recording = Recording { conn: &conn, calls: RefCell::new(Vec::new()) };
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
         let rows = read(&recording, 2, 1);
         assert_eq!(ids(&rows), [1]);
         let calls = recording.calls.borrow();
-        let body_reads: Vec<_> = calls.iter().filter(|(sql, _, _)| sql.contains("body_md")).collect();
+        let body_reads: Vec<_> = calls
+            .iter()
+            .filter(|(sql, _, _)| sql.contains("body_md"))
+            .collect();
         assert_eq!(body_reads.len(), 1);
         assert_eq!(body_reads[0].1, 1);
         assert_eq!(body_reads[0].2, 1);
@@ -945,14 +1124,23 @@ mod tests {
         assert_eq!(rows.len(), 300);
         assert_eq!(ids(&rows)[..4], [1, 2, 3, 4]);
         assert_eq!(rows.last().unwrap().message.id, Some(305));
-        assert!(recording.calls.borrow().iter().all(|(_, binds, _)| *binds <= HYDRATE_BATCH));
+        assert!(
+            recording
+                .calls
+                .borrow()
+                .iter()
+                .all(|(_, binds, _)| *binds <= HYDRATE_BATCH)
+        );
     }
 
     #[test]
     fn malformed_receipt_and_missing_message_sources_are_not_partial_successes() {
         let (_directory, conn, _pool) = fixture();
         conn.execute_raw("UPDATE project_mailbox_receipts SET read_ts='not a timestamp' WHERE message_id=3 AND agent_id=2").unwrap();
-        assert!(matches!(read_from_conn(&Cx::for_testing(), &*conn, 1, 2, 100), Outcome::Err(_)));
+        assert!(matches!(
+            read_from_conn(&Cx::for_testing(), &*conn, 1, 2, 100),
+            Outcome::Err(_)
+        ));
         // The reader released its scope even on decode failure.
         conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
     }
@@ -960,7 +1148,10 @@ mod tests {
     #[test]
     fn zero_and_overflow_limits_are_resolved_without_database_io() {
         let (_directory, conn, _pool) = fixture();
-        let recording = Recording { conn: &conn, calls: RefCell::new(Vec::new()) };
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
         assert!(read(&recording, 2, 0).is_empty());
         #[cfg(target_pointer_width = "64")]
         assert!(matches!(
@@ -992,12 +1183,17 @@ mod tests {
         let (_directory, conn, _pool) = fixture();
         for outer_transaction in [false, true] {
             if outer_transaction {
-                conn.execute_raw("BEGIN; UPDATE messages SET subject='caller write' WHERE id=2").unwrap();
+                conn.execute_raw("BEGIN; UPDATE messages SET subject='caller write' WHERE id=2")
+                    .unwrap();
             } else {
                 conn.execute_raw("PRAGMA query_only=ON").unwrap();
             }
             let cx = Cx::for_testing();
-            let interrupt = Interrupt { conn: &conn, cx: &cx, fired: Cell::new(false) };
+            let interrupt = Interrupt {
+                conn: &conn,
+                cx: &cx,
+                fired: Cell::new(false),
+            };
             assert!(matches!(
                 read_from_conn(&cx, &interrupt, 1, 2, 100),
                 Outcome::Cancelled(_)
@@ -1005,13 +1201,20 @@ mod tests {
             assert!(interrupt.fired.get());
             if outer_transaction {
                 assert_eq!(
-                    conn.query_sync("SELECT subject FROM messages WHERE id=2", &[]).unwrap()[0]
-                        .get_named::<String>("subject").unwrap(),
+                    conn.query_sync("SELECT subject FROM messages WHERE id=2", &[])
+                        .unwrap()[0]
+                        .get_named::<String>("subject")
+                        .unwrap(),
                     "caller write"
                 );
                 conn.execute_raw("ROLLBACK").unwrap();
             } else {
-                assert_eq!(conn.query_sync("PRAGMA query_only", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 1);
+                assert_eq!(
+                    conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0)
+                        .unwrap(),
+                    1
+                );
                 conn.execute_raw("PRAGMA query_only=OFF").unwrap();
             }
             conn.execute_raw("BEGIN; ROLLBACK").unwrap();
@@ -1046,7 +1249,11 @@ mod tests {
                 self.reader.execute_raw(sql)
             }
         }
-        let race = Racing { reader: &conn, writer: &writer, committed: Cell::new(false) };
+        let race = Racing {
+            reader: &conn,
+            writer: &writer,
+            committed: Cell::new(false),
+        };
         let before = read(&race, 2, 100);
         assert!(race.committed.get());
         assert_eq!(ids(&before), [1, 2, 3, 4]);
@@ -1071,17 +1278,20 @@ mod tests {
                 (None, vec![1, 2, 3, 4]),
             ] {
                 for limit in [0, 1, 2, 3, 100] {
-                    let rows = fetch_metadata(
-                        &cx, &pool, 1, 2, limit, cutoff,
-                    ).await.into_result().unwrap();
+                    let rows = fetch_metadata(&cx, &pool, 1, 2, limit, cutoff)
+                        .await
+                        .into_result()
+                        .unwrap();
                     assert_eq!(ids(&rows), expected[..limit.min(expected.len())]);
                     assert!(rows.iter().all(|row| row.message.body_md.is_empty()));
                     assert!(rows.iter().all(|row| row.sender_name == "BlueLake"));
                 }
             }
-            let full = fetch(&cx, &pool, 1, 2, 100)
-                .await.into_result().unwrap();
-            assert!(full.iter().all(|row| row.message.body_md == format!("body-{}", row.message.id.unwrap())));
+            let full = fetch(&cx, &pool, 1, 2, 100).await.into_result().unwrap();
+            assert!(
+                full.iter()
+                    .all(|row| row.message.body_md == format!("body-{}", row.message.id.unwrap()))
+            );
         });
         assert_eq!(shared_receipt_state(&conn), before);
     }
@@ -1089,19 +1299,36 @@ mod tests {
     #[test]
     fn metadata_hydration_never_reads_the_body_column_or_changes_receipts() {
         let (_directory, conn, _pool) = fixture();
-        conn.execute_sync("UPDATE messages SET body_md = ?", &[Value::Text("b".repeat(1_000_000))]).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET body_md = ?",
+            &[Value::Text("b".repeat(1_000_000))],
+        )
+        .unwrap();
         conn.execute_raw("PRAGMA query_only=ON").unwrap();
-        let recording = Recording { conn: &conn, calls: RefCell::new(Vec::new()) };
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
         let rows = read_with_options(
-            &Cx::for_testing(), &recording, 1, 2, 3,
-            ReadOptions { before_ts: Some(200), include_bodies: false },
-        ).into_result().unwrap();
+            &Cx::for_testing(),
+            &recording,
+            1,
+            2,
+            3,
+            ReadOptions {
+                before_ts: Some(200),
+                include_bodies: false,
+            },
+        )
+        .into_result()
+        .unwrap();
         assert_eq!(ids(&rows), [1, 2, 3]);
         assert_eq!(rows[1].read_ts, Some(123));
         assert_eq!(rows[2].read_ts, Some(456));
         assert!(rows.iter().all(|row| row.message.body_md.is_empty()));
         let calls = recording.calls.borrow();
-        let hydrations: Vec<_> = calls.iter()
+        let hydrations: Vec<_> = calls
+            .iter()
             .filter(|(sql, _, _)| sql.contains("AS body_md"))
             .collect();
         assert_eq!(hydrations.len(), 1);
@@ -1111,7 +1338,12 @@ mod tests {
         for (sql, _, _) in calls.iter() {
             assert!(!sql.replace("'' AS body_md", "").contains("body_md"));
         }
-        assert_eq!(conn.query_sync("PRAGMA query_only", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 1);
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1120,9 +1352,18 @@ mod tests {
         conn.execute_raw("PRAGMA foreign_keys=OFF; DROP TABLE project_mailbox_receipts; DROP TABLE project_mailbox_deliveries").unwrap();
         for (cutoff, expected) in [(199, vec![]), (200, vec![2]), (300, vec![2, 4])] {
             let rows = read_with_options(
-                &Cx::for_testing(), &*conn, 1, 2, 100,
-                ReadOptions { before_ts: Some(cutoff), include_bodies: false },
-            ).into_result().unwrap();
+                &Cx::for_testing(),
+                &*conn,
+                1,
+                2,
+                100,
+                ReadOptions {
+                    before_ts: Some(cutoff),
+                    include_bodies: false,
+                },
+            )
+            .into_result()
+            .unwrap();
             assert_eq!(ids(&rows), expected);
             assert!(rows.iter().all(|row| row.message.body_md.is_empty()));
         }
@@ -1133,7 +1374,10 @@ mod tests {
         for shared in [false, true] {
             for cutoff in [i64::MIN, -1, 0, i64::MAX] {
                 let sql = selection_query(shared, 7, Some(cutoff)).unwrap();
-                assert_eq!(sql.matches("m.created_ts <= ?3").count(), if shared { 2 } else { 1 });
+                assert_eq!(
+                    sql.matches("m.created_ts <= ?3").count(),
+                    if shared { 2 } else { 1 }
+                );
                 assert_eq!(sql.matches("LIMIT").count(), 1);
                 assert!(sql.ends_with("ORDER BY created_ts ASC, id ASC LIMIT 7"));
                 assert!(!sql.contains(&i64::MIN.to_string()));
@@ -1173,12 +1417,30 @@ mod tests {
             )).unwrap();
         }
         conn.execute_raw("COMMIT").unwrap();
-        let recording = Recording { conn: &conn, calls: RefCell::new(Vec::new()) };
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
         assert_eq!(ids(&read(&recording, 2, 3)), [1699, 1698, 1697]);
         let calls = recording.calls.borrow();
-        assert!(calls.iter().filter(|(sql, _, _)| sql == DIRECT_NEXT_SQL).count() >= 2);
-        assert!(calls.iter().all(|(sql, _, rows)| !sql.contains("JOIN") && !sql.contains("UNION") && *rows <= HYDRATE_BATCH));
-        assert_eq!(calls.iter().filter(|(sql, _, _)| sql.contains("body_md")).map(|(_, _, rows)| rows).sum::<usize>(), 3);
+        assert!(
+            calls
+                .iter()
+                .filter(|(sql, _, _)| sql == DIRECT_NEXT_SQL)
+                .count()
+                >= 2
+        );
+        assert!(calls.iter().all(|(sql, _, rows)| !sql.contains("JOIN")
+            && !sql.contains("UNION")
+            && *rows <= HYDRATE_BATCH));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(sql, _, _)| sql.contains("body_md"))
+                .map(|(_, _, rows)| rows)
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]
@@ -1194,11 +1456,22 @@ mod tests {
             )).unwrap();
         }
         conn.execute_raw("COMMIT").unwrap();
-        let recording = Recording { conn: &conn, calls: RefCell::new(Vec::new()) };
+        let recording = Recording {
+            conn: &conn,
+            calls: RefCell::new(Vec::new()),
+        };
         assert_eq!(ids(&read(&recording, 2, 3)), [1, 1000, 1001]);
         let calls = recording.calls.borrow();
-        assert!(calls.iter().filter(|(sql, _, _)| sql.contains("ORDER BY created_ts ASC LIMIT 128 OFFSET")).count() >= 4);
-        assert!(calls.iter().all(|(sql, _, rows)| !sql.contains("JOIN") && !sql.contains("UNION") && *rows <= HYDRATE_BATCH));
+        assert!(
+            calls
+                .iter()
+                .filter(|(sql, _, _)| sql.contains("ORDER BY created_ts ASC LIMIT 128 OFFSET"))
+                .count()
+                >= 4
+        );
+        assert!(calls.iter().all(|(sql, _, rows)| !sql.contains("JOIN")
+            && !sql.contains("UNION")
+            && *rows <= HYDRATE_BATCH));
     }
 
     #[test]
@@ -1210,20 +1483,49 @@ mod tests {
                     for cutoff in [None, Some(i64::MIN), Some(100), Some(200), Some(i64::MAX)] {
                         let reference_sql = selection_query(true, limit, cutoff).unwrap();
                         let mut params = vec![Value::BigInt(viewer), Value::BigInt(project)];
-                        if let Some(ts) = cutoff { params.push(Value::BigInt(ts)); }
+                        if let Some(ts) = cutoff {
+                            params.push(Value::BigInt(ts));
+                        }
                         let expected = conn.query_sync(&reference_sql, &params).unwrap();
-                        let actual = read_with_options(&Cx::for_testing(), &*conn, project, viewer, limit,
-                            ReadOptions { before_ts: cutoff, include_bodies: false }).into_result().unwrap();
-                        let expected: Vec<_> = expected.iter().map(|row| (
-                            row.get_named::<i64>("id").unwrap(),
-                            row.get_named::<i64>("created_ts").unwrap(),
-                            row.get_named::<String>("kind").unwrap(),
-                            receipt_timestamp(row, "read_ts").unwrap(),
-                        )).collect();
-                        let actual: Vec<_> = actual.into_iter().map(|row| (
-                            row.message.id.unwrap(), row.message.created_ts, row.kind, row.read_ts,
-                        )).collect();
-                        assert_eq!(actual, expected, "viewer={viewer} project={project} limit={limit} cutoff={cutoff:?}");
+                        let actual = read_with_options(
+                            &Cx::for_testing(),
+                            &*conn,
+                            project,
+                            viewer,
+                            limit,
+                            ReadOptions {
+                                before_ts: cutoff,
+                                include_bodies: false,
+                            },
+                        )
+                        .into_result()
+                        .unwrap();
+                        let expected: Vec<_> = expected
+                            .iter()
+                            .map(|row| {
+                                (
+                                    row.get_named::<i64>("id").unwrap(),
+                                    row.get_named::<i64>("created_ts").unwrap(),
+                                    row.get_named::<String>("kind").unwrap(),
+                                    receipt_timestamp(row, "read_ts").unwrap(),
+                                )
+                            })
+                            .collect();
+                        let actual: Vec<_> = actual
+                            .into_iter()
+                            .map(|row| {
+                                (
+                                    row.message.id.unwrap(),
+                                    row.message.created_ts,
+                                    row.kind,
+                                    row.read_ts,
+                                )
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "viewer={viewer} project={project} limit={limit} cutoff={cutoff:?}"
+                        );
                     }
                 }
             }
@@ -1232,17 +1534,25 @@ mod tests {
 
     #[test]
     fn cancellation_between_receipt_pages_returns_no_partial_window() {
-        struct CancelSecondPage<'a> { conn: &'a DbConn, cx: &'a Cx, pages: Cell<usize> }
+        struct CancelSecondPage<'a> {
+            conn: &'a DbConn,
+            cx: &'a Cx,
+            pages: Cell<usize>,
+        }
         impl SyncQuery for CancelSecondPage<'_> {
             fn query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, SqlError> {
                 let rows = self.conn.query_sync(sql, params)?;
                 if sql == DIRECT_PAGE_SQL || sql == DIRECT_NEXT_SQL {
                     self.pages.set(self.pages.get() + 1);
-                    if self.pages.get() == 2 { self.cx.set_cancel_requested(true); }
+                    if self.pages.get() == 2 {
+                        self.cx.set_cancel_requested(true);
+                    }
                 }
                 Ok(rows)
             }
-            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> { self.conn.execute_raw(sql) }
+            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                self.conn.execute_raw(sql)
+            }
         }
         let (_directory, conn, _pool) = fixture();
         conn.execute_raw("BEGIN").unwrap();
@@ -1254,11 +1564,24 @@ mod tests {
         }
         conn.execute_raw("COMMIT; PRAGMA query_only=ON").unwrap();
         let cx = Cx::for_testing();
-        let interrupted = CancelSecondPage { conn: &conn, cx: &cx, pages: Cell::new(0) };
-        assert!(matches!(read_from_conn(&cx, &interrupted, 1, 2, 1), Outcome::Cancelled(_)));
+        let interrupted = CancelSecondPage {
+            conn: &conn,
+            cx: &cx,
+            pages: Cell::new(0),
+        };
+        assert!(matches!(
+            read_from_conn(&cx, &interrupted, 1, 2, 1),
+            Outcome::Cancelled(_)
+        ));
         assert_eq!(interrupted.pages.get(), 2);
-        assert_eq!(conn.query_sync("PRAGMA query_only", &[]).unwrap()[0].get_as::<i64>(0).unwrap(), 1);
-        conn.execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        conn.execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
     }
 
     #[test]
@@ -1272,7 +1595,9 @@ mod tests {
                 }
                 Ok(rows)
             }
-            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> { self.0.execute_raw(sql) }
+            fn execute_raw(&self, sql: &str) -> Result<(), SqlError> {
+                self.0.execute_raw(sql)
+            }
         }
         let (_directory, conn, _pool) = fixture();
         let result = read_from_conn(&Cx::for_testing(), &Duplicate(&conn), 1, 2, 100);

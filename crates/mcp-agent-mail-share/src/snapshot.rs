@@ -1187,9 +1187,10 @@ fn finish_snapshot_context(
 /// before the final canonical rebuild so old payload pages are not shipped.
 fn clear_published_archive_metadata(snapshot_path: &Path) -> Result<(), ShareError> {
     let path = crate::require_real_share_sqlite_path(snapshot_path)?;
-    let conn = DbConn::open_file(path.display().to_string()).map_err(|error| ShareError::Sqlite {
-        message: format!("open snapshot for recovery metadata cleanup: {error}"),
-    })?;
+    let conn =
+        DbConn::open_file(path.display().to_string()).map_err(|error| ShareError::Sqlite {
+            message: format!("open snapshot for recovery metadata cleanup: {error}"),
+        })?;
     let conn = mcp_agent_mail_db::guard_db_conn(conn, "published recovery metadata cleanup");
     // Every snapshot produced here has this column, even for legacy sources.
     // Its absence or an unreadable schema must stop publication, not skip it.
@@ -1422,7 +1423,10 @@ mod tests {
         let copied_body = target
             .query_sync("SELECT body_md FROM messages WHERE id=1001", &[])
             .unwrap();
-        assert_eq!(copied_body[0].get_named::<String>("body_md").unwrap(), "body");
+        assert_eq!(
+            copied_body[0].get_named::<String>("body_md").unwrap(),
+            "body"
+        );
     }
 
     #[test]
