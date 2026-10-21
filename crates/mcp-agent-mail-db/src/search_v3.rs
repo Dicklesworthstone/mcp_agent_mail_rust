@@ -4336,9 +4336,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_bridge_for_tests();
         let source = tempfile::TempDir::new().unwrap();
+        let source_root = source.path().canonicalize().unwrap();
         let index = tempfile::TempDir::new().unwrap();
         let db_path = create_test_db(
-            source.path(),
+            &source_root,
             &[(
                 1,
                 "guarded refresh",
@@ -5011,7 +5012,11 @@ mod tests {
     fn resolve_search_sqlite_path_from_database_url_treats_three_slashes_as_absolute_even_when_relative_shadow_is_missing()
      {
         let dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = dir.path().join("backfill-missing-relative.sqlite3");
+        let absolute_db = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("backfill-missing-relative.sqlite3");
         std::fs::write(&absolute_db, b"seed").expect("write absolute db");
 
         let relative_path = absolute_db

@@ -2341,7 +2341,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    // APFS and HFS+ refuse non-UTF-8 names (EILSEQ), so this byte-path case
+    // cannot occur on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_inventory_preserves_non_unicode_database_identity() {
         use std::os::unix::ffi::OsStringExt;
@@ -2607,7 +2609,9 @@ mod tests {
         assert!(inspect_proactive_backup_staging(&outside.join("database-alias/mail.db")).is_err());
     }
 
-    #[cfg(unix)]
+    // APFS and HFS+ refuse non-UTF-8 names (EILSEQ), so this byte-path case
+    // cannot occur on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn proactive_staging_inventory_preserves_non_unicode_names_and_sparse_lengths() {
         use std::os::unix::ffi::OsStringExt;

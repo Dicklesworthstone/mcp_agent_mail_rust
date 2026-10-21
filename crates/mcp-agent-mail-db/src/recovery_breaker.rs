@@ -1749,12 +1749,9 @@ mod tests {
             match shape {
                 "symlink" => std::os::unix::fs::symlink(&sentinel, &wal).unwrap(),
                 "directory" => std::fs::create_dir(&wal).unwrap(),
-                "fifo" => rustix::fs::mknodat(
-                    rustix::fs::CWD,
+                "fifo" => nix::unistd::mkfifo(
                     &wal,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-                    0,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
                 )
                 .unwrap(),
                 _ => unreachable!(),

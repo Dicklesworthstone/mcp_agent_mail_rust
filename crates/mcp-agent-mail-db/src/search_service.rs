@@ -5728,7 +5728,9 @@ mod tests {
         assert_ne!(first, other);
     }
 
-    #[cfg(unix)]
+    // APFS and HFS+ refuse non-UTF-8 names (EILSEQ), so this byte-path case
+    // cannot occur on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn stable_direct_surface_index_dir_keeps_native_byte_authorities_distinct() {
         use std::ffi::OsString;
@@ -6893,7 +6895,8 @@ mod tests {
         reset_lexical_bootstrap_tracking();
 
         let root = tempfile::tempdir().expect("tempdir");
-        let db_path = root.path().join("mail.sqlite3");
+        let root_path = root.path().canonicalize().expect("canonical tempdir");
+        let db_path = root_path.join("mail.sqlite3");
         seed_generation_db(&db_path, "gen-296");
         let db_url = format!("sqlite:///{}", db_path.display());
         let expected_key = format!("{}@gen-296", db_path.display());
@@ -6902,7 +6905,7 @@ mod tests {
         // Order A: the startup backfill wins the race; the handlers' pool
         // only appears afterwards (the always-on daemon's normal boot).
         note_startup_lexical_backfill_completed(&db_url).expect("record startup bootstrap");
-        let later_pool = temp_file_pool(root.path(), "mail.sqlite3");
+        let later_pool = temp_file_pool(&root_path, "mail.sqlite3");
         assert_eq!(sqlite_key_for_pool(&later_pool), expected_key);
         assert_eq!(
             sqlite_key_from_database_url(&db_url).as_deref(),
@@ -6922,7 +6925,7 @@ mod tests {
         // Order B: a fresh pool generation (a second wrapper minted later in
         // the process, exactly what `get_or_reuse_compatible_memory_pool`
         // produced for the recorder) must still compare equal.
-        let earlier_pool = temp_file_pool(root.path(), "mail.sqlite3");
+        let earlier_pool = temp_file_pool(&root_path, "mail.sqlite3");
         assert_ne!(
             earlier_pool.sqlite_identity_key(),
             later_pool.sqlite_identity_key(),
@@ -6990,7 +6993,11 @@ mod tests {
     fn sqlite_key_from_database_url_treats_three_slashes_as_absolute_even_when_relative_shadow_is_missing()
      {
         let absolute_dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = absolute_dir.path().join("storage-missing.sqlite3");
+        let absolute_db = absolute_dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("storage-missing.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
         let conn = crate::DbConn::open_file(&absolute_db_str).expect("open");
         conn.execute_raw("CREATE TABLE t (x INTEGER)")
@@ -7011,7 +7018,11 @@ mod tests {
     #[test]
     fn sqlite_key_from_database_url_normalizes_malformed_relative_paths() {
         let absolute_dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = absolute_dir.path().join("storage.sqlite3");
+        let absolute_db = absolute_dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("storage.sqlite3");
         let absolute_db_str = absolute_db.to_string_lossy().into_owned();
         let conn = crate::DbConn::open_file(&absolute_db_str).expect("open");
         conn.execute_raw("CREATE TABLE t (x INTEGER)")
@@ -7058,7 +7069,11 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_lexical_bootstrap_tracking();
         let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("mailbox.sqlite3");
+        let db_path = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("mailbox.sqlite3");
         seed_generation_db(&db_path, "gen-display");
         let config = crate::pool::DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),

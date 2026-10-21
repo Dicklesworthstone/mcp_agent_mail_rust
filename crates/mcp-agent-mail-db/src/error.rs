@@ -964,6 +964,7 @@ fn fd_pressure_for(class: DbErrorClass, detail: &str) -> Option<DbFailureFdPress
 /// Descriptors of headroom below the soft `RLIMIT_NOFILE` at or under which the
 /// process counts as at its ceiling (GH#333): one open needs the main file
 /// plus its sidecars.
+#[cfg(any(target_os = "linux", test))]
 const FD_CEILING_HEADROOM: u64 = 16;
 
 /// Classes an exhausted descriptor table surfaces as (GH#333). Corruption,
@@ -979,6 +980,7 @@ const fn can_mask_fd_exhaustion(class: DbErrorClass) -> bool {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 const fn fd_count_at_ceiling(open: u64, soft_limit: u64) -> bool {
     soft_limit.saturating_sub(open) <= FD_CEILING_HEADROOM
 }

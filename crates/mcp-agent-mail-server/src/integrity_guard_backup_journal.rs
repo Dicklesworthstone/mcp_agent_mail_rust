@@ -383,7 +383,9 @@ impl AutomaticBackupLease {
         self.persist()
     }
 
-    #[allow(clippy::unnecessary_cast)] // stat field widths differ across Unix targets.
+    // stat field widths differ across Unix targets (macOS st_dev is i32); std's
+    // dev() widens with the same `as u64`, so both sides compare alike.
+    #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
     fn validate_entry(&self) -> io::Result<()> {
         let opened = self.file.metadata()?;
         let named = fstatat(

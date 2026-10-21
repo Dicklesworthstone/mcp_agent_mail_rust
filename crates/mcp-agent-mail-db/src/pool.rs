@@ -5567,7 +5567,7 @@ fn normalize_sqlite_identity_path(path: &str) -> String {
 /// Return the lossless normalized identity for a file-backed SQLite path.
 /// `None` is the in-memory sentinel, which must remain isolated by underlying
 /// pool identity rather than entering any file-backed registry.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn normalize_file_sqlite_identity(path: &str) -> Option<PathBuf> {
     (path != ":memory:").then(|| normalize_sqlite_identity_path_buf(Path::new(path)))
 }
@@ -15004,7 +15004,9 @@ fn quarantine_stale_proactive_backup_companions(
 
 /// Without Linux `/proc`, open handles cannot be ruled out, so stale
 /// companions keep the refusal and stay in place.
+// Same signature as the Linux variant, so the shared caller stays cfg-free.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
 fn quarantine_stale_proactive_backup_companions(
     _backup_path: &Path,
     _before_mutation: impl FnOnce() -> std::io::Result<()>,
@@ -25507,7 +25509,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // APFS and HFS+ refuse non-UTF-8 names (EILSEQ), so this byte-path case
+    // cannot occur on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn invalid_byte_archive_roots_remain_distinct_allocator_authorities() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25573,7 +25577,9 @@ mod tests {
         assert!(!established.message_id_allocator().is_retired());
     }
 
-    #[cfg(unix)]
+    // APFS and HFS+ refuse non-UTF-8 names (EILSEQ), so this byte-path case
+    // cannot occur on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn invalid_byte_sqlite_targets_remain_distinct_allocator_identities() {
         use std::os::unix::fs::symlink;
@@ -26057,7 +26063,7 @@ mod tests {
     #[test]
     fn pool_sqlite_path_accessor() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("path_test.db");
+        let db_path = dir.path().canonicalize().unwrap().join("path_test.db");
         let expected = db_path.display().to_string();
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
@@ -29580,7 +29586,9 @@ mod tests {
         recovery_admission().reset();
     }
 
-    #[cfg(unix)]
+    // APFS and HFS+ refuse non-UTF-8 names (EILSEQ), so this byte-path case
+    // cannot occur on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn nested_recovery_admission_distinguishes_lossy_colliding_unix_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -32110,8 +32118,9 @@ mod tests {
     #[test]
     fn proactive_backup_refreshes_unknown_fresh_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("unknown-backup.db");
-        let backup = dir.path().join("unknown-backup.db.bak");
+        let root = dir.path().canonicalize().unwrap();
+        let db_path = root.join("unknown-backup.db");
+        let backup = root.join("unknown-backup.db.bak");
         write_marker_db(&db_path, "healthy-primary");
         std::fs::write(&backup, b"unverified fresh bytes").unwrap();
         let pool = DbPool::new(&DbPoolConfig {
@@ -32534,8 +32543,9 @@ mod tests {
     #[test]
     fn proactive_backup_refreshes_corruption_with_unchanged_mtime_and_length() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test_refresh_bad_bak.db");
-        let bak_path = dir.path().join("test_refresh_bad_bak.db.bak");
+        let root = dir.path().canonicalize().unwrap();
+        let db_path = root.join("test_refresh_bad_bak.db");
+        let bak_path = root.join("test_refresh_bad_bak.db.bak");
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             ..Default::default()
@@ -37242,8 +37252,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("ATC authority tempdir");
-        let ordinary_dir = root.path().join("ordinary");
-        let redirected_dir = root.path().join("redirected");
+        let root_path = root.path().canonicalize().expect("canonical ATC tempdir");
+        let ordinary_dir = root_path.join("ordinary");
+        let redirected_dir = root_path.join("redirected");
         std::fs::create_dir_all(&ordinary_dir).expect("create ordinary ATC authority directory");
         std::fs::create_dir_all(&redirected_dir)
             .expect("create redirected ATC authority directory");

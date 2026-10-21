@@ -3979,7 +3979,13 @@ mod tests {
     #[test]
     fn open_sync_connection_with_path_uses_shared_server_resolver() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = dir.path().join("poller_fallback.sqlite3");
+        // The resolver reports canonical paths; macOS temp dirs sit behind the
+        // /var -> /private/var symlink.
+        let absolute_db = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("poller_fallback.sqlite3");
         let conn = DbConn::open_file(absolute_db.to_string_lossy().as_ref()).expect("open");
         create_empty_mail_schema(&conn);
         drop(conn);
