@@ -112,6 +112,9 @@ const KNOWN_TABLES: &[KnownTable] = &[
             "created_ts",
             "recipients_json",
             "attachments",
+            // NULL is unknown legacy authority; {} proves a non-reply. Keep
+            // the opaque value intact through private copies and finalization.
+            "archive_metadata_json",
         ],
     },
     KnownTable {
@@ -1114,8 +1117,8 @@ pub fn create_snapshot_context(
 /// What a snapshot is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotPurpose {
-    /// A share bundle that will be published: agents' registration tokens are
-    /// removed whatever the scrub preset.
+    /// A share bundle that will be published: registration tokens and opaque
+    /// message recovery metadata are removed whatever the scrub preset.
     Publish,
     /// A private archive (`am archive save`): the preset alone decides, so the
     /// lossless `archive` preset keeps tokens and a restore can still send.
@@ -1163,6 +1166,7 @@ fn finish_snapshot_context(
         // Before finalize rebuilds the file, so no page keeps the old values.
         let removed = crate::scrub::clear_registration_tokens(snapshot_path)?;
         scrub_summary.secrets_replaced += removed;
+        clear_published_archive_metadata(snapshot_path)?;
     }
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
         crate::scrub::redact_scope_project_human_keys(&mut scope);
@@ -1175,6 +1179,40 @@ fn finish_snapshot_context(
         scrub_summary,
         fts_enabled: finalize.fts_enabled,
     })
+}
+
+/// Recovery metadata is not viewer data and newer writers may put credentials
+/// or private routing in it. Preserve it in private archives, but never publish
+/// it, including with the otherwise lossless archive scrub preset. This runs
+/// before the final canonical rebuild so old payload pages are not shipped.
+fn clear_published_archive_metadata(snapshot_path: &Path) -> Result<(), ShareError> {
+    let path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let conn = DbConn::open_file(path.display().to_string()).map_err(|error| ShareError::Sqlite {
+        message: format!("open snapshot for recovery metadata cleanup: {error}"),
+    })?;
+    let conn = mcp_agent_mail_db::guard_db_conn(conn, "published recovery metadata cleanup");
+    // Every snapshot produced here has this column, even for legacy sources.
+    // Its absence or an unreadable schema must stop publication, not skip it.
+    conn.execute_raw(
+        "UPDATE messages SET archive_metadata_json = NULL WHERE archive_metadata_json IS NOT NULL",
+    )
+    .map_err(|error| ShareError::Sqlite {
+        message: format!("clear published recovery metadata: {error}"),
+    })?;
+    let remaining = conn
+        .query_sync(
+            "SELECT 1 FROM messages WHERE archive_metadata_json IS NOT NULL LIMIT 1",
+            &[],
+        )
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("verify published recovery metadata cleanup: {error}"),
+        })?;
+    if !remaining.is_empty() {
+        return Err(ShareError::Validation {
+            message: "message recovery metadata remains in published snapshot".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Context returned by the snapshot preparation pipeline.
@@ -1192,6 +1230,199 @@ mod tests {
 
     fn private_source(path: &Path) -> CanonicalDbConn {
         CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap()
+    }
+
+    fn seed_reply_metadata_source(conn: &impl SnapshotSource, legacy: bool) {
+        for sql in [
+            "CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            "CREATE TABLE agents(id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT DEFAULT 'test', model TEXT DEFAULT 'test', task_description TEXT DEFAULT '', inception_ts INTEGER DEFAULT 0, last_active_ts INTEGER DEFAULT 0, attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT DEFAULT 'thread', topic TEXT DEFAULT 'handoff', subject TEXT DEFAULT 'subject', body_md TEXT DEFAULT 'body', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts INTEGER DEFAULT 1707000000000000, recipients_json TEXT DEFAULT '{}', attachments TEXT DEFAULT '[]')",
+        ] {
+            conn.execute_snapshot(sql).unwrap();
+        }
+        // Add the optional column before any rows: this fixture is not a v30
+        // short-record migration, which has its own materialization coverage.
+        if !legacy {
+            conn.execute_snapshot("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT")
+                .unwrap();
+        }
+        for sql in [
+            "INSERT INTO projects VALUES(1,'reply-copy','/reply-copy',1707000000000000)",
+            "INSERT INTO agents(id,project_id,name) VALUES(1,1,'BlueLake')",
+            "INSERT INTO messages(id,project_id,sender_id) VALUES(1,1,1),(2,1,1),(3,1,1),(4,1,1),(5,1,1),(6,1,1)",
+        ] {
+            conn.execute_snapshot(sql).unwrap();
+        }
+        if !legacy {
+            for sql in [
+                "UPDATE messages SET archive_metadata_json='{}' WHERE id=2",
+                "UPDATE messages SET archive_metadata_json='{\"reply_to\":2}' WHERE id=3",
+                "UPDATE messages SET archive_metadata_json=' { \"reply_to\" : 2 } ' WHERE id=4",
+                "UPDATE messages SET archive_metadata_json='{\"future\":\"private recovery payload\",\"reply_to\":2}' WHERE id=5",
+                "UPDATE messages SET archive_metadata_json='not-json' WHERE id=6",
+            ] {
+                conn.execute_snapshot(sql).unwrap();
+            }
+        }
+    }
+
+    fn reply_metadata(conn: &impl SnapshotSource) -> Vec<(i64, Option<String>)> {
+        conn.query_snapshot(
+            "SELECT id, archive_metadata_json FROM messages ORDER BY id",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_named("id").unwrap(),
+                row.get_named("archive_metadata_json").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn snapshot_preserves_exact_reply_authority_through_live_and_private_copies() {
+        for live in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("metadata-source.sqlite3");
+            let copy = dir.path().join("metadata-copy.sqlite3");
+            let rebuilt = dir.path().join("metadata-rebuilt.sqlite3");
+            let expected = if live {
+                let conn = DbConn::open_file(source.display().to_string()).unwrap();
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            } else {
+                let conn = private_source(&source);
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            };
+            assert_eq!(expected[0], (1, None));
+            assert_eq!(expected[1], (2, Some("{}".to_string())));
+            assert_eq!(expected[2], (3, Some("{\"reply_to\":2}".to_string())));
+            if live {
+                create_sqlite_snapshot(&source, &copy, false).unwrap();
+            } else {
+                create_private_canonical_sqlite_snapshot(&source, &copy, false).unwrap();
+            }
+            assert_eq!(reply_metadata(&private_source(&copy)), expected);
+            create_private_canonical_sqlite_snapshot(&copy, &rebuilt, false).unwrap();
+            assert_eq!(reply_metadata(&private_source(&rebuilt)), expected);
+            let unchanged = if live {
+                reply_metadata(&DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                reply_metadata(&private_source(&source))
+            };
+            assert_eq!(unchanged, expected, "source must remain unchanged");
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_metadata_remains_unknown_instead_of_becoming_a_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy-metadata.sqlite3");
+        let copy = dir.path().join("legacy-copy.sqlite3");
+        let rebuilt = dir.path().join("legacy-rebuilt.sqlite3");
+        seed_reply_metadata_source(&private_source(&source), true);
+        create_private_canonical_sqlite_snapshot(&source, &copy, false).unwrap();
+        create_private_canonical_sqlite_snapshot(&copy, &rebuilt, false).unwrap();
+        let expected: Vec<_> = (1..=6).map(|id| (id, None)).collect();
+        assert_eq!(reply_metadata(&private_source(&copy)), expected);
+        assert_eq!(reply_metadata(&private_source(&rebuilt)), expected);
+    }
+
+    #[test]
+    fn snapshot_context_preserves_private_metadata_and_clears_every_publish_preset() {
+        for preset in [
+            crate::ScrubPreset::Standard,
+            crate::ScrubPreset::Strict,
+            crate::ScrubPreset::Archive,
+        ] {
+            for purpose in [SnapshotPurpose::Publish, SnapshotPurpose::PrivateArchive] {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("context-metadata.sqlite3");
+                let snapshot = dir.path().join("context-copy.sqlite3");
+                seed_reply_metadata_source(&private_source(&source), false);
+                let original = reply_metadata(&private_source(&source));
+                create_private_canonical_snapshot_context(&source, &snapshot, &[], preset, purpose)
+                    .unwrap();
+                let expected = if purpose == SnapshotPurpose::PrivateArchive
+                    && matches!(preset, crate::ScrubPreset::Archive)
+                {
+                    original.clone()
+                } else {
+                    original.iter().map(|(id, _)| (*id, None)).collect()
+                };
+                assert_eq!(reply_metadata(&private_source(&snapshot)), expected);
+                assert_eq!(reply_metadata(&private_source(&source)), original);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_metadata_pagination_observes_one_wal_generation() {
+        use std::cell::Cell;
+        struct MetadataRace<'a> {
+            reader: &'a CanonicalDbConn,
+            writer: &'a CanonicalDbConn,
+            pages: Cell<usize>,
+        }
+        impl SnapshotSource for MetadataRace<'_> {
+            fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.reader.execute_raw(sql)
+            }
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                let rows = self.reader.query_sync(sql, params)?;
+                if sql.contains("FROM \"messages\"") {
+                    assert!(sql.contains("\"archive_metadata_json\" AS \"archive_metadata_json\""));
+                    assert!(sql.ends_with("LIMIT 1000"));
+                    assert!(rows.len() <= 1000);
+                    self.pages.set(self.pages.get() + 1);
+                    if self.pages.get() == 1 {
+                        self.writer.execute_raw("BEGIN IMMEDIATE; UPDATE messages SET archive_metadata_json='{\"reply_to\":2}', body_md='later body' WHERE id=1001; COMMIT")?;
+                    }
+                }
+                Ok(rows)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("wal-metadata.sqlite3");
+        let conn = private_source(&source);
+        conn.execute_raw("PRAGMA journal_mode=WAL").unwrap();
+        seed_reply_metadata_source(&conn, false);
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        for id in 7..=1001 {
+            conn.execute_sync(
+                "INSERT INTO messages(id,project_id,sender_id,archive_metadata_json) VALUES(?1,1,1,'{\"reply_to\":1}')",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        let expected = reply_metadata(&conn);
+        let writer = private_source(&source);
+        let target = private_source(&dir.path().join("wal-metadata-copy.sqlite3"));
+        let race = MetadataRace {
+            reader: &conn,
+            writer: &writer,
+            pages: Cell::new(0),
+        };
+        transfer_tables_in_consistent_read(&race, &target).unwrap();
+        assert_eq!(race.pages.get(), 3);
+        assert_eq!(reply_metadata(&target), expected);
+        assert_eq!(
+            reply_metadata(&conn).last().unwrap().1.as_deref(),
+            Some("{\"reply_to\":2}")
+        );
+        let copied_body = target
+            .query_sync("SELECT body_md FROM messages WHERE id=1001", &[])
+            .unwrap();
+        assert_eq!(copied_body[0].get_named::<String>("body_md").unwrap(), "body");
     }
 
     #[test]
