@@ -940,10 +940,9 @@ fn snapshot_page_keys<'a>(
     table: &'a KnownTable,
     columns: &HashSet<String>,
 ) -> Result<Vec<&'a str>, ShareError> {
-    let keys = table.page_by_column.map_or_else(
-        || table.primary_key_columns.to_vec(),
-        |column| vec![column],
-    );
+    let keys = table
+        .page_by_column
+        .map_or_else(|| table.primary_key_columns.to_vec(), |column| vec![column]);
     if keys.is_empty() || keys.iter().any(|key| !columns.contains(*key)) {
         return Err(ShareError::Validation {
             message: format!("snapshot {} lacks its complete pagination key", table.name),
@@ -956,24 +955,34 @@ fn snapshot_page_keys<'a>(
         })?;
     let mut primary = std::collections::BTreeMap::new();
     for row in rows {
-        let name = row.get_named::<String>("name").map_err(|error| ShareError::Sqlite {
-            message: format!("decode snapshot {} key name: {error}", table.name),
-        })?.to_ascii_lowercase();
-        let position = row.get_named::<i64>("pk").map_err(|error| ShareError::Sqlite {
-            message: format!("decode snapshot {} key position: {error}", table.name),
-        })?;
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("decode snapshot {} key name: {error}", table.name),
+            })?
+            .to_ascii_lowercase();
+        let position = row
+            .get_named::<i64>("pk")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("decode snapshot {} key position: {error}", table.name),
+            })?;
         if position < 0 || (position > 0 && primary.insert(position, name).is_some()) {
             return Err(ShareError::Validation {
                 message: format!("snapshot {} has an ambiguous primary key", table.name),
             });
         }
     }
-    if primary.is_empty() || primary.iter().enumerate().any(|(index, (position, name))| {
-        *position != i64::try_from(index + 1).unwrap_or(i64::MAX)
-            || !keys.contains(&name.as_str())
-    }) {
+    if primary.is_empty()
+        || primary.iter().enumerate().any(|(index, (position, name))| {
+            *position != i64::try_from(index + 1).unwrap_or(i64::MAX)
+                || !keys.contains(&name.as_str())
+        })
+    {
         return Err(ShareError::Validation {
-            message: format!("snapshot {} pagination key is not uniquely constrained", table.name),
+            message: format!(
+                "snapshot {} pagination key is not uniquely constrained",
+                table.name
+            ),
         });
     }
     Ok(keys)
@@ -987,28 +996,45 @@ fn snapshot_page_query(
 ) -> (String, Vec<Value>) {
     // Alias the projection so upper-case imported column declarations do not
     // change the names returned by the driver. Identifiers are known constants.
-    let projection = columns.iter().map(|column| format!("\"{column}\" AS \"{column}\""))
-        .collect::<Vec<_>>().join(", ");
-    let order_keys = keys.iter().map(|key| {
-        if *key == "kind" { format!("\"{key}\" COLLATE BINARY") } else { format!("\"{key}\"") }
-    }).collect::<Vec<_>>();
+    let projection = columns
+        .iter()
+        .map(|column| format!("\"{column}\" AS \"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_keys = keys
+        .iter()
+        .map(|key| {
+            if *key == "kind" {
+                format!("\"{key}\" COLLATE BINARY")
+            } else {
+                format!("\"{key}\"")
+            }
+        })
+        .collect::<Vec<_>>();
     let mut sql = format!("SELECT {projection} FROM \"{}\"", table.name);
     let mut params = Vec::new();
     if let Some(after) = after {
         debug_assert_eq!(after.len(), keys.len());
-        let continuation = (0..keys.len()).map(|index| {
-            let mut terms = (0..index).map(|equal| format!("{} = ?{}", order_keys[equal], equal + 1))
-                .collect::<Vec<_>>();
-            terms.push(format!("{} > ?{}", order_keys[index], index + 1));
-            format!("({})", terms.join(" AND "))
-        }).collect::<Vec<_>>().join(" OR ");
+        let continuation = (0..keys.len())
+            .map(|index| {
+                let mut terms = (0..index)
+                    .map(|equal| format!("{} = ?{}", order_keys[equal], equal + 1))
+                    .collect::<Vec<_>>();
+                terms.push(format!("{} > ?{}", order_keys[index], index + 1));
+                format!("({})", terms.join(" AND "))
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
         sql.push_str(&format!(" WHERE {continuation}"));
         params.extend(after.iter().map(|key| match key {
             SnapshotKey::Integer(value) => Value::BigInt(*value),
             SnapshotKey::Text(value) => Value::Text(value.clone()),
         }));
     }
-    sql.push_str(&format!(" ORDER BY {} LIMIT {SNAPSHOT_PAGE_ROWS}", order_keys.join(", ")));
+    sql.push_str(&format!(
+        " ORDER BY {} LIMIT {SNAPSHOT_PAGE_ROWS}",
+        order_keys.join(", ")
+    ));
     (sql, params)
 }
 
@@ -1017,17 +1043,19 @@ fn snapshot_row_key(
     table: &str,
     keys: &[&str],
 ) -> Result<Vec<SnapshotKey>, ShareError> {
-    keys.iter().map(|key| match (*key, row.get_by_name(key)) {
-        ("kind", Some(Value::Text(value))) => Ok(SnapshotKey::Text(value.clone())),
-        ("kind", _) => Err(ShareError::Validation {
-            message: format!("unexpected non-text pagination column {table}.{key}"),
-        }),
-        (_, Some(Value::BigInt(value))) => Ok(SnapshotKey::Integer(*value)),
-        (_, Some(Value::Int(value))) => Ok(SnapshotKey::Integer(i64::from(*value))),
-        _ => Err(ShareError::Sqlite {
-            message: format!("unexpected non-integer pagination column {table}.{key}"),
-        }),
-    }).collect()
+    keys.iter()
+        .map(|key| match (*key, row.get_by_name(key)) {
+            ("kind", Some(Value::Text(value))) => Ok(SnapshotKey::Text(value.clone())),
+            ("kind", _) => Err(ShareError::Validation {
+                message: format!("unexpected non-text pagination column {table}.{key}"),
+            }),
+            (_, Some(Value::BigInt(value))) => Ok(SnapshotKey::Integer(*value)),
+            (_, Some(Value::Int(value))) => Ok(SnapshotKey::Integer(i64::from(*value))),
+            _ => Err(ShareError::Sqlite {
+                message: format!("unexpected non-integer pagination column {table}.{key}"),
+            }),
+        })
+        .collect()
 }
 
 fn available_columns<'a>(table: &'a KnownTable, source_columns: &HashSet<String>) -> Vec<&'a str> {
@@ -1176,28 +1204,48 @@ mod tests {
         conn.execute_raw("CREATE TABLE projects(id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)").unwrap();
         let ids = [i64::MIN, -1001, -1, 0, 1, i64::MAX];
         for id in ids {
-            conn.execute_sync("INSERT INTO projects VALUES(?1, ?2, ?3, 0)", &[
-                Value::BigInt(id), Value::Text(format!("p-{id}")), Value::Text(format!("/p-{id}")),
-            ]).unwrap();
+            conn.execute_sync(
+                "INSERT INTO projects VALUES(?1, ?2, ?3, 0)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(format!("p-{id}")),
+                    Value::Text(format!("/p-{id}")),
+                ],
+            )
+            .unwrap();
         }
         drop(conn);
         create_private_canonical_sqlite_snapshot(&source, &copied, false).unwrap();
         create_private_canonical_sqlite_snapshot(&copied, &rebuilt, false).unwrap();
         for path in [&source, &copied, &rebuilt] {
-            let rows = private_source(path).query_sync("SELECT id FROM projects ORDER BY id", &[]).unwrap();
-            assert_eq!(rows.iter().map(|row| row.get_named::<i64>("id").unwrap()).collect::<Vec<_>>(), ids);
+            let rows = private_source(path)
+                .query_sync("SELECT id FROM projects ORDER BY id", &[])
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.get_named::<i64>("id").unwrap())
+                    .collect::<Vec<_>>(),
+                ids
+            );
         }
     }
 
     #[test]
     fn snapshot_recipient_pages_preserve_one_messages_large_population() {
         use std::cell::Cell;
-        struct Recorded<'a> { source: &'a CanonicalDbConn, pages: Cell<usize> }
+        struct Recorded<'a> {
+            source: &'a CanonicalDbConn,
+            pages: Cell<usize>,
+        }
         impl SnapshotSource for Recorded<'_> {
             fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
                 self.source.execute_raw(sql)
             }
-            fn query_snapshot(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
                 let rows = self.source.query_sync(sql, params)?;
                 if sql.contains("FROM \"message_recipients\"") {
                     assert!(sql.ends_with("LIMIT 1000"), "{sql}");
@@ -1213,22 +1261,38 @@ mod tests {
         source.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id, kind)); BEGIN").unwrap();
         for agent in -500..650 {
             for kind in ["to", "cc", "bcc"] {
-                source.execute_sync("INSERT INTO message_recipients VALUES(-1, ?1, ?2, ?3, NULL)", &[
-                    Value::BigInt(agent), Value::Text(kind.into()), Value::BigInt(agent + 1000),
-                ]).unwrap();
+                source
+                    .execute_sync(
+                        "INSERT INTO message_recipients VALUES(-1, ?1, ?2, ?3, NULL)",
+                        &[
+                            Value::BigInt(agent),
+                            Value::Text(kind.into()),
+                            Value::BigInt(agent + 1000),
+                        ],
+                    )
+                    .unwrap();
             }
         }
         source.execute_raw("COMMIT").unwrap();
-        let recorded = Recorded { source: &source, pages: Cell::new(0) };
+        let recorded = Recorded {
+            source: &source,
+            pages: Cell::new(0),
+        };
         transfer_tables_in_consistent_read(&recorded, &target).unwrap();
         assert_eq!(recorded.pages.get(), 5);
         let rows = target.query_sync("SELECT message_id, agent_id, kind, read_ts, ack_ts FROM message_recipients ORDER BY message_id, agent_id, kind", &[]).unwrap();
         assert_eq!(rows.len(), 3450);
-        for (row, (agent, kind)) in rows.iter().zip((-500..650).flat_map(|agent| ["bcc", "cc", "to"].map(|kind| (agent, kind)))) {
+        for (row, (agent, kind)) in rows
+            .iter()
+            .zip((-500..650).flat_map(|agent| ["bcc", "cc", "to"].map(|kind| (agent, kind))))
+        {
             assert_eq!(row.get_named::<i64>("message_id").unwrap(), -1);
             assert_eq!(row.get_named::<i64>("agent_id").unwrap(), agent);
             assert_eq!(row.get_named::<String>("kind").unwrap(), kind);
-            assert_eq!(row.get_named::<String>("read_ts").unwrap(), (agent + 1000).to_string());
+            assert_eq!(
+                row.get_named::<String>("read_ts").unwrap(),
+                (agent + 1000).to_string()
+            );
             assert_eq!(row.get_named::<Option<i64>>("ack_ts").unwrap(), None);
         }
     }
@@ -1242,7 +1306,9 @@ mod tests {
         conn.execute_raw("CREATE TABLE PROJECTS(ID INTEGER PRIMARY KEY, SLUG TEXT, HUMAN_KEY TEXT, CREATED_AT INTEGER); INSERT INTO PROJECTS VALUES(-7, 'upper', '/upper', 17)").unwrap();
         drop(conn);
         create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap();
-        let rows = private_source(&target).query_sync("SELECT id, slug, created_at FROM projects", &[]).unwrap();
+        let rows = private_source(&target)
+            .query_sync("SELECT id, slug, created_at FROM projects", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_named::<i64>("id").unwrap(), -7);
         assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "upper");
@@ -1258,16 +1324,28 @@ mod tests {
         conn.execute_raw("CREATE TABLE projects(id INTEGER, slug TEXT, human_key TEXT, created_at INTEGER); BEGIN").unwrap();
         for n in 1..=1001 {
             let id = n.min(1000);
-            conn.execute_sync("INSERT INTO projects VALUES(?1, ?2, '/duplicate', 0)", &[
-                Value::BigInt(id), Value::Text(format!("original-{n}")),
-            ]).unwrap();
+            conn.execute_sync(
+                "INSERT INTO projects VALUES(?1, ?2, '/duplicate', 0)",
+                &[Value::BigInt(id), Value::Text(format!("original-{n}"))],
+            )
+            .unwrap();
         }
         conn.execute_raw("COMMIT").unwrap();
         drop(conn);
         let error = create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap_err();
-        assert!(error.to_string().contains("not uniquely constrained"), "{error}");
+        assert!(
+            error.to_string().contains("not uniquely constrained"),
+            "{error}"
+        );
         assert!(!target.exists());
-        assert_eq!(private_source(&source).query_sync("SELECT count(*) AS n FROM projects", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 1001);
+        assert_eq!(
+            private_source(&source)
+                .query_sync("SELECT count(*) AS n FROM projects", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            1001
+        );
     }
 
     #[test]
@@ -1279,9 +1357,20 @@ mod tests {
         conn.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind)); INSERT INTO message_recipients VALUES(1, 2, NULL, 17, 19)").unwrap();
         drop(conn);
         let error = create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap_err();
-        assert!(error.to_string().contains("non-text pagination column message_recipients.kind"));
+        assert!(
+            error
+                .to_string()
+                .contains("non-text pagination column message_recipients.kind")
+        );
         assert!(!target.exists());
-        assert_eq!(private_source(&source).query_sync("SELECT ack_ts FROM message_recipients", &[]).unwrap()[0].get_named::<i64>("ack_ts").unwrap(), 19);
+        assert_eq!(
+            private_source(&source)
+                .query_sync("SELECT ack_ts FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("ack_ts")
+                .unwrap(),
+            19
+        );
     }
 
     #[test]
@@ -1291,18 +1380,33 @@ mod tests {
         let target = dir.path().join("nocase-copy.sqlite3");
         let conn = private_source(&source);
         conn.execute_raw("CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT COLLATE NOCASE, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id,kind)); BEGIN").unwrap();
-        let kinds = (0..1100).map(|n| format!("{}-{n:04}", if n % 2 == 0 { "B" } else { "a" }))
+        let kinds = (0..1100)
+            .map(|n| format!("{}-{n:04}", if n % 2 == 0 { "B" } else { "a" }))
             .collect::<Vec<_>>();
         for kind in &kinds {
-            conn.execute_sync("INSERT INTO message_recipients VALUES(1, 2, ?1, NULL, 19)", &[Value::Text(kind.clone())]).unwrap();
+            conn.execute_sync(
+                "INSERT INTO message_recipients VALUES(1, 2, ?1, NULL, 19)",
+                &[Value::Text(kind.clone())],
+            )
+            .unwrap();
         }
         conn.execute_raw("COMMIT").unwrap();
         drop(conn);
         create_private_canonical_sqlite_snapshot(&source, &target, false).unwrap();
-        let rows = private_source(&target).query_sync("SELECT kind FROM message_recipients ORDER BY kind COLLATE BINARY", &[]).unwrap();
+        let rows = private_source(&target)
+            .query_sync(
+                "SELECT kind FROM message_recipients ORDER BY kind COLLATE BINARY",
+                &[],
+            )
+            .unwrap();
         let mut expected = kinds;
         expected.sort();
-        assert_eq!(rows.iter().map(|row| row.get_named::<String>("kind").unwrap()).collect::<Vec<_>>(), expected);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.get_named::<String>("kind").unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -1312,9 +1416,15 @@ mod tests {
             fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
                 self.0.execute_raw(sql)
             }
-            fn query_snapshot(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
                 let mut rows = self.0.query_sync(sql, params)?;
-                if sql.contains("FROM \"projects\"") { rows.reverse(); }
+                if sql.contains("FROM \"projects\"") {
+                    rows.reverse();
+                }
                 Ok(rows)
             }
         }
@@ -1330,12 +1440,20 @@ mod tests {
     #[test]
     fn snapshot_recipient_paging_keeps_one_wal_snapshot_across_peer_commits() {
         use std::cell::Cell;
-        struct Interleaved<'a> { source: &'a CanonicalDbConn, writer: &'a CanonicalDbConn, fired: Cell<bool> }
+        struct Interleaved<'a> {
+            source: &'a CanonicalDbConn,
+            writer: &'a CanonicalDbConn,
+            fired: Cell<bool>,
+        }
         impl SnapshotSource for Interleaved<'_> {
             fn execute_snapshot(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
                 self.source.execute_raw(sql)
             }
-            fn query_snapshot(&self, sql: &str, params: &[Value]) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+            fn query_snapshot(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
                 let rows = self.source.query_sync(sql, params)?;
                 if sql.contains("FROM \"message_recipients\"") && !self.fired.replace(true) {
                     self.writer.execute_raw("BEGIN IMMEDIATE; UPDATE message_recipients SET ack_ts = 999 WHERE agent_id = 2000; INSERT INTO message_recipients VALUES(1,9999,'to',NULL,777); COMMIT")?;
@@ -1348,18 +1466,61 @@ mod tests {
         let source = private_source(&path);
         source.execute_raw("PRAGMA journal_mode=WAL; CREATE TABLE message_recipients(message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id)); BEGIN").unwrap();
         for agent in 1..=2300 {
-            source.execute_sync("INSERT INTO message_recipients VALUES(1,?1,'to',NULL,NULL)", &[Value::BigInt(agent)]).unwrap();
+            source
+                .execute_sync(
+                    "INSERT INTO message_recipients VALUES(1,?1,'to',NULL,NULL)",
+                    &[Value::BigInt(agent)],
+                )
+                .unwrap();
         }
         source.execute_raw("COMMIT").unwrap();
         let writer = private_source(&path);
         let target = private_source(&dir.path().join("paged-wal-copy.sqlite3"));
-        let interleaved = Interleaved { source: &source, writer: &writer, fired: Cell::new(false) };
+        let interleaved = Interleaved {
+            source: &source,
+            writer: &writer,
+            fired: Cell::new(false),
+        };
         transfer_tables_in_consistent_read(&interleaved, &target).unwrap();
         assert!(interleaved.fired.get());
-        assert_eq!(target.query_sync("SELECT count(*) AS n FROM message_recipients", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 2300);
-        assert_eq!(target.query_sync("SELECT ack_ts FROM message_recipients WHERE agent_id=2000", &[]).unwrap()[0].get_named::<Option<String>>("ack_ts").unwrap(), None);
-        assert_eq!(source.query_sync("SELECT count(*) AS n FROM message_recipients", &[]).unwrap()[0].get_named::<i64>("n").unwrap(), 2301);
-        assert_eq!(source.query_sync("SELECT ack_ts FROM message_recipients WHERE agent_id=2000", &[]).unwrap()[0].get_named::<i64>("ack_ts").unwrap(), 999);
+        assert_eq!(
+            target
+                .query_sync("SELECT count(*) AS n FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            2300
+        );
+        assert_eq!(
+            target
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE agent_id=2000",
+                    &[]
+                )
+                .unwrap()[0]
+                .get_named::<Option<String>>("ack_ts")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            source
+                .query_sync("SELECT count(*) AS n FROM message_recipients", &[])
+                .unwrap()[0]
+                .get_named::<i64>("n")
+                .unwrap(),
+            2301
+        );
+        assert_eq!(
+            source
+                .query_sync(
+                    "SELECT ack_ts FROM message_recipients WHERE agent_id=2000",
+                    &[]
+                )
+                .unwrap()[0]
+                .get_named::<i64>("ack_ts")
+                .unwrap(),
+            999
+        );
     }
 
     struct InterleavingSnapshotSource {

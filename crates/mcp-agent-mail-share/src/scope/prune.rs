@@ -365,12 +365,15 @@ mod tests {
         let conn = Conn::open_file(path.display().to_string()).unwrap();
         conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
         conn.execute_raw("CREATE TABLE message_delivery_signal_receipts(message_id INTEGER NOT NULL REFERENCES messages(id), agent_id INTEGER NOT NULL REFERENCES agents(id), delivery_route TEXT NOT NULL, signal_path_digest TEXT NOT NULL, observed_ts INTEGER NOT NULL, PRIMARY KEY(message_id, agent_id, delivery_route))").unwrap();
-        conn.execute_raw("INSERT INTO message_delivery_signal_receipts VALUES
+        conn.execute_raw(
+            "INSERT INTO message_delivery_signal_receipts VALUES
             (101,11,'inbox','kept-inbox',170),
             (101,11,'notification','kept-notification',171),
             (101,22,'inbox','excluded-bcc',172),
             (202,11,'inbox','excluded-message',173),
-            (303,22,'inbox','excluded-both',174)").unwrap();
+            (303,22,'inbox','excluded-both',174)",
+        )
+        .unwrap();
     }
 
     type SignalRow = (i64, i64, String, String, i64);
@@ -441,9 +444,12 @@ mod tests {
             ))
             .unwrap();
         }
-        conn.execute_raw("INSERT INTO messages(id,project_id,sender_id) VALUES(999,399,22);
+        conn.execute_raw(
+            "INSERT INTO messages(id,project_id,sender_id) VALUES(999,399,22);
             INSERT INTO message_delivery_signal_receipts VALUES(999,11,'inbox','late-message',175),
-            (999,22,'inbox','cross-chunk',176); COMMIT").unwrap();
+            (999,22,'inbox','cross-chunk',176); COMMIT",
+        )
+        .unwrap();
         drop(conn);
         let result = apply_project_scope(&path, &["keep".to_string()]).unwrap();
         assert_eq!(result.removed_count, 398);
@@ -482,14 +488,20 @@ mod tests {
             if malformed {
                 conn.execute_raw("ALTER TABLE message_delivery_signal_receipts RENAME COLUMN agent_id TO unavailable_agent_id").unwrap();
             } else {
-                conn.execute_raw("ALTER TABLE message_delivery_signal_receipts RENAME TO retained_signals;
-                    CREATE VIEW message_delivery_signal_receipts AS SELECT * FROM retained_signals").unwrap();
+                conn.execute_raw(
+                    "ALTER TABLE message_delivery_signal_receipts RENAME TO retained_signals;
+                    CREATE VIEW message_delivery_signal_receipts AS SELECT * FROM retained_signals",
+                )
+                .unwrap();
             }
             drop(conn);
             assert!(apply_project_scope(&path, &["keep".to_string()]).is_err());
             let conn = Conn::open_file(path.display().to_string()).unwrap();
             assert_eq!(
-                scalar(&conn, "SELECT COUNT(*) FROM message_delivery_signal_receipts"),
+                scalar(
+                    &conn,
+                    "SELECT COUNT(*) FROM message_delivery_signal_receipts"
+                ),
                 5
             );
             assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM projects"), 3);

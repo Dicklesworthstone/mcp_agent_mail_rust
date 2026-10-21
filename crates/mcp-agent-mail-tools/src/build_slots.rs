@@ -1360,8 +1360,7 @@ mod tests {
         assert!(result.released);
         assert_eq!(stored_lease(&alias).released_ts, Some(result.released_at));
         assert_eq!(std::fs::read(&preferred).unwrap(), untouched);
-        let next =
-            acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true).unwrap();
+        let next = acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true).unwrap();
         assert!(
             next.conflicts.is_empty(),
             "released legacy lease still blocks another holder"
@@ -1527,8 +1526,7 @@ mod tests {
             let preferred = lease_path_for_holder(&slot, "BlueLake", None);
             let alias = legacy_lease_path_for_holder(&slot, "BlueLake", Some("old"));
             let mut expired = make_lease("BlueLake", None, true);
-            expired.expires_ts =
-                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+            expired.expires_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
             write_lease_json(&preferred, &expired).unwrap();
             write_lease_json(&alias, &make_lease("BlueLake", Some("old"), true)).unwrap();
             let preferred_before = std::fs::read(&preferred).unwrap();
