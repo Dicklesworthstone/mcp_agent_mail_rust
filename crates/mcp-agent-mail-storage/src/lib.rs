@@ -25879,6 +25879,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark; unreliable under CI/parallel test load — run with --ignored"]
     fn spill_path_btreeset_benchmark_random_order_stability() {
         use std::time::Instant;
 
