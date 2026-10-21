@@ -1732,6 +1732,10 @@ mod tests {
                 let (tmp, pool, cx, original) =
                     seed_unacked_message_with(ensure_test_project_in_current_env);
                 seed_more_overdue(&cx, &pool, &original, 1..=2);
+                // Seed the durable generation before the first lap. Enabling
+                // escalation later seeds it (0b694c35), and a changed generation
+                // restarts the lap, which is not the property under test here.
+                let _ = seeded_generation(&cx, &pool);
                 let mut config = escalation_config(&tmp);
                 config.ack_escalation_enabled = false;
                 let mut state = AckScanState::default();
