@@ -172,12 +172,35 @@ fn legacy_metadata_matches_namespace(
         && meta.row_counts.iter().all(|(table, count)| {
             SNAPSHOT_ROW_COUNT_TABLES.contains(&table.as_str()) && *count >= 0
         })
-        && primary
-            .to_str()
-            .is_some_and(|path| meta.source_path == path)
+        && legacy_metadata_names_this_database(meta, primary, canonical_bak)
+}
+
+/// Those releases recorded the configured database spelling, not its
+/// canonical path: `/tmp/...` rather than `/private/tmp/...` on macOS, or a
+/// path with `.` components (GH#355). Accept an absolute record whose `.bak`
+/// spelling derives from its own source spelling and whose source normalizes,
+/// under the primary's own symlink policy, to this exact database. Relative,
+/// foreign and mismatched records stay unrecognized and are never replaced.
+fn legacy_metadata_names_this_database(
+    meta: &LegacySnapshotMetadata,
+    primary: &Path,
+    canonical_bak: &Path,
+) -> bool {
+    if primary
+        .to_str()
+        .is_some_and(|path| meta.source_path == path)
         && canonical_bak
             .to_str()
             .is_some_and(|path| meta.snapshot_path == path)
+    {
+        return true;
+    }
+    let recorded = Path::new(&meta.source_path);
+    recorded.is_absolute()
+        && snapshot_bak_path(recorded)
+            .to_str()
+            .is_some_and(|path| meta.snapshot_path == path)
+        && normalized_snapshot_primary(recorded).is_ok_and(|resolved| resolved == primary)
 }
 
 /// Resolve the `.bak` snapshot path for a primary database path.
@@ -592,6 +615,46 @@ fn write_snapshot_metadata(primary: &Path, meta: &VerifiedSnapshotMetadata) -> D
             ))
         })?;
     Ok(())
+}
+
+/// How the next verified backup will treat the metadata sidecar (GH#355).
+///
+/// This is a read-only health classification. It neither hashes a backup nor
+/// takes snapshot authority, so `Current` means only that the record belongs
+/// to this database in the current format, not that its exact bytes still
+/// exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotMetadataState {
+    /// No sidecar: no verified snapshot has been recorded yet.
+    Absent,
+    /// A current-format record for this database.
+    Current,
+    /// An unversioned v0.3.13-v0.3.30 record. It authorizes nothing; the next
+    /// verified backup preserves it as evidence and replaces it.
+    Legacy,
+    /// Malformed, foreign, future-format, unreadable or not a regular file.
+    /// Verified backups refuse to replace it, and while it is present backup
+    /// rotation keeps every backup generation.
+    Unrecognized(String),
+}
+
+/// Classify the metadata sidecar exactly as verified publication would.
+///
+/// # Errors
+/// Returns an error only when the database path itself cannot be resolved.
+pub fn snapshot_metadata_state(primary: &Path) -> DbResult<SnapshotMetadataState> {
+    let primary = normalized_snapshot_primary(primary)?;
+    let canonical_bak = snapshot_bak_path(&primary);
+    let meta_path = snapshot_meta_path(&primary);
+    Ok(
+        match existing_snapshot_metadata_authority(&meta_path, &primary, &canonical_bak) {
+            Ok(SnapshotMetadataAuthority::Missing) => SnapshotMetadataState::Absent,
+            Ok(SnapshotMetadataAuthority::Current(_)) => SnapshotMetadataState::Current,
+            Ok(SnapshotMetadataAuthority::Legacy(_)) => SnapshotMetadataState::Legacy,
+            Err(DbError::Sqlite(reason)) => SnapshotMetadataState::Unrecognized(reason),
+            Err(error) => SnapshotMetadataState::Unrecognized(error.to_string()),
+        },
+    )
 }
 
 /// Read the metadata sidecar for a primary database path, if present and parseable.
@@ -2079,6 +2142,128 @@ mod tests {
                 assert!(preserved.is_empty(), "{version}");
             }
         }
+    }
+
+    #[test]
+    fn legacy_metadata_recorded_through_another_spelling_of_this_database_is_superseded() {
+        // GH#355: v0.3.13-v0.3.30 recorded the configured database spelling,
+        // not its canonical path. A record that names this same database
+        // through an unnormalized absolute spelling must not block verified
+        // backups forever; relative, foreign and inconsistent ones still must.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+        let primary = canonical_dir.join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_primary = other.path().canonicalize().unwrap().join("storage.sqlite3");
+        make_restorable_mailbox_db(&other_primary);
+        let meta_path = snapshot_meta_path(&primary);
+        // Keep the `.` inside the parent: `Path::parent` trims a trailing one,
+        // so this spelling survives into the record's own `.bak` spelling.
+        // `Path` equality ignores `.` components, so compare the strings.
+        let spelled = PathBuf::from(format!(
+            "{}/./{}/storage.sqlite3",
+            canonical_dir.parent().unwrap().display(),
+            canonical_dir.file_name().unwrap().to_str().unwrap()
+        ));
+        assert_ne!(spelled.to_str(), primary.to_str());
+        assert_ne!(
+            snapshot_bak_path(&spelled).to_str(),
+            snapshot_bak_path(&primary).to_str()
+        );
+        let record = |source: &Path, snapshot: &Path| {
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&legacy_metadata_bytes(&primary)).unwrap();
+            record["source_path"] = serde_json::json!(source.to_str().unwrap());
+            record["snapshot_path"] = serde_json::json!(snapshot.to_str().unwrap());
+            serde_json::to_vec_pretty(&record).unwrap()
+        };
+
+        let unrecognized = [
+            record(
+                Path::new("./storage.sqlite3"),
+                &snapshot_bak_path(Path::new("./storage.sqlite3")),
+            ),
+            record(&other_primary, &snapshot_bak_path(&other_primary)),
+            record(&spelled, &snapshot_bak_path(&primary)),
+            record(&spelled, &snapshot_bak_path(&other_primary)),
+        ];
+        for bytes in unrecognized {
+            std::fs::write(&meta_path, &bytes).unwrap();
+            assert!(matches!(
+                snapshot_metadata_state(&primary).unwrap(),
+                SnapshotMetadataState::Unrecognized(_)
+            ));
+            let error = record_snapshot_metadata(&primary, 42)
+                .expect_err("a record for another or ambiguous path must fail closed");
+            assert!(error.to_string().contains("unrecognized regular file"));
+            assert_eq!(std::fs::read(&meta_path).unwrap(), bytes);
+            assert_eq!(
+                preserved_legacy_paths(&canonical_dir),
+                Vec::<PathBuf>::new()
+            );
+        }
+
+        let legacy = record(&spelled, &snapshot_bak_path(&spelled));
+        std::fs::write(&meta_path, &legacy).unwrap();
+        assert_eq!(
+            snapshot_metadata_state(&primary).unwrap(),
+            SnapshotMetadataState::Legacy
+        );
+        let fresh = record_snapshot_metadata(&primary, 42).expect("supersede the old spelling");
+        assert_eq!(fresh.source_path, primary.to_str().unwrap());
+        assert_eq!(latest_verified_snapshot(&primary), Some(fresh));
+        let preserved = preserved_legacy_paths(&canonical_dir);
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(std::fs::read(&preserved[0]).unwrap(), legacy);
+    }
+
+    #[test]
+    fn snapshot_metadata_state_matches_what_verified_publication_will_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        make_restorable_mailbox_db(&primary);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        let meta_path = snapshot_meta_path(&primary);
+        assert_eq!(
+            snapshot_metadata_state(&primary).unwrap(),
+            SnapshotMetadataState::Absent
+        );
+
+        std::fs::write(&meta_path, legacy_metadata_bytes(&primary)).unwrap();
+        assert_eq!(
+            snapshot_metadata_state(&primary).unwrap(),
+            SnapshotMetadataState::Legacy
+        );
+
+        record_snapshot_metadata(&primary, 42).unwrap();
+        assert_eq!(
+            snapshot_metadata_state(&primary).unwrap(),
+            SnapshotMetadataState::Current
+        );
+
+        let mut foreign: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        foreign["source_path"] = serde_json::json!("/foreign/storage.sqlite3");
+        std::fs::write(&meta_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let SnapshotMetadataState::Unrecognized(reason) =
+            snapshot_metadata_state(&primary).unwrap()
+        else {
+            panic!("a record for another database is not replaceable");
+        };
+        assert!(reason.contains("foreign or future authority"), "{reason}");
+        assert!(!reason.starts_with("SQLite error"), "{reason}");
+
+        let sentinel = b"operator evidence, not snapshot metadata";
+        std::fs::write(&meta_path, sentinel).unwrap();
+        let SnapshotMetadataState::Unrecognized(reason) =
+            snapshot_metadata_state(&primary).unwrap()
+        else {
+            panic!("malformed metadata is not replaceable");
+        };
+        assert!(reason.contains("unrecognized regular file"), "{reason}");
+        assert_eq!(std::fs::read(&meta_path).unwrap(), sentinel);
     }
 
     #[test]

@@ -251,10 +251,13 @@ pub fn rotation_delete_opted_in() -> bool {
     })
 }
 
-/// Periodic snapshots reclaim superseded bytes by default. An explicit false
-/// retains the operator's move-only policy; publication admission then bounds
-/// further growth instead of silently ignoring that policy.
-pub(crate) fn periodic_reclamation_enabled() -> bool {
+/// Periodic snapshots reclaim superseded bytes by default.
+///
+/// An explicit false retains the operator's move-only policy; publication
+/// admission then bounds further growth instead of silently ignoring that
+/// policy.
+#[must_use]
+pub fn periodic_reclamation_enabled() -> bool {
     mcp_agent_mail_core::config::process_env_value("AM_BACKUP_ROTATION_DELETE")
         .is_none_or(|_| rotation_delete_opted_in())
 }
@@ -355,6 +358,17 @@ fn periodic_byte_budget(primary: &Path, keep: usize) -> std::io::Result<(u64, u6
     Ok((generation, limit))
 }
 
+/// The one admission rule shared by the producer and health reporting.
+const fn periodic_limit_reached(
+    count: usize,
+    bytes: u64,
+    projected: u64,
+    count_limit: usize,
+    byte_limit: u64,
+) -> bool {
+    count >= count_limit || bytes.saturating_add(projected) > byte_limit
+}
+
 /// Publication admission and retention must use the same complete footprint.
 /// A planned or refused eviction does not create capacity for the producer.
 struct PeriodicPublicationBudget {
@@ -383,8 +397,13 @@ impl PeriodicPublicationBudget {
     }
 
     const fn exhausted(&self) -> bool {
-        self.count >= self.count_limit
-            || self.bytes.saturating_add(self.projected) > self.byte_limit
+        periodic_limit_reached(
+            self.count,
+            self.bytes,
+            self.projected,
+            self.count_limit,
+            self.byte_limit,
+        )
     }
 
     fn admit(&self) -> std::io::Result<()> {
@@ -615,6 +634,62 @@ pub(crate) fn admit_periodic_publication(
     primary: &Path,
     keep: usize,
 ) -> std::io::Result<()> {
+    periodic_publication_budget(storage_root, primary, keep)?.admit()
+}
+
+/// The automatic producer's retained footprint, computed exactly as
+/// publication admission computes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeriodicBackupFootprint {
+    /// Strict periodic images (`.bak` and `.bak.<timestamp>`), both beside
+    /// the database and under `doctor/reclaimable/`.
+    pub images: usize,
+    /// Those resident images plus every byte under `doctor/reclaimable/`.
+    pub retained_bytes: u64,
+    /// Size of the next publication (database plus WAL).
+    pub projected_bytes: u64,
+    pub image_limit: usize,
+    pub byte_limit: u64,
+}
+
+impl PeriodicBackupFootprint {
+    /// Whether the automatic producer refuses to publish another backup.
+    #[must_use]
+    pub const fn publication_refused(&self) -> bool {
+        periodic_limit_reached(
+            self.images,
+            self.retained_bytes,
+            self.projected_bytes,
+            self.image_limit,
+            self.byte_limit,
+        )
+    }
+}
+
+/// Read-only view of [`admit_periodic_publication`] for health reporting.
+///
+/// # Errors
+/// Fails closed, like admission, when the inventory is incomplete.
+pub fn periodic_backup_footprint(
+    storage_root: &Path,
+    primary: &Path,
+    keep: usize,
+) -> std::io::Result<PeriodicBackupFootprint> {
+    let budget = periodic_publication_budget(storage_root, primary, keep)?;
+    Ok(PeriodicBackupFootprint {
+        images: budget.count,
+        retained_bytes: budget.bytes,
+        projected_bytes: budget.projected,
+        image_limit: budget.count_limit,
+        byte_limit: budget.byte_limit,
+    })
+}
+
+fn periodic_publication_budget(
+    storage_root: &Path,
+    primary: &Path,
+    keep: usize,
+) -> std::io::Result<PeriodicPublicationBudget> {
     let mut count = 0_usize;
     let mut bytes = 0_u64;
     // Admission is fail-closed, unlike the best-effort health inventory:
@@ -664,7 +739,7 @@ pub(crate) fn admit_periodic_publication(
     bytes = bytes
         .checked_add(history.bytes)
         .ok_or_else(|| std::io::Error::other("retained backup size overflow"))?;
-    PeriodicPublicationBudget::new(primary, keep, count, bytes)?.admit()
+    PeriodicPublicationBudget::new(primary, keep, count, bytes)
 }
 
 #[cfg(unix)]

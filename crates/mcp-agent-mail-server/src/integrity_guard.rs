@@ -1949,6 +1949,51 @@ mod tests {
         false
     }
 
+    /// Linux hides `/proc/<pid>/fd` of the owner's nondumpable processes, for
+    /// example every `sshd-session` of an SSH login. The reclamation reader
+    /// proof cannot inspect them and refuses every deletion, so a drain can be
+    /// asserted only where the owner's whole process table is observable.
+    #[cfg(unix)]
+    fn owner_processes_fully_observable() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let uids = |process: &Path| -> Vec<u32> {
+                std::fs::read_to_string(process.join("status"))
+                    .ok()
+                    .and_then(|status| {
+                        status.lines().find_map(|line| {
+                            line.strip_prefix("Uid:").map(|uids| {
+                                uids.split_whitespace()
+                                    .filter_map(|uid| uid.parse().ok())
+                                    .collect()
+                            })
+                        })
+                    })
+                    .unwrap_or_default()
+            };
+            let owner = uids(Path::new("/proc/self"))[1];
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .all(|process| {
+                    let pid = process.file_name();
+                    if pid.to_str().is_none_or(|pid| pid.parse::<u32>().is_err())
+                        || !uids(&process.path()).contains(&owner)
+                    {
+                        return true;
+                    }
+                    match std::fs::read_dir(process.path().join("fd")) {
+                        Ok(_) => true,
+                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                    }
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+
     #[cfg(unix)]
     fn retention_mailbox(root: &Path) -> (PathBuf, DbPool) {
         let primary = root.join("mail.sqlite3");
@@ -2339,6 +2384,115 @@ mod tests {
             );
             assert_eq!(std::fs::read(&primary).unwrap(), live);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_v0330_snapshot_metadata_no_longer_strands_a_backup_backlog() {
+        // GH#355: a sidecar written by v0.3.30 (no schema, size or SHA-256)
+        // parked rotation and made every verified backup fail, while each
+        // proactive refresh renamed one more `.bak.<timestamp>` aside.
+        use mcp_agent_mail_db::snapshot::{
+            SnapshotMetadataState, snapshot_bak_path, snapshot_meta_path, snapshot_metadata_state,
+        };
+        if !isolated_default_retention_child() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let (primary, pool) = retention_mailbox(&root);
+        let live = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let metadata = snapshot_meta_path(&primary);
+        let legacy = serde_json::to_vec_pretty(&serde_json::json!({
+            "created_us": 1_789_546_475_731_049_i64,
+            "integrity_verified": true,
+            "integrity_kind": "integrity_check",
+            "schema_version": 1,
+            "row_counts": {"agents": 21, "messages": 5257},
+            "source_path": primary.to_str().unwrap(),
+            "snapshot_path": backup.to_str().unwrap(),
+            "binary_version": "0.3.30"
+        }))
+        .unwrap();
+        std::fs::write(&metadata, &legacy).unwrap();
+        for second in 0..50 {
+            std::fs::copy(
+                &primary,
+                root.join(format!("mail.sqlite3.bak.20000101_0000{second:02}")),
+            )
+            .unwrap();
+        }
+        // Only the producer's own strict generations may ever be removed.
+        let untouched = [
+            root.join("mail.sqlite3.manual-backup-20000101_000000"),
+            root.join("mail.sqlite3.bak.20000101"),
+            root.join("operator-notes.txt"),
+        ];
+        for path in &untouched {
+            std::fs::copy(&primary, path).unwrap();
+        }
+        assert_eq!(
+            snapshot_metadata_state(&primary).unwrap(),
+            SnapshotMetadataState::Legacy
+        );
+        let before = crate::backup_rotation::periodic_backup_footprint(&root, &primary, 3).unwrap();
+        assert_eq!(before.images, 51);
+        assert!(before.publication_refused());
+        assert!(crate::backup_rotation::admit_periodic_publication(&root, &primary, 3).is_err());
+
+        // Startup rotation alone cannot pin a generation from this record.
+        let startup = crate::backup_rotation::rotate_storage_backups(&root, &primary, 3).unwrap();
+        assert_eq!(startup.evicted(), 0);
+        assert_eq!(
+            crate::backup_rotation::periodic_backup_footprint(&root, &primary, 3)
+                .unwrap()
+                .images,
+            51
+        );
+
+        let mut schedule = AutomaticBackupSchedule::default();
+        assert!(run_automatic_backup(&pool, &root, &mut schedule));
+        assert_eq!(schedule.consecutive_failures(), 0);
+        assert_eq!(
+            snapshot_metadata_state(&primary).unwrap(),
+            SnapshotMetadataState::Current
+        );
+        assert_eq!(
+            mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).as_deref(),
+            Some(backup.as_path()),
+            "one verified repair must supersede the legacy record"
+        );
+        let preserved = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("mail.sqlite3.bak.meta.json.legacy-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(std::fs::read(&preserved[0]).unwrap(), legacy);
+
+        // The cycle published at most the one repair generation.
+        let after = crate::backup_rotation::periodic_backup_footprint(&root, &primary, 3).unwrap();
+        assert!(after.images <= before.images + 1, "{after:?}");
+        if owner_processes_fully_observable() {
+            assert!(after.images <= 4, "{after:?}");
+            assert!(!after.publication_refused(), "{after:?}");
+            crate::backup_rotation::admit_periodic_publication(&root, &primary, 3)
+                .expect("ordinary automatic backups resume");
+        } else {
+            eprintln!(
+                "not asserting the drain: a process of this user hides its open files, so the reclamation reader proof refuses every deletion"
+            );
+        }
+        for path in &untouched {
+            assert_eq!(std::fs::read(path).unwrap(), live, "{}", path.display());
+        }
+        assert_eq!(std::fs::read(&primary).unwrap(), live);
     }
 
     #[cfg(unix)]

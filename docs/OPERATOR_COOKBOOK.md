@@ -568,6 +568,26 @@ queue's entire cleanup allowance.
 Bounded cleanup passes can leave more work for a later attempt; the publication
 limit remains in force while that work is pending.
 
+`am doctor health` prints a `backup_retention:` line for this state. It reads
+`storage.sqlite3.bak.meta.json` the way a verified backup would and computes
+the producer's count and byte footprint with the same rule as admission. An
+unversioned sidecar written by v0.3.13 through v0.3.30 is a warning: the next
+verified backup keeps it as a `.legacy-<sha256>.json` sibling and replaces it.
+Health fails (exit 1) when verified backups cannot replace the sidecar
+(malformed, foreign, from a newer format, or not a regular file), because
+verified backups then keep failing and rotation keeps every backup generation.
+It also fails when the footprint is at the publication limit, because
+automatic backups are then paused. For an unrecognized sidecar, move it aside
+and keep it as evidence; the next verified backup records fresh metadata.
+While automatic backups are paused, retention can delete superseded
+generations only after a verified backup has recorded current metadata, and
+the server makes at most one verified repair backup while over the limit. If
+health still does not show `snapshot_metadata=current` after the next backup
+attempt, stop the server and remove old `storage.sqlite3.bak.<timestamp>`
+files by hand, keeping `storage.sqlite3.bak` and the newest few. Generations
+that retention cannot tie to this mailbox also stay where they are; if
+`backup_images` stops falling, remove them the same way.
+
 ## 14. Plan archive pack maintenance [read-only]
 
 **Goal:** Measure mailbox archive bloat without changing the Git archive.

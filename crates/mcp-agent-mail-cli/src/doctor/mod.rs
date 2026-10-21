@@ -661,6 +661,72 @@ fn proactive_backup_health(
     }
 }
 
+/// `(status, detail)` for verified-snapshot metadata and periodic backup
+/// retention (GH#355). Unrecognized metadata makes every verified backup
+/// fail and parks rotation, and a footprint at the producer's limit pauses
+/// automatic backups: both leave the mailbox without a fresh restore point,
+/// so they fail. Legacy metadata is replaced by the next verified backup.
+fn backup_retention_health(
+    metadata_path: &Path,
+    metadata: &mcp_agent_mail_db::snapshot::SnapshotMetadataState,
+    footprint: &mcp_agent_mail_server::backup_rotation::PeriodicBackupFootprint,
+    periodic_reclamation: bool,
+) -> (&'static str, String) {
+    use mcp_agent_mail_db::snapshot::SnapshotMetadataState;
+
+    let mut status = "ok";
+    let mut problems = Vec::new();
+    let label = match metadata {
+        SnapshotMetadataState::Absent => "none",
+        SnapshotMetadataState::Current => "current",
+        SnapshotMetadataState::Legacy => {
+            status = "warn";
+            problems.push(format!(
+                "{} is an unversioned record written by v0.3.13-v0.3.30; the next verified backup keeps it as a .legacy-<sha256>.json sibling and replaces it",
+                metadata_path.display()
+            ));
+            "legacy"
+        }
+        SnapshotMetadataState::Unrecognized(reason) => {
+            status = "fail";
+            problems.push(format!(
+                "verified backups cannot replace {} and rotation keeps every backup generation while it is there ({reason}); next: move that file aside, keeping it as evidence, so the next verified backup records fresh metadata",
+                metadata_path.display()
+            ));
+            "unrecognized"
+        }
+    };
+    if footprint.publication_refused() {
+        status = "fail";
+        let remedy = if !periodic_reclamation {
+            "automatic deletion is off (AM_BACKUP_ROTATION_DELETE=false, or a platform without it), so old timestamped .bak files must be removed by hand"
+        } else if *metadata == SnapshotMetadataState::Current {
+            "retention deletes the superseded generations it can prove came from this mailbox, a bounded batch per backup attempt; if backup_images stops falling, stop the server and remove the remaining old timestamped .bak files by hand, keeping the plain .bak and the newest few"
+        } else {
+            "retention deletes nothing until a verified backup records current metadata, and the server makes only one verified repair backup while over the limit; if snapshot_metadata is still not current after the next backup attempt, stop the server and remove old timestamped .bak files by hand, keeping the plain .bak and the newest few"
+        };
+        problems.push(format!(
+            "automatic backups are paused: {} backup images and {} retained (plus {} for the next backup) are at the limit of {} images or {}; {remedy}",
+            footprint.images,
+            crate::format_bytes(footprint.retained_bytes),
+            crate::format_bytes(footprint.projected_bytes),
+            footprint.image_limit,
+            crate::format_bytes(footprint.byte_limit),
+        ));
+    }
+    let mut detail = format!(
+        "snapshot_metadata={label} backup_images={}/{} retained={}",
+        footprint.images,
+        footprint.image_limit,
+        crate::format_bytes(footprint.retained_bytes),
+    );
+    for problem in problems {
+        detail.push_str("; ");
+        detail.push_str(&problem);
+    }
+    (status, detail)
+}
+
 /// Read-only retention footprint for the same mailbox selected by the health
 /// probe. The resident total de-duplicates archive-reconcile files, which are
 /// visible both to direct backup rotation and recovery-debris reclaim.
@@ -681,6 +747,28 @@ fn doctor_retention_resident_stats(
         None,
     )
     .map_err(|error| format!("inspecting direct backup retention: {error}"))
+}
+
+fn doctor_backup_retention_health(
+    probe_target: &DoctorLiveProbeTarget,
+) -> Result<(&'static str, String), String> {
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        .map_err(|error| format!("resolving live database path: {error}"))?;
+    let database_path = PathBuf::from(&resolved.canonical_path);
+    let metadata = mcp_agent_mail_db::snapshot::snapshot_metadata_state(&database_path)
+        .map_err(|error| format!("inspecting snapshot metadata: {error}"))?;
+    let footprint = mcp_agent_mail_server::backup_rotation::periodic_backup_footprint(
+        &probe_target.storage_root,
+        &database_path,
+        mcp_agent_mail_server::backup_rotation::resolved_keep_per_kind(),
+    )
+    .map_err(|error| format!("inspecting periodic backups: {error}"))?;
+    Ok(backup_retention_health(
+        &mcp_agent_mail_db::snapshot::snapshot_meta_path(&database_path),
+        &metadata,
+        &footprint,
+        cfg!(unix) && mcp_agent_mail_server::backup_rotation::periodic_reclamation_enabled(),
+    ))
 }
 
 fn format_resident_to_live_database_ratio(
@@ -3610,6 +3698,21 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
+    // GH#355: metadata that verified backups cannot replace, or a periodic
+    // footprint at the producer's limit, silently stopped fresh restore
+    // points while this command still reported a healthy mailbox.
+    match doctor_backup_retention_health(&probe_target) {
+        Ok((status, detail)) => {
+            ftui_runtime::ftui_println!("backup_retention: {status} ({detail})");
+            if status == "fail" {
+                return Err(CliError::ExitCode(1));
+            }
+        }
+        Err(error) => {
+            ftui_runtime::ftui_println!("backup_retention: not_run ({error})");
+        }
+    }
+
     let root = runs::doctor_root(target);
     let latest = root.join("latest");
     let runs_dir = root.join("runs");
@@ -3933,6 +4036,199 @@ mod tests {
         ] {
             let (status, detail) = proactive_backup_health(guard, true, age, owner, true);
             assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
+        }
+    }
+
+    #[test]
+    fn backup_retention_health_fails_when_backups_cannot_refresh() {
+        use mcp_agent_mail_db::snapshot::SnapshotMetadataState;
+        use mcp_agent_mail_server::backup_rotation::PeriodicBackupFootprint;
+
+        let meta = Path::new("/mail/storage.sqlite3.bak.meta.json");
+        let footprint = |images, retained_bytes| PeriodicBackupFootprint {
+            images,
+            retained_bytes,
+            projected_bytes: 1024,
+            image_limit: 6,
+            byte_limit: 512 * 1024 * 1024,
+        };
+        let healthy = footprint(3, 3 * 1024);
+
+        for state in [
+            SnapshotMetadataState::Absent,
+            SnapshotMetadataState::Current,
+        ] {
+            let (status, detail) = backup_retention_health(meta, &state, &healthy, true);
+            assert_eq!(status, "ok", "{state:?}: {detail}");
+            assert!(detail.contains("backup_images=3/6"), "{detail}");
+        }
+
+        // A legacy record is replaced by the next verified backup.
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Legacy, &healthy, true);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("snapshot_metadata=legacy"), "{detail}");
+        assert!(detail.contains("v0.3.13-v0.3.30"), "{detail}");
+
+        // Metadata verified backups refuse to replace stops restore points.
+        let unrecognized = SnapshotMetadataState::Unrecognized(
+            "snapshot metadata refuses to replace unrecognized regular file".to_string(),
+        );
+        let (status, detail) = backup_retention_health(meta, &unrecognized, &healthy, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains(meta.to_str().unwrap()), "{detail}");
+        assert!(detail.contains("move that file aside"), "{detail}");
+
+        // GH#355's mailbox: 784 generations, 24.7 GiB, automatic backups paused.
+        // Without current metadata nothing can be deleted until a verified
+        // repair backup lands, so the operator is told what to do otherwise.
+        let backlog = footprint(784, 24_700 * 1024 * 1024);
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Legacy, &backlog, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("backup_images=784/6"), "{detail}");
+        assert!(detail.contains("automatic backups are paused"), "{detail}");
+        assert!(detail.contains("one verified repair backup"), "{detail}");
+        assert!(
+            detail.contains("remove old timestamped .bak files"),
+            "{detail}"
+        );
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Current, &backlog, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("bounded batch"), "{detail}");
+        assert!(detail.contains("stops falling"), "{detail}");
+        assert!(!detail.contains("one verified repair backup"), "{detail}");
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Current, &backlog, false);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("removed by hand"), "{detail}");
+
+        // The byte limit alone also pauses the producer.
+        let (status, detail) = backup_retention_health(
+            meta,
+            &SnapshotMetadataState::Current,
+            &footprint(2, 512 * 1024 * 1024),
+            true,
+        );
+        assert_eq!(status, "fail", "{detail}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_reports_snapshot_metadata_that_blocks_backups() {
+        // GH#355: a stale sidecar blocked rotation and every verified backup
+        // while `am doctor health` printed "ok: live mailbox healthy".
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        /// (label, sidecar, .bak generations, exits 1, expected output)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            usize,
+            bool,
+            &'static [&'static str],
+        );
+        let cases: [Case; 4] = [
+            (
+                "clean",
+                None,
+                0,
+                false,
+                &["backup_retention: ok", "snapshot_metadata=none"],
+            ),
+            (
+                "legacy record, no backlog",
+                Some("legacy"),
+                2,
+                false,
+                &["backup_retention: warn", "snapshot_metadata=legacy"],
+            ),
+            (
+                "unrecognized record",
+                Some("unrecognized"),
+                2,
+                true,
+                &["backup_retention: fail", "move that file aside"],
+            ),
+            (
+                "legacy record with a stranded backlog",
+                Some("legacy"),
+                40,
+                true,
+                &[
+                    "backup_retention: fail",
+                    "snapshot_metadata=legacy",
+                    "backup_images=40/",
+                    "automatic backups are paused",
+                ],
+            ),
+        ];
+        for (label, metadata, generations, fails, expected) in cases {
+            let target = tempfile::tempdir().unwrap();
+            let storage_root = tempfile::tempdir().unwrap();
+            let db_path = storage_root.path().join("storage.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
+            seed_healthy_live_mailbox(&db_path);
+            let meta_path = storage_root.path().join("storage.sqlite3.bak.meta.json");
+            // The v0.3.30 shape from the report: no schema, size or SHA-256.
+            let meta_bytes = metadata.map(|kind| match kind {
+                "legacy" => serde_json::to_vec_pretty(&serde_json::json!({
+                    "created_us": 1_789_546_475_731_049_i64,
+                    "integrity_verified": true,
+                    "integrity_kind": "integrity_check",
+                    "schema_version": 1,
+                    "row_counts": {"agents": 21, "messages": 5257},
+                    "source_path": db_path.to_str().unwrap(),
+                    "snapshot_path": format!("{}.bak", db_path.display()),
+                    "binary_version": "0.3.30"
+                }))
+                .unwrap(),
+                _ => b"operator evidence, not snapshot metadata".to_vec(),
+            });
+            if let Some(bytes) = &meta_bytes {
+                fs::write(&meta_path, bytes).unwrap();
+            }
+            if generations > 0 {
+                fs::copy(&db_path, storage_root.path().join("storage.sqlite3.bak")).unwrap();
+            }
+            for index in 1..generations {
+                fs::copy(
+                    &db_path,
+                    storage_root
+                        .path()
+                        .join(format!("storage.sqlite3.bak.20260921_{index:06}")),
+                )
+                .unwrap();
+            }
+
+            let (result, output) =
+                run_health_capturing(target.path(), &db_url, storage_root.path());
+
+            for needle in expected {
+                assert!(output.contains(needle), "{label}: {needle:?} in:\n{output}");
+            }
+            if fails {
+                assert!(
+                    matches!(result, Err(CliError::ExitCode(1))),
+                    "{label}: {result:?}\n{output}"
+                );
+                assert!(
+                    !output.contains("ok: live mailbox healthy"),
+                    "{label}:\n{output}"
+                );
+            } else {
+                assert!(result.is_ok(), "{label}: {result:?}\n{output}");
+                assert!(
+                    output.contains("ok: live mailbox healthy"),
+                    "{label}:\n{output}"
+                );
+            }
+            // Health is read-only: the metadata is reported, never replaced.
+            if let Some(bytes) = meta_bytes {
+                assert_eq!(fs::read(&meta_path).unwrap(), bytes, "{label}");
+            }
         }
     }
 
