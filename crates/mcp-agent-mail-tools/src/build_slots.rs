@@ -511,13 +511,12 @@ fn release_slot_lease(
         if !lease_matches_holder(&entry.lease, agent_name, branch) {
             continue;
         }
-        let released_at = match &entry.lease.released_ts {
-            Some(existing) => existing.clone(),
-            None => {
-                entry.lease.released_ts = Some(released_now.clone());
-                write_lease_json(&entry.path, &entry.lease)?;
-                released_now.clone()
-            }
+        let released_at = if let Some(existing) = &entry.lease.released_ts {
+            existing.clone()
+        } else {
+            entry.lease.released_ts = Some(released_now.clone());
+            write_lease_json(&entry.path, &entry.lease)?;
+            released_now.clone()
         };
         // A previously released alias must not short-circuit a remaining
         // active one after an interrupted release. Only successful completion

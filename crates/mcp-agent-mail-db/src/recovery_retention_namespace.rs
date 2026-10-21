@@ -23,6 +23,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// One newly claimed quarantine, retained across all moves in a batch.
+///
 /// Dropping it releases the directory lease and closes the handle; it never
 /// removes the directory or evidence. Empty-directory reclamation must acquire
 /// this same lease, so a newly claimed batch remains live before its first move.
@@ -388,10 +389,12 @@ fn validate_delete_inventory(file: &File, expected: &Metadata) -> io::Result<()>
     Ok(())
 }
 
-/// Remove an inventoried, empty native rotation directory. The caller owns
-/// naming/policy admission; this boundary refuses live leases, open readers,
-/// replaced inodes and symlinked ancestors. `rmdir` atomically refuses any
-/// child added after inventory, so this can never remove recovery evidence.
+/// Remove an inventoried, empty native rotation directory.
+///
+/// The caller owns naming/policy admission; this boundary refuses live
+/// leases, open readers, replaced inodes and symlinked ancestors. `rmdir`
+/// atomically refuses any child added after inventory, so this can never
+/// remove recovery evidence.
 pub fn delete_empty_reclaim_directory(source: &Path, inventoried: &Metadata) -> io::Result<()> {
     delete_empty_reclaim_directory_with(
         source,

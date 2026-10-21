@@ -94,13 +94,13 @@ impl SnapshotRetentionGuard {
             .map(|selected| selected.source.metadata())
             .transpose()?;
         let guard = Self {
-            recovery,
             authority,
             primary,
             metadata_path,
             metadata,
             selected,
             selected_identity,
+            recovery,
         };
         guard.revalidate()?;
         Ok(guard)
