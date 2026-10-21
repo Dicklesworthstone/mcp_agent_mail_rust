@@ -485,8 +485,22 @@ mod tests {
         let receipts_after = conn
             .query_sync("SELECT * FROM retained_receipts", &[])
             .unwrap();
-        assert_eq!(format!("{events_before:?}"), format!("{events_after:?}"));
-        assert_eq!(format!("{receipts_before:?}"), format!("{receipts_after:?}"));
+        assert_eq!(row_state(&events_before), row_state(&events_after));
+        assert_eq!(row_state(&receipts_before), row_state(&receipts_after));
+    }
+
+    /// Ordered column names and values. A `Row`'s Debug output also prints its
+    /// name-to-index HashMap, whose iteration order differs between rows that
+    /// hold identical data, so Debug strings are not evidence of equal rows.
+    fn row_state(rows: &[sqlmodel_core::Row]) -> Vec<(Vec<String>, Vec<sqlmodel_core::Value>)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.column_names().map(str::to_owned).collect(),
+                    row.values().cloned().collect(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -571,6 +585,8 @@ mod tests {
 
     #[test]
     fn partial_shared_schema_errors_but_complete_legacy_absence_remains_readable() {
+        // The failed read may retire its checkout, and a replacement in-memory
+        // checkout is an empty database, so each schema state gets a fixture.
         fixture(|runtime, pool| {
             execute(
                 runtime,
@@ -589,6 +605,13 @@ mod tests {
                     _ => panic!("partial schema must not report an empty shared inbox"),
                 }
             });
+        });
+        fixture(|runtime, pool| {
+            execute(
+                runtime,
+                pool,
+                "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+            );
             execute(
                 runtime,
                 pool,
