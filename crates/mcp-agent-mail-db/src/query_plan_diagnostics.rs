@@ -142,6 +142,9 @@ fn explain_query_plan(
     spec: &HotQuerySpec,
 ) -> Result<QueryPlanDiagnostic, QueryPlanError> {
     let mut steps = Vec::new();
+    let mut warnings = Vec::new();
+    let mut program_verified = 0_usize;
+    let index_names = std::cell::OnceCell::new();
     for (sql, params) in std::iter::once((&spec.sql, &spec.params))
         .chain(spec.extra_queries.iter().map(|(sql, params)| (sql, params)))
     {
@@ -152,6 +155,7 @@ fn explain_query_plan(
                     path: spec.path.as_str(),
                     source,
                 })?;
+        let mut statement_steps = Vec::with_capacity(rows.len());
         for row in rows {
             let id = row
                 .get_as(0)
@@ -165,24 +169,49 @@ fn explain_query_plan(
             let detail = row
                 .get_as(3)
                 .map_err(|error| decode_error(spec.path, error))?;
-            steps.push(QueryPlanStep {
+            statement_steps.push(QueryPlanStep {
                 id,
                 parent,
                 notused,
                 detail,
             });
         }
+        let statement_warnings = scan_warnings(
+            &statement_steps,
+            spec.scan_sensitive_sources,
+            &spec.expected_indexes,
+        );
+        if !statement_warnings.is_empty() {
+            let verified = explain_program(conn, sql, params).is_some_and(|ops| {
+                index_names
+                    .get_or_init(|| sqlite_index_names(conn))
+                    .as_deref()
+                    .is_some_and(|names| {
+                        program_seeks_expected_index(&ops, names, &spec.expected_indexes)
+                    })
+            });
+            if verified {
+                program_verified += 1;
+            } else {
+                warnings.extend(statement_warnings);
+            }
+        }
+        steps.extend(statement_steps);
     }
 
     let missing_expected_indexes = missing_expected_indexes(&steps, &spec.expected_indexes);
-    let warnings = scan_warnings(&steps, spec.scan_sensitive_sources, &spec.expected_indexes);
     let status = if missing_expected_indexes.is_empty() && warnings.is_empty() {
         "ok"
     } else {
         "warn"
     }
     .to_string();
-    let detail = if status == "ok" {
+    let detail = if status == "ok" && program_verified > 0 {
+        format!(
+            "plan uses expected indexed access; {program_verified} statement(s) labelled SCAN \
+             seek an expected index in their programs"
+        )
+    } else if status == "ok" {
         "plan uses expected indexed access".to_string()
     } else {
         let mut parts = Vec::new();
@@ -214,6 +243,97 @@ fn decode_error(path: HotQueryPath, error: sqlmodel_core::Error) -> QueryPlanErr
         path: path.as_str(),
         detail: error.to_string(),
     }
+}
+
+/// One instruction of a statement's `EXPLAIN` program. The pinned engine
+/// renders an `OpenRead` p4 as the bare table or index name.
+#[derive(Debug, Clone)]
+struct ProgramOp {
+    opcode: String,
+    cursor: i64,
+    p4: String,
+}
+
+/// The statement's emitted program, or `None` when the engine cannot emit it
+/// (its VDBE codegen does not support LEFT JOIN yet) or a row does not decode.
+/// Without a program the label verdict stands.
+fn explain_program(conn: &DbConn, sql: &str, params: &[Value]) -> Option<Vec<ProgramOp>> {
+    let rows = conn.query_sync(&format!("EXPLAIN {sql}"), params).ok()?;
+    rows.iter()
+        .map(|row| {
+            Some(ProgramOp {
+                opcode: row.get_as(1).ok()?,
+                cursor: row.get_as(2).ok()?,
+                p4: row.get_as(5).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Lowercased index names from the schema. A bare `OpenRead` name does not say
+/// whether it opened a table or an index.
+fn sqlite_index_names(conn: &DbConn) -> Option<Vec<String>> {
+    let rows = conn
+        .query_sync("SELECT name FROM sqlite_master WHERE type = 'index'", &[])
+        .ok()?;
+    rows.iter()
+        .map(|row| {
+            row.get_as::<String>(0)
+                .ok()
+                .map(|name| name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// Whether a statement's program reaches its rows through a seek on one of
+/// the expected indexes and walks nothing from either end.
+///
+/// When the program seeks an index other than the planner's choice, the pinned
+/// engine names the seek in `EXPLAIN QUERY PLAN` only under ORDER BY, an
+/// aggregate, or a multi-column equality key. Any other such seek gets its
+/// generic bytecode explain, which labels every opened table `SCAN`. The
+/// unordered receipt continuation page (`sync::inbox` `RECIPIENT_NEXT_SQL`,
+/// unordered since 08c47009) seeks `(agent_id, message_id)` with a range on the
+/// second column, so its labels read like a full scan of
+/// `message_recipients`. The opcodes decide: a seek positions a cursor opened
+/// on a schema index (`index_names`) that an expectation names, and a walk
+/// starts at `Rewind` or `Last`. On these integer-key paths the engine's only
+/// walk is its fallback for a key value that is not an integer, which comes
+/// after an `IsType` check, so a walk after the first `IsType` does not count.
+fn program_seeks_expected_index(
+    ops: &[ProgramOp],
+    index_names: &[String],
+    expected: &[IndexExpectation],
+) -> bool {
+    let fragments = expected
+        .iter()
+        .flat_map(|expectation| expectation.alternatives.iter())
+        .map(|fragment| fragment.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let index_cursors = ops
+        .iter()
+        .filter(|op| op.opcode == "OpenRead")
+        .filter_map(|op| {
+            let name = op.p4.to_ascii_lowercase();
+            (index_names.contains(&name)
+                && fragments
+                    .iter()
+                    .any(|fragment| name.contains(fragment.as_str())))
+            .then_some(op.cursor)
+        })
+        .collect::<Vec<_>>();
+    let seeks_expected_index = ops.iter().any(|op| {
+        matches!(
+            op.opcode.as_str(),
+            "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT"
+        ) && index_cursors.contains(&op.cursor)
+    });
+    let fallback_guard = ops.iter().position(|op| op.opcode == "IsType");
+    let walks = ops.iter().enumerate().any(|(at, op)| {
+        matches!(op.opcode.as_str(), "Rewind" | "Last")
+            && fallback_guard.is_none_or(|guard| at < guard)
+    });
+    seeks_expected_index && !walks
 }
 
 fn missing_expected_indexes(steps: &[QueryPlanStep], expected: &[IndexExpectation]) -> Vec<String> {
@@ -626,6 +746,151 @@ mod tests {
             warnings.is_empty(),
             "alias source 'm' should not match message_recipients: {warnings:?}"
         );
+    }
+
+    fn op(opcode: &str, cursor: i64, p4: &str) -> ProgramOp {
+        ProgramOp {
+            opcode: opcode.to_string(),
+            cursor,
+            p4: p4.to_string(),
+        }
+    }
+
+    /// The opcode rule that clears a SCAN label, with each wrong shape
+    /// planted: a walk before the non-integer fallback guard, a walk of the
+    /// index instead of a seek, a seek on an index that is not expected, a
+    /// seek on the table, and a seek on a table whose name an expectation
+    /// matches.
+    #[test]
+    fn program_seek_rule_requires_an_expected_index_seek_and_no_walk() {
+        let expected = vec![IndexExpectation {
+            label: "message_recipients(agent_id)",
+            alternatives: &["idx_message_recipients_agent_message"],
+        }];
+        let index_names = vec![
+            "idx_message_recipients_agent_message".to_string(),
+            "idx_mr_ack_message".to_string(),
+        ];
+        let open_table = op("OpenRead", 0, "message_recipients");
+        let open_index = op("OpenRead", 1, "idx_message_recipients_agent_message");
+        let seek = op("SeekGE", 1, "");
+        let fallback_walk = op("Rewind", 0, "");
+
+        let bounded = [
+            open_table.clone(),
+            open_index.clone(),
+            seek.clone(),
+            op("IsType", 0, ""),
+            fallback_walk.clone(),
+        ];
+        assert!(program_seeks_expected_index(
+            &bounded,
+            &index_names,
+            &expected
+        ));
+
+        let unguarded_walk = [
+            open_table.clone(),
+            open_index.clone(),
+            fallback_walk,
+            seek.clone(),
+        ];
+        assert!(!program_seeks_expected_index(
+            &unguarded_walk,
+            &index_names,
+            &expected
+        ));
+
+        let index_walk = [
+            open_table.clone(),
+            open_index,
+            op("Rewind", 1, ""),
+            op("Next", 1, ""),
+        ];
+        assert!(!program_seeks_expected_index(
+            &index_walk,
+            &index_names,
+            &expected
+        ));
+
+        let unexpected_index = [
+            open_table.clone(),
+            op("OpenRead", 1, "idx_mr_ack_message"),
+            seek,
+        ];
+        assert!(!program_seeks_expected_index(
+            &unexpected_index,
+            &index_names,
+            &expected
+        ));
+
+        let table_seek = [open_table, op("SeekGE", 0, "")];
+        assert!(!program_seeks_expected_index(
+            &table_seek,
+            &index_names,
+            &expected
+        ));
+
+        let table_named_like_an_expectation = [
+            op("OpenRead", 0, "product_project_links"),
+            op("SeekGE", 0, ""),
+        ];
+        let by_table_name = vec![IndexExpectation {
+            label: "product_project_links(product_id, project_id)",
+            alternatives: &["product_project_links"],
+        }];
+        assert!(!program_seeks_expected_index(
+            &table_named_like_an_expectation,
+            &index_names,
+            &by_table_name
+        ));
+    }
+
+    /// Both receipt pages seek an expected index in their emitted programs.
+    /// The continuation page's range seek is labelled SCAN by the pinned
+    /// engine, so the program is what the diagnostic judges.
+    #[test]
+    fn unordered_receipt_pages_are_judged_by_their_programs() {
+        let conn = test_conn();
+        let spec = inbox_spec();
+        let index_names = sqlite_index_names(&conn).expect("schema index names");
+        for (sql, params) in [
+            (&spec.sql, &spec.params),
+            (&spec.extra_queries[0].0, &spec.extra_queries[0].1),
+        ] {
+            let ops = explain_program(&conn, sql, params).expect("explain program");
+            assert!(
+                program_seeks_expected_index(&ops, &index_names, &spec.expected_indexes),
+                "{sql}: {ops:?}"
+            );
+        }
+    }
+
+    /// A statement whose program the engine cannot emit keeps its label
+    /// verdict: no program, no clearance.
+    #[test]
+    fn statement_without_a_program_keeps_its_scan_warning() {
+        let conn = test_conn();
+        let spec = HotQuerySpec {
+            path: HotQueryPath::SearchFallback,
+            extra_queries: Vec::new(),
+            sql: "SELECT m.id, s.name FROM messages m LEFT JOIN agents s ON s.id = m.sender_id \
+                  WHERE m.body_md LIKE ? LIMIT ?"
+                .to_string(),
+            params: vec![
+                Value::Text("%needle%".to_string()),
+                Value::BigInt(DEFAULT_LIMIT),
+            ],
+            expected_indexes: vec![IndexExpectation {
+                label: "agents primary key",
+                alternatives: &["integer primary key", "primary key"],
+            }],
+            scan_sensitive_sources: &["m", "messages"],
+        };
+
+        let diagnostic = explain_query_plan(&conn, &spec).expect("explain left join");
+        assert_eq!(diagnostic.status, "warn", "{diagnostic:?}");
+        assert!(!diagnostic.warnings.is_empty(), "{diagnostic:?}");
     }
 
     #[test]
