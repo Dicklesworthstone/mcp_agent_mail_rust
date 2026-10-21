@@ -668,6 +668,23 @@ mod tests {
                 .into_result()
                 .unwrap();
         });
+        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        // Pool initialization repairs tiny legacy message timestamps, even
+        // with migrations disabled. Finish that initialization on the empty
+        // fixture before inserting deliberate microsecond boundary values.
+        run(async {
+            let cx = Cx::for_testing();
+            let checkout = pool.acquire(&cx).await.into_result().unwrap();
+            drop(checkout);
+        });
         conn.execute_raw(
             "INSERT INTO projects(id,slug,human_key,created_at) VALUES \
              (1,'one','/one',0),(2,'two','/two',0); \
@@ -694,15 +711,6 @@ mod tests {
              (3,2,456,NULL),(4,2,777,777),(1,3,888,888)",
         )
         .unwrap();
-        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
-            database_url: format!("sqlite:///{}", path.display()),
-            min_connections: 0,
-            max_connections: 1,
-            run_migrations: false,
-            warmup_connections: 0,
-            ..Default::default()
-        })
-        .unwrap();
         (directory, conn, pool)
     }
 
@@ -716,10 +724,82 @@ mod tests {
         rows.iter().map(|row| row.message.id.unwrap()).collect()
     }
 
+    type ReceiptState = Vec<(i64, i64, Option<i64>, Option<i64>)>;
+
+    fn shared_receipt_state(conn: &DbConn) -> ReceiptState {
+        conn.query_sync(
+            "SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts \
+             ORDER BY message_id, agent_id",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (
+            row.get_named("message_id").unwrap(),
+            row.get_named("agent_id").unwrap(),
+            row.get_named("read_ts").unwrap(),
+            row.get_named("ack_ts").unwrap(),
+        ))
+        .collect()
+    }
+
+    #[test]
+    fn receipt_state_comparison_detects_changed_values_and_membership() {
+        let (_directory, conn, _pool) = fixture();
+        let before = shared_receipt_state(&conn);
+        assert_eq!(before, vec![(1, 3, Some(888), Some(888)), (3, 2, Some(456), None), (4, 2, Some(777), Some(777))]);
+        for sql in [
+            "UPDATE project_mailbox_receipts SET read_ts=457 WHERE message_id=3 AND agent_id=2",
+            "UPDATE project_mailbox_receipts SET ack_ts=999 WHERE message_id=3 AND agent_id=2",
+            "UPDATE project_mailbox_receipts SET agent_id=1 WHERE message_id=3 AND agent_id=2",
+            "DELETE FROM project_mailbox_receipts WHERE message_id=3 AND agent_id=2",
+            "INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES(2,3,NULL,NULL)",
+        ] {
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw(sql).unwrap();
+            assert_ne!(shared_receipt_state(&conn), before, "{sql}");
+            conn.execute_raw("ROLLBACK").unwrap();
+            assert_eq!(shared_receipt_state(&conn), before);
+        }
+    }
+
+    #[test]
+    fn fixture_keeps_microsecond_timestamps_after_pooled_checkout() {
+        let (_directory, conn, pool) = fixture();
+        let timestamps = |connection: &DbConn| -> Vec<(i64, i64)> {
+            connection.query_sync(
+                "SELECT id, created_ts FROM messages ORDER BY id",
+                &[],
+            ).unwrap().iter().map(|row| (
+                row.get_named("id").unwrap(),
+                row.get_named("created_ts").unwrap(),
+            )).collect()
+        };
+        let expected = vec![
+            (1, 100), (2, 200), (3, 200), (4, 300), (5, 400),
+            (6, 99), (7, 100), (8, 100), (9, 50),
+        ];
+        assert_eq!(timestamps(&conn), expected);
+        run(async {
+            let cx = Cx::for_testing();
+            for _ in 0..2 {
+                let checkout = pool.acquire(&cx).await.into_result().unwrap();
+                assert_eq!(timestamps(&checkout), expected);
+                drop(checkout);
+            }
+            let full = fetch(&cx, &pool, 1, 2, 1).await.into_result().unwrap();
+            assert_eq!(ids(&full), [1]);
+            let metadata = fetch_metadata(&cx, &pool, 1, 2, 20, Some(100))
+                .await.into_result().unwrap();
+            assert_eq!(ids(&metadata), [1]);
+        });
+        assert_eq!(timestamps(&conn), expected);
+    }
+
     #[test]
     fn public_pending_reader_merges_direct_and_shared_before_global_limit() {
         let (_directory, conn, pool) = fixture();
-        let before = conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap();
+        let before = shared_receipt_state(&conn);
         run(async {
             let cx = Cx::for_testing();
             for limit in [0, 1, 2, 3, 4, 100] {
@@ -734,8 +814,7 @@ mod tests {
                 }
             }
         });
-        let after = conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap();
-        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(shared_receipt_state(&conn), before);
     }
 
     #[test]
@@ -978,7 +1057,7 @@ mod tests {
     #[test]
     fn metadata_cutoff_is_inclusive_for_both_lanes_before_the_global_limit() {
         let (_directory, conn, pool) = fixture();
-        let before = conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap();
+        let before = shared_receipt_state(&conn);
         run(async {
             let cx = Cx::for_testing();
             for (cutoff, expected) in [
@@ -1004,8 +1083,7 @@ mod tests {
                 .await.into_result().unwrap();
             assert!(full.iter().all(|row| row.message.body_md == format!("body-{}", row.message.id.unwrap())));
         });
-        let after = conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap();
-        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(shared_receipt_state(&conn), before);
     }
 
     #[test]
@@ -1068,7 +1146,7 @@ mod tests {
     #[test]
     fn cancelled_metadata_read_never_returns_an_empty_success_or_marks_mail_read() {
         let (_directory, conn, pool) = fixture();
-        let before = conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap();
+        let before = shared_receipt_state(&conn);
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
         run(async {
@@ -1079,7 +1157,7 @@ mod tests {
                 ));
             }
         });
-        assert_eq!(format!("{before:?}"), format!("{:?}", conn.query_sync("SELECT * FROM project_mailbox_receipts", &[]).unwrap()));
+        assert_eq!(shared_receipt_state(&conn), before);
     }
 
     #[test]
