@@ -406,8 +406,7 @@ mod tests {
         conn
     }
 
-    const AUTHORITY_EVENT_TABLE: &str =
-        "CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, project_id INTEGER, \
+    const AUTHORITY_EVENT_TABLE: &str = "CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, project_id INTEGER, \
          agent_id INTEGER, message_id INTEGER, kind TEXT, delivered_ts INTEGER)";
 
     #[test]
@@ -419,7 +418,11 @@ mod tests {
             ))
             .unwrap();
             let error = super::schema_available(&*conn).unwrap_err();
-            assert!(error.to_string().contains("retained project delivery events"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("retained project delivery events")
+            );
             assert!(!error.to_string().contains("no such table"));
         }
     }
@@ -535,21 +538,32 @@ mod tests {
                         };
                         match fetch_explorer_page(&cx, pool, &selected).await {
                             Outcome::Err(error) => {
-                                assert!(error.to_string().contains("retained project delivery events"));
+                                assert!(
+                                    error
+                                        .to_string()
+                                        .contains("retained project delivery events")
+                                );
                             }
                             _ => panic!("lost shared authority must not become a direct-only page"),
                         }
                     } else {
                         let result = if operation == 1 {
-                            crate::unacked_inbox::fetch_metadata(&cx, pool, 1, 11, 20, Some(1_000)).await
+                            crate::unacked_inbox::fetch_metadata(&cx, pool, 1, 11, 20, Some(1_000))
+                                .await
                         } else {
                             crate::unacked_inbox::fetch(&cx, pool, 1, 11, 20).await
                         };
                         match result {
                             Outcome::Err(error) => {
-                                assert!(error.to_string().contains("retained project delivery events"));
+                                assert!(
+                                    error
+                                        .to_string()
+                                        .contains("retained project delivery events")
+                                );
                             }
-                            _ => panic!("lost shared authority must not hide shared ACK obligations"),
+                            _ => {
+                                panic!("lost shared authority must not hide shared ACK obligations")
+                            }
                         }
                     }
                 });
