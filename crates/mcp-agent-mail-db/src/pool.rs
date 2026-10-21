@@ -7136,6 +7136,21 @@ fn archive_drift_reconstruction_failed_on_healthy_primary(
     }
 }
 
+/// br-bgwj1: a primary that just passed its health check keeps serving when
+/// the archive-drift reconcile fails, with the drift left pending for the
+/// periodic retry. The reconcile itself still reports the failure (a replay
+/// error must not look like success to its other callers).
+#[allow(clippy::result_large_err)]
+fn reconcile_archive_state_keeping_healthy_primary(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    if let Err(error) = reconcile_archive_state_before_init(primary_path, storage_root) {
+        archive_drift_reconstruction_failed_on_healthy_primary(primary_path, storage_root, &error)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn ensure_sqlite_parent_dir_exists(path: &str) -> Result<(), SqlError> {
     if path == ":memory:" {
@@ -17153,8 +17168,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         }
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
         if sqlite_file_is_healthy(primary_path)? {
-            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
-            return Ok(());
+            return reconcile_archive_state_keeping_healthy_primary(primary_path, storage_root);
         }
     } else if find_healthy_backup(primary_path).is_none()
         && (!is_real_directory(storage_root) || !is_real_directory(&storage_root.join("projects")))
@@ -17202,8 +17216,7 @@ fn ensure_sqlite_file_healthy_with_archive_inner(
         let _ = cleanup_empty_wal_sidecar(primary_path)?;
     }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
-        let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
-        return Ok(());
+        return reconcile_archive_state_keeping_healthy_primary(primary_path, storage_root);
     }
 
     refuse_mutating_mailbox_when_owned(primary_path, storage_root)?;
