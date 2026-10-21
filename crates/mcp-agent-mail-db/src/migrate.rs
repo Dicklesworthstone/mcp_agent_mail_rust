@@ -2168,6 +2168,11 @@ mod tests {
             .execute_raw("INSERT INTO marker(value) VALUES('python-source')")
             .expect("seed source marker");
         let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        // A stopped Python install leaves stale sidecars behind, not a live
+        // connection. With this connection still open while its -wal/-shm were
+        // overwritten, the copy's pre-copy checkpoint failed with "database is
+        // locked" on macOS.
+        drop(source_conn);
 
         let source_journal = std::path::PathBuf::from(format!("{}-journal", src_db.display()));
         let source_wal = std::path::PathBuf::from(format!("{}-wal", src_db.display()));
