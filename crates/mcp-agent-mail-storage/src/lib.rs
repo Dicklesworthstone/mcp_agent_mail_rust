@@ -1309,6 +1309,18 @@ std::thread_local! {
     // tests can let the real drain finish before the enqueue call returns.
     static WBQ_AFTER_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    // Inject a failure after the real drain has entered its archive mutation
+    // window, so panic regressions exercise lock unwinding and queue progress.
+    static WBQ_BEFORE_EXECUTE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn wbq_run_before_execute_test_hook() {
+    let hook = WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn wbq_try_send_counted(
@@ -3420,11 +3432,7 @@ fn wbq_drain_loop(
         while idx < batch.len() {
             let end = wbq_message_bundle_batch_end(&batch, idx);
             let envelopes = &batch[idx..end];
-            let result = if envelopes.len() > 1 {
-                wbq_execute_message_bundle_batch(envelopes)
-            } else {
-                wbq_execute_op(&envelopes[0].op, "wbq-drain")
-            };
+            let result = wbq_execute_envelopes(envelopes);
             let group_failed = result.is_err();
             let reservation_version_refused = matches!(
                 &result,
@@ -3442,9 +3450,8 @@ fn wbq_drain_loop(
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
             }
             if let Err(error) = result {
-                // Retry budget was already exhausted inside wbq_execute_op /
-                // wbq_execute_message_bundle_batch. Reaching this branch means
-                // the row enqueued via the API was never persisted — that's
+                // Execution exhausted its retry budget or panicked. Reaching
+                // this branch means archive persistence is not confirmed — that's
                 // a durability failure that must be visible to the API gate
                 // so future send_message calls refuse instead of accepting
                 // writes that will silently disappear. See #122.
@@ -3536,7 +3543,7 @@ fn wbq_drain_loop(
                 }
 
                 wbq_mark_batch_in_flight(std::slice::from_ref(&envelope));
-                let r = wbq_execute_op(&envelope.op, "wbq-drain");
+                let r = wbq_execute_envelopes(std::slice::from_ref(&envelope));
                 let latency_us = u64::try_from(
                     envelope
                         .enqueued_at
@@ -3602,6 +3609,27 @@ fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize 
     end
 }
 
+/// Keep an archive-writer panic inside its group, after mutation and project
+/// guards have unwound. A dequeued batch is no longer in the receiver slot or
+/// queue-depth count, so respawning a dead drain cannot salvage it. Returning
+/// an error instead sends EVERY op in the possibly partially written group
+/// through the normal durability ledger while later groups keep draining.
+/// Panics are not retried here; deterministic failures must not spin forever.
+fn wbq_execute_envelopes(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    std::panic::catch_unwind(|| match envelopes {
+        [] => Ok(()),
+        [envelope] => wbq_execute_op(&envelope.op, "wbq-drain"),
+        _ => wbq_execute_message_bundle_batch(envelopes),
+    })
+    .unwrap_or_else(|_| {
+        // The panic hook already records the panic. Do not copy an arbitrary
+        // payload (which may contain message content) into storage diagnostics.
+        Err(StorageError::Io(std::io::Error::other(
+            "archive write panicked; the affected operations require reconciliation",
+        )))
+    })
+}
+
 /// Storage root mutated by a write-behind op, used to anchor the persisted
 /// archive mutation epoch (GH#235).
 fn write_op_storage_root(op: &WriteOp) -> &Path {
@@ -3649,6 +3677,9 @@ fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
 }
 
 fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    #[cfg(test)]
+    wbq_run_before_execute_test_hook();
+
     let Some(WriteOp::MessageBundle {
         project_slug,
         config,
@@ -3737,6 +3768,9 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
 }
 
 fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
+    #[cfg(test)]
+    wbq_run_before_execute_test_hook();
+
     match op {
         WriteOp::MessageBundle {
             project_slug,
@@ -20995,6 +21029,166 @@ mod tests {
         let archive = ensure_archive(&config, project_slug).unwrap();
         let commits = get_recent_commits(&archive, 3, None).unwrap();
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
+    }
+
+    #[test]
+    fn wbq_drain_survives_writer_panics_without_losing_remaining_ops() {
+        const CHILD: &str = "AM_TEST_WBQ_PANIC_SCENARIO";
+        const COMPLETED: &str = "WBQ writer panic recovery verified";
+        let Ok(scenario) = std::env::var(CHILD) else {
+            // Failure accounting and the durability ledger are process-wide.
+            // Isolate both the single/batched paths and the final shutdown drain
+            // from other tests instead of resetting their shared state.
+            for scenario in ["single", "batch", "shutdown"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::wbq_drain_survives_writer_panics_without_losing_remaining_ops",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, scenario)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            }
+            return;
+        };
+
+        let final_drain = scenario == "shutdown";
+        let group_size: u64 = if scenario == "batch" { 2 } else { 1 };
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "wbq-panic-recovery";
+        let archive = ensure_archive(&config, project).unwrap();
+        let partial_op = backlog_test_message_op(&config, project, 41);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let depth = Arc::new(AtomicU64::new(0));
+        let profile_op = |name: &str| WriteOp::AgentProfile {
+            project_slug: project.to_string(),
+            config: config.clone(),
+            agent_json: serde_json::json!({"name": name, "program": "test", "model": "test"}),
+        };
+        if final_drain {
+            tx.send(WbqMsg::Shutdown).unwrap();
+            assert_eq!(
+                wbq_enqueue_with_sender(&tx, &depth, profile_op("WarmupAgent")),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        for id in 41..41 + i64::try_from(group_size).unwrap() {
+            assert_eq!(
+                wbq_enqueue_with_sender(&tx, &depth, backlog_test_message_op(&config, project, id)),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        // The profile separates message groups without using a fake writer.
+        assert_eq!(
+            wbq_enqueue_with_sender(&tx, &depth, profile_op("FollowingAgent")),
+            WbqEnqueueResult::Enqueued,
+        );
+        assert_eq!(
+            wbq_enqueue_with_sender(&tx, &depth, backlog_test_message_op(&config, project, 99)),
+            WbqEnqueueResult::Enqueued,
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Flush(done_tx)).unwrap();
+
+        let worker_depth = Arc::clone(&depth);
+        let panic_archive = archive.clone();
+        let worker = std::thread::spawn(move || {
+            let inject_panic: Box<dyn FnOnce()> = Box::new(move || {
+                // Materialize only the first message before the batch fails.
+                // All its ops still need verification, including this one.
+                wbq_execute_op_inner(&partial_op).unwrap();
+                let _: Result<()> = with_project_lock(&panic_archive, || {
+                    panic!("injected archive writer panic after partial materialization");
+                });
+            });
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(if final_drain {
+                    // The first batch consumes Shutdown + one healthy warmup
+                    // op; the next execution is in the final-drain branch.
+                    Box::new(move || {
+                        WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                            *slot.borrow_mut() = Some(inject_panic);
+                        });
+                    })
+                } else {
+                    inject_panic
+                });
+            });
+            wbq_drain_loop(
+                Arc::new(Mutex::new(Some(rx))),
+                worker_depth,
+                8,
+                if final_drain { 1 } else { 8 },
+            );
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a panicked write must not lose later writes or the flush acknowledgement");
+        if !final_drain {
+            assert!(
+                !worker.is_finished(),
+                "the archive worker must remain alive"
+            );
+            tx.send(WbqMsg::Shutdown).unwrap();
+        }
+        worker.join().expect("the archive panic must be contained");
+        flush_async_commits();
+
+        let stats = wbq_stats();
+        assert_eq!(stats.enqueued, group_size + 2 + u64::from(final_drain));
+        assert_eq!(stats.drained, stats.enqueued);
+        assert_eq!(stats.errors, group_size);
+        assert_eq!(stats.unrecoverable_errors, group_size);
+        assert!(
+            durability_degraded(),
+            "partial writes must not report healthy"
+        );
+        assert!(stats.last_unrecoverable_error_us > 0);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert!(
+            read_agent_profile(&archive, "FollowingAgent")
+                .unwrap()
+                .is_some()
+        );
+
+        for id in [41, 99] {
+            let WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                ..
+            } = backlog_test_message_op(&config, project, id)
+            else {
+                unreachable!();
+            };
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+            for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                let (message, body) = read_message_file(path).unwrap();
+                assert_eq!(message["id"], id);
+                assert_eq!(body.trim(), body_md);
+            }
+        }
+        if group_size == 2 {
+            let mut missing_paths = Vec::new();
+            collect_canonical_message_paths_with_id(
+                &archive.root.join("messages"),
+                42,
+                &mut missing_paths,
+            );
+            assert!(missing_paths.is_empty());
+        }
+        println!("{COMPLETED}");
     }
 
     // ── Ack-fast durable archive retry backlog (br-ack-fast-storage-commit-reply-3ac88) ──
