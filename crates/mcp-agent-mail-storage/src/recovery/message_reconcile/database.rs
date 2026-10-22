@@ -42,6 +42,7 @@ const MAX_REPAIRS_PER_BATCH: usize = 4;
 const MAX_DB_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const NORMAL_ARCHIVE_GRACE_US: i64 = 30 * 1_000_000;
+const MAX_ARCHIVE_LAG_GRACE_US: u64 = 10 * 60 * 1_000_000;
 const MAX_RETRY_IDS: usize = 1024;
 const MAX_RETRIES_PER_PASS: usize = 16;
 const MAX_IDS_PER_PASS: usize = 32;
@@ -367,6 +368,23 @@ fn interleave_ids(tail: &[i64], history: &[i64], history_first: bool) -> Vec<(i6
         }
     }
     selected
+}
+
+fn normal_archive_cutoff(now_us: i64, settled_before_us: i64, archive_lag_us: u64) -> i64 {
+    // A fixed grace mistakes still-queued mail for lost mail when WBQ falls
+    // behind. Its repair then competes for the publication fence with the
+    // very drain and reservation writers that need to make progress (br-9ott5).
+    // Lag is a process-wide scheduling hint, never proof that a particular
+    // message is queued. Bound its effect so unrelated or stalled archive
+    // work cannot hide a genuinely lost message indefinitely.
+    let lag_grace_us =
+        i64::try_from(archive_lag_us.min(MAX_ARCHIVE_LAG_GRACE_US)).unwrap_or(i64::MAX);
+    now_us
+        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
+        .saturating_sub(lag_grace_us)
+        // A restarted worker cannot own the prior process's queued mail.
+        // Known failures also bypass this cutoff through the retry lane.
+        .max(settled_before_us)
 }
 
 fn select_ids(
@@ -939,7 +957,9 @@ impl CommittedMessages {
 /// archive work per pass. SQL projections are separately bounded before JSON
 /// serialization; an expanded payload that cannot fit any batch is deferred
 /// without pinning the cursor. These are work bounds, not deadlines on SQL,
-/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace.
+/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace
+/// plus observed archive lag, capped at ten additional minutes. Pre-startup
+/// rows and known failed-write retries remain eligible during that grace.
 /// No row, receipt, delivery, notification or thread digest is mutated. Transient
 /// archive refusals retain a bounded FIFO retry lane; conflicts stay on backfill
 /// with a cooldown. Retries never bypass source or archive authority checks.
@@ -992,9 +1012,11 @@ fn reconcile_message_batch_inner(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
-    let cutoff = mcp_agent_mail_db::now_micros()
-        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
-        .max(cursor.settled_before_us);
+    let cutoff = normal_archive_cutoff(
+        mcp_agent_mail_db::now_micros(),
+        cursor.settled_before_us,
+        crate::archive_lag_snapshot().oldest_unmaterialized_us,
+    );
     let selected = {
         // The selection itself must not enter a pool while promotion owns
         // admission. Refusal leaves both scan positions untouched.

@@ -130,6 +130,222 @@ fn database_evidence(cx: &Cx, pool: &DbPool) -> Value {
     json!({"messages": messages, "receipts": receipts})
 }
 
+/// Run with an actual drain blocked at the archive fence. Backdate only the
+/// enqueue timestamp so the test exercises minutes of lag without sleeping
+/// for minutes; queue accounting, drain, lag sampling and reconciliation are
+/// the production paths. `fixture` isolates their process-global state.
+fn with_queued_archive_lag(config: &Config, age: Duration, test: impl FnOnce()) {
+    crate::wbq_start();
+    // Publication admission is reentrant on its owning thread. Keep the owner
+    // separate from both this caller and the WBQ so real repair attempts must
+    // observe contention instead of inheriting the fixture's authority.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let _fence = crate::ArchiveMutationGuard::begin();
+        ready_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(30))
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let wbq = crate::WBQ.get().unwrap();
+    let sender = wbq.sender.lock().unwrap().as_ref().unwrap().clone();
+    let op = crate::WriteOp::ClearSignal {
+        config: config.clone(),
+        project_slug: "project".into(),
+        agent_name: "GreenStone".into(),
+    };
+    assert!(
+        crate::wbq_try_send_counted(
+            &sender,
+            &wbq.op_depth,
+            crate::WbqMsg::Op(crate::WbqOpEnvelope {
+                enqueued_at: Instant::now().checked_sub(age).unwrap(),
+                op: Box::new(op),
+            }),
+            Some(&wbq.lifecycle),
+        )
+        .is_ok()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let lag = crate::archive_lag_snapshot();
+        if lag.wbq_inflight_oldest_age_us >= crate::duration_as_micros_u64(age) {
+            assert!(lag.oldest_unmaterialized_us >= lag.wbq_inflight_oldest_age_us);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WBQ drain never entered its batch"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    test();
+    release_tx.send(()).unwrap();
+    owner.join().unwrap().unwrap();
+    assert_eq!(crate::wbq_flush_status(), crate::WbqFlushOutcome::Drained);
+    crate::wbq_shutdown();
+    assert_eq!(crate::archive_lag_snapshot().oldest_unmaterialized_us, 0);
+}
+
+#[test]
+fn archive_lag_grace_leaves_queued_mail_to_drain_then_reconciles_orphans() {
+    fixture(|cx, pool, config| {
+        let created = mcp_agent_mail_db::now_micros() - 60 * 1_000_000;
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!("UPDATE messages SET created_ts = {created}"))
+            .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(120), || {
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (
+                    report.scanned,
+                    report.repaired,
+                    report.deferred,
+                    report.retry_len
+                ),
+                (0, 0, 0, 0),
+                "still-queued mail must not contend with its drain: {report:?}"
+            );
+            assert!(!report.budget_exhausted);
+            assert_eq!(database_evidence(cx, pool), before);
+        });
+        // No failure ticket was needed: once the actual queue drains, ordinary
+        // scanning must repair same-process orphans on the next bounded pass.
+        let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+        assert_eq!((report.repaired, report.deferred), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_does_not_hide_pre_restart_mail() {
+    fixture(|cx, pool, config| {
+        let now = mcp_agent_mail_db::now_micros();
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!(
+            "UPDATE messages SET created_ts = {}",
+            now - 60 * 1_000_000
+        ))
+        .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::settled_before(now - 30 * 1_000_000);
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(120), || {
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred_transient, report.retry_len),
+                (2, 2, 2),
+                "old-process mail must reach repair despite new-process queue lag"
+            );
+        });
+        let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+        assert_eq!((report.repaired, report.retry_len), (2, 0));
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_does_not_hide_known_failed_writes() {
+    fixture(|cx, pool, config| {
+        let created = mcp_agent_mail_db::now_micros() - 60 * 1_000_000;
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!("UPDATE messages SET created_ts = {created}"))
+            .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let failed = crate::WriteOp::MessageBundle {
+            config: config.clone(),
+            project_slug: prepared.project_slug,
+            message_json: prepared.message,
+            body_md: prepared.body,
+            sender: prepared.sender,
+            recipients: prepared.recipients,
+            extra_paths: Vec::new(),
+        };
+        durability::record_failures(std::iter::once(&failed));
+        assert!(crate::durability_degraded());
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(120), || {
+            let mut cursor = ReconcileCursor::default();
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred_transient, report.retry_len),
+                (1, 1, 1),
+                "the failed-write lane must bypass normal-scan grace"
+            );
+            assert_eq!(cursor.retries.front().unwrap().id, 901);
+            assert!(crate::durability_degraded());
+        });
+        // Release the refusal only through real archive publication and proof,
+        // never by resetting the ledger or ignoring its retry backoff.
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut ReconcileCursor::default(), &stop)
+                .unwrap();
+        assert_eq!(report.repaired, 2);
+        assert!(!crate::durability_degraded());
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_is_capped_for_stalled_or_unrelated_work() {
+    fixture(|cx, pool, config| {
+        let now = mcp_agent_mail_db::now_micros();
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw(&format!(
+            "UPDATE messages SET created_ts = {} WHERE id = 901; \
+             UPDATE messages SET created_ts = {} WHERE id = 902",
+            now - 700 * 1_000_000,
+            now - 60 * 1_000_000,
+        ))
+        .unwrap();
+        drop(conn);
+        let before = database_evidence(cx, pool);
+        let stop = AtomicBool::new(false);
+        with_queued_archive_lag(config, Duration::from_secs(3_600), || {
+            let mut cursor = ReconcileCursor::default();
+            let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (report.scanned, report.deferred_transient, report.retry_len),
+                (1, 1, 1),
+                "an hour of lag may shield recent mail, but not an old orphan"
+            );
+            assert_eq!(cursor.retries.front().unwrap().id, 901);
+        });
+        let report =
+            reconcile_message_batch(cx, pool, config, &mut ReconcileCursor::default(), &stop)
+                .unwrap();
+        assert_eq!(report.repaired, 2);
+        assert_eq!(database_evidence(cx, pool), before);
+    });
+}
+
+#[test]
+fn archive_lag_grace_saturates_extreme_measurements_without_losing_startup_anchor() {
+    assert_eq!(normal_archive_cutoff(1_000_000_000, 0, 0), 970_000_000);
+    assert_eq!(
+        normal_archive_cutoff(1_000_000_000, 0, u64::MAX),
+        370_000_000
+    );
+    assert_eq!(
+        normal_archive_cutoff(1_000_000_000, 990_000_000, u64::MAX),
+        990_000_000
+    );
+    assert_eq!(normal_archive_cutoff(i64::MIN, 0, u64::MAX), 0);
+}
+
 fn seed_outbox(config: &Config, prepared: &PreparedMessage) -> (std::path::PathBuf, Vec<u8>) {
     let archive = crate::ensure_archive(config, &prepared.project_slug).unwrap();
     let paths = crate::message_paths_for_bundle(
