@@ -74,7 +74,7 @@ impl RetryQueue {
     }
 }
 
-fn transient(error: &StorageError) -> bool {
+pub(super) fn transient(error: &StorageError) -> bool {
     use std::io::ErrorKind;
 
     // A failed write/fsync under resource pressure is not contrary release
@@ -203,28 +203,27 @@ fn attempt(
     stop: &AtomicBool,
 ) -> bool {
     let mut attempted = false;
-    // Source validation failures remain conflicts. In particular, an invalid
-    // generation or absent holder must not become trusted retry authority.
-    let result = read_source(cx, pool, id)
-        .map_err(invalid)
-        .and_then(|source| {
-            source.map_or(Ok(false), |source| {
-                let result = publish_release(
-                    cx,
-                    pool,
-                    config,
-                    &source,
-                    ReleaseTargets::WithOwnedAliases,
-                    &mut attempted,
-                );
-                tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
+    // Failed checkout/query operations retain retry debt. Validated malformed
+    // identity or missing holder evidence still remains a conflict; neither
+    // outcome can authorize publication without a fresh live source read.
+    let result = read_source(cx, pool, id).and_then(|source| {
+        source.map_or(Ok(false), |source| {
+            let result = publish_release(
+                cx,
+                pool,
+                config,
+                &source,
+                ReleaseTargets::WithOwnedAliases,
+                &mut attempted,
+            );
+            tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
                 reservation_id = id, project = %source.project_slug,
                 generation = ?source.generation, db_state = "released",
                 action = "verify_terminal_release", outcome = ?result,
                 "reservation archive release reconciliation decision");
-                result
-            })
-        });
+            result
+        })
+    });
     report.attempted += usize::from(attempted);
     if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
         report.interrupted = true;
@@ -238,7 +237,7 @@ fn attempt(
 /// cannot be retained. This seam never creates artifacts or grants authority.
 fn record_result(
     id: i64,
-    result: crate::Result<bool>,
+    result: Result<bool, ReleaseFailure>,
     queue: &mut RetryQueue,
     report: &mut ReservationReconcileReport,
     now: Instant,
@@ -255,7 +254,7 @@ fn record_result(
         }
         Err(error) => {
             report.deferred += 1;
-            let retryable = transient(&error);
+            let retryable = error.transient;
             if retryable {
                 report.deferred_transient += 1;
                 if !queue.defer(id, now) {
@@ -563,7 +562,7 @@ mod tests {
         let mut report = ReservationReconcileReport::default();
         assert!(record_result(
             401,
-            Err(invalid("resource busy; foreign generation")),
+            Err(invalid("resource busy; foreign generation").into()),
             &mut queue,
             &mut report,
             now
@@ -574,6 +573,192 @@ mod tests {
         );
         assert!(!queue.contains(401));
         assert!(queue.contains(402));
+    }
+
+    fn source_outage_retains_release_before_history_wrap(during_publication: bool) {
+        super::super::tests::fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let (path, before) = super::super::tests::seed_artifact(config, &source, "aabb", false);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..482 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES({id}, 71, 81, 'source-retry/{id}.rs', 1, 'active', 1000000, 9000000, NULL)")).unwrap();
+            }
+            // Temporarily make the real SQL source unavailable without
+            // fabricating a storage outcome or touching any archive evidence.
+            // The connection-local flag is a witness that the failed reader
+            // is detached instead of being returned to this one-slot pool.
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("ALTER TABLE agents RENAME TO release_source_agents_held")
+                .unwrap();
+            conn.execute_raw("COMMIT").unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let mut cursor = ReservationReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                history: ScanPosition {
+                    after: 432,
+                    ceiling: Some(481),
+                },
+                ..Default::default()
+            };
+            let mut failed = ReservationReconcileReport::default();
+            if during_publication {
+                let mut attempted = false;
+                let result = publish_release(
+                    cx,
+                    pool,
+                    config,
+                    &source,
+                    ReleaseTargets::WithOwnedAliases,
+                    &mut attempted,
+                );
+                assert!(
+                    !attempted,
+                    "failed source recheck cannot authorize publication"
+                );
+                assert!(record_result(
+                    401,
+                    result,
+                    &mut cursor.retries,
+                    &mut failed,
+                    Instant::now()
+                ));
+            } else {
+                assert!(attempt(
+                    cx,
+                    pool,
+                    config,
+                    401,
+                    &mut cursor.retries,
+                    &mut failed,
+                    &AtomicBool::new(false),
+                ));
+            }
+            assert_eq!(
+                (failed.scanned, failed.deferred, failed.deferred_transient),
+                (1, 1, 1)
+            );
+            assert_eq!((failed.attempted, failed.repaired), (0, 0));
+            assert_eq!(cursor.retries.due(Instant::now()), [401]);
+            assert_eq!(fs::read(&path).unwrap(), before);
+
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                0,
+                "a source retry must not reuse the reader whose query failed"
+            );
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("ALTER TABLE release_source_agents_held RENAME TO agents")
+                .unwrap();
+            conn.execute_raw(
+                "UPDATE file_reservations SET reason='current source after recovery' WHERE id=401",
+            )
+            .unwrap();
+            conn.execute_raw("COMMIT").unwrap();
+            drop(conn);
+            let resumed = run(cx, pool, config, &mut cursor, &AtomicBool::new(false)).unwrap();
+            assert_eq!(
+                (resumed.repaired, resumed.retry_len, resumed.deferred),
+                (1, 0, 0)
+            );
+            assert!(cursor.history.after > 432 && cursor.history.after < 481);
+            assert!(resumed.scanned <= usize::try_from(IDS_PER_BATCH).unwrap());
+            assert!(resumed.attempted <= MAX_REPAIRS_PER_BATCH);
+            let artifact = read_artifact(&path).unwrap().unwrap();
+            assert_eq!(artifact.value["reason"], "current source after recovery");
+            assert_eq!(artifact.value["operator_note"], "preserve this note");
+            assert_eq!(
+                artifact.value["released_ts"],
+                source.artifact["released_ts"]
+            );
+            let repo = Repository::open(&config.storage_root).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-401-gaabb.json"
+                )
+                .unwrap()
+                .unwrap()
+                .bytes,
+                artifact.bytes
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("SELECT COUNT(*) FROM file_reservations", &[])
+                    .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                81
+            );
+            assert_eq!(
+                conn.query_sync(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id=401",
+                    &[]
+                )
+                .unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                5_000_000
+            );
+        });
+    }
+
+    #[test]
+    fn unavailable_release_source_is_retained_and_repairs_before_history_wrap() {
+        source_outage_retains_release_before_history_wrap(false);
+    }
+
+    #[test]
+    fn unavailable_publication_source_is_retained_and_releases_its_failed_reader() {
+        source_outage_retains_release_before_history_wrap(true);
+    }
+
+    #[test]
+    fn invalid_release_identity_is_not_a_source_outage_or_a_failed_reader() {
+        super::super::tests::fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            let (path, before) = super::super::tests::seed_artifact(config, &source, "aabb", false);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE db_identity SET generation_id='not-a-generation' WHERE singleton=0",
+            )
+            .unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let mut queue = RetryQueue::default();
+            assert!(queue.defer(401, Instant::now()));
+            assert!(queue.defer(402, Instant::now()));
+            let mut report = ReservationReconcileReport::default();
+            assert!(attempt(
+                cx,
+                pool,
+                config,
+                401,
+                &mut queue,
+                &mut report,
+                &AtomicBool::new(false)
+            ));
+            assert_eq!(
+                (report.deferred, report.deferred_transient, report.attempted),
+                (1, 0, 0)
+            );
+            assert_eq!(queue.due(Instant::now()), [402]);
+            assert_eq!(fs::read(path).unwrap(), before);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "valid SQL returning conflicting data must keep its healthy reader"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        });
     }
 
     #[cfg(target_os = "linux")]

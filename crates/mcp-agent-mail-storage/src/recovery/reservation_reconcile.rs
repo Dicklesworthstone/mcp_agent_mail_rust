@@ -159,6 +159,55 @@ struct ReleaseSource {
     artifact: Value,
 }
 
+/// An unavailable source is not evidence that a terminal release conflicts.
+/// Keep that distinction through the publication lock's storage-error boundary
+/// so the scheduler retains only the ID and rereads the source on its next try.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+struct ReleaseFailure {
+    detail: String,
+    transient: bool,
+}
+
+impl ReleaseFailure {
+    fn source_unavailable(error: impl std::fmt::Display) -> Self {
+        Self {
+            detail: source_error(error),
+            transient: true,
+        }
+    }
+}
+
+impl From<String> for ReleaseFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+        }
+    }
+}
+
+impl From<&str> for ReleaseFailure {
+    fn from(detail: &str) -> Self {
+        detail.to_string().into()
+    }
+}
+
+impl From<StorageError> for ReleaseFailure {
+    fn from(error: StorageError) -> Self {
+        Self {
+            transient: retry::transient(&error),
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for ReleaseFailure {
+    fn from(error: std::io::Error) -> Self {
+        StorageError::Io(error).into()
+    }
+}
+
 fn invalid(message: impl Into<String>) -> StorageError {
     StorageError::InvalidPath(message.into())
 }
@@ -261,12 +310,19 @@ fn select_ids(
         .collect()
 }
 
-fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<ReleaseSource>, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    read_source_connection(&conn, id)
+fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<ReleaseSource>, ReleaseFailure> {
+    let conn = outcome(block_on(pool.acquire(cx))).map_err(ReleaseFailure::source_unavailable)?;
+    let result = read_source_connection(&conn, id);
+    if result.as_ref().is_err_and(|error| error.transient) {
+        // Retrying on the maintenance pool's single failed reader can pin a
+        // release forever. Detach only SQL failures; valid conflicting data
+        // must neither churn the pool nor become publication authority.
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed reservation release source read");
+    }
+    result
 }
 
-fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<ReleaseSource>, String> {
+fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<ReleaseSource>, ReleaseFailure> {
     // Identity, effective release and generation belong to one SQL snapshot.
     // Bound raw strings before materializing them; never seed a generation.
     let rows = conn.query_sync(
@@ -285,7 +341,7 @@ fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<ReleaseSource
                COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
                COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?",
         &[id.into(), MAX_SOURCE_BYTES.into()],
-    ).map_err(source_error)?;
+    ).map_err(ReleaseFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "reservation source missing, oversized, or lacking project/holder authority".into(),
@@ -495,22 +551,31 @@ fn publish_release(
     original: &ReleaseSource,
     targets: ReleaseTargets,
     attempted: &mut bool,
-) -> crate::Result<bool> {
+) -> Result<bool, ReleaseFailure> {
     // Pool checkout may wait for capacity or connection validation. Never
     // retain the global archive fence while waiting: a current borrower may
     // itself need that fence before it can return the only source connection.
     let checkout = pool.acquire(cx);
     #[cfg(test)]
     let checkout = tests::observe_checkout_pending(checkout);
-    let conn = outcome(block_on(checkout)).map_err(invalid)?;
+    let conn = outcome(block_on(checkout)).map_err(ReleaseFailure::source_unavailable)?;
+    let mut conn = Some(conn);
     // Keep typed admission failures until the scheduler has distinguished
     // retryable contention from conflicting source/archive evidence.
-    let _mutation = repair_lock::try_begin_at(cx, &config.storage_root)?;
+    let mutation = repair_lock::try_begin_at(cx, &config.storage_root)?;
     let archive = crate::ensure_archive(config, &original.project_slug)?;
-    repair_lock::with_repair_lock(cx, &archive, || {
+    let mut source_transient = false;
+    let result = repair_lock::with_repair_lock(cx, &archive, || {
         // A source captured before checkout or lock admission is not enough:
         // re-read the current generation and release under the archive locks.
-        let source = read_source_connection(&conn, original.id).map_err(invalid)?;
+        let source = read_source_connection(
+            conn.as_ref().expect("retained source connection"),
+            original.id,
+        )
+        .map_err(|error| {
+            source_transient |= error.transient;
+            invalid(error.detail)
+        })?;
         if source.as_ref() != Some(original) {
             return Err(invalid(
                 "reservation source/generation changed before publication; deferred",
@@ -577,11 +642,15 @@ fn publish_release(
         // Recheck both live source and exact working bytes immediately before
         // replacing anything. The outer source lease prevents DB promotion;
         // terminal release is monotone within that generation.
-        if read_source_connection(&conn, original.id)
-            .map_err(invalid)?
-            .as_ref()
-            != Some(original)
-        {
+        let current = read_source_connection(
+            conn.as_ref().expect("retained source connection"),
+            original.id,
+        )
+        .map_err(|error| {
+            source_transient |= error.transient;
+            invalid(error.detail)
+        })?;
+        if current.as_ref() != Some(original) {
             return Err(invalid(
                 "reservation source changed during artifact verification; deferred",
             ));
@@ -589,7 +658,7 @@ fn publish_release(
         // Both authoritative observations are complete. Return this reader
         // before file publication and Git I/O, without another pool checkout
         // inside the publication window.
-        drop(conn);
+        drop(conn.take());
         for target in &targets {
             if read_artifact(&target.path)?
                 .as_ref()
@@ -638,6 +707,22 @@ fn publish_release(
             }
         }
         Ok(true)
+    });
+    drop(mutation);
+    if source_transient {
+        // Both archive locks are released before closing a failed reader.
+        // Healthy readers (including source conflicts) remain reusable.
+        if let Some(conn) = conn.take() {
+            mcp_agent_mail_db::close_db_conn(
+                conn.detach(),
+                "failed reservation release publication source read",
+            );
+        }
+    }
+    result.map_err(|error| {
+        let mut failure = ReleaseFailure::from(error);
+        failure.transient |= source_transient;
+        failure
     })
 }
 
@@ -707,7 +792,8 @@ pub fn reconcile_released_reservation(
             return Err("query-only snapshots cannot authorize reservation archive repair".into());
         }
     }
-    let source = read_source(cx, pool, id)?
+    let source = read_source(cx, pool, id)
+        .map_err(|error| error.to_string())?
         .ok_or("captured reservation has no live terminal release authority")?;
     if source.generation.as_deref() != Some(expected_generation)
         || source.project_id != reservation.project_id
