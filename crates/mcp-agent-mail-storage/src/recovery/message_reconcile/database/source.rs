@@ -105,7 +105,18 @@ fn with_source_connection<T>(
             return Err(ReconcileFailure::source_unavailable("source read panicked"));
         }
     };
-    let result = read(&conn);
+    // The synchronous driver/decoder may unwind instead of returning an SQL
+    // error. Keep that failure inside the read-only observation: the caller's
+    // bounded retry lane must retain the message ID, and the uncertain pager
+    // must never return to this one-slot pool. No archive publication or SQL
+    // mutation is included in this boundary. Do not copy the panic payload
+    // into the returned error; it may contain private source data.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&conn)))
+        .unwrap_or_else(|_| {
+            Err(ReconcileFailure::source_unavailable(
+                "message archive source read panicked",
+            ))
+        });
     if result.as_ref().is_err_and(|error| error.transient) {
         // Detach updates pool accounting and prevents Drop from returning this
         // handle to the idle slot. Use the driver's normal explicit close path;
@@ -1140,6 +1151,62 @@ mod tests {
         conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
             .get_as::<i64>(0)
             .unwrap()
+    }
+
+    #[test]
+    fn source_read_panics_retire_the_reader_and_leave_repairable_mail() {
+        for after_projection in [false, true] {
+            fixture(|cx, pool, config| {
+                let failed = with_source_connection(cx, pool, |conn| -> Result<PreparedMessage, ReconcileFailure> {
+                    conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                    assert_eq!(query_only(conn), 1);
+                    if after_projection {
+                        let prepared = read_source(901, |sql, params| {
+                            conn.query_sync(sql, params)
+                                .map_err(ReconcileFailure::source_unavailable)
+                        })?;
+                        assert_eq!(prepared.body, "Keep this body.");
+                    }
+                    panic!("private-source-panic-payload");
+                });
+                let failure = failed.err().expect("a panic must not publish a source projection");
+                assert!(failure.transient, "the bounded retry lane must retain this ID");
+                assert!(failure.detail.contains("panicked"));
+                assert!(!failure.detail.contains("private-source-panic-payload"));
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(query_only(&conn), 0, "panicked reader must not be reused");
+                drop(conn);
+                let report = reconcile_message_batch(
+                    cx,
+                    pool,
+                    config,
+                    &mut ReconcileCursor::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(report.repaired, 1);
+                assert_eq!(report.files_created, 5);
+                assert_eq!(report.deferred, 0);
+                let original = prepare_message(cx, pool, 901).unwrap();
+                assert_eq!(original.body, "Keep this body.");
+                assert_eq!(original.message["bcc"], json!(["RedFox"]));
+                assert_eq!(
+                    reconcile_prepared(config, &original).unwrap(),
+                    ReconcileResult::default()
+                );
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+                let receipts = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901 AND agent_id = 102",
+                    &[],
+                ).unwrap();
+                assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 7);
+                assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 11);
+            });
+        }
     }
 
     #[test]
