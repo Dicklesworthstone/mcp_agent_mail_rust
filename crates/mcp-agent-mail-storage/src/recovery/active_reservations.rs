@@ -105,9 +105,16 @@ impl From<crate::StorageError> for RepairFailure {
                 if matches!(error.kind(),
                     std::io::ErrorKind::WouldBlock
                         | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::AlreadyExists));
+                        | std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ResourceBusy
+                        | std::io::ErrorKind::StorageFull
+                        | std::io::ErrorKind::QuotaExceeded
+                        | std::io::ErrorKind::OutOfMemory));
         // AlreadyExists can be a concurrent create-only publisher. A retry
         // revalidates its file; it never changes noclobber into replacement.
+        // Resource pressure likewise proves no conflicting lease. Every
+        // retained ID must reread its current grant/release state on retry.
         Self {
             detail: error.to_string(),
             transient,
@@ -182,7 +189,14 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, Repair
         detail,
         transient: true,
     })?;
-    read_source_connection(&conn, id)
+    let result = read_source_connection(&conn, id);
+    if result.as_ref().is_err_and(|error| error.transient) {
+        // Retrying the same failed pager in the worker's single idle slot can
+        // wedge otherwise valid grants indefinitely. Successful reads that
+        // expose conflicting lease evidence must not churn the pool instead.
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed active reservation source read");
+    }
+    result
 }
 
 fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, RepairFailure> {
@@ -368,10 +382,11 @@ fn repair_one(
         detail,
         transient: true,
     })?;
+    let mut conn = Some(conn);
     // Keep the source lease out of an unbounded archive wait. Use the same
     // native fence and project locks as terminal/message recovery, not a
     // second publication protocol or a detached writer.
-    let _mutation = crate::ArchiveMutationGuard::try_begin_repair(&config.storage_root, || {
+    let mutation = crate::ArchiveMutationGuard::try_begin_repair(&config.storage_root, || {
         stop.load(Ordering::Acquire) || cx.checkpoint().is_err()
     })
     .map_err(RepairFailure::from)?;
@@ -382,12 +397,15 @@ fn repair_one(
     let mut source_transient = false;
     let publish = || {
         checkpoint(cx, stop)?;
-        if read_source_connection(&conn, original.id)
-            .map_err(|error| {
-                source_transient |= error.transient;
-                invalid(error.detail)
-            })?
-            .as_ref()
+        if read_source_connection(
+            conn.as_ref().expect("retained source connection"),
+            original.id,
+        )
+        .map_err(|error| {
+            source_transient |= error.transient;
+            invalid(error.detail)
+        })?
+        .as_ref()
             != Some(original)
         {
             return Err(invalid(
@@ -460,12 +478,15 @@ fn repair_one(
         if working.is_some() && committed.as_ref().is_some_and(|a| a.bytes == bytes) {
             return Ok(false);
         }
-        if read_source_connection(&conn, original.id)
-            .map_err(|error| {
-                source_transient |= error.transient;
-                invalid(error.detail)
-            })?
-            .as_ref()
+        if read_source_connection(
+            conn.as_ref().expect("retained source connection"),
+            original.id,
+        )
+        .map_err(|error| {
+            source_transient |= error.transient;
+            invalid(error.detail)
+        })?
+        .as_ref()
             != Some(original)
         {
             return Err(invalid(
@@ -474,7 +495,7 @@ fn repair_one(
         }
         // Publication needs the outer generation lease, not a pool slot.
         // Release capacity before filesystem syncs and Git commit work.
-        drop(conn);
+        drop(conn.take());
         checkpoint(cx, stop)?;
         *attempted = true;
         if working.is_none() {
@@ -511,6 +532,13 @@ fn repair_one(
         || stop.load(Ordering::Acquire) || cx.checkpoint().is_err(),
         publish,
     );
+    drop(mutation);
+    if source_transient && let Some(conn) = conn.take() {
+        mcp_agent_mail_db::close_db_conn(
+            conn.detach(),
+            "failed active reservation publication source read",
+        );
+    }
     result.map_err(|error| {
         let mut failure = RepairFailure::from(error);
         failure.transient |= source_transient;
@@ -926,6 +954,118 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap()
+    }
+
+    fn query_only(conn: &DbConn) -> i64 {
+        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
+    }
+
+    #[test]
+    fn active_failed_source_queries_replace_reader_and_resume_real_publication() {
+        fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            for during_publication in [false, true] {
+                let before = fs::read(target(config)).ok();
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                // Make the actual source SELECT fail, without changing any
+                // lease row. A connection-local marker proves that recovery
+                // does not just hand the failed one-slot reader back again.
+                conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                conn.execute_raw(
+                    "ALTER TABLE file_reservation_releases RENAME TO retained_release_ledger",
+                )
+                .unwrap();
+                conn.execute_raw("COMMIT").unwrap();
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                assert_eq!(query_only(&conn), 1);
+                drop(conn);
+                let mut attempted = false;
+                let failure = if during_publication {
+                    repair_one(
+                        cx,
+                        pool,
+                        config,
+                        &source,
+                        &mut attempted,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap_err()
+                } else {
+                    read_source(cx, pool, 401).unwrap_err()
+                };
+                assert!(failure.transient, "{failure:?}");
+                assert!(!attempted, "a failed live source cannot publish a lease");
+                assert_eq!(fs::read(target(config)).ok(), before);
+
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(
+                    query_only(&conn),
+                    0,
+                    "the failed reader must be detached in both source-read phases"
+                );
+                conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                conn.execute_raw(
+                    "ALTER TABLE retained_release_ledger RENAME TO file_reservation_releases",
+                )
+                .unwrap();
+                conn.execute_raw("COMMIT").unwrap();
+                drop(conn);
+                assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+                let report = pass(cx, pool, config);
+                assert_eq!(report.deferred, 0);
+                assert_eq!(report.repaired, usize::from(before.is_none()));
+                assert_committed(cx, pool, config, 401);
+            }
+        });
+    }
+
+    #[test]
+    fn active_successful_or_conflicting_source_keeps_healthy_reader() {
+        fixture(|cx, pool, config| {
+            let source = read_source(cx, pool, 401).unwrap().unwrap();
+            for conflicting in [false, true] {
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                if conflicting {
+                    conn.execute_raw(
+                        "UPDATE db_identity SET generation_id = 'invalid/generation' WHERE singleton = 0",
+                    )
+                    .unwrap();
+                }
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                drop(conn);
+                let result = read_source(cx, pool, 401);
+                if conflicting {
+                    let failure = result.unwrap_err();
+                    assert!(
+                        !failure.transient,
+                        "invalid authority is not a reader failure"
+                    );
+                    assert!(failure.detail.contains("generation is invalid"));
+                } else {
+                    assert_eq!(result.unwrap().unwrap(), source);
+                }
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(
+                    query_only(&conn),
+                    1,
+                    "successful SQL must not churn the pool"
+                );
+                conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+                if conflicting {
+                    conn.execute_raw(
+                        "UPDATE db_identity SET generation_id = 'aabb' WHERE singleton = 0",
+                    )
+                    .unwrap();
+                }
+                drop(conn);
+                assert!(!target(config).exists());
+            }
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+            assert_eq!(pass(cx, pool, config).repaired, 1);
+            assert_committed(cx, pool, config, 401);
+        });
     }
 
     #[test]
@@ -1608,6 +1748,11 @@ mod tests {
             std::io::ErrorKind::WouldBlock,
             std::io::ErrorKind::TimedOut,
             std::io::ErrorKind::AlreadyExists,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ResourceBusy,
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+            std::io::ErrorKind::OutOfMemory,
         ] {
             let failure =
                 RepairFailure::from(crate::StorageError::Io(std::io::Error::new(kind, "test")));
@@ -1616,9 +1761,13 @@ mod tests {
         for kind in [
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::NotFound,
         ] {
-            let failure =
-                RepairFailure::from(crate::StorageError::Io(std::io::Error::new(kind, "test")));
+            let failure = RepairFailure::from(crate::StorageError::Io(std::io::Error::new(
+                kind,
+                "storage full or database locked is only text",
+            )));
             assert!(!failure.transient, "{kind:?}");
         }
         assert!(!RepairFailure::from(invalid("terminal evidence must be preserved")).transient);
