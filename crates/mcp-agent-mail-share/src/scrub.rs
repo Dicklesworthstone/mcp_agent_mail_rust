@@ -218,14 +218,81 @@ pub fn clear_registration_tokens(snapshot_path: &Path) -> Result<i64, ShareError
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot {path_str}: {e}"),
     })?;
-    if !column_exists(&conn, "agents", "registration_token")? {
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .map_err(|_| ShareError::Sqlite {
+            message: "cannot begin registration-token cleanup".to_string(),
+        })?;
+    let result = clear_registration_tokens_from_conn(&conn).and_then(|cleared| {
+        conn.execute_raw("COMMIT")
+            .map_err(|_| ShareError::Sqlite {
+                message: "cannot commit registration-token cleanup".to_string(),
+            })?;
+        Ok(cleared)
+    });
+    if result.is_err() {
+        let _ = conn.execute_raw("ROLLBACK");
+    }
+    result
+}
+
+/// The caller owns the transaction, including catalog inspection and readback.
+/// Identifier case is not credential absence. Nor does an affected-row count
+/// prove that a trigger or driver actually removed every token.
+fn clear_registration_tokens_from_conn(conn: &Conn) -> Result<i64, ShareError> {
+    if !private_export_table_exists(conn, "agents")? {
         return Ok(0);
     }
-    exec_count(
-        &conn,
+    let columns = conn
+        .query_sync("PRAGMA table_info(agents)", &[])
+        .map_err(|_| ShareError::Sqlite {
+            message: "cannot inspect registration-token columns".to_string(),
+        })?;
+    if columns.is_empty() {
+        return Err(ShareError::Validation {
+            message: "cannot establish registration-token column authority".to_string(),
+        });
+    }
+    let mut token_columns = 0;
+    for column in columns {
+        let name = column
+            .get_named::<String>("name")
+            .map_err(|_| ShareError::Validation {
+                message: "invalid registration-token column metadata".to_string(),
+            })?;
+        if name.eq_ignore_ascii_case("registration_token") {
+            token_columns += 1;
+        }
+    }
+    if token_columns == 0 {
+        return Ok(0);
+    }
+    if token_columns != 1 {
+        return Err(ShareError::Validation {
+            message: "ambiguous registration-token column authority".to_string(),
+        });
+    }
+    let cleared = exec_count(
+        conn,
         "UPDATE agents SET registration_token = NULL WHERE registration_token IS NOT NULL",
         &[],
     )
+    .map_err(|_| ShareError::Sqlite {
+        message: "registration-token cleanup failed".to_string(),
+    })?;
+    let remaining = conn
+        .query_sync(
+            "SELECT 1 FROM agents WHERE registration_token IS NOT NULL LIMIT 1",
+            &[],
+        )
+        .map_err(|_| ShareError::Sqlite {
+            message: "cannot verify registration-token cleanup".to_string(),
+        })?;
+    if !remaining.is_empty() {
+        return Err(ShareError::Validation {
+            message: "registration tokens were not cleared; export refused".to_string(),
+        });
+    }
+    Ok(cleared)
 }
 
 /// # Errors
@@ -595,18 +662,11 @@ pub fn scrub_snapshot_redacting(
                 scrub_secrets_in_text_column(&conn, RedactTextColumn::AgentTaskDescription)?;
             secrets_replaced +=
                 scrub_secrets_in_text_column(&conn, RedactTextColumn::SiblingSuggestionRationale)?;
-            if column_exists(&conn, "agents", "registration_token")? {
-                // Registration tokens are credentials by definition. Sharing
-                // presets must remove them even when their encoding does not
-                // match a generic secret detector; the full-fidelity archive
-                // preset keeps them so disaster recovery remains lossless.
-                secrets_replaced += exec_count(
-                    &conn,
-                    "UPDATE agents SET registration_token = NULL \
-                     WHERE registration_token IS NOT NULL",
-                    &[],
-                )?;
-            }
+            // Sharing presets clear credentials regardless of their spelling or
+            // encoding. Verify within this transaction so a refused cleanup also
+            // rolls back bodies, recipients, paths, and other scrub mutations.
+            // The private Archive preset never enters this secret-scrub branch.
+            secrets_replaced += clear_registration_tokens_from_conn(&conn)?;
             // The replay cache and recovery envelope retain pre-scrub copies
             // of bodies, recipients, attachments and credentials. They are not
             // viewer data. Full bundle rebuilding already omits these fields;
@@ -666,6 +726,9 @@ fn clear_private_runtime_state(
         "idempotency_keys",
         "proof_gate_consumed_nonces",
         "inbox_delivery_events",
+        // This ledger also identifies recipients and retains observation times
+        // and route/path fingerprints after ordinary receipts are scrubbed.
+        "message_delivery_signal_receipts",
         "project_mailbox_receipts",
         "project_mailbox_deliveries",
     ] {
@@ -1434,6 +1497,147 @@ mod tests {
         assert_eq!(message_text(&conn, "attachments"), PRIVATE_ATTACHMENT);
     }
 
+    fn seed_delivery_signal_scrub_state(db: &Path) {
+        seed_shared_mailbox_scrub_state(db);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_delivery_signal_receipts (\
+             message_id INTEGER NOT NULL REFERENCES messages(id), \
+             agent_id INTEGER NOT NULL REFERENCES agents(id), \
+             delivery_route TEXT NOT NULL, signal_path_digest TEXT NOT NULL, \
+             observed_ts INTEGER NOT NULL, \
+             PRIMARY KEY(message_id, agent_id, delivery_route))",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_delivery_signal_receipts VALUES \
+             (1, 1, 'inbox', 'private-route-one', 1700000000000001), \
+             (1, 1, 'notification', 'private-route-two', 1700000000000002), \
+             (1, 2, 'notification', 'private-route-three', 1700000000000003)",
+        )
+        .unwrap();
+    }
+
+    type DeliverySignalScrubRow = (i64, i64, String, String, i64);
+
+    fn delivery_signal_scrub_rows(conn: &Conn) -> Vec<DeliverySignalScrubRow> {
+        conn.query_sync(
+            "SELECT message_id, agent_id, delivery_route, signal_path_digest, observed_ts \
+             FROM message_delivery_signal_receipts \
+             ORDER BY message_id, agent_id, delivery_route",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_named("message_id").unwrap(),
+                row.get_named("agent_id").unwrap(),
+                row.get_named("delivery_route").unwrap(),
+                row.get_named("signal_path_digest").unwrap(),
+                row.get_named("observed_ts").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sharing_scrub_removes_signal_activity_but_archive_preserves_exact_rows() {
+        for preset in [
+            ScrubPreset::Standard,
+            ScrubPreset::Strict,
+            ScrubPreset::Archive,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_delivery_signal_scrub_state(&db);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let original = delivery_signal_scrub_rows(&conn);
+            assert_eq!(original.len(), 3);
+            drop(conn);
+            for _ in 0..2 {
+                scrub_snapshot(&db, preset).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let actual = delivery_signal_scrub_rows(&conn);
+                if preset == ScrubPreset::Archive {
+                    assert_eq!(actual, original, "private archive signal fidelity");
+                } else {
+                    assert!(actual.is_empty(), "signal activity survived {preset:?}");
+                }
+                assert_eq!(
+                    count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages").unwrap(),
+                    1
+                );
+                assert!(
+                    conn.query_sync("PRAGMA foreign_key_check", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signal_cleanup_refusal_rolls_back_the_entire_sharing_scrub() {
+        for preset in [ScrubPreset::Standard, ScrubPreset::Strict] {
+            for failure in ["view", "ignore", "abort"] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                seed_delivery_signal_scrub_state(&db);
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let original = delivery_signal_scrub_rows(&conn);
+                let sql = match failure {
+                    "view" => {
+                        "ALTER TABLE message_delivery_signal_receipts RENAME TO retained_signals; \
+                         CREATE VIEW message_delivery_signal_receipts AS SELECT * FROM retained_signals"
+                    }
+                    "ignore" => {
+                        "CREATE TRIGGER refuse_signal_cleanup BEFORE DELETE ON \
+                         message_delivery_signal_receipts BEGIN SELECT RAISE(IGNORE); END"
+                    }
+                    _ => {
+                        "CREATE TRIGGER refuse_signal_cleanup BEFORE DELETE ON \
+                         message_delivery_signal_receipts BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+                    }
+                };
+                conn.execute_raw(sql).unwrap();
+                drop(conn);
+                let error = scrub_snapshot(&db, preset).unwrap_err();
+                if failure == "view" {
+                    assert!(error.to_string().contains("must be a table"));
+                } else if failure == "ignore" {
+                    assert!(error.to_string().contains("was not cleared"));
+                }
+                assert!(!error.to_string().contains("private-route-"));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                assert_eq!(delivery_signal_scrub_rows(&conn), original);
+                assert_eq!(message_text(&conn, "body_md"), "Hello world");
+                assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+                for (table, expected) in [
+                    ("message_recipients", 1),
+                    ("project_mailbox_deliveries", 1),
+                    ("project_mailbox_receipts", 2),
+                    ("idempotency_keys", 2),
+                    ("proof_gate_consumed_nonces", 1),
+                    ("inbox_delivery_events", 1),
+                ] {
+                    assert_eq!(
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}"))
+                            .unwrap(),
+                        expected,
+                        "rollback: {preset:?}, {failure}, {table}"
+                    );
+                }
+                assert_eq!(
+                    count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1")
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
     fn seed_private_runtime_state(db: &Path) {
         let conn = Conn::open_file(db.display().to_string()).unwrap();
         conn.execute_raw("CREATE TABLE idempotency_keys (project_id INTEGER NOT NULL, tool TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, PRIMARY KEY (project_id, tool, idempotency_key))").unwrap();
@@ -1458,6 +1662,146 @@ mod tests {
         .unwrap();
         conn.execute_raw("INSERT INTO inbox_delivery_events VALUES (1, 1, 1, 1, 'bcc', 1)")
             .unwrap();
+    }
+
+    #[test]
+    fn registration_token_cleanup_covers_imported_case_and_preserves_private_archives() {
+        for column in ["registration_token", "REGISTRATION_TOKEN", "Registration_Token"] {
+            for preset in [ScrubPreset::Standard, ScrubPreset::Strict, ScrubPreset::Archive] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                conn.execute_raw(&format!(
+                    "ALTER TABLE agents ADD COLUMN {column} TEXT; \
+                     UPDATE agents SET {column} = 'opaque-credential-sentinel' WHERE id = 1"
+                ))
+                .unwrap();
+                drop(conn);
+                scrub_snapshot(&db, preset).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT registration_token AS token FROM agents WHERE id = 1", &[])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get_named::<Option<String>>("token").unwrap().as_deref(),
+                    if preset == ScrubPreset::Archive {
+                        Some("opaque-credential-sentinel")
+                    } else {
+                        None
+                    },
+                    "column={column}, preset={preset:?}"
+                );
+                drop(conn);
+                // Published Archive exports still call this independent cleanup.
+                // Verify final state, not the driver's affected-row accounting.
+                for _ in 0..2 {
+                    clear_registration_tokens(&db).unwrap();
+                    let conn = Conn::open_file(db.display().to_string()).unwrap();
+                    assert!(conn
+                        .query_sync("SELECT 1 FROM agents WHERE registration_token IS NOT NULL", &[])
+                        .unwrap()
+                        .is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registration_token_cleanup_refusal_restores_all_credential_and_scrub_state() {
+        for preset in [None, Some(ScrubPreset::Standard), Some(ScrubPreset::Strict)] {
+            for refusal in ["ignore", "abort", "restore"] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                conn.execute_raw(
+                    "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+                     INSERT INTO agents(id, project_id, name) VALUES (2, 1, 'SecondAgent'); \
+                     UPDATE agents SET registration_token = 'opaque-credential-sentinel'; \
+                     UPDATE messages SET ack_required = 1; \
+                     UPDATE message_recipients SET read_ts = 'read-before', ack_ts = 'ack-before'"
+                )
+                .unwrap();
+                let trigger = match refusal {
+                    "ignore" => "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(IGNORE); END",
+                    "abort" => "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+                    _ => "CREATE TRIGGER refuse_token_cleanup AFTER UPDATE OF registration_token ON agents WHEN NEW.id = 2 AND NEW.registration_token IS NULL BEGIN UPDATE agents SET registration_token = 'opaque-credential-sentinel' WHERE id = 2; END",
+                };
+                conn.execute_raw(trigger).unwrap();
+                drop(conn);
+                let result = if let Some(preset) = preset {
+                    scrub_snapshot(&db, preset).map(|_| ())
+                } else {
+                    clear_registration_tokens(&db).map(|_| ())
+                };
+                let error = result.unwrap_err();
+                assert!(!error.to_string().contains("opaque-credential-sentinel"));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT registration_token AS token FROM agents ORDER BY id", &[])
+                    .unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|row| row.get_named::<String>("token").unwrap()
+                    == "opaque-credential-sentinel"));
+                assert_eq!(message_text(&conn, "body_md"), "Hello world");
+                assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1").unwrap(), 1);
+                assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients WHERE read_ts = 'read-before' AND ack_ts = 'ack-before'").unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn registration_token_cleanup_rejects_a_view_and_allows_proven_legacy_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        assert_eq!(clear_registration_tokens(&db).unwrap(), 0);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+             UPDATE agents SET registration_token = 'opaque-credential-sentinel'; \
+             ALTER TABLE agents RENAME TO original_agents; \
+             CREATE VIEW agents AS SELECT * FROM original_agents"
+        )
+        .unwrap();
+        drop(conn);
+        let error = clear_registration_tokens(&db).unwrap_err();
+        assert!(error.to_string().contains("must be a table"));
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT registration_token AS token FROM original_agents", &[])
+                .unwrap()[0].get_named::<String>("token").unwrap(),
+            "opaque-credential-sentinel"
+        );
+    }
+
+    #[test]
+    fn later_private_cleanup_failure_restores_already_cleared_registration_tokens() {
+        for preset in [ScrubPreset::Standard, ScrubPreset::Strict] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_shared_mailbox_scrub_state(&db);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "ALTER TABLE agents ADD COLUMN REGISTRATION_TOKEN TEXT; \
+                 UPDATE agents SET REGISTRATION_TOKEN = 'opaque-credential-sentinel'; \
+                 CREATE TRIGGER refuse_receipt_cleanup BEFORE DELETE ON \
+                 project_mailbox_receipts BEGIN SELECT RAISE(IGNORE); END"
+            )
+            .unwrap();
+            drop(conn);
+            let error = scrub_snapshot(&db, preset).unwrap_err();
+            assert!(error.to_string().contains("was not cleared"));
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let tokens = conn
+                .query_sync("SELECT registration_token AS token FROM agents ORDER BY id", &[])
+                .unwrap();
+            assert_eq!(tokens.len(), 2);
+            assert!(tokens.iter().all(|row| row.get_named::<String>("token").unwrap()
+                == "opaque-credential-sentinel"));
+            assert_eq!(message_text(&conn, "body_md"), "Hello world");
+            assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+            assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM project_mailbox_receipts").unwrap(), 2);
+            assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients").unwrap(), 1);
+        }
     }
 
     fn seed_shared_mailbox_scrub_state(db: &Path) {
