@@ -319,6 +319,362 @@ fn busy_global_fence_defers_missing_archive_initialization_and_revisits_live_mai
     exercise_busy_fence(false);
 }
 
+fn while_publication_fence_is_held<T>(observe: impl FnOnce() -> T) -> T {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        crate::with_archive_snapshot_publication_fence(|| {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(20))
+        })
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let result = observe();
+    let _ = release_tx.send(());
+    assert!(owner.join().unwrap().is_ok(), "fence owner timed out");
+    result
+}
+
+#[test]
+fn complete_bundles_verify_without_acquiring_the_global_publication_fence() {
+    fixture(|cx, pool, config| {
+        let initial = reconcile_message_batch(
+            cx,
+            pool,
+            config,
+            &mut ReconcileCursor::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(initial.repaired, 2);
+        crate::flush_async_commits();
+        let before_db = database_evidence(cx, pool);
+        let before = crate::archive_epoch_read_stamp(&config.storage_root)
+            .unwrap()
+            .unwrap();
+        let (report, owner_held, writers) = while_publication_fence_is_held(|| {
+            let report = reconcile_message_batch(
+                cx,
+                pool,
+                config,
+                &mut ReconcileCursor::default(),
+                &AtomicBool::new(false),
+            );
+            (
+                report,
+                crate::archive_publication_fence_holder().is_some(),
+                active_writer_count(),
+            )
+        });
+        let report = report.unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.unchanged,
+                report.repaired,
+                report.deferred
+            ),
+            (2, 2, 0, 0),
+            "{report:?}"
+        );
+        assert!(owner_held);
+        assert_eq!(writers, 0);
+        assert_eq!(database_evidence(cx, pool), before_db);
+        assert_eq!(
+            crate::archive_epoch_read_stamp(&config.storage_root).unwrap(),
+            Some(before)
+        );
+        assert_recovered(cx, pool, config, 901, false);
+        assert_recovered(cx, pool, config, 902, false);
+    });
+}
+
+#[test]
+fn complete_failed_bundle_requires_guarded_verification_before_clearing_durability_debt() {
+    fixture(|cx, pool, config| {
+        durability::clear_by_operator();
+        let stop = AtomicBool::new(false);
+        let initial =
+            reconcile_message_batch(cx, pool, config, &mut ReconcileCursor::default(), &stop)
+                .unwrap();
+        assert_eq!(initial.repaired, 2);
+        crate::flush_async_commits();
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let failed = crate::WriteOp::MessageBundle {
+            config: config.clone(),
+            project_slug: prepared.project_slug.clone(),
+            message_json: prepared.message.clone(),
+            body_md: prepared.body.clone(),
+            sender: prepared.sender.clone(),
+            recipients: prepared.recipients.clone(),
+            extra_paths: Vec::new(),
+        };
+        // The real failure ledger can outlive a completed archive write, for
+        // example when acknowledgement failed after publication. Complete
+        // files do not make its refusal an ordinary read-only observation.
+        durability::record_failures(std::iter::once(&failed));
+        assert!(crate::durability_degraded());
+        assert!(durability::ticket_for(config, &prepared).is_some());
+        let before_db = database_evidence(cx, pool);
+        let mut cursor = ReconcileCursor::default();
+        let (report, refused, retained) = while_publication_fence_is_held(|| {
+            (
+                reconcile_message_batch(cx, pool, config, &mut cursor, &stop),
+                crate::durability_degraded(),
+                durability::ticket_for(config, &prepared).is_some(),
+            )
+        });
+        let report = report.unwrap();
+        assert_eq!(
+            (report.scanned, report.unchanged, report.deferred_transient),
+            (2, 1, 1),
+            "only the healthy companion may use read-only verification: {report:?}"
+        );
+        assert!(
+            refused && retained,
+            "an observation cannot clear durability debt"
+        );
+        assert_eq!(database_evidence(cx, pool), before_db);
+
+        // Failure-ledger seeding plus the refused attempt owns a cooldown.
+        // Advance only its scheduling hint, without waiting on wall time or
+        // changing the retained ticket/source/archive proof obligations.
+        for retry in &mut cursor.retries {
+            retry.ready_at = Instant::now();
+        }
+        let resumed = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+        assert_eq!(resumed.deferred, 0, "{resumed:?}");
+        assert!(resumed.unchanged > 0, "{resumed:?}");
+        assert!(!crate::durability_degraded());
+        assert!(durability::ticket_for(config, &prepared).is_none());
+        assert_eq!(database_evidence(cx, pool), before_db);
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn missing_committed_copy_cannot_be_reported_as_an_unchanged_bundle() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let retained = config.storage_root.join("retained-inbox.md");
+        fs::rename(&paths.inbox[0], &retained).unwrap();
+        let bytes = fs::read(&retained).unwrap();
+        let stop = AtomicBool::new(false);
+        let error = while_publication_fence_is_held(|| {
+            reconcile_prepared_inner(
+                config,
+                &prepared,
+                Some(RepairControl { cx, stop: &stop }),
+                false,
+            )
+        })
+        .unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(!paths.inbox[0].exists());
+        assert_eq!(fs::read(&retained).unwrap(), bytes);
+        assert_eq!(
+            reconcile_prepared(config, &prepared).unwrap().files_created,
+            1
+        );
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn uncommitted_complete_files_still_require_repair_publication_admission() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        let archive = crate::ensure_archive(config, "project").unwrap();
+        crate::flush_async_commits();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let full = crate::render_message_bundle_content(&prepared.message, &prepared.body).unwrap();
+        let inbox = crate::render_message_bundle_content(
+            &crate::redact_message_bcc_for_inbox(&prepared.message),
+            &prepared.body,
+        )
+        .unwrap();
+        for (path, bytes) in [&paths.canonical, &paths.outbox]
+            .into_iter()
+            .map(|path| (path, &full))
+            .chain(paths.inbox.iter().map(|path| (path, &inbox)))
+        {
+            crate::ensure_parent_dir(path).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let error = while_publication_fence_is_held(|| {
+            reconcile_prepared_inner(
+                config,
+                &prepared,
+                Some(RepairControl { cx, stop: &stop }),
+                false,
+            )
+        })
+        .unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(
+            CommittedMessages::open(&archive)
+                .unwrap()
+                .file_identity(&archive, &paths.canonical)
+                .is_err()
+        );
+        let repaired = reconcile_prepared(config, &prepared).unwrap();
+        assert_eq!(repaired.files_created, 0);
+        assert!(repaired.git_commit_needed);
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn read_only_verification_keeps_staged_conflicting_identity_visible() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let paths = crate::message_paths_for_bundle(
+            &archive,
+            &prepared.message,
+            &prepared.sender,
+            &prepared.recipients,
+        )
+        .unwrap()
+        .0;
+        let original = fs::read(&paths.canonical).unwrap();
+        let mut conflicting = prepared.message.clone();
+        conflicting["reply_to"] = json!(701);
+        fs::write(
+            &paths.canonical,
+            crate::render_message_bundle_content(&conflicting, &prepared.body).unwrap(),
+        )
+        .unwrap();
+        let repo = git2::Repository::open(&archive.repo_root).unwrap();
+        let mut index = repo.index().unwrap();
+        let relative =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        index.add_path(Path::new(&relative)).unwrap();
+        index.write().unwrap();
+        fs::write(&paths.canonical, &original).unwrap();
+        let before_index = fs::read(repo.path().join("index")).unwrap();
+        let before_head = repo.head().unwrap().target();
+        let error = verify_prepared_without_mutation(config, &prepared, None).unwrap_err();
+        assert!(
+            error.detail.contains("staged canonical payload conflicts"),
+            "{error:?}"
+        );
+        assert!(!error.transient);
+        assert_eq!(fs::read(repo.path().join("index")).unwrap(), before_index);
+        assert_eq!(repo.head().unwrap().target(), before_head);
+        assert_eq!(fs::read(&paths.canonical).unwrap(), original);
+    });
+}
+
+#[test]
+fn read_only_verification_retries_when_archive_epoch_changes_during_its_reads() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let root = config.storage_root.clone();
+        let before = crate::archive_epoch_read_stamp(&root).unwrap();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    drop(crate::ArchiveMutationGuard::begin_at(&root));
+                }
+            }));
+        });
+        let stop = AtomicBool::new(false);
+        let result = verify_prepared_without_mutation(
+            config,
+            &prepared,
+            Some(RepairControl { cx, stop: &stop }),
+        );
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        assert!(fired.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert_ne!(
+            crate::archive_epoch_read_stamp(&config.storage_root).unwrap(),
+            before
+        );
+        assert!(verify_prepared_without_mutation(config, &prepared, None).unwrap());
+        assert_recovered(cx, pool, config, 901, false);
+    });
+}
+
+#[test]
+fn read_only_verification_retries_when_head_changes_even_with_identical_tree() {
+    fixture(|cx, pool, config| {
+        let prepared = prepare_message(cx, pool, 901).unwrap();
+        reconcile_prepared(config, &prepared).unwrap();
+        crate::flush_async_commits();
+        let archive = crate::open_archive(config, "project").unwrap().unwrap();
+        let before = CommittedMessages::open(&archive).unwrap();
+        let root = config.storage_root.clone();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        super::super::SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |stage| {
+                if stage == "git root" && !observed.swap(true, Ordering::AcqRel) {
+                    // An external Git writer need not use our process-local
+                    // mutation counter. Change actual HEAD without changing
+                    // any tree object or on-disk message bytes.
+                    let repo = git2::Repository::open(&root).unwrap();
+                    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+                    let tree = parent.tree().unwrap();
+                    let signature = git2::Signature::now("test", "test@example.invalid").unwrap();
+                    repo.commit(
+                        Some("HEAD"),
+                        &signature,
+                        &signature,
+                        "advance HEAD during read-only verification",
+                        &tree,
+                        &[&parent],
+                    )
+                    .unwrap();
+                }
+            }));
+        });
+        let stop = AtomicBool::new(false);
+        let result = verify_prepared_without_mutation(
+            config,
+            &prepared,
+            Some(RepairControl { cx, stop: &stop }),
+        );
+        super::super::SCAN_HOOK.with(|slot| drop(slot.borrow_mut().take()));
+        assert!(fired.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        let after = CommittedMessages::open(&archive).unwrap();
+        assert_ne!(before.head_id, after.head_id);
+        assert_eq!(before.tree_id, after.tree_id);
+        assert!(verify_prepared_without_mutation(config, &prepared, None).unwrap());
+    });
+}
+
 #[test]
 fn busy_project_is_skipped_while_another_mailbox_project_repairs_then_is_revisited() {
     fixture(|cx, pool, config| {

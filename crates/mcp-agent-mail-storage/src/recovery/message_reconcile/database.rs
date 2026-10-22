@@ -583,14 +583,18 @@ fn reconcile_prepared(
     config: &Config,
     prepared: &PreparedMessage,
 ) -> Result<ReconcileResult, String> {
-    reconcile_prepared_inner(config, prepared, None).map_err(|error| error.detail)
+    reconcile_prepared_inner(config, prepared, None, false).map_err(|error| error.detail)
 }
 
 fn reconcile_prepared_inner(
     config: &Config,
     prepared: &PreparedMessage,
     control: Option<RepairControl<'_>>,
+    require_guarded_proof: bool,
 ) -> Result<ReconcileResult, ReconcileFailure> {
+    if !require_guarded_proof && verify_prepared_without_mutation(config, prepared, control)? {
+        return Ok(ReconcileResult::default());
+    }
     // Admit before ensure_archive: even creating a missing archive must not
     // wait behind an unrelated publisher while retaining the DB source lease.
     // Nested bundle publication retains this same native mutation window.
@@ -720,10 +724,89 @@ fn reconcile_prepared_inner(
     .map_err(ReconcileFailure::from)
 }
 
+/// Observe an already complete, committed bundle without taking the global
+/// publication fence. This can only report unchanged: every missing, damaged,
+/// uncommitted, or otherwise unproven bundle still uses guarded repair.
+///
+/// Equal stamps detect local mutation windows and observed remote epoch/HEAD
+/// changes. A remote mutation window can span both samples, so this is not a
+/// publication or deletion authorization. A stale unchanged observation merely
+/// leaves repair for a later sweep, as can a write immediately after a fenced
+/// observation. Keep all reads pinned to one HEAD and retain source revalidation.
+fn verify_prepared_without_mutation(
+    config: &Config,
+    prepared: &PreparedMessage,
+    control: Option<RepairControl<'_>>,
+) -> Result<bool, ReconcileFailure> {
+    super::checkpoint(control)?;
+    let Some(archive) = crate::open_archive(config, &prepared.project_slug)? else {
+        return Ok(false);
+    };
+    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)? else {
+        return Ok(false);
+    };
+    let changed = || crate::StorageError::LockContention {
+        message: "archive changed during read-only message verification; retry required".into(),
+    };
+    let committed = CommittedMessages::open(&archive)?;
+    if before.generation.head != committed.head_id {
+        return Err(changed().into());
+    }
+    if !matches!(
+        verify_retention_archive_at(&archive, prepared, &mut 0, &committed, control),
+        Ok(Some(_))
+    ) {
+        super::checkpoint(control)?;
+        return Ok(false);
+    }
+    // A staged canonical collision remains conflicting evidence even when
+    // every expected disk/HEAD copy is intact. Reuse the same bounded identity
+    // gate as publication, bracketed by the pinned HEAD checks because its
+    // own preflight opens HEAD independently.
+    if !committed.same_head(&archive)? {
+        return Err(changed().into());
+    }
+    let paths = crate::message_paths_for_bundle(
+        &archive,
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )?
+    .0;
+    let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+    let expected = committed.file_identity(&archive, &paths.canonical)?.0;
+    let mut budget = super::CanonicalScanBudget {
+        control,
+        ..Default::default()
+    };
+    if !super::identity::preflight(
+        &committed.repo,
+        &archive,
+        prepared.message["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| super::invalid("message has no positive archive identity"))?,
+        &canonical,
+        expected,
+        false,
+        &mut budget,
+    )? {
+        return Ok(false);
+    }
+    super::checkpoint(control)?;
+    if !committed.same_head(&archive)?
+        || crate::archive_epoch_read_stamp(&archive.repo_root)?.as_ref() != Some(&before)
+    {
+        return Err(changed().into());
+    }
+    Ok(true)
+}
+
 /// Immutable Git observation for all surviving copies of one message.
 /// Holding the tree identity avoids mixing metadata from separate HEADs.
 struct CommittedMessages {
     repo: git2::Repository,
+    head_id: Option<git2::Oid>,
     tree_id: Option<git2::Oid>,
 }
 
@@ -733,19 +816,31 @@ impl CommittedMessages {
             crate::archive_repo_root_checked(archive).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let tree_id = match repo.head() {
-            Ok(head) => Some(head.peel_to_tree().map_err(|error| error.to_string())?.id()),
+        let (head_id, tree_id) = match repo.head() {
+            Ok(head) => {
+                let commit = head.peel_to_commit().map_err(|error| error.to_string())?;
+                (Some(commit.id()), Some(commit.tree_id()))
+            }
             Err(error)
                 if matches!(
                     error.code(),
                     git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
                 ) =>
             {
-                None
+                (None, None)
             }
             Err(error) => return Err(error.to_string()),
         };
-        Ok(Self { repo, tree_id })
+        Ok(Self {
+            repo,
+            head_id,
+            tree_id,
+        })
+    }
+
+    fn same_head(&self, archive: &ProjectArchive) -> Result<bool, String> {
+        let current = Self::open(archive)?;
+        Ok(self.head_id == current.head_id && self.tree_id == current.tree_id)
     }
 
     fn file_identity(
@@ -1013,6 +1108,11 @@ fn reconcile_message_batch_inner(
                         config,
                         &prepared,
                         Some(RepairControl { cx, stop }),
+                        // Clearing a failed-write refusal consumes an archive
+                        // proof, so even unchanged failed mail must retain the
+                        // original guarded verification. The optimistic path
+                        // is only an observation for ordinary maintenance.
+                        ticket.is_some(),
                     );
                     if result.is_ok() {
                         durability::confirm_repaired(
@@ -1079,6 +1179,18 @@ fn verify_retention_archive(
     prepared: &PreparedMessage,
     admitted_bytes: &mut usize,
 ) -> Result<Option<usize>, String> {
+    let committed = CommittedMessages::open(archive)?;
+    verify_retention_archive_at(archive, prepared, admitted_bytes, &committed, None)
+}
+
+fn verify_retention_archive_at(
+    archive: &ProjectArchive,
+    prepared: &PreparedMessage,
+    admitted_bytes: &mut usize,
+    committed: &CommittedMessages,
+    control: Option<RepairControl<'_>>,
+) -> Result<Option<usize>, String> {
+    super::checkpoint(control).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
         archive,
         &prepared.message,
@@ -1089,7 +1201,6 @@ fn verify_retention_archive(
     .0;
     let attachments = super::attachments::required_paths(archive, &prepared.message)
         .map_err(|error| error.to_string())?;
-    let committed = CommittedMessages::open(archive)?;
     let mut expected = Vec::new();
     let mut bundle_bytes = 0_usize;
     let mut message_bytes = 0_usize;
@@ -1098,6 +1209,7 @@ fn verify_retention_archive(
         .chain(paths.inbox.iter().map(|path| (path, true)))
         .chain(attachments.iter().map(|path| (path, false)))
     {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (oid, size) = committed.file_identity(archive, path)?;
         if message && size > super::MAX_MESSAGE_ARTIFACT_BYTES {
             return Err("retention message exceeds the archive artifact byte bound".into());
@@ -1119,6 +1231,7 @@ fn verify_retention_archive(
     *admitted_bytes += bundle_bytes;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (message, body) = committed
             .read(archive, path)?
             .ok_or("retention requires committed canonical and outbox copies")?;
@@ -1130,6 +1243,7 @@ fn verify_retention_archive(
         )?;
     }
     for path in &paths.inbox {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (message, body) = committed
             .read(archive, path)?
             .ok_or("retention requires every committed recipient inbox copy")?;
@@ -1143,6 +1257,7 @@ fn verify_retention_archive(
     // Reuse attachment path, size and content-digest validation. The preceding
     // inventory requires committed blobs even when repair could use a proven
     // uncommitted original. This verifier never creates or commits files.
+    super::checkpoint(control).map_err(|error| error.to_string())?;
     let files = super::attachments::prepare(
         &committed.repo,
         archive,
@@ -1151,6 +1266,7 @@ fn verify_retention_archive(
     )
     .map_err(|error| error.to_string())?;
     for (path, bytes) in files {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (oid, _) = committed.file_identity(archive, &path)?;
         if git2::Oid::hash_object_ext(git2::ObjectType::Blob, &bytes, oid.object_format())
             .map_err(|error| error.to_string())?
@@ -1161,6 +1277,7 @@ fn verify_retention_archive(
     }
     let current = CommittedMessages::open(archive)?;
     for (path, oid) in expected {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         if current.file_identity(archive, path)?.0 != oid {
             return Err("retention archive changed during verification".into());
         }
