@@ -15,25 +15,12 @@
 use std::fs::Metadata;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-const STAGING_PREFIX: &[u8] = b".mcp-agent-mail-proactive-backup-";
-// Older metadata verification used an unbudgeted NamedTempFile directly in
-// this parent. A crash could leave a partial or complete database image here.
-// Count those files as retained stages, without treating them as disposable.
-const LEGACY_INSPECTION_PREFIX: &[u8] = b".snapshot-inspect-";
-const LEGACY_INSPECTION_SUFFIX: &[u8] = b".sqlite3";
-const MAX_RETAINED_STAGES: usize = 3;
-const STAGING_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
-const MAX_INVENTORY_ENTRIES: usize = 16_384;
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Inventory {
-    /// Proactive stage directories plus legacy metadata inspection files.
-    stages: usize,
-    /// Logical file lengths, not allocated blocks (sparse files count fully).
-    bytes: u64,
-}
+use mcp_agent_mail_db::recovery_retention::staging::{
+    STAGING_REMEDIATION, assess_automatic_backup_staging,
+    inspect_staging_for_admission as inspect_staging, regular_file_bytes,
+};
 
 /// Keeping this value alive serializes automatic exporters sharing a parent.
 /// Dropping it releases the OS lease, including unwinding and process exit;
@@ -75,33 +62,14 @@ impl Admission {
         // Do not create a control file for an absent/non-regular primary.
         regular_file_bytes(&primary, false)?;
         let lease = acquire_parent_lease(parent)?;
-        // A source/WAL read failure is unavailable evidence, never a zero-size DB.
-        let main_bytes = regular_file_bytes(&primary, false)?;
-        let mut wal_name = primary
-            .file_name()
-            .ok_or_else(|| invalid("database has no name"))?
-            .to_os_string();
-        wal_name.push("-wal");
-        let wal_bytes = regular_file_bytes(&primary.with_file_name(wal_name), true)?;
-        let generation_bytes = main_bytes
-            .checked_add(wal_bytes)
-            .ok_or_else(|| invalid("database/WAL size overflow"))?;
-        // The guarded export and canonical snapshot coexist. Keep the same
-        // two-generation estimate as the database layer's disk-headroom gate.
-        let projected_bytes = generation_bytes
-            .checked_mul(2)
-            .ok_or_else(|| invalid("backup staging estimate overflow"))?;
-        let byte_limit = generation_bytes
-            .checked_mul(5)
-            .ok_or_else(|| invalid("backup staging budget overflow"))?
-            .max(STAGING_BYTES_FLOOR);
-        let inventory = inspect_staging(parent)?;
-        check_budget(&inventory, projected_bytes, byte_limit).map_err(|error| {
-            io::Error::new(error.kind(), format!(
-                "{}: {error}; inspect retained {prefix}* directories and {legacy}* files in this parent and reclaim evidence explicitly before retrying",
-                parent.display(), prefix = String::from_utf8_lossy(STAGING_PREFIX),
-                legacy = String::from_utf8_lossy(LEGACY_INSPECTION_PREFIX)
-            ))
+        // Health and this producer share both the inventory rules and the
+        // count/projected-byte policy. Only this producer holds admission.
+        let assessment = assess_automatic_backup_staging(&primary, inspect_staging(parent)?)?;
+        assessment.check_budget().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{}: {error}; {STAGING_REMEDIATION}", parent.display()),
+            )
         })?;
         validate_parent_lease(parent, &lease)?;
         Ok(Self { _lease: lease })
@@ -126,120 +94,6 @@ fn try_lock(file: &File) -> io::Result<()> {
             error
         }
     })
-}
-
-fn regular_file_bytes(path: &Path, missing_is_empty: bool) -> io::Result<u64> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(metadata.len()),
-        Ok(_) => Err(invalid(format!("{} is not a regular file", path.display()))),
-        Err(error) if missing_is_empty && error.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error),
-    }
-}
-
-fn check_budget(inventory: &Inventory, projected_bytes: u64, byte_limit: u64) -> io::Result<()> {
-    if inventory.stages >= MAX_RETAINED_STAGES {
-        return Err(invalid(format!(
-            "{} retained staging artifacts reached the automatic limit of {MAX_RETAINED_STAGES}",
-            inventory.stages
-        )));
-    }
-    let projected_total = inventory
-        .bytes
-        .checked_add(projected_bytes)
-        .ok_or_else(|| invalid("retained plus projected staging size overflow"))?;
-    if projected_total > byte_limit {
-        return Err(invalid(format!(
-            "{} retained bytes plus {projected_bytes} projected bytes exceed the {byte_limit}-byte staging budget",
-            inventory.bytes
-        )));
-    }
-    Ok(())
-}
-
-fn inspect_staging(parent: &Path) -> io::Result<Inventory> {
-    let mut inventory = Inventory::default();
-    let mut pending = Vec::<PathBuf>::new();
-    let mut visited = 0_usize;
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        visit_entry(&mut visited)?;
-        let name = entry.file_name();
-        let name = name.as_encoded_bytes();
-        let legacy_inspection = name.starts_with(LEGACY_INSPECTION_PREFIX);
-        if !name.starts_with(STAGING_PREFIX) && !legacy_inspection {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if legacy_inspection {
-            if !metadata.file_type().is_file()
-                || !name.ends_with(LEGACY_INSPECTION_SUFFIX)
-                || name.len() <= LEGACY_INSPECTION_PREFIX.len() + LEGACY_INSPECTION_SUFFIX.len()
-            {
-                return Err(invalid(format!(
-                    "legacy snapshot inspection entry {} is not a recognized regular staging file; its footprint is unavailable",
-                    entry.path().display()
-                )));
-            }
-            inventory.bytes = inventory
-                .bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| invalid("staging inventory byte count overflow"))?;
-        } else if !metadata.file_type().is_dir() {
-            return Err(invalid(format!(
-                "staging-shaped entry {} is not a real directory",
-                entry.path().display()
-            )));
-        }
-        inventory.stages = inventory
-            .stages
-            .checked_add(1)
-            .ok_or_else(|| invalid("staging artifact count overflow"))?;
-        // A saturated count already refuses admission; do not walk arbitrarily
-        // many large trees merely to format the refusal's byte count.
-        if inventory.stages >= MAX_RETAINED_STAGES {
-            return Ok(inventory);
-        }
-        if !legacy_inspection {
-            pending.push(entry.path());
-        }
-    }
-    while let Some(directory) = pending.pop() {
-        // Recheck at descent: do not intentionally traverse a symlink swapped
-        // in since enumeration. This inventory is not a hostile-user sandbox.
-        if !fs::symlink_metadata(&directory)?.file_type().is_dir() {
-            return Err(invalid("staging directory changed type during inventory"));
-        }
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            visit_entry(&mut visited)?;
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if metadata.file_type().is_dir() {
-                pending.push(entry.path());
-            } else if metadata.file_type().is_file() {
-                inventory.bytes = inventory
-                    .bytes
-                    .checked_add(metadata.len())
-                    .ok_or_else(|| invalid("staging inventory byte count overflow"))?;
-            } else {
-                return Err(invalid(format!(
-                    "staging entry {} is a symlink or special file; its footprint is unavailable",
-                    entry.path().display()
-                )));
-            }
-        }
-    }
-    Ok(inventory)
-}
-
-fn visit_entry(visited: &mut usize) -> io::Result<()> {
-    *visited += 1;
-    if *visited > MAX_INVENTORY_ENTRIES {
-        return Err(invalid(
-            "staging inventory entry limit exceeded; footprint is unavailable",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -344,7 +198,25 @@ fn validate_parent_lease(_parent: &Path, _retained: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_agent_mail_db::recovery_retention::staging::{
+        AutomaticBackupStagingAssessment, MAX_RETAINED_STAGES,
+        ProactiveBackupStagingInventory as Inventory, STAGING_BYTES_FLOOR,
+    };
     use std::cell::Cell;
+    use std::path::PathBuf;
+
+    fn check_budget(
+        inventory: &Inventory,
+        projected_bytes: u64,
+        byte_limit: u64,
+    ) -> io::Result<()> {
+        AutomaticBackupStagingAssessment {
+            inventory: *inventory,
+            projected_bytes,
+            byte_limit,
+        }
+        .check_budget()
+    }
 
     fn fixture() -> PathBuf {
         tempfile::tempdir()
@@ -371,7 +243,8 @@ mod tests {
     #[test]
     fn budget_counts_the_next_attempt_and_rejects_overflow() {
         let inventory = Inventory {
-            stages: 2,
+            directories: 2,
+            legacy_files: 0,
             bytes: 60,
         };
         assert!(check_budget(&inventory, 40, 100).is_ok());
@@ -379,7 +252,8 @@ mod tests {
         assert!(
             check_budget(
                 &Inventory {
-                    stages: 3,
+                    directories: 3,
+                    legacy_files: 0,
                     bytes: 0
                 },
                 0,
@@ -390,7 +264,8 @@ mod tests {
         assert!(
             check_budget(
                 &Inventory {
-                    stages: 0,
+                    directories: 0,
+                    legacy_files: 0,
                     bytes: u64::MAX
                 },
                 1,
@@ -412,7 +287,8 @@ mod tests {
         assert_eq!(
             inspect_staging(&root).unwrap(),
             Inventory {
-                stages: 1,
+                directories: 1,
+                legacy_files: 0,
                 bytes: 13
             }
         );
@@ -438,7 +314,10 @@ mod tests {
             MAX_RETAINED_STAGES,
             "fresh process-local state cannot bypass retained inventory"
         );
-        assert_eq!(inspect_staging(&root).unwrap().stages, MAX_RETAINED_STAGES);
+        assert_eq!(
+            inspect_staging(&root).unwrap().artifacts(),
+            MAX_RETAINED_STAGES
+        );
         for ordinal in 0..MAX_RETAINED_STAGES {
             let path = root.join(format!(
                 ".mcp-agent-mail-proactive-backup-{ordinal:06}/snapshot.sqlite3"
@@ -457,7 +336,8 @@ mod tests {
         assert_eq!(
             inspect_staging(&root).unwrap(),
             Inventory {
-                stages: 2,
+                directories: 1,
+                legacy_files: 1,
                 bytes: 20,
             }
         );
@@ -653,7 +533,7 @@ mod tests {
             fs::create_dir(kept.join("nested")).unwrap();
         }
         let inventory = inspect_staging(&root).unwrap();
-        assert_eq!(inventory.stages, MAX_RETAINED_STAGES);
+        assert_eq!(inventory.artifacts(), MAX_RETAINED_STAGES);
         assert_eq!(
             inventory.bytes, 0,
             "the saturated count is sufficient to refuse"
@@ -719,15 +599,15 @@ mod tests {
     }
 
     #[test]
-    fn staging_lookalike_files_and_excessive_inventory_are_not_empty_evidence() {
+    fn staging_lookalike_files_are_not_empty_evidence() {
         let root = fixture();
         let primary = primary(&root);
         let unexpected = root.join(".mcp-agent-mail-proactive-backup-unexpected");
         fs::write(&unexpected, b"unclassified evidence").unwrap();
         assert!(with_admission(&primary, || Ok(())).is_err());
         assert_eq!(fs::read(unexpected).unwrap(), b"unclassified evidence");
-        let mut visited = MAX_INVENTORY_ENTRIES;
-        assert!(visit_entry(&mut visited).is_err());
+        // The shared staging module tests the real bounded directory walk,
+        // including parent and nested entries, rather than a counter alone.
     }
 
     #[cfg(unix)]

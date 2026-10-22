@@ -26,6 +26,14 @@ use std::time::UNIX_EPOCH;
 #[path = "recovery_retention_namespace.rs"]
 mod namespace;
 
+#[path = "recovery_retention_staging.rs"]
+pub mod staging;
+
+pub use staging::{ProactiveBackupStagingInventory, inspect_proactive_backup_staging};
+
+#[cfg(test)]
+use staging::{PROACTIVE_STAGING_PREFIX, inspect_proactive_backup_staging_with_limit};
+
 #[cfg(unix)]
 pub use namespace::{
     CompletedReclaimDelete, CompletedReclaimMove, ReclaimDirectory, ReclaimedFileBytes,
@@ -643,127 +651,6 @@ pub fn inspect_storage_backups(database_path: &Path) -> std::io::Result<BackupIn
     Ok(inventory)
 }
 
-const PROACTIVE_STAGING_PREFIX: &[u8] = b".mcp-agent-mail-proactive-backup-";
-const MAX_STAGING_INVENTORY_ENTRIES: usize = 16_384;
-
-/// Read-only footprint of proactive-backup stages beside the database.
-///
-/// Stage names do not identify a mailbox. This intentionally covers the whole
-/// database parent, just like automatic backup admission. It includes active
-/// and failed stages; neither a name nor this inventory authorizes reclamation.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ProactiveBackupStagingInventory {
-    pub directories: usize,
-    /// Logical regular-file lengths, not allocated blocks. Sparse files count
-    /// fully, matching the admission budget; no `SQLite` file is opened.
-    pub bytes: u64,
-}
-
-/// Inspect all staging-shaped directories beside the configured database.
-///
-/// Unlike admission's count-only early refusal, health needs the whole bounded
-/// footprint even when there are already more than three stages. Read failures,
-/// symlinks, special files, byte overflow, and an exhausted entry budget return
-/// unavailable evidence, never a successful empty or truncated inventory.
-/// Missing parents remain empty during first-run bootstrap. This is a live
-/// metadata observation, not a transactional snapshot or a hostile-user sandbox.
-pub fn inspect_proactive_backup_staging(
-    database_path: &Path,
-) -> std::io::Result<ProactiveBackupStagingInventory> {
-    inspect_proactive_backup_staging_with_limit(database_path, MAX_STAGING_INVENTORY_ENTRIES)
-}
-
-fn staging_inventory_error(message: impl Into<String>) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
-}
-
-fn inspect_proactive_backup_staging_with_limit(
-    database_path: &Path,
-    max_entries: usize,
-) -> std::io::Result<ProactiveBackupStagingInventory> {
-    if database_path.file_name().is_none() {
-        return Ok(ProactiveBackupStagingInventory::default());
-    }
-    // Freeze relative paths once; do not change the process working directory.
-    let primary = if database_path.is_absolute() {
-        database_path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(database_path)
-    };
-    let parent = primary
-        .parent()
-        .ok_or_else(|| staging_inventory_error("staging inventory database has no parent"))?;
-    match std::fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => {
-            return Err(staging_inventory_error(
-                "staging inventory database parent is not a real directory",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ProactiveBackupStagingInventory::default());
-        }
-        Err(error) => return Err(error),
-    }
-    let mut remaining = max_entries;
-    let mut visit = || -> std::io::Result<()> {
-        remaining = remaining.checked_sub(1).ok_or_else(|| {
-            staging_inventory_error("proactive backup staging inventory entry limit exceeded")
-        })?;
-        Ok(())
-    };
-    let mut inventory = ProactiveBackupStagingInventory::default();
-    let mut pending = Vec::new();
-    for entry in std::fs::read_dir(parent)? {
-        let entry = entry?;
-        visit()?;
-        if !entry
-            .file_name()
-            .as_encoded_bytes()
-            .starts_with(PROACTIVE_STAGING_PREFIX)
-        {
-            continue;
-        }
-        let path = entry.path();
-        if !std::fs::symlink_metadata(&path)?.file_type().is_dir() {
-            return Err(staging_inventory_error(format!(
-                "staging-shaped entry {} is not a real directory",
-                path.display()
-            )));
-        }
-        inventory.directories += 1; // Bounded by the entry budget.
-        pending.push(path);
-    }
-    while let Some(directory) = pending.pop() {
-        // Recheck before descent, as the admission inventory does. Never
-        // intentionally follow a substituted symlink into an unrelated tree.
-        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
-            return Err(staging_inventory_error(
-                "proactive backup staging directory changed type during inventory",
-            ));
-        }
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
-            visit()?;
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_dir() {
-                pending.push(path);
-            } else if metadata.file_type().is_file() {
-                inventory.bytes = inventory.bytes.checked_add(metadata.len()).ok_or_else(|| {
-                    staging_inventory_error("proactive backup staging byte count overflow")
-                })?;
-            } else {
-                return Err(staging_inventory_error(format!(
-                    "proactive backup staging entry {} is a symlink or special file; footprint unavailable",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(inventory)
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Combined retention resident footprint (GH#210, br-kp1in.36).
 // ────────────────────────────────────────────────────────────────────────────
@@ -781,6 +668,9 @@ pub struct RetentionResidentStats {
     pub recovery_debris_artifacts: usize,
     pub direct_backup_only_artifacts: usize,
     pub reclaimable_staging_bytes: u64,
+    /// Complete parent-wide staging inventory, including legacy inspection
+    /// files. Its artifact count can block backups even below byte alarms.
+    pub proactive_backup_staging: ProactiveBackupStagingInventory,
     /// Total resident logical bytes, including parent-wide proactive stages.
     pub resident_bytes: u64,
     pub live_database_bytes: Option<u64>,
@@ -887,6 +777,7 @@ pub fn retention_resident_stats(
         recovery_debris_artifacts: recovery_debris.len(),
         direct_backup_only_artifacts,
         reclaimable_staging_bytes: staging_bytes,
+        proactive_backup_staging: proactive_staging,
         resident_bytes: recovery_bytes
             .saturating_add(direct_backup_only_bytes)
             .saturating_add(staging_bytes)
@@ -2450,6 +2341,7 @@ mod tests {
             inspect_proactive_backup_staging(&primary).unwrap(),
             ProactiveBackupStagingInventory {
                 directories: 6,
+                legacy_files: 0,
                 bytes: 186,
             }
         );
