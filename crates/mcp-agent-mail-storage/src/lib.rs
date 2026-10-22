@@ -769,10 +769,16 @@ fn rewrite_archive_epoch_file(git_dir: &Path) {
 
 /// Read and validate the persisted mutation-epoch token from `git_dir`.
 /// Returns `None` when the file is missing or does not parse (unknown format
-/// version, empty/non-hex token), which readers treat as "no epoch protocol"
-/// and fall back to their conservative full-scan gate.
+/// version, empty/non-hex token). Callers requiring the epoch protocol then
+/// fall back to their conservative inventory gate.
 fn read_archive_epoch_token(git_dir: &Path) -> Option<String> {
-    let bytes = fs::read(git_dir.join(ARCHIVE_EPOCH_FILE_NAME)).ok()?;
+    // Every indexed read samples this file. Keep both allocation and I/O
+    // bounded even when a malformed control file is unexpectedly large.
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &git_dir.join(ARCHIVE_EPOCH_FILE_NAME),
+        129,
+    )
+    .ok()?;
     let (&version, token) = bytes.split_first()?;
     if version != ARCHIVE_EPOCH_FORMAT_VERSION
         || token.is_empty()
@@ -890,14 +896,19 @@ pub fn archive_mutations_active() -> usize {
     ARCHIVE_MUTATIONS_ACTIVE.load(Ordering::Acquire)
 }
 
-/// O(1) archive marker for consumers that need to fence an archive-backed
+/// O(1) archive marker for consumers that need to validate an archive-backed
 /// read without walking the `projects/` working tree.
 ///
 /// The marker combines the resolved Git `HEAD`, the Git index's filesystem
-/// generation, and the in-process physical-mutation epoch.  Archive readers
-/// must sample it before and after their reconstruction and compare the two
-/// markers; storage writers advance the epoch on both edges of every physical
-/// mutation window.  This deliberately does not try to discover arbitrary
+/// generation, the in-process physical-mutation epoch, and the persisted
+/// per-repo epoch token when available. Archive readers compare markers around
+/// reconstruction so completed remote writes invalidate cached reads even
+/// before the Git coalescer advances `HEAD` or the index.
+///
+/// This is an observation, not cross-process exclusion: a remote mutation can
+/// span both samples, and persisted token writes are best-effort. Equal markers
+/// do not authorize archive publication, deletion, or durability-debt clearance.
+/// This deliberately does not try to discover arbitrary
 /// uncoordinated writes beneath `projects/`: the storage write API and Git
 /// index/ref protocol are the archive authorities, and a full tree scan made
 /// the read gate scale with the whole mailbox instead of the read operation.
@@ -906,6 +917,7 @@ pub struct ArchiveReadGeneration {
     head: Option<git2::Oid>,
     index: ArchiveReadIndexStamp,
     mutation_epoch: u64,
+    epoch_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1016,13 +1028,20 @@ fn archive_read_head(repo: &Repository) -> Result<Option<git2::Oid>> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Sample the indexed/incremental generation marker for an archive root.
 ///
 /// This is constant with respect to archive working-tree size: it resolves
-/// `HEAD` and stats the Git index, rather than recursively hashing
-/// `projects/`. A concurrent in-process storage mutation or a Git
-/// `index.lock` is reported as contention so callers can retry instead of
-/// publishing a mixed read.
+/// `HEAD`, samples the Git index and reads the small persisted epoch token,
+/// rather than recursively hashing `projects/`. A concurrent in-process storage
+/// mutation, Git `index.lock`, or token change during sampling is reported as
+/// contention. The token remains optional for uninitialized/older archives;
+/// its appearance or disappearance also changes the returned generation.
 pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGeneration> {
     let mutation_epoch = archive_mutation_epoch();
     if archive_mutations_active() != 0 {
@@ -1050,16 +1069,27 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
                 head: None,
                 index: ArchiveReadIndexStamp::default(),
                 mutation_epoch,
+                epoch_token: None,
             });
         }
         Err(error) => return Err(error.into()),
     };
+    let token_before = read_archive_epoch_token(repo.path());
     let head_before = archive_read_head(&repo)?;
     let index_before = archive_read_index_stamp(repo.path())?;
+    #[cfg(test)]
+    {
+        let hook = ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     let head_after = archive_read_head(&repo)?;
     let index_after = archive_read_index_stamp(repo.path())?;
+    let token_after = read_archive_epoch_token(repo.path());
     if head_before != head_after
         || index_before != index_after
+        || token_before != token_after
         || archive_mutations_active() != 0
         || archive_mutation_epoch() != mutation_epoch
     {
@@ -1072,16 +1102,15 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
         head: head_after,
         index: index_after,
         mutation_epoch,
+        epoch_token: token_after,
     })
 }
 
-/// Persisted cross-process archive read stamp: the O(1) generation marker
-/// (`HEAD` + Git index stamp + in-process mutation epoch) combined with the
-/// per-repo epoch token every physical mutation window rewrites on disk.
+/// Archive read generation with a present, valid persisted epoch token.
 ///
-/// Two equal stamps sampled around an archive read guarantee no mutation
-/// window — in this process or any other — touched the archive in between,
-/// without walking the working tree.
+/// Like [`ArchiveReadGeneration`], this detects observed remote token changes
+/// without walking the working tree. It does not exclude a remote mutation
+/// spanning both samples and must not be used as publication/deletion authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEpochReadStamp {
     generation: ArchiveReadGeneration,
@@ -1098,24 +1127,13 @@ pub struct ArchiveEpochReadStamp {
 /// - `Err(..)`: contention (active mutation window, Git `index.lock`, token
 ///   rewritten mid-sample). Callers must not cache the read.
 pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpochReadStamp>> {
-    let storage_root = mcp_agent_mail_core::disk::simplify_verbatim_path(storage_root);
-    let git_dir = match Repository::open(&storage_root) {
-        Ok(repo) => repo.path().to_path_buf(),
-        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(token_before) = read_archive_epoch_token(&git_dir) else {
+    let generation = archive_read_generation(storage_root)?;
+    let Some(epoch_token) = generation.epoch_token.clone() else {
         return Ok(None);
     };
-    let generation = archive_read_generation(&storage_root)?;
-    if read_archive_epoch_token(&git_dir).as_deref() != Some(token_before.as_str()) {
-        return Err(StorageError::LockContention {
-            message: "archive epoch token changed while being sampled".to_string(),
-        });
-    }
     Ok(Some(ArchiveEpochReadStamp {
         generation,
-        epoch_token: token_before,
+        epoch_token,
     }))
 }
 
@@ -20751,6 +20769,11 @@ mod tests {
             sample_epoch_stamp_for_test(&config.storage_root).is_none(),
             "a non-hex token must disable the epoch protocol"
         );
+        fs::write(&epoch_path, format!("1{}", "ab".repeat(65))).unwrap();
+        assert!(
+            sample_epoch_stamp_for_test(&config.storage_root).is_none(),
+            "an oversized token must disable the epoch protocol"
+        );
     }
 
     #[test]
@@ -24734,6 +24757,72 @@ mod tests {
 
         let after = archive_read_generation(&archive.repo_root).unwrap();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn archive_read_generation_tracks_external_epoch_changes_without_git_changes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let epoch_path = repo.path().join(ARCHIVE_EPOCH_FILE_NAME);
+        with_archive_snapshot_publication_fence(|| {
+            let absent = archive_read_generation(tmp.path()).unwrap();
+            assert!(absent.epoch_token.is_none());
+            fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+            let first = archive_read_generation(tmp.path()).unwrap();
+            assert_ne!(
+                absent, first,
+                "a newly participating writer invalidates reads"
+            );
+
+            // Disk-only rewrite models another process: no local counter,
+            // commit or index change can explain the invalidation.
+            fs::write(&epoch_path, format!("1{}", "cd".repeat(16))).unwrap();
+            let second = archive_read_generation(tmp.path()).unwrap();
+            assert_eq!(first.head, second.head);
+            assert_eq!(first.index, second.index);
+            assert_eq!(first.mutation_epoch, second.mutation_epoch);
+            assert_ne!(first, second);
+
+            fs::rename(&epoch_path, tmp.path().join("retained-epoch")).unwrap();
+            let missing = archive_read_generation(tmp.path()).unwrap();
+            assert!(missing.epoch_token.is_none());
+            assert_ne!(
+                second, missing,
+                "losing the token cannot retain a cached read"
+            );
+        });
+    }
+
+    #[test]
+    fn archive_read_generation_rejects_an_epoch_rewrite_during_sampling() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let epoch_path = repo.path().join(ARCHIVE_EPOCH_FILE_NAME);
+        with_archive_snapshot_publication_fence(|| {
+            fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+            let before = archive_read_generation(tmp.path()).unwrap();
+            ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::write(&epoch_path, format!("1{}", "cd".repeat(16))).unwrap();
+                }));
+            });
+            let sampled = archive_read_generation(tmp.path());
+            let pending =
+                ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            assert!(
+                pending.is_none(),
+                "the real sampling path must run the rewrite"
+            );
+            assert!(
+                matches!(sampled, Err(StorageError::LockContention { message })
+                if message.contains("changed while being sampled"))
+            );
+            let after = archive_read_generation(tmp.path()).unwrap();
+            assert_eq!(before.head, after.head);
+            assert_eq!(before.index, after.index);
+            assert_eq!(before.mutation_epoch, after.mutation_epoch);
+            assert_ne!(before, after);
+        });
     }
 
     #[test]
