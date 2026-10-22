@@ -8146,15 +8146,16 @@ require_minisign() {
 }
 
 # Fetch the release SHA256SUMS manifest plus its .minisig, verify the
-# signature over the exact manifest bytes with the pinned public key, then
-# verify the archive against the checksum recorded in the now-authenticated
-# manifest. Fail-closed at every step.
+# signature over the exact manifest bytes with the pinned public key, bind
+# the authenticated comment to the requested release, then verify the archive
+# against the checksum in that manifest. Fail-closed at every step.
 verify_minisign_signed_checksum() {
   local archive_file="$1"
   local artifact_url="$2"
   local artifact_name="$3"
   local release_base sha256sums_url sha256sums_file sig_url sig_file
-  local expected_checksum
+  local expected_checksum trusted_comment expected_prefix signed_metadata signed_commit
+  local release_identity_valid=0
 
   require_minisign || return 1
 
@@ -8187,7 +8188,40 @@ verify_minisign_signed_checksum() {
     error_support_hint
     return 1
   fi
-  ok "Release manifest signature verified (minisign)"
+  # Minisign authenticates this third line through its global signature.
+  # The same key signs every release, so key verification alone also accepts
+  # a genuine manifest replayed from another tag with the same asset names.
+  trusted_comment="$(sed -n '3p' "$sig_file")"
+  trusted_comment="${trusted_comment%$'\r'}"
+  expected_prefix="trusted comment: mcp_agent_mail_rust ${VERSION} "
+  case "$trusted_comment" in
+    "$expected_prefix"*)
+      signed_metadata="${trusted_comment#"$expected_prefix"}"
+      if [ "$signed_metadata" = SHA256SUMS ]; then
+        release_identity_valid=1
+      else
+        # Published v0.3.34/.35 carry "source <commit> SHA256SUMS";
+        # v0.3.36 carries only the full source commit after the exact tag.
+        signed_commit="$signed_metadata"
+        case "$signed_metadata" in
+          source\ *\ SHA256SUMS)
+            signed_commit="${signed_metadata#source }"
+            signed_commit="${signed_commit% SHA256SUMS}"
+            ;;
+        esac
+        if [[ "$signed_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          release_identity_valid=1
+        fi
+      fi
+      ;;
+  esac
+  if [ "$release_identity_valid" -ne 1 ]; then
+    err "Signed checksum manifest does not identify the requested release ${VERSION}."
+    err "Expected authenticated product and tag: mcp_agent_mail_rust ${VERSION}"
+    error_support_hint
+    return 1
+  fi
+  ok "Release manifest signature and exact release identity verified (minisign)"
   verbose "verify_minisign:ok manifest=${sha256sums_file}"
 
   expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")

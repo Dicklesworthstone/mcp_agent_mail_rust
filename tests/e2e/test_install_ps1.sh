@@ -102,6 +102,14 @@ function Load-InstallFunction([string]$Name) {
 }
 Load-InstallFunction "Get-ReleaseContract"
 Load-InstallFunction "Assert-SafeCosignVersion"
+$boundary = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $node.Left.VariablePath.UserPath -ceq "MinisignTrustMinVersion"
+}, $true)
+if ($null -eq $boundary) { throw "installer minisign trust boundary is missing" }
+$global:MinisignTrustMinVersion = Invoke-Expression $boundary.Right.Extent.Text
 
 $release = Get-ReleaseContract -RawVersion "9.8.7-rc.1"
 if ($release.Tag -cne "v9.8.7-rc.1" -or $release.Version -cne "9.8.7-rc.1") {
@@ -453,6 +461,135 @@ try {
 '
 
 e2e_log "NOTE: case 4 injects terminating function faults; it does not claim Windows host Ctrl+C coverage."
+
+e2e_case_banner "Minisign binds authenticated manifests to the requested release"
+if ! command -v minisign >/dev/null 2>&1; then
+    if [ "${AM_E2E_INSTALL_PS1_REQUIRE_MINISIGN:-0}" = "1" ]; then
+        e2e_fail "minisign is required for the strict install.ps1 signature lane"
+    else
+        e2e_skip "minisign not found; skipping real install.ps1 signature checks"
+    fi
+else
+run_pwsh_case \
+    "case_minisign_release_identity" \
+    "Real minisign accepts published identities and rejects replay or tampering" \
+'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($InstallPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw "installer parse errors" }
+foreach ($name in @("Write-Info", "Write-Ok", "Get-Sha256Hex", "Parse-ChecksumHex", "Verify-ChecksumFile", "Get-MinisignPath", "Verify-MinisignSignedChecksum")) {
+    $fn = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        Where-Object Name -eq $name | Select-Object -First 1
+    if ($null -eq $fn) { throw "installer function missing: $name" }
+    Invoke-Expression ("function global:{0} {1}" -f $name, $fn.Body.Extent.Text)
+}
+
+$root = Join-Path $PSScriptRoot "minisign-release-identity"
+$global:MinisignFixtureDir = Join-Path $root "fixtures"
+$workDir = Join-Path $root "downloads"
+[void][System.IO.Directory]::CreateDirectory($global:MinisignFixtureDir)
+[void][System.IO.Directory]::CreateDirectory($workDir)
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$minisign = Get-MinisignPath
+$secretKey = Join-Path $root "test.key"
+$publicKey = Join-Path $root "test.pub"
+& $minisign -G -W -p $publicKey -s $secretKey *> $null
+if ($LASTEXITCODE -ne 0) { throw "real minisign key generation failed" }
+$global:MinisignPublicKey = [string](Get-Content -LiteralPath $publicKey | Select-Object -Last 1)
+$global:MinisignTrustMinVersion = [Version]"0.3.31"
+$assetName = "mcp-agent-mail-x86_64-pc-windows-msvc.zip"
+$artifact = Join-Path $root $assetName
+[System.IO.File]::WriteAllText($artifact, "signed installer fixture", $utf8)
+$manifest = Join-Path $global:MinisignFixtureDir "SHA256SUMS"
+$signature = "$manifest.minisig"
+$manifestText = "$(Get-Sha256Hex -FilePath $artifact)  $assetName`n"
+[System.IO.File]::WriteAllText($manifest, $manifestText, $utf8)
+$requestedTag = "v9.8.7-rc.1"
+$global:MinisignExpectedBase = "https://example.invalid/releases/download/$requestedTag"
+
+# Only transport is local. Signature verification, release binding and archive
+# hashing execute the installer functions against a real throwaway signing key.
+function global:Download-File {
+    param([string]$Url, [string]$OutFile)
+    if ($Url -ceq "$global:MinisignExpectedBase/SHA256SUMS") {
+        $name = "SHA256SUMS"
+    } elseif ($Url -ceq "$global:MinisignExpectedBase/SHA256SUMS.minisig") {
+        $name = "SHA256SUMS.minisig"
+    } else {
+        throw "unexpected release download: $Url"
+    }
+    [System.IO.File]::Copy((Join-Path $global:MinisignFixtureDir $name), $OutFile, $true)
+}
+function Sign-Fixture([string]$Comment) {
+    & $minisign -S -W -s $secretKey -m $manifest -x $signature -t $Comment *> $null
+    if ($LASTEXITCODE -ne 0) { throw "real minisign signing failed for $Comment" }
+}
+function Verify-Fixture {
+    Verify-MinisignSignedChecksum -FilePath $artifact `
+        -AssetUrl "$global:MinisignExpectedBase/$assetName" `
+        -AssetName $assetName -WorkDir $workDir -ExpectedReleaseTag $requestedTag
+}
+$script:rejected = 0
+function Assert-Rejected([string]$Reason) {
+    $failure = $null
+    try { Verify-Fixture } catch { $failure = $_.Exception.Message }
+    if ($null -eq $failure) { throw "verification unexpectedly accepted a negative case: $Reason" }
+    if ($failure -notmatch [regex]::Escape($Reason)) {
+        throw "verification rejected for the wrong reason: $failure (expected $Reason)"
+    }
+    $script:rejected += 1
+}
+
+$commit = "071e1c85d06b6247bbddab11cc8139b38cc885bf"
+$accepted = 0
+foreach ($suffix in @("SHA256SUMS", $commit, "source $commit SHA256SUMS")) {
+    Sign-Fixture "mcp_agent_mail_rust $requestedTag $suffix"
+    Verify-Fixture
+    $accepted += 1
+    # Transport line endings must not change the authenticated comment.
+    $crlf = [System.IO.File]::ReadAllText($signature).Replace("`r`n", "`n").Replace("`n", "`r`n")
+    [System.IO.File]::WriteAllText($signature, $crlf, $utf8)
+    Verify-Fixture
+    $accepted += 1
+}
+
+foreach ($comment in @(
+    "mcp_agent_mail_rust v9.8.6 SHA256SUMS",
+    "mcp_agent_mail_rust v9.8.7-rc.10 SHA256SUMS",
+    "mcp_agent_mail_rust v9.8.7-rcx1 SHA256SUMS",
+    "mcp_agent_mail_rust v9.8.7-RC.1 SHA256SUMS",
+    "MCP_agent_mail_rust $requestedTag SHA256SUMS",
+    "another_product $requestedTag SHA256SUMS",
+    "mcp_agent_mail_rust 9.8.7-rc.1 SHA256SUMS",
+    "mcp_agent_mail_rust $requestedTag SHA256SUMS ",
+    "mcp_agent_mail_rust $requestedTag source $($commit.Substring(1)) SHA256SUMS",
+    "mcp_agent_mail_rust $requestedTag ${commit}0",
+    "mcp_agent_mail_rust $requestedTag source $commit SHA256SUMS extra",
+    "mcp_agent_mail_rust $requestedTag another_manifest",
+    ""
+)) {
+    Sign-Fixture $comment
+    Assert-Rejected "does not identify the requested release"
+}
+
+# Relabeling a real older signature must fail cryptography before identity.
+Sign-Fixture "mcp_agent_mail_rust v9.8.6 SHA256SUMS"
+$relabeled = [System.IO.File]::ReadAllText($signature).Replace("v9.8.6", $requestedTag)
+[System.IO.File]::WriteAllText($signature, $relabeled, $utf8)
+Assert-Rejected "Minisign verification FAILED"
+
+Sign-Fixture "mcp_agent_mail_rust $requestedTag SHA256SUMS"
+[System.IO.File]::WriteAllText($manifest, "$manifestText# tampered`n", $utf8)
+Assert-Rejected "Minisign verification FAILED"
+[System.IO.File]::WriteAllText($manifest, $manifestText, $utf8)
+[System.IO.File]::WriteAllText($artifact, "tampered archive", $utf8)
+Assert-Rejected "Checksum verification failed"
+[System.IO.File]::WriteAllText($signature, "", $utf8)
+Assert-Rejected "Verification input is missing or empty"
+Write-Host "Real minisign verified $accepted positive and $script:rejected negative cases; retained $root"
+'
+fi
 
 e2e_case_banner "5) Sigstore verification isolates trust and forces the modern parser"
 run_pwsh_case \

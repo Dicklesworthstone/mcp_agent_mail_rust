@@ -24205,9 +24205,13 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
              releases v0.3.31 and later must publish SHA256SUMS.minisig and the updater refuses unsigned manifests"
         )
     })?;
-    let signer_key_id =
-        release_signing::verify_manifest_signature(&checksum_body, &signature_body, &trusted_keys)
-            .map_err(|e| format!("release manifest signature verification failed: {e}"))?;
+    let signer_key_id = release_signing::verify_release_manifest_signature(
+        &checksum_body,
+        &signature_body,
+        &trusted_keys,
+        &version,
+    )
+    .map_err(|e| format!("release manifest signature verification failed: {e}"))?;
     ftui_runtime::ftui_eprintln!("Manifest signature verified (minisign key {signer_key_id}).");
 
     let checksum_text = String::from_utf8(checksum_body)

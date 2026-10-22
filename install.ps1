@@ -383,15 +383,17 @@ function Get-MinisignPath {
 }
 
 # Fetch the release SHA256SUMS manifest plus its .minisig, verify the
-# signature over the exact manifest bytes with the pinned public key, then
-# verify the archive against the checksum recorded in the now-authenticated
-# manifest. Fail-closed at every step.
+# signature over the exact manifest bytes with the pinned public key, bind
+# the authenticated comment to the requested release, then verify the archive
+# against the checksum in that manifest. Fail-closed at every step.
 function Verify-MinisignSignedChecksum {
     param(
         [string]$FilePath,
         [string]$AssetUrl,
         [string]$AssetName,
-        [string]$WorkDir
+        [string]$WorkDir,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedReleaseTag
     )
 
     $minisignPath = Get-MinisignPath
@@ -425,7 +427,15 @@ function Verify-MinisignSignedChecksum {
         $detail = ($minisignOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
         throw "Minisign verification FAILED for the release checksum manifest. The manifest must be signed by the maintainer release key (id 1BBD79B28BF718D0). The release may be corrupted or tampered with; do not install it. minisign output: $detail"
     }
-    Write-Ok "Release manifest signature verified (minisign)"
+    # The global signature authenticates the third line. Bind its product/tag
+    # exactly, retaining the source-provenance formats published by .34-.36.
+    $signatureLines = @(Get-Content -LiteralPath $sigPath)
+    $expectedPrefix = [regex]::Escape("trusted comment: mcp_agent_mail_rust $ExpectedReleaseTag ")
+    $identityPattern = "^${expectedPrefix}(?:SHA256SUMS|[0-9a-fA-F]{40}|source [0-9a-fA-F]{40} SHA256SUMS)\z"
+    if ($signatureLines.Count -lt 3 -or $signatureLines[2] -cnotmatch $identityPattern) {
+        throw "Signed checksum manifest does not identify the requested release $ExpectedReleaseTag. Expected authenticated product and tag: mcp_agent_mail_rust $ExpectedReleaseTag"
+    }
+    Write-Ok "Release manifest signature and exact release identity verified (minisign)"
 
     $assetPattern = "(?im)^([a-f0-9]{64})\s+\*?(?:\./)?$([regex]::Escape($AssetName))\s*$"
     $manifestMatch = [regex]::Match((Get-Content -LiteralPath $sha256sumsPath -Raw), $assetPattern)
@@ -1734,7 +1744,7 @@ try {
             # Sigstore/cosign path is not consulted for these releases
             # (GitHub Actions no longer builds them, so its workflow
             # identity cannot exist).
-            Verify-MinisignSignedChecksum -FilePath $zipPath -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
+            Verify-MinisignSignedChecksum -FilePath $zipPath -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir -ExpectedReleaseTag $resolvedVersion
         } else {
             $checksumText = Resolve-ChecksumText -AssetUrl $assetUrl -AssetName $AssetName -WorkDir $workDir
             Verify-ChecksumFile -FilePath $zipPath -ExpectedChecksum $checksumText

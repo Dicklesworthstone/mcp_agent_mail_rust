@@ -2,8 +2,8 @@
 #
 # Verifies artifact fallback plus the fail-closed release-evidence contract
 # shared by the Unix and Windows installers: exact tag identity, checksum and
-# Sigstore witnesses, exact archive inventory, and exact staged/post-install
-# binary versions.
+# Sigstore/Minisign witnesses, exact archive inventory, and exact
+# staged/post-install binary versions. The Minisign cases use the real verifier.
 
 set -euo pipefail
 
@@ -15,6 +15,12 @@ CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
 
 if [ ! -f "$INSTALL_SH" ] || [ ! -f "$INSTALL_PS1" ] || [ ! -f "$CI_YML" ]; then
     echo "FATAL: installer or CI source not found ($INSTALL_SH, $INSTALL_PS1, or $CI_YML)" >&2
+    exit 2
+fi
+
+minisign_bin="$(type -P minisign 2>/dev/null || true)"
+if [ -z "$minisign_bin" ] || [ ! -x "$minisign_bin" ]; then
+    echo "FATAL: real minisign is required for installer release replay regressions (apt install minisign or brew install minisign)" >&2
     exit 2
 fi
 
@@ -59,6 +65,7 @@ extract_function() {
     echo 'ISSUES_URL=https://example.invalid/issues'
     echo 'COSIGN_BIN='
     echo 'MINISIGN_TRUST_MIN_VERSION=0.3.31'
+    sed -n '/^MINISIGN_PUBLIC_KEY=/p' "$INSTALL_SH"
     echo 'RELEASE_TRUST_MODEL='
     echo 'BINARY_TRANSACTION_ACTIVE_INSTALL_DIR='
     echo 'BINARY_TRANSACTION_RECOVERY_ACTIVE=0'
@@ -115,8 +122,11 @@ extract_function() {
     extract_function resolve_and_verify_archive_checksum
     extract_function require_safe_cosign
     extract_function verify_sigstore_bundle
+    extract_function require_minisign
+    extract_function verify_minisign_signed_checksum
     extract_function verify_release_archive
     extract_function verify_archive_members_exact
+    extract_function extract_release_archive
     extract_function binary_version_matches_exact
     extract_function verify_release_binaries_exact
     extract_function ensure_real_directory_tree
@@ -156,7 +166,8 @@ extract_function() {
 
 for required in establish_release_contract set_artifact_url check_network \
     select_linux_x86_64_gnu_artifact_if_available verify_release_archive \
-    verify_archive_members_exact verify_release_binaries_exact require_safe_cosign \
+    verify_archive_members_exact extract_release_archive verify_release_binaries_exact require_safe_cosign \
+    require_minisign verify_minisign_signed_checksum \
     install_binary_pair_transactional recover_binary_pair_transaction \
     validate_binary_transaction_source_receipt \
     installer_path_owner_uid preflight_checks \
@@ -934,7 +945,7 @@ fi
 no_verify_line=$(grep -nF 'if [ "$NO_VERIFY" -eq 1 ]; then' "$INSTALL_SH" | tail -1 | cut -d: -f1)
 verify_call_line=$(grep -nFx '  elif ! verify_release_archive "$TMP/$TAR" "$URL" "$TAR"; then' "$INSTALL_SH" | cut -d: -f1)
 members_line=$(grep -nF 'verify_archive_members_exact "$TMP/$TAR"' "$INSTALL_SH" | cut -d: -f1)
-extract_line=$(grep -nF 'tar -xf "$TMP/$TAR" -C "$EXTRACT_DIR"' "$INSTALL_SH" | cut -d: -f1)
+extract_line=$(grep -nF 'extract_release_archive "$TMP/$TAR" "$EXTRACT_DIR"' "$INSTALL_SH" | cut -d: -f1)
 verify_gate_end_line=$(awk -v first="$verify_call_line" -v last="$members_line" \
     'NR > first && NR < last && $0 ~ /^[[:space:]]*fi[[:space:]]*$/ { line = NR } END { print line }' "$INSTALL_SH")
 verify_gate_fi_count=$(awk -v first="$verify_call_line" -v last="$members_line" \
@@ -1050,6 +1061,190 @@ for bad_versions in wrong-cli wrong-server extra-lines nul-byte; do
         exit 1
     fi
 done
+
+step "scenario J2: real Minisign binds every supported signed comment to the exact requested release"
+minisign_root="$tmp/minisign-fixtures"
+published_manifest_dir="$REPO_ROOT/crates/mcp-agent-mail-cli/tests/fixtures/release_signing/v0.3.32"
+minisign_artifact_name='mcp-agent-mail-x86_64-unknown-linux-gnu.tar.gz'
+mkdir -p "$minisign_root/old" "$minisign_root/cases"
+make_version_fixture "$minisign_root/old/am" 'am 9.9.8'
+make_version_fixture "$minisign_root/old/mcp-agent-mail" 'mcp-agent-mail 9.9.8'
+
+# This control uses the maintainer key extracted from the installer and the
+# untouched published fixture. A replay rejection must not pass just because
+# the fixture or its cryptographic signature is invalid.
+pinned_minisign_key=$(EXTRACT="$extract" bash -c 'source "$EXTRACT"; printf "%s" "$MINISIGN_PUBLIC_KEY"')
+"$minisign_bin" -Vm "$published_manifest_dir/SHA256SUMS" \
+    -x "$published_manifest_dir/SHA256SUMS.minisig" -P "$pinned_minisign_key" \
+    >"$minisign_root/published-signature.out" 2>&1
+"$minisign_bin" -G -W -p "$minisign_root/test.pub" -s "$minisign_root/test.key" \
+    >"$minisign_root/key-generation.out" 2>&1
+fixture_minisign_key=$(sed -n '2p' "$minisign_root/test.pub")
+
+for fixture_version in 9.9.9 9.9.9-rc.1; do
+    payload_dir="$minisign_root/payload-$fixture_version"
+    mkdir -p "$payload_dir"
+    make_version_fixture "$payload_dir/am" "am $fixture_version"
+    make_version_fixture "$payload_dir/mcp-agent-mail" "mcp-agent-mail $fixture_version"
+    tar -czf "$payload_dir/$minisign_artifact_name" -C "$payload_dir" am mcp-agent-mail
+done
+stable_minisign_archive="$minisign_root/payload-9.9.9/$minisign_artifact_name"
+prerelease_minisign_archive="$minisign_root/payload-9.9.9-rc.1/$minisign_artifact_name"
+
+sign_minisign_fixture() {
+    local fixture_name="$1" archive="$2" trusted_comment="$3"
+    local fixture_dir="$minisign_root/$fixture_name" digest
+    mkdir -p "$fixture_dir"
+    digest=$(EXTRACT="$extract" ARCHIVE_FILE="$archive" bash -c '
+        source "$EXTRACT"
+        file_sha256_hex "$ARCHIVE_FILE"
+    ')
+    printf '%s  %s\n' "$digest" "$minisign_artifact_name" >"$fixture_dir/SHA256SUMS"
+    "$minisign_bin" -Sm "$fixture_dir/SHA256SUMS" -s "$minisign_root/test.key" \
+        -t "$trusted_comment" >"$fixture_dir/signing.out" 2>&1
+}
+
+minisign_harness="$minisign_root/verify-and-install.sh"
+cat >"$minisign_harness" <<'MINISIGN_HARNESS'
+#!/usr/bin/env bash
+set -euo pipefail
+source "${EXTRACT:?}"
+TMP="${CASE_TMP:?}/downloads"
+BIN_CLI=am
+BIN_SERVER=mcp-agent-mail
+CHECKSUM=""
+CHECKSUM_URL=""
+SIGSTORE_BUNDLE_URL=""
+VERSION="${REQUESTED_VERSION:?}"
+establish_release_contract
+if [ -n "${FIXTURE_PUBLIC_KEY:-}" ]; then
+    MINISIGN_PUBLIC_KEY="$FIXTURE_PUBLIC_KEY"
+fi
+
+# Only transport is replaced. The production Minisign verifier, checksum,
+# member/version gates, and durable pair replacement all execute unchanged.
+download_to_file() {
+    case "$3" in
+        sha256sums-download) cp "$MANIFEST_DIR/SHA256SUMS" "$2" ;;
+        minisig-download) cp "$MANIFEST_DIR/SHA256SUMS.minisig" "$2" ;;
+        *) echo "Unexpected download: $1 ($3)" >&2; return 1 ;;
+    esac
+}
+verbose() {
+    case "$1" in
+        verify_checksum:start*) printf '%s\n' checksum >>"$STAGE_LOG" ;;
+    esac
+}
+
+verify_release_archive "$ARCHIVE_FILE" \
+    "https://example.invalid/releases/download/$VERSION/$ARTIFACT_NAME" "$ARTIFACT_NAME"
+verify_archive_members_exact "$ARCHIVE_FILE"
+printf '%s\n' extraction >>"$STAGE_LOG"
+mkdir -p "$CASE_TMP/staged"
+extract_release_archive "$ARCHIVE_FILE" "$CASE_TMP/staged"
+verify_release_binaries_exact "$CASE_TMP/staged/$BIN_SERVER" "$CASE_TMP/staged/$BIN_CLI" Staged
+printf '%s\n' replacement >>"$STAGE_LOG"
+install_binary_pair_transactional \
+    "$CASE_TMP/staged/$BIN_SERVER" "$CASE_TMP/staged/$BIN_CLI" "$CASE_TMP/installed"
+MINISIGN_HARNESS
+
+run_minisign_case() {
+    local requested_version="$2" manifest_dir="$3" archive="$4"
+    local public_key="${5:-}" case_dir="$minisign_root/cases/$1"
+    mkdir -p "$case_dir/downloads" "$case_dir/installed"
+    cp "$minisign_root/old/am" "$case_dir/installed/am"
+    cp "$minisign_root/old/mcp-agent-mail" "$case_dir/installed/mcp-agent-mail"
+    : >"$case_dir/stages"
+    EXTRACT="$extract" CASE_TMP="$case_dir" REQUESTED_VERSION="$requested_version" \
+        MANIFEST_DIR="$manifest_dir" ARCHIVE_FILE="$archive" \
+        ARTIFACT_NAME="$minisign_artifact_name" FIXTURE_PUBLIC_KEY="$public_key" \
+        STAGE_LOG="$case_dir/stages" bash "$minisign_harness" >"$case_dir/output" 2>&1
+}
+
+assert_minisign_rejected_before_checksum() {
+    local case_name="$1" expected_error="$2" case_dir="$minisign_root/cases/$1"
+    if ! grep -Fq "$expected_error" "$case_dir/output" || [ -s "$case_dir/stages" ] || \
+        ! cmp -s "$minisign_root/old/am" "$case_dir/installed/am" || \
+        ! cmp -s "$minisign_root/old/mcp-agent-mail" "$case_dir/installed/mcp-agent-mail"; then
+        echo "FAIL: $case_name must reject before checksum, extraction, or replacement and preserve both installed binaries" >&2
+        cat "$case_dir/output" "$case_dir/stages" >&2
+        exit 1
+    fi
+}
+
+# The old release payload is deliberately absent: the authenticated identity
+# must reject the genuine replay before even consulting archive bytes.
+if run_minisign_case published-replay v0.3.33 "$published_manifest_dir" \
+    "$minisign_root/replayed-archive-not-downloaded.tar.gz"; then
+    echo "FAIL: genuine v0.3.32 signature authenticated a request for v0.3.33" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum published-replay 'does not identify the requested release'
+
+fixture_commit='0123456789abcdef0123456789abcdef01234567'
+sign_minisign_fixture exact-manifest "$stable_minisign_archive" 'mcp_agent_mail_rust v9.9.9 SHA256SUMS'
+sign_minisign_fixture exact-commit "$stable_minisign_archive" "mcp_agent_mail_rust v9.9.9 $fixture_commit"
+sign_minisign_fixture exact-source "$stable_minisign_archive" "mcp_agent_mail_rust v9.9.9 source $fixture_commit SHA256SUMS"
+sign_minisign_fixture exact-prerelease "$prerelease_minisign_archive" 'mcp_agent_mail_rust v9.9.9-rc.1 SHA256SUMS'
+expected_minisign_stages=$(printf '%s\n' checksum extraction replacement)
+for valid_comment in exact-manifest exact-commit exact-source exact-prerelease; do
+    fixture_version=9.9.9
+    if [ "$valid_comment" = exact-prerelease ]; then fixture_version=9.9.9-rc.1; fi
+    payload_dir="$minisign_root/payload-$fixture_version"
+    if ! run_minisign_case "$valid_comment" "$fixture_version" "$minisign_root/$valid_comment" \
+        "$payload_dir/$minisign_artifact_name" "$fixture_minisign_key"; then
+        echo "FAIL: valid $valid_comment did not authenticate and install its exact release" >&2
+        cat "$minisign_root/cases/$valid_comment/output" >&2
+        exit 1
+    fi
+    if [ "$(cat "$minisign_root/cases/$valid_comment/stages")" != "$expected_minisign_stages" ] || \
+        ! cmp -s "$payload_dir/am" "$minisign_root/cases/$valid_comment/installed/am" || \
+        ! cmp -s "$payload_dir/mcp-agent-mail" "$minisign_root/cases/$valid_comment/installed/mcp-agent-mail"; then
+        echo "FAIL: $valid_comment did not execute checksum, extraction, and replacement in order" >&2
+        exit 1
+    fi
+done
+
+# Every negative below is freshly signed with a real key. The signature is
+# valid; only the authenticated release/comment grammar makes it unacceptable.
+while IFS='|' read -r invalid_comment trusted_comment; do
+    sign_minisign_fixture "$invalid_comment" "$stable_minisign_archive" "$trusted_comment"
+    if run_minisign_case "$invalid_comment" v9.9.9 "$minisign_root/$invalid_comment" \
+        "$stable_minisign_archive" "$fixture_minisign_key"; then
+        echo "FAIL: authenticated $invalid_comment was accepted for v9.9.9" >&2
+        exit 1
+    fi
+    assert_minisign_rejected_before_checksum "$invalid_comment" 'does not identify the requested release'
+done <<COMMENT_CASES
+wrong-tag|mcp_agent_mail_rust v9.9.8 SHA256SUMS
+tag-prefix|mcp_agent_mail_rust v9.9.90 SHA256SUMS
+unexpected-prerelease|mcp_agent_mail_rust v9.9.9-rc.1 SHA256SUMS
+extra-manifest-field|mcp_agent_mail_rust v9.9.9 SHA256SUMS extra
+short-commit|mcp_agent_mail_rust v9.9.9 ${fixture_commit%?}
+long-commit|mcp_agent_mail_rust v9.9.9 ${fixture_commit}8
+extra-commit-field|mcp_agent_mail_rust v9.9.9 $fixture_commit extra
+short-source-commit|mcp_agent_mail_rust v9.9.9 source ${fixture_commit%?} SHA256SUMS
+long-source-commit|mcp_agent_mail_rust v9.9.9 source ${fixture_commit}8 SHA256SUMS
+extra-source-field|mcp_agent_mail_rust v9.9.9 source $fixture_commit SHA256SUMS extra
+COMMENT_CASES
+
+if run_minisign_case prerelease-replay v9.9.9-rc.2 "$minisign_root/exact-prerelease" \
+    "$prerelease_minisign_archive" "$fixture_minisign_key"; then
+    echo "FAIL: signed rc.1 authenticated a request for rc.2" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum prerelease-replay 'does not identify the requested release'
+
+mkdir -p "$minisign_root/tampered-comment"
+cp "$published_manifest_dir/SHA256SUMS" "$minisign_root/tampered-comment/SHA256SUMS"
+sed '3s/v0\.3\.32/v0.3.33/' "$published_manifest_dir/SHA256SUMS.minisig" \
+    >"$minisign_root/tampered-comment/SHA256SUMS.minisig"
+if run_minisign_case tampered-comment v0.3.33 "$minisign_root/tampered-comment" \
+    "$minisign_root/replayed-archive-not-downloaded.tar.gz"; then
+    echo "FAIL: rewriting the signed comment bypassed cryptographic verification" >&2
+    exit 1
+fi
+assert_minisign_rejected_before_checksum tampered-comment 'Minisign verification FAILED'
 
 step "scenario K: Unix pair journal converges old-old or new-new across every durable phase"
 transaction_root="$tmp/transaction-fixtures"
