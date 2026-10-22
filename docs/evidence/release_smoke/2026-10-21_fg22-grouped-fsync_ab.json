@@ -1,0 +1,772 @@
+{
+ "schema": "br-9ott5 fg22b v1",
+ "rule": "fg22: grouped archive fsyncs (FG) vs main. Beads br-9ott5 (reservations fail under swarm load), br-kp1in.13 (WBQ drain cannot\nkeep up), br-qbhs0 (fsync cost per message). Written 2026-10-21 ~16:55Z by CopperGoose, while the cand build runs and before\nany fg22 run. It gets a FROZEN line with the cand sha256 before its first run.\n\nDISCLOSED CONTEXT. Everything below was seen before this rule.\n- draindiag4 (one P2 run of the base binary below, ancestor /proc sampler, no ptrace; reservation errors 2410/2633, like rg21\n  base): the wbq-drain thread spent 76% of its samples in fdatasync (inbox 28%, queued reservation artifacts 19%, canonical\n  15%, outbox 14%), 12% on CPU, 12% in futex. At swarm end: wbq enqueued 14234, drained 7328, depth 6650,\n  archive_message_gap 4338, wbq latency p50 134 s; completion 358 s, so the drain rate was ~20.5 ops/s against ~40 enqueued/s.\n- Microbench (fsync_group_bench.py, this host's ext4, idle): 7 new 1 KB files synced one after another 64.3 ms; synced\n  concurrently 20.7 ms; 3 files 27.4 vs 20.0 ms; 4 files 36.5 vs 20.1 ms. A mechanism check, not a whole-job number.\n- rg21 base P2 runs: 92-95% of message-reconciler visits deferred on a busy fence (312/4518, 359/4679, 244/4365 verified).\n  Seen while validating the evidence builder (same base binary, same server env as this rule): rg21 P2 drain rate base\n  18.06 ops/s pooled (runs 18.00, 17.84, 18.36; completion 517, 531, 483 s; mean end gap 3004); rg21 cand (L2) 16.61 ops/s.\n  draindiag4 ran without the batch_write log env and completed in 358 s.\n- br-9sxrn history: staging bundle files outside the fence with parallel fsyncs (stagepar) removed fence contention but lost\n  on closed-loop send-latency guards (10-11, 10-12) and, with L2+L3 (ab18), on P2 completion 1.12x and soak convergence. FG\n  keeps the fence where it is; it only makes the syncs inside it concurrent.\n\nLEVER (fg_v2.patch, storage lib.rs only; current-main diff hash 4d5f959c1cb4). fg_v1 (9d02efe211a6) was superseded before\nany build finished or any run: it held a whole batch's rendered copies in memory; v2 stages incrementally.\n- StagedArchiveWrites::add writes a temp file and defers its fdatasync to the current group; a group of 16 is synced\n  concurrently (scoped threads; a failed spawn syncs inline); publish() syncs whatever is pending before renaming anything.\n  Every file is still synced before its rename. stage() = add each + sync.\n- The WBQ batch writer (write_message_batch_bundle) prepares each entry (render + canonical-id collision check), stages its\n  canonical/outbox/inbox files into one StagedArchiveWrites, then publishes all in entry order and appends thread digests.\n  A failure before publication now leaves no entry written (previously earlier entries stayed). write_message_bundle (single)\n  groups its own files the same way. Fence and project-lock placement are unchanged.\n\nARMS (portable release, same host, host lock):\n- base = build36/ab18b_base/am, sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254 (2b5d14d7 + br-tsqvm),\n  re-run live;\n- cand = build36/fg22v2b_cand/am, built from rc1021f = 2b5d14d7 + the same br-tsqvm diff (af51a3426ded) + fg_v2.patch. Its build\n  log must show diff=a13f6ac77e92. The sha256 is recorded at freeze.\n\nRUNS: P2 (60 agents, period 2 s, 300 s of work): base cand cand base. P6: cand base base cand. Then the release smoke in both\norders (cand_vs_base, base_vs_cand) from rc1020f, as rg21. Validity as rg21: start when the 1-min load < 8; a run overlapping a\nforeign >400% CPU process is invalid and re-queued; 6 h deadline. Disk guard: before every run, if / has < 8 GB free, stop;\nthe remaining runs are recorded as not run (never as failed), and a verdict missing primary data is INCONCLUSIVE.\n\nPRIMARY (must hold):\n- M1 (drain capacity at saturation): P2 drain rate = health queues.wbq.drained_total / completion_s per run.\n  Pooled (sum drained / sum completion) cand >= 1.3x base, AND every valid cand P2 run's rate > every valid base P2 run's rate.\n\nGUARDS (any failure = LOSS):\n- G1 equal work: P2 completion median cand <= 1.05x base; smoke swarm acked sends cand >= 0.95x base in each order.\n- G2 errors and safety:\n  - non-reservation paced tool errors cand <= base + 5 (P2 and P6 pooled);\n  - file_reservation_paths errors cand <= 1.02x base at P2 and at P6 (pooled);\n  - smoke tool errors cand <= base + 5 in each order; cand crash phase PASS in each order; integrity_check ok;\n  - no canonical-id collision errors in any cand log; smoke dispatch zombies cand == 0 or <= base's, in each order.\n- G3 below saturation: P6 send p99 cand <= 1.2x base; every P6 completion <= 330 s; P6 mean archive_message_gap cand <= base + 50.\n- G4 convergence: P2 mean archive_message_gap at swarm end cand <= base; the smoke soak \"archive converges after load stops\"\n  must not pass for base and fail for cand in either order; post-swarm un-archived cand <= base + 2% of cand's acked sends.\n- C, on current main + fg_v2.patch (rc1021e), all of:\n  - storage lib nextest --no-fail-fast (only br-3ukrb's and br-u5biy's tests may fail, and only as on base);\n  - storage + tools clippy -D warnings; workspace --lib --bins check; tools it; conformance;\n  - planted negative: write_message_batch_bundle_publishes_nothing_when_a_later_file_cannot_be_staged FAILS on the old\n    one-entry-at-a-time writer (base code + that test only).\n\nREPORTED, not gated: P2 file_reservation_paths error rate per arm (the br-9ott5 probe); wbq depth and latency p50/p99 at swarm\nend; reconciler verified/deferred counters; reservation p50/p99; send p50/p90 (closed-loop caveat).\n\nDECISION:\n- WIN only if M1, G1-G4 and C hold. A WIN lands fg_v2.patch (storage lib.rs; mine) with this rule and the evidence cited.\n  br-9ott5, br-kp1in.13 and br-qbhs0 stay open unless their own probes pass.\n- LOSS: one line on br-9ott5, br-kp1in.13 and br-qbhs0; the patch goes beside the receipt; nothing lands.\n\nFROZEN 2026-10-21T21:21:19.8Z, before any fg22 run (no fg22 directory exists).\n- cand am sha256 06226514ada82a6649c378255ae85608087549703dd169775d57971a1ef7b511 (build36/fg22v2b_cand; log diff=a13f6ac77e92,\n  head 2b5d14d7; storage crate compiled from rc1021f; marker 'archive file sync thread panicked' count 1, base 0).\n- base am sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254.\n- Seen since this rule was written: nothing about fg22 arms. Gate lanes on current main + fg_v2 (vfg21b) passed storage lib (only\n  the two base failures), storage clippy and prodcheck; the planted negative failed on the old writer (vneg22). / had 31 GB free.\n\nADDENDUM 2026-10-21T21:47:14Z, before any fg22b run (deviation, disclosed; no metric or threshold changes):\n- The first attempt (OUT fg22) ran only P1 (p2 base, 21:21-21:28Z). / reached 0 bytes during it (67 'No space left' in its\n  server log; P1 exit=120); the pre-run disk guard then stopped the series. P1 is INVALID (environment); no cand run happened.\n  fg22 is kept as is and not pooled.\n- The rerun uses OUT fg22b, the same arms, order, runs, rule and builder. Added validity rule, symmetric for both arms: a 15 s\n  sampler logs / free space; a paced run during which / fell below 2 GB free is invalid and re-queued (like foreign CPU).\n\nDETERMINED 2026-10-21T22:16:52Z: G1 FAILS after all 4 fg22b P2 runs, all valid (foreign_samples=0, / >= 27 GB free).\n- P2 completion: base 387.9, 360.9 s; cand 411.3, 386.3 s. Rule statistic (pct .5 of 2 = the larger): cand 411.26 vs base 387.91 =\n  1.060x > 1.05x (means 398.8 vs 374.4 = 1.065x). VERDICT: LOSS. Nothing lands.\n- Primary M1 PASSES (reported because the guard decides): pooled drain rate cand 30.295 vs base 21.354 ops/s = 1.42x; runs cand\n  29.04, 31.63 > base 20.86, 21.88. G4 P2 gap passes: mean archive gap at swarm end cand 39 vs base 4056. P2 reservation errors\n  918 vs 922 per 1000 (unchanged).\n- The P6 runs (P5-P8) continue for reported data; the smoke will be stopped before it starts (its guards cannot change a LOSS).\nNOTE 2026-10-21T22:23:37Z: changed my mind on stopping before the smoke. It runs for REPORTED data only (crash-phase and soak-convergence evidence for the owner's tradeoff decision); the verdict stays LOSS whatever it shows.\n\nOWNER DECISION 2026-10-21T23:01:21Z: the user, asked (AskUserQuestion) after the LOSS was determined, chose \"Land fg22 by your decision\"\n(option text: \"You accept the tradeoff (+6% closed-loop completion at saturation for a current archive and much better P6 tails). I\nfinish the C gate (tools clippy, tools it, conformance), land fg_v2 citing your decision + the receipt, then pre-register FG+L2 for\nreservations.\"). The measured verdict stays LOSS on G1; fg_v2 lands by owner decision, not as a WIN, after the C gate passes on\ncurrent main + fg_v2.\nNOTE 2026-10-22T01:02:44Z: the base_vs_cand smoke line's 'min_free_kb=0 foreign_samples=0' is an artifact: the smoke ran 23:50:33-01:02:04Z across midnight and the runner's time-of-day window does not wrap. Recounted with a wrapped window: / stayed >= 137 GB free and there were 0 foreign CPU samples. Both smokes ran to completion (reported data only).\n",
+ "binaries": {
+  "base": {
+   "am_sha256": "3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/ab18b_base/am"
+  },
+  "cand": {
+   "am_sha256": "06226514ada82a6649c378255ae85608087549703dd169775d57971a1ef7b511",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/fg22v2b_cand/am"
+  }
+ },
+ "provenance": {
+  "base": "start 2026-10-20T20:17:24Z wt=/data/projects/mcp_agent_mail_rust-rc1020f head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=af51a3426ded features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1227854,vmi1293453,hz1,hz2,hz3 jobs=2",
+  "cand": "start 2026-10-21T17:37:23Z wt=/data/projects/mcp_agent_mail_rust-rc1021f head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=a13f6ac77e92 features=portable workers=vmi1152480,vmi1153651,vmi1293453,vmi1227854 jobs=2"
+ },
+ "run_log": "P1 p2 base start 2026-10-21T21:48:04Z load=1.76 1.98 3.38\nP1 p2 base exit=0 end 2026-10-21T21:55:14Z min_free_kb=31699712 foreign_samples=0\nP2 p2 cand start 2026-10-21T21:55:14Z load=6.55 7.00 5.41\nP2 p2 cand exit=0 end 2026-10-21T22:02:15Z min_free_kb=29984304 foreign_samples=0\nP3 p2 cand start 2026-10-21T22:02:36Z load=7.24 8.72 6.90\nP3 p2 cand exit=0 end 2026-10-21T22:09:11Z min_free_kb=28333380 foreign_samples=0\nP4 p2 base start 2026-10-21T22:09:31Z load=7.37 9.32 7.93\nP4 p2 base exit=0 end 2026-10-21T22:16:12Z min_free_kb=27449388 foreign_samples=0\nP5 p6 cand start 2026-10-21T22:16:32Z load=6.72 9.06 8.41\nP5 p6 cand exit=0 end 2026-10-21T22:21:41Z min_free_kb=26925248 foreign_samples=0\nP6 p6 base start 2026-10-21T22:21:41Z load=4.89 6.50 7.49\nP6 p6 base exit=0 end 2026-10-21T22:26:50Z min_free_kb=26583056 foreign_samples=0\nP7 p6 base start 2026-10-21T22:26:50Z load=5.96 6.51 7.24\nP7 p6 base exit=0 end 2026-10-21T22:32:01Z min_free_kb=30809792 foreign_samples=0\nP8 p6 cand start 2026-10-21T22:32:01Z load=6.12 6.54 7.07\nP8 p6 cand exit=0 end 2026-10-21T22:37:09Z min_free_kb=29759916 foreign_samples=0\nR cand_vs_base start 2026-10-21T22:37:09Z load=6.33 6.00 6.64\nR cand_vs_base exit=1 end 2026-10-21T23:50:33Z min_free_kb=26151172 foreign_samples=1\nR base_vs_cand start 2026-10-21T23:50:33Z load=5.72 5.20 5.08\nR base_vs_cand exit=1 end 2026-10-22T01:02:04Z min_free_kb=0 foreign_samples=0\ndone 2026-10-22T01:02:04Z\n",
+ "paced_runs": [
+  {
+   "run": "1-p2-base",
+   "completion_s": 387.9,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2421
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2421,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3348,
+    "unchanged": 245,
+    "repaired": 0,
+    "deferred": 3103,
+    "passes": 131
+   },
+   "wbq_end": {
+    "enqueued_total": 14185,
+    "drained_total": 8093,
+    "depth": 5836,
+    "latency_p50_ms": 134218,
+    "latency_p99_ms": 190177
+   },
+   "archive_message_gap_end": 3963,
+   "drain_rate_ops_s": 20.86,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0367,
+     "p90": 0.1887,
+     "p99": 0.7235
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1276,
+     "p90": 0.5051,
+     "p99": 1.1199
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.1752,
+     "p90": 0.6456,
+     "p99": 1.3258
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.1739,
+     "p90": 3.105,
+     "p99": 7.2371
+    }
+   }
+  },
+  {
+   "run": "2-p2-cand",
+   "completion_s": 411.3,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2387
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2387,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {
+    "recovery/message_reconcile/database.rs": 16
+   },
+   "reconciler_held_fence_waits_2s": 16,
+   "reconciler": {
+    "scanned": 3805,
+    "unchanged": 342,
+    "repaired": 0,
+    "deferred": 3463,
+    "passes": 155
+   },
+   "wbq_end": {
+    "enqueued_total": 12080,
+    "drained_total": 11943,
+    "depth": 8,
+    "latency_p50_ms": 132,
+    "latency_p99_ms": 6392
+   },
+   "archive_message_gap_end": 58,
+   "drain_rate_ops_s": 29.04,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0377,
+     "p90": 0.2254,
+     "p99": 0.7818
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1315,
+     "p90": 0.5517,
+     "p99": 1.253
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.1776,
+     "p90": 0.6559,
+     "p99": 1.2931
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.3114,
+     "p90": 2.9933,
+     "p99": 6.5601
+    }
+   }
+  },
+  {
+   "run": "3-p2-cand",
+   "completion_s": 386.3,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2447,
+    "fetch_inbox": 2
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2447,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {
+    "recovery/message_reconcile/database.rs": 13,
+    "lib.rs": 1
+   },
+   "reconciler_held_fence_waits_2s": 13,
+   "reconciler": {
+    "scanned": 3402,
+    "unchanged": 131,
+    "repaired": 0,
+    "deferred": 3271,
+    "passes": 142
+   },
+   "wbq_end": {
+    "enqueued_total": 12277,
+    "drained_total": 12219,
+    "depth": 6,
+    "latency_p50_ms": 263,
+    "latency_p99_ms": 7754
+   },
+   "archive_message_gap_end": 20,
+   "drain_rate_ops_s": 31.63,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0378,
+     "p90": 0.1926,
+     "p99": 0.6903
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.128,
+     "p90": 0.5151,
+     "p99": 1.0946
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.1667,
+     "p90": 0.6195,
+     "p99": 1.342
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.1304,
+     "p90": 3.1831,
+     "p99": 5.595
+    }
+   }
+  },
+  {
+   "run": "4-p2-base",
+   "completion_s": 360.9,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2434
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2434,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3141,
+    "unchanged": 228,
+    "repaired": 1,
+    "deferred": 2912,
+    "passes": 119
+   },
+   "wbq_end": {
+    "enqueued_total": 14266,
+    "drained_total": 7898,
+    "depth": 6112,
+    "latency_p50_ms": 134218,
+    "latency_p99_ms": 189713
+   },
+   "archive_message_gap_end": 4149,
+   "drain_rate_ops_s": 21.88,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0366,
+     "p90": 0.1577,
+     "p99": 0.6437
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1255,
+     "p90": 0.4734,
+     "p99": 0.9643
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.1771,
+     "p90": 0.615,
+     "p99": 1.2252
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.0948,
+     "p90": 2.8544,
+     "p99": 5.2564
+    }
+   }
+  },
+  {
+   "run": "5-p6-cand",
+   "completion_s": 300.1,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 459,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 886,
+   "resv_errors": 459,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3999,
+    "unchanged": 1790,
+    "repaired": 0,
+    "deferred": 2209,
+    "passes": 126
+   },
+   "wbq_end": {
+    "enqueued_total": 4058,
+    "drained_total": 4058,
+    "depth": 0,
+    "latency_p50_ms": 33,
+    "latency_p99_ms": 132
+   },
+   "archive_message_gap_end": 0,
+   "drain_rate_ops_s": 13.52,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0252,
+     "p90": 0.0695,
+     "p99": 0.1615
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0875,
+     "p90": 0.1409,
+     "p99": 0.3305
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1142,
+     "p90": 0.1994,
+     "p99": 0.4368
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.0983,
+     "p90": 0.1995,
+     "p99": 0.7578
+    }
+   }
+  },
+  {
+   "run": "6-p6-base",
+   "completion_s": 300.0,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 694,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 886,
+   "resv_errors": 694,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {
+    "lib.rs": 1
+   },
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3848,
+    "unchanged": 792,
+    "repaired": 0,
+    "deferred": 3056,
+    "passes": 128
+   },
+   "wbq_end": {
+    "enqueued_total": 4334,
+    "drained_total": 4334,
+    "depth": 0,
+    "latency_p50_ms": 132,
+    "latency_p99_ms": 6439
+   },
+   "archive_message_gap_end": 0,
+   "drain_rate_ops_s": 14.45,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0268,
+     "p90": 0.1241,
+     "p99": 0.6796
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0905,
+     "p90": 0.2251,
+     "p99": 1.2805
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1204,
+     "p90": 0.3149,
+     "p99": 1.1426
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1202,
+     "p90": 3.5373,
+     "p99": 8.75
+    }
+   }
+  },
+  {
+   "run": "7-p6-base",
+   "completion_s": 300.1,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 663,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 886,
+   "resv_errors": 663,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4208,
+    "unchanged": 1224,
+    "repaired": 0,
+    "deferred": 2984,
+    "passes": 132
+   },
+   "wbq_end": {
+    "enqueued_total": 4298,
+    "drained_total": 4298,
+    "depth": 0,
+    "latency_p50_ms": 132,
+    "latency_p99_ms": 2959
+   },
+   "archive_message_gap_end": 0,
+   "drain_rate_ops_s": 14.32,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0308,
+     "p90": 0.1719,
+     "p99": 0.6401
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0976,
+     "p90": 0.3285,
+     "p99": 0.8957
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1405,
+     "p90": 0.4461,
+     "p99": 1.024
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.136,
+     "p90": 3.4966,
+     "p99": 8.4581
+    }
+   }
+  },
+  {
+   "run": "8-p6-cand",
+   "completion_s": 300.0,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 449,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 886,
+   "resv_errors": 449,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4013,
+    "unchanged": 1947,
+    "repaired": 0,
+    "deferred": 2066,
+    "passes": 126
+   },
+   "wbq_end": {
+    "enqueued_total": 4032,
+    "drained_total": 4032,
+    "depth": 0,
+    "latency_p50_ms": 33,
+    "latency_p99_ms": 263
+   },
+   "archive_message_gap_end": 0,
+   "drain_rate_ops_s": 13.44,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0269,
+     "p90": 0.075,
+     "p99": 0.219
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0893,
+     "p90": 0.1428,
+     "p99": 0.3539
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1216,
+     "p90": 0.2269,
+     "p99": 0.5623
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.0999,
+     "p90": 0.2295,
+     "p99": 1.8725
+    }
+   }
+  }
+ ],
+ "paced_pooled": {
+  "p2-base": {
+   "runs": 2,
+   "completion_median_s": 387.909,
+   "completion_s": [
+    387.9,
+    360.9
+   ],
+   "send_p50": 2.1369,
+   "send_p99": 5.703,
+   "late60_send_p90": 3.2229,
+   "resv_calls": 5266,
+   "resv_errors": 4855,
+   "resv_errors_per_1000": 922.0,
+   "other_errors": 0,
+   "reserve_p50": 0.1263,
+   "reserve_p99": 1.0768,
+   "release_p99": 1.2892,
+   "reconciler_held_fence_waits_2s": 0,
+   "drain_rate_pooled_ops_s": 21.354,
+   "drain_rates_ops_s": [
+    20.86,
+    21.88
+   ],
+   "archive_gap_mean": 4056.0
+  },
+  "p2-cand": {
+   "runs": 2,
+   "completion_median_s": 411.26370000000003,
+   "completion_s": [
+    411.3,
+    386.3
+   ],
+   "send_p50": 2.2457,
+   "send_p99": 6.0678,
+   "late60_send_p90": 3.4087,
+   "resv_calls": 5266,
+   "resv_errors": 4834,
+   "resv_errors_per_1000": 918.0,
+   "other_errors": 2,
+   "reserve_p50": 0.1298,
+   "reserve_p99": 1.199,
+   "release_p99": 1.3124,
+   "reconciler_held_fence_waits_2s": 29,
+   "drain_rate_pooled_ops_s": 30.295,
+   "drain_rates_ops_s": [
+    29.04,
+    31.63
+   ],
+   "archive_gap_mean": 39.0
+  },
+  "p6-cand": {
+   "runs": 2,
+   "completion_median_s": 300.0779,
+   "completion_s": [
+    300.1,
+    300.0
+   ],
+   "send_p50": 0.0992,
+   "send_p99": 1.2821,
+   "late60_send_p90": 0.1566,
+   "resv_calls": 1772,
+   "resv_errors": 908,
+   "resv_errors_per_1000": 512.4,
+   "other_errors": 2,
+   "reserve_p50": 0.0882,
+   "reserve_p99": 0.3534,
+   "release_p99": 0.5106,
+   "reconciler_held_fence_waits_2s": 0,
+   "drain_rate_pooled_ops_s": 13.481,
+   "drain_rates_ops_s": [
+    13.52,
+    13.44
+   ],
+   "archive_gap_mean": 0.0
+  },
+  "p6-base": {
+   "runs": 2,
+   "completion_median_s": 300.0929,
+   "completion_s": [
+    300.0,
+    300.1
+   ],
+   "send_p50": 0.1275,
+   "send_p99": 8.4811,
+   "late60_send_p90": 0.1774,
+   "resv_calls": 1772,
+   "resv_errors": 1357,
+   "resv_errors_per_1000": 765.8,
+   "other_errors": 2,
+   "reserve_p50": 0.0942,
+   "reserve_p99": 1.1169,
+   "release_p99": 1.1054,
+   "reconciler_held_fence_waits_2s": 0,
+   "drain_rate_pooled_ops_s": 14.384,
+   "drain_rates_ops_s": [
+    14.45,
+    14.32
+   ],
+   "archive_gap_mean": 0.0
+  }
+ },
+ "smoke": [
+  {
+   "run": "cand_vs_base",
+   "started_at": "2026-10-21T22:37:09Z",
+   "arms": {
+    "cand": {
+     "harness_arm": "candidate",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "PASS",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": true,
+     "soak_converged": true,
+     "log": {
+      "collision_errors": 0,
+      "fence_waits_2s_by_holder": {
+       "recovery/message_reconcile/database.rs": 35
+      },
+      "reconciler_held_fence_waits_2s": 35,
+      "reconciler": {}
+     },
+     "soak_counts": {
+      "send": 13530,
+      "read": 111343,
+      "search": 1147,
+      "health": 255,
+      "err": 1
+     },
+     "soak_fetch_p99_s": 0.009859323501586914,
+     "soak_zombies_max": null,
+     "swarm_zombies_max": 0,
+     "swarm_acked_sends": 9042,
+     "swarm_tool_errors": 2625,
+     "soak_errors": 1,
+     "post_swarm_unarchived": 7148,
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ]
+    },
+    "base": {
+     "harness_arm": "control",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "FAIL",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": false,
+     "soak_converged": true,
+     "log": {
+      "collision_errors": 0,
+      "fence_waits_2s_by_holder": {
+       "lib.rs": 54,
+       "recovery/message_reconcile/database.rs": 37
+      },
+      "reconciler_held_fence_waits_2s": 37,
+      "reconciler": {}
+     },
+     "soak_counts": {
+      "send": 12740,
+      "read": 104575,
+      "search": 777,
+      "health": 269,
+      "err": 0
+     },
+     "soak_fetch_p99_s": 0.010837793350219727,
+     "soak_zombies_max": null,
+     "swarm_zombies_max": 0,
+     "swarm_acked_sends": 9001,
+     "swarm_tool_errors": 2608,
+     "soak_errors": 0,
+     "post_swarm_unarchived": 8066,
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ]
+    }
+   }
+  },
+  {
+   "run": "base_vs_cand",
+   "started_at": "2026-10-21T23:50:33Z",
+   "arms": {
+    "base": {
+     "harness_arm": "candidate",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "FAIL",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": false,
+     "soak_converged": true,
+     "log": {
+      "collision_errors": 0,
+      "fence_waits_2s_by_holder": {
+       "lib.rs": 52,
+       "recovery/message_reconcile/database.rs": 36
+      },
+      "reconciler_held_fence_waits_2s": 36,
+      "reconciler": {}
+     },
+     "soak_counts": {
+      "send": 12834,
+      "read": 104974,
+      "search": 791,
+      "health": 269,
+      "err": 1
+     },
+     "soak_fetch_p99_s": 0.010506153106689453,
+     "soak_zombies_max": null,
+     "swarm_zombies_max": 0,
+     "swarm_acked_sends": 8545,
+     "swarm_tool_errors": 2481,
+     "soak_errors": 1,
+     "post_swarm_unarchived": 8033,
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ]
+    },
+    "cand": {
+     "harness_arm": "control",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "PASS",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": true,
+     "soak_converged": true,
+     "log": {
+      "collision_errors": 0,
+      "fence_waits_2s_by_holder": {
+       "recovery/message_reconcile/database.rs": 45,
+       "lib.rs": 1
+      },
+      "reconciler_held_fence_waits_2s": 45,
+      "reconciler": {}
+     },
+     "soak_counts": {
+      "send": 13494,
+      "read": 108003,
+      "search": 1132,
+      "health": 254,
+      "err": 0
+     },
+     "soak_fetch_p99_s": 0.010782718658447266,
+     "soak_zombies_max": null,
+     "swarm_zombies_max": 0,
+     "swarm_acked_sends": 7921,
+     "swarm_tool_errors": 2297,
+     "soak_errors": 0,
+     "post_swarm_unarchived": 6376,
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ]
+    }
+   }
+  }
+ ],
+ "smoke_note": null,
+ "p6_note": null,
+ "checks": {
+  "M1 P2 pooled drain rate cand >= 1.3x base": true,
+  "M1 every cand P2 drain rate > every base P2 drain rate": true,
+  "G2 file_reservation_paths errors cand <= 1.02x base (P2 and P6 pooled)": true,
+  "G3 P6 mean archive gap cand <= base + 50": true,
+  "G4 P2 mean archive gap at swarm end cand <= base": true,
+  "G1 P2 completion median cand <= 1.05x base": false,
+  "G1 swarm acked sends cand >= 0.95x base each order": false,
+  "G2 non-reservation paced errors cand <= base + 5 (P2 and P6 pooled)": true,
+  "G2 smoke errors (swarm + soak) cand <= base + 5 each order": false,
+  "G2 cand crash PASS and integrity_check ok, each order": true,
+  "G2 no canonical-id collision errors in any cand log": true,
+  "G2 dispatch zombies cand == 0 or <= base, each order": true,
+  "G3 every P6 completion <= 330 s": true,
+  "G3 P6 send p99 and late-60s p90 cand <= 1.2x base": true,
+  "G4 post-swarm unarchived cand <= base + 2% of cand acked, each order": true,
+  "G4 soak convergence not (base pass and cand fail), each order": true
+ },
+ "reported": {
+  "bead probe (cand P2 and P6 resv errors <= 10/1000, no reconciler-held waits)": false
+ },
+ "measured_verdict": "LOSS (see failed checks; null = not evaluated)"
+}
