@@ -8700,16 +8700,34 @@ async fn ensure_message_participants_active_in_tx(
         }
     }
 
+    // Cross-project messages may have a sender in a different project from
+    // their recipients. Their routing is validated separately.
+    ensure_agents_active_in_tx(cx, tracked, &participant_ids, None).await
+}
+
+/// Revalidate distinct agent identities at the same transaction boundary as
+/// the new work they authorize. Reservations additionally require the owner to
+/// belong to their project; cached tool-layer identity checks are insufficient.
+async fn ensure_agents_active_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_ids: &[i64],
+    project_id: Option<i64>,
+) -> Outcome<(), DbError> {
     let mut states: HashMap<i64, (String, Option<i64>, Option<i64>)> = HashMap::new();
-    for chunk in participant_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-        let sql = format!(
+    for chunk in agent_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+        let mut sql = format!(
             "SELECT a.id, a.name, a.retired_at, d.deregistered_at \
              FROM agents a \
              LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
              WHERE a.id IN ({})",
             placeholders(chunk.len())
         );
-        let params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+        let mut params: Vec<Value> = chunk.iter().copied().map(Value::BigInt).collect();
+        if let Some(project_id) = project_id {
+            sql.push_str(" AND a.project_id = ?");
+            params.push(Value::BigInt(project_id));
+        }
         let rows = match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
             Outcome::Ok(rows) => rows,
             Outcome::Err(error) => return Outcome::Err(error),
@@ -8738,9 +8756,13 @@ async fn ensure_message_participants_active_in_tx(
         }
     }
 
-    for agent_id in participant_ids {
-        let Some((name, retired_at, deregistered_at)) = states.remove(&agent_id) else {
-            return Outcome::Err(DbError::not_found("Agent", agent_id.to_string()));
+    for agent_id in agent_ids {
+        let Some((name, retired_at, deregistered_at)) = states.remove(agent_id) else {
+            let identifier = project_id.map_or_else(
+                || agent_id.to_string(),
+                |project_id| format!("{agent_id} in project {project_id}"),
+            );
+            return Outcome::Err(DbError::not_found("Agent", identifier));
         };
         if let Some(timestamp) = deregistered_at {
             return Outcome::Err(DbError::invalid(
@@ -14562,6 +14584,15 @@ async fn create_file_reservations_impl(
             }
         }
 
+        // An exact replay above only reads the original result. New grants and
+        // reacquisitions extend coordination authority, so retirement or
+        // deregistration must be checked inside this write transaction.
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[agent_id], Some(project_id)).await
+        );
+
         let exclusive_filter = if exclusive {
             ""
         } else {
@@ -15751,6 +15782,12 @@ pub async fn renew_reservations(
     // only after admission, just like create_file_reservations.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
         let now = now_micros();
+
+        try_in_tx!(
+            cx,
+            &tracked,
+            ensure_agents_active_in_tx(cx, &tracked, &[agent_id], Some(project_id)).await
+        );
 
         // Fetch candidate reservations first (so tools can report old/new expiry).
         let mut sql = format!(
@@ -27262,6 +27299,387 @@ mod tests {
 
             assert_eq!(roots, vec![root_with_reply_id]);
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reservation_lifecycle_blocks_new_work_but_preserves_replay_release_and_history() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for permanent in [false, true] {
+            let (_cx, pool, _dir) =
+                setup_test_pool(&format!("reservation-lifecycle-{permanent}.db"));
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/reservation-lifecycle")
+                    .await
+                    .into_result()
+                    .expect("project")
+                    .id
+                    .unwrap();
+                let agent_id = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("agent")
+                .id
+                .unwrap();
+                let message = create_message_with_recipients(
+                    &cx, &pool, project_id, agent_id, "preserved history", "body", None,
+                    "normal", false, "[]", &[(agent_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("historical message");
+                let paths = ["src/held.rs", "src/release.rs"];
+                let claim = IdempotencyClaim {
+                    project_id,
+                    tool: "file_reservation_paths",
+                    key: "original-grant",
+                    fingerprint: "original-paths-ttl-mode-reason",
+                };
+                let original = create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &paths, 3600, true, "original", claim,
+                )
+                .await
+                .into_result()
+                .expect("active grant");
+                let IdempotentOutcome::Fresh(original) = original else {
+                    panic!("first grant must be fresh");
+                };
+                let original_json = serde_json::to_value(&original).unwrap();
+                let ids: Vec<i64> = original.iter().map(|row| row.id.unwrap()).collect();
+                let expected_field = if permanent {
+                    deregister_agent(&cx, &pool, agent_id, now_micros())
+                        .await
+                        .into_result()
+                        .expect("deregister owner");
+                    "agent_deregistered"
+                } else {
+                    set_agent_retired_at(&cx, &pool, agent_id, Some(now_micros()))
+                        .await
+                        .into_result()
+                        .expect("retire owner");
+                    "agent_retired"
+                };
+
+                for path in ["src/new.rs", "src/held.rs"] {
+                    let error = create_file_reservations(
+                        &cx, &pool, project_id, agent_id, &[path], 7200, false, "changed intent",
+                    )
+                    .await
+                    .into_result()
+                    .expect_err("inactive owner cannot acquire or reacquire");
+                    assert!(matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field));
+                }
+                let error = renew_reservations(
+                    &cx, &pool, project_id, agent_id, 600, None, Some(&ids),
+                )
+                .await
+                .into_result()
+                .expect_err("inactive owner cannot extend leases");
+                assert!(matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field));
+                let new_claim = IdempotencyClaim {
+                    key: "new-grant",
+                    fingerprint: "new-path-ttl-mode-reason",
+                    ..claim
+                };
+                let error = create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &["src/new.rs"], 3600, true, "new work", new_claim,
+                )
+                .await
+                .into_result()
+                .expect_err("a new idempotency key cannot bypass lifecycle admission");
+                assert!(matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field));
+
+                let stored = list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .expect("retained reservations");
+                assert_eq!(stored.len(), original.len(), "no new lease was inserted");
+                for row in &original {
+                    let retained = stored.iter().find(|stored| stored.id == row.id).unwrap();
+                    assert_eq!(serde_json::to_value(retained).unwrap(), serde_json::to_value(row).unwrap());
+                }
+
+                // An identical retry is historical readback, even after a lease
+                // is released. It must neither extend nor resurrect that lease.
+                for released in [false, true] {
+                    if released {
+                        let rows = release_reservations(
+                            &cx, &pool, project_id, agent_id, Some(&["src/release.rs"]), None,
+                        )
+                        .await
+                        .into_result()
+                        .expect("inactive owner may release existing work");
+                        assert_eq!(rows.len(), 1);
+                        assert_eq!(rows[0].id, original[1].id);
+                    }
+                    let replay = create_file_reservations_idempotent(
+                        &cx, &pool, project_id, agent_id, &paths, 3600, true, "original", claim,
+                    )
+                    .await
+                    .into_result()
+                    .expect("historical grant remains replayable");
+                    let IdempotentOutcome::Replayed(replayed) = replay else {
+                        panic!("retry must replay the original grant");
+                    };
+                    assert_eq!(serde_json::to_value(replayed).unwrap(), original_json);
+                    let retained = get_reservations_by_ids(&cx, &pool, &ids)
+                        .await
+                        .into_result()
+                        .expect("current lease state");
+                    let release_row = retained.iter().find(|row| row.id == original[1].id).unwrap();
+                    assert_eq!(release_row.released_ts.is_some(), released);
+                    for row in &retained {
+                        let old = original.iter().find(|old| old.id == row.id).unwrap();
+                        assert_eq!(row.expires_ts, old.expires_ts);
+                    }
+                }
+
+                let conflict = create_file_reservations_idempotent(
+                    &cx, &pool, project_id, agent_id, &paths, 7200, true, "changed",
+                    IdempotencyClaim { fingerprint: "different-request", ..claim },
+                )
+                .await
+                .into_result()
+                .expect("idempotency conflicts remain classified");
+                assert!(matches!(conflict, IdempotentOutcome::Conflict(_)));
+                let retained_message = get_message(&cx, &pool, message.id.unwrap())
+                    .await
+                    .into_result()
+                    .expect("lifecycle leaves history readable");
+                assert_eq!(retained_message.subject, "preserved history");
+
+                if !permanent {
+                    set_agent_retired_at(&cx, &pool, agent_id, None)
+                        .await
+                        .into_result()
+                        .expect("unretire owner");
+                    let renewed = renew_reservations(
+                        &cx, &pool, project_id, agent_id, 600, None, Some(&[ids[0]]),
+                    )
+                    .await
+                    .into_result()
+                    .expect("unretirement restores renewal");
+                    assert_eq!(renewed.len(), 1);
+                    assert!(renewed[0].expires_ts > original[0].expires_ts);
+                    let granted = create_file_reservations_idempotent(
+                        &cx, &pool, project_id, agent_id, &["src/new.rs"], 3600, true, "new work", new_claim,
+                    )
+                    .await
+                    .into_result()
+                    .expect("unretirement restores grants");
+                    let IdempotentOutcome::Fresh(granted) = granted else {
+                        panic!("refused grants must not consume their idempotency key");
+                    };
+                    assert_eq!(granted.len(), 1);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn reservation_grants_and_renewals_require_an_owner_in_the_requested_project() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_cx, pool, _dir) = setup_test_pool("reservation-owner-project.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project_id = ensure_project(&cx, &pool, "/tmp/reservation-owner")
+                .await
+                .into_result()
+                .expect("owner project")
+                .id
+                .unwrap();
+            let foreign_project_id = ensure_project(&cx, &pool, "/tmp/reservation-foreign")
+                .await
+                .into_result()
+                .expect("foreign project")
+                .id
+                .unwrap();
+            let agent_id = register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .expect("owner")
+            .id
+            .unwrap();
+            let original = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/held.rs"],
+                3600,
+                true,
+                "own project",
+            )
+            .await
+            .into_result()
+            .expect("valid grant");
+            let id = original[0].id.unwrap();
+            let error = create_file_reservations(
+                &cx,
+                &pool,
+                foreign_project_id,
+                agent_id,
+                &["src/foreign.rs"],
+                3600,
+                true,
+                "wrong project",
+            )
+            .await
+            .into_result()
+            .expect_err("foreign owner cannot grant");
+            assert!(matches!(error, DbError::NotFound { .. }));
+            let error = renew_reservations(
+                &cx,
+                &pool,
+                foreign_project_id,
+                agent_id,
+                600,
+                None,
+                Some(&[id]),
+            )
+            .await
+            .into_result()
+            .expect_err("foreign owner cannot renew");
+            assert!(matches!(error, DbError::NotFound { .. }));
+            let foreign_rows = list_file_reservations(&cx, &pool, foreign_project_id, false)
+                .await
+                .into_result()
+                .expect("foreign project remains empty");
+            assert!(foreign_rows.is_empty());
+            let retained = get_reservations_by_ids(&cx, &pool, &[id])
+                .await
+                .into_result()
+                .expect("valid lease remains unchanged");
+            assert_eq!(
+                serde_json::to_value(retained).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reservation_lifecycle_is_rechecked_after_waiting_for_pool_admission() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for renewal in [false, true] {
+            let (_cx, pool, _dir) =
+                setup_test_pool(&format!("reservation-retirement-wait-{renewal}.db"));
+            let lifecycle_pool = DbPool::new(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", pool.sqlite_path()),
+                storage_root: Some(pool.storage_root().to_path_buf()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("independent lifecycle pool");
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let project_id = ensure_project(&cx, &pool, "/tmp/reservation-retirement-wait")
+                    .await
+                    .into_result()
+                    .expect("project")
+                    .id
+                    .unwrap();
+                let agent_id = register_agent(
+                    &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("owner")
+                .id
+                .unwrap();
+                let original = create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/held.rs"],
+                    3600,
+                    true,
+                    "original",
+                )
+                .await
+                .into_result()
+                .expect("original grant");
+                drop(
+                    lifecycle_pool
+                        .acquire(&cx)
+                        .await
+                        .into_result()
+                        .expect("initialize lifecycle pool"),
+                );
+                let held = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("hold sole checkout");
+                let mut waiting = std::pin::pin!(async {
+                    if renewal {
+                        renew_reservations(&cx, &pool, project_id, agent_id, 600, None, None).await
+                    } else {
+                        create_file_reservations(
+                            &cx,
+                            &pool,
+                            project_id,
+                            agent_id,
+                            &["src/new.rs"],
+                            3600,
+                            true,
+                            "queued grant",
+                        )
+                        .await
+                    }
+                });
+                {
+                    let mut context = Context::from_waker(Waker::noop());
+                    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+                }
+                // A real lifecycle write commits through another pool while the
+                // reservation is waiting, after any tool-level identity lookup.
+                set_agent_retired_at(&cx, &lifecycle_pool, agent_id, Some(now_micros()))
+                    .await
+                    .into_result()
+                    .expect("retire while reservation waits");
+                drop(held);
+                let error =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5), waiting)
+                        .await
+                        .expect("reservation admission watchdog")
+                        .into_result()
+                        .expect_err("retirement wins before reservation admission");
+                assert!(matches!(
+                    error,
+                    DbError::InvalidArgument {
+                        field: "agent_retired",
+                        ..
+                    }
+                ));
+                let stored = list_file_reservations(&cx, &pool, project_id, false)
+                    .await
+                    .into_result()
+                    .expect("unchanged reservations");
+                assert_eq!(
+                    serde_json::to_value(stored).unwrap(),
+                    serde_json::to_value(original).unwrap()
+                );
+            });
+        }
     }
 
     #[test]
