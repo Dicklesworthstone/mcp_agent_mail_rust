@@ -1,6 +1,365 @@
 # Bridge Plan: MCP Agent Mail (Rust)
 
-## October 8, 2026 assessment (black-box acceptance of the shipped v0.3.38)
+## October 22, 2026 assessment (shipped v0.3.39; origin/main 127defb6)
+
+**For a small or medium team, Agent Mail still does what the README says, and v0.3.39 is
+measurably better than v0.3.38 at swarm scale.** At 60 agents it acknowledges about twice as many
+sends, hits zero 30 s dispatch timeouts, and loses no acknowledged message across SIGKILL.
+
+It still fails the README's central swarm promise, on the same checks that failed on October 8:
+
+- reservation calls take 14–20 s at p99;
+- the archive is still 172–850 messages behind SQLite 300 s after load stops;
+- the write-behind queue (WBQ) has windows where it stops draining.
+
+Main is 300 commits past v0.3.39. Those commits fix many user-reported issues, but they also change
+the reservation failure from *slow* into *refused*, unless the L2 admission wait ships with them.
+The long-lived reference daemon has a problem with no bead: an 8.8 GB heap that keeps health red at
+idle.
+
+This section supersedes the October 8 judgment.
+
+### What was actually run
+
+- **Reading.**
+  - AGENTS.md and README.md, in full.
+  - The shared checkout `/data/projects/mcp_agent_mail_rust` is 656 commits behind origin/main and
+    carries 6 local "preserve" commits. It was not touched.
+  - Every claim below was re-verified at origin/main `127defb6` in a detached worktree. Two of the
+    three sub-agent audits first read the stale checkout, and their findings were re-checked.
+- **Three read-only code audits** (sub-agents, spot-checked):
+  - surface counts and stubs;
+  - web, share, guard, product bus, cross-project mail and the proof gate;
+  - search, ATC, the release path and CI.
+- **Black-box receipts.**
+  - The committed release-smoke receipt
+    `docs/evidence/release_smoke/2026-10-13_a4ec56bc-release_vs_v0.3.38_swarm-only_idle-host.json`.
+    It covers 6 runs in the order A B B A A B, with 60 agents, 480 s of load and a SIGKILL at about
+    242 s. Its v0.3.39 binary (`aeb222d8…`) is byte-identical to the published, minisign-verified
+    `x86_64-unknown-linux-musl` `am`.
+  - The paced-swarm A/B receipts from 10-21 and 10-22 (`fg22`, `fl23`), measured on main builds.
+- **Live host, read-only.** MCP `health_check`; `/proc/<pid>/status` and `smaps_rollup` of the 8765
+  owner; a storage-root listing.
+- **Tracker and GitHub.** Beads were imported from origin/main's JSONL into an isolated database.
+  All 23 open issues were mapped to beads.
+- **Not run.**
+  - A full test gate on `127defb6` (see "Gate").
+  - A paced swarm of the shipped v0.3.39. It was queued, but the run requires a host load below 8 and
+    the load stayed between 40 and 50.
+  - The interactive TUI, semantic search, mutating doctor verbs and the WASM replay.
+
+### Findings, ranked by user impact
+
+1. **Swarm-scale coordination still fails on the shipped release.**
+   - P1; owners `br-9ott5`, `br-kp1in.13`, `br-kp1in.35`, `br-qbhs0`.
+   - Receipt above, idle host (load 2.5–5.4 for v0.3.39):
+
+     | Arm (3 runs each) | Acked sends | Sends/s | Reserve p99 | 30 s timeouts | Archive gap 300 s after load |
+     |---|---|---|---|---|---|
+     | v0.3.39 | 6,413–7,322 | 13.0–14.8 | 14.2–19.9 s | 0 | 172 / 358 / 850 |
+     | v0.3.38 | 686–3,252 | 1.2–6.5 | 30.0 s | 10–180 | 60 / 80 / 80 |
+
+   - Every v0.3.39 run fails the same 5 swarm checks: both reservation p99 bounds, zero tool errors
+     (one `RESOURCE_BUSY`), WBQ progress in every 10 s window, and archive convergence.
+   - Every v0.3.39 run passes the rest: send p99 within its 5 s bound, no dispatch zombies, at most 2
+     SQLite descriptors, independent `integrity_check` ok, and 20,224 of 20,224 acknowledged sends
+     surviving SIGKILL.
+   - The archive gap is larger than v0.3.38's because v0.3.39 accepts about twice as much mail
+     through the same single drain.
+2. **Main turns reservation latency into refusals.**
+   - P1; owner `br-9ott5`.
+   - Cause: since `3f550ad1` (10-14), a direct reservation publication tries the global fence without
+     waiting, and since `fdece065` (10-20) a failed try returns `RESERVATION_ARCHIVE_UNAVAILABLE`.
+     Both are unreleased.
+   - Paced swarm, refusals per 1,000 `file_reservation_paths` calls, valid runs only:
+
+     | Build | P6 (below saturation) | P2 (saturation) |
+     |---|---|---|
+     | main + FG (`baea07e2`) | 513 | 942 |
+     | main + FG + L2 | 13.2 | 694 |
+
+   - L2 waits up to 500 ms for the fence. It lost its own pre-registered rule (P6 ≤ 10, P2 ≤ 0.5×).
+     It lands by the owner's decision, after its gates pass on `127defb6`.
+   - A v0.3.40 cut from main without L2 or better would regress reservations from slow to refused.
+   - Every lever measured inside the global-fence design has lost or been marginal:
+     - lost: bundle staging, skip-publication (×2), reconciler grace, L2 alone, L2 on FG;
+     - landed by decision: FG.
+   - The fence exists so that snapshot publication sees no in-flight archive mutation, yet every
+     mutation in every project takes the same `std::sync::Mutex`
+     (`storage/src/lib.rs:818-847`, `:867`).
+   - The next lever (`fy24`, a short give-way to waiting direct writers) has a test that passes
+     3 of 3 and a planted negative that fails 3 of 3. It runs under a rule written before any run.
+     If it loses, the structural options are recorded on `br-9ott5`.
+3. **The long-lived daemon's heap sits above its own fatal threshold, and health blames the wrong
+   subsystem.**
+   - P1; new bead `br-kp1in.44`.
+   - The reference host runs the shipped v0.3.38 glibc `am` as an interactive TUI, up 10 days, for a
+     72 MB database with 42,618 messages. It holds:
+     - VmRSS 8.8 GB, VmHWM 11.8 GB;
+     - 6.7 GB in `[anon:mimalloc]` and about 2.0 GB of other anonymous memory;
+     - only 38 MB file-backed.
+   - The default `memory_fatal_mb` is 8192, so `health_check` is red at idle, with an idle pool and
+     queues and every verdict green.
+   - The only red contributor reads "live pool/queue pressure level"
+     (`tools/src/identity.rs:2340`). Nothing in health names memory.
+   - Shedding is off by default. With `BACKPRESSURE_SHEDDING_ENABLED=true`, this idle daemon would
+     shed sheddable tools.
+   - GH#353's reconciler bursts (1–4 GB each) are one candidate cause, and their fixes are on main,
+     unreleased. The bead requires attribution before any fix.
+4. **Convergence and retention defects are still visible live.**
+   - Owners `br-kp1in.35`, `br-kp1in.36`; the live host is on v0.3.38, so main's fixes cannot show
+     there.
+   - SQLite is ahead of the archive by 29 messages, the same gap as on 10-08, and parity still reads
+     green.
+   - 63.7 GB of recovery artifacts are resident against a 72 MB database (58.0 GB of direct
+     backups), with `reclaimable_attention: false`.
+   - There are 818 rotated `.bak` files (817 on 10-08). GH#359 documents the hourly producer on a
+     running v0.3.39.
+5. **Release cadence is now the main obstacle to user value.**
+   - Owners `br-bx73n` and new `br-kp1in.45`.
+   - origin/main is 300 commits past v0.3.39 (230 by Jeff), yet the CHANGELOG "Unreleased" section
+     says "No changes since v0.3.39".
+   - The maintainer's own status comments say these fixes are on main and "ship in the next release
+     after v0.3.39": #362 (2 of 3 costs) and #353, still open, and #355–#358, #360 and #361, already
+     closed. `install.ps1` (#352) is fixed on main and already served from it.
+   - GH#350: strict dsr cannot build a release while the Beads-only FrankenSQLite git patch (which
+     carries a submodule) exists. v0.3.39 needed an older dsr and a primed host Cargo cache.
+6. **No current full-gate verdict.**
+   - Known reds on main:
+     - `br-zhhq7` (8 db lib failures);
+     - `br-3ukrb` and `br-u5biy` (storage);
+     - `br-wvn4i` (startup regression);
+     - `br-ah0au` (macOS does not compile the db crate);
+     - GH#349.
+   - All GitHub workflows that gate main are disabled. The release gate is the manual DSR checklist
+     (`docs/RELEASE_CHECKLIST.md:9-43`).
+7. **Documentation drift, one item user-impacting.** Owner `br-4meup`; the full list is in its
+   comment. The user-impacting one: README.md:1313 documents the rejected v1 proof-signing format, so
+   an issuer written from the README fails verification. The others:
+   - the comparison table claims hybrid search in release builds;
+   - ATC "appends experience rows" by default;
+   - overseer mail is "Git + SQLite" at send time;
+   - the stress table shows p99 6.8 s;
+   - `WORKTREES_ENABLED` is described as a build-slot flag only;
+   - a stale CHANGELOG, UPGRADE_LOG and release checklist;
+   - `robot-docs` says "10 verbs".
+8. **The tracker still lags the work.**
+   - 69 beads are in progress; 60 of them, including 16 of the 17 in-progress P0s, have not been
+     updated since 10-08. 41 of the 74 open beads have not either.
+   - 50 beads closed since 10-08. 132 of 417 commits (32%; 46% on 10-08) cite no bead or issue.
+   - Some open GitHub issues are tracked only on GitHub, with active fixes by the maintainer: #362,
+     #353, #341 and #291. Others are open although their bead closed: #345 (`br-9bwnb` closed 10-18,
+     and the unreleased bounded admission it cites is what produces finding 2).
+   - `br-kp1in.22` (DSR vs Actions) is settled in practice by `docs/RELEASE_CHECKLIST.md:11-12` and
+     README.md:300, but it still ranks in `bv --robot-triage`'s top picks.
+
+### What is verifiably working
+
+- **Surface counts at `127defb6`:**
+  - 45 registered tools in 9 clusters;
+  - 33 resource handlers over 25 distinct URIs;
+  - 16 real screens (the placeholder screen is test-only);
+  - 19 robot subcommands and 28 doctor verbs.
+  - Broadcast is refused both at normalization and in the handler.
+  - There are no `todo!`/`unimplemented!`. The web dashboard's 501 routes and the 38 detect-only
+    doctor FMs are documented refusals, not fake data.
+- **Shipped v0.3.39, from the receipt:**
+  - the flow phase passes in every run;
+  - acknowledged mail survives SIGKILL at 60 agents (20,224 / 20,224), integrity is ok, and descriptors
+    are bounded;
+  - no HTTP restarts or EMFILE;
+  - clean SIGTERM exit;
+  - send p99 is within bound.
+- **Fixed since 10-08, verified in source at `127defb6`** (shipped status as noted):
+  - the share viewer's controller ships (`viewer.js`, with DOMPurify loaded under SRI; `br-kp1in.42`;
+    in v0.3.39);
+  - web search field scopes (in v0.3.39);
+  - the guard hook bakes in `STORAGE_ROOT` from `config.env`, and the Python and Rust guard readers
+    agree;
+  - a refused reservation archive write is now reported to the holder (`db_committed: true`)
+    instead of returning silent success (unreleased);
+  - root installs (`br-kp1in.38`, GH#339);
+  - `INTEGRITY_CHECK_ON_STARTUP=false` no longer disables the whole guard (`br-kp1in.37`, in
+    v0.3.39);
+  - the project-mailbox foreign-key violation (`br-kp1in.39`);
+  - main's inbox read path (`br-kp1in.40`).
+
+### Vision checklist delta (the September 21 25-goal matrix remains the inventory)
+
+| # | Goal | Oct 8 | Oct 22 | Evidence |
+|---|---|---|---|---|
+| 1 | 45 tools / 25 resources | WORKING (shipped) | WORKING | counts at `127defb6`; flow phase PASS on v0.3.39 |
+| 2 | Send/reply/read/ack, receipts | WORKING (shipped) | WORKING (v0.3.39) | flow PASS ×3; 20,224 acked swarm sends |
+| 3 | Broadcast refused | WORKING | WORKING | two refusal sites in `messaging.rs` |
+| 4 | DB→Git convergence | PARTIAL | **PARTIAL** | v0.3.39 172–850 behind after 300 s; live 29-message gap, green |
+| 5 | No lost/duplicate accepted mail | WORKING at 60 incl. SIGKILL | WORKING at 60 incl. SIGKILL | 20,224/20,224; integrity ok |
+| 6 | Safe recovery / namespace authority | PARTIAL (not re-verified) | PARTIAL (not re-verified) | authority P0s still untouched |
+| 7 | Bounded engine/pool lifetime | WORKING on Linux | **PARTIAL** | descriptors ≤ 2 in the swarm, but live heap 8.8 GB (`br-kp1in.44`) |
+| 8 | Identity / contact / topic | WORKING (cross-project) | WORKING (code) | contacts fail closed; proof gate v2; README format wrong |
+| 9 | Leases, conflicts, guard | PARTIAL | **PARTIAL, changing shape** | v0.3.39 slow (p99 14–20 s); main refuses (L2: 1.3% at P6, 69% at P2) |
+| 10 | Product bus, build slots | WORKING (shipped) | WORKING (code) | gated by `WORKTREES_ENABLED`, under-documented |
+| 11 | Bare `am`, agent setup | SUPERSEDED | SUPERSEDED | GH#318 decision |
+| 12 | Credentials / client config | PARTIAL (not re-verified) | PARTIAL (not re-verified) | `br-3cqr4`, `br-x2jf5`, `br-6u4hx` open |
+| 13 | 16-screen TUI | PARTIAL (not exercised) | PARTIAL (not exercised) | 16 real screens; #338 repaint (`br-drvoq`) open |
+| 14 | Web mail, share/export | web WORKING | WORKING (code), not exercised | viewer controller and search scopes fixed |
+| 15 | Fast, truthful robot/doctor health | PARTIAL | **PARTIAL** | red at idle, misattributed; parity green on a persistent gap; retention blind |
+| 16 | Reversible owner-safe doctor | UNPROVEN | UNPROVEN | not exercised |
+| 17 | Scoped Search V3 | WORKING (lexical, shipped) | WORKING (lexical) | release binaries are lexical only |
+| 18 | Optional model / TOON quality | UNPROVEN | UNPROVEN | semantic tier not in release binaries |
+| 19 | ATC learns quietly | defaults verified | defaults verified; long-run UNPROVEN | `atc_record_outcome` has no production caller; write mode off |
+| 20 | Signed install/update | WORKING (unprivileged); root FAILS | WORKING (Linux); release build PARTIAL | root fix closed; `install.ps1` fixed on main; GH#350 |
+| 21 | Python import and cutover | PARTIAL | PARTIAL | `br-ajiq8` decision open |
+| 22 | Complete gate | did not compile | **NO VERDICT; known reds** | finding 6 |
+| 23 | Latency / resource budgets | PARTIAL | PARTIAL | swarm p99 out of bounds; v0.3.39 ~13–15 sends/s at 60 agents |
+| 24 | Honest active docs | PARTIAL | PARTIAL | finding 7 |
+| 25 | Privacy-safe WASM replay | not re-verified | not re-verified | `br-f9avw` untouched since 08-26 |
+
+### Bead coverage (skill questions 4 and 5)
+
+**If every open and in-progress bead were finished as written, would the gap close?** No, for
+three reasons:
+
+- Two observed defects had no bead:
+  - the daemon heap and the health misattribution (now `br-kp1in.44`);
+  - the strict-dsr release build (now `br-kp1in.45`, GH#350).
+- The swarm reservation failure has an owner (`br-9ott5`) but no design known to pass: every
+  measured lever inside the global fence has lost. October 8's ambition round 2 (one writer per
+  archive object) was never turned into work. It is now recorded on `br-9ott5` as the structural
+  option, gated on the swarm-phase crash-under-load receipt, rather than as a parallel bead.
+- Most user-visible progress is blocked on a release, not on code. No bead change fixes that; it is
+  the maintainer's call.
+
+**New beads** (parent `br-kp1in`):
+
+| Bead | P | Gap |
+|---|---|---|
+| `br-kp1in.44` | P1 | Daemon heap 8.8 GB, above `MEMORY_FATAL_MB`; health red at idle and blaming pool/queue |
+| `br-kp1in.45` | P2 | GH#350: strict dsr cannot build while the Beads-only FrankenSQLite git patch exists |
+
+**Graph changes:**
+
+- related links: `.44`↔`br-kp1in.29`, `.44`↔`br-on1zo`, `br-bx73n`↔`.44`, `br-bx73n`↔`.45`;
+- `br dep cycles` is empty.
+
+**Evidence comments added** (no status, owner or priority changed): `br-9ott5`, `br-bx73n`,
+`br-4meup`, `br-kp1in.35`, `br-kp1in.36`, `br-ge9o4`.
+
+### Bridge: shortest route to a release users can trust under swarm load
+
+1. **Land L2 (S, in progress).** Its change lines are byte-identical on `127defb6`; the gates run
+   there first. Without it, finding 2 ships.
+2. **Run `fy24` against main + L2 (S).** The rule is frozen before the runs. If it loses, take the
+   structural option on `br-9ott5` (M–L): direct reservation artifacts as a priority lane of the
+   single archive writer, so the tool waits on that writer's acknowledgement with a deadline instead
+   of racing it for a mutex.
+3. **Cut v0.3.40 (maintainer, M).** The candidate must:
+   - fix or classify the known reds;
+   - pass the release smoke, including the swarm phase, in both orders against v0.3.39 on glibc and
+     musl;
+   - be no worse than v0.3.39 on every swarm check;
+   - ship a CHANGELOG for its 300 commits;
+   - include L2.
+   GH#350 is either fixed or the dsr workaround is recorded in the receipt.
+4. **Attribute the daemon heap (S–M, `br-kp1in.44`):** a 6 h soak of main vs v0.3.39 in the same
+   invocation, before any fix.
+5. **Upgrade the reference host to v0.3.40 (maintainer).** Then re-read the live evidence for
+   `.35`, `.36` and `.44`. The interactive TUI has been the daemon since the systemd unit went
+   inactive on 10-12.
+6. **Docs (S, `br-4meup`):** fix the proof-format text first.
+7. **Owner-led tracker triage (maintainer, not done here):**
+   - the 60 in-progress beads untouched since 10-08;
+   - `br-kp1in.22`;
+   - GitHub issues that are open with a closed bead (#345);
+   - issues tracked only on GitHub.
+
+### Ambition round 1: one archive writer, not one archive mutex
+
+The fence is a mutual-exclusion lock standing in for a scheduling decision. The WBQ drain, the
+commit coalescer and the reconcilers release and retake it between units of work. Direct
+reservation writers poll it from other threads, so who wins depends on timing, not on priority.
+
+- **The alternative:** make the drain the only archive mutator, and give direct writes a priority
+  lane with a per-request deadline. Snapshot publication keeps its exclusion, because it runs on, or
+  pauses, that one writer.
+- **What it buys:** the race becomes an ordered queue with measurable waiting time. That is the
+  service level October 8's round 1 asked health to report.
+- **What it must not do:** reorder publication relative to recovery promotion. The crash-under-load
+  receipt is the bar, not a microbench.
+
+### Ambition round 2: release whenever main beats the release
+
+The swarm-phase smoke already compares two binaries in one invocation. Run it on a fixed cadence
+(main vs the latest release, both orders), and treat "main is no worse on every check and better on
+at least one" as the trigger for a release candidate. That turns finding 5 from a judgment into a
+measured, recurring decision. It adds no new artifact: the receipts already exist under
+`docs/evidence/release_smoke/`.
+
+### Ambition round 3 (considered, deliberately bounded)
+
+Considered and rejected for now:
+
+- **Heap-profiling instrumentation in the shipped binary.** `br-kp1in.44` needs attribution once,
+  on a scratch soak, not a permanent surface.
+- **A formal model of fence scheduling.** The paced swarm reproduces the defect in 5 minutes.
+
+### Gate
+
+At the time of writing: L2's gates are running on `127defb6`, together with a storage-lib baseline
+run of `127defb6` itself (results go on `br-9ott5` and in L2's landing commit). There is no full
+workspace verdict for `127defb6`. The last classified state is in `br-uwvwz` and `br-zhhq7`.
+
+### Refinement record (Phase 3a and Phase 5 passes)
+
+Both new beads follow the frozen Phase 3a intent. Each carries observed evidence with file:line,
+why it matters, the required change, and acceptance that includes a planted negative and an E2E
+script with structured logs. Neither needs this document to be understood.
+
+1. **Users and optimality.**
+   - `.44` requires attribution before any fix, and forbids "fixing" it by raising thresholds.
+   - `.45` offers three paths, so the build-path fix stays the owner's choice.
+2. **Duplicates and owners.**
+   - `bv --robot-suggest` flags nothing for the new beads.
+   - Findings with an existing owner got comments, not beads: the fence design on `br-9ott5`, the
+     live evidence on `.35`/`.36`/`br-ge9o4`, release inputs on `br-bx73n`, docs on `br-4meup`.
+3. **Dependency semantics.** The new beads are linked as related, not blocking, so `br ready`
+   still offers them. The release-acceptance bead names them in its comment.
+4. **Tests.** Each acceptance includes a negative that a naive fix fails:
+   - for `.44`, a rename-only health fix;
+   - for `.45`, re-adding a submodule source must fail the strict build.
+5. **Convergence.**
+   - A re-read found nothing further to change. `br dep cycles` is empty.
+   - `bv --robot-triage` top picks (`br-3cqr4`, `br-kp1in.13`, `br-kp1in.3`) follow graph
+     position. The bridge order above follows measured user impact.
+
+### Real-work and honesty disposition
+
+This assessment is user-requested process. Its weight is in:
+
+- the committed shipped-artifact receipt (re-read, with binary identity verified);
+- live-host reads;
+- source verification at the real origin/main.
+
+It changed no product code, gate, golden, default or configuration. It revised this plan in place,
+created two beads, and added six evidence comments. No bead was closed, reassigned or
+re-prioritized.
+
+Limits:
+
+- The v0.3.39 swarm numbers are a committed receipt from 10-13, not a fresh run, because the fresh
+  run could not start under host load 40–50.
+- The memory finding is one process at one point in time, plus a short sample series. The bead
+  requires the soak.
+- The sub-agent audits read source code; they did not run it.
+
+Left behind:
+
+- detached worktrees `/data/projects/mcp_agent_mail_rust-rc1022r` (audit) and `-rc1022l` (L2
+  landing);
+- scratch receipts under the session scratchpad.
+
+No shared mailbox was modified.
+
+## October 8, 2026 assessment (black-box acceptance of the shipped v0.3.38; superseded by October 22)
 
 **Agent Mail now does what the README says for a small or medium team of agents,
 and the build users actually download is the one that does it.** The signed
