@@ -1519,7 +1519,17 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
 pub fn write_op_sync(op: &WriteOp) -> Result<()> {
     let metrics = mcp_agent_mail_core::global_metrics();
     let started = Instant::now();
-    let result = wbq_execute_op(op, "archive-sync");
+    let result =
+        std::panic::catch_unwind(|| wbq_execute_op(op, "archive-sync")).unwrap_or_else(|_| {
+            // Unwind the writer's mutation/project guards before accounting
+            // for failure. The durable backlog must retain its journal and
+            // advance its retry budget instead of losing its only drainer.
+            // The panic hook already records the payload; do not copy possible
+            // message content into storage diagnostics or the dead-letter log.
+            Err(StorageError::Io(std::io::Error::other(
+                "archive write panicked; the affected operation requires reconciliation",
+            )))
+        });
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
         .storage
@@ -2380,8 +2390,9 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
 }
 
 /// Background drain loop. Single drainer, so the front entry is stable across
-/// the unlocked `write_op_sync` call (only pushes append to the back). Never
-/// returns; a panic is caught by `ensure_drain`'s respawn.
+/// the unlocked `write_op_sync` call (only pushes append to the back). Writer
+/// panics become failed attempts in `write_op_sync`, so they retain the journal
+/// for retry and eventually reach the normal dead-letter bound.
 ///
 /// Materialization is via `write_op_sync` (NOT `wbq_enqueue`): the write-behind
 /// queue is in-memory, so handing the op back to it and dropping the journal
@@ -21470,6 +21481,217 @@ mod tests {
         // The message is now durably in the git archive.
         let archive = ensure_archive(&config, "local-drain").unwrap();
         assert!(!get_recent_commits(&archive, 4, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_retries_partial_bundle_after_writer_panic() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_retries_partial_bundle_after_writer_panic",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "backlog-panic-partial").unwrap();
+        let op = backlog_test_message_op(&config, "backlog-panic-partial", 8081);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = &op
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, message_json, sender, recipients).unwrap();
+        let canonical_content = render_message_bundle_content(message_json, body_md).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        let panic_archive = archive.clone();
+        let partial_path = paths.canonical.clone();
+        let partial_content = canonical_content.clone();
+        WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let _: Result<()> = with_project_lock(&panic_archive, || {
+                    // Publish one real, durable copy before unwinding both
+                    // locks. Retry must preserve it and fill the missing copies.
+                    ensure_parent_dir(&partial_path)?;
+                    let mut writes = StagedArchiveWrites::default();
+                    writes.add(partial_path, partial_content.as_bytes())?;
+                    writes.publish()?;
+                    panic!("injected archive writer panic after canonical publication");
+                });
+            }));
+        });
+
+        let errors_before = mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_direct_write_errors_total
+            .load();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(1)
+        ));
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(
+            std::fs::read_to_string(&paths.canonical).unwrap(),
+            canonical_content
+        );
+        assert!(!paths.outbox.exists());
+        assert!(!paths.inbox[0].exists());
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .archive_direct_write_errors_total
+                .load(),
+            errors_before + 1
+        );
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        flush_async_commits();
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(!journal.exists());
+        let resolved = journal
+            .parent()
+            .unwrap()
+            .join("resolved")
+            .join(journal.file_name().unwrap());
+        assert_eq!(std::fs::read(resolved).unwrap(), journal_bytes);
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), canonical_content);
+        }
+        let mut canonical_paths = Vec::new();
+        collect_canonical_message_paths_with_id(
+            &archive.root.join("messages"),
+            8081,
+            &mut canonical_paths,
+        );
+        assert_eq!(canonical_paths, vec![paths.canonical]);
+    }
+
+    #[test]
+    fn archive_backlog_dead_letters_writer_panics_and_drains_following_mail() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_dead_letters_writer_panics_and_drains_following_mail",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "backlog-panic-poison";
+        let archive = ensure_archive(&config, project).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, project, 8082), 8_192),
+            ArchiveBacklogPush::Queued
+        );
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, project, 8083), 8_192),
+            ArchiveBacklogPush::Queued
+        );
+
+        for attempt in 1..=ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            let panic_archive = archive.clone();
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let _: Result<()> = with_project_lock(&panic_archive, || {
+                        panic!("private message content from injected writer panic");
+                    });
+                }));
+            });
+            let outcome = backlog.drain_step();
+            if attempt < ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+                assert!(matches!(outcome, ArchiveBacklogDrainStep::RetryLater(n) if n == attempt));
+                assert_eq!(backlog.backlog_state().0, 2);
+                assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+            } else {
+                assert!(matches!(outcome, ArchiveBacklogDrainStep::DeadLettered));
+            }
+        }
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert!(!journal.exists());
+        let failed = journal
+            .parent()
+            .unwrap()
+            .join("failed")
+            .join(journal.file_name().unwrap());
+        assert_eq!(std::fs::read(failed).unwrap(), journal_bytes);
+        let ledger =
+            std::fs::read_to_string(config.storage_root.join("doctor/backlog_dead_letter.jsonl"))
+                .unwrap();
+        let records: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["attempts"], ARCHIVE_BACKLOG_MAX_ATTEMPTS);
+        assert_eq!(records[0]["op"]["message_json"]["id"], 8082);
+        assert!(
+            records[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("archive write panicked")
+        );
+        assert!(!ledger.contains("private message content"));
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        flush_async_commits();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Empty
+        ));
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = backlog_test_message_op(&config, project, 8083)
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            let (message, body) = read_message_file(path).unwrap();
+            assert_eq!(message["id"], 8083);
+            assert_eq!(body.trim(), body_md);
+        }
     }
 
     #[test]
