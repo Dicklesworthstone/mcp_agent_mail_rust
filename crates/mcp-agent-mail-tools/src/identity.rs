@@ -2222,6 +2222,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // queue capacity/soft-cap values even before the first write/commit.
     mcp_agent_mail_storage::wbq_start();
     let _ = mcp_agent_mail_storage::get_commit_coalescer();
+    let disk_sample = if config.disk_space_monitor_enabled {
+        Some(mcp_agent_mail_core::disk::sample_and_record(config))
+    } else {
+        None
+    };
+    // Include the disk sample in the same observation used for pressure
+    // classification, reported queue gauges, and the pressure explanation.
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
     let timeout_diagnostics = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(
         mcp_agent_mail_core::config::ECOSYSTEM_CLIENT_DEADLINE_MS.saturating_mul(1_000),
@@ -2230,12 +2237,6 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         metrics.storage.commit_queue_latency_us.p99,
         config.health_commit_coalescer_p99_degraded_ms,
     );
-    let disk_sample = if config.disk_space_monitor_enabled {
-        Some(mcp_agent_mail_core::disk::sample_and_record(config))
-    } else {
-        None
-    };
-
     let now_us = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap_or(0);
     let over_80_for_s = if metrics.db.pool_over_80_since_us == 0 {
         0
@@ -2259,8 +2260,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let archive_drain_stall = archive_drain_stall_detail(&archive_lag, archive_lag_critical_us);
     let archive_drain_stalled = archive_drain_stall.is_some();
 
-    // Refresh the cached health level (pressure-derived) from live metrics.
-    let (pressure_level, _changed) = mcp_agent_mail_core::refresh_health_level();
+    // br-kp1in.44: an idle pool must not hide memory-driven red. Classify,
+    // cache and explain one observation rather than taking another snapshot.
+    let pressure_signals = mcp_agent_mail_core::HealthSignals::from_snapshot(&metrics, now_us);
+    let (pressure_level, _changed) =
+        mcp_agent_mail_core::backpressure::refresh_health_level_from_snapshot(&metrics, now_us);
 
     // C1 (br-bvq1x.3.1): decompose health into independent verdicts and roll up
     // strictly, so a green top-level can never coexist with a broken critical
@@ -2337,7 +2341,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         HealthLevelContributor {
             name: "pressure".to_string(),
             level: pressure_level.to_string(),
-            detail: "live pool/queue pressure level".to_string(),
+            detail: pressure_signals.pressure_detail(&metrics.system, config),
         },
         HealthLevelContributor {
             name: "archive_lag".to_string(),
