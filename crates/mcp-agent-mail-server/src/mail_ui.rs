@@ -6652,6 +6652,108 @@ mod fresh_eyes_regression_tests {
     }
 
     #[test]
+    fn handle_mark_all_read_clears_shared_and_mixed_inboxes_for_only_the_viewer() {
+        for mixed in [false, true] {
+            let runtime = message_fixture_runtime();
+            let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+            let label = if mixed {
+                "mail-ui-all-read-mixed"
+            } else {
+                "mail-ui-all-read-shared"
+            };
+            let pool = make_test_pool(label);
+            let project = outcome_ok(block_on(queries::ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/{label}"),
+            )));
+            let project_id = project.id.expect("project id");
+            let sender = outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, project_id, "RedFox", "test", "test", None, None, None,
+            )));
+            let viewer = outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )));
+            let peer = outcome_ok(block_on(queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )));
+            let viewer_id = viewer.id.expect("viewer id");
+            let peer_id = peer.id.expect("peer id");
+            let mut deliveries = vec![
+                ("first shared", false, true),
+                ("second shared", false, true),
+            ];
+            if mixed {
+                deliveries.extend([("direct", true, false), ("direct and shared", true, true)]);
+            }
+            let expected_marked = deliveries.len();
+            for (subject, direct, shared) in deliveries {
+                let recipients = if direct {
+                    vec![(viewer_id, "to")]
+                } else {
+                    Vec::new()
+                };
+                outcome_ok(block_on(queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.expect("sender id"),
+                    subject,
+                    "Body",
+                    None,
+                    None,
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &recipients,
+                    shared.then_some("to"),
+                )));
+            }
+
+            let payload = handle_mark_all_read(&cx, &pool, &project.slug, "BlueLake")
+                .expect("all-read route succeeds")
+                .expect("JSON response");
+            let response: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(response["success"], true);
+            assert_eq!(response["marked_count"], expected_marked);
+            assert!(
+                outcome_ok(block_on(queries::fetch_inbox_unread(
+                    &cx, &pool, project_id, viewer_id, false, None, 100,
+                )))
+                .is_empty()
+            );
+            let peer_unread = outcome_ok(block_on(queries::fetch_inbox_unread(
+                &cx, &pool, project_id, peer_id, false, None, 100,
+            )));
+            assert_eq!(peer_unread.len(), if mixed { 3 } else { 2 });
+            let unacked = outcome_ok(block_on(queries::fetch_unacked_for_agent(
+                &cx, &pool, project_id, viewer_id, 100,
+            )));
+            assert_eq!(
+                unacked.len(),
+                expected_marked,
+                "reading never acknowledges mail"
+            );
+            assert!(unacked.iter().all(|row| row.read_ts.is_some()));
+
+            let payload = handle_mark_all_read(&cx, &pool, &project.slug, "BlueLake")
+                .expect("repeated all-read succeeds")
+                .expect("JSON response");
+            let response: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(response["marked_count"], 0);
+        }
+    }
+
+    #[test]
     fn sibling_update_route_persists_and_index_renders_both_orientations() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-sibling");

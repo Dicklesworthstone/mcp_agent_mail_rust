@@ -672,13 +672,16 @@ type VisibleReceipt = (i64, Option<i64>, Option<i64>);
 
 /// Receipt state is authority, not best-effort display data. A malformed
 /// timestamp must never become an apparently unread/unacknowledged delivery.
-fn receipt_timestamp(row: &sqlmodel_core::Row, column: &str) -> Result<Option<i64>, DbError> {
+pub(crate) fn receipt_timestamp(
+    row: &sqlmodel_core::Row,
+    column: &str,
+) -> Result<Option<i64>, DbError> {
     match row.get_by_name(column) {
         Some(Value::Null) => Ok(None),
         Some(Value::BigInt(value)) => Ok(Some(*value)),
         Some(Value::Int(value)) => Ok(Some(i64::from(*value))),
         _ => Err(DbError::Sqlite(format!(
-            "project mailbox receipt column {column} is missing or not an integer"
+            "receipt column {column} is missing or not an integer"
         ))),
     }
 }
@@ -802,7 +805,8 @@ pub fn visible_receipt_query(agent_id: i64, message_id: i64) -> (String, Vec<Val
 /// Oldest-first ids of the visible project deliveries an agent has not read.
 ///
 /// Optionally only those created at or before `older_than`. Returns
-/// `(sql, params)` selecting at most `limit` `message_id` rows.
+/// `(sql, params)` selecting at most `limit` rows with `message_id` and the
+/// viewer's existing `ack_ts`, so read-only mutations can verify it is preserved.
 #[must_use]
 pub fn unread_visible_query(
     agent_id: i64,
@@ -811,7 +815,7 @@ pub fn unread_visible_query(
     limit: i64,
 ) -> (String, Vec<Value>) {
     let mut sql = format!(
-        "SELECT d.message_id AS message_id \
+        "SELECT d.message_id AS message_id, pr.ack_ts AS ack_ts \
          FROM project_mailbox_deliveries d \
          JOIN messages m ON m.id = d.message_id \
          JOIN agents viewer ON viewer.id = ? \

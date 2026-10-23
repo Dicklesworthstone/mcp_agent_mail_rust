@@ -12398,104 +12398,11 @@ pub async fn mark_all_messages_read_in_project(
     project_id: i64,
     agent_id: i64,
 ) -> Outcome<i64, DbError> {
-    let now = now_micros();
-
-    run_with_mvcc_retry(cx, "mark_all_messages_read_in_project", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-        // Identify which messages are actually unread for this agent in this project.
-        // We do this explicitly to avoid trusting unreliable rows_affected from UPDATE.
-        let find_sql = "SELECT m.id FROM message_recipients r \
-                        JOIN messages m ON m.id = r.message_id \
-                        WHERE r.agent_id = ? AND r.read_ts IS NULL \
-                        AND m.project_id = ?";
-        let find_params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-        // Route through try_in_tx! so the open BEGIN CONCURRENT is rolled back on
-        // cancel/panic too (the bare match previously only rolled back on Err,
-        // leaking a half-open transaction back into the pool on cancellation).
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
-        );
-
-        let mut message_ids = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let Some(message_id) = row_first_i64(row) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "unread inbox query returned a message without an integer id".to_string(),
-                ));
-            };
-            message_ids.push(message_id);
-        }
-
-        if !message_ids.is_empty() {
-            // Update the exact rows selected above. In addition to keeping the
-            // count truthful, bounded chunks avoid executor limits in large
-            // subquery-backed UPDATEs and keep the whole operation atomic.
-            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-                let ph = placeholders(chunk.len());
-                let sql = format!(
-                    "UPDATE message_recipients \
-                     SET read_ts = ? \
-                     WHERE agent_id = ? AND read_ts IS NULL \
-                     AND message_id IN ({ph})"
-                );
-                let mut params = Vec::with_capacity(2 + chunk.len());
-                params.push(Value::BigInt(now));
-                params.push(Value::BigInt(agent_id));
-                params.extend(chunk.iter().copied().map(Value::BigInt));
-                try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
-                );
-            }
-
-            // Do not report a successful bulk transition unless every row
-            // selected in this transaction is now read. A partial executor
-            // result must roll the entire transaction back rather than leave
-            // inbox state and the returned count out of sync.
-            let unread_after = try_in_tx!(
-                cx,
-                &tracked,
-                map_sql_outcome(traw_query(cx, &tracked, find_sql, &find_params).await)
-            );
-            if !unread_after.is_empty() {
-                let remaining = unread_after.len();
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(format!(
-                    "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
-                )));
-            }
-
-            // Rebuild inbox_stats from ground truth.
-            try_in_tx!(
-                cx,
-                &tracked,
-                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
-            );
-        }
-
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        // Post-commit invalidation — see mark_message_read.
-        crate::cache::read_cache()
-            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
-
-        let count_i64 =
-            i64::try_from(message_ids.len()).expect("message recipient count fits in i64");
-        Outcome::Ok(count_i64)
-    })
-    .await
+    // The web action has no cap, but it must use the same shared visibility,
+    // receipt verification and single transaction as the MCP/CLI action.
+    mark_messages_read_bulk(cx, pool, project_id, agent_id, None, usize::MAX)
+        .await
+        .map(|outcome| i64::try_from(outcome.marked).expect("selected message count fits in i64"))
 }
 
 /// Result of a capped bulk mark-read pass (GH#273).
@@ -12506,6 +12413,164 @@ pub struct BulkMarkReadOutcome {
     /// True when more unread messages matching the filters remain (the caller
     /// should call again to continue draining the backlog).
     pub more: bool,
+}
+
+struct BulkReadReceipt {
+    message_id: i64,
+    ack_ts: Option<i64>,
+    shared: bool,
+}
+
+fn decode_bulk_read_receipts(
+    rows: &[SqlRow],
+    shared: bool,
+) -> std::result::Result<Vec<BulkReadReceipt>, DbError> {
+    rows.iter()
+        .map(|row| {
+            Ok(BulkReadReceipt {
+                message_id: row
+                    .get_named("message_id")
+                    .map_err(|error| DbError::Sqlite(error.to_string()))?,
+                ack_ts: crate::project_mailbox::receipt_timestamp(row, "ack_ts")?,
+                shared,
+            })
+        })
+        .collect()
+}
+
+async fn select_bulk_read_receipts_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    agent_id: i64,
+    older_than_us: Option<i64>,
+    limit: usize,
+) -> Outcome<(Vec<BulkReadReceipt>, bool), DbError> {
+    // Each lane over-fetches one; merging before truncation gives direct and
+    // shared mail one globally oldest-first budget. Shared visibility excludes
+    // every direct delivery, including direct messages that are already read.
+    let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut direct_sql = String::from(
+        "SELECT m.id AS message_id, r.ack_ts AS ack_ts FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE r.agent_id = ? AND r.read_ts IS NULL AND m.project_id = ?",
+    );
+    let mut direct_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
+    if let Some(cutoff) = older_than_us {
+        direct_sql.push_str(" AND m.created_ts <= ?");
+        direct_params.push(Value::BigInt(cutoff));
+    }
+    direct_sql.push_str(" ORDER BY m.id LIMIT ?");
+    direct_params.push(Value::BigInt(overfetch));
+    let direct_rows = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(traw_query(cx, tracked, &direct_sql, &direct_params).await)
+    );
+    let (shared_sql, shared_params) = crate::project_mailbox::unread_visible_query(
+        agent_id,
+        project_id,
+        older_than_us,
+        overfetch,
+    );
+    let shared_rows =
+        match map_sql_outcome(traw_query(cx, tracked, &shared_sql, &shared_params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error)
+                if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                    &error.to_string(),
+                ) =>
+            {
+                if let Err(error) = crate::project_mailbox::allow_absent_shared_schema(
+                    tracked.inner,
+                    &error.to_string(),
+                ) {
+                    return Outcome::Err(error);
+                }
+                Vec::new()
+            }
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+    let mut receipts = match decode_bulk_read_receipts(&direct_rows, false) {
+        Ok(receipts) => receipts,
+        Err(error) => return Outcome::Err(error),
+    };
+    match decode_bulk_read_receipts(&shared_rows, true) {
+        Ok(shared) => receipts.extend(shared),
+        Err(error) => return Outcome::Err(error),
+    }
+    receipts.sort_unstable_by_key(|receipt| receipt.message_id);
+    let more = receipts.len() > limit;
+    receipts.truncate(limit);
+    Outcome::Ok((receipts, more))
+}
+
+async fn verify_bulk_read_receipts_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    now: i64,
+    receipts: &[BulkReadReceipt],
+) -> Outcome<(), DbError> {
+    for (shared, table) in [
+        (false, "message_recipients"),
+        (true, "project_mailbox_receipts"),
+    ] {
+        let expected: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| receipt.shared == shared)
+            .collect();
+        for chunk in expected.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let sql = format!(
+                "SELECT message_id, read_ts, ack_ts FROM {table} \
+                 WHERE agent_id = ? AND message_id IN ({ph}) ORDER BY message_id"
+            );
+            let mut params = Vec::with_capacity(1 + chunk.len());
+            params.push(Value::BigInt(agent_id));
+            params.extend(
+                chunk
+                    .iter()
+                    .map(|receipt| Value::BigInt(receipt.message_id)),
+            );
+            let rows = try_in_tx!(
+                cx,
+                tracked,
+                map_sql_outcome(traw_query(cx, tracked, &sql, &params).await)
+            );
+            if rows.len() != chunk.len() {
+                return Outcome::Err(DbError::Internal(format!(
+                    "bulk mark-read did not store every selected {table} receipt for agent {agent_id}"
+                )));
+            }
+            for (row, expected) in rows.iter().zip(chunk) {
+                let message_id = match row.get_named::<i64>("message_id") {
+                    Ok(message_id) => message_id,
+                    Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+                };
+                let read_ts = match crate::project_mailbox::receipt_timestamp(row, "read_ts") {
+                    Ok(timestamp) => timestamp,
+                    Err(error) => return Outcome::Err(error),
+                };
+                let ack_ts = match crate::project_mailbox::receipt_timestamp(row, "ack_ts") {
+                    Ok(timestamp) => timestamp,
+                    Err(error) => return Outcome::Err(error),
+                };
+                if message_id != expected.message_id
+                    || read_ts != Some(now)
+                    || ack_ts != expected.ack_ts
+                {
+                    return Outcome::Err(DbError::Internal(format!(
+                        "bulk mark-read did not store the expected read-only receipt for message {} and agent {agent_id}",
+                        expected.message_id
+                    )));
+                }
+            }
+        }
+    }
+    Outcome::Ok(())
 }
 
 /// Mark up to `limit` unread messages read for one agent in one project.
@@ -12522,6 +12587,8 @@ pub struct BulkMarkReadOutcome {
 ///   (lowest id) are marked first, and the returned `more` flag reports
 ///   whether eligible unread rows remain past the cap.
 ///
+/// Direct and visible shared-project mail share that one limit. A direct
+/// delivery takes precedence over the same message's shared delivery.
 /// Read receipts only: acknowledgement state (`ack_ts`) is never touched.
 pub async fn mark_messages_read_bulk(
     cx: &Cx,
@@ -12540,149 +12607,54 @@ pub async fn mark_messages_read_bulk(
     let now = now_micros();
 
     run_with_mvcc_retry(cx, "mark_messages_read_bulk", || async {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+        let tracked = tracked(&*conn);
 
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-        // Select the exact unread rows this call will transition (oldest-first
-        // by id, over-fetch by one to detect remaining backlog) so the count
-        // and the `more` flag are truthful even with unreliable rows_affected.
-        let mut find_sql = String::from(
-            "SELECT m.id FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             WHERE r.agent_id = ? AND r.read_ts IS NULL \
-             AND m.project_id = ?",
-        );
-        let mut find_params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
-        if let Some(cutoff) = older_than_us {
-            find_sql.push_str(" AND m.created_ts <= ?");
-            find_params.push(Value::BigInt(cutoff));
-        }
-        find_sql.push_str(" ORDER BY m.id LIMIT ?");
-        let overfetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        find_params.push(Value::BigInt(overfetch));
-
-        let rows = try_in_tx!(
+        let (receipts, more) = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &find_sql, &find_params).await)
+            select_bulk_read_receipts_in_tx(
+                cx,
+                &tracked,
+                project_id,
+                agent_id,
+                older_than_us,
+                limit,
+            )
+            .await
         );
-
-        let mut message_ids = Vec::with_capacity(rows.len().min(limit));
-        for row in &rows {
-            let Some(message_id) = row_first_i64(row) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "bulk mark-read query returned a message without an integer id".to_string(),
-                ));
-            };
-            if message_ids.len() < limit {
-                message_ids.push(message_id);
-            }
-        }
-        let more = rows.len() > limit;
-
-        if !message_ids.is_empty() {
-            for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
-                let ph = placeholders(chunk.len());
-                let sql = format!(
-                    "UPDATE message_recipients \
-                     SET read_ts = ? \
-                     WHERE agent_id = ? AND read_ts IS NULL \
-                     AND message_id IN ({ph})"
-                );
-                let mut params = Vec::with_capacity(2 + chunk.len());
-                params.push(Value::BigInt(now));
-                params.push(Value::BigInt(agent_id));
-                params.extend(chunk.iter().copied().map(Value::BigInt));
-                try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
-                );
-
-                // Do not report success unless every selected row in this
-                // chunk is now read (see mark_all_messages_read_in_project).
-                let verify_sql = format!(
-                    "SELECT COUNT(*) FROM message_recipients \
-                     WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
-                );
-                let mut verify_params = Vec::with_capacity(1 + chunk.len());
-                verify_params.push(Value::BigInt(agent_id));
-                verify_params.extend(chunk.iter().copied().map(Value::BigInt));
-                let verify_rows = try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &verify_params).await)
-                );
-                let remaining = verify_rows.first().and_then(row_first_i64).unwrap_or(0);
-                if remaining > 0 {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(DbError::Internal(format!(
-                        "bulk mark-read left {remaining} unread rows in project {project_id} for agent {agent_id}"
-                    )));
-                }
-            }
-
-            // Rebuild inbox_stats from ground truth.
+        let direct_ids: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| !receipt.shared)
+            .map(|receipt| receipt.message_id)
+            .collect();
+        for chunk in direct_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let sql = format!(
+                "UPDATE message_recipients SET read_ts = ? \
+                 WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({ph})"
+            );
+            let mut params = Vec::with_capacity(2 + chunk.len());
+            params.push(Value::BigInt(now));
+            params.push(Value::BigInt(agent_id));
+            params.extend(chunk.iter().copied().map(Value::BigInt));
             try_in_tx!(
                 cx,
                 &tracked,
-                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
+                map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
             );
         }
-
-        // GH#282: the remaining budget clears this agent's unread project
-        // mailbox mail (its own lazy receipts). With no budget left, one row
-        // is enough to report that more remains.
-        let shared_budget = limit - message_ids.len();
-        let (shared_sql, shared_params) = crate::project_mailbox::unread_visible_query(
-            agent_id,
-            project_id,
-            older_than_us,
-            i64::try_from(shared_budget.saturating_add(1)).unwrap_or(i64::MAX),
-        );
-        let shared_rows =
-            match map_sql_outcome(traw_query(cx, &tracked, &shared_sql, &shared_params).await) {
-                Outcome::Ok(rows) => rows,
-                Outcome::Err(error)
-                    if crate::project_mailbox::is_missing_project_mailbox_table_error(
-                        &error.to_string(),
-                    ) =>
-                {
-                    Vec::new()
-                }
-                Outcome::Err(error) => {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Err(error);
-                }
-                Outcome::Cancelled(reason) => {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Cancelled(reason);
-                }
-                Outcome::Panicked(payload) => {
-                    rollback_tx(cx, &tracked).await;
-                    return Outcome::Panicked(payload);
-                }
-            };
-        let more = more || shared_rows.len() > shared_budget;
-        let mut shared_marked = 0usize;
-        for row in shared_rows.iter().take(shared_budget) {
-            let Some(message_id) = row_first_i64(row) else {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(DbError::Internal(
-                    "bulk mark-read project mailbox query returned a non-integer id".to_string(),
-                ));
-            };
+        for receipt in receipts.iter().filter(|receipt| receipt.shared) {
             for (sql, params) in crate::project_mailbox::receipt_write_statements(
                 crate::project_mailbox::ReceiptUpdate::Read,
-                message_id,
+                receipt.message_id,
                 agent_id,
                 now,
             ) {
@@ -12692,8 +12664,23 @@ pub async fn mark_messages_read_bulk(
                     map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
                 );
             }
-            shared_marked += 1;
         }
+        if !direct_ids.is_empty() {
+            try_in_tx!(
+                cx,
+                &tracked,
+                rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
+            );
+        }
+        // Check the complete selected set after every write, including the
+        // stats rebuild. Suppressed inserts/updates, missing rows, ACK changes
+        // and a later write undoing an earlier chunk must all roll back both
+        // delivery lanes instead of reporting a partially successful drain.
+        try_in_tx!(
+            cx,
+            &tracked,
+            verify_bulk_read_receipts_in_tx(cx, &tracked, agent_id, now, &receipts).await
+        );
 
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         // Post-commit invalidation — see mark_message_read.
@@ -12701,7 +12688,7 @@ pub async fn mark_messages_read_bulk(
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
         Outcome::Ok(BulkMarkReadOutcome {
-            marked: u64::try_from(message_ids.len() + shared_marked).unwrap_or(u64::MAX),
+            marked: u64::try_from(receipts.len()).expect("selected message count fits in u64"),
             more,
         })
     })
@@ -25717,6 +25704,339 @@ mod tests {
                 1,
                 "another agent's unread state is untouched"
             );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bulk_mark_read_merges_shared_mail_with_one_limit_and_viewer_receipts() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("bulk_shared_read.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'shared', '/tmp/bulk-shared', 0),
+                        (2, 'foreign', '/tmp/bulk-foreign', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0),
+                        (3, 1, 'Peer', 'test', 'test', 0, 0),
+                        (4, 1, 'Late', 'test', 'test', 1000, 0),
+                        (5, 1, 'Retired', 'test', 'test', 0, 0),
+                        (6, 1, 'Blocked', 'test', 'test', 0, 0),
+                        (7, 2, 'Foreign', 'test', 'test', 0, 0);
+                 UPDATE agents SET retired_at = 42 WHERE id = 5;
+                 UPDATE agents SET contact_policy = 'block_all' WHERE id = 6;
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'oldest shared', '', 100, 1),
+                        (2, 1, 1, 'direct ack preserved', '', 200, 1),
+                        (3, 1, 1, 'direct precedence', '', 200, 1),
+                        (4, 1, 1, 'shared already read', '', 200, 1),
+                        (5, 1, 2, 'viewer authored', '', 200, 1),
+                        (6, 1, 1, 'fresh shared', '', 600, 1),
+                        (7, 2, 7, 'foreign project', '', 200, 1),
+                        (8, 1, 1, 'direct already read', '', 200, 1),
+                        (9, 1, 1, 'shared ack preserved', '', 300, 1),
+                        (11, 1, 1, 'fresh direct', '', 700, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (2, 2, 'to', NULL, 22), (3, 2, 'cc', NULL, 33),
+                        (8, 2, 'to', 88, 88), (11, 2, 'to', NULL, NULL);
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (1, 1, 'to', 100), (3, 1, 'to', 200), (4, 1, 'to', 200),
+                        (5, 1, 'to', 200), (6, 1, 'to', 600), (7, 2, 'to', 200),
+                        (8, 1, 'to', 200), (9, 1, 'to', 300);
+                 INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+                 VALUES (1, 3, 111, 112), (3, 2, NULL, 333),
+                        (4, 2, 44, NULL), (9, 2, NULL, 99);",
+            )
+            .unwrap();
+            drop(conn);
+
+            assert_eq!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, None, 0)
+                    .await
+                    .into_result()
+                    .unwrap(),
+                BulkMarkReadOutcome { marked: 0, more: false }
+            );
+            let first = mark_messages_read_bulk(&cx, &pool, 1, 2, Some(300), 1)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(first, BulkMarkReadOutcome { marked: 1, more: true });
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn
+                .query_sync("SELECT message_id FROM project_mailbox_receipts WHERE agent_id = 2 AND read_ts IS NOT NULL ORDER BY message_id", &[])
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.get_named::<i64>("message_id").unwrap()).collect::<Vec<_>>(),
+                vec![1, 4],
+                "the oldest shared message wins the cap before newer direct mail"
+            );
+            let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 2 AND agent_id = 2", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None);
+            drop(conn);
+
+            assert_eq!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, Some(300), 2)
+                    .await.into_result().unwrap(),
+                BulkMarkReadOutcome { marked: 2, more: true }
+            );
+            assert_eq!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, Some(300), 1)
+                    .await.into_result().unwrap(),
+                BulkMarkReadOutcome { marked: 1, more: false },
+                "the inclusive age boundary clears shared mail without counting fresh mail"
+            );
+            assert_eq!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2)
+                    .await.into_result().unwrap(),
+                2,
+                "the uncapped action drains the remaining direct and shared messages"
+            );
+            assert_eq!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2)
+                    .await.into_result().unwrap(),
+                0,
+                "already-read direct/shared duplicates are never counted again"
+            );
+            for hidden_viewer in [4, 5, 6, 7] {
+                assert_eq!(
+                    mark_all_messages_read_in_project(&cx, &pool, 1, hidden_viewer)
+                        .await.into_result().unwrap(),
+                    0,
+                    "late, retired, blocked and foreign agents cannot claim shared receipts"
+                );
+            }
+            let stats = get_inbox_stats(&cx, &pool, 2)
+                .await.into_result().unwrap().unwrap();
+            assert_eq!(stats.unread_count, 0);
+            assert_eq!(stats.ack_pending_count, 1);
+            assert!(fetch_inbox_unread(&cx, &pool, 1, 2, false, None, 100)
+                .await.into_result().unwrap().is_empty());
+            assert_eq!(fetch_inbox_unread(&cx, &pool, 1, 3, false, None, 100)
+                .await.into_result().unwrap().len(), 6);
+
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync(
+                "SELECT message_id, ack_ts FROM message_recipients WHERE agent_id = 2 ORDER BY message_id",
+                &[],
+            ).unwrap();
+            let direct: Vec<_> = rows.iter().map(|row| (
+                row.get_named::<i64>("message_id").unwrap(),
+                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+            )).collect();
+            assert_eq!(direct, vec![(2, Some(22)), (3, Some(33)), (8, Some(88)), (11, None)]);
+            let rows = conn.query_sync(
+                "SELECT message_id, read_ts, ack_ts FROM project_mailbox_receipts WHERE agent_id = 2 ORDER BY message_id",
+                &[],
+            ).unwrap();
+            let shared: Vec<_> = rows.iter().map(|row| (
+                row.get_named::<i64>("message_id").unwrap(),
+                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                row.get_named::<Option<i64>>("ack_ts").unwrap(),
+            )).collect();
+            assert_eq!(shared.iter().map(|row| row.0).collect::<Vec<_>>(), vec![1, 3, 4, 6, 9]);
+            assert_eq!(shared[1], (3, None, Some(333)), "direct receipt remains authoritative");
+            assert_eq!(shared[2], (4, Some(44), None), "existing reads remain unchanged");
+            assert!(shared[0].1.is_some() && shared[3].1.is_some() && shared[4].1.is_some());
+            assert_eq!((shared[0].2, shared[3].2, shared[4].2), (None, None, Some(99)));
+            let rows = conn.query_sync(
+                "SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE message_id = 1 AND agent_id = 3",
+                &[],
+            ).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), Some(111));
+            assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), Some(112));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bulk_mark_read_rolls_back_both_lanes_when_shared_receipts_are_not_stored() {
+        for (label, trigger, uncapped) in [
+            (
+                "suppressed_insert",
+                "CREATE TRIGGER sabotage_receipt BEFORE INSERT ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN SELECT RAISE(IGNORE); END;",
+                false,
+            ),
+            (
+                "suppressed_update",
+                "CREATE TRIGGER sabotage_receipt BEFORE UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN SELECT RAISE(IGNORE); END;",
+                true,
+            ),
+            (
+                "changed_ack",
+                "CREATE TRIGGER sabotage_receipt AFTER UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 AND NEW.ack_ts IS NULL BEGIN
+                   UPDATE project_mailbox_receipts SET ack_ts = 777 WHERE message_id = 3 AND agent_id = 2;
+                 END;",
+                false,
+            ),
+            (
+                "later_shared_write_undoes_direct",
+                "CREATE TRIGGER sabotage_receipt AFTER UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN
+                   UPDATE message_recipients SET read_ts = NULL WHERE message_id = 1 AND agent_id = 2;
+                 END;",
+                true,
+            ),
+            (
+                "later_shared_write_undoes_shared",
+                "CREATE TRIGGER sabotage_receipt AFTER UPDATE ON project_mailbox_receipts
+                 WHEN NEW.message_id = 3 BEGIN
+                   UPDATE project_mailbox_receipts SET read_ts = NULL WHERE message_id = 2 AND agent_id = 2;
+                 END;",
+                false,
+            ),
+        ] {
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime");
+            let dir = tempfile::tempdir().expect("receipt fixture");
+            let db_path = dir.path().join(format!("bulk_{label}.db"));
+            let seed = crate::DbConn::open_file(db_path.display().to_string()).unwrap();
+            seed.execute_raw(crate::schema::PRAGMA_DB_INIT_SQL).unwrap();
+            seed.execute_raw(&crate::schema::init_schema_sql_base()).unwrap();
+            rt.block_on(async {
+                let cx = Cx::current().expect("migration context");
+                crate::schema::migrate_to_latest_base(&cx, &seed)
+                    .await.into_result().unwrap();
+            });
+            seed.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'atomic', '/tmp/bulk-atomic', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'direct', '', 100, 1),
+                        (2, 1, 1, 'first shared', '', 200, 1),
+                        (3, 1, 1, 'last shared', '', 300, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind)
+                 VALUES (1, 2, 'to');
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (2, 1, 'to', 200), (3, 1, 'to', 300);
+                 INSERT OR REPLACE INTO inbox_stats
+                     (agent_id, total_count, unread_count, ack_pending_count)
+                 VALUES (2, 99, 99, 99);",
+            )
+            .unwrap();
+            // Install the real trigger before pooled transactions begin.
+            seed.execute_raw(trigger).unwrap();
+            drop(seed);
+            let pool = crate::create_pool(&crate::pool::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            rt.block_on(async {
+                let cx = Cx::current().expect("runtime context");
+                let outcome = if uncapped {
+                    mark_all_messages_read_in_project(&cx, &pool, 1, 2).await.map(|_| ())
+                } else {
+                    mark_messages_read_bulk(&cx, &pool, 1, 2, None, 3).await.map(|_| ())
+                };
+                assert!(
+                    matches!(outcome, Outcome::Err(DbError::Internal(ref message))
+                        if message.contains("did not store")),
+                    "{label}: {outcome:?}"
+                );
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                let rows = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2",
+                    &[],
+                ).unwrap();
+                assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "{label}: direct update rolls back");
+                assert_eq!(rows[0].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                let rows = conn.query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[]).unwrap();
+                assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 0, "{label}: all lazy shared receipts roll back");
+                let rows = conn.query_sync("SELECT total_count FROM inbox_stats WHERE agent_id = 2", &[]).unwrap();
+                assert_eq!(rows[0].get_named::<i64>("total_count").unwrap(), 99, "{label}: stats rebuild rolls back");
+                conn.execute_sync("BEGIN IMMEDIATE", &[]).expect("failure releases the transaction");
+                conn.execute_sync("ROLLBACK", &[]).unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn bulk_mark_read_requires_complete_shared_receipt_authority() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("bulk_shared_schema.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'authority', '/tmp/bulk-authority', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'direct', '', 100, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind)
+                 VALUES (1, 2, 'to');
+                 ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts;
+                 ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                mark_messages_read_bulk(&cx, &pool, 1, 2, None, 1).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "neither failed action commits direct receipts");
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;").unwrap();
+            drop(conn);
+            assert_eq!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2)
+                    .await.into_result().unwrap(),
+                1,
+                "a genuinely absent shared schema still permits direct-only reads"
+            );
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw("UPDATE message_recipients SET read_ts = NULL WHERE message_id = 1 AND agent_id = 2;").unwrap();
+            conn.execute_sync(
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &[Value::BigInt(1), Value::BigInt(1), Value::BigInt(100)],
+            ).unwrap();
+            drop(conn);
+            assert!(matches!(
+                mark_all_messages_read_in_project(&cx, &pool, 1, 2).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let rows = conn.query_sync("SELECT read_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 2", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<Option<i64>>("read_ts").unwrap(), None, "retained project events rule out the legacy exception");
         });
     }
 
