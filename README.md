@@ -1157,7 +1157,7 @@ Overseer messages:
 - Bypass normal contact policies so you can always reach any agent
 - Include a preamble instructing agents to pause current work, handle the request, then resume
 
-Agents see overseer messages in their normal inbox via `fetch_inbox` or `resource://inbox/{name}?project=<abs-path>`. They can reply in-thread like any other message. Everything is stored identically to agent-to-agent messages (Git + SQLite), fully auditable.
+Agents see overseer messages in their normal inbox via `fetch_inbox` or `resource://inbox/{name}?project=<abs-path>`. They can reply in-thread like any other message. The send writes the message to SQLite; the background DB-to-archive reconciler then writes its Git archive copy, in the same envelope as agent-to-agent mail, so it is auditable once reconciled.
 
 ---
 
@@ -1215,7 +1215,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
 | `AM_TUI_FULL_REDRAW_MAX_SECS` | `30` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs terminal desync (e.g. after a mux pane swap). Each forced redraw resends the whole screen, so lower values cost terminal output; `<= 0` disables the bound |
 | `AM_IDEMPOTENCY_RETENTION_SECS` | `86400` | Retention window in seconds for `file_reservation_paths` idempotency keys; invalid or non-positive values fall back to 24 hours |
-| `WORKTREES_ENABLED` | `false` | Build slots feature flag |
+| `WORKTREES_ENABLED` | `false` | Enables build slots and the product bus (`ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product`); while off, those tools return `FEATURE_DISABLED`. `GIT_IDENTITY_ENABLED=true` also enables them |
 | `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run the boot-time `PRAGMA quick_check`; `false` skips only this probe and leaves the background guard enabled |
 | `INTEGRITY_GUARD_ENABLED` | `true` | Enable periodic integrity checks, automatic backups and database maintenance; `false` stops that worker |
 | `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `300` | Background quick-check cadence and initial delay when startup checking is skipped (minimum 1 second) |
@@ -1309,9 +1309,20 @@ are persisted in the database, so replay protection survives server restarts.
 | `AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS` | `60` | Clock-skew tolerance for the validity window. |
 | `AM_REGISTRATION_PROOF_REQUIRE_NONCE` | `true` | Require and consume a single-use nonce per proof (replay protection). |
 
-The canonical signing bytes are explicit (domain-separation tag +
-newline-delimited `field=value` lines; capabilities sorted and de-duplicated),
-so issuers can be written in any language. Verification is expressed through a
+The canonical signing bytes (v2) are explicit, so issuers can be written in any
+language. They are LF-terminated lines:
+
+1. `agent-mail-registration-proof:v2`.
+2. `identity`, `project_key`, `program` and `model`, in that order. Each is
+   `label=N:value`, where N is the value's UTF-8 byte length; values are neither
+   escaped nor trimmed.
+3. `capabilities=N` with the count, then one `capability=N:value` line per
+   capability (trimmed, non-empty, sorted by bytes, de-duplicated).
+4. `issued_at=N` and `expires_at=N` as decimal i64.
+5. `nonce=N:value`.
+
+v1 proofs (`field=value` lines without length prefixes) are rejected; reissue
+them. Verification is expressed through a
 pluggable `ProofVerifier` trait (`crates/mcp-agent-mail-tools/src/proof_gate.rs`);
 the shipped implementation is the Ed25519 trust-anchor verifier, and external
 verifier backends can be added without touching registration call sites.
@@ -1576,7 +1587,7 @@ If the live layer gets sick, the durable ledger can rebuild it.
 | File reservation / advisory locks | Glob patterns, TTL, exclusive/shared, pre-commit guard | Lockfiles (no TTL, no glob) | Build yourself | None |
 | Audit trail | Full Git history of all communication | File timestamps | Depends | Chat logs (if saved) |
 | Cross-repo coordination | Product bus, contact system | Manual | Build yourself | Manual |
-| Search | Search V3 (lexical + semantic + hybrid) | `grep` | Build yourself | Limited |
+| Search | Search V3 (lexical in release binaries; semantic + hybrid in default-feature source builds) | `grep` | Build yourself | Limited |
 | Operational visibility | 16-screen TUI, robot CLI, metrics | None | None | None |
 | Token efficiency | Messages stored externally, not in context | Files in context | Varies | All in context |
 

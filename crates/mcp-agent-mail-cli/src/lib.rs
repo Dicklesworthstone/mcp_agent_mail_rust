@@ -2935,8 +2935,8 @@ pub enum DoctorCommand {
     /// Print the paste-ready agent handbook (Markdown).
     ///
     /// Single source of truth for an agent invoking `am doctor` cold.
-    /// Documents the 10 verbs, 11 exit codes, 5 common workflows, and
-    /// the 11 subsystems. No external lookup needed.
+    /// Documents every verb, the exit codes, the common workflows, and
+    /// the subsystems. No external lookup needed.
     #[command(name = "robot-docs")]
     RobotDocs,
 
