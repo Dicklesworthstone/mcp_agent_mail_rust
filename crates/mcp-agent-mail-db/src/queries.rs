@@ -17829,9 +17829,11 @@ pub struct UnackedInboxRow {
 
 /// Fetch ack-required messages for a specific agent that have NOT been acknowledged.
 ///
-/// Returns messages ordered by `created_ts` ascending (oldest first), limited to
-/// `limit` rows. Each row includes the recipient `read_ts` so callers can report
-/// whether the message was at least read even if not acked.
+/// Direct and visible shared-project deliveries share one oldest-first window,
+/// ordered by creation time and message ID and limited to the requested count.
+/// A direct delivery takes precedence over the same message's project delivery,
+/// including its acknowledgement state. Each row carries the viewer's own read
+/// timestamp; this read never creates shared receipts or marks messages read.
 #[allow(clippy::too_many_lines)]
 pub async fn fetch_unacked_for_agent(
     cx: &Cx,
@@ -17853,117 +17855,88 @@ pub async fn fetch_unacked_for_agent(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+    let direct = format!(
+        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
                   m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                   m.attachments, \
-                  r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts \
+                  r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
            FROM message_recipients r \
            JOIN messages m ON m.id = r.message_id \
            LEFT JOIN agents s ON s.id = m.sender_id \
            WHERE r.agent_id = ? AND m.project_id = ? \
-             AND m.ack_required = 1 AND r.ack_ts IS NULL \
-           ORDER BY m.created_ts ASC \
-           LIMIT ?"
+             AND m.ack_required = 1 AND r.ack_ts IS NULL"
     );
-
-    let params: Vec<Value> = vec![
+    let visibility = crate::project_mailbox::visible_to_viewer_sql!();
+    let shared = format!(
+        "SELECT m.id AS id, m.project_id, m.sender_id, m.thread_id, m.topic, m.subject, m.body_md, \
+                m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+                'project' AS kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
+                pr.read_ts, pr.ack_ts \
+         FROM project_mailbox_deliveries d \
+         JOIN messages m ON m.id = d.message_id \
+         JOIN agents viewer ON viewer.id = ? \
+         LEFT JOIN agents s ON s.id = m.sender_id \
+         LEFT JOIN project_mailbox_receipts pr \
+                ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+         WHERE d.project_id = ? AND {visibility} \
+           AND m.ack_required = 1 AND pr.ack_ts IS NULL"
+    );
+    // One statement observes both delivery kinds and their receipts together.
+    // As in the product inbox, render the validated integer limit: the pinned
+    // compound-select executor does not bind LIMIT parameters.
+    let sql =
+        format!("{direct} UNION ALL {shared} ORDER BY created_ts ASC, id ASC LIMIT {limit_i64}");
+    let params = [
         Value::BigInt(agent_id),
         Value::BigInt(project_id),
-        Value::BigInt(limit_i64),
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
     ];
-
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: i64 = match row.get_as(0) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let proj_id: i64 = match row.get_as(1) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_id: i64 = match row.get_as(2) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let thread_id: Option<String> = match row.get_as(3) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let topic: Option<String> = match row.get_as(4) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let subject: String = match row.get_as(5) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let body_md: String = match row.get_as(6) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let importance: String = match row.get_as(7) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let ack_required: i64 = match row.get_as(8) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let created_ts: i64 = match row.get_as(9) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let recipients_json: String = match row.get_as(10) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let attachments: String = match row.get_as(11) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let kind: String = match row.get_as(12) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let sender_name: String = match row.get_as(13) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-                let read_ts: Option<i64> = match row.get_as(14) {
-                    Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
-                };
-
-                out.push(UnackedInboxRow {
-                    message: MessageRow {
-                        id: Some(id),
-                        project_id: proj_id,
-                        sender_id,
-                        thread_id,
-                        topic,
-                        subject,
-                        body_md,
-                        importance,
-                        ack_required,
-                        created_ts,
-                        recipients_json,
-                        attachments,
-                    },
-                    kind,
-                    sender_name,
-                    read_ts,
-                });
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            // Only a genuinely pre-upgrade mailbox may fall back to direct
+            // mail. Retained shared receipts/events or a broken schema must
+            // never turn pending acknowledgements into an empty success.
+            if let Err(error) =
+                crate::project_mailbox::allow_absent_shared_schema(&**conn, &error.to_string())
+            {
+                return Outcome::Err(error);
             }
-            Outcome::Ok(out)
+            let direct = format!("{direct} ORDER BY m.created_ts ASC, m.id ASC LIMIT ?");
+            let params = [
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(limit_i64),
+            ];
+            match map_sql_outcome(traw_query(cx, &tracked, &direct, &params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decode_inbox_row_indexed(&row) {
+            Ok(row) => out.push(UnackedInboxRow {
+                message: row.message,
+                kind: row.kind,
+                sender_name: row.sender_name,
+                read_ts: row.read_ts,
+            }),
+            Err(error) => return Outcome::Err(error),
+        }
     }
+    Outcome::Ok(out)
 }
 
 /// Insert a raw agent row without name validation (for ops/system agents).
@@ -35593,6 +35566,190 @@ mod tests {
                 .expect("find orphaned-project global inbox row");
             assert_eq!(row.project_id, project_id);
             assert_eq!(row.project_slug, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fetch_unacked_merges_shared_obligations_with_viewer_receipts_and_oldest_limit() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("unacked_shared.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'shared', '/tmp/unacked-shared', 0),
+                        (2, 'other', '/tmp/unacked-other', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0),
+                        (3, 1, 'Peer', 'test', 'test', 0, 0),
+                        (4, 1, 'Late', 'test', 'test', 900, 0),
+                        (5, 1, 'Retired', 'test', 'test', 0, 0),
+                        (6, 1, 'Blocked', 'test', 'test', 0, 0),
+                        (7, 2, 'Foreign', 'test', 'test', 0, 0);
+                 UPDATE agents SET retired_at = 42 WHERE id = 5;
+                 UPDATE agents SET contact_policy = 'block_all' WHERE id = 6;
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+                 VALUES (1, 1, 1, 'shared urgent', '', 100, 'urgent', 1),
+                        (2, 1, 1, 'direct precedence', '', 200, 'high', 1),
+                        (3, 1, 1, 'direct already acked', '', 50, 'normal', 1),
+                        (4, 1, 1, 'no ack required', '', 300, 'normal', 0),
+                        (5, 1, 2, 'viewer authored', '', 60, 'normal', 1),
+                        (6, 1, 1, 'direct timestamp tie', '', 100, 'normal', 1),
+                        (7, 2, 7, 'other project', '', 70, 'normal', 1),
+                        (8, 1, 1, 'acked but unread', '', 90, 'normal', 1),
+                        (9, 1, 1, 'read but unacked', '', 150, 'normal', 1);
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES (1, 1, 'to', 100), (2, 1, 'to', 200), (3, 1, 'to', 50),
+                        (4, 1, 'to', 300), (5, 1, 'to', 60), (7, 2, 'to', 70),
+                        (8, 1, 'to', 90), (9, 1, 'to', 150);
+                 INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (2, 2, 'cc', 210, NULL), (3, 2, 'to', 90, 90),
+                        (6, 2, 'to', NULL, NULL);
+                 INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+                 VALUES (1, 3, 110, 111), (2, 2, 220, 230),
+                        (8, 2, NULL, 91), (9, 2, 160, NULL);",
+            )
+            .unwrap();
+            drop(conn);
+
+            let rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 100)
+                .await
+                .into_result()
+                .unwrap();
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|row| (row.message.id.unwrap(), row.kind.as_str(), row.read_ts))
+                .collect();
+            assert_eq!(
+                actual,
+                vec![
+                    (1, "project", None),
+                    (6, "to", None),
+                    (9, "project", Some(160)),
+                    (2, "cc", Some(210)),
+                ]
+            );
+            let limited = fetch_unacked_for_agent(&cx, &pool, 1, 2, 2)
+                .await
+                .into_result()
+                .unwrap();
+            assert_eq!(
+                limited.iter().map(|row| row.message.id).collect::<Vec<_>>(),
+                vec![Some(1), Some(6)]
+            );
+            assert!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 0)
+                    .await
+                    .into_result()
+                    .unwrap()
+                    .is_empty()
+            );
+            for viewer in [4, 5, 6, 7] {
+                assert!(
+                    fetch_unacked_for_agent(&cx, &pool, 1, viewer, 100)
+                        .await
+                        .into_result()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            let receipts = conn
+                .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+                .unwrap();
+            assert_eq!(receipts[0].get_named::<i64>("n").unwrap(), 4);
+            let activity = conn
+                .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+                .unwrap();
+            assert_eq!(activity[0].get_named::<i64>("n").unwrap(), 0);
+            drop(conn);
+
+            acknowledge_message(&cx, &pool, 2, 9)
+                .await
+                .into_result()
+                .unwrap();
+            let viewer_rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 100)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(viewer_rows.iter().all(|row| row.message.id != Some(9)));
+            let peer_rows = fetch_unacked_for_agent(&cx, &pool, 1, 3, 100)
+                .await
+                .into_result()
+                .unwrap();
+            assert!(peer_rows.iter().any(|row| row.message.id == Some(9)));
+        });
+    }
+
+    #[test]
+    fn fetch_unacked_falls_back_only_for_a_genuinely_absent_shared_schema() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (_setup_cx, pool, _dir) = setup_test_pool("unacked_shared_schema.db");
+        rt.block_on(async {
+            let cx = Cx::current().expect("runtime installs context");
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'legacy', '/tmp/unacked-legacy', 0);
+                 INSERT INTO agents
+                     (id, project_id, name, program, model, inception_ts, last_active_ts)
+                 VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                        (2, 1, 'Viewer', 'test', 'test', 0, 0);
+                 INSERT INTO messages
+                     (id, project_id, sender_id, subject, body_md, created_ts, ack_required)
+                 VALUES (1, 1, 1, 'direct obligation', '', 10, 1);
+                 INSERT INTO message_recipients (message_id, agent_id, kind)
+                 VALUES (1, 2, 'to');
+                 ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw(
+                "ALTER TABLE retained_receipts RENAME TO project_mailbox_receipts;
+                 ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries;",
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_raw("ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts;")
+                .unwrap();
+            drop(conn);
+            let rows = fetch_unacked_for_agent(&cx, &pool, 1, 2, 10)
+                .await
+                .into_result()
+                .expect("genuinely old schema retains direct obligations");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].message.id, Some(1));
+
+            let conn = pool.acquire(&cx).await.into_result().unwrap();
+            conn.execute_sync(
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &[Value::BigInt(1), Value::BigInt(1), Value::BigInt(10)],
+            )
+            .unwrap();
+            drop(conn);
+            assert!(matches!(
+                fetch_unacked_for_agent(&cx, &pool, 1, 2, 10).await,
+                Outcome::Err(_)
+            ));
         });
     }
 

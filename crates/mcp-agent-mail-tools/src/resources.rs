@@ -6957,6 +6957,109 @@ mod resource_shape_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn acknowledgement_views_include_shared_mail_and_keep_receipts_per_viewer() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = seed_pool();
+                let project_key = format!("/tmp/resources-shared-acks-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap();
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let viewer = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                register_agent(&cx, &pool, project_id, "GreenStone").await;
+                let message = queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap(),
+                    "Shared acknowledgement",
+                    "All eligible project readers need their own acknowledgement.",
+                    None,
+                    None,
+                    None,
+                    "high",
+                    true,
+                    "[]",
+                    &[],
+                    Some("to"),
+                )
+                .await
+                .into_result()
+                .expect("create shared message through the normal send query");
+                let message_id = message.id.unwrap();
+                let conn = pool.acquire(&cx).await.into_result().unwrap();
+                conn.execute_sync(
+                    "UPDATE agents SET inception_ts = 0 WHERE project_id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id)],
+                )
+                .unwrap();
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = created_ts - ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(120_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                    ],
+                )
+                .unwrap();
+                drop(conn);
+                let ctx = McpContext::new(cx.clone(), 1);
+
+                for agent in ["RedPeak", "GreenStone"] {
+                    let stale = parse_json(
+                        &views_acks_stale(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_seconds=60"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(stale["count"], 1);
+                    assert_eq!(stale["messages"][0]["id"], message_id);
+                    assert_eq!(stale["messages"][0]["kind"], "project");
+                    assert!(stale["messages"][0].get("read_at").is_none());
+                    let overdue = parse_json(
+                        &views_ack_overdue(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_minutes=1"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(overdue["count"], 1);
+                    assert_eq!(overdue["messages"][0]["id"], message_id);
+                    assert_eq!(overdue["messages"][0]["kind"], "project");
+                }
+
+                queries::acknowledge_message(&cx, &pool, viewer.id.unwrap(), message_id)
+                    .await
+                    .into_result()
+                    .unwrap();
+                for (agent, expected_count) in [("RedPeak", 0), ("GreenStone", 1)] {
+                    let stale = parse_json(
+                        &views_acks_stale(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_seconds=60"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(stale["count"], expected_count);
+                    let overdue = parse_json(
+                        &views_ack_overdue(
+                            &ctx,
+                            format!("{agent}?project={project_key}&ttl_minutes=1"),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert_eq!(overdue["count"], expected_count);
+                }
+            });
+        });
+    }
+
+    #[test]
     fn resources_surface_malformed_message_metadata() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
