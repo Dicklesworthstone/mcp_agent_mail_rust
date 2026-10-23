@@ -1331,11 +1331,23 @@ std::thread_local! {
     // window, so panic regressions exercise lock unwinding and queue progress.
     static WBQ_BEFORE_EXECUTE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    // Observe a real failed attempt after its guards unwind and before retry
+    // backoff, so liveness tests do not depend on catching a timed sleep.
+    static WBQ_BEFORE_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn wbq_run_before_execute_test_hook() {
     let hook = WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn wbq_run_before_retry_test_hook() {
+    let hook = WBQ_BEFORE_RETRY_TEST_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -3661,16 +3673,23 @@ fn write_op_storage_root(op: &WriteOp) -> &Path {
 }
 
 fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
-    let _mutation = envelopes
-        .first()
-        .map_or_else(ArchiveMutationGuard::begin, |envelope| {
-            ArchiveMutationGuard::begin_at(write_op_storage_root(envelope.op.as_ref()))
-        });
     debug_assert!(!envelopes.is_empty());
 
     let mut attempts = 0;
     loop {
-        match wbq_execute_message_bundle_batch_inner(envelopes) {
+        let result = {
+            let _mutation =
+                envelopes
+                    .first()
+                    .map_or_else(ArchiveMutationGuard::begin, |envelope| {
+                        ArchiveMutationGuard::begin_at(write_op_storage_root(envelope.op.as_ref()))
+                    });
+            wbq_execute_message_bundle_batch_inner(envelopes)
+        };
+        // Every attempt keeps fence-before-project-lock ordering and repeats
+        // the immutable-message no-clobber checks. A failed attempt has fully
+        // unwound before backoff, just as a final failed attempt already does.
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempts += 1;
@@ -3685,6 +3704,8 @@ fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
                         tracing::warn!(
                             "[wbq-drain] batch failed (attempt {attempts}/3): {e}, retrying..."
                         );
+                        #[cfg(test)]
+                        wbq_run_before_retry_test_hook();
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
                     _ => return Err(e),
@@ -3754,14 +3775,29 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
     // place, and it takes no per-project archive lock. Holding the fence
     // across its fsyncs serialized every agent's reservation behind every
     // other's, the swarm-scale p99 of ~25 s.
-    let _mutation = if matches!(op, WriteOp::FileReservation { .. }) {
+    // Immutable messages can release their window during retry backoff:
+    // every attempt rechecks canonical identity under its project lock.
+    // Mutable profiles/signals retain one window across retries so an older
+    // failed write cannot interleave with and replace a newer publication.
+    let _mutation = if matches!(
+        op,
+        WriteOp::FileReservation { .. } | WriteOp::MessageBundle { .. }
+    ) {
         None
     } else {
         Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
     };
     let mut attempts = 0;
     loop {
-        match wbq_execute_op_inner(op) {
+        let result = {
+            let _message_attempt = if matches!(op, WriteOp::MessageBundle { .. }) {
+                Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
+            } else {
+                None
+            };
+            wbq_execute_op_inner(op)
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempts += 1;
@@ -3776,6 +3812,8 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
                         tracing::warn!(
                             "[{log_context}] op failed (attempt {attempts}/3): {e}, retrying..."
                         );
+                        #[cfg(test)]
+                        wbq_run_before_retry_test_hook();
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
                     _ => return Err(e),
@@ -21052,6 +21090,95 @@ mod tests {
         let archive = ensure_archive(&config, project_slug).unwrap();
         let commits = get_recent_commits(&archive, 3, None).unwrap();
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
+    }
+
+    #[test]
+    fn wbq_message_retry_backoff_releases_fence_for_reservations() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_message_retry_backoff_releases_fence_for_reservations",
+        ) {
+            return;
+        }
+
+        for message_count in [1_i64, 2] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let reservation_project = "retry-unrelated-reservation";
+            let reservation_archive = ensure_archive(&config, reservation_project).unwrap();
+            let message_project = "retry-obstructed-messages";
+            let obstructed = reservation_archive
+                .repo_root
+                .join("projects")
+                .join(message_project);
+            let retained = obstructed.with_extension("retained");
+            // An ordinary file in place of the project directory makes the
+            // first real archive attempt fail with a retryable I/O error.
+            fs::write(&obstructed, b"temporary directory obstruction").unwrap();
+            let reservation = publication_test_reservation(message_count, "aabbccdd");
+            let reservation_op = WriteOp::FileReservation {
+                project_slug: reservation_project.to_string(),
+                config: config.clone(),
+                reservations: vec![reservation.clone()],
+            };
+            let retained_for_retry = retained.clone();
+            WBQ_BEFORE_RETRY_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Another thread cannot reuse the failing writer's nested
+                    // guard. Admission therefore proves the global fence is
+                    // available before its retry, without racing a sleep.
+                    let result = std::thread::spawn(move || write_op_sync_direct(&reservation_op))
+                        .join()
+                        .unwrap();
+                    assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+                    flush_async_commits();
+                    fs::rename(&obstructed, &retained_for_retry).unwrap();
+                }));
+            });
+
+            let envelopes: Vec<_> = (41..41 + message_count)
+                .map(|id| WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(backlog_test_message_op(&config, message_project, id)),
+                })
+                .collect();
+            wbq_execute_envelopes(&envelopes).expect(
+                "both single and batched messages must succeed after the obstruction clears",
+            );
+            flush_async_commits();
+            assert_eq!(
+                fs::read(&retained).unwrap(),
+                b"temporary directory obstruction",
+                "the real failed attempt must have reached its retry boundary",
+            );
+            let (stable, alias) = publication_test_paths(&reservation_archive, &reservation);
+            for path in [stable, alias] {
+                let published: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(published, reservation);
+            }
+
+            let message_archive = ensure_archive(&config, message_project).unwrap();
+            for envelope in &envelopes {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    sender,
+                    recipients,
+                    ..
+                } = envelope.op.as_ref()
+                else {
+                    unreachable!();
+                };
+                let (paths, _, _) =
+                    message_paths_for_bundle(&message_archive, message_json, sender, recipients)
+                        .unwrap();
+                for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                    let (message, body) = read_message_file(path).unwrap();
+                    assert_eq!(message["id"], message_json["id"]);
+                    assert_eq!(body.trim(), body_md.as_str());
+                }
+            }
+        }
     }
 
     #[test]
