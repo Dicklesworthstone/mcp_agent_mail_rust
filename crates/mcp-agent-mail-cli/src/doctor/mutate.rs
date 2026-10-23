@@ -78,8 +78,8 @@ impl Op {
 /// The `phase` field distinguishes the two-phase write protocol.
 /// `"pending"` is appended before the mutation executes, after the backup
 /// is in place. `"completed"` is appended after the mutation succeeds or
-/// rolls back. Undo treats a pending-without-completed pair as a
-/// crash-window record: the backup exists, so restore from it. Legacy
+/// rolls back. Pending writes record their intended result separately so
+/// undo can verify publication before restoring a backup. Legacy
 /// `actions.jsonl` lines without `phase` are treated as completed.
 #[derive(Debug, Serialize)]
 pub struct ActionRecord {
@@ -87,6 +87,12 @@ pub struct ActionRecord {
     pub op: String,
     pub before_hash: String,
     pub after_hash: String,
+    /// Intended replacement, recorded before publication. This is not proof
+    /// that the mutation succeeded; pending undo must verify the live file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_after_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_after_mode: Option<u32>,
     pub started_at_ns: u128,
     pub finished_at_ns: u128,
     pub run_id: String,
@@ -1028,14 +1034,22 @@ fn mutate_prepared(
     let mut after_mode: Option<u32> = None;
 
     // Write a pending action before the mutation. If the process dies
-    // mid-mutation, undo can pair the pending line with the verbatim backup
-    // and restore without needing a completed action.
+    // mid-mutation, undo can verify the intended replacement before using
+    // the verbatim backup. The planned hash does not claim publication.
     {
         let pending_record = ActionRecord {
             path: rel.to_string_lossy().into_owned(),
             op: op.op_kind().to_string(),
             before_hash: before_hash.clone(),
-            after_hash: String::new(), // unknown until step 9
+            after_hash: String::new(), // no completed result yet
+            expected_after_hash: match &op {
+                Op::WriteFile { content, .. } => Some(sha256_bytes(content)),
+                _ => None,
+            },
+            expected_after_mode: match &op {
+                Op::WriteFile { mode, .. } => Some(*mode),
+                _ => None,
+            },
             started_at_ns,
             finished_at_ns: 0, // not yet finished
             run_id: ctx.run_id.clone(),
@@ -1230,6 +1244,8 @@ fn mutate_prepared(
         op: op.op_kind().to_string(),
         before_hash: before_hash.clone(),
         after_hash: after_hash.clone(),
+        expected_after_hash: None,
+        expected_after_mode: None,
         started_at_ns,
         finished_at_ns: elapsed_ns(ctx.start),
         run_id: ctx.run_id.clone(),
@@ -1554,7 +1570,14 @@ mod tests {
         // First line should be pending, second completed.
         assert_eq!(lines.len(), 2, "expected 2 lines (pending + completed)");
         assert_eq!(lines[0]["phase"], "pending");
+        assert_eq!(lines[0]["expected_after_hash"], sha256_bytes(b"x"));
+        assert_eq!(lines[0]["expected_after_mode"], 0o644);
+        assert_eq!(lines[0]["after_hash"], "");
+        assert_eq!(lines[0]["ok"], false);
+        assert_eq!(lines[0]["finished_at_ns"], 0);
         let v = &lines[1];
+        assert!(v.get("expected_after_hash").is_none());
+        assert!(v.get("expected_after_mode").is_none());
         assert_eq!(v["phase"], "completed");
         assert_eq!(v["op"], "WriteFile");
         assert!(v["before_hash"].as_str().unwrap().starts_with("sha256:"));
