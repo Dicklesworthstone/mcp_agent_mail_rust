@@ -4590,7 +4590,6 @@ pub async fn execute_search(
     let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
     let query = hinted.as_ref().unwrap_or(query);
     let product_sql_budget = product_sql_budget_state(cx, query);
-    let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
     let engine = engine_for_text_fields(resolve_search_engine(options), query);
     let needs_lexical_freshness = matches!(
         engine,
@@ -4598,26 +4597,20 @@ pub async fn execute_search(
     ) && matches!(query.doc_kind, DocKind::Message | DocKind::Thread)
         && !message_query_requires_sql_plan(query);
 
+    // Process-local invalidation cannot observe another server/CLI writer.
+    // Only routes that check the live lexical revision below can reuse a
+    // result set. SQL facets and metadata also depend on tables/columns that
+    // the lexical clock does not cover (recipient/product membership and agent
+    // descriptions, for example), so initializing the lexical bridge early
+    // would not make their cached results authoritative. Read those routes
+    // afresh until they have a complete source-revision contract of their own.
+    let cache_allowed = cfg!(feature = "tantivy-engine")
+        && needs_lexical_freshness
+        && product_sql_budget.is_none_or(|state| !state.page_limited);
+
     // ── Cache lookup ──────────────────────────────────────────────────
     let cache = global_search_cache();
     let mut cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
-
-    if cache_allowed
-        && !needs_lexical_freshness
-        && let Some(cached) = cache.get(&cache_key)
-    {
-        let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
-        if options.track_telemetry {
-            record_query("search_service_cache_hit", latency_us);
-        }
-        tracing::debug!(
-            target: "search.cache",
-            latency_us,
-            query = %query.text,
-            "search cache hit"
-        );
-        return Outcome::Ok(cached);
-    }
 
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
         || message_query_requires_sql_plan(query)
@@ -4687,7 +4680,7 @@ pub async fn execute_search(
             .search
             .record_legacy_query(latency_us, false);
         let resp = finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
-        if let Outcome::Ok(ref val) = resp {
+        if cache_allowed && let Outcome::Ok(ref val) = resp {
             cache.put(cache_key, val.clone());
         }
         return resp;
@@ -4863,7 +4856,7 @@ pub async fn execute_search(
             global_metrics().search.record_v3_query(latency_us, false);
             let resp =
                 finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
-            if let Outcome::Ok(ref val) = resp {
+            if cache_allowed && let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }
             return resp;
@@ -4904,7 +4897,7 @@ pub async fn execute_search(
             global_metrics().search.record_v3_query(latency_us, false);
             let resp =
                 finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
-            if let Outcome::Ok(ref val) = resp {
+            if cache_allowed && let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }
             return resp;
@@ -5009,7 +5002,7 @@ pub async fn execute_search(
             global_metrics().search.record_v3_query(latency_us, false);
             let resp =
                 finish_scoped_response(raw_results, query, options, assistance.clone(), explain);
-            if let Outcome::Ok(ref val) = resp {
+            if cache_allowed && let Outcome::Ok(ref val) = resp {
                 cache.put(cache_key, val.clone());
             }
             return resp;
@@ -6060,12 +6053,28 @@ mod tests {
                         conn.execute_sync(sql, &[]).expect("external runtime mutation");
                     }
                     for (text, expected_count) in queries {
-                        let query = SearchQuery::messages(text, project_id);
-                        for _ in 0..2 {
-                            let response = execute_search(&cx, &pool, &query, &options)
-                                .await.into_result().unwrap();
-                            assert_eq!(response.results.len(), expected_count, "{engine:?}: {text}");
+                        // Exercise SQL before relevance can invalidate its old cache.
+                        for ranking in [RankingMode::Recency, RankingMode::Oldest, RankingMode::Relevance] {
+                            let query = SearchQuery { ranking, ..SearchQuery::messages(text, project_id) };
+                            for _ in 0..2 {
+                                let response = execute_search(&cx, &pool, &query, &options)
+                                    .await.into_result().unwrap();
+                                assert_eq!(response.results.len(), expected_count, "{engine:?}/{ranking:?}: {text}");
+                            }
                         }
+                    }
+                }
+                // Agent descriptions are not covered by the lexical clock.
+                let query = SearchQuery::agents("freshpurpose", project_id);
+                for expected_count in [0, 1] {
+                    if expected_count == 1 {
+                        conn.execute_sync("UPDATE agents SET task_description = 'freshpurpose' WHERE id = ?",
+                            &[Value::BigInt(sender.id.unwrap())]).unwrap();
+                    }
+                    for _ in 0..2 {
+                        let response = execute_search(&cx, &pool, &query, &options)
+                            .await.into_result().unwrap();
+                        assert_eq!(response.results.len(), expected_count);
                     }
                 }
                 let active_index = crate::search_v3::get_bridge().unwrap();
