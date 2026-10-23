@@ -857,6 +857,69 @@ fn raw_result_matches_query_filters(
 
 const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
 
+type SemanticContentHashes = HashMap<(DocKind, i64), (Option<i64>, String)>;
+
+#[derive(Clone, Default)]
+struct SemanticCandidateProof {
+    hashes: SemanticContentHashes,
+    #[cfg(feature = "hybrid")]
+    source: Option<(Arc<SemanticSource>, u64)>,
+}
+
+/// Hydrate before accepting a vector's score, and verify the content that was
+/// actually embedded. An ID existing today does not prove an old vector is valid.
+async fn canonicalize_semantic_results(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    results: Vec<SearchResult>,
+    proof: &SemanticCandidateProof,
+) -> Outcome<Vec<SearchResult>, DbError> {
+    let mut results = match canonicalize_message_results(cx, pool, query, results, false).await {
+        Outcome::Ok(results) => results,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    if results.is_empty() {
+        return Outcome::Ok(results);
+    }
+    #[cfg(feature = "hybrid")]
+    if let Some((source, epoch)) = proof.source.as_ref() {
+        let Some(expected_generation) = source.generation_for_epoch(pool, *epoch) else {
+            return Outcome::Ok(Vec::new());
+        };
+        let conn = match pool.acquire(cx).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        if semantic_source_generation(&conn).ok() != Some(expected_generation)
+            || source.epoch_for_pool(pool) != Some(*epoch)
+        {
+            return Outcome::Ok(Vec::new());
+        }
+    }
+    results.retain(|result| {
+        proof
+            .hashes
+            .get(&(result.doc_kind, result.id))
+            .is_some_and(|(project_id, hash)| {
+                *project_id == result.project_id
+                    && *hash
+                        == crate::search_canonical::canonicalize_and_hash(
+                            mcp_agent_mail_core::DocKind::Message,
+                            &result.title,
+                            &result.body,
+                            crate::search_canonical::CanonPolicy::Full,
+                        )
+                        .1
+            })
+    });
+    Outcome::Ok(results)
+}
+
 #[derive(serde::Deserialize, Default)]
 struct FastRecipients {
     #[serde(default)]
@@ -1927,8 +1990,342 @@ impl Embedder for AutoInitSemanticEmbedder {
     }
 }
 
-/// Bridge to the semantic search infrastructure (vector index + embedder).
 #[cfg(feature = "hybrid")]
+const SEMANTIC_BACKFILL_PAGE_SIZE: i64 = 64;
+
+/// One mailbox owns the process-local semantic index. Reconstruct its message
+/// history lazily from bounded, read-only pages after the first semantic query.
+/// Source resets run on the embedding worker, between completed batches.
+#[cfg(feature = "hybrid")]
+#[derive(Default)]
+struct SemanticSourceState {
+    pool: Option<DbPool>,
+    active_pool_key: Option<String>,
+    file_identity: Option<(u64, u64)>,
+    generation: Option<String>,
+    clock: Option<crate::search_v3::LexicalChangeClock>,
+    after_id: Option<i64>,
+    scan_started_clock: Option<crate::search_v3::LexicalChangeClock>,
+    tail_base_clock: Option<crate::search_v3::LexicalChangeClock>,
+    tail_rows: u64,
+    epoch: u64,
+    last_error: Option<String>,
+}
+
+#[cfg(feature = "hybrid")]
+struct SemanticSource {
+    state: Mutex<SemanticSourceState>,
+    queue: Arc<EmbeddingQueue>,
+    index: Arc<RwLock<VectorIndex>>,
+}
+
+#[cfg(feature = "hybrid")]
+impl SemanticSource {
+    fn bind_pool(&self, pool: &DbPool) -> bool {
+        if pool.sqlite_path() == ":memory:"
+            || pool.search_identity_path() != pool.sqlite_path()
+            || pool
+                .validated_sqlite_path("semantic source binding")
+                .is_err()
+        {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(bound) = state.pool.as_ref() {
+            if bound.sqlite_path() != pool.sqlite_path() {
+                return false;
+            }
+            if bound.engine_identity_key() == pool.engine_identity_key() {
+                return true;
+            }
+        }
+        state.pool = Some(pool.clone());
+        state.active_pool_key = None;
+        state.epoch = state.epoch.wrapping_add(1);
+        true
+    }
+
+    fn epoch_for_pool(&self, pool: &DbPool) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.active_pool_key.as_deref() == Some(pool.engine_identity_key().as_str())
+            && semantic_source_file_identity(pool)
+                .ok()
+                .is_some_and(|current| state.file_identity.as_ref() == Some(&current)))
+        .then_some(state.epoch)
+    }
+
+    fn generation_for_epoch(&self, pool: &DbPool, epoch: u64) -> Option<Option<String>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.epoch == epoch
+            && state.active_pool_key.as_deref() == Some(pool.engine_identity_key().as_str()))
+        .then(|| state.generation.clone())
+    }
+
+    fn is_foreign_to_pool(&self, pool: &DbPool) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pool
+            .as_ref()
+            .is_some_and(|bound| bound.sqlite_path() != pool.sqlite_path())
+    }
+
+    fn reset(&self, state: &mut SemanticSourceState) {
+        let had_work = state.active_pool_key.is_some() || !self.queue.is_empty();
+        self.queue.clear();
+        let mut index = write_guard_or_recover("semantic.vector_index", &self.index);
+        let had_vectors = !index.is_empty();
+        index.clear();
+        drop(index);
+        state.active_pool_key = None;
+        state.file_identity = None;
+        state.clock = None;
+        state.after_id = None;
+        state.scan_started_clock = None;
+        state.tail_base_clock = None;
+        state.tail_rows = 0;
+        state.epoch = state.epoch.wrapping_add(1);
+        if had_work || had_vectors {
+            invalidate_search_cache(InvalidationTrigger::IndexUpdate);
+        }
+    }
+
+    fn refill(&self, shutdown: &std::sync::atomic::AtomicBool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pool) = state.pool.clone() else {
+            // Explicitly initialized bridges can still be used by callers that
+            // manage their own index without a mailbox source.
+            return true;
+        };
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) || pool.is_closed() {
+            return false;
+        }
+        match self.refill_page(&pool, &mut state, shutdown) {
+            Ok(ready) => {
+                state.last_error = None;
+                ready
+            }
+            Err(error) => {
+                // A missing/unreadable source clock is not evidence of a fresh
+                // index. Retire both ready and retry work until the DB is valid.
+                self.reset(&mut state);
+                if state.last_error.as_ref() != Some(&error) {
+                    tracing::warn!(target: "search.semantic", %error,
+                        "semantic history refresh deferred; canonical source unavailable");
+                    state.last_error = Some(error);
+                }
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn refill_page(
+        &self,
+        pool: &DbPool,
+        state: &mut SemanticSourceState,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, String> {
+        let path = pool
+            .validated_sqlite_path("semantic history refresh")
+            .map_err(|error| error.to_string())?;
+        let file_identity = semantic_source_file_identity(pool)?;
+        let conn = crate::guard_db_conn(
+            crate::pool::open_guarded_read_only_franken_existing_file(
+                path,
+                "semantic history refresh",
+            )
+            .map_err(|error| error.to_string())?,
+            "semantic history refresh",
+        );
+        conn.execute_raw("PRAGMA busy_timeout = 100")
+            .map_err(|error| error.to_string())?;
+        conn.execute_raw("BEGIN DEFERRED")
+            .map_err(|error| error.to_string())?;
+        let generation = semantic_source_generation(&conn)?;
+        let clock = semantic_source_clock(&conn)?;
+        let pool_key = pool.engine_identity_key();
+        let reset = state.active_pool_key.as_ref() != Some(&pool_key)
+            || state.file_identity.as_ref() != Some(&file_identity)
+            || state.generation != generation
+            || state
+                .clock
+                .is_none_or(|previous| !clock.allows_append_from(previous));
+        let after_id = if reset { None } else { state.after_id };
+        // Keep the tail predicate sargable so each page seeks directly to its
+        // first ID instead of walking the prefix again. A distinct first-page
+        // query also includes imported IDs at or below zero.
+        let rows = match after_id {
+            Some(after_id) => conn.query_sync(
+                "SELECT id, project_id, subject, body_md FROM messages \
+                 WHERE id > ? ORDER BY id LIMIT ?",
+                &[
+                    Value::BigInt(after_id),
+                    Value::BigInt(SEMANTIC_BACKFILL_PAGE_SIZE),
+                ],
+            ),
+            None => conn.query_sync(
+                "SELECT id, project_id, subject, body_md FROM messages ORDER BY id LIMIT ?",
+                &[Value::BigInt(SEMANTIC_BACKFILL_PAGE_SIZE)],
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        let mut requests = Vec::with_capacity(rows.len());
+        for row in rows {
+            requests.push(EmbeddingRequest::new(
+                row.get_named::<i64>("id")
+                    .map_err(|error| error.to_string())?,
+                SearchDocKind::Message,
+                Some(
+                    row.get_named::<i64>("project_id")
+                        .map_err(|error| error.to_string())?,
+                ),
+                row.get_named::<String>("subject")
+                    .map_err(|error| error.to_string())?,
+                row.get_named::<String>("body_md")
+                    .map_err(|error| error.to_string())?,
+                ModelTier::Fast,
+            ));
+        }
+        conn.execute_raw("COMMIT")
+            .map_err(|error| error.to_string())?;
+
+        // Never publish a page whose snapshot predates a rewrite/replacement.
+        // A concurrent append is harmless: the next page catches its new IDs.
+        let current_clock = semantic_source_clock(&conn)?;
+        if semantic_source_file_identity(pool)? != file_identity
+            || semantic_source_generation(&conn)? != generation
+            || !current_clock.allows_append_from(clock)
+        {
+            self.reset(state);
+            return Ok(false);
+        }
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(false);
+        }
+        if reset {
+            self.reset(state);
+        }
+        state.active_pool_key = Some(pool_key);
+        state.file_identity = Some(file_identity);
+        state.generation = generation;
+        state.clock = Some(clock);
+        state.scan_started_clock.get_or_insert(clock);
+        if requests.is_empty() {
+            let complete = state.tail_base_clock.map_or_else(
+                || state.scan_started_clock == Some(clock),
+                |base| clock.insertions_since(base) == Some(state.tail_rows),
+            );
+            if complete {
+                state.tail_base_clock = Some(clock);
+            } else {
+                // An insert can restore an archive ID below the tail cursor.
+                // Compare the transactional insertion delta with visited rows;
+                // a mismatch needs a bounded rescan, not an unbounded COUNT.
+                state.after_id = None;
+                state.tail_base_clock = None;
+                state.scan_started_clock = Some(clock);
+            }
+            state.tail_rows = 0;
+        }
+        for request in requests {
+            let id = request.doc_id;
+            let hash = crate::search_canonical::canonicalize_and_hash(
+                request.doc_kind,
+                &request.title,
+                &request.body,
+                crate::search_canonical::CanonPolicy::Full,
+            )
+            .1;
+            let up_to_date = read_guard_or_recover("semantic.vector_index", &self.index)
+                .get(id, request.doc_kind)
+                .is_some_and(|entry| {
+                    entry.metadata.project_id == request.project_id
+                        && entry.metadata.content_hash == hash
+                });
+            if !up_to_date && !self.queue.enqueue(request) {
+                // Keep the cursor before the rejected row; model absence or a
+                // full live queue must never permanently skip historical mail.
+                break;
+            }
+            state.after_id = Some(id);
+            if state.tail_base_clock.is_some() {
+                state.tail_rows = state.tail_rows.saturating_add(1);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Observe the pathname's physical identity without opening the main database.
+/// On Unix, closing an extra descriptor can release SQLite locks held by other
+/// connections in this process. The guarded engine opener supplies the retained
+/// namespace/descriptor authority; this metadata pair detects path replacement
+/// between cycles, alongside the logical generation and content checks.
+#[cfg(feature = "hybrid")]
+fn semantic_source_file_identity(pool: &DbPool) -> Result<(u64, u64), String> {
+    let path = pool
+        .validated_sqlite_path("semantic source identity")
+        .map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("semantic source is not a regular database file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        metadata
+            .volume_serial_number()
+            .zip(metadata.file_index())
+            .map(|(volume, file)| (u64::from(volume), file))
+            .ok_or_else(|| "semantic source has no stable file identity".to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err("semantic source file identity is unavailable on this platform".to_string())
+    }
+}
+
+#[cfg(feature = "hybrid")]
+fn semantic_source_clock(
+    conn: &crate::DbConn,
+) -> Result<crate::search_v3::LexicalChangeClock, String> {
+    crate::search_v3::lexical_change_clock(conn)?
+        .ok_or_else(|| "semantic history requires a transactional message change clock".to_string())
+}
+
+#[cfg(feature = "hybrid")]
+fn semantic_source_generation(conn: &crate::DbConn) -> Result<Option<String>, String> {
+    let rows = conn
+        .query_sync(crate::queries::SELECT_DB_GENERATION_SQL, &[])
+        .map_err(|error| error.to_string())?;
+    rows.first()
+        .map(|row| {
+            row.get_named::<String>("generation_id")
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+#[cfg(feature = "hybrid")]
+/// Bridge to the semantic search infrastructure (vector index + embedder).
 pub struct SemanticBridge {
     /// The vector index holding document embeddings.
     index: Arc<RwLock<VectorIndex>>,
@@ -1940,6 +2337,8 @@ pub struct SemanticBridge {
     queue: Arc<EmbeddingQueue>,
     /// Batch runner for embedding/index updates.
     runner: Arc<EmbeddingJobRunner>,
+    /// Lazily attached canonical mailbox and bounded history cursor.
+    source: Arc<SemanticSource>,
     /// Background refresh worker.
     refresh_worker: Arc<IndexRefreshWorker>,
     /// Background refresh worker handle.
@@ -1969,7 +2368,16 @@ impl SemanticBridge {
             rebuild_on_startup: false,
             max_docs_per_cycle: 256,
         };
-        let refresh_worker = Arc::new(IndexRefreshWorker::new(worker_cfg, runner.clone()));
+        let source = Arc::new(SemanticSource {
+            state: Mutex::new(SemanticSourceState::default()),
+            queue: queue.clone(),
+            index: index.clone(),
+        });
+        let refill_source = source.clone();
+        let refresh_worker = Arc::new(
+            IndexRefreshWorker::new(worker_cfg, runner.clone())
+                .with_source_refill(move |shutdown| refill_source.refill(shutdown)),
+        );
         let worker = {
             let worker = refresh_worker.clone();
             std::thread::Builder::new()
@@ -1985,6 +2393,7 @@ impl SemanticBridge {
             registry,
             queue,
             runner,
+            source,
             refresh_worker,
             worker: Mutex::new(worker),
         }
@@ -2034,6 +2443,10 @@ impl SemanticBridge {
     ///
     /// Embeds the query text and performs vector similarity search.
     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+        self.search_with_proof(query, limit).results
+    }
+
+    fn search_with_proof(&self, query: &SearchQuery, limit: usize) -> TwoTierSearchOutcome {
         let embedding = match self.embedder.embed(&query.text) {
             Ok(result) => result,
             Err(e) => {
@@ -2042,7 +2455,7 @@ impl SemanticBridge {
                     error = %e,
                     "failed to embed query"
                 );
-                return Vec::new();
+                return TwoTierSearchOutcome::default();
             }
         };
         if embedding.is_hash_only() {
@@ -2050,7 +2463,7 @@ impl SemanticBridge {
                 target: "search.semantic",
                 "no real embedder available, skipping semantic search"
             );
-            return Vec::new();
+            return TwoTierSearchOutcome::default();
         }
         let selected = self.embedder.model_info();
         // `ModelInfo` names its identity `id`; an embedding records it as `model_id`.
@@ -2063,7 +2476,7 @@ impl SemanticBridge {
             || embedding.vector.len() != embedding.dimension
             || embedding.vector.iter().any(|value| !value.is_finite())
         {
-            return Vec::new();
+            return TwoTierSearchOutcome::default();
         }
 
         // Build filter from query
@@ -2074,7 +2487,7 @@ impl SemanticBridge {
         if index.bound_model_id() != Some(embedding.model_id.as_str())
             || index.config().dimension != embedding.dimension
         {
-            return Vec::new();
+            return TwoTierSearchOutcome::default();
         }
         let hits = match index.search(&embedding.vector, limit, Some(&filter)) {
             Ok(h) => h,
@@ -2084,13 +2497,25 @@ impl SemanticBridge {
                     error = %e,
                     "vector search failed"
                 );
-                return Vec::new();
+                return TwoTierSearchOutcome::default();
             }
         };
+        let hashes = hits
+            .iter()
+            .filter_map(|hit| {
+                index.get(hit.doc_id, hit.doc_kind).map(|entry| {
+                    (
+                        (convert_doc_kind(hit.doc_kind), hit.doc_id),
+                        (hit.project_id, entry.metadata.content_hash.clone()),
+                    )
+                })
+            })
+            .collect();
         drop(index);
 
         // Convert to SearchResult
-        hits.into_iter()
+        let results = hits
+            .into_iter()
             .map(|hit| SearchResult {
                 doc_kind: convert_doc_kind(hit.doc_kind),
                 id: hit.doc_id,
@@ -2110,10 +2535,23 @@ impl SemanticBridge {
                 redaction_reason: None,
                 ..SearchResult::default()
             })
-            .collect()
+            .collect();
+        TwoTierSearchOutcome {
+            results,
+            proof: SemanticCandidateProof {
+                hashes,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// Enqueue a document for background semantic indexing.
+    ///
+    /// After a canonical mailbox is bound, message payloads are only hints:
+    /// the bounded source reader supplies authoritative bytes from that mailbox.
+    /// Unscoped live callers must not overwrite its vectors using another
+    /// mailbox's overlapping numeric IDs.
     pub fn enqueue_document(
         &self,
         doc_id: i64,
@@ -2122,14 +2560,24 @@ impl SemanticBridge {
         title: &str,
         body: &str,
     ) -> bool {
-        self.queue.enqueue(EmbeddingRequest::new(
+        let source = self
+            .source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if doc_kind == SearchDocKind::Message && source.pool.is_some() {
+            return true;
+        }
+        let accepted = self.queue.enqueue(EmbeddingRequest::new(
             doc_id,
             doc_kind,
             project_id,
             title,
             body,
             ModelTier::Fast,
-        ))
+        ));
+        drop(source);
+        accepted
     }
 
     #[must_use]
@@ -2274,10 +2722,11 @@ struct TwoTierSearchTelemetry {
 }
 
 #[cfg(feature = "hybrid")]
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct TwoTierSearchOutcome {
     results: Vec<SearchResult>,
     telemetry: TwoTierSearchTelemetry,
+    proof: SemanticCandidateProof,
 }
 
 #[cfg(feature = "hybrid")]
@@ -2664,6 +3113,8 @@ fn emit_fast_only_search_hint_once(latency_ms: u64) {
 pub struct TwoTierBridge {
     /// The two-tier index holding document embeddings.
     index: RwLock<TwoTierIndex>,
+    /// Canonical input witnesses, always accessed while holding the index lock.
+    content_hashes: Mutex<SemanticContentHashes>,
     /// Configuration (derived from auto-detected embedders).
     config: TwoTierConfig,
     /// Rolling observability metrics for two-tier search behavior.
@@ -2696,6 +3147,7 @@ impl TwoTierBridge {
 
         Self {
             index: RwLock::new(index),
+            content_hashes: Mutex::new(HashMap::new()),
             config,
             metrics,
         }
@@ -2708,7 +3160,34 @@ impl TwoTierBridge {
 
     /// Get a mutable reference to the index (for writes).
     pub fn index_mut(&self) -> std::sync::RwLockWriteGuard<'_, TwoTierIndex> {
-        write_guard_or_recover("semantic.two_tier_index", &self.index)
+        let index = write_guard_or_recover("semantic.two_tier_index", &self.index);
+        // A raw vector mutation has no canonical input witness. Public direct
+        // searches remain available, but mailbox searches must fail closed.
+        self.content_hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        index
+    }
+
+    fn proof_for_scored(&self, results: &[ScoredResult]) -> SemanticCandidateProof {
+        let hashes = self
+            .content_hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SemanticCandidateProof {
+            hashes: results
+                .iter()
+                .filter_map(|result| {
+                    let key = (
+                        convert_doc_kind(result.doc_kind),
+                        i64::try_from(result.doc_id).ok()?,
+                    );
+                    hashes.get(&key).cloned().map(|hash| (key, hash))
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     fn update_index_metrics(&self) {
@@ -2824,25 +3303,35 @@ impl TwoTierBridge {
             return TwoTierSearchOutcome {
                 results: Vec::new(),
                 telemetry: fallback_telemetry,
+                ..Default::default()
             };
         }
 
-        let (selected_results, had_searcher) = {
+        let (selected_results, had_searcher, proof) = {
             let index = self.index();
-            ctx.create_searcher(&index)
-                .map_or((None, false), |searcher| {
-                    let searcher = searcher.with_metrics_recorder(Arc::clone(&self.metrics));
-                    (
-                        if force_fast_only {
-                            select_initial_two_tier_results(searcher.search(&query.text, limit))
-                        } else if prefer_fast_first {
-                            select_fast_first_two_tier_results(searcher.search(&query.text, limit))
-                        } else {
-                            select_best_two_tier_results(searcher.search(&query.text, limit))
-                        },
-                        true,
-                    )
-                })
+            let (selected, had_searcher) =
+                ctx.create_searcher(&index)
+                    .map_or((None, false), |searcher| {
+                        let searcher = searcher.with_metrics_recorder(Arc::clone(&self.metrics));
+                        (
+                            if force_fast_only {
+                                select_initial_two_tier_results(searcher.search(&query.text, limit))
+                            } else if prefer_fast_first {
+                                select_fast_first_two_tier_results(
+                                    searcher.search(&query.text, limit),
+                                )
+                            } else {
+                                select_best_two_tier_results(searcher.search(&query.text, limit))
+                            },
+                            true,
+                        )
+                    });
+            let proof = selected
+                .as_ref()
+                .map_or_else(SemanticCandidateProof::default, |selected| {
+                    self.proof_for_scored(&selected.results)
+                });
+            (selected, had_searcher, proof)
         };
 
         if let Some(mut selected) = selected_results {
@@ -2856,6 +3345,7 @@ impl TwoTierBridge {
             return TwoTierSearchOutcome {
                 results: scored_results_to_search_results(selected.results),
                 telemetry: selected.telemetry,
+                proof,
             };
         }
 
@@ -2886,11 +3376,17 @@ impl TwoTierBridge {
                 return TwoTierSearchOutcome {
                     results: Vec::new(),
                     telemetry: fallback_telemetry,
+                    ..Default::default()
                 };
             }
         };
 
-        let hits = self.index().search_fast(&embedding, limit);
+        let (hits, proof) = {
+            let index = self.index();
+            let hits = index.search_fast(&embedding, limit);
+            let proof = self.proof_for_scored(&hits);
+            (hits, proof)
+        };
         #[allow(clippy::cast_possible_truncation)]
         {
             fallback_telemetry.initial_latency_ms =
@@ -2905,6 +3401,7 @@ impl TwoTierBridge {
         TwoTierSearchOutcome {
             results: scored_results_to_search_results(hits),
             telemetry: fallback_telemetry,
+            proof,
         }
     }
 
@@ -2924,18 +3421,27 @@ impl TwoTierBridge {
             return Err("fast embedder unavailable".to_string());
         }
 
+        // Use the same canonical text contract as the background message jobs.
+        let (text, hash) = crate::search_canonical::canonicalize_and_hash(
+            SearchDocKind::Message,
+            "",
+            text,
+            crate::search_canonical::CanonPolicy::Full,
+        );
+
         // Embed with fast tier
         let fast_embedding = ctx
-            .embed_fast(text)
+            .embed_fast(&text)
             .map_err(|e| format!("fast embed failed: {e}"))?;
 
         // Embed with quality tier if available
         let quality_embedding = if ctx.is_full() {
-            ctx.embed_quality(text).ok()
+            ctx.embed_quality(&text).ok()
         } else {
             None
         };
 
+        let proof_key = (doc_kind, doc_id);
         let doc_id = u64::try_from(doc_id).map_err(|_| "doc_id overflow".to_string())?;
 
         let has_quality = quality_embedding.is_some();
@@ -2976,10 +3482,14 @@ impl TwoTierBridge {
         };
 
         // Add to index
-        let mut index = self.index_mut();
+        let mut index = write_guard_or_recover("semantic.two_tier_index", &self.index);
         index
             .add_entry(entry)
             .map_err(|e| format!("two-tier index add_entry failed: {e}"))?;
+        self.content_hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(proof_key, (project_id, hash));
         if let Ok(mut metrics) = self.metrics.lock() {
             metrics.record_index(index.metrics());
         }
@@ -3117,7 +3627,26 @@ fn try_two_tier_search_with_cx(
 /// Normal message/agent writes feed `SemanticBridge`; those completed embeddings
 /// must be available to hybrid and auto searches as well as explicit semantic mode.
 #[cfg(feature = "hybrid")]
-fn semantic_search_with_cx(cx: &Cx, query: &SearchQuery, limit: usize) -> TwoTierSearchOutcome {
+fn semantic_search_with_cx(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    limit: usize,
+) -> TwoTierSearchOutcome {
+    if cx.checkpoint().is_err() {
+        return TwoTierSearchOutcome::default();
+    }
+    let Some(bridge) = get_or_init_semantic_bridge() else {
+        return TwoTierSearchOutcome::default();
+    };
+    if !bridge.source.bind_pool(pool) {
+        return TwoTierSearchOutcome::default();
+    }
+    let Some(epoch) = bridge.source.epoch_for_pool(pool) else {
+        // The worker will reconstruct history. Do not query vectors from an
+        // earlier source while the first bounded page is being prepared.
+        return TwoTierSearchOutcome::default();
+    };
     let mut outcome = try_two_tier_search_with_cx(cx, query, limit).unwrap_or_default();
     outcome.results.retain(|result| {
         query
@@ -3126,13 +3655,24 @@ fn semantic_search_with_cx(cx: &Cx, query: &SearchQuery, limit: usize) -> TwoTie
             && (result.doc_kind == query.doc_kind
                 || (query.doc_kind == DocKind::Thread && result.doc_kind == DocKind::Message))
     });
-    if cx.checkpoint().is_ok()
-        && let Some(bridge) = get_or_init_semantic_bridge()
-    {
-        outcome.results =
-            fuse_semantic_candidates(outcome.results, bridge.search(query, limit), limit);
+    if cx.checkpoint().is_ok() {
+        let live = bridge.search_with_proof(query, limit);
+        // A progressive vector for an older revision cannot contribute a second
+        // vote when the live index already holds a different canonical input.
+        outcome.results.retain(|result| {
+            let key = (result.doc_kind, result.id);
+            outcome.proof.hashes.get(&key).is_some_and(|hash| {
+                live.proof
+                    .hashes
+                    .get(&key)
+                    .is_none_or(|live_hash| live_hash == hash)
+            })
+        });
+        outcome.proof.hashes.extend(live.proof.hashes);
+        outcome.results = fuse_semantic_candidates(outcome.results, live.results, limit);
     }
-    if cx.checkpoint().is_err() {
+    outcome.proof.source = Some((bridge.source.clone(), epoch));
+    if cx.checkpoint().is_err() || bridge.source.epoch_for_pool(pool) != Some(epoch) {
         outcome.results.clear();
     }
     outcome
@@ -4119,6 +4659,7 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
     plan: &HybridExecutionPlan,
     lexical_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
+    semantic_proof: Option<&SemanticCandidateProof>,
 ) -> Outcome<(Vec<SearchResult>, Option<HybridRerankAudit>), DbError> {
     // Semantic hits contain IDs and scores only. Resolve both sources from the
     // canonical mailbox before ranking: rerank must receive the actual message
@@ -4131,13 +4672,17 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-    let semantic_results =
-        match canonicalize_message_results(cx, pool, query, semantic_results, false).await {
-            Outcome::Ok(results) => results,
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
+    let semantic_outcome = if let Some(proof) = semantic_proof {
+        canonicalize_semantic_results(cx, pool, query, semantic_results, proof).await
+    } else {
+        canonicalize_message_results(cx, pool, query, semantic_results, false).await
+    };
+    let semantic_results = match semantic_outcome {
+        Outcome::Ok(results) => results,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
     let merged = orchestrate_hybrid_results(
         query,
         &plan.derivation,
@@ -4692,9 +5237,10 @@ pub async fn execute_search(
     // older or foreign materialization. Semantic indexes remain bound to the
     // live source, so these reads use their own lexical candidates.
     #[cfg(feature = "tantivy-engine")]
-    if needs_lexical_freshness
+    if (needs_lexical_freshness || (cfg!(feature = "hybrid") && engine == SearchEngine::Semantic))
         && (pool.search_identity_path() != pool.sqlite_path()
-            || lexical_index_is_foreign_to_pool(pool))
+            || lexical_index_is_foreign_to_pool(pool)
+            || semantic_index_is_foreign_to_pool(pool))
     {
         let raw_results = match crate::search_v3::search_private_snapshot(
             &lexical_backfill_database_url(pool),
@@ -4874,14 +5420,21 @@ pub async fn execute_search(
         #[cfg(feature = "hybrid")]
         {
             let candidate_limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
-            let mut raw_results = semantic_search_with_cx(cx, query, candidate_limit).results;
-            raw_results =
-                match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                    Outcome::Ok(results) => results,
-                    Outcome::Err(err) => return Outcome::Err(err),
-                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-                };
+            let semantic = semantic_search_with_cx(cx, pool, query, candidate_limit);
+            let mut raw_results = match canonicalize_semantic_results(
+                cx,
+                pool,
+                query,
+                semantic.results,
+                &semantic.proof,
+            )
+            .await
+            {
+                Outcome::Ok(results) => results,
+                Outcome::Err(err) => return Outcome::Err(err),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
             raw_results = apply_cursor_window(raw_results, query);
             raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
 
@@ -4946,18 +5499,22 @@ pub async fn execute_search(
             Err(error) => return Outcome::Err(error),
         };
         #[cfg(feature = "hybrid")]
-        let (semantic_results, two_tier_telemetry) = if plan.derivation.budget.semantic_limit == 0 {
-            (Vec::new(), None)
-        } else {
-            let outcome = semantic_search_with_cx(
-                cx,
-                &candidate_query,
-                plan.derivation.budget.semantic_limit,
-            );
-            (outcome.results, Some(outcome.telemetry))
-        };
+        let (semantic_results, semantic_proof, two_tier_telemetry) =
+            if plan.derivation.budget.semantic_limit == 0 {
+                (Vec::new(), SemanticCandidateProof::default(), None)
+            } else {
+                let outcome = semantic_search_with_cx(
+                    cx,
+                    pool,
+                    &candidate_query,
+                    plan.derivation.budget.semantic_limit,
+                );
+                (outcome.results, outcome.proof, Some(outcome.telemetry))
+            };
         #[cfg(not(feature = "hybrid"))]
         let semantic_results: Vec<SearchResult> = Vec::new();
+        #[cfg(not(feature = "hybrid"))]
+        let semantic_proof = SemanticCandidateProof::default();
 
         if let Some(lexical_results) = lexical_results {
             let (mut raw_results, rerank_audit) =
@@ -4968,6 +5525,7 @@ pub async fn execute_search(
                     &plan,
                     lexical_results,
                     semantic_results,
+                    Some(&semantic_proof),
                 )
                 .await
                 {
@@ -5043,6 +5601,19 @@ pub async fn execute_search(
 fn lexical_index_is_foreign_to_pool(pool: &DbPool) -> bool {
     pool.sqlite_path() != ":memory:"
         && lexical_backfill_health_with_affinity(pool).1 == LexicalIndexAffinity::Foreign
+}
+
+#[cfg(feature = "tantivy-engine")]
+fn semantic_index_is_foreign_to_pool(pool: &DbPool) -> bool {
+    #[cfg(feature = "hybrid")]
+    {
+        get_semantic_bridge().is_some_and(|bridge| bridge.source.is_foreign_to_pool(pool))
+    }
+    #[cfg(not(feature = "hybrid"))]
+    {
+        let _ = pool;
+        false
+    }
 }
 
 /// Plain-keyword SQL message scan shared by the `Legacy`/`Shadow` engines.
@@ -6002,8 +6573,40 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-engine")]
+    fn run_semantic_enabled_search_test_in_child(test_name: &str) -> bool {
+        const CHILD: &str = "AM_TEST_SEMANTIC_SOURCE_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some(test_name) {
+            assert!(
+                mcp_agent_mail_core::Config::get()
+                    .search_rollout
+                    .semantic_enabled
+            );
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name)
+            .env("AM_SEARCH_SEMANTIC_ENABLED", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated source test failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[cfg(feature = "tantivy-engine")]
     #[test]
     fn execute_search_refreshes_cached_edits_and_preserves_snapshot_authority() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::execute_search_refreshes_cached_edits_and_preserves_snapshot_authority",
+        ) {
+            return;
+        }
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6089,11 +6692,23 @@ mod tests {
                     warmup_connections: 0, run_migrations: false,
                     ..Default::default()
                 }).unwrap().with_search_identity_path(pool.sqlite_path());
-                for (text, expected_count) in [("amberstart", 1), ("violetfinish", 0)] {
-                    let response = execute_search(&cx, &snapshot_pool,
-                        &SearchQuery::messages(text, project_id), &options)
-                        .await.into_result().unwrap();
-                    assert_eq!(response.results.len(), expected_count, "snapshot {engine:?}: {text}");
+                for snapshot_engine in [engine, SearchEngine::Semantic] {
+                    let snapshot_options = SearchOptions {
+                        search_engine: Some(snapshot_engine), ..options.clone()
+                    };
+                    assert_eq!(resolve_search_engine(&snapshot_options), snapshot_engine);
+                    for (text, expected_count) in [("amberstart", 1), ("violetfinish", 0)] {
+                        let outcome = execute_search(&cx, &snapshot_pool,
+                            &SearchQuery::messages(text, project_id), &snapshot_options).await;
+                        if snapshot_engine == SearchEngine::Semantic && !cfg!(feature = "hybrid") {
+                            assert!(matches!(outcome, Outcome::Err(DbError::Sqlite(ref error))
+                                if error.contains("build without hybrid feature")));
+                            continue;
+                        }
+                        let response = outcome.into_result().unwrap();
+                        assert_eq!(response.results.len(), expected_count,
+                            "snapshot {snapshot_engine:?}: {text}");
+                    }
                 }
                 assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
                 assert_eq!(std::fs::read(&meta).unwrap(), meta_before);
@@ -6416,6 +7031,11 @@ mod tests {
     #[test]
     #[cfg(feature = "tantivy-engine")]
     fn foreign_mailbox_search_preserves_lexical_syntax_scope_and_live_index() {
+        if !run_semantic_enabled_search_test_in_child(
+            "search_service::tests::foreign_mailbox_search_preserves_lexical_syntax_scope_and_live_index",
+        ) {
+            return;
+        }
         let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6501,25 +7121,33 @@ mod tests {
                 ("ownerarchive", None, &[]),
                 ("latearrival", None, &[]),
             ];
-            for &(text, project_id, expected) in cases {
+            for engine in [SearchEngine::Lexical, SearchEngine::Semantic] {
+              let options = SearchOptions { search_engine: Some(engine), ..options.clone() };
+                assert_eq!(resolve_search_engine(&options), engine);
+              for &(text, project_id, expected) in cases {
                 let query = SearchQuery {
                     text: text.to_string(),
                     project_id,
                     explain: true,
                     ..Default::default()
                 };
-                let response = execute_search(&cx, &foreign_pool, &query, &options)
-                    .await
-                    .expect("foreign lexical search");
+                let outcome = execute_search(&cx, &foreign_pool, &query, &options).await;
+                if engine == SearchEngine::Semantic && !cfg!(feature = "hybrid") {
+                    assert!(matches!(outcome, Outcome::Err(DbError::Sqlite(ref error))
+                        if error.contains("build without hybrid feature")));
+                    continue;
+                }
+                let response = outcome.expect("foreign source search");
                 let mut ids: Vec<_> = response.results.iter().map(|r| r.result.id).collect();
                 ids.sort_unstable();
-                assert_eq!(ids, expected, "query {text:?} in {project_id:?}");
+                assert_eq!(ids, expected, "{engine:?} query {text:?} in {project_id:?}");
                 assert!(response.results.iter().all(|r| r.result.score.is_some()));
                 if let Some(hit) = response.results.iter().find(|r| r.result.id == 1) {
                     assert_eq!(hit.result.body, "foreign exact content");
                     assert_eq!(hit.result.topic.as_deref(), Some("release"));
                     assert_eq!(hit.result.thread_id.as_deref(), Some("thread-one"));
                 }
+              }
             }
 
             let scoped_options = SearchOptions {
@@ -8964,7 +9592,7 @@ mod tests {
                 &cx,
                 &pool,
                 foreign,
-                "GreenField",
+                "GreenLake",
                 "codex",
                 "test",
                 None,
@@ -9062,6 +9690,7 @@ mod tests {
                 &plan,
                 candidates.clone(),
                 candidates,
+                None,
             )
             .await
             .into_result()
@@ -9676,6 +10305,7 @@ mod tests {
         ready: std::sync::atomic::AtomicBool,
         model_changed: std::sync::atomic::AtomicBool,
         output_dimension: std::sync::atomic::AtomicUsize,
+        on_first_embedding: Mutex<Option<(String, Vec<String>)>>,
     }
 
     #[cfg(feature = "hybrid")]
@@ -9693,6 +10323,7 @@ mod tests {
                 ready: std::sync::atomic::AtomicBool::new(true),
                 model_changed: std::sync::atomic::AtomicBool::new(false),
                 output_dimension: std::sync::atomic::AtomicUsize::new(dimension),
+                on_first_embedding: Mutex::new(None),
             }
         }
     }
@@ -9702,6 +10333,15 @@ mod tests {
         fn embed(&self, text: &str) -> crate::search_error::SearchResult<EmbeddingResult> {
             if !self.is_ready() {
                 return HashEmbedder::new().embed(text);
+            }
+            if let Some((path, statements)) = self.on_first_embedding.lock().unwrap().take() {
+                let conn = crate::guard_db_conn(
+                    crate::DbConn::open_file(&path).unwrap(),
+                    "in-flight history edit fixture",
+                );
+                for sql in statements {
+                    conn.execute_raw(&sql).unwrap();
+                }
             }
             let model_id = if self
                 .model_changed
@@ -9734,6 +10374,605 @@ mod tests {
     }
 
     #[cfg(feature = "hybrid")]
+    fn semantic_history_pool(root: &Path, name: &str, messages: i64) -> DbPool {
+        let pool = temp_file_pool(root, name);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let conn = pool.acquire(&cx).await.unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                VALUES (1, 'history', '/semantic-history', 1)",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "INSERT INTO agents \
+                (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1)",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "INSERT OR REPLACE INTO db_identity (singleton, generation_id) \
+                VALUES (0, 'semantic-history-first')",
+            )
+            .unwrap();
+            for id in 1..=messages {
+                conn.execute_sync(
+                    "INSERT INTO messages \
+                    (id, project_id, sender_id, subject, body_md, created_ts) \
+                    VALUES (?, 1, 1, ?, 'The **historical** body.', 1000000)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(format!("Historical subject {id}")),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+        });
+        pool
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn manual_semantic_history_bridge(embedder: Arc<FixedSemanticTestEmbedder>) -> SemanticBridge {
+        let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
+        bridge.refresh_worker.shutdown();
+        if let Some(worker) = bridge.worker.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
+        bridge
+            .refresh_worker
+            .shutdown_flag()
+            .store(false, std::sync::atomic::Ordering::Release);
+        bridge
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn semantic_history_candidates(bridge: &SemanticBridge, pool: &DbPool) -> TwoTierSearchOutcome {
+        let mut outcome = bridge.search_with_proof(&SearchQuery::messages("history", 1), 2048);
+        outcome.proof.source = Some((
+            bridge.source.clone(),
+            bridge.source.epoch_for_pool(pool).unwrap(),
+        ));
+        outcome
+    }
+
+    #[cfg(feature = "hybrid")]
+    fn hydrate_semantic_history(pool: &DbPool, outcome: TwoTierSearchOutcome) -> Vec<SearchResult> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(canonicalize_semantic_results(
+                &Cx::for_testing(),
+                pool,
+                &SearchQuery::messages("history", 1),
+                outcome.results,
+                &outcome.proof,
+            ))
+            .into_result()
+            .unwrap()
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_execute_search_bootstraps_without_live_enqueue() {
+        const CHILD: &str = "AM_TEST_SEMANTIC_HISTORY_CHILD";
+        const VERIFIED: &str = "canonical history reached execute_search without a live enqueue";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "search_service::tests::semantic_history_execute_search_bootstraps_without_live_enqueue", "--nocapture"])
+                .env(CHILD, "1")
+                .env("AM_SEARCH_SEMANTIC_ENABLED", "true")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "isolated semantic history failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains(VERIFIED),
+                "child did not run history acceptance: {stdout}"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "execute-history.sqlite3", 3);
+        let foreign = semantic_history_pool(root.path(), "execute-foreign.sqlite3", 1);
+        let bridge = Arc::new(manual_semantic_history_bridge(Arc::new(
+            FixedSemanticTestEmbedder::new(4),
+        )));
+        assert!(SEMANTIC_BRIDGE.set(Some(bridge.clone())).is_ok());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let query = SearchQuery::messages("history", 1);
+            let options = SearchOptions { search_engine: Some(SearchEngine::Semantic), ..Default::default() };
+            assert_eq!(resolve_search_engine(&options), SearchEngine::Semantic);
+            let cold = execute_search(&cx, &pool, &query, &options).await.into_result().unwrap();
+            assert!(cold.results.is_empty());
+            assert!(bridge.source.state.lock().unwrap().pool.is_some(), "query must attach its source");
+            assert_eq!(bridge.refresh_worker.run_cycle(), 3);
+            let warm = execute_search(&cx, &pool, &query, &options).await.into_result().unwrap();
+            assert_eq!(warm.results.len(), 3);
+            assert_eq!(warm.results[0].result.title, "Historical subject 1");
+
+            let conn = crate::guard_db_conn(crate::DbConn::open_file(pool.sqlite_path()).unwrap(), "history tail fixture");
+            conn.execute_raw("INSERT INTO messages \
+                (id, project_id, sender_id, subject, body_md, created_ts) \
+                VALUES (4, 1, 1, 'late arrival', 'appended after bootstrap', 1000001)").unwrap();
+            assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+            let tailed = execute_search(&cx, &pool, &query, &options).await.into_result().unwrap();
+            assert_eq!(tailed.results.len(), 4);
+
+            // No lexical index owns a mailbox yet. The semantic index's own
+            // authority must still route this same-ID foreign query privately.
+            let conn = crate::guard_db_conn(crate::DbConn::open_file(foreign.sqlite_path()).unwrap(), "foreign semantic fixture");
+            conn.execute_raw("UPDATE messages SET subject = 'foreignneedle', body_md = 'foreign canonical body' WHERE id = 1").unwrap();
+            let scoped = execute_search(&cx, &foreign, &SearchQuery::messages("foreignneedle", 1), &options)
+                .await.into_result().unwrap();
+            assert_eq!(scoped.results.len(), 1);
+            assert_eq!(scoped.results[0].result.body, "foreign canonical body");
+            assert_eq!(bridge.index().len(), 4);
+        });
+        println!("{VERIFIED}");
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_bootstrap_is_bounded_and_restarts_from_canonical_mail() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "history.sqlite3", 70);
+        // Two empty bridge instances represent a process restart: neither has
+        // received a live write event or inherited the previous vector index.
+        for _ in 0..2 {
+            let bridge =
+                manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+            assert!(bridge.index().is_empty());
+            assert!(bridge.source.bind_pool(&pool));
+            assert!(bridge.source.epoch_for_pool(&pool).is_none());
+            assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+            assert_eq!(bridge.index().len(), 64);
+            assert_eq!(bridge.refresh_worker.run_cycle(), 6);
+            assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+            assert_eq!(bridge.index().len(), 70);
+            let results =
+                hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+            assert_eq!(results.len(), 70);
+            assert_eq!(results[0].title, "Historical subject 1");
+            assert_eq!(results[0].body, "The **historical** body.");
+        }
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_first_page_includes_nonpositive_imported_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "imported-history.sqlite3", 1);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "imported history fixture",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+             (-1, 1, 1, 'negative imported ID', 'history', 1), \
+             (0, 1, 1, 'zero imported ID', 'history', 1)",
+        )
+        .unwrap();
+        let bridge = manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 3);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(bridge.index().contains(-1, SearchDocKind::Message));
+        assert!(bridge.index().contains(0, SearchDocKind::Message));
+        assert!(bridge.index().contains(1, SearchDocKind::Message));
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_bound_source_ignores_unscoped_live_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "live-hints.sqlite3", 2);
+        let bridge = manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+
+        // This may be another mailbox's committed message with the same ID.
+        // The owner has not changed, so a tail reader will never revisit ID 1.
+        assert!(bridge.enqueue_document(
+            1,
+            SearchDocKind::Message,
+            Some(1),
+            "foreign subject",
+            "foreign body",
+        ));
+        assert!(bridge.queue.is_empty());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Historical subject 1");
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 2);
+
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "live hint owner append",
+        );
+        conn.execute_raw(
+            "INSERT INTO messages \
+             (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (3, 1, 1, 'owner append', 'canonical owner content', 2)",
+        )
+        .unwrap();
+        assert!(bridge.enqueue_document(
+            3,
+            SearchDocKind::Message,
+            Some(1),
+            "untrusted hint title",
+            "untrusted hint body",
+        ));
+        assert!(bridge.queue.is_empty());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 1);
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 3);
+        let appended = results.iter().find(|result| result.id == 3).unwrap();
+        assert_eq!(appended.title, "owner append");
+        assert_eq!(appended.body, "canonical owner content");
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_backpressure_retains_every_unaccepted_row() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "backpressure.sqlite3", 1005);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        for _ in 0..20 {
+            assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        }
+        assert_eq!(bridge.queue.len(), 1000);
+        assert_eq!(bridge.source.state.lock().unwrap().after_id, Some(1000));
+        assert!(bridge.index().is_empty());
+        embedder
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        for _ in 0..6 {
+            assert!(bridge.refresh_worker.run_cycle() <= 256);
+        }
+        assert!(bridge.queue.is_empty());
+        assert_eq!(bridge.index().len(), 1005);
+        assert!(bridge.index().contains(1005, SearchDocKind::Message));
+        assert_eq!(bridge.metrics_snapshot().total_succeeded, 1005);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_recovers_restored_ids_below_the_tail_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "restored-history.sqlite3", 70);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "restored history fixture",
+        );
+        conn.execute_raw("DELETE FROM messages WHERE id = 2")
+            .unwrap();
+        let bridge = manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 5);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        for id in [2, 71] {
+            conn.execute_sync(
+                "INSERT INTO messages \
+                (id, project_id, sender_id, subject, body_md, created_ts) \
+                VALUES (?, 1, 1, 'restored or appended', 'new canonical body', 1000001)",
+                &[Value::BigInt(id)],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            bridge.refresh_worker.run_cycle(),
+            1,
+            "the ordinary tail sees ID 71"
+        );
+        assert_eq!(
+            bridge.refresh_worker.run_cycle(),
+            0,
+            "the insertion delta detects the missing old ID"
+        );
+        assert_eq!(
+            bridge.refresh_worker.run_cycle(),
+            1,
+            "the rescan embeds only the restored row"
+        );
+        assert_eq!(bridge.index().len(), 71);
+        assert!(bridge.index().contains(2, SearchDocKind::Message));
+        assert!(bridge.index().contains(71, SearchDocKind::Message));
+        assert_eq!(
+            bridge.metrics_snapshot().total_succeeded,
+            71,
+            "unchanged vectors must not be recomputed"
+        );
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_rewrites_deletes_and_generation_changes_retire_stale_work() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "rewrites.sqlite3", 70);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        embedder
+            .ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let bridge = manual_semantic_history_bridge(embedder.clone());
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.queue.len(), 64);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "history rewrite fixture",
+        );
+        conn.execute_raw("UPDATE messages SET subject = 'Updated **subject**', body_md = 'replacement body' WHERE id = 1").unwrap();
+        conn.execute_raw("DELETE FROM messages WHERE id = 2")
+            .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(
+            bridge.queue.len(),
+            64,
+            "old queued generation must be replaced, not appended"
+        );
+        embedder
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 69);
+        assert_eq!(bridge.index().len(), 69);
+        assert!(!bridge.index().contains(2, SearchDocKind::Message));
+        assert_eq!(
+            bridge
+                .index()
+                .get(1, SearchDocKind::Message)
+                .unwrap()
+                .metadata
+                .content_hash,
+            crate::search_canonical::canonicalize_and_hash(
+                SearchDocKind::Message,
+                "Updated **subject**",
+                "replacement body",
+                crate::search_canonical::CanonPolicy::Full
+            )
+            .1
+        );
+
+        // Hydration must reject stale vectors immediately, before the next
+        // background refresh notices the rewrite clock.
+        let old_candidates = semantic_history_candidates(&bridge, &pool);
+        conn.execute_raw("UPDATE messages SET body_md = 'newer body' WHERE id = 1")
+            .unwrap();
+        conn.execute_raw("DELETE FROM messages WHERE id = 3")
+            .unwrap();
+        let results = hydrate_semantic_history(&pool, old_candidates);
+        assert_eq!(results.len(), 67);
+        assert!(results.iter().all(|result| ![1, 2, 3].contains(&result.id)));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 4);
+        let old_generation = semantic_history_candidates(&bridge, &pool);
+
+        // Replacing a DB generation invalidates identical numeric IDs even
+        // when both the canonical text and revision counters happen to agree.
+        conn.execute_raw(
+            "UPDATE db_identity SET generation_id = 'semantic-history-rebuilt' WHERE singleton = 0",
+        )
+        .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert!(hydrate_semantic_history(&pool, old_generation).is_empty());
+        assert_eq!(bridge.refresh_worker.run_cycle(), 4);
+        assert_eq!(bridge.index().len(), 68);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_rejects_foreign_mailbox_and_private_snapshot_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = semantic_history_pool(root.path(), "owner-history.sqlite3", 2);
+        let foreign = semantic_history_pool(root.path(), "foreign-history.sqlite3", 2);
+        let bridge = manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+        assert!(bridge.source.bind_pool(&owner));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        let owner_candidates = semantic_history_candidates(&bridge, &owner);
+        assert!(!bridge.source.bind_pool(&foreign));
+        assert!(bridge.source.is_foreign_to_pool(&foreign));
+        assert!(
+            hydrate_semantic_history(&foreign, owner_candidates).is_empty(),
+            "matching IDs, projects and text are still a different source authority"
+        );
+        let private = foreign
+            .clone()
+            .with_search_identity_path(owner.sqlite_path());
+        assert!(!bridge.source.bind_pool(&private));
+        assert_eq!(bridge.index().len(), 2);
+        assert_eq!(
+            hydrate_semantic_history(&owner, semantic_history_candidates(&bridge, &owner)).len(),
+            2
+        );
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_missing_clock_fails_closed_and_shutdown_stops_refill() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "clock-history.sqlite3", 70);
+        let bridge = manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        bridge.refresh_worker.shutdown();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert_eq!(bridge.index().len(), 64);
+        bridge
+            .refresh_worker
+            .shutdown_flag()
+            .store(false, std::sync::atomic::Ordering::Release);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(pool.sqlite_path()).unwrap(),
+            "missing history clock fixture",
+        );
+        conn.execute_raw("DELETE FROM lexical_change_clock WHERE id = 1")
+            .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(bridge.source.epoch_for_pool(&pool).is_none());
+        assert!(bridge.queue.is_empty());
+        assert!(bridge.index().is_empty());
+        conn.execute_raw(
+            "INSERT INTO lexical_change_clock (id, revision, rewrite_revision) VALUES (1, 0, 0)",
+        )
+        .unwrap();
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 6);
+        assert_eq!(bridge.index().len(), 70);
+    }
+
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn semantic_history_generation_change_during_embedding_rejects_old_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "inflight-history.sqlite3", 70);
+        let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
+        *embedder.on_first_embedding.lock().unwrap() = Some((pool.sqlite_path().to_string(), vec![
+            "UPDATE db_identity SET generation_id = 'changed-during-embedding' WHERE singleton = 0".to_string(),
+            "UPDATE messages SET body_md = 'new generation body' WHERE id = 1".to_string(),
+        ]));
+        let bridge = manual_semantic_history_bridge(embedder);
+        assert!(bridge.source.bind_pool(&pool));
+        // The deterministic callback changes the real DB after its page has
+        // been read, while the old canonical inputs are being embedded.
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert!(
+            hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool)).is_empty(),
+            "no old-generation score may survive before the next worker reset"
+        );
+        assert_eq!(bridge.refresh_worker.run_cycle(), 64);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 6);
+        let results = hydrate_semantic_history(&pool, semantic_history_candidates(&bridge, &pool));
+        assert_eq!(results.len(), 70);
+        assert_eq!(results[0].body, "new generation body");
+        assert_eq!(
+            bridge
+                .index()
+                .get(1, SearchDocKind::Message)
+                .unwrap()
+                .metadata
+                .content_hash,
+            crate::search_canonical::canonicalize_and_hash(
+                SearchDocKind::Message,
+                "Historical subject 1",
+                "new generation body",
+                crate::search_canonical::CanonPolicy::Full
+            )
+            .1
+        );
+    }
+
+    #[cfg(all(feature = "hybrid", unix))]
+    #[test]
+    fn semantic_history_replaced_file_restarts_even_with_equal_clock_and_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = semantic_history_pool(root.path(), "physical-history.sqlite3", 2);
+        let original = crate::DbConn::open_file(pool.sqlite_path()).unwrap();
+        let replacement_path = root.path().join("replacement-history.sqlite3");
+        original
+            .execute_sync(
+                "VACUUM INTO ?",
+                &[Value::Text(replacement_path.to_str().unwrap().to_string())],
+            )
+            .unwrap();
+        original
+            .execute_raw("UPDATE messages SET body_md = 'original branch' WHERE id = 1")
+            .unwrap();
+        let replacement = crate::DbConn::open_file(replacement_path.to_str().unwrap()).unwrap();
+        replacement
+            .execute_raw("UPDATE messages SET body_md = 'restored branch' WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            semantic_source_clock(&original).unwrap(),
+            semantic_source_clock(&replacement).unwrap()
+        );
+        assert_eq!(
+            semantic_source_generation(&original).unwrap(),
+            semantic_source_generation(&replacement).unwrap()
+        );
+        original
+            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        replacement
+            .execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        crate::close_db_conn(original, "semantic original before physical replacement");
+        crate::close_db_conn(replacement, "semantic replacement before promotion");
+
+        let bridge = manual_semantic_history_bridge(Arc::new(FixedSemanticTestEmbedder::new(4)));
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        let epoch = bridge.source.epoch_for_pool(&pool).unwrap();
+        std::fs::rename(
+            pool.sqlite_path(),
+            root.path().join("retained-original.sqlite3"),
+        )
+        .unwrap();
+        std::fs::rename(&replacement_path, pool.sqlite_path()).unwrap();
+        assert!(
+            bridge.source.epoch_for_pool(&pool).is_none(),
+            "a copied logical generation cannot authorize the replaced file"
+        );
+        assert_eq!(bridge.refresh_worker.run_cycle(), 0);
+        assert!(bridge.index().is_empty());
+        assert!(bridge.source.epoch_for_pool(&pool).is_none());
+        // A main-file-only swap is not an admitted namespace transition. Retire
+        // the old engine pool before the ordinary writer open can safely admit
+        // this quiescent replacement; the read-only worker may not do so itself.
+        let old_pool = bridge.source.state.lock().unwrap().pool.take();
+        drop(old_pool);
+        drop(pool);
+        let pool = temp_file_pool(root.path(), "physical-history.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            drop(pool.acquire(&cx).await.unwrap());
+        });
+        assert!(bridge.source.bind_pool(&pool));
+        assert_eq!(bridge.refresh_worker.run_cycle(), 2);
+        assert_ne!(bridge.source.epoch_for_pool(&pool), Some(epoch));
+        assert_eq!(
+            bridge
+                .index()
+                .get(1, SearchDocKind::Message)
+                .unwrap()
+                .metadata
+                .content_hash,
+            crate::search_canonical::canonicalize_and_hash(
+                SearchDocKind::Message,
+                "Historical subject 1",
+                "restored branch",
+                crate::search_canonical::CanonPolicy::Full,
+            )
+            .1
+        );
+    }
+
+    #[cfg(feature = "hybrid")]
     #[test]
     fn semantic_bridge_pipeline_runs_enqueue_process_and_index_search() {
         let embedder = Arc::new(FixedSemanticTestEmbedder::new(4));
@@ -9747,6 +10986,10 @@ mod tests {
         if let Some(worker) = worker {
             worker.join().unwrap();
         }
+        bridge
+            .refresh_worker
+            .shutdown_flag()
+            .store(false, std::sync::atomic::Ordering::Release);
 
         assert!(bridge.enqueue_document(
             7001,
@@ -9955,7 +11198,7 @@ mod tests {
                 &cx, &pool, project_id, "RedStone", "codex", "test", None, None, None,
             ).await.into_result().unwrap();
             let outsider = crate::queries::register_agent(
-                &cx, &pool, foreign_id, "GreenField", "codex", "test", None, None, None,
+                &cx, &pool, foreign_id, "GreenLake", "codex", "test", None, None, None,
             ).await.into_result().unwrap();
             let scope = ScopeContext {
                 viewer: Some(ViewerIdentity { project_id, agent_id: sender.id.unwrap() }),
@@ -10284,6 +11527,7 @@ mod tests {
         metrics.record_index(index.metrics());
         Arc::new(TwoTierBridge {
             index: std::sync::RwLock::new(index),
+            content_hashes: Mutex::new(HashMap::new()),
             config,
             metrics: Arc::new(Mutex::new(metrics)),
         })

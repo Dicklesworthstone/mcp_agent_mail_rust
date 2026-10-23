@@ -661,6 +661,20 @@ pub(crate) struct LexicalChangeClock {
     rewrite_revision: i64,
 }
 
+#[cfg(feature = "hybrid")]
+impl LexicalChangeClock {
+    /// A tail scan is safe only while the source has no rewrites or clock reset.
+    pub(crate) const fn allows_append_from(self, previous: Self) -> bool {
+        self.revision >= previous.revision && self.rewrite_revision == previous.rewrite_revision
+    }
+
+    pub(crate) fn insertions_since(self, previous: Self) -> Option<u64> {
+        self.allows_append_from(previous)
+            .then(|| u64::try_from(self.revision - previous.revision).ok())
+            .flatten()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct ObservedLexicalSource {
     path: String,

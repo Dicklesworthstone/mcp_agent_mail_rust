@@ -27665,7 +27665,7 @@ mod tests {
                     .await
                     .into_result()
                     .expect_err("inactive owner cannot acquire or reacquire");
-                    assert!(matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field));
+                    assert!(matches!(error, asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. }) if field == expected_field));
                 }
                 let error = renew_reservations(
                     &cx, &pool, project_id, agent_id, 600, None, Some(&ids),
@@ -27673,7 +27673,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect_err("inactive owner cannot extend leases");
-                assert!(matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field));
+                assert!(matches!(error, asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. }) if field == expected_field));
                 let new_claim = IdempotencyClaim {
                     key: "new-grant",
                     fingerprint: "new-path-ttl-mode-reason",
@@ -27685,7 +27685,7 @@ mod tests {
                 .await
                 .into_result()
                 .expect_err("a new idempotency key cannot bypass lifecycle admission");
-                assert!(matches!(error, DbError::InvalidArgument { field, .. } if field == expected_field));
+                assert!(matches!(error, asupersync::OutcomeError::Err(DbError::InvalidArgument { field, .. }) if field == expected_field));
 
                 let stored = list_file_reservations(&cx, &pool, project_id, false)
                     .await
@@ -27829,7 +27829,10 @@ mod tests {
             .await
             .into_result()
             .expect_err("foreign owner cannot grant");
-            assert!(matches!(error, DbError::NotFound { .. }));
+            assert!(matches!(
+                error,
+                asupersync::OutcomeError::Err(DbError::NotFound { .. })
+            ));
             let error = renew_reservations(
                 &cx,
                 &pool,
@@ -27842,7 +27845,10 @@ mod tests {
             .await
             .into_result()
             .expect_err("foreign owner cannot renew");
-            assert!(matches!(error, DbError::NotFound { .. }));
+            assert!(matches!(
+                error,
+                asupersync::OutcomeError::Err(DbError::NotFound { .. })
+            ));
             let foreign_rows = list_file_reservations(&cx, &pool, foreign_project_id, false)
                 .await
                 .into_result()
@@ -27958,10 +27964,10 @@ mod tests {
                         .expect_err("retirement wins before reservation admission");
                 assert!(matches!(
                     error,
-                    DbError::InvalidArgument {
+                    asupersync::OutcomeError::Err(DbError::InvalidArgument {
                         field: "agent_retired",
                         ..
-                    }
+                    })
                 ));
                 let stored = list_file_reservations(&cx, &pool, project_id, false)
                     .await
