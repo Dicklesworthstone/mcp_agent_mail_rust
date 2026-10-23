@@ -40,66 +40,50 @@ fn head_tree_for_identity<'repo>(
     }
 }
 
-/// Return whether this exact canonical payload is already recorded in HEAD.
-///
-/// Missing or malformed objects and exhausted budgets never prove absence.
-/// The caller retains the project lock and shares the remaining budget with
-/// its working-tree scan before publication. No Git objects or refs are written.
-pub(super) fn preflight(
-    repo: &Repository,
-    archive: &ProjectArchive,
+/// An immutable canonical-namespace observation, not publication authority.
+/// The exact namespace must still be current when the project lock is held;
+/// staged entries and working-tree evidence are checked independently then.
+pub(super) struct CommittedIdentityProof {
+    namespace: String,
+    namespace_tree: Option<Oid>,
     message_id: i64,
+    canonical: String,
+    expected: Oid,
+    canonical_committed: bool,
+    history_scanned: bool,
+}
+
+fn canonical_is_committed(
+    tree: Option<&Tree<'_>>,
     canonical: &str,
     expected: Oid,
-    message_files_missing: bool,
-    budget: &mut CanonicalScanBudget<'_>,
 ) -> crate::Result<bool> {
-    let Some(tree) = head_tree_for_identity(repo, budget)? else {
-        staged::preflight(repo, archive, message_id, canonical, expected, None, budget)?;
+    let Some(tree) = tree else {
         return Ok(false);
     };
-    let canonical_committed = match tree.get_path(Path::new(canonical)) {
+    match tree.get_path(Path::new(canonical)) {
         Ok(entry)
             if entry.kind() == Some(ObjectType::Blob)
                 && matches!(entry.filemode(), 0o100644 | 0o100755)
                 && entry.id() == expected =>
         {
-            true
+            Ok(true)
         }
-        Ok(_) => {
-            return Err(invalid(
-                "committed canonical payload conflicts with authoritative message; preserved",
-            ));
-        }
-        Err(error) if error.code() == ErrorCode::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
-    // Even a complete committed bundle can coexist with conflicting staged
-    // evidence. A failed Git commit must not make that identity invisible.
-    staged::preflight(
-        repo,
-        archive,
-        message_id,
-        canonical,
-        expected,
-        Some(&tree),
-        budget,
-    )?;
-    // A fully materialized, already-recorded message (including an attachment-
-    // only repair) introduces no canonical path. Do not rescan history on every
-    // unchanged maintenance visit. Missing message copies still require proof.
-    if canonical_committed && !message_files_missing {
-        budget.checkpoint("git scan result")?;
-        return Ok(true);
+        Ok(_) => Err(invalid(
+            "committed canonical payload conflicts with authoritative message; preserved",
+        )),
+        Err(error) if error.code() == ErrorCode::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    let root = crate::archive_project_root_checked(archive)?.join("messages");
-    let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
-    let entry = match tree.get_path(Path::new(&relative)) {
+}
+
+fn namespace_tree(tree: Option<&Tree<'_>>, relative: &str) -> crate::Result<Option<Oid>> {
+    let Some(tree) = tree else {
+        return Ok(None);
+    };
+    let entry = match tree.get_path(Path::new(relative)) {
         Ok(entry) => entry,
-        Err(error) if error.code() == ErrorCode::NotFound => {
-            budget.checkpoint("git scan result")?;
-            return Ok(canonical_committed);
-        }
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     if entry.kind() != Some(ObjectType::Tree) || entry.filemode() != 0o040000 {
@@ -107,7 +91,53 @@ pub(super) fn preflight(
             "committed canonical namespace is not a directory; repair refused",
         ));
     }
-    let root = repo.find_tree(entry.id())?;
+    Ok(Some(entry.id()))
+}
+
+/// Check historical immutable blobs without retaining the mutation fence.
+/// Missing/malformed objects and exhausted budgets never produce a proof.
+/// Only the exact content-addressed project namespace may be reused later;
+/// neither HEAD movement elsewhere nor an epoch token proves this namespace.
+pub(super) fn prepare_committed(
+    repo: &Repository,
+    archive: &ProjectArchive,
+    message_id: i64,
+    canonical: &str,
+    expected: Oid,
+    message_files_missing: bool,
+    budget: &mut CanonicalScanBudget<'_>,
+) -> crate::Result<CommittedIdentityProof> {
+    let tree = head_tree_for_identity(repo, budget)?;
+    let root = crate::archive_project_root_checked(archive)?.join("messages");
+    let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
+    if !canonical.starts_with(&format!("{relative}/")) {
+        return Err(invalid(
+            "committed canonical target is outside its project namespace",
+        ));
+    }
+    let canonical_committed = canonical_is_committed(tree.as_ref(), canonical, expected)?;
+    let namespace_tree = namespace_tree(tree.as_ref(), &relative)?;
+    let proof = CommittedIdentityProof {
+        namespace: relative.clone(),
+        namespace_tree,
+        message_id,
+        canonical: canonical.to_string(),
+        expected,
+        canonical_committed,
+        history_scanned: !canonical_committed || message_files_missing,
+    };
+    // A fully materialized, already-recorded message (including an attachment-
+    // only repair) introduces no canonical path. Do not rescan history on every
+    // unchanged maintenance visit. Missing message copies still require proof.
+    if canonical_committed && !message_files_missing {
+        budget.checkpoint("git scan result")?;
+        return Ok(proof);
+    }
+    let Some(namespace_tree) = namespace_tree else {
+        budget.checkpoint("git scan result")?;
+        return Ok(proof);
+    };
+    let root = repo.find_tree(namespace_tree)?;
     for (year, year_id) in date_trees(&root, 4, budget)? {
         budget.checkpoint("git year")?;
         let year_tree = repo.find_tree(year_id)?;
@@ -145,7 +175,67 @@ pub(super) fn preflight(
         }
     }
     budget.checkpoint("git scan result")?;
-    Ok(canonical_committed)
+    Ok(proof)
+}
+
+/// Consume the immutable proof under the caller's publication/project locks.
+/// A changed namespace or newly missing copy requires a fresh bounded pass;
+/// never fall back to a historical scan while the global fence is held.
+pub(super) fn revalidate_prepared(
+    repo: &Repository,
+    archive: &ProjectArchive,
+    proof: &CommittedIdentityProof,
+    message_files_missing: bool,
+    budget: &mut CanonicalScanBudget<'_>,
+) -> crate::Result<bool> {
+    budget.checkpoint("git proof revalidation")?;
+    let tree = head_tree_for_identity(repo, budget)?;
+    let root = crate::archive_project_root_checked(archive)?.join("messages");
+    let relative = crate::rel_path_cached(&archive.canonical_repo_root, &root)?;
+    if relative != proof.namespace
+        || namespace_tree(tree.as_ref(), &relative)? != proof.namespace_tree
+        || (message_files_missing && !proof.history_scanned)
+    {
+        return Err(crate::StorageError::LockContention {
+            message: "canonical archive identity changed after preparation; retry required".into(),
+        });
+    }
+    // Even a complete committed bundle can coexist with conflicting staged
+    // evidence. Read current index bytes only after taking publication locks.
+    staged::preflight(
+        repo,
+        archive,
+        proof.message_id,
+        &proof.canonical,
+        proof.expected,
+        tree.as_ref(),
+        budget,
+    )?;
+    budget.checkpoint("git scan result")?;
+    Ok(proof.canonical_committed)
+}
+
+/// Return whether this exact canonical payload is already recorded in HEAD.
+/// Read-only observers and standalone checks retain the same shared bounds.
+pub(super) fn preflight(
+    repo: &Repository,
+    archive: &ProjectArchive,
+    message_id: i64,
+    canonical: &str,
+    expected: Oid,
+    message_files_missing: bool,
+    budget: &mut CanonicalScanBudget<'_>,
+) -> crate::Result<bool> {
+    let proof = prepare_committed(
+        repo,
+        archive,
+        message_id,
+        canonical,
+        expected,
+        message_files_missing,
+        budget,
+    )?;
+    revalidate_prepared(repo, archive, &proof, message_files_missing, budget)
 }
 
 fn date_trees(
@@ -595,5 +685,87 @@ mod tests {
         assert_eq!(std::fs::read(source).unwrap(), bytes);
         assert!(!paths.canonical.exists());
         assert_eq!(repo.head().unwrap().target().unwrap(), before);
+    }
+
+    #[test]
+    fn prepared_history_keeps_its_consumed_budget_for_guarded_index_checks() {
+        let (_dir, config, archive, message, recipients) = fixture();
+        let source = archive.root.join("messages/2025/01/other.md");
+        let bytes = b"---json\n{\"id\":99}\n---\n\nretained";
+        let before = commit_source(&archive, &config, &source, bytes);
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(&relative)).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let full =
+            crate::render_message_bundle_content(&message, entry(&message, &recipients).body_md)
+                .unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, full.as_bytes()).unwrap();
+        let mut budget = CanonicalScanBudget {
+            entries_left: 3,
+            ..Default::default()
+        };
+        let proof = prepare_committed(&repo, &archive, 42, &canonical, expected, true, &mut budget)
+            .unwrap();
+        assert_eq!(budget.entries_left, 0, "year, month, and canonical blob");
+        assert_eq!(
+            budget.bytes_left,
+            super::super::MAX_CANONICAL_SCAN_BYTES - bytes.len() as u64
+        );
+        let error = revalidate_prepared(&repo, &archive, &proof, true, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("entry budget"), "{error}");
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
+        assert_eq!(repo.head().unwrap().target().unwrap(), before);
+        assert_eq!(std::fs::read(source).unwrap(), bytes);
+    }
+
+    #[test]
+    fn newly_missing_message_copy_requires_a_full_fresh_history_proof() {
+        let (_dir, config, archive, message, recipients) = fixture();
+        reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let paths = crate::message_paths_for_bundle(&archive, &message, "BlueLake", &recipients)
+            .unwrap()
+            .0;
+        let canonical =
+            crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical).unwrap();
+        let full = std::fs::read(&paths.canonical).unwrap();
+        let expected = Oid::hash_object(ObjectType::Blob, &full).unwrap();
+        let mut budget = CanonicalScanBudget::default();
+        let proof = prepare_committed(
+            &repo,
+            &archive,
+            42,
+            &canonical,
+            expected,
+            false,
+            &mut budget,
+        )
+        .unwrap();
+        std::fs::rename(
+            &paths.outbox,
+            config.storage_root.join("retained-outbox.md"),
+        )
+        .unwrap();
+        let missing = super::super::artifact_missing(&paths.outbox, &full).unwrap();
+        let error = revalidate_prepared(&repo, &archive, &proof, missing, &mut budget).unwrap_err();
+        assert!(matches!(error, crate::StorageError::LockContention { .. }));
+        assert!(
+            !paths.outbox.exists(),
+            "an incomplete proof authorizes no repair"
+        );
+        let repaired =
+            reconcile_message_bundle(&archive, &config, entry(&message, &recipients)).unwrap();
+        assert_eq!(repaired.files_created, 1);
+        assert_eq!(std::fs::read(&paths.outbox).unwrap(), full);
     }
 }

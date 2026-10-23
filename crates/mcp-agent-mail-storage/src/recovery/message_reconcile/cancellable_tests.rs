@@ -448,6 +448,163 @@ impl Drop for StopOnScan {
     }
 }
 
+pub(super) struct ObserveScan;
+
+impl ObserveScan {
+    pub(super) fn new(hook: impl FnMut(&'static str) + 'static) -> Self {
+        SCAN_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested scan observer");
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        Self
+    }
+}
+
+impl Drop for ObserveScan {
+    fn drop(&mut self) {
+        SCAN_HOOK.with(|slot| {
+            drop(slot.borrow_mut().take());
+        });
+    }
+}
+
+#[test]
+fn historical_git_scan_allows_a_direct_reservation_writer_to_publish() {
+    if isolated() {
+        return;
+    }
+    let (_temp, config, archive, message, recipients) = fixture();
+    let source = archive.root.join("messages/2025/01/other.md");
+    crate::ensure_parent_dir(&source).unwrap();
+    fs::write(&source, b"---json\n{\"id\":99}\n---\n\nretained").unwrap();
+    let relative = crate::rel_path_cached(&archive.canonical_repo_root, &source).unwrap();
+    crate::commit_paths_with_retry(
+        &archive.repo_root,
+        &config,
+        "fixture: immutable history",
+        &[relative.as_str()],
+    )
+    .unwrap();
+    let other = crate::ensure_archive(&config, "reservation-peer").unwrap();
+    let op = crate::WriteOp::FileReservation {
+        project_slug: other.slug.clone(),
+        config: config.clone(),
+        reservations: vec![serde_json::json!({
+            "id": 1, "agent": "GreenCastle", "path_pattern": "src/**",
+            "exclusive": true, "reason": "unrelated reservation",
+            "created_ts": "2026-10-01T00:00:00Z", "expires_ts": "2030-10-01T00:00:00Z",
+        })],
+    };
+    let visited = std::sync::Arc::new(AtomicBool::new(false));
+    let hook_visited = visited.clone();
+    let observer = ObserveScan::new(move |stage| {
+        if stage != "git blob" || hook_visited.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let op = op.clone();
+        let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
+            .join()
+            .unwrap();
+        assert!(
+            matches!(result, crate::DirectArchiveWrite::Written),
+            "{result:?}"
+        );
+        crate::flush_async_commits();
+    });
+    let result = reconcile_message_bundle_cancellable(
+        &Cx::for_testing(),
+        &archive,
+        &config,
+        entry(&message, &recipients),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    drop(observer);
+    assert!(visited.load(Ordering::Acquire));
+    assert_eq!(result.files_created, 4);
+    assert_committed(&archive, &bundle_paths(&archive, &message, &recipients));
+    let reservation: serde_json::Value =
+        serde_json::from_slice(&fs::read(other.root.join("file_reservations/id-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(reservation["agent"], "GreenCastle");
+    assert_eq!(reservation["path_pattern"], "src/**");
+    assert_scan_locks_released(&archive);
+}
+
+#[test]
+fn publication_revalidates_history_and_new_staging_after_immutable_preparation() {
+    if isolated() {
+        return;
+    }
+    for case in ["committed-conflict", "staged-conflict", "foreign-commit"] {
+        let (_temp, config, archive, message, recipients) = fixture();
+        let other = crate::ensure_archive(&config, "unrelated-history").unwrap();
+        let source = if case == "foreign-commit" {
+            other.root.join("messages/2025/01/prior.md")
+        } else {
+            archive.root.join("messages/2025/01/prior.md")
+        };
+        let evidence = config.storage_root.join(format!("{case}-evidence.md"));
+        let evidence_for_hook = evidence.clone();
+        let repo_root = archive.repo_root.clone();
+        let canonical_repo_root = archive.canonical_repo_root.clone();
+        let hook_config = config.clone();
+        let visited = std::sync::Arc::new(AtomicBool::new(false));
+        let hook_visited = visited.clone();
+        let bytes = b"---json\n{\"id\":42}\n---\n\nretained prior identity";
+        let observer = ObserveScan::new(move |stage| {
+            if stage != "git scan result" || hook_visited.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            crate::ensure_parent_dir(&source).unwrap();
+            fs::write(&source, bytes).unwrap();
+            let relative = crate::rel_path_cached(&canonical_repo_root, &source).unwrap();
+            if case == "staged-conflict" {
+                let repo = Repository::open(&repo_root).unwrap();
+                let mut index = repo.index().unwrap();
+                index.add_path(Path::new(&relative)).unwrap();
+                index.write().unwrap();
+            } else {
+                crate::commit_paths_with_retry(
+                    &repo_root,
+                    &hook_config,
+                    "fixture: concurrent identity",
+                    &[relative.as_str()],
+                )
+                .unwrap();
+            }
+            fs::rename(&source, &evidence_for_hook).unwrap();
+        });
+        let result = reconcile_message_bundle_cancellable(
+            &Cx::for_testing(),
+            &archive,
+            &config,
+            entry(&message, &recipients),
+            &AtomicBool::new(false),
+        );
+        drop(observer);
+        assert!(visited.load(Ordering::Acquire), "{case}");
+        let paths = bundle_paths(&archive, &message, &recipients);
+        if case == "foreign-commit" {
+            assert_eq!(result.unwrap().files_created, 4);
+            assert_committed(&archive, &paths);
+        } else {
+            let error = result.unwrap_err();
+            if case == "committed-conflict" {
+                assert!(
+                    matches!(error, StorageError::LockContention { .. }),
+                    "{error}"
+                );
+            } else {
+                assert!(error.to_string().contains("already staged"), "{error}");
+            }
+            assert!(paths.iter().all(|path| !path.exists()), "{case}");
+        }
+        assert_eq!(fs::read(evidence).unwrap(), bytes);
+        assert_scan_locks_released(&archive);
+    }
+}
+
 fn assert_scan_interrupted(error: &StorageError, stage: &str) {
     assert!(
         matches!(error, StorageError::Io(error)

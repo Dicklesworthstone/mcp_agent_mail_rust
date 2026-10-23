@@ -615,8 +615,11 @@ fn reconcile_prepared_inner(
     }
     // Admit before ensure_archive: even creating a missing archive must not
     // wait behind an unrelated publisher while retaining the DB source lease.
-    // Nested bundle publication retains this same native mutation window.
-    let _mutation = control
+    // Keep mutable metadata collection in one native mutation window. Bundle
+    // repair revalidates the captured bytes before publishing, so release this
+    // window before its immutable Git-history proof: scanning old messages must
+    // not exclude unrelated live archive writers.
+    let metadata_mutation = control
         .map(|control| control.begin_at(&config.storage_root))
         .transpose()?;
     let archive = crate::ensure_archive(config, &prepared.project_slug)?;
@@ -729,6 +732,7 @@ fn reconcile_prepared_inner(
         recipients: &prepared.recipients,
         extra_paths: &[],
     };
+    drop(metadata_mutation);
     match control {
         Some(control) => super::reconcile_message_bundle_cancellable(
             control.cx,
@@ -1756,6 +1760,129 @@ mod tests {
         let original = prepared();
         let archive = crate::ensure_archive(&config, &original.project_slug).unwrap();
         (temp, config, original, archive)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prepared_repair_releases_metadata_fence_and_rechecks_surviving_reply() {
+        use super::super::cancellable_tests::{ObserveScan, isolated};
+        use std::fs;
+        use std::sync::atomic::Ordering;
+
+        if isolated() {
+            return;
+        }
+        for replace_survivor in [false, true] {
+            let (_temp, config, original, archive) = git_fixture();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
+            let mut full = original.message.clone();
+            full["reply_to"] = json!(7);
+            full["future_metadata"] = json!({"opaque": ["keep", 42]});
+            let redacted = crate::redact_message_bcc_for_inbox(&full);
+            let survivor_bytes =
+                crate::render_message_bundle_content(&redacted, &original.body).unwrap();
+            crate::ensure_parent_dir(&paths.inbox[0]).unwrap();
+            fs::write(&paths.inbox[0], survivor_bytes.as_bytes()).unwrap();
+            let history = archive.root.join("messages/2025/01/other.md");
+            commit_survivors(&archive, &[(&history, &json!({"id": 99}))], "history");
+            let other = crate::ensure_archive(&config, "reservation-peer").unwrap();
+            let op = crate::WriteOp::FileReservation {
+                project_slug: other.slug.clone(),
+                config: config.clone(),
+                reservations: vec![json!({
+                    "id": 1, "agent": "GreenCastle", "path_pattern": "src/**",
+                    "exclusive": true, "reason": "unrelated reservation",
+                    "created_ts": "2026-10-01T00:00:00Z", "expires_ts": "2030-10-01T00:00:00Z",
+                })],
+            };
+            let mut replacement = redacted.clone();
+            replacement["reply_to"] = json!(8);
+            replacement["future_metadata"] = json!({"concurrent": "preserve"});
+            let replacement_bytes =
+                crate::render_message_bundle_content(&replacement, &original.body).unwrap();
+            let replacement_for_hook = replacement_bytes.clone();
+            let survivor = paths.inbox[0].clone();
+            let visited = std::sync::Arc::new(AtomicBool::new(false));
+            let hook_visited = visited.clone();
+            let observer = ObserveScan::new(move |stage| {
+                if stage != "git blob" || hook_visited.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let op = op.clone();
+                let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
+                    .join()
+                    .unwrap();
+                assert!(
+                    matches!(result, crate::DirectArchiveWrite::Written),
+                    "{result:?}"
+                );
+                crate::flush_async_commits();
+                if replace_survivor {
+                    fs::write(&survivor, replacement_for_hook.as_bytes()).unwrap();
+                }
+            });
+            let cx = Cx::for_testing();
+            let stop = AtomicBool::new(false);
+            let result = reconcile_prepared_inner(
+                &config,
+                &original,
+                Some(RepairControl {
+                    cx: &cx,
+                    stop: &stop,
+                }),
+                true,
+            );
+            drop(observer);
+            assert!(visited.load(Ordering::Acquire));
+            let reservation: Value = serde_json::from_slice(
+                &fs::read(other.root.join("file_reservations/id-1.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reservation["agent"], "GreenCastle");
+            assert_eq!(reservation["path_pattern"], "src/**");
+            if replace_survivor {
+                let error = result.unwrap_err();
+                assert!(error.detail.contains("conflict"), "{}", error.detail);
+                assert!(!paths.canonical.exists());
+                assert!(!paths.outbox.exists());
+                assert!(!paths.inbox[1].exists());
+                assert_eq!(
+                    fs::read(&paths.inbox[0]).unwrap(),
+                    replacement_bytes.as_bytes()
+                );
+            } else {
+                let repaired = result.unwrap();
+                assert_eq!(repaired.files_created, 3);
+                assert!(repaired.git_commit_needed);
+                for path in [&paths.canonical, &paths.outbox] {
+                    let (message, body) = read_surviving_message(path).unwrap().unwrap();
+                    assert_eq!(message, full);
+                    assert_eq!(body, original.body);
+                }
+                for path in &paths.inbox {
+                    assert_eq!(fs::read(path).unwrap(), survivor_bytes.as_bytes());
+                }
+                let repo = git2::Repository::open(&archive.repo_root).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(paths.inbox.iter())
+                {
+                    let relative =
+                        crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                    let entry = tree.get_path(std::path::Path::new(&relative)).unwrap();
+                    let blob = repo.find_blob(entry.id()).unwrap();
+                    assert_eq!(blob.content(), fs::read(path).unwrap().as_slice());
+                }
+            }
+        }
     }
 
     #[test]

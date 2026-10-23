@@ -109,8 +109,9 @@ pub fn reconcile_message_bundle(
 /// Restore a message bundle with cooperative cancellation and bounded lock admission.
 ///
 /// Uses the same validation, no-clobber publication and exact Git verification
-/// as [`reconcile_message_bundle`]. A busy global publication fence defers
-/// immediately; project mutex/flock waits share a 250 ms acquisition budget.
+/// as [`reconcile_message_bundle`]. Immutable history is checked before the
+/// non-blocking global publication-fence admission; project mutex/flock waits
+/// share a 250 ms acquisition budget.
 /// The worker stop flag and Cx are checked before admission, while waiting for
 /// project locks, during canonical identity scans, between file publications,
 /// and before committing. Completed
@@ -207,6 +208,31 @@ fn reconcile_message_bundle_inner(
     targets.extend(paths.inbox.into_iter().map(|path| (path, inbox.as_bytes())));
     let message_target_count = targets.len();
     let repo_root = crate::archive_repo_root_checked(archive)?;
+    let repo = Repository::open(repo_root)?;
+    // Historical Git blobs are immutable and can be verified before entering
+    // the global mutation window. Keep their bounded proof tied to the exact
+    // canonical namespace, then revalidate it under the project lock below.
+    // Mutable destinations are observed again there; this first observation
+    // only decides whether a full historical identity scan is necessary.
+    let mut initial_message_files_missing = false;
+    for (path, expected) in &targets {
+        initial_message_files_missing |= artifact_missing(path, expected)?;
+    }
+    let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+    let expected = Oid::hash_object(ObjectType::Blob, full.as_bytes())?;
+    let mut identity_budget = CanonicalScanBudget {
+        control,
+        ..Default::default()
+    };
+    let committed_identity = identity::prepare_committed(
+        &repo,
+        archive,
+        id,
+        &canonical,
+        expected,
+        initial_message_files_missing,
+        &mut identity_budget,
+    )?;
     // Missing-file publication creates parent directories inside the project
     // lock. Enter their mutation fence first, matching ordinary bundle writes
     // and archive-verified retention, so repair cannot invert that lock order.
@@ -214,7 +240,6 @@ fn reconcile_message_bundle_inner(
         Some(control) => control.begin_at(repo_root)?,
         None => crate::ArchiveMutationGuard::begin_at(repo_root),
     };
-    let repo = Repository::open(repo_root)?;
     let attachment_files =
         attachments::prepare(&repo, archive, entry.message, MAX_BUNDLE_BYTES - bytes)?;
     targets.extend(
@@ -250,18 +275,13 @@ fn reconcile_message_bundle_inner(
             .take(message_target_count)
             .any(|missing| *missing);
         // Disk loss does not erase a canonical ID recorded under another Git
-        // path. Share one budget across both namespaces. An interrupted repair
-        // with all files present still needs this proof before its first commit.
-        let mut identity_budget = CanonicalScanBudget {
-            control,
-            ..Default::default()
-        };
-        let canonical_committed = identity::preflight(
+        // path. Consume the immutable proof only if that exact namespace is
+        // still current; mutable index and disk checks share its remaining
+        // budget. Drift defers instead of rescanning while holding the fence.
+        let canonical_committed = identity::revalidate_prepared(
             &repo,
             archive,
-            id,
-            &rel_paths[0],
-            expected_oids[0],
+            &committed_identity,
             message_files_missing,
             &mut identity_budget,
         )?;
