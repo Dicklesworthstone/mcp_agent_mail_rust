@@ -4093,7 +4093,11 @@ pub async fn reply_message(
     let bcc = normalize_optional_agent_names(bcc);
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
-    // Fingerprint the normalized reply payload (only when a key was supplied).
+    // Presence changes reply semantics: omitted recipients default to the
+    // original sender, omitted prefix means "Re:", and omitted ACK inherits.
+    // Keep those distinct from explicit empty/false values before replay.
+    // The added presence fields intentionally conflict with older, ambiguous
+    // reply fingerprints rather than reinterpret a retained key's intent.
     let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
         let sorted = |v: Option<&Vec<String>>| {
             let mut x = v.cloned().unwrap_or_default();
@@ -4109,11 +4113,17 @@ pub async fn reply_message(
                 ("sender", sender_name.clone()),
                 ("body_md", body_md.clone()),
                 ("to", sorted(to.as_ref())),
+                ("to_provided", to.is_some().to_string()),
                 ("cc", sorted(cc.as_ref())),
                 ("bcc", sorted(bcc.as_ref())),
                 ("subject_prefix", subject_prefix.clone().unwrap_or_default()),
+                (
+                    "subject_prefix_provided",
+                    subject_prefix.is_some().to_string(),
+                ),
                 ("importance", importance.clone().unwrap_or_default()),
                 ("ack_required", ack_required.unwrap_or(false).to_string()),
+                ("ack_required_provided", ack_required.is_some().to_string()),
                 ("attachments", atts.join("\u{1f}")),
                 (
                     "convert_images",
