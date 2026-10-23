@@ -43,7 +43,7 @@
 //!
 //! ## Fix (`Op::WriteFile`)
 //!
-//! `transform_file` reads and renders the current JSON under the
+//! `transform_config_file` reads and renders the current JSON under the
 //! canonical mutation locks. Only the detected token field changes;
 //! removed fields and newer operator values are not overwritten.
 //! Backup, hash verification, owner-only publication, and undo records
@@ -57,7 +57,7 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::transform_file;
+use crate::doctor::mutate::transform_config_file;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -334,7 +334,7 @@ pub fn fix(
             quarantined_paths: Vec::new(),
         });
     }
-    let result = transform_file(ctx, &finding.config_path, 0o600, |source| {
+    let result = transform_config_file(ctx, &finding.config_path, 0o600, true, |source| {
         let mut value: serde_json::Value = serde_json::from_slice(source)?;
         let loc = &finding.location;
         if !SERVERS_CONTAINER_KEYS.contains(&loc.container_key.as_str())

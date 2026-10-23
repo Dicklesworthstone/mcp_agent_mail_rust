@@ -31,6 +31,9 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use mcp_agent_mail_core::setup::{
+    ExistingConfigTransformOptions, SetupError, transform_existing_config_atomic,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -219,8 +222,20 @@ pub enum MutateError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("config mutation refused or publication unconfirmed: {0}")]
+    ConfigAuthority(SetupError),
     #[error("op not implemented in this build: {0}")]
     Unsupported(&'static str),
+}
+
+impl From<SetupError> for MutateError {
+    fn from(error: SetupError) -> Self {
+        match error {
+            SetupError::ConfigSourceChanged(path) => Self::TamperedBeforeMutate(path),
+            SetupError::ConfigLockHeld(path) => Self::LockHeld(path),
+            error => Self::ConfigAuthority(error),
+        }
+    }
 }
 
 /// Stream SHA-256 over the file's bytes without loading the entire file into
@@ -800,54 +815,99 @@ fn chmod_via_fd(path: &Path, mode: u32) -> std::io::Result<()> {
 /// files are skipped rather than recreated. Dry runs evaluate the transform
 /// without creating lock files or other mutation artifacts.
 ///
-/// Both the bytes read by the callback and the live file after rendering
-/// must match the chokepoint's `before_hash`. The existing post-backup
-/// check then witnesses that same snapshot. This closes the read/render
-/// window that `mutate(Op::WriteFile)` cannot protect for its callers.
-/// Advisory locks do not exclude arbitrary non-cooperating writers; this
-/// API does not claim directory-pinned publication or a filesystem CAS.
+/// The retained no-follow parent and source snapshot bind rendering, the
+/// verbatim backup, atomic exchange, and both action records. Repository
+/// serialization protects secret-bearing live and backup paths through
+/// completion, without unlogged changes to `.gitignore`.
 pub fn transform_file(
     ctx: &MutateContext,
     path: &Path,
     mode: u32,
     transform: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, MutateError>,
 ) -> Result<Option<ActionResult>, MutateError> {
+    transform_config_file(ctx, path, mode, false, transform)
+}
+
+/// As `transform_file`, with an explicit secret flag for repairs of plain
+/// token fields that do not carry an `Authorization: Bearer` prefix.
+pub fn transform_config_file(
+    ctx: &MutateContext,
+    path: &Path,
+    mode: u32,
+    contains_literal_secret: bool,
+    transform: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, MutateError>,
+) -> Result<Option<ActionResult>, MutateError> {
     ensure_in_scope(&ctx.capabilities, path)?;
-    let op = Op::WriteFile {
-        content: Vec::new(),
-        mode,
-    };
-    reject_unexpected_symlink(path, &op)?;
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-        Ok(_) => {}
-    }
-    mutate_prepared(ctx, path, op, |_, before_hash| {
-        let mut file = open_regular_file_no_follow(path)?;
-        let mut source = Vec::new();
-        file.read_to_end(&mut source)?;
-        if sha256_bytes(&source) != before_hash {
-            return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
-        }
-        let content = transform(&source)?;
-        // Refuse before backup/pending records: rolling back here would
-        // itself clobber the concurrent writer we are trying to protect.
-        reject_unexpected_symlink(
-            path,
-            &Op::WriteFile {
-                content: Vec::new(),
-                mode,
+    reject_unexpected_symlink(
+        path,
+        &Op::WriteFile {
+            content: Vec::new(),
+            mode,
+        },
+    )?;
+    let started_at_ns = elapsed_ns(ctx.start);
+    let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
+    let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
+    let record = |view: &mcp_agent_mail_core::setup::ConfigTransformSnapshot<'_>,
+                  completed: bool|
+     -> Result<(), MutateError> {
+        let action = ActionRecord {
+            path: rel.to_string_lossy().into_owned(),
+            op: "WriteFile".into(),
+            before_hash: sha256_bytes(view.before),
+            after_hash: if completed {
+                sha256_bytes(view.after)
+            } else {
+                String::new()
             },
-        )?;
-        ensure_in_scope(&ctx.capabilities, path)?;
-        if sha256_of_path(path)? != before_hash {
-            return Err(MutateError::TamperedBeforeMutate(path.to_path_buf()));
-        }
-        Ok(content
-            .filter(|bytes| bytes != &source)
-            .map(|content| Op::WriteFile { content, mode }))
-    })
+            expected_after_hash: Some(sha256_bytes(view.after)),
+            expected_after_mode: Some(view.after_mode),
+            started_at_ns,
+            finished_at_ns: if completed { elapsed_ns(ctx.start) } else { 0 },
+            run_id: ctx.run_id.clone(),
+            fixer_id: ctx.fixer_id.clone(),
+            ok: completed,
+            phase: Some(if completed { "completed" } else { "pending" }),
+            rename_to: None,
+            before_mode: Some(view.before_mode),
+            after_mode: completed.then_some(view.after_mode),
+            error: None,
+            rolled_back: None,
+        };
+        let mut file = ctx
+            .actions_file
+            .lock()
+            .map_err(|_| MutateError::Unsupported("actions_file mutex poisoned"))?;
+        file.write_all((serde_json::to_string(&action)? + "\n").as_bytes())?;
+        file.sync_data()?;
+        Ok(())
+    };
+    transform_existing_config_atomic(
+        path,
+        ExistingConfigTransformOptions {
+            permissions: mode,
+            contains_literal_secret,
+            dry_run: ctx.dry_run,
+            backup_path: &backup_path,
+        },
+        || ctx.acquire_extra_locks(),
+        transform,
+        |view| {
+            ensure_in_scope(&ctx.capabilities, path)?;
+            record(view, false)
+        },
+        |view| {
+            if !ctx.dry_run {
+                record(view, true)?;
+            }
+            Ok(ActionResult {
+                ok: true,
+                before_hash: sha256_bytes(view.before),
+                after_hash: sha256_bytes(if ctx.dry_run { view.before } else { view.after }),
+                error: None,
+            })
+        },
+    )
 }
 
 /// THE chokepoint. Every fixer-driven mutation flows through this.
@@ -2412,5 +2472,240 @@ mod tests {
         .unwrap();
         assert!(skipped.is_none());
         assert!(!missing.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn transform_file_refuses_same_bytes_with_changed_inode_mode_or_links() {
+        for change in ["inode", "mode", "hardlink"] {
+            let td = TempDir::new().unwrap();
+            let target = td.path().join("config.json");
+            fs::write(&target, b"original").unwrap();
+            fs::set_permissions(&target, Permissions::from_mode(0o600)).unwrap();
+            let ctx = make_ctx(&td, "2026-10-23T00-00-00Z__source_identity");
+            let error = transform_file(&ctx, &target, 0o600, |_| {
+                match change {
+                    "inode" => {
+                        fs::rename(&target, td.path().join("displaced.json"))?;
+                        fs::write(&target, b"original")?;
+                        fs::set_permissions(&target, Permissions::from_mode(0o600))?;
+                    }
+                    "mode" => fs::set_permissions(&target, Permissions::from_mode(0o640))?,
+                    "hardlink" => fs::hard_link(&target, td.path().join("alias.json"))?,
+                    _ => unreachable!(),
+                }
+                Ok(Some(b"replacement".to_vec()))
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, MutateError::TamperedBeforeMutate(_)),
+                "{change}: {error}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"original");
+            assert!(
+                fs::read(ctx.run_dir.join("actions.jsonl"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn transform_file_refuses_replaced_config_and_backup_parents() {
+        for replace_backup_parent in [false, true] {
+            let td = TempDir::new().unwrap();
+            let parent = td.path().join("client");
+            fs::create_dir(&parent).unwrap();
+            let target = parent.join("config.json");
+            fs::write(&target, b"original").unwrap();
+            let ctx = make_ctx(&td, "2026-10-23T00-00-01Z__parent_identity");
+            let result = transform_file(&ctx, &target, 0o600, |_| {
+                let replaced = if replace_backup_parent {
+                    ctx.run_dir.join("backups")
+                } else {
+                    parent.clone()
+                };
+                fs::rename(&replaced, td.path().join("retained-parent"))?;
+                fs::create_dir(&replaced)?;
+                if !replace_backup_parent {
+                    fs::write(&target, b"concurrent operator config")?;
+                }
+                Ok(Some(b"replacement".to_vec()))
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                if replace_backup_parent {
+                    b"original".as_slice()
+                } else {
+                    b"concurrent operator config".as_slice()
+                }
+            );
+            assert!(
+                fs::read(ctx.run_dir.join("actions.jsonl"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+                0
+            );
+        }
+    }
+
+    fn config_test_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn transform_file_refuses_tracked_and_unignored_plain_tokens_without_gitignore_edits() {
+        for tracked in [false, true] {
+            let td = TempDir::new().unwrap();
+            config_test_git(td.path(), &["init", "-q"]);
+            let target = td.path().join("config.json");
+            let original = br#"{"token":"old-private-value","url":"old"}"#;
+            fs::write(&target, original).unwrap();
+            let ignore = b".doctor/\n";
+            fs::write(td.path().join(".gitignore"), ignore).unwrap();
+            if tracked {
+                config_test_git(td.path(), &["add", "--", "config.json"]);
+            }
+            let ctx = make_ctx(&td, "2026-10-23T00-00-02Z__git_exposure");
+            // URL repairs must detect plain token values too; they may not
+            // preserve credentials into a tracked config as a side effect.
+            let error = transform_file(&ctx, &target, 0o600, |_| {
+                Ok(Some(
+                    br#"{"token":"old-private-value","url":"new"}"#.to_vec(),
+                ))
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if tracked {
+                    "Git-tracked"
+                } else {
+                    "does not protect"
+                }),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("old-private-value"));
+            assert_eq!(fs::read(&target).unwrap(), original);
+            assert_eq!(fs::read(td.path().join(".gitignore")).unwrap(), ignore);
+            assert!(
+                fs::read(ctx.run_dir.join("actions.jsonl"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn transform_file_detaches_tracked_hardlink_and_keeps_secret_backup_private() {
+        use std::os::unix::fs::MetadataExt as _;
+        let td = TempDir::new().unwrap();
+        config_test_git(td.path(), &["init", "-q"]);
+        fs::write(
+            td.path().join(".gitignore"),
+            b"/config.json\n/.config.json.*\n/config.json.bak*\n/.doctor/\n",
+        )
+        .unwrap();
+        let target = td.path().join("config.json");
+        let tracked_alias = td.path().join("tracked.json");
+        let original = br#"{ "token": "old-private-value" }"#;
+        let replacement = br#"{"token":"new-private-value"}"#;
+        fs::write(&tracked_alias, original).unwrap();
+        fs::hard_link(&tracked_alias, &target).unwrap();
+        config_test_git(td.path(), &["add", "--", "tracked.json"]);
+        let ctx = make_ctx(&td, "2026-10-23T00-00-03Z__secret_hardlink");
+        transform_config_file(&ctx, &target, 0o600, true, |_| {
+            let sentinel = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(td.path().join(".git/am.git-serialize.lock"))?;
+            assert!(
+                sentinel.try_lock_exclusive().is_err(),
+                "repository lock must cover rendering"
+            );
+            Ok(Some(replacement.to_vec()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), replacement);
+        assert_eq!(fs::read(&tracked_alias).unwrap(), original);
+        assert_ne!(
+            fs::metadata(&target).unwrap().ino(),
+            fs::metadata(&tracked_alias).unwrap().ino()
+        );
+        assert_eq!(fs::metadata(&target).unwrap().nlink(), 1);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let backup_dir = fs::read_dir(ctx.run_dir.join("backups"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let backup = backup_dir.join("config.json");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let actions = fs::read_to_string(ctx.run_dir.join("actions.jsonl")).unwrap();
+        assert_eq!(actions.lines().count(), 2);
+        assert!(!actions.contains("old-private-value"));
+        assert!(!actions.contains("new-private-value"));
+    }
+
+    #[test]
+    fn transform_file_checks_backup_worktree_for_home_config_secrets() {
+        let home = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        config_test_git(workspace.path(), &["init", "-q"]);
+        let target = home.path().join("config.json");
+        fs::write(&target, br#"{"token":"old-private-value"}"#).unwrap();
+        let mut ctx = make_ctx(&workspace, "2026-10-23T00-00-04Z__backup_exposure");
+        ctx.capabilities
+            .write_scopes
+            .push(home.path().to_path_buf());
+        let replacement = br#"{"token":"new-private-value"}"#;
+        let result = transform_config_file(&ctx, &target, 0o600, true, |_| {
+            Ok(Some(replacement.to_vec()))
+        });
+        assert!(result.unwrap_err().to_string().contains("does not protect"));
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read_dir(ctx.run_dir.join("backups")).unwrap().count(),
+            0
+        );
+        fs::write(workspace.path().join(".gitignore"), b"/.doctor/\n").unwrap();
+        transform_config_file(&ctx, &target, 0o600, true, |_| {
+            Ok(Some(replacement.to_vec()))
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), replacement);
     }
 }

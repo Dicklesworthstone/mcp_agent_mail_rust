@@ -32,6 +32,14 @@ pub enum SetupError {
     #[error("unknown agent platform: {0}")]
     UnknownPlatform(String),
 
+    #[error(
+        "config {0} changed identity, content, permissions, or link topology during its transform"
+    )]
+    ConfigSourceChanged(PathBuf),
+
+    #[error("config mutation lock is held for {0}")]
+    ConfigLockHeld(PathBuf),
+
     /// Namespace publication occurred, but its file flush was not confirmed.
     /// This never promises power-loss durability of directory entries.
     #[cfg(windows)]
@@ -2679,6 +2687,8 @@ impl AgentPlatform {
 // file cannot force setup/status to allocate without limit.
 const SETUP_CONFIG_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+type SetupArtifactCheck<'a> = &'a dyn Fn(&Path) -> Result<(), SetupError>;
+
 fn setup_metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
@@ -2961,7 +2971,13 @@ fn open_setup_directory_authority(path: &Path) -> std::io::Result<SetupDirectory
 struct SetupFileSnapshot {
     content: String,
     permissions: u32,
+    recorded_mode: u32,
     link_count: u64,
+    // Keep the observed Unix inode alive until its transaction finishes.
+    // Windows publication instead reacquires exclusive validated flush handles;
+    // retaining these read handles would prevent that exclusive acquisition.
+    #[cfg(unix)]
+    _file: std::fs::File,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -3034,7 +3050,24 @@ fn snapshot_open_setup_file(
     Ok(SetupFileSnapshot {
         content,
         permissions,
+        recorded_mode: {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                metadata.permissions().mode()
+            }
+            #[cfg(not(unix))]
+            {
+                if metadata.permissions().readonly() {
+                    0o444
+                } else {
+                    0o644
+                }
+            }
+        },
         link_count,
+        #[cfg(unix)]
+        _file: file,
         #[cfg(unix)]
         device: {
             use std::os::unix::fs::MetadataExt as _;
@@ -3161,7 +3194,7 @@ fn create_unique_setup_file_at(
         match openat(
             &authority.fd,
             candidate.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_raw_mode(raw_mode),
         ) {
             Ok(fd) => {
@@ -3226,6 +3259,7 @@ fn setup_snapshots_match(expected: &SetupFileSnapshot, observed: &SetupFileSnaps
     let same_identity = false;
     expected.content == observed.content
         && expected.permissions == observed.permissions
+        && expected.recorded_mode == observed.recorded_mode
         && expected.link_count == observed.link_count
         && same_identity
 }
@@ -3285,9 +3319,11 @@ fn revalidate_setup_directory_authority(
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
 fn retain_exchanged_setup_file(
     authority: &SetupDirectoryAuthority,
+    parent: &Path,
     temp_name: &str,
     file_name: &str,
     suffix: &str,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(), SetupError> {
     use rustix::fs::{RenameFlags, renameat_with};
 
@@ -3295,6 +3331,7 @@ fn retain_exchanged_setup_file(
     let now = crate::timestamps::now_micros();
     for attempt in 0..1024 {
         let retained = format!(".{file_name}.{pid}.{now}.{attempt}.{suffix}");
+        verify_artifact(&parent.join(&retained))?;
         match renameat_with(
             &authority.fd,
             temp_name,
@@ -3315,14 +3352,17 @@ fn retain_exchanged_setup_file(
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
 fn write_setup_backup_at(
     authority: &SetupDirectoryAuthority,
+    parent: &Path,
     file_name: &str,
     content: &[u8],
     permissions: u32,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(), SetupError> {
     use rustix::fs::fsync;
 
-    let (_backup_name, mut output) =
+    let (backup_name, mut output) =
         create_unique_setup_file_at(authority, file_name, "bak", permissions)?;
+    verify_artifact(&parent.join(backup_name))?;
     output.write_all(content)?;
     output.sync_all()?;
     drop(output);
@@ -3398,6 +3438,7 @@ fn replace_windows_setup_file_retaining_displaced(
     replaced_path: &str,
     replacement_path: &str,
     suffix: &str,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(String, String), SetupError> {
     replace_windows_setup_file_retaining_displaced_with(
         authority,
@@ -3418,6 +3459,7 @@ fn replace_windows_setup_file_retaining_displaced(
         |existing, new| {
             winsafe::MoveFileEx(existing, Some(new), winsafe::co::MOVEFILE::WRITE_THROUGH)
         },
+        verify_artifact,
     )
 }
 
@@ -3431,11 +3473,13 @@ fn replace_windows_setup_file_retaining_displaced_with(
     suffix: &str,
     mut replace_file: impl FnMut(&str, &str, &str) -> Result<(), winsafe::co::ERROR>,
     mut move_file_no_replace: impl FnMut(&str, &str) -> Result<(), winsafe::co::ERROR>,
+    verify_artifact: SetupArtifactCheck<'_>,
 ) -> Result<(String, String), SetupError> {
     let mut recovered_partial_moves = 0_u8;
     for _ in 0..1024 {
         let (retained_name, retained_path) =
             unique_windows_setup_sibling(authority, file_name, suffix)?;
+        verify_artifact(Path::new(&retained_path))?;
         match replace_file(replaced_path, replacement_path, &retained_path) {
             Ok(()) => return Ok((retained_name, retained_path)),
             Err(error)
@@ -3547,7 +3591,9 @@ fn write_setup_file_atomic_bound(
         || Ok(()),
         || Ok(()),
         || {},
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(all(test, windows))]
@@ -3571,7 +3617,9 @@ fn write_setup_file_atomic_bound_with_hook(
         before_publish,
         || Ok(()),
         || {},
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(windows)]
@@ -3587,7 +3635,8 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
     before_publish: impl FnOnce() -> Result<(), SetupError>,
     before_replace: impl FnOnce() -> Result<(), SetupError>,
     after_replace: impl FnOnce(),
-) -> Result<(), SetupError> {
+    verify_artifact: SetupArtifactCheck<'_>,
+) -> Result<SetupFileSnapshot, SetupError> {
     let _ = permissions;
     ensure_setup_parent_dir(path, label)?;
     validate_setup_file_target(path, label)?;
@@ -3615,7 +3664,10 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
         )
     })?;
 
+    verify_artifact(path)?;
     let (mut temp_file, temp_path) = create_persistent_windows_setup_temp(authority, file_name)?;
+    verify_artifact(&temp_path)?;
+    revalidate_setup_directory_authority(parent, authority)?;
     temp_file.write_all(content)?;
     temp_file.sync_all()?;
     std::io::Seek::rewind(&mut temp_file)?;
@@ -3624,6 +3676,13 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
         &temp_path,
         "Windows setup staged file",
     )?;
+    if published_snapshot.content.as_bytes() != content || published_snapshot.link_count != 1 {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "staged file changed before publication",
+        ));
+    }
     drop(temp_file);
     revalidate_setup_directory_authority(parent, authority)?;
     before_publish()?;
@@ -3653,6 +3712,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
             &target_path,
             &temp_path,
             suffix,
+            verify_artifact,
         )?;
         // The production wrapper supplies a no-op. Tests use this seam to
         // observe transient namespace effects before CAS validation can roll
@@ -3673,6 +3733,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
                 &target_path,
                 &retained_path,
                 "replaced",
+                verify_artifact,
             );
             let (rejected_name, rejected_path) =
                 rollback.map_err(|source| SetupError::WindowsPublicationUnconfirmed {
@@ -3733,7 +3794,7 @@ fn write_setup_file_atomic_bound_with_windows_hooks(
         )?;
     }
 
-    Ok(())
+    Ok(published_snapshot)
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3755,7 +3816,9 @@ fn write_setup_file_atomic_bound(
         backup_existing,
         authority,
         || Ok(()),
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(all(test, unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3777,7 +3840,9 @@ fn write_setup_file_atomic_bound_with_hook(
         backup_existing,
         None,
         before_publish,
+        &|_| Ok(()),
     )
+    .map(|_| ())
 }
 
 #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
@@ -3791,7 +3856,8 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
     backup_existing: bool,
     authority: Option<&SetupDirectoryAuthority>,
     before_publish: impl FnOnce() -> Result<(), SetupError>,
-) -> Result<(), SetupError> {
+    verify_artifact: SetupArtifactCheck<'_>,
+) -> Result<SetupFileSnapshot, SetupError> {
     use rustix::fs::{RenameFlags, fsync, renameat_with};
 
     ensure_setup_parent_dir(path, label)?;
@@ -3812,10 +3878,29 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
         &owned_authority
     };
     revalidate_setup_directory_authority(parent, authority)?;
+    verify_artifact(path)?;
     let (temp_name, mut temp_file) =
         create_unique_setup_file_at(authority, &display_name, "tmp", permissions)?;
+    verify_artifact(&parent.join(&temp_name))?;
+    revalidate_setup_directory_authority(parent, authority)?;
     temp_file.write_all(content)?;
     temp_file.sync_all()?;
+    std::io::Seek::rewind(&mut temp_file)?;
+    let published_snapshot = snapshot_open_setup_file(
+        temp_file.try_clone()?,
+        &parent.join(&temp_name),
+        "setup staged file",
+    )?;
+    if published_snapshot.content.as_bytes() != content
+        || published_snapshot.recorded_mode & 0o7777 != permissions & 0o7777
+        || published_snapshot.link_count != 1
+    {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "staged file changed before publication",
+        ));
+    }
     drop(temp_file);
     revalidate_setup_directory_authority(parent, authority)?;
     before_publish()?;
@@ -3853,9 +3938,11 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
         if backup_existing
             && let Err(error) = write_setup_backup_at(
                 authority,
+                parent,
                 &display_name,
                 observed.content.as_bytes(),
                 permissions,
+                verify_artifact,
             )
         {
             renameat_with(
@@ -3869,9 +3956,14 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
             fsync(&authority.fd).map_err(std::io::Error::from)?;
             return Err(error);
         }
-        if let Err(error) =
-            retain_exchanged_setup_file(authority, &temp_name, &display_name, "replaced")
-        {
+        if let Err(error) = retain_exchanged_setup_file(
+            authority,
+            parent,
+            &temp_name,
+            &display_name,
+            "replaced",
+            verify_artifact,
+        ) {
             renameat_with(
                 &authority.fd,
                 temp_name.as_str(),
@@ -3895,7 +3987,19 @@ fn write_setup_file_atomic_bound_with_authority_and_hook(
     }
 
     fsync(&authority.fd).map_err(std::io::Error::from)?;
-    revalidate_setup_directory_authority(parent, authority)
+    revalidate_setup_directory_authority(parent, authority)?;
+    let observed = snapshot_setup_authority_leaf(authority, file_name, path, label)?;
+    if !observed
+        .as_ref()
+        .is_some_and(|observed| setup_snapshots_match(&published_snapshot, observed))
+    {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "published file identity or contents could not be confirmed",
+        ));
+    }
+    Ok(published_snapshot)
 }
 
 fn write_setup_file_atomic(
@@ -3915,6 +4019,62 @@ fn write_setup_file_atomic(
         backup_existing,
         None,
     )
+}
+
+/// Return the exact staged inode witness (and retain its handle on Unix).
+/// Reopening the published pathname would lose the original staging witness.
+fn write_audited_setup_file(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    expected: Option<&SetupFileSnapshot>,
+    authority: &SetupDirectoryAuthority,
+    verify_artifact: SetupArtifactCheck<'_>,
+) -> Result<SetupFileSnapshot, SetupError> {
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    {
+        write_setup_file_atomic_bound_with_authority_and_hook(
+            path,
+            content,
+            permissions,
+            "audited config",
+            expected,
+            false,
+            Some(authority),
+            || Ok(()),
+            verify_artifact,
+        )
+    }
+    #[cfg(windows)]
+    {
+        write_setup_file_atomic_bound_with_windows_hooks(
+            path,
+            content,
+            permissions,
+            "audited config",
+            expected,
+            false,
+            Some(authority),
+            || Ok(()),
+            || Ok(()),
+            || {},
+            verify_artifact,
+        )
+    }
+    #[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+    {
+        let _ = (
+            path,
+            content,
+            permissions,
+            expected,
+            authority,
+            verify_artifact,
+        );
+        Err(SetupError::Other(
+            "retained config mutation authority is unavailable on this platform".into(),
+        ))
+    }
 }
 
 fn write_setup_file_atomic_with_authority(
@@ -4055,6 +4215,15 @@ fn resolve_secret_git_context(
     path: &Path,
     secure_gitignore: bool,
 ) -> Result<Option<(PathBuf, PathBuf)>, SetupError> {
+    resolve_secret_git_context_inner(path, secure_gitignore, false, false)
+}
+
+fn resolve_secret_git_context_inner(
+    path: &Path,
+    secure_gitignore: bool,
+    locks_held: bool,
+    allow_missing_parents: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, SetupError> {
     const REPOSITORY_SHAPING_GIT_ENV: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -4072,23 +4241,44 @@ fn resolve_secret_git_context(
             path.display()
         )));
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| invalid_setup_path("secret config", path, "must name a file"))?;
-    validate_setup_real_directory(parent, "secret config parent")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_no_parent_traversal(path, "secret config")?;
+    if path.file_name().is_none() {
+        return Err(invalid_setup_path(
+            "secret config",
+            path,
+            "must name a file",
+        ));
+    }
+    let mut ancestor = parent;
+    if allow_missing_parents {
+        while !check_setup_real_directory(ancestor, "secret config parent", false)? {
+            ancestor = ancestor
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+        }
+    } else {
+        validate_setup_real_directory(parent, "secret config parent")?;
+    }
     validate_setup_file_target(path, "secret config")?;
     let _ = read_setup_file(path, "secret config")?;
-    let parent = std::fs::canonicalize(parent).map_err(|error| {
+    let canonical_ancestor = std::fs::canonicalize(ancestor).map_err(|error| {
         SetupError::Other(format!(
             "cannot resolve secret config parent {}: {error}",
-            parent.display()
+            ancestor.display()
         ))
     })?;
-    let repo_probe = crate::git_cmd::GitCmd::new(&parent)
+    let target = canonical_ancestor.join(path.strip_prefix(ancestor).unwrap_or(path));
+    let repo_probe = crate::git_cmd::GitCmd::new(&canonical_ancestor)
         .env("LC_ALL", "C")
         .args(["rev-parse", "--show-toplevel"]);
-    let repo_probe = if secure_gitignore {
+    let repo_probe = if locks_held {
+        repo_probe.skip_flock().skip_mutex()
+    } else if secure_gitignore {
         repo_probe
     } else {
         repo_probe.skip_flock()
@@ -4123,7 +4313,6 @@ fn resolve_secret_git_context(
             path.display()
         ))
     })?;
-    let target = parent.join(file_name);
     let relative = target.strip_prefix(&repo_root).map_err(|_| {
         SetupError::Other(format!(
             "secret config {} is outside the resolved Git worktree {}",
@@ -4136,7 +4325,7 @@ fn resolve_secret_git_context(
 
 fn verify_secret_gitignore_protection(
     repo_root: &Path,
-    representative_paths: [String; 5],
+    representative_paths: impl IntoIterator<Item = String>,
 ) -> Result<(), SetupError> {
     for representative in representative_paths {
         // `git check-ignore` does not accept the global `--literal-pathspecs`
@@ -4394,6 +4583,529 @@ pub fn transform_config_atomic(
         false,
         &transform,
     )
+}
+
+/// Publication policy and doctor-owned backup destination for an existing config.
+///
+/// The backup is created exclusively, from the transform's exact
+/// source bytes, with mode 0600 on Unix. Windows retains the setup writer's
+/// inherited parent ACL and verified file-flush contract.
+#[derive(Clone, Copy)]
+pub struct ExistingConfigTransformOptions<'a> {
+    pub permissions: u32,
+    pub contains_literal_secret: bool,
+    pub dry_run: bool,
+    pub backup_path: &'a Path,
+}
+
+/// The same snapshot witnesses semantic validation, the verbatim backup, and
+/// the pending/completed action records. No credential bytes belong in logs.
+pub struct ConfigTransformSnapshot<'a> {
+    pub before: &'a [u8],
+    pub after: &'a [u8],
+    pub before_mode: u32,
+    pub after_mode: u32,
+}
+
+fn config_contains_literal_secret(content: &[u8]) -> bool {
+    fn has_credential(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => fields.iter().any(|(key, value)| {
+                ((key.eq_ignore_ascii_case("authorization")
+                    || matches!(key.as_str(), "bearer" | "token" | "HTTP_BEARER_TOKEN"))
+                    && value.as_str().is_some_and(|value| !value.is_empty()))
+                    || has_credential(value)
+            }),
+            Value::Array(values) => values.iter().any(has_credential),
+            _ => false,
+        }
+    }
+    content
+        .windows(7)
+        .any(|bytes| bytes.eq_ignore_ascii_case(b"Bearer "))
+        || serde_json::from_slice::<Value>(content).is_ok_and(|value| has_credential(&value))
+}
+
+#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+fn open_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<std::fs::File, SetupError> {
+    let basename = path
+        .file_name()
+        .ok_or_else(|| invalid_setup_path("config", path, "must name a file"))?;
+    let mut name = OsString::from(".");
+    name.push(basename);
+    name.push(".doctor-lock");
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    let file = {
+        use rustix::fs::{Mode, OFlags, openat};
+        use std::os::unix::fs::MetadataExt as _;
+        let fd = openat(
+            &authority.fd,
+            &name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)?;
+        let file = std::fs::File::from(fd);
+        if file.metadata()?.nlink() != 1 {
+            return Err(invalid_setup_path(
+                "config lock",
+                path,
+                "must not have hardlink aliases",
+            ));
+        }
+        file
+    };
+    #[cfg(windows)]
+    let file = {
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+        let mut options = cap_std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .follow(FollowSymlinks::No);
+        let file = authority.dir.open_with(&name, &options)?.into_std();
+        if cap_fs_ext::MetadataExt::nlink(&file.metadata()?) != 1 {
+            return Err(invalid_setup_path(
+                "config lock",
+                path,
+                "must not have hardlink aliases",
+            ));
+        }
+        file
+    };
+    if !file.metadata()?.is_file() {
+        return Err(invalid_setup_path(
+            "config lock",
+            path,
+            "must be a regular file",
+        ));
+    }
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| SetupError::ConfigLockHeld(path.to_path_buf()))?;
+    Ok(file)
+}
+
+#[cfg(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux"))))]
+fn revalidate_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+    lock: &std::fs::File,
+) -> Result<(), SetupError> {
+    let mut name = OsString::from(".");
+    name.push(
+        path.file_name()
+            .ok_or_else(|| invalid_setup_path("config", path, "must name a file"))?,
+    );
+    name.push(".doctor-lock");
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    let unchanged = {
+        use rustix::fs::{AtFlags, fstat, statat};
+        let expected = fstat(lock).map_err(std::io::Error::from)?;
+        let observed = statat(&authority.fd, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)?;
+        expected.st_dev == observed.st_dev
+            && expected.st_ino == observed.st_ino
+            && expected.st_mode == observed.st_mode
+            && expected.st_nlink == 1
+            && observed.st_nlink == 1
+    };
+    #[cfg(windows)]
+    let unchanged = {
+        use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let observed = authority.dir.open_with(&name, &options)?.into_std();
+        let expected = lock.metadata()?;
+        let observed = observed.metadata()?;
+        observed.is_file()
+            && expected.dev() == observed.dev()
+            && expected.ino() == observed.ino()
+            && expected.nlink() == 1
+            && observed.nlink() == 1
+    };
+    if !unchanged {
+        return Err(invalid_setup_path(
+            "config lock",
+            path,
+            "changed identity or hardlink topology during its transform",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+fn open_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+) -> Result<std::fs::File, SetupError> {
+    let _ = (path, authority);
+    Err(SetupError::Other(
+        "retained config mutation authority is unavailable on this platform".into(),
+    ))
+}
+
+#[cfg(not(any(windows, all(unix, any(target_vendor = "apple", target_os = "linux")))))]
+fn revalidate_config_transform_lock(
+    path: &Path,
+    authority: &SetupDirectoryAuthority,
+    lock: &std::fs::File,
+) -> Result<(), SetupError> {
+    let _ = (path, authority, lock);
+    Err(SetupError::Other(
+        "retained config mutation authority is unavailable on this platform".into(),
+    ))
+}
+
+fn verify_existing_secret_git_protection(
+    path: &Path,
+    context: Option<&(PathBuf, PathBuf)>,
+    adjacent_artifacts: bool,
+) -> Result<(), SetupError> {
+    let Some((repo, relative)) = context else {
+        return Ok(());
+    };
+    // This is deliberately verify-only: doctor must never write an unlogged
+    // .gitignore as a side effect of repairing an unrelated config field.
+    check_secret_config_git_exposure_locked(path, repo, relative, false)?;
+    let relative = gitignore_relative_path(relative)?;
+    if !adjacent_artifacts {
+        return verify_secret_gitignore_protection(repo, [relative]);
+    }
+    let (directory, basename) = relative.rsplit_once('/').unwrap_or(("", &relative));
+    verify_secret_gitignore_protection(
+        repo,
+        [
+            relative.clone(),
+            format!("{directory}/.{basename}.probe.tmp")
+                .trim_start_matches('/')
+                .to_owned(),
+            format!("{directory}/.{basename}.probe.bak")
+                .trim_start_matches('/')
+                .to_owned(),
+            format!("{directory}/.{basename}.probe.replaced")
+                .trim_start_matches('/')
+                .to_owned(),
+            format!("{relative}.bak"),
+        ],
+    )
+}
+
+/// Transform an existing config while retaining its no-follow parent and
+/// serializing both its live path and the doctor's backup worktree.
+///
+/// The callback executes once, under the per-path and subsystem locks and all
+/// repository locks (acquired in sorted order). Source identity, bytes, mode,
+/// and hardlink topology must still match before backup and atomic exchange.
+/// Secret writes require existing ignore coverage; this API never edits
+/// `.gitignore`. The exchange detaches hardlink aliases of the original file.
+///
+/// `prepare` records pending intent after the exact-source backup is durable.
+/// `finish` runs only after publication and authority checks succeed, with all
+/// guards still held. On an error after `prepare`, the caller must leave the
+/// pending record unconfirmed: it must not roll back through a fresh pathname
+/// or claim completion. Dry runs skip all writes and call only `finish` for
+/// the preview. Missing files and unchanged transforms invoke neither observer.
+///
+/// # Errors
+///
+/// Refuses unsafe filesystem authority, concurrent source changes, unavailable
+/// serialization, exposed secret artifacts, and failed backup/publication or
+/// observers. Callback errors retain the caller's error type.
+#[allow(clippy::too_many_lines)]
+pub fn transform_existing_config_atomic<E, G, T>(
+    path: &Path,
+    options: ExistingConfigTransformOptions<'_>,
+    acquire_subsystem_locks: impl FnOnce() -> Result<G, E>,
+    transform: impl FnOnce(&[u8]) -> Result<Option<Vec<u8>>, E>,
+    prepare: impl FnOnce(&ConfigTransformSnapshot<'_>) -> Result<(), E>,
+    finish: impl FnOnce(&ConfigTransformSnapshot<'_>) -> Result<T, E>,
+) -> Result<Option<T>, E>
+where
+    E: From<SetupError>,
+{
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !check_setup_real_directory(parent, "config parent", false)? {
+        return Ok(None);
+    }
+    let authority = open_setup_directory_authority(parent).map_err(SetupError::from)?;
+    if read_setup_file_with_authority(path, "config", Some(&authority))?.is_none() {
+        return Ok(None);
+    }
+    let path_lock = if options.dry_run {
+        None
+    } else {
+        Some(open_config_transform_lock(path, &authority)?)
+    };
+    // Per-action subdirectories do not exist yet. Retain the nearest existing
+    // backup ancestor now, so replacing the run directory cannot redirect the
+    // later secret copy into a different real directory or symlink tree.
+    let mut backup_anchor = options
+        .backup_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    while !check_setup_real_directory(backup_anchor, "config backup parent", false)? {
+        backup_anchor = backup_anchor
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+    }
+    let backup_authority =
+        open_setup_directory_authority(backup_anchor).map_err(SetupError::from)?;
+    // Repository guards precede optional subsystem locks so an extra lock on
+    // the repository sentinel refuses nonblockingly rather than self-waiting.
+    let contexts = [
+        resolve_secret_git_context_inner(path, false, false, false)?,
+        resolve_secret_git_context_inner(options.backup_path, false, false, true)?,
+    ];
+    let mut repos: Vec<_> = contexts
+        .iter()
+        .flatten()
+        .map(|(repo, _)| repo.clone())
+        .collect();
+    repos.sort();
+    repos.dedup();
+    let mutexes: Vec<_> = if options.dry_run {
+        Vec::new()
+    } else {
+        repos
+            .iter()
+            .map(|repo| {
+                crate::GitRepoLocks::global()
+                    .lock_for_with_timeout(repo, std::time::Duration::from_secs(1))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(SetupError::from)?
+    };
+    let _mutex_guards: Vec<_> = mutexes
+        .iter()
+        .map(|mutex| crate::git_lock::lock_mutex_with_timeout(mutex, std::time::Duration::ZERO))
+        .collect::<Result<_, _>>()
+        .map_err(SetupError::from)?;
+    let mut flock_guards = Vec::new();
+    if !options.dry_run {
+        for repo in &repos {
+            let guard = crate::RepoFlock::acquire_with_timeout(repo, std::time::Duration::ZERO)
+                .map_err(SetupError::from)?;
+            if !guard.is_real() {
+                return Err(SetupError::Other(format!(
+                    "cannot serialize config transaction in {}",
+                    repo.display()
+                ))
+                .into());
+            }
+            flock_guards.push(guard);
+        }
+    }
+    let _subsystem_guards = if options.dry_run {
+        None
+    } else {
+        Some(acquire_subsystem_locks()?)
+    };
+    let verify_repositories = || -> Result<(), SetupError> {
+        let observed = [
+            resolve_secret_git_context_inner(path, false, true, false)?,
+            resolve_secret_git_context_inner(options.backup_path, false, true, true)?,
+        ];
+        if contexts != observed {
+            return Err(invalid_setup_path(
+                "config transaction",
+                path,
+                "changed Git repository authority",
+            ));
+        }
+        Ok(())
+    };
+    verify_repositories()?;
+    let Some(source) = read_setup_file_with_authority(path, "config", Some(&authority))? else {
+        return Ok(None);
+    };
+    let output = transform(source.content.as_bytes())?;
+    let verify_source = || -> Result<(), SetupError> {
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        if let Some(lock) = path_lock.as_ref() {
+            revalidate_config_transform_lock(path, &authority, lock)?;
+        }
+        let observed = read_setup_file_with_authority(path, "config", Some(&authority))?;
+        if !observed
+            .as_ref()
+            .is_some_and(|observed| setup_snapshots_match(&source, observed))
+        {
+            return Err(SetupError::ConfigSourceChanged(path.to_path_buf()));
+        }
+        Ok(())
+    };
+    verify_source()?;
+    let Some(output) = output.filter(|output| output != source.content.as_bytes()) else {
+        return Ok(None);
+    };
+    if u64::try_from(output.len()).unwrap_or(u64::MAX) > SETUP_CONFIG_FILE_MAX_BYTES
+        || std::str::from_utf8(&output).is_err()
+    {
+        return Err(invalid_setup_path("transformed config", path, "must be bounded UTF-8").into());
+    }
+    let secret = options.contains_literal_secret
+        || config_contains_literal_secret(source.content.as_bytes())
+        || config_contains_literal_secret(&output);
+    let artifact_paths = std::cell::RefCell::new(Vec::<PathBuf>::new());
+    let verify_exact_artifact = |artifact: &Path| -> Result<(), SetupError> {
+        revalidate_setup_directory_authority(parent, &authority)?;
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        if let Some(lock) = path_lock.as_ref() {
+            revalidate_config_transform_lock(path, &authority, lock)?;
+        }
+        verify_repositories()?;
+        let context = resolve_secret_git_context_inner(artifact, false, true, true)?;
+        if context
+            .as_ref()
+            .is_some_and(|(repo, _)| !repos.contains(repo))
+        {
+            return Err(invalid_setup_path(
+                "config artifact",
+                artifact,
+                "changed Git repository authority",
+            ));
+        }
+        verify_existing_secret_git_protection(artifact, context.as_ref(), false)
+    };
+    let protect_artifact = |artifact: &Path| -> Result<(), SetupError> {
+        if secret {
+            // Representative ignore probes cannot detect a negation targeting
+            // a generated name. Verify the actual name before it receives
+            // bytes or a retained secret inode, then remember it for the final
+            // index/ignore check under the same repository guards.
+            verify_exact_artifact(artifact)?;
+            artifact_paths.borrow_mut().push(artifact.to_path_buf());
+        }
+        Ok(())
+    };
+    let verify_exposure = || -> Result<(), SetupError> {
+        revalidate_setup_directory_authority(parent, &authority)?;
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        if let Some(lock) = path_lock.as_ref() {
+            revalidate_config_transform_lock(path, &authority, lock)?;
+        }
+        verify_repositories()?;
+        if secret {
+            verify_existing_secret_git_protection(path, contexts[0].as_ref(), true)?;
+            verify_existing_secret_git_protection(options.backup_path, contexts[1].as_ref(), true)?;
+            for artifact in artifact_paths.borrow().iter() {
+                verify_exact_artifact(artifact)?;
+            }
+        }
+        revalidate_setup_directory_authority(parent, &authority)?;
+        revalidate_setup_directory_authority(backup_anchor, &backup_authority)?;
+        Ok(())
+    };
+    verify_exposure()?;
+    let view = ConfigTransformSnapshot {
+        before: source.content.as_bytes(),
+        after: &output,
+        before_mode: source.recorded_mode,
+        after_mode: if secret {
+            0o600
+        } else {
+            (options.permissions & 0o777) | 0o600
+        },
+    };
+    if options.dry_run {
+        return finish(&view).map(Some);
+    }
+    // The caller chooses a fresh per-action path. Refuse existing backups;
+    // never overwrite evidence from another mutation or follow a link.
+    ensure_setup_parent_dir(options.backup_path, "config backup")?;
+    let backup_parent = options
+        .backup_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let backup_parent_authority =
+        open_setup_directory_authority(backup_parent).map_err(SetupError::from)?;
+    if read_setup_file_with_authority(
+        options.backup_path,
+        "config backup",
+        Some(&backup_parent_authority),
+    )?
+    .is_some()
+    {
+        return Err(
+            invalid_setup_path("config backup", options.backup_path, "already exists").into(),
+        );
+    }
+    verify_exposure()?;
+    verify_source()?;
+    let backup = write_audited_setup_file(
+        options.backup_path,
+        view.before,
+        0o600,
+        None,
+        &backup_parent_authority,
+        &protect_artifact,
+    )?;
+    if backup.content.as_bytes() != view.before
+        || backup.link_count != 1
+        || (cfg!(unix) && backup.recorded_mode & 0o7777 != 0o600)
+    {
+        return Err(invalid_setup_path(
+            "config backup",
+            options.backup_path,
+            "failed verbatim verification",
+        )
+        .into());
+    }
+    let verify_backup = || -> Result<(), SetupError> {
+        let observed = read_setup_file_with_authority(
+            options.backup_path,
+            "config backup",
+            Some(&backup_parent_authority),
+        )?;
+        if !observed
+            .as_ref()
+            .is_some_and(|observed| setup_snapshots_match(&backup, observed))
+        {
+            return Err(invalid_setup_path(
+                "config backup",
+                options.backup_path,
+                "changed after verbatim verification",
+            ));
+        }
+        Ok(())
+    };
+    verify_exposure()?;
+    verify_source()?;
+    prepare(&view)?;
+    verify_exposure()?;
+    verify_source()?;
+    verify_backup()?;
+    let published = write_audited_setup_file(
+        path,
+        view.after,
+        view.after_mode,
+        Some(&source),
+        &authority,
+        &protect_artifact,
+    )?;
+    verify_exposure()?;
+    let observed = read_setup_file_with_authority(path, "config", Some(&authority))?;
+    if !observed
+        .as_ref()
+        .is_some_and(|observed| setup_snapshots_match(&published, observed))
+    {
+        return Err(invalid_setup_path("config", path, "publication was not confirmed").into());
+    }
+    verify_backup()?;
+    let result = finish(&view).map(Some);
+    // The collection owns the repository locks through the completion
+    // observer; releasing it earlier would detach the receipt from authority.
+    drop(flock_guards);
+    result
 }
 
 fn write_config_atomic_inner(
@@ -7659,6 +8371,323 @@ mod tests {
             .expect("setup temp directory")
     }
 
+    #[test]
+    fn audited_config_transform_never_completes_or_rolls_back_a_changed_source() {
+        let td = setup_real_tempdir();
+        let path = td.path().join("config.json");
+        let backup = td.path().join("backups/config.json");
+        std::fs::write(&path, b"original").unwrap();
+        let prepared = std::cell::Cell::new(false);
+        let error = transform_existing_config_atomic(
+            &path,
+            ExistingConfigTransformOptions {
+                permissions: 0o600,
+                contains_literal_secret: false,
+                dry_run: false,
+                backup_path: &backup,
+            },
+            || Ok::<_, SetupError>(()),
+            |_| Ok(Some(b"replacement".to_vec())),
+            |snapshot| {
+                assert_eq!(std::fs::read(&backup)?, snapshot.before);
+                prepared.set(true);
+                std::fs::write(&path, b"concurrent operator edit")?;
+                Ok(())
+            },
+            |_| -> Result<(), SetupError> { panic!("unconfirmed publication must not complete") },
+        )
+        .unwrap_err();
+        assert!(prepared.get());
+        assert!(matches!(error, SetupError::ConfigSourceChanged(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"concurrent operator edit");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original");
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    fn audited_config_transform_refuses_changed_lock_leaf() {
+        for replace_lock in [false, true] {
+            let td = setup_real_tempdir();
+            let path = td.path().join("config.json");
+            let backup = td.path().join("backups/config.json");
+            let lock_path = td.path().join(".config.json.doctor-lock");
+            std::fs::write(&path, b"original").unwrap();
+            let error = transform_existing_config_atomic(
+                &path,
+                ExistingConfigTransformOptions {
+                    permissions: 0o600,
+                    contains_literal_secret: false,
+                    dry_run: false,
+                    backup_path: &backup,
+                },
+                || Ok::<_, SetupError>(()),
+                |_| {
+                    let displaced = td.path().join("retained-lock");
+                    if replace_lock {
+                        std::fs::rename(&lock_path, &displaced)?;
+                        std::fs::write(&lock_path, b"")?;
+                    } else {
+                        std::fs::hard_link(&lock_path, &displaced)?;
+                    }
+                    Ok(Some(b"replacement".to_vec()))
+                },
+                |_| -> Result<(), SetupError> {
+                    panic!("changed lock must precede pending intent")
+                },
+                |_| -> Result<(), SetupError> { panic!("changed lock must not complete") },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("config lock"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            assert!(!backup.exists());
+        }
+    }
+
+    #[test]
+    fn audited_config_transform_checks_git_again_after_pending_intent() {
+        let td = setup_real_tempdir();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(td.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = td.path().join("config.json");
+        let backup = td.path().join("backups/config.json");
+        let original = br#"{"token":"old-private-value"}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(
+            td.path().join(".gitignore"),
+            b"/config.json\n/.config.json.*\n/config.json.bak*\n/backups/\n",
+        )
+        .unwrap();
+        let prepared = std::cell::Cell::new(false);
+        let error = transform_existing_config_atomic(
+            &path,
+            ExistingConfigTransformOptions {
+                permissions: 0o600,
+                contains_literal_secret: true,
+                dry_run: false,
+                backup_path: &backup,
+            },
+            || Ok::<_, SetupError>(()),
+            |_| Ok(Some(br#"{"token":"new-private-value"}"#.to_vec())),
+            |_| {
+                prepared.set(true);
+                // A non-cooperating git command ignores our advisory guard.
+                // Its index change must be caught before secret publication.
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(td.path())
+                        .args(["add", "-f", "--", "config.json"])
+                        .status()?
+                        .success()
+                );
+                Ok(())
+            },
+            |_| -> Result<(), SetupError> {
+                panic!("tracked secret publication must not complete")
+            },
+        )
+        .unwrap_err();
+        assert!(prepared.get());
+        assert!(error.to_string().contains("Git-tracked"), "{error}");
+        assert!(!error.to_string().contains("private-value"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn audited_config_transform_holds_both_repository_guards_through_completion() {
+        let live = setup_real_tempdir();
+        let audit = setup_real_tempdir();
+        for repo in [live.path(), audit.path()] {
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(
+                repo.join(".gitignore"),
+                b"/config.json\n/.config.json.*\n/config.json.bak*\n/backups/\n",
+            )
+            .unwrap();
+        }
+        let path = live.path().join("config.json");
+        let backup = audit.path().join("backups/config.json");
+        std::fs::write(&path, br#"{"token":"old-private-value"}"#).unwrap();
+        let replacement = br#"{"token":"new-private-value"}"#;
+        let check_locks = || {
+            for lock_path in [
+                live.path().join(".config.json.doctor-lock"),
+                live.path().join(".git/am.git-serialize.lock"),
+                audit.path().join(".git/am.git-serialize.lock"),
+            ] {
+                let contender = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path)
+                    .unwrap();
+                assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
+            }
+        };
+        transform_existing_config_atomic(
+            &path,
+            ExistingConfigTransformOptions {
+                permissions: 0o600,
+                contains_literal_secret: true,
+                dry_run: false,
+                backup_path: &backup,
+            },
+            || Ok::<_, SetupError>(()),
+            |_| {
+                check_locks();
+                Ok(Some(replacement.to_vec()))
+            },
+            |_| {
+                check_locks();
+                Ok(())
+            },
+            |snapshot| {
+                check_locks();
+                assert_eq!(std::fs::read(&path)?, snapshot.after);
+                assert_eq!(std::fs::read(&backup)?, snapshot.before);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    fn audited_config_transform_checks_exact_generated_artifact_names_before_secret_writes() {
+        for suffix in ["tmp", "replaced"] {
+            let td = setup_real_tempdir();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(td.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let path = td.path().join("config.json");
+            let backup = td.path().join("backups/config.json");
+            let original = br#"{"token":"old-private-value"}"#;
+            std::fs::write(&path, original).unwrap();
+            // The representative .probe names are ignored, but real generated
+            // names from this process are exposed by the later negation.
+            let ignore = format!(
+                "/config.json\n/.config.json.*\n/config.json.bak*\n/backups/\n!/.config.json.{}.*.{suffix}\n",
+                std::process::id()
+            );
+            std::fs::write(td.path().join(".gitignore"), &ignore).unwrap();
+            let error = transform_existing_config_atomic(
+                &path,
+                ExistingConfigTransformOptions {
+                    permissions: 0o600,
+                    contains_literal_secret: true,
+                    dry_run: false,
+                    backup_path: &backup,
+                },
+                || Ok::<_, SetupError>(()),
+                |_| Ok(Some(br#"{"token":"new-private-value"}"#.to_vec())),
+                |_| Ok(()),
+                |_| -> Result<(), SetupError> {
+                    panic!("an exposed generated artifact must not complete")
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("does not protect artifact"),
+                "{suffix}: {error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read_to_string(td.path().join(".gitignore")).unwrap(),
+                ignore
+            );
+            for entry in std::fs::read_dir(td.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.json.")
+                    && entry.metadata().unwrap().len() != 0
+                {
+                    assert!(
+                        Command::new("git")
+                            .arg("-C")
+                            .arg(td.path())
+                            .args(["check-ignore", "--no-index", "--"])
+                            .arg(entry.path())
+                            .status()
+                            .unwrap()
+                            .success(),
+                        "every retained credential artifact must be ignored"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, any(target_vendor = "apple", target_os = "linux")))]
+    fn audited_config_transform_rejects_a_same_bytes_staged_inode_swap() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let td = setup_real_tempdir();
+        let path = td.path().join("config.json");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = read_setup_file(&path, "test source").unwrap().unwrap();
+        let error = write_setup_file_atomic_bound_with_authority_and_hook(
+            &path,
+            b"replacement",
+            0o600,
+            "test config",
+            Some(&expected),
+            false,
+            None,
+            || {
+                let temp = std::fs::read_dir(td.path())?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .find(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+                    .expect("staged config");
+                std::fs::rename(&temp, td.path().join("retained-staged-file"))?;
+                std::fs::write(&temp, b"replacement")?;
+                std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            },
+            &|_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("published file identity"),
+            "{error}"
+        );
+        // Publication happened, but the returned error must never be mistaken
+        // for a confirmed commit or trigger a fresh-path rollback.
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(td.path().join("retained-staged-file")).unwrap(),
+            b"replacement"
+        );
+        assert!(std::fs::read_dir(td.path()).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            path.extension().is_some_and(|ext| ext == "replaced")
+                && std::fs::read(path).unwrap() == b"original"
+        }));
+    }
+
     #[cfg(unix)]
     fn non_utf8_os_string() -> OsString {
         use std::os::unix::ffi::OsStringExt as _;
@@ -10120,6 +11149,7 @@ mod tests {
                 Ok(())
             },
             || {},
+            &|_| Ok(()),
         )
         .expect_err("a leaf swap at the ReplaceFile seam must roll back");
 
@@ -10175,6 +11205,7 @@ mod tests {
                 outside_received_secret
                     .set(std::fs::read(&outside).is_ok_and(|content| content == attempted));
             },
+            &|_| Ok(()),
         );
 
         assert!(
@@ -10348,6 +11379,7 @@ mod tests {
                 std::fs::rename(existing, new).unwrap();
                 Ok(())
             },
+            &|_| Ok(()),
         )
         .expect("the documented partial-move state must be restored before retry");
 
