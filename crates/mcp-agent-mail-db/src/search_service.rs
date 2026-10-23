@@ -4010,21 +4010,60 @@ fn orchestrate_hybrid_results(
         .map(|result| (result.id, result))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let ordered_candidates = prepared
-        .candidates
-        .iter()
-        .take(requested_limit)
-        .collect::<Vec<_>>();
-
-    let merged = ordered_candidates
-        .iter()
-        .filter_map(|candidate| {
+    // Preparation only deduplicates and budgets the sources. Their raw scores
+    // are not comparable (BM25 versus cosine), and its best-rank order is not
+    // fusion: a document supported by both sources must receive both votes.
+    let fused = crate::search_fusion::fuse_rrf(
+        &prepared.candidates,
+        crate::search_fusion::RrfConfig::from_env(),
+        0,
+        prepared.candidates.len(),
+    );
+    let mut merged = fused
+        .hits
+        .into_iter()
+        .filter_map(|hit| {
             lexical_map
-                .get(&candidate.doc_id)
+                .get(&hit.doc_id)
                 .cloned()
-                .or_else(|| semantic_map.get(&candidate.doc_id).cloned())
+                .or_else(|| semantic_map.get(&hit.doc_id).cloned())
+                .map(|mut result| {
+                    result.score = Some(hit.rrf_score);
+                    result.reason_codes.push("hybrid_rrf".to_string());
+                    result.score_factors = if query.explain {
+                        hit.explain
+                            .source_contributions
+                            .into_iter()
+                            .filter_map(|source| {
+                                let rank = source.rank?;
+                                Some(crate::search_planner::ScoreFactorSummary {
+                                    key: format!("rrf_{}", source.source),
+                                    contribution: source.contribution,
+                                    summary: format!(
+                                        "{} rank {rank} contribution to hybrid score",
+                                        source.source
+                                    ),
+                                })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    result
+                })
         })
         .collect::<Vec<_>>();
+    // The service cursor carries (score, id), not the fusion helper's lexical
+    // tie-break score. Use that same total ordering before truncation and on
+    // every page, including ties between lexical-only and semantic-only hits.
+    merged.sort_by(|left, right| {
+        right
+            .score
+            .unwrap_or(0.0)
+            .total_cmp(&left.score.unwrap_or(0.0))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    merged.truncate(requested_limit);
 
     tracing::debug!(
         target: "search.metrics",
@@ -4075,11 +4114,30 @@ fn rerank_skip_audit_for_governor(
 
 async fn orchestrate_hybrid_results_with_optional_rerank(
     cx: &Cx,
+    pool: &DbPool,
     query: &SearchQuery,
     plan: &HybridExecutionPlan,
     lexical_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
-) -> (Vec<SearchResult>, Option<HybridRerankAudit>) {
+) -> Outcome<(Vec<SearchResult>, Option<HybridRerankAudit>), DbError> {
+    // Semantic hits contain IDs and scores only. Resolve both sources from the
+    // canonical mailbox before ranking: rerank must receive the actual message
+    // text, and missing/foreign/filter-mismatched rows must not occupy the fused
+    // candidate budget. Never preserve unverified index-only hits here.
+    let lexical_results =
+        match canonicalize_message_results(cx, pool, query, lexical_results, false).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+    let semantic_results =
+        match canonicalize_message_results(cx, pool, query, semantic_results, false).await {
+            Outcome::Ok(results) => results,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
     let merged = orchestrate_hybrid_results(
         query,
         &plan.derivation,
@@ -4104,7 +4162,7 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
         None
     };
 
-    (merged, rerank_audit)
+    Outcome::Ok((merged, rerank_audit))
 }
 
 fn build_v3_query_explain(
@@ -4909,14 +4967,22 @@ pub async fn execute_search(
         let semantic_results: Vec<SearchResult> = Vec::new();
 
         if let Some(lexical_results) = lexical_results {
-            let (mut raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
-                cx,
-                &candidate_query,
-                &plan,
-                lexical_results,
-                semantic_results,
-            )
-            .await;
+            let (mut raw_results, rerank_audit) =
+                match orchestrate_hybrid_results_with_optional_rerank(
+                    cx,
+                    pool,
+                    &candidate_query,
+                    &plan,
+                    lexical_results,
+                    semantic_results,
+                )
+                .await
+                {
+                    Outcome::Ok(results) => results,
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                };
             #[cfg(feature = "hybrid")]
             let mut rerank_audit = rerank_audit;
             #[cfg(feature = "hybrid")]
@@ -4929,13 +4995,6 @@ pub async fn execute_search(
                 audit.two_tier_refinement_failed = telemetry.refinement_error.is_some();
                 audit.two_tier_fast_only = telemetry.fast_only_mode;
             }
-            raw_results =
-                match canonicalize_message_results(cx, pool, query, raw_results, false).await {
-                    Outcome::Ok(results) => results,
-                    Outcome::Err(err) => return Outcome::Err(err),
-                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-                };
             raw_results = apply_cursor_window(raw_results, query);
             raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
             let explain = if query.explain {
@@ -8666,8 +8725,12 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_orchestration_keeps_lexical_ordering_deterministic() {
-        let query = SearchQuery::messages("incident rollback plan", 1);
+    fn hybrid_orchestration_fuses_both_sources_before_limiting() {
+        let query = SearchQuery {
+            explain: true,
+            limit: Some(2),
+            ..SearchQuery::messages("incident rollback plan", 1)
+        };
         let derivation = CandidateBudget::derive_with_decision(
             query.effective_limit(),
             CandidateMode::Hybrid,
@@ -8693,7 +8756,27 @@ mod tests {
             semantic,
         );
         let ids = merged.iter().map(|result| result.id).collect::<Vec<_>>();
-        assert_eq!(ids, vec![10, 20, 40, 30]);
+        // Documents 20 and 30 have support from both sources. Preparation's
+        // old [10, 20, 40, 30] ordering discarded 30 before fusion could vote.
+        assert_eq!(ids, vec![20, 30]);
+        let k = crate::search_fusion::RrfConfig::from_env().k;
+        assert!((merged[0].score.unwrap() - (1.0 / (k + 2.0) + 1.0 / (k + 1.0))).abs() < 1e-8);
+        assert!((merged[1].score.unwrap() - 2.0 / (k + 3.0)).abs() < 1e-8);
+        for result in &merged {
+            assert!(
+                result
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == "hybrid_rrf")
+            );
+            assert_eq!(result.score_factors.len(), 2);
+            let contributions: f64 = result
+                .score_factors
+                .iter()
+                .map(|factor| factor.contribution)
+                .sum();
+            assert!((contributions - result.score.unwrap()).abs() < 1e-8);
+        }
     }
 
     #[test]
@@ -8722,6 +8805,299 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, 1);
         assert_eq!(merged[1].id, 2);
+    }
+
+    #[test]
+    fn hybrid_orchestration_rank_order_is_independent_of_source_score_scale() {
+        let query = SearchQuery::messages("incident rollback plan", 1);
+        let derivation = CandidateBudget::derive_with_decision(
+            query.effective_limit(),
+            CandidateMode::Hybrid,
+            QueryClass::classify(&query.text),
+            CandidateBudgetConfig::default(),
+        );
+        let rank = |lexical_scale: f64, semantic_scale: f64| {
+            orchestrate_hybrid_results(
+                &query,
+                &derivation,
+                passthrough_governor(),
+                vec![
+                    result_with_score(10, 9.0 * lexical_scale),
+                    result_with_score(20, 8.0 * lexical_scale),
+                ],
+                vec![
+                    result_with_score(20, 0.99 * semantic_scale),
+                    result_with_score(30, 0.8 * semantic_scale),
+                ],
+            )
+        };
+        let bm25_dominant = rank(1000.0, 0.001);
+        let cosine_dominant = rank(0.001, 1000.0);
+        assert_eq!(
+            bm25_dominant.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            [20, 10, 30]
+        );
+        assert_eq!(
+            bm25_dominant
+                .iter()
+                .map(|hit| (hit.id, hit.score))
+                .collect::<Vec<_>>(),
+            cosine_dominant
+                .iter()
+                .map(|hit| (hit.id, hit.score))
+                .collect::<Vec<_>>(),
+            "only source rank, never BM25/cosine units, contributes to RRF"
+        );
+    }
+
+    #[test]
+    fn hybrid_orchestration_cursor_uses_fused_scores_and_stable_id_ties() {
+        let query = SearchQuery {
+            limit: Some(1),
+            ..SearchQuery::messages("incident rollback plan", 1)
+        };
+        let candidates = |query: &SearchQuery| {
+            let derivation = CandidateBudget::derive_with_decision(
+                query.effective_limit(),
+                CandidateMode::Hybrid,
+                QueryClass::classify(&query.text),
+                CandidateBudgetConfig::default(),
+            );
+            orchestrate_hybrid_results(
+                query,
+                &derivation,
+                passthrough_governor(),
+                vec![result_with_score(80, 1000.0), result_with_score(50, 900.0)],
+                vec![result_with_score(70, 0.9), result_with_score(50, 0.8)],
+            )
+        };
+        let first = candidates(&query);
+        assert_eq!(
+            first[0].id, 50,
+            "the jointly supported hit wins before the page limit"
+        );
+        let cursor = compute_next_cursor(&first, 1, RankingMode::Relevance).unwrap();
+        let page_query = SearchQuery {
+            cursor: Some(cursor),
+            ..query.clone()
+        };
+        let retrieval_query = SearchQuery {
+            limit: Some(pagination_fetch_limit(&page_query, 1)),
+            ..page_query.clone()
+        };
+        let second = trim_search_results_to_limit(
+            apply_cursor_window(candidates(&retrieval_query), &page_query),
+            1,
+        );
+        assert_eq!(
+            second[0].id, 70,
+            "tied single-source hits use the cursor's ID order"
+        );
+        let third_query = SearchQuery {
+            cursor: compute_next_cursor(&second, 1, RankingMode::Relevance),
+            ..page_query
+        };
+        let third = trim_search_results_to_limit(
+            apply_cursor_window(candidates(&retrieval_query), &third_query),
+            1,
+        );
+        assert_eq!(third[0].id, 80);
+        assert_eq!(second[0].score, third[0].score);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn hybrid_pipeline_hydrates_canonical_rows_before_ranking_and_keeps_scope_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "hybrid-canonical.sqlite3");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context for real mailbox operations");
+            let project = crate::queries::ensure_project(&cx, &pool, "/hybrid-visible")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let foreign = crate::queries::ensure_project(&cx, &pool, "/hybrid-foreign")
+                .await
+                .into_result()
+                .unwrap()
+                .id
+                .unwrap();
+            let sender = crate::queries::register_agent(
+                &cx, &pool, project, "BlueLake", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let viewer = crate::queries::register_agent(
+                &cx, &pool, project, "GoldOwl", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let blocked_sender = crate::queries::register_agent(
+                &cx, &pool, project, "RedStone", "codex", "test", None, None, None,
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let outsider = crate::queries::register_agent(
+                &cx,
+                &pool,
+                foreign,
+                "GreenField",
+                "codex",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let visible = crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project,
+                sender,
+                "Canonical incident report",
+                "Actual rollback instructions",
+                Some("hybrid-thread"),
+                "high",
+                true,
+                "[]",
+                &[(viewer, "to")],
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let blocked = crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project,
+                blocked_sender,
+                "Blocked incident",
+                "blocked-body-canary",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let foreign_message = crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                foreign,
+                outsider,
+                "Foreign incident",
+                "foreign-body-canary",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[],
+            )
+            .await
+            .into_result()
+            .unwrap()
+            .id
+            .unwrap();
+            let query = SearchQuery {
+                limit: Some(2),
+                ..SearchQuery::messages("incident rollback plan", project)
+            };
+            let plan = HybridExecutionPlan {
+                derivation: CandidateBudget::derive_with_decision(
+                    2,
+                    CandidateMode::Hybrid,
+                    QueryClass::NaturalLanguage,
+                    CandidateBudgetConfig::default(),
+                ),
+                governor: HybridBudgetGovernorState {
+                    rerank_enabled: false,
+                    ..passthrough_governor()
+                },
+            };
+            // Search indexes provide candidate IDs, not authority. Both the
+            // ghost and the lying foreign candidate outrank the real rows in
+            // each source; neither may consume the two-result budget.
+            let candidates = vec![
+                result_with_score(i64::MAX - 1, 1000.0),
+                result_with_score(foreign_message, 900.0),
+                result_with_score(visible, 800.0),
+                result_with_score(blocked, 700.0),
+            ];
+            let (rows, _) = orchestrate_hybrid_results_with_optional_rerank(
+                &cx,
+                &pool,
+                &query,
+                &plan,
+                candidates.clone(),
+                candidates,
+            )
+            .await
+            .into_result()
+            .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                [visible, blocked]
+            );
+            assert_eq!(rows[0].title, "Canonical incident report");
+            assert_eq!(rows[0].body, "Actual rollback instructions");
+            assert_eq!(rows[0].from_agent_id, Some(sender));
+            assert_eq!(rows[0].project_id, Some(project));
+            assert_eq!(
+                rows[0].to.as_deref(),
+                Some(["GoldOwl".to_string()].as_slice())
+            );
+            assert_eq!(rows[0].thread_id.as_deref(), Some("hybrid-thread"));
+
+            let options = SearchOptions {
+                scope_ctx: Some(ScopeContext {
+                    viewer: Some(ViewerIdentity {
+                        project_id: project,
+                        agent_id: viewer,
+                    }),
+                    approved_contacts: Vec::new(),
+                    viewer_project_ids: vec![project],
+                    sender_policies: vec![SenderPolicy {
+                        project_id: project,
+                        agent_id: blocked_sender,
+                        policy: ContactPolicyKind::BlockAll,
+                    }],
+                    recipient_map: vec![RecipientEntry {
+                        message_id: visible,
+                        agent_ids: vec![viewer],
+                    }],
+                }),
+                ..SearchOptions::default()
+            };
+            let response = finish_scoped_response(rows, &query, &options, None, None)
+                .into_result()
+                .unwrap();
+            assert_eq!(response.results.len(), 1);
+            assert_eq!(response.results[0].result.id, visible);
+            assert_eq!(response.audit_summary.unwrap().denied_count, 1);
+        });
     }
 
     #[test]
