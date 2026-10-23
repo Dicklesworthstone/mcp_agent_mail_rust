@@ -988,9 +988,12 @@ pub fn run_undo_with_scopes(
         match action.op.as_str() {
             "WriteFile" | "AppendFile" | "Chmod" => {
                 if !backup_file.exists() {
-                    if action.before_hash == EMPTY_FILE_SHA256 {
-                        // before_hash of empty file: target didn't exist before
-                        // the mutation. Undo by quarantining the new file.
+                    if action.before_hash == EMPTY_FILE_SHA256 && action.before_mode.is_none() {
+                        // An absent target and an existing empty file share
+                        // the empty-content hash. Only the absent target has
+                        // no recorded mode; a lost backup must never turn an
+                        // existing empty file into a newly created file.
+                        // Undo a genuinely new file by quarantining it.
                         //
                         // C3 fix: BEFORE quarantining, verify the live file
                         // still matches `after_hash`. If not, the user (or
@@ -2448,6 +2451,132 @@ mod tests {
             "USER EDITED THIS\n",
             "user's post-fix edit must not be clobbered (non-strict)"
         );
+    }
+
+    #[test]
+    fn completed_empty_original_missing_backup_never_quarantines() {
+        for op_name in ["WriteFile", "AppendFile", "Chmod"] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let target = td.path().join("original-empty.txt");
+                    super::super::mutate::atomic_write_file(&target, b"", 0o640).unwrap();
+                    let run_id = "2026-10-23T00-00-01Z__completed-empty-missing-backup";
+                    let ctx = make_ctx(&td, run_id);
+                    let op = match op_name {
+                        "WriteFile" => Op::WriteFile {
+                            content: b"doctor replacement\n".to_vec(),
+                            mode: 0o600,
+                        },
+                        "AppendFile" => Op::AppendFile {
+                            content: b"doctor appended\n".to_vec(),
+                        },
+                        "Chmod" => Op::Chmod { mode: 0o600 },
+                        _ => unreachable!(),
+                    };
+                    mutate(&ctx, &target, op).unwrap();
+                    let run_dir = ctx.run_dir.clone();
+                    drop(ctx);
+                    let actions = fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
+                    let action: StoredAction =
+                        serde_json::from_str(actions.lines().last().unwrap()).unwrap();
+                    assert_eq!(action.phase.as_deref(), Some("completed"));
+                    assert!(action.ok);
+                    assert_eq!(action.before_hash, EMPTY_FILE_SHA256);
+                    assert!(action.before_mode.is_some());
+                    let backup = action_backup_file(&run_dir.join("backups"), &action).unwrap();
+                    let retained_backup = backup.with_extension("retained");
+                    fs::rename(&backup, &retained_backup).unwrap();
+                    let after_bytes = fs::read(&target).unwrap();
+                    let after_mode = platform::permission_mode(&fs::metadata(&target).unwrap());
+
+                    let result = test_undo(td.path(), run_id, dry_run, strict);
+                    if strict {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        assert!(error.to_string().contains("backup missing"));
+                    } else {
+                        let summary = result.unwrap();
+                        assert_eq!(summary.actions_replayed, 0);
+                        assert_eq!(summary.actions_skipped, 0);
+                        assert_eq!(summary.failures.len(), 1);
+                        assert!(summary.failures[0].contains("backup missing"));
+                    }
+                    assert_eq!(fs::read(&target).unwrap(), after_bytes, "{op_name}");
+                    assert_eq!(
+                        platform::permission_mode(&fs::metadata(&target).unwrap()),
+                        after_mode,
+                        "{op_name}"
+                    );
+                    assert!(fs::read(&retained_backup).unwrap().is_empty());
+                    assert!(!run_dir.join("quarantine_undo").exists());
+                    assert!(!undo_complete(td.path(), run_id));
+                    if dry_run {
+                        assert!(!run_dir.join("undo.lock").exists());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_new_empty_file_still_quarantines() {
+        for op_name in ["WriteFile", "AppendFile"] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let target = td.path().join("created-empty.txt");
+                    let run_id = "2026-10-23T00-00-02Z__completed-new-empty";
+                    let ctx = make_ctx(&td, run_id);
+                    let op = match op_name {
+                        "WriteFile" => Op::WriteFile {
+                            content: Vec::new(),
+                            mode: 0o600,
+                        },
+                        "AppendFile" => Op::AppendFile {
+                            content: Vec::new(),
+                        },
+                        _ => unreachable!(),
+                    };
+                    mutate(&ctx, &target, op).unwrap();
+                    let run_dir = ctx.run_dir.clone();
+                    drop(ctx);
+                    let actions = fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
+                    let action: StoredAction =
+                        serde_json::from_str(actions.lines().last().unwrap()).unwrap();
+                    assert_eq!(action.phase.as_deref(), Some("completed"));
+                    assert!(action.ok);
+                    assert_eq!(action.before_hash, EMPTY_FILE_SHA256);
+                    assert!(action.before_mode.is_none());
+                    assert!(fs::read(&target).unwrap().is_empty());
+                    assert!(
+                        !action_backup_file(&run_dir.join("backups"), &action)
+                            .unwrap()
+                            .exists()
+                    );
+                    let after_mode = platform::permission_mode(&fs::metadata(&target).unwrap());
+
+                    let summary = test_undo(td.path(), run_id, dry_run, strict).unwrap();
+                    assert_eq!(summary.actions_replayed, 1, "{op_name}");
+                    assert_eq!(summary.actions_skipped, 0);
+                    assert!(summary.failures.is_empty());
+                    let quarantine = run_dir.join("quarantine_undo").join("created-empty.txt");
+                    let retained = if dry_run {
+                        assert!(!quarantine.exists());
+                        &target
+                    } else {
+                        assert!(!target.exists());
+                        &quarantine
+                    };
+                    assert!(fs::read(retained).unwrap().is_empty());
+                    assert_eq!(
+                        platform::permission_mode(&fs::metadata(retained).unwrap()),
+                        after_mode
+                    );
+                    assert_eq!(undo_complete(td.path(), run_id), !dry_run);
+                }
+            }
+        }
     }
 
     #[test]
