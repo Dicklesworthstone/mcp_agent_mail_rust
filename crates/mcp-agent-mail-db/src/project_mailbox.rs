@@ -207,6 +207,196 @@ fn has_project_deliveries(
     Ok(false)
 }
 
+/// Whether a project has shared deliveries, with a consistent schema observation.
+///
+/// A completely legacy schema is empty; incomplete shared-mail authority is an
+/// error so callers cannot mistake an unreadable mailbox for a direct-only one.
+pub fn has_project_mailbox_deliveries(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+) -> Result<bool, DbError> {
+    crate::sync::inbox::with_snapshot(conn, || has_project_deliveries(conn, project_id))
+}
+
+/// An agent's shared-mail obligations, excluding messages delivered directly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectMailboxInboxCounts {
+    pub unread: usize,
+    pub urgent: usize,
+    pub ack_required: usize,
+    pub ack_overdue: usize,
+}
+
+/// Count visible shared mail without loading message bodies.
+///
+/// All bounded pages share a read snapshot. Read and acknowledgement state are
+/// independent, and the canonical visibility predicate gives direct mail
+/// precedence over shared delivery of the same message.
+pub fn project_mailbox_inbox_counts_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    overdue_before: i64,
+) -> Result<ProjectMailboxInboxCounts, DbError> {
+    crate::sync::inbox::with_snapshot(conn, || {
+        let mut counts = ProjectMailboxInboxCounts::default();
+        if !has_project_deliveries(conn, project_id)? {
+            return Ok(counts);
+        }
+        let mut floor = None;
+        let mut skip_at_floor = 0;
+        loop {
+            let ids = project_mailbox_count_ids(conn, project_id, &mut floor, &mut skip_at_floor)?;
+            if ids.is_empty() {
+                return Ok(counts);
+            }
+            let page =
+                project_mailbox_count_page(conn, project_id, agent_id, overdue_before, &ids)?;
+            for (total, increment) in [
+                (&mut counts.unread, page.unread),
+                (&mut counts.urgent, page.urgent),
+                (&mut counts.ack_required, page.ack_required),
+                (&mut counts.ack_overdue, page.ack_overdue),
+            ] {
+                *total = total
+                    .checked_add(increment)
+                    .ok_or_else(|| DbError::Internal("project inbox count overflow".to_string()))?;
+            }
+            if ids.len() < 128 {
+                return Ok(counts);
+            }
+        }
+    })
+}
+
+/// Page in the existing project/timestamp index's order. As in the inbox reader,
+/// a single timestamp sort key keeps the pinned engine on its indexed path;
+/// the offset counts only rows already consumed at the boundary timestamp.
+fn project_mailbox_count_ids(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    floor: &mut Option<i64>,
+    skip_at_floor: &mut i64,
+) -> Result<Vec<i64>, DbError> {
+    let mut sql = "SELECT message_id, delivered_ts FROM project_mailbox_deliveries \
+                   WHERE project_id = ?"
+        .to_string();
+    let mut params = vec![Value::BigInt(project_id)];
+    if let Some(timestamp) = *floor {
+        sql.push_str(" AND delivered_ts >= ?");
+        params.push(Value::BigInt(timestamp));
+    }
+    sql.push_str(" ORDER BY delivered_ts ASC LIMIT 128 OFFSET ?");
+    params.push(Value::BigInt(*skip_at_floor));
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    if rows.len() > 128 {
+        return Err(DbError::Internal(
+            "project inbox count page exceeded its bound".to_string(),
+        ));
+    }
+    let mut ids = Vec::with_capacity(rows.len());
+    let mut last_ts = *floor;
+    let mut trailing_count = *skip_at_floor;
+    for row in rows {
+        let id = row
+            .get_named::<i64>("message_id")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let timestamp = row
+            .get_named::<i64>("delivered_ts")
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        if last_ts.is_some_and(|previous| timestamp < previous) {
+            return Err(DbError::Internal(
+                "project inbox count timestamp moved backwards".to_string(),
+            ));
+        }
+        trailing_count = if last_ts == Some(timestamp) {
+            trailing_count.checked_add(1).ok_or_else(|| {
+                DbError::Internal("project inbox count timestamp offset overflow".to_string())
+            })?
+        } else {
+            1
+        };
+        last_ts = Some(timestamp);
+        ids.push(id);
+    }
+    *floor = last_ts;
+    *skip_at_floor = trailing_count;
+    Ok(ids)
+}
+
+fn project_mailbox_count_page(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    overdue_before: i64,
+    ids: &[i64],
+) -> Result<ProjectMailboxInboxCounts, DbError> {
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let sql = format!(
+        "SELECT COUNT(*) AS visible,
+                COALESCE(SUM(CASE WHEN pr.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread,
+                COALESCE(SUM(CASE WHEN pr.read_ts IS NULL
+                    AND m.importance IN ('urgent','high') THEN 1 ELSE 0 END), 0) AS urgent,
+                COALESCE(SUM(CASE WHEN m.ack_required = 1 AND pr.ack_ts IS NULL
+                    THEN 1 ELSE 0 END), 0) AS ack_required,
+                COALESCE(SUM(CASE WHEN m.ack_required = 1 AND pr.ack_ts IS NULL
+                    AND m.created_ts < ? THEN 1 ELSE 0 END), 0) AS ack_overdue
+         FROM project_mailbox_deliveries d
+         JOIN messages m ON m.id = d.message_id
+         JOIN agents viewer ON viewer.id = ?
+         LEFT JOIN project_mailbox_receipts pr
+             ON pr.message_id = d.message_id AND pr.agent_id = viewer.id
+         WHERE d.project_id = ? AND d.message_id IN ({placeholders})
+             AND {VISIBLE_TO_VIEWER_SQL}"
+    );
+    let mut params = vec![
+        Value::BigInt(overdue_before),
+        Value::BigInt(agent_id),
+        Value::BigInt(project_id),
+    ];
+    params.extend(ids.iter().copied().map(Value::BigInt));
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    if rows.len() != 1 {
+        return Err(DbError::Internal(
+            "project inbox count query did not return one aggregate row".to_string(),
+        ));
+    }
+    let row = &rows[0];
+    let count = |name: &str| -> Result<usize, DbError> {
+        let raw = row
+            .get_named::<i64>(name)
+            .map_err(|error| DbError::Sqlite(error.to_string()))?;
+        let value = usize::try_from(raw)
+            .map_err(|_| DbError::Internal(format!("invalid project inbox {name} count")))?;
+        if value > ids.len() {
+            return Err(DbError::Internal(format!(
+                "project inbox {name} count exceeded its page"
+            )));
+        }
+        Ok(value)
+    };
+    let visible = count("visible")?;
+    let bounded_count = |name: &str| -> Result<usize, DbError> {
+        let value = count(name)?;
+        if value > visible {
+            return Err(DbError::Internal(format!(
+                "project inbox {name} count exceeded visible messages"
+            )));
+        }
+        Ok(value)
+    };
+    Ok(ProjectMailboxInboxCounts {
+        unread: bounded_count("unread")?,
+        urgent: bounded_count("urgent")?,
+        ack_required: bounded_count("ack_required")?,
+        ack_overdue: bounded_count("ack_overdue")?,
+    })
+}
+
 /// Shared-mailbox inbox rows for one agent, newest first, with the same
 /// filter set as the direct inbox. Each row carries
 /// [`PROJECT_MAILBOX_KIND`] and the agent's own lazily-recorded read/ack state.
@@ -875,6 +1065,72 @@ pub fn project_mailbox_delivery_from_conn(
 mod tests {
     use super::*;
     use crate::schema;
+
+    #[test]
+    fn project_mailbox_inbox_counts_cross_pages_without_mutating_receipts() {
+        let conn = test_conn();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'counts', '/tmp/counts', 0);
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (1, 1, 'Sender', 'test', 'test', 0, 0),
+                    (2, 1, 'Reader', 'test', 'test', 0, 0);
+             BEGIN;",
+        )
+        .unwrap();
+        for message_id in 1_i64..=257 {
+            let importance = if message_id % 2 == 0 {
+                "high"
+            } else {
+                "normal"
+            };
+            let ack_required = i64::from(message_id % 3 == 0);
+            let created_ts = message_id * 1_000;
+            // A timestamp tie spans the 128-row page boundary.
+            let delivered_ts = message_id / 200;
+            conn.execute_raw(&format!(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+                 VALUES ({message_id}, 1, 1, 'shared', '', {created_ts}, '{importance}', {ack_required});
+                 INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+                 VALUES ({message_id}, 1, 'to', {delivered_ts});"
+            ))
+            .unwrap();
+        }
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (129, 2, 'to', 300000, 300000);
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+             VALUES (130, 2, 300000, 300000),
+                    (132, 2, 300000, NULL),
+                    (135, 2, NULL, 300000);
+             COMMIT;
+             PRAGMA query_only = ON;",
+        )
+        .unwrap();
+        let counts = project_mailbox_inbox_counts_from_conn(&conn, 1, 2, 150_000).unwrap();
+        assert_eq!(
+            counts,
+            ProjectMailboxInboxCounts {
+                unread: 254,
+                urgent: 126,
+                ack_required: 83,
+                ack_overdue: 47,
+            }
+        );
+        assert_eq!(
+            project_mailbox_inbox_counts_from_conn(&conn, 1, 99, 150_000).unwrap(),
+            ProjectMailboxInboxCounts::default()
+        );
+        let receipts = conn
+            .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+            .unwrap();
+        assert_eq!(receipts[0].get_named::<i64>("n").unwrap(), 3);
+        let activity = conn
+            .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+            .unwrap();
+        assert_eq!(activity[0].get_named::<i64>("n").unwrap(), 0);
+    }
 
     fn receipt_fixture(test: impl FnOnce(&DbConn)) {
         let temp = tempfile::tempdir().unwrap();

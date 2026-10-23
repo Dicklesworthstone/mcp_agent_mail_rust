@@ -5294,6 +5294,9 @@ fn build_status_with_phase(
 
     // 1. Inbox counts (agent-specific, if resolved)
     let (unread, urgent, ack_required, ack_overdue) = if let Some((agent_id, _)) = &agent {
+        // Direct and shared obligations must describe the same observation.
+        // A plain status read creates neither receipts nor agent activity.
+        let snapshot = RobotInboxReadSnapshot::begin(conn)?;
         let inbox_sql = "
             SELECT
                 SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread,
@@ -5316,7 +5319,7 @@ fn build_status_with_phase(
                 ],
             )
             .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
-        if let Some(row) = rows.first() {
+        let direct = if let Some(row) = rows.first() {
             (
                 row.get_named::<i64>("unread").unwrap_or(0) as usize,
                 row.get_named::<i64>("urgent").unwrap_or(0) as usize,
@@ -5325,7 +5328,23 @@ fn build_status_with_phase(
             )
         } else {
             (0, 0, 0, 0)
-        }
+        };
+        let shared = mcp_agent_mail_db::project_mailbox::project_mailbox_inbox_counts_from_conn(
+            conn, project_id, *agent_id, threshold,
+        )
+        .map_err(|error| CliError::Other(format!("project inbox counts failed: {error}")))?;
+        snapshot.finish()?;
+        let add = |direct: usize, shared: usize| {
+            direct
+                .checked_add(shared)
+                .ok_or_else(|| CliError::Other("inbox count overflow".to_string()))
+        };
+        (
+            add(direct.0, shared.unread)?,
+            add(direct.1, shared.urgent)?,
+            add(direct.2, shared.ack_required)?,
+            add(direct.3, shared.ack_overdue)?,
+        )
     } else {
         (0, 0, 0, 0)
     };
@@ -5656,8 +5675,35 @@ fn build_status_with_snapshot_cache(
     project_id: i64,
     project_slug: &str,
     agent: Option<(i64, String)>,
+    phase: Option<&mut TailLatencyPhaseRecorder>,
+) -> Result<(StatusData, Vec<String>), CliError> {
+    let snapshot = RobotInboxReadSnapshot::begin(conn)?;
+    let result =
+        build_status_with_snapshot_cache_in_snapshot(conn, project_id, project_slug, agent, phase)?;
+    snapshot.finish()?;
+    Ok(result)
+}
+
+fn build_status_with_snapshot_cache_in_snapshot(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
     mut phase: Option<&mut TailLatencyPhaseRecorder>,
 ) -> Result<(StatusData, Vec<String>), CliError> {
+    // Shared visibility and receipts can change without touching the legacy
+    // generation's direct-recipient or last-active timestamps. As for the
+    // inbox cache, only a proven direct-only project may use that generation.
+    // Failed schema observations go through the live reader, which reports
+    // the error instead of returning stale or apparently empty mail.
+    if agent.is_some()
+        && !mcp_agent_mail_db::project_mailbox::has_project_mailbox_deliveries(conn, project_id)
+            .is_ok_and(|present| !present)
+    {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_bypass_shared_state");
+        return build_status_with_phase(conn, project_id, project_slug, agent, phase);
+    }
+
     let db_identity = robot_db_identity(conn);
     let generation = match robot_status_snapshot_generation(conn, project_id) {
         Ok(generation) => {
@@ -25467,6 +25513,180 @@ mod tests {
     }
 
     #[test]
+    fn robot_status_counts_shared_mail_with_direct_precedence_and_independent_receipts() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_temp, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "UPDATE agents SET inception_ts = 100 WHERE id = 2;
+             INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (2, 'other', '/tmp/other', 0);
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts)
+             VALUES (4, 2, 'OtherSender', 'test', 'test', 0, 0),
+                    (5, 2, 'OtherReader', 'test', 'test', 0, 0),
+                    (6, 1, 'LateReader', 'test', 'test', 300, 0),
+                    (7, 1, 'RetiredReader', 'test', 'test', 0, 0),
+                    (8, 1, 'BlockedReader', 'test', 'test', 0, 0);
+             UPDATE agents SET retired_at = 42 WHERE id = 7;
+             UPDATE agents SET contact_policy = 'block_all' WHERE id = 8;
+             INSERT INTO messages
+             (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+             VALUES (100, 1, 1, 'shared urgent', '', 100, 'urgent', 1),
+                    (101, 1, 1, 'direct wins', '', 110, 'normal', 1),
+                    (102, 1, 1, 'read pending ack', '', 120, 'normal', 1),
+                    (103, 1, 1, 'acked unread', '', 130, 'normal', 1),
+                    (104, 1, 2, 'self authored', '', 140, 'normal', 0),
+                    (105, 1, 1, 'before registration', '', 99, 'normal', 0),
+                    (106, 1, 1, 'direct unread', '', 140, 'normal', 1),
+                    (200, 2, 4, 'other project', '', 130, 'urgent', 1);
+             INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (100, 1, 'to', 100), (101, 1, 'to', 110),
+                    (102, 1, 'to', 120), (103, 1, 'to', 130),
+                    (104, 1, 'to', 140), (105, 1, 'to', 99), (200, 2, 'to', 130);
+             INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (101, 2, 'to', 150, 160), (106, 2, 'to', NULL, NULL);
+             INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+             VALUES (102, 2, 150, NULL), (103, 2, NULL, 160), (100, 3, 150, 160);
+             PRAGMA query_only = ON;",
+        )
+        .unwrap();
+        let (status, actions) = build_status(&conn, 1, "proj", Some((2, "Bob".to_string())))
+            .expect("status reads direct and shared obligations");
+        assert_eq!(
+            (
+                status.unread,
+                status.urgent,
+                status.ack_required,
+                status.ack_overdue,
+            ),
+            (3, 1, 3, 3)
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action == "am robot inbox --urgent")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action == "am robot inbox --project proj --agent Bob --ack-overdue")
+        );
+        assert!(
+            status
+                .anomalies
+                .iter()
+                .any(|anomaly| anomaly.category == "ack_sla")
+        );
+        for viewer_id in [5, 6, 7, 8] {
+            let counts =
+                mcp_agent_mail_db::project_mailbox::project_mailbox_inbox_counts_from_conn(
+                    &conn, 1, viewer_id, 1_000,
+                )
+                .unwrap();
+            assert_eq!(
+                counts,
+                mcp_agent_mail_db::project_mailbox::ProjectMailboxInboxCounts::default(),
+                "hidden shared mail for {viewer_id}"
+            );
+        }
+        let receipt_rows = conn
+            .query_sync("SELECT COUNT(*) AS n FROM project_mailbox_receipts", &[])
+            .unwrap();
+        assert_eq!(receipt_rows[0].get_named::<i64>("n").unwrap(), 3);
+        let activity_rows = conn
+            .query_sync("SELECT SUM(last_active_ts) AS n FROM agents", &[])
+            .unwrap();
+        assert_eq!(activity_rows[0].get_named::<i64>("n").unwrap(), 0);
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_named::<i64>("query_only")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn robot_status_cache_observes_shared_receipts_and_viewer_visibility() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp, conn) = setup_robot_thread_message_test_db();
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, body_md, created_ts, importance, ack_required)
+             VALUES (500, 1, 1, 'urgent shared', '', 100, 'urgent', 1);",
+        )
+        .unwrap();
+        let read_counts = || {
+            let (status, _) = build_status_with_snapshot_cache(
+                &conn,
+                1,
+                "proj",
+                Some((2, "Bob".to_string())),
+                None,
+            )
+            .unwrap();
+            (
+                status.unread,
+                status.urgent,
+                status.ack_required,
+                status.ack_overdue,
+            )
+        };
+        assert_eq!(read_counts(), (0, 0, 0, 0));
+        conn.execute_raw(
+            "INSERT INTO project_mailbox_deliveries (message_id, project_id, kind, delivered_ts)
+             VALUES (500, 1, 'to', 100);",
+        )
+        .unwrap();
+        assert_eq!(read_counts(), (1, 1, 1, 1));
+        for (sql, expected) in [
+            (
+                "INSERT INTO project_mailbox_receipts (message_id, agent_id, read_ts, ack_ts)
+                 VALUES (500, 2, 200, NULL)",
+                (0, 0, 1, 1),
+            ),
+            (
+                "UPDATE project_mailbox_receipts SET ack_ts = 300 WHERE agent_id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE project_mailbox_receipts SET read_ts = NULL, ack_ts = NULL WHERE agent_id = 2",
+                (1, 1, 1, 1),
+            ),
+            (
+                "UPDATE agents SET contact_policy = 'block_all' WHERE id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE agents SET contact_policy = 'auto' WHERE id = 2",
+                (1, 1, 1, 1),
+            ),
+            (
+                "UPDATE agents SET retired_at = 42 WHERE id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE agents SET retired_at = NULL WHERE id = 2",
+                (1, 1, 1, 1),
+            ),
+            (
+                "UPDATE agents SET inception_ts = 101 WHERE id = 2",
+                (0, 0, 0, 0),
+            ),
+            (
+                "UPDATE agents SET inception_ts = 100 WHERE id = 2",
+                (1, 1, 1, 1),
+            ),
+        ] {
+            conn.execute_raw(sql).unwrap();
+            assert_eq!(read_counts(), expected, "mutation: {sql}");
+        }
+    }
+
+    #[test]
     fn robot_inbox_shared_schema_failures_release_only_their_read_snapshot() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         conn.execute_raw(
@@ -25488,6 +25708,25 @@ mod tests {
                 .to_string()
                 .contains("incomplete project mailbox schema")
         );
+
+        conn.execute_raw(
+            "BEGIN;
+             UPDATE messages SET subject = 'Caller change before status error' WHERE id = 600;",
+        )
+        .unwrap();
+        let error =
+            build_status_with_snapshot_cache(&conn, 1, "proj", Some((2, "Bob".to_string())), None)
+                .expect_err("status must report missing shared receipt authority");
+        assert!(error.to_string().contains("project inbox counts failed"));
+        assert_eq!(
+            conn.query_sync("SELECT subject FROM messages WHERE id = 600", &[])
+                .unwrap()[0]
+                .get_named::<String>("subject")
+                .unwrap(),
+            "Caller change before status error"
+        );
+        conn.execute_raw("ROLLBACK")
+            .expect("failed status read preserved the caller's transaction");
 
         conn.execute_raw(
             "BEGIN IMMEDIATE;
