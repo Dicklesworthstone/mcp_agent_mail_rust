@@ -5962,10 +5962,10 @@ fn quarantine_stale_activity_lock_if_unheld(
     };
 
     if metadata.file_type().is_symlink() {
-        return quarantine_startup_activity_lock_if_exists(lock_path, context);
+        return quarantine_startup_artifact_if_exists(lock_path, context, None);
     }
     if !metadata.file_type().is_file() {
-        let quarantined = quarantine_startup_activity_lock_if_exists(lock_path, context)?;
+        let quarantined = quarantine_startup_artifact_if_exists(lock_path, context, None)?;
         if let Some(ref quarantined_path) = quarantined {
             tracing::warn!(
                 path = %lock_path.display(),
@@ -5976,11 +5976,7 @@ fn quarantine_stale_activity_lock_if_unheld(
         return Ok(quarantined);
     }
 
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(lock_path)
-    {
+    let file = match mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(CliError::Io(error)),
@@ -5993,7 +5989,67 @@ fn quarantine_stale_activity_lock_if_unheld(
         return Ok(None);
     }
 
-    quarantine_startup_activity_lock_if_exists(lock_path, context)
+    // Keep the advisory lock on this exact file until publication and its
+    // directory barrier finish. A replacement at the pathname is not covered
+    // by this lock and must never be treated as the observed stale lock.
+    quarantine_startup_artifact_if_exists(lock_path, context, Some(&file))
+}
+
+fn verify_startup_held_file_identity(path: &Path, held: &std::fs::File) -> std::io::Result<()> {
+    let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+    let retained_identity = same_file::Handle::from_file(held.try_clone()?)?;
+    let current_identity = same_file::Handle::from_file(current)?;
+    if retained_identity != current_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "startup artifact {} no longer names the retained file; refusing publication",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sync_startup_artifact_parents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Match the recovery publishers' Unix directory durability barrier. Rust's
+    // portable File::open cannot open Windows directories; copied file bytes
+    // are still synced on every platform before this additional barrier.
+    #[cfg(unix)]
+    {
+        let parent = |path: &Path| {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
+        let source_parent = parent(source);
+        let destination_parent = parent(destination);
+        std::fs::File::open(&source_parent)?.sync_all()?;
+        if destination_parent != source_parent {
+            std::fs::File::open(&destination_parent)?.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (source, destination);
+    Ok(())
+}
+
+#[cfg(test)]
+type StartupArtifactPublicationHook = Box<dyn FnOnce(&Path, &Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static STARTUP_ARTIFACT_BEFORE_PUBLICATION: std::cell::RefCell<Option<StartupArtifactPublicationHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn startup_artifact_before_publication(source: &Path, destination: &Path) {
+    let hook = STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(source, destination);
+    }
 }
 
 fn next_startup_sqlite_sidecar_artifact_path(
@@ -6026,27 +6082,47 @@ fn next_startup_sqlite_sidecar_snapshot_path(sidecar_path: &Path, timestamp: &st
     next_startup_sqlite_sidecar_artifact_path(sidecar_path, "startup-precheckpoint", timestamp)
 }
 
-fn quarantine_startup_activity_lock_if_exists(
-    lock_path: &Path,
+fn quarantine_startup_artifact_if_exists(
+    artifact_path: &Path,
     context: &str,
+    held_file: Option<&std::fs::File>,
 ) -> CliResult<Option<PathBuf>> {
-    match std::fs::symlink_metadata(lock_path) {
+    match std::fs::symlink_metadata(artifact_path) {
         Ok(_) => {}
         Err(e) => {
-            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+            if held_file.is_none() && matches!(e.kind(), std::io::ErrorKind::NotFound) {
                 return Ok(None);
             }
             return Err(CliError::Io(e));
         }
     }
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let quarantined = next_startup_sqlite_sidecar_quarantine_path(lock_path, &timestamp);
-    match std::fs::rename(lock_path, &quarantined) {
-        Ok(()) => Ok(Some(quarantined)),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => Ok(None),
+    let quarantined = next_startup_sqlite_sidecar_quarantine_path(artifact_path, &timestamp);
+    #[cfg(test)]
+    startup_artifact_before_publication(artifact_path, &quarantined);
+    if let Some(file) = held_file {
+        verify_startup_held_file_identity(artifact_path, file)?;
+    }
+    // The name allocator is only a convenience. Atomic no-replace publication
+    // is what protects evidence created after that check, including dangling
+    // symlinks. Unsupported platforms fail closed in the shared primitive.
+    match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(artifact_path, &quarantined) {
+        Ok(()) => {
+            sync_startup_artifact_parents(artifact_path, &quarantined).map_err(|error| {
+                CliError::Other(format!(
+                    "quarantined {context} {} to {}, but could not sync its directory; preserved the quarantine for inspection: {error}",
+                    artifact_path.display(),
+                    quarantined.display()
+                ))
+            })?;
+            Ok(Some(quarantined))
+        }
+        Err(e) if held_file.is_none() && matches!(e.kind(), std::io::ErrorKind::NotFound) => {
+            Ok(None)
+        }
         Err(e) => Err(CliError::Other(format!(
             "failed to quarantine {context} {} to {}: {e}",
-            lock_path.display(),
+            artifact_path.display(),
             quarantined.display()
         ))),
     }
@@ -6056,26 +6132,7 @@ fn quarantine_startup_sqlite_sidecar_if_exists(
     sidecar_path: &Path,
     context: &str,
 ) -> CliResult<Option<PathBuf>> {
-    match std::fs::symlink_metadata(sidecar_path) {
-        Ok(_) => {}
-        Err(e) => {
-            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                return Ok(None);
-            }
-            return Err(CliError::Io(e));
-        }
-    }
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let quarantined = next_startup_sqlite_sidecar_quarantine_path(sidecar_path, &timestamp);
-    match std::fs::rename(sidecar_path, &quarantined) {
-        Ok(()) => Ok(Some(quarantined)),
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => Ok(None),
-        Err(e) => Err(CliError::Other(format!(
-            "failed to quarantine {context} sidecar {} to {}: {e}",
-            sidecar_path.display(),
-            quarantined.display()
-        ))),
-    }
+    quarantine_startup_artifact_if_exists(sidecar_path, &format!("{context} sidecar"), None)
 }
 
 fn quarantine_startup_sqlite_sidecar(sidecar_path: &Path, context: &str) -> CliResult<PathBuf> {
@@ -6104,11 +6161,24 @@ fn copy_startup_sqlite_sidecar_snapshot(
         return Ok(None);
     }
 
+    let mut source = mcp_agent_mail_core::disk::open_regular_file_no_follow(sidecar_path)?;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let snapshot = next_startup_sqlite_sidecar_snapshot_path(sidecar_path, &timestamp);
-    std::fs::copy(sidecar_path, &snapshot).map_err(|e| {
+    #[cfg(test)]
+    startup_artifact_before_publication(sidecar_path, &snapshot);
+    verify_startup_held_file_identity(sidecar_path, &source)?;
+    let copy_result = (|| -> std::io::Result<()> {
+        let mut destination =
+            mcp_agent_mail_core::disk::create_new_private_file_no_follow(&snapshot)?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        verify_startup_held_file_identity(sidecar_path, &source)?;
+        verify_startup_held_file_identity(&snapshot, &destination)?;
+        sync_startup_artifact_parents(sidecar_path, &snapshot)
+    })();
+    copy_result.map_err(|e| {
         CliError::Other(format!(
-            "failed to snapshot {context} sidecar {} to {}: {e}",
+            "failed to snapshot {context} sidecar {} to {}; any created artifact was preserved for inspection: {e}",
             sidecar_path.display(),
             snapshot.display()
         ))
@@ -77932,6 +78002,264 @@ startup_timeout_sec = 42
             Some("cleanup-stale-wal.sqlite3-wal.startup-quarantine-20260102_120000_000-01"),
             "startup quarantine allocation must not overwrite broken symlink artifacts"
         );
+    }
+
+    type StartupArtifactPublisher = fn(&Path, &str) -> CliResult<Option<PathBuf>>;
+
+    fn startup_artifact_publishers() -> [(&'static str, StartupArtifactPublisher); 3] {
+        [
+            ("activity-lock", quarantine_stale_activity_lock_if_unheld),
+            ("sidecar", quarantine_startup_sqlite_sidecar_if_exists),
+            ("snapshot", copy_startup_sqlite_sidecar_snapshot),
+        ]
+    }
+
+    #[test]
+    fn startup_artifact_publication_refuses_raced_regular_destination() {
+        for (name, publish) in startup_artifact_publishers() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join(name);
+            std::fs::write(&source, b"original recovery evidence").expect("write source");
+            STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(|_, destination| {
+                    std::fs::write(destination, b"raced destination evidence")
+                        .expect("occupy selected destination");
+                }));
+            });
+
+            publish(&source, "race test").expect_err("occupied destination must refuse");
+
+            assert_eq!(
+                std::fs::read(&source).expect("source retained"),
+                b"original recovery evidence",
+                "{name} must preserve its source when the allocated name is occupied"
+            );
+            let artifacts =
+                quarantined_artifacts_with_prefix(dir.path(), &format!("{name}.startup-"));
+            assert_eq!(
+                artifacts.len(),
+                1,
+                "{name} must not silently retry publication"
+            );
+            assert_eq!(
+                std::fs::read(&artifacts[0]).expect("raced destination retained"),
+                b"raced destination evidence",
+                "{name} must not overwrite another publisher's evidence"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_artifact_publication_refuses_raced_dangling_destination() {
+        for (name, publish) in startup_artifact_publishers() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join(name);
+            let missing_target = dir.path().join("missing-target");
+            std::fs::write(&source, b"original recovery evidence").expect("write source");
+            let hook_target = missing_target.clone();
+            STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move |_, destination| {
+                    std::os::unix::fs::symlink(&hook_target, destination)
+                        .expect("occupy selected destination with dangling symlink");
+                }));
+            });
+
+            publish(&source, "race test").expect_err("dangling destination must refuse");
+
+            assert_eq!(
+                std::fs::read(&source).expect("source retained"),
+                b"original recovery evidence"
+            );
+            let artifacts =
+                quarantined_artifacts_with_prefix(dir.path(), &format!("{name}.startup-"));
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(
+                std::fs::read_link(&artifacts[0]).expect("raced symlink retained"),
+                missing_target
+            );
+            assert!(
+                !missing_target.exists(),
+                "{name} must not write through the raced destination symlink"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_activity_quarantine_refuses_substituted_locked_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.activity.lock");
+        let retained = dir.path().join("retained-original-lock");
+        std::fs::write(&source, b"original stale lock").expect("write stale lock");
+        let replacement_lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_lock = std::rc::Rc::clone(&replacement_lock);
+        let hook_retained = retained.clone();
+        STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |path, _| {
+                let probe = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)
+                    .expect("open original lock probe");
+                assert!(
+                    fs2::FileExt::try_lock_exclusive(&probe).is_err(),
+                    "the original file must still be locked at the publication boundary"
+                );
+                drop(probe);
+                std::fs::rename(path, &hook_retained).expect("retain original locked inode");
+                std::fs::write(path, b"new live owner's lock").expect("publish replacement lock");
+                let file = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)
+                    .expect("open replacement lock");
+                fs2::FileExt::try_lock_exclusive(&file).expect("new owner holds replacement lock");
+                *hook_lock.borrow_mut() = Some(file);
+            }));
+        });
+
+        let error = quarantine_stale_activity_lock_if_unheld(&source, "identity test")
+            .expect_err("a lock on the old inode cannot authorize moving the replacement");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer names the retained file")
+        );
+        drop(replacement_lock.borrow_mut().take());
+        assert_eq!(
+            std::fs::read(&source).expect("replacement lock retained"),
+            b"new live owner's lock"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("original locked inode retained"),
+            b"original stale lock"
+        );
+        assert!(
+            quarantined_artifacts_with_prefix(dir.path(), "mail.activity.lock.startup-quarantine-")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_refuses_substituted_source_before_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.sqlite3-wal");
+        let retained = dir.path().join("retained-original-wal");
+        std::fs::write(&source, b"original WAL evidence").expect("write WAL");
+        let hook_retained = retained.clone();
+        STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |path, _| {
+                std::fs::rename(path, &hook_retained).expect("retain opened WAL inode");
+                std::fs::write(path, b"replacement WAL evidence").expect("replace source path");
+            }));
+        });
+
+        let error = copy_startup_sqlite_sidecar_snapshot(&source, "identity test")
+            .expect_err("source replacement must refuse before copying");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer names the retained file")
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("replacement WAL retained"),
+            b"replacement WAL evidence"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("original WAL retained"),
+            b"original WAL evidence"
+        );
+        assert!(
+            quarantined_artifacts_with_prefix(
+                dir.path(),
+                "mail.sqlite3-wal.startup-precheckpoint-"
+            )
+            .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_snapshot_refuses_source_symlink_substitution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.sqlite3-wal");
+        let retained = dir.path().join("retained-original-wal");
+        let outside = dir.path().join("outside-evidence");
+        std::fs::write(&source, b"original WAL evidence").expect("write WAL");
+        std::fs::write(&outside, b"unrelated private evidence").expect("write outside file");
+        let hook_retained = retained.clone();
+        let hook_outside = outside.clone();
+        STARTUP_ARTIFACT_BEFORE_PUBLICATION.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |path, _| {
+                std::fs::rename(path, &hook_retained).expect("retain opened WAL inode");
+                std::os::unix::fs::symlink(&hook_outside, path).expect("substitute source link");
+            }));
+        });
+
+        copy_startup_sqlite_sidecar_snapshot(&source, "identity test")
+            .expect_err("source symlink substitution must refuse");
+        assert_eq!(
+            std::fs::read_link(&source).expect("source link retained"),
+            outside
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("outside file retained"),
+            b"unrelated private evidence"
+        );
+        assert_eq!(
+            std::fs::read(&retained).expect("original WAL retained"),
+            b"original WAL evidence"
+        );
+        assert!(
+            quarantined_artifacts_with_prefix(
+                dir.path(),
+                "mail.sqlite3-wal.startup-precheckpoint-"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_creates_private_independent_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("mail.sqlite3-wal");
+        std::fs::write(&source, b"complete WAL evidence").expect("write WAL");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o666))
+                .expect("set permissive source mode");
+        }
+
+        let snapshot = copy_startup_sqlite_sidecar_snapshot(&source, "snapshot test")
+            .expect("snapshot")
+            .expect("snapshot path");
+        assert_eq!(
+            std::fs::read(&snapshot).expect("read snapshot"),
+            b"complete WAL evidence"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("source intact"),
+            b"complete WAL evidence"
+        );
+        assert_ne!(
+            same_file::Handle::from_path(&source).expect("source identity"),
+            same_file::Handle::from_path(&snapshot).expect("snapshot identity")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&snapshot)
+                    .expect("snapshot metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&source)
+                    .expect("source metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o666
+            );
+        }
     }
 
     #[test]
