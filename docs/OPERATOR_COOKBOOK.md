@@ -136,7 +136,11 @@ migration runner subsequently records the migrations and performs dependent
 work. When columns are added, canonical record materialization preserves
 legacy row values before runtime reads resume. Replay rechecks missing IDs in
 its write transaction and leaves already present messages untouched. If
-post-apply inventories still disagree, startup stops without reconstructing.
+post-apply inventories still disagree, the reconcile fails without
+reconstructing; a primary that passed its health check keeps serving, with the
+drift left pending for the periodic retry. The startup warning says to run
+`am doctor health`, then `am doctor reconstruct --yes` to retry under
+supervision.
 A replay/schema error rolls back and stops reconciliation without
 reconstructing a healthy primary. Existing corruption recovery still has its
 separate health checks and recovery admission controls.
