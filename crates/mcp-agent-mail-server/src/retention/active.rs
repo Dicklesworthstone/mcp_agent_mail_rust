@@ -356,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::manual_assert)] // the panic is the injected fault
     fn supervisor_restarts_panics_and_unexpected_returns() {
         let stop = AtomicBool::new(false);
         let attempts = Cell::new(0);
@@ -428,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::manual_assert)] // the panic is the injected fault
     fn failed_run_resources_are_dropped_before_backoff_and_restart() {
         struct Lease<'a>(&'a Cell<usize>);
         impl Drop for Lease<'_> {
@@ -543,6 +545,7 @@ mod tests {
     }
 
     impl TestWorker {
+        #[allow(clippy::manual_assert)] // the panic is the injected fault
         fn spawn(config: Config, fail_first: bool) -> Self {
             let stop = std::sync::Arc::new(AtomicBool::new(false));
             let worker_stop = stop.clone();
