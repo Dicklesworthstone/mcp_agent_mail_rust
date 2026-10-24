@@ -21914,7 +21914,13 @@ first body
         ];
         env_overrides.extend_from_slice(overrides);
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env_overrides, || {
-            f(project_key)
+            let result = f(project_key);
+            // Drain queued archive writes while their storage root still
+            // exists. A write that exhausts its retries against the deleted
+            // tempdir sets the process-wide durability flag, and every later
+            // send in this binary is then refused with DURABILITY_DEGRADED.
+            mcp_agent_mail_storage::wbq_flush();
+            result
         })
     }
 
@@ -24717,7 +24723,9 @@ first body
                 1_i64,
             ));
             assert!(
-                ensure_project.is_ok(),
+                ensure_project
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "ensure_project should succeed before contact flow: {ensure_project:?}"
             );
 
@@ -24736,7 +24744,9 @@ first body
                 2_i64,
             ));
             assert!(
-                register_sender.is_ok(),
+                register_sender
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "sender registration should succeed: {register_sender:?}"
             );
 
@@ -24755,7 +24765,9 @@ first body
                 3_i64,
             ));
             assert!(
-                register_recipient.is_ok(),
+                register_recipient
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "recipient registration should succeed: {register_recipient:?}"
             );
 
@@ -24773,7 +24785,9 @@ first body
                 4_i64,
             ));
             assert!(
-                request_contact.is_ok(),
+                request_contact
+                    .as_ref()
+                    .is_ok_and(|result| result["isError"] != true),
                 "request_contact should accept documented from_agent/to_agent fields unchanged: {request_contact:?}"
             );
         });

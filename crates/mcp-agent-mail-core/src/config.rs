@@ -3578,6 +3578,14 @@ fn process_env_override_value(key: &str) -> Option<String> {
 static TEST_SERIALIZER: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+thread_local! {
+    /// Set while this thread is inside an override scope. Locking
+    /// `TEST_SERIALIZER` again from the same thread never returns, and every
+    /// later scope in the binary then queues behind it.
+    static IN_PROCESS_ENV_OVERRIDE_SCOPE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 struct ProcessEnvOverrideGuard {
     previous: Vec<(String, Option<String>)>,
 }
@@ -3600,14 +3608,23 @@ impl Drop for ProcessEnvOverrideGuard {
             }
         }
         global_config_cache_reset();
+        IN_PROCESS_ENV_OVERRIDE_SCOPE.set(false);
     }
 }
 
+/// Panics when called from inside another override scope on the same thread
+/// (including the isolated-storage-root helpers): pass every override to the
+/// outer scope instead.
 #[doc(hidden)]
 pub fn with_process_env_overrides_for_test<R>(
     overrides: &[(&str, &str)],
     f: impl FnOnce() -> R,
 ) -> R {
+    assert!(
+        !IN_PROCESS_ENV_OVERRIDE_SCOPE.get(),
+        "nested env-override scope: this thread already holds one and would deadlock \
+         the test binary; pass these overrides to the outer scope"
+    );
     let _lock = TEST_SERIALIZER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3627,6 +3644,7 @@ pub fn with_process_env_overrides_for_test<R>(
 
     global_config_cache_reset();
     let restore = ProcessEnvOverrideGuard { previous };
+    IN_PROCESS_ENV_OVERRIDE_SCOPE.set(true);
     let result = f();
     drop(restore);
     result
@@ -7602,6 +7620,33 @@ fn after() { var("KEEP_AFTER"); }
                 assert!(!default_storage_root_refused_under_test_harness(root));
             },
         );
+    }
+
+    #[test]
+    fn nested_env_override_scope_panics_instead_of_deadlocking() {
+        let nested = std::panic::catch_unwind(|| {
+            with_isolated_default_storage_root_for_test(|_| {
+                with_process_env_overrides_for_test(&[("HTTP_PORT", "48124")], || ());
+            });
+        });
+        let message = nested.expect_err("a nested scope must not proceed");
+        let message = message
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| message.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("nested env-override scope"), "{message}");
+
+        // The unwound outer scope released the lock and restored its keys.
+        let (port, storage_root) =
+            with_process_env_overrides_for_test(&[("HTTP_PORT", "48125")], || {
+                (
+                    Config::from_env().http_port,
+                    process_env_override_value("STORAGE_ROOT"),
+                )
+            });
+        assert_eq!(port, 48125);
+        assert_eq!(storage_root, None);
     }
 
     // -----------------------------------------------------------------------
