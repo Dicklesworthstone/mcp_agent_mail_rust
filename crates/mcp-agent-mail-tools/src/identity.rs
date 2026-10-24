@@ -649,17 +649,14 @@ fn retention_health_verdict(
             let live_database = retention
                 .live_database_bytes
                 .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string());
-            let next_step = if let Some(reason) = staging_refusal {
-                format!(
+            let next_step = match staging_refusal {
+                Some(reason) => format!(
                     "automatic backups refused: {reason}; {}",
                     mcp_agent_mail_db::recovery_retention::staging::STAGING_REMEDIATION
-                )
-            } else if staging.is_none() {
-                "automatic backup staging assessment unavailable; request a fresh health check before treating backups as available".to_string()
-            } else if attention {
-                "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption".to_string()
-            } else {
-                "staging budget permits an attempt; retention is below the configured alert thresholds, or byte alerts are disabled".to_string()
+                ),
+                None if staging.is_none() => "automatic backup staging assessment unavailable; request a fresh health check before treating backups as available".to_string(),
+                None if attention => "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption".to_string(),
+                None => "staging budget permits an attempt; retention is below the configured alert thresholds, or byte alerts are disabled".to_string(),
             };
             HealthVerdict::new(
                 if attention {

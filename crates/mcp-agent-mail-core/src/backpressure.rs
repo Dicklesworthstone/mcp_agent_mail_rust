@@ -581,12 +581,14 @@ pub fn cached_health_level() -> HealthLevel {
 ///
 /// Returns `(new_level, changed)`. Call this periodically (e.g., every
 /// 250ms alongside pool stats sampling) or on each `health_check`.
+#[must_use]
 pub fn refresh_health_level() -> (HealthLevel, bool) {
     let snapshot = global_metrics().snapshot();
     refresh_health_level_from_snapshot(&snapshot, now_micros_u64())
 }
 
 /// Update cached health from an already-observed metrics snapshot.
+///
 /// Health responses use this to keep their level and explanatory signals on
 /// one observation, even if a sampler updates the live metrics while rendering.
 pub fn refresh_health_level_from_snapshot(
