@@ -1,0 +1,1363 @@
+{
+  "schema": "br-qbhs0-writer-sample-outside-serializer-ab-v1",
+  "bead": "br-qbhs0",
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "change_under_test": "db queries.rs create_message_with_recipients_impl: the writer's two post-commit COUNT queries run after MESSAGE_WRITE_SERIALIZER is released (they were ~10% of its hold at saturation per the br-qbhs0 attribution).",
+  "decision_rule_fixed_before_the_run": "Writer post-commit sample outside MESSAGE_WRITE_SERIALIZER: A/B decision rule. Written 2026-10-11 ~17:55Z, before\nbuild17 finished and before any run.\n\nArms (release builds, same host, one invocation):\n  base   = build16/base, main 1a787eda\n  sample = 1a787eda + writer_sample_outside.patch: the two COUNT queries after commit run after the serializer\n           is released (~10% of its hold at saturation per the br-qbhs0 attribution)\n\nRuns: paced_swarm.py, 60 agents, 300 s.\n  - Period 2 s (saturating, where serializer capacity binds): base sample sample base base sample.\n  - Then period 6 s: sample base base sample.\n\nDecision, pooling every send of the runs per arm and period:\n  S1. Period 2 s: pooled sample send p50 and p90 are each at least 10% lower than pooled base's. Every sample\n      run's p50 is below the median of the base runs' p50s.\n  S2. Period 2 s: pooled send p99 is no more than 20% above base's. Send+fetch errors are no more than base's + 3.\n  S3. Period 6 s: pooled sample send p50 and p90 are no more than 10% above base's (no regression below\n      saturation).\n  S4. Correctness:\n      - db lib message_serializer_is_released_before_the_post_commit_probe passes; it is extended to assert\n        that writer samples run unlocked;\n      - db lib create_message tests pass;\n      - db clippy shows no findings in queries.rs beyond main's existing ones.\n  WIN if S1-S4 hold: it lands with this evidence. Otherwise it is not landed and the loss/null is reported.\n",
+  "builds": {
+    "base": {
+      "source": "main 1a787eda (clean)",
+      "release_am_sha256": "bc2c9e0b69e9ef06c505fae064b95d7aefc9b577114ae0c8518eff34890feee4"
+    },
+    "sample": {
+      "source": "1a787eda + writer_sample_outside.patch",
+      "patch_sha256": "daa0640fa85b25b157ae6ac4812fc0b36e6ae0fc7918b4b8e7d1ddf82bdac65f",
+      "release_am_sha256": "553c24c4e5ebbfd85acd10178e1c034516e3cbef8eeed8c0501ff6885dcffa5b"
+    }
+  },
+  "runs_order_p2_base_sample_sample_base_base_sample_then_p6_sample_base_base_sample": [
+    {
+      "run": "1-base-p2",
+      "period_s": 2.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "15.70",
+        "12.23",
+        "9.37"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.108,
+          "p90": 0.244,
+          "p99": 0.786,
+          "max": 3.035,
+          "mean": 0.142,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 2633,
+          "p50": 4.338,
+          "p90": 9.131,
+          "p99": 14.307,
+          "max": 18.874,
+          "mean": 4.789,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "release_file_reservations": {
+          "n": 2633,
+          "p50": 4.086,
+          "p90": 8.828,
+          "p99": 13.063,
+          "max": 18.869,
+          "mean": 4.619,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "send_message": {
+          "n": 9000,
+          "p50": 0.654,
+          "p90": 2.336,
+          "p99": 4.242,
+          "max": 7.289,
+          "mean": 0.968,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 132,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 13458,
+        "archive_commit_queue_p99_ms": 483472,
+        "git_commit_p99_ms": 8389
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 316,
+          "slow": 162
+        },
+        "30": {
+          "calls": 444,
+          "slow": 3
+        },
+        "60": {
+          "calls": 481,
+          "slow": 0
+        },
+        "90": {
+          "calls": 439,
+          "slow": 0
+        },
+        "120": {
+          "calls": 524,
+          "slow": 0
+        },
+        "150": {
+          "calls": 476,
+          "slow": 0
+        },
+        "180": {
+          "calls": 410,
+          "slow": 130
+        },
+        "210": {
+          "calls": 483,
+          "slow": 0
+        },
+        "240": {
+          "calls": 509,
+          "slow": 0
+        },
+        "270": {
+          "calls": 398,
+          "slow": 0
+        },
+        "300": {
+          "calls": 448,
+          "slow": 1
+        },
+        "330": {
+          "calls": 488,
+          "slow": 33
+        },
+        "360": {
+          "calls": 417,
+          "slow": 0
+        },
+        "390": {
+          "calls": 500,
+          "slow": 47
+        },
+        "420": {
+          "calls": 415,
+          "slow": 4
+        },
+        "450": {
+          "calls": 454,
+          "slow": 337
+        },
+        "480": {
+          "calls": 382,
+          "slow": 309
+        },
+        "510": {
+          "calls": 330,
+          "slow": 66
+        },
+        "540": {
+          "calls": 405,
+          "slow": 192
+        },
+        "570": {
+          "calls": 386,
+          "slow": 72
+        },
+        "600": {
+          "calls": 295,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "10-sample-p6",
+      "period_s": 6.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "7.03",
+        "7.19",
+        "8.32"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 3000,
+          "p50": 0.057,
+          "p90": 0.108,
+          "p99": 0.303,
+          "max": 1.086,
+          "mean": 0.07,
+          "outcomes": {
+            "ok": 3000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 886,
+          "p50": 0.172,
+          "p90": 2.412,
+          "p99": 7.114,
+          "max": 9.905,
+          "mean": 0.735,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "release_file_reservations": {
+          "n": 886,
+          "p50": 0.216,
+          "p90": 2.403,
+          "p99": 6.886,
+          "max": 10.187,
+          "mean": 0.733,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "send_message": {
+          "n": 3000,
+          "p50": 0.142,
+          "p90": 0.502,
+          "p99": 4.72,
+          "max": 6.446,
+          "mean": 0.342,
+          "outcomes": {
+            "ok": 3000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 66,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 5281,
+        "archive_commit_queue_p99_ms": 47802,
+        "git_commit_p99_ms": 263
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 273,
+          "slow": 116
+        },
+        "30": {
+          "calls": 327,
+          "slow": 0
+        },
+        "60": {
+          "calls": 300,
+          "slow": 0
+        },
+        "90": {
+          "calls": 300,
+          "slow": 0
+        },
+        "120": {
+          "calls": 300,
+          "slow": 0
+        },
+        "150": {
+          "calls": 300,
+          "slow": 0
+        },
+        "180": {
+          "calls": 300,
+          "slow": 0
+        },
+        "210": {
+          "calls": 300,
+          "slow": 0
+        },
+        "240": {
+          "calls": 300,
+          "slow": 0
+        },
+        "270": {
+          "calls": 300,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "2-sample-p2",
+      "period_s": 2.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "8.39",
+        "10.93",
+        "10.06"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.116,
+          "p90": 0.31,
+          "p99": 0.923,
+          "max": 2.978,
+          "mean": 0.16,
+          "outcomes": {
+            "ok": 8999,
+            "error": 1
+          }
+        },
+        "file_reservation_paths": {
+          "n": 2633,
+          "p50": 4.828,
+          "p90": 9.499,
+          "p99": 14.803,
+          "max": 18.714,
+          "mean": 5.171,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "release_file_reservations": {
+          "n": 2633,
+          "p50": 4.357,
+          "p90": 9.266,
+          "p99": 13.274,
+          "max": 17.861,
+          "mean": 4.96,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "send_message": {
+          "n": 9000,
+          "p50": 0.579,
+          "p90": 1.576,
+          "p99": 3.718,
+          "max": 6.07,
+          "mean": 0.766,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 132,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 14899,
+        "archive_commit_queue_p99_ms": 574283,
+        "git_commit_p99_ms": 8389
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 409,
+          "slow": 211
+        },
+        "30": {
+          "calls": 315,
+          "slow": 0
+        },
+        "60": {
+          "calls": 473,
+          "slow": 1
+        },
+        "90": {
+          "calls": 428,
+          "slow": 0
+        },
+        "120": {
+          "calls": 509,
+          "slow": 0
+        },
+        "150": {
+          "calls": 471,
+          "slow": 0
+        },
+        "180": {
+          "calls": 473,
+          "slow": 0
+        },
+        "210": {
+          "calls": 429,
+          "slow": 0
+        },
+        "240": {
+          "calls": 486,
+          "slow": 3
+        },
+        "270": {
+          "calls": 443,
+          "slow": 6
+        },
+        "300": {
+          "calls": 400,
+          "slow": 6
+        },
+        "330": {
+          "calls": 491,
+          "slow": 4
+        },
+        "360": {
+          "calls": 463,
+          "slow": 3
+        },
+        "390": {
+          "calls": 499,
+          "slow": 33
+        },
+        "420": {
+          "calls": 379,
+          "slow": 30
+        },
+        "450": {
+          "calls": 456,
+          "slow": 9
+        },
+        "480": {
+          "calls": 406,
+          "slow": 62
+        },
+        "510": {
+          "calls": 393,
+          "slow": 21
+        },
+        "540": {
+          "calls": 430,
+          "slow": 18
+        },
+        "570": {
+          "calls": 348,
+          "slow": 9
+        },
+        "600": {
+          "calls": 260,
+          "slow": 0
+        },
+        "630": {
+          "calls": 39,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "3-sample-p2",
+      "period_s": 2.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "9.04",
+        "10.87",
+        "10.38"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.113,
+          "p90": 0.299,
+          "p99": 0.97,
+          "max": 2.532,
+          "mean": 0.157,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 2633,
+          "p50": 4.664,
+          "p90": 9.545,
+          "p99": 13.902,
+          "max": 16.532,
+          "mean": 5.145,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "release_file_reservations": {
+          "n": 2633,
+          "p50": 4.392,
+          "p90": 8.943,
+          "p99": 13.451,
+          "max": 18.811,
+          "mean": 4.897,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "send_message": {
+          "n": 9000,
+          "p50": 0.524,
+          "p90": 1.474,
+          "p99": 3.209,
+          "max": 5.722,
+          "mean": 0.706,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 132,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 13958,
+        "archive_commit_queue_p99_ms": 579924,
+        "git_commit_p99_ms": 8389
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 364,
+          "slow": 128
+        },
+        "30": {
+          "calls": 397,
+          "slow": 0
+        },
+        "60": {
+          "calls": 420,
+          "slow": 0
+        },
+        "90": {
+          "calls": 515,
+          "slow": 0
+        },
+        "120": {
+          "calls": 481,
+          "slow": 1
+        },
+        "150": {
+          "calls": 462,
+          "slow": 0
+        },
+        "180": {
+          "calls": 476,
+          "slow": 1
+        },
+        "210": {
+          "calls": 462,
+          "slow": 1
+        },
+        "240": {
+          "calls": 469,
+          "slow": 0
+        },
+        "270": {
+          "calls": 528,
+          "slow": 2
+        },
+        "300": {
+          "calls": 404,
+          "slow": 0
+        },
+        "330": {
+          "calls": 450,
+          "slow": 33
+        },
+        "360": {
+          "calls": 530,
+          "slow": 40
+        },
+        "390": {
+          "calls": 369,
+          "slow": 1
+        },
+        "420": {
+          "calls": 415,
+          "slow": 31
+        },
+        "450": {
+          "calls": 468,
+          "slow": 67
+        },
+        "480": {
+          "calls": 421,
+          "slow": 11
+        },
+        "510": {
+          "calls": 436,
+          "slow": 8
+        },
+        "540": {
+          "calls": 402,
+          "slow": 35
+        },
+        "570": {
+          "calls": 364,
+          "slow": 1
+        },
+        "600": {
+          "calls": 167,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "4-base-p2",
+      "period_s": 2.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "7.90",
+        "10.53",
+        "10.63"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.109,
+          "p90": 0.233,
+          "p99": 0.771,
+          "max": 2.189,
+          "mean": 0.14,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 2633,
+          "p50": 4.34,
+          "p90": 9.207,
+          "p99": 15.011,
+          "max": 18.179,
+          "mean": 4.865,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "release_file_reservations": {
+          "n": 2633,
+          "p50": 4.061,
+          "p90": 9.02,
+          "p99": 14.456,
+          "max": 19.625,
+          "mean": 4.65,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "send_message": {
+          "n": 9000,
+          "p50": 0.731,
+          "p90": 2.213,
+          "p99": 3.92,
+          "max": 6.072,
+          "mean": 0.989,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 132,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 12642,
+        "archive_commit_queue_p99_ms": 548372,
+        "git_commit_p99_ms": 8389
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 314,
+          "slow": 128
+        },
+        "30": {
+          "calls": 437,
+          "slow": 97
+        },
+        "60": {
+          "calls": 429,
+          "slow": 7
+        },
+        "90": {
+          "calls": 472,
+          "slow": 0
+        },
+        "120": {
+          "calls": 495,
+          "slow": 0
+        },
+        "150": {
+          "calls": 468,
+          "slow": 0
+        },
+        "180": {
+          "calls": 464,
+          "slow": 16
+        },
+        "210": {
+          "calls": 506,
+          "slow": 0
+        },
+        "240": {
+          "calls": 433,
+          "slow": 1
+        },
+        "270": {
+          "calls": 448,
+          "slow": 14
+        },
+        "300": {
+          "calls": 427,
+          "slow": 4
+        },
+        "330": {
+          "calls": 467,
+          "slow": 2
+        },
+        "360": {
+          "calls": 427,
+          "slow": 115
+        },
+        "390": {
+          "calls": 474,
+          "slow": 195
+        },
+        "420": {
+          "calls": 419,
+          "slow": 15
+        },
+        "450": {
+          "calls": 424,
+          "slow": 88
+        },
+        "480": {
+          "calls": 445,
+          "slow": 38
+        },
+        "510": {
+          "calls": 432,
+          "slow": 291
+        },
+        "540": {
+          "calls": 370,
+          "slow": 152
+        },
+        "570": {
+          "calls": 278,
+          "slow": 38
+        },
+        "600": {
+          "calls": 361,
+          "slow": 1
+        },
+        "630": {
+          "calls": 10,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "5-base-p2",
+      "period_s": 2.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "9.69",
+        "11.17",
+        "10.85"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.11,
+          "p90": 0.249,
+          "p99": 0.827,
+          "max": 2.535,
+          "mean": 0.144,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 2633,
+          "p50": 4.369,
+          "p90": 9.494,
+          "p99": 14.212,
+          "max": 21.286,
+          "mean": 4.873,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "release_file_reservations": {
+          "n": 2633,
+          "p50": 4.198,
+          "p90": 9.718,
+          "p99": 13.614,
+          "max": 22.379,
+          "mean": 4.804,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "send_message": {
+          "n": 9000,
+          "p50": 0.656,
+          "p90": 2.301,
+          "p99": 3.882,
+          "max": 7.087,
+          "mean": 0.956,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 132,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 12787,
+        "archive_commit_queue_p99_ms": 370151,
+        "git_commit_p99_ms": 8389
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 362,
+          "slow": 139
+        },
+        "30": {
+          "calls": 354,
+          "slow": 0
+        },
+        "60": {
+          "calls": 478,
+          "slow": 1
+        },
+        "90": {
+          "calls": 493,
+          "slow": 0
+        },
+        "120": {
+          "calls": 464,
+          "slow": 2
+        },
+        "150": {
+          "calls": 536,
+          "slow": 1
+        },
+        "180": {
+          "calls": 426,
+          "slow": 1
+        },
+        "210": {
+          "calls": 455,
+          "slow": 0
+        },
+        "240": {
+          "calls": 498,
+          "slow": 2
+        },
+        "270": {
+          "calls": 428,
+          "slow": 1
+        },
+        "300": {
+          "calls": 500,
+          "slow": 8
+        },
+        "330": {
+          "calls": 381,
+          "slow": 0
+        },
+        "360": {
+          "calls": 464,
+          "slow": 93
+        },
+        "390": {
+          "calls": 335,
+          "slow": 138
+        },
+        "420": {
+          "calls": 450,
+          "slow": 31
+        },
+        "450": {
+          "calls": 388,
+          "slow": 246
+        },
+        "480": {
+          "calls": 415,
+          "slow": 12
+        },
+        "510": {
+          "calls": 420,
+          "slow": 111
+        },
+        "540": {
+          "calls": 425,
+          "slow": 376
+        },
+        "570": {
+          "calls": 406,
+          "slow": 8
+        },
+        "600": {
+          "calls": 317,
+          "slow": 1
+        },
+        "630": {
+          "calls": 5,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "6-sample-p2",
+      "period_s": 2.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "7.86",
+        "10.91",
+        "11.07"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 9000,
+          "p50": 0.117,
+          "p90": 0.327,
+          "p99": 0.969,
+          "max": 2.296,
+          "mean": 0.163,
+          "outcomes": {
+            "ok": 9000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 2633,
+          "p50": 4.511,
+          "p90": 9.142,
+          "p99": 13.2,
+          "max": 20.606,
+          "mean": 4.885,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "release_file_reservations": {
+          "n": 2633,
+          "p50": 4.362,
+          "p90": 9.341,
+          "p99": 12.724,
+          "max": 16.394,
+          "mean": 4.847,
+          "outcomes": {
+            "ok": 2633
+          }
+        },
+        "send_message": {
+          "n": 9000,
+          "p50": 0.574,
+          "p90": 2.132,
+          "p99": 3.437,
+          "max": 4.856,
+          "mean": 0.862,
+          "outcomes": {
+            "ok": 9000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 132,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 15045,
+        "archive_commit_queue_p99_ms": 535300,
+        "git_commit_p99_ms": 8389
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 303,
+          "slow": 116
+        },
+        "30": {
+          "calls": 422,
+          "slow": 0
+        },
+        "60": {
+          "calls": 445,
+          "slow": 0
+        },
+        "90": {
+          "calls": 472,
+          "slow": 0
+        },
+        "120": {
+          "calls": 480,
+          "slow": 0
+        },
+        "150": {
+          "calls": 484,
+          "slow": 0
+        },
+        "180": {
+          "calls": 523,
+          "slow": 3
+        },
+        "210": {
+          "calls": 434,
+          "slow": 1
+        },
+        "240": {
+          "calls": 473,
+          "slow": 3
+        },
+        "270": {
+          "calls": 443,
+          "slow": 0
+        },
+        "300": {
+          "calls": 402,
+          "slow": 0
+        },
+        "330": {
+          "calls": 517,
+          "slow": 16
+        },
+        "360": {
+          "calls": 434,
+          "slow": 126
+        },
+        "390": {
+          "calls": 457,
+          "slow": 60
+        },
+        "420": {
+          "calls": 417,
+          "slow": 54
+        },
+        "450": {
+          "calls": 447,
+          "slow": 309
+        },
+        "480": {
+          "calls": 480,
+          "slow": 151
+        },
+        "510": {
+          "calls": 384,
+          "slow": 24
+        },
+        "540": {
+          "calls": 283,
+          "slow": 146
+        },
+        "570": {
+          "calls": 387,
+          "slow": 12
+        },
+        "600": {
+          "calls": 307,
+          "slow": 0
+        },
+        "630": {
+          "calls": 6,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "7-sample-p6",
+      "period_s": 6.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "7.22",
+        "8.81",
+        "10.11"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 3000,
+          "p50": 0.056,
+          "p90": 0.114,
+          "p99": 0.334,
+          "max": 1.197,
+          "mean": 0.072,
+          "outcomes": {
+            "ok": 3000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 886,
+          "p50": 0.165,
+          "p90": 3.22,
+          "p99": 8.249,
+          "max": 10.731,
+          "mean": 0.848,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "release_file_reservations": {
+          "n": 886,
+          "p50": 0.21,
+          "p90": 2.993,
+          "p99": 8.479,
+          "max": 11.87,
+          "mean": 0.883,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "send_message": {
+          "n": 3000,
+          "p50": 0.137,
+          "p90": 0.32,
+          "p99": 1.092,
+          "max": 2.012,
+          "mean": 0.19,
+          "outcomes": {
+            "ok": 3000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 66,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 5094,
+        "archive_commit_queue_p99_ms": 51726,
+        "git_commit_p99_ms": 263
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 265,
+          "slow": 1
+        },
+        "30": {
+          "calls": 335,
+          "slow": 0
+        },
+        "60": {
+          "calls": 300,
+          "slow": 0
+        },
+        "90": {
+          "calls": 300,
+          "slow": 0
+        },
+        "120": {
+          "calls": 300,
+          "slow": 0
+        },
+        "150": {
+          "calls": 300,
+          "slow": 0
+        },
+        "180": {
+          "calls": 300,
+          "slow": 0
+        },
+        "210": {
+          "calls": 300,
+          "slow": 0
+        },
+        "240": {
+          "calls": 300,
+          "slow": 0
+        },
+        "270": {
+          "calls": 300,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "8-base-p6",
+      "period_s": 6.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "8.06",
+        "8.39",
+        "9.55"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 3000,
+          "p50": 0.055,
+          "p90": 0.107,
+          "p99": 0.287,
+          "max": 1.094,
+          "mean": 0.069,
+          "outcomes": {
+            "ok": 3000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 886,
+          "p50": 0.171,
+          "p90": 2.953,
+          "p99": 6.875,
+          "max": 9.958,
+          "mean": 0.752,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "release_file_reservations": {
+          "n": 886,
+          "p50": 0.218,
+          "p90": 2.75,
+          "p99": 7.799,
+          "max": 10.521,
+          "mean": 0.809,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "send_message": {
+          "n": 3000,
+          "p50": 0.138,
+          "p90": 0.361,
+          "p99": 2.192,
+          "max": 4.382,
+          "mean": 0.242,
+          "outcomes": {
+            "ok": 3000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 66,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 5629,
+        "archive_commit_queue_p99_ms": 53215,
+        "git_commit_p99_ms": 263
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 269,
+          "slow": 41
+        },
+        "30": {
+          "calls": 331,
+          "slow": 0
+        },
+        "60": {
+          "calls": 300,
+          "slow": 0
+        },
+        "90": {
+          "calls": 300,
+          "slow": 0
+        },
+        "120": {
+          "calls": 300,
+          "slow": 0
+        },
+        "150": {
+          "calls": 300,
+          "slow": 0
+        },
+        "180": {
+          "calls": 300,
+          "slow": 0
+        },
+        "210": {
+          "calls": 300,
+          "slow": 0
+        },
+        "240": {
+          "calls": 300,
+          "slow": 0
+        },
+        "270": {
+          "calls": 300,
+          "slow": 0
+        }
+      }
+    },
+    {
+      "run": "9-base-p6",
+      "period_s": 6.0,
+      "agents": 60,
+      "secs": 300,
+      "loadavg_end": [
+        "6.15",
+        "7.39",
+        "8.79"
+      ],
+      "tools": {
+        "fetch_inbox": {
+          "n": 3000,
+          "p50": 0.055,
+          "p90": 0.109,
+          "p99": 0.434,
+          "max": 1.254,
+          "mean": 0.072,
+          "outcomes": {
+            "ok": 3000
+          }
+        },
+        "file_reservation_paths": {
+          "n": 886,
+          "p50": 0.167,
+          "p90": 1.115,
+          "p99": 6.493,
+          "max": 9.034,
+          "mean": 0.498,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "release_file_reservations": {
+          "n": 886,
+          "p50": 0.212,
+          "p90": 1.245,
+          "p99": 6.304,
+          "max": 9.216,
+          "mean": 0.558,
+          "outcomes": {
+            "ok": 886
+          }
+        },
+        "send_message": {
+          "n": 3000,
+          "p50": 0.141,
+          "p90": 0.632,
+          "p99": 5.435,
+          "max": 8.017,
+          "mean": 0.42,
+          "outcomes": {
+            "ok": 3000
+          }
+        }
+      },
+      "server_p99_ms": {
+        "pool_acquire_p99_ms": 66,
+        "database_write_p99_ms": 9,
+        "archive_wbq_p99_ms": 3787,
+        "archive_commit_queue_p99_ms": 37332,
+        "git_commit_p99_ms": 263
+      },
+      "send_slow_ge_2s_by_30s_window": {
+        "0": {
+          "calls": 276,
+          "slow": 115
+        },
+        "30": {
+          "calls": 324,
+          "slow": 53
+        },
+        "60": {
+          "calls": 300,
+          "slow": 0
+        },
+        "90": {
+          "calls": 300,
+          "slow": 0
+        },
+        "120": {
+          "calls": 300,
+          "slow": 0
+        },
+        "150": {
+          "calls": 300,
+          "slow": 0
+        },
+        "180": {
+          "calls": 300,
+          "slow": 0
+        },
+        "210": {
+          "calls": 300,
+          "slow": 0
+        },
+        "240": {
+          "calls": 300,
+          "slow": 0
+        },
+        "270": {
+          "calls": 300,
+          "slow": 0
+        }
+      }
+    }
+  ],
+  "pooled_verdict_output": "1-base-p2        n=9000 p50=0.654 p90=2.336 p99=4.242 errors=0\n2-sample-p2      n=9000 p50=0.579 p90=1.576 p99=3.718 errors=1\n3-sample-p2      n=9000 p50=0.524 p90=1.474 p99=3.209 errors=0\n4-base-p2        n=9000 p50=0.731 p90=2.213 p99=3.920 errors=0\n5-base-p2        n=9000 p50=0.656 p90=2.301 p99=3.882 errors=0\n6-sample-p2      n=9000 p50=0.574 p90=2.132 p99=3.437 errors=0\n7-sample-p6      n=3000 p50=0.137 p90=0.320 p99=1.092 errors=0\n8-base-p6        n=3000 p50=0.138 p90=0.361 p99=2.192 errors=0\n9-base-p6        n=3000 p50=0.141 p90=0.632 p99=5.435 errors=0\n10-sample-p6     n=3000 p50=0.142 p90=0.502 p99=4.720 errors=0\n\npooled ('base', 'p2'): n=27000 p50=0.680 p90=2.284 p99=3.966 errors=0 run_p50s=[0.654, 0.731, 0.656]\npooled ('base', 'p6'): n=6000 p50=0.140 p90=0.441 p99=4.531 errors=0 run_p50s=[0.138, 0.141]\npooled ('sample', 'p2'): n=27000 p50=0.556 p90=1.687 p99=3.448 errors=1 run_p50s=[0.579, 0.524, 0.574]\npooled ('sample', 'p6'): n=6000 p50=0.140 p90=0.369 p99=3.778 errors=0 run_p50s=[0.137, 0.142]\nS1=True S2=True S3=True  (S4 = correctness lane, checked separately)\n",
+  "correctness": "db lib message_serializer_is_released_before_the_post_commit_probe (extended to writer samples) 1/0; db lib create_message 5/0 (1 ignored); db clippy only main's recovery_retention.rs:1239 assert-empty error"
+}

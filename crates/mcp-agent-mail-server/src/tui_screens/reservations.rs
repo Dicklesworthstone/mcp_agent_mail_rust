@@ -4,7 +4,6 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use asupersync::Cx;
 use fastmcp::prelude::McpContext;
 use fastmcp_core::block_on;
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
@@ -30,7 +29,10 @@ use crate::tui_persist::{
     ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
+    operator_tool_context,
+};
 use crate::tui_widgets::fancy::SummaryFooter;
 use crate::tui_widgets::{MetricTile, MetricTrend};
 
@@ -320,6 +322,9 @@ pub struct ReservationsScreen {
     sort_col: usize,
     sort_asc: bool,
     show_released: bool,
+    /// Agent the table is narrowed to ("View reservations" on an agent);
+    /// `X` clears it.
+    agent_filter: Option<String>,
     last_seq: u64,
     /// Timestamp of the last DB snapshot consumed by this screen.
     last_snapshot_micros: i64,
@@ -378,6 +383,7 @@ impl ReservationsScreen {
             sort_col: COL_TTL,
             sort_asc: true,
             show_released: false,
+            agent_filter: None,
             last_seq: 0,
             last_snapshot_micros: 0,
             empty_snapshot_streak: 0,
@@ -673,6 +679,7 @@ impl ReservationsScreen {
             .reservations
             .iter()
             .filter(|(_, r)| show_released || !r.released)
+            .filter(|(_, r)| self.agent_filter.as_ref().is_none_or(|a| r.agent == *a))
             .collect();
 
         entries.sort_by(|(ka, a), (kb, b)| {
@@ -1105,6 +1112,9 @@ impl ReservationsScreen {
         values.insert("sort_col".to_string(), self.sort_col.to_string());
         values.insert("sort_asc".to_string(), self.sort_asc.to_string());
         values.insert("show_released".to_string(), self.show_released.to_string());
+        if let Some(agent) = &self.agent_filter {
+            values.insert("agent".to_string(), agent.clone());
+        }
         values
     }
 
@@ -1150,6 +1160,9 @@ impl ReservationsScreen {
                 "1" | "true" | "yes" | "on"
             );
         }
+        // A preset is the whole filter state: one saved without an agent
+        // shows every agent.
+        self.agent_filter = values.get("agent").cloned();
         self.rebuild_sorted();
     }
 
@@ -1367,13 +1380,9 @@ impl ReservationsScreen {
             return Cmd::None;
         };
 
-        // Borrow the runtime-backed ambient Cx<cap::All> installed by
-        // `Runtime::block_on` instead of the test-only `Cx::for_testing()`
-        // constructor (gated behind `test-internals`).
-        let cx = block_on(async {
-            Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
-        });
-        let ctx = McpContext::new(cx, 1);
+        // The operator reserves in the agent's name; that is not the agent's
+        // own activity.
+        let ctx = operator_tool_context();
         let result = block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
             &ctx,
             payload.project_key.clone(),
@@ -1517,6 +1526,156 @@ impl ReservationsScreen {
         }
         Cmd::None
     }
+
+    /// The listed rows the action menu named by id (`"11,22"`), grouped by
+    /// `(project, holder)` because the tools act for one agent at a time.
+    fn reservation_ids_by_holder(
+        &self,
+        ids_csv: &str,
+    ) -> Result<BTreeMap<(String, String), Vec<i64>>, String> {
+        let mut groups: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
+        for raw in ids_csv.split(',') {
+            let id: i64 = raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("not a reservation id: {raw:?}"))?;
+            let row = self
+                .reservations
+                .values()
+                .find(|row| row.reservation_id == Some(id))
+                .ok_or_else(|| format!("reservation #{id} is no longer listed"))?;
+            groups
+                .entry((row.project.clone(), row.agent.clone()))
+                .or_default()
+                .push(id);
+        }
+        Ok(groups)
+    }
+
+    fn mark_rows_released(&mut self, ids: &[i64]) {
+        for row in self.reservations.values_mut() {
+            if row.reservation_id.is_some_and(|id| ids.contains(&id)) {
+                row.released = true;
+            }
+        }
+        self.clear_reservation_selection();
+        self.rebuild_sorted();
+    }
+
+    /// Renew (`release == false`) or release the named reservations on their
+    /// holders' behalf.
+    fn renew_or_release(&mut self, ids_csv: &str, release: bool) -> Result<String, String> {
+        let groups = self.reservation_ids_by_holder(ids_csv)?;
+        let ctx = operator_tool_context();
+        let mut done = 0_i64;
+        let mut done_ids = Vec::new();
+        for ((project, agent), ids) in groups {
+            let result = if release {
+                block_on(
+                    mcp_agent_mail_tools::reservations::release_file_reservations(
+                        &ctx,
+                        project,
+                        agent.clone(),
+                        None,
+                        Some(ids.clone()),
+                    ),
+                )
+            } else {
+                block_on(mcp_agent_mail_tools::reservations::renew_file_reservations(
+                    &ctx,
+                    project,
+                    agent.clone(),
+                    None,
+                    None,
+                    Some(ids.clone()),
+                ))
+            };
+            let raw = result.map_err(|err| format!("{agent}: {err}"))?;
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            if response["queued"].as_bool() == Some(true) {
+                return Err(format!(
+                    "{agent}: the database is unavailable; the release is queued and replays on the next release"
+                ));
+            }
+            done += response[if release { "released" } else { "renewed" }]
+                .as_i64()
+                .unwrap_or(0);
+            done_ids.extend(ids);
+        }
+        if release {
+            self.mark_rows_released(&done_ids);
+            Ok(format!("released {done} reservation(s)"))
+        } else {
+            self.clear_reservation_selection();
+            Ok(format!("renewed {done} reservation(s) by 30 minutes"))
+        }
+    }
+
+    /// Force-release one reservation as the operator (`HumanOverseer`). The
+    /// tool still refuses a holder that shows recent activity, and tells the
+    /// holder its reservation was taken.
+    fn force_release(&mut self, id_arg: &str) -> Result<String, String> {
+        let groups = self.reservation_ids_by_holder(id_arg)?;
+        let Some(((project, holder), id)) = groups
+            .into_iter()
+            .next()
+            .and_then(|(owner, ids)| Some((owner, *ids.first()?)))
+        else {
+            return Err("no reservation named".to_string());
+        };
+        let ctx = operator_tool_context();
+        ensure_overseer(&ctx, &project)?;
+        block_on(
+            mcp_agent_mail_tools::reservations::force_release_file_reservation(
+                &ctx,
+                project,
+                OVERSEER_NAME.to_string(),
+                id,
+                Some("Released from the operator console.".to_string()),
+                Some(true),
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        self.mark_rows_released(&[id]);
+        Ok(format!("released {holder}'s reservation #{id}"))
+    }
+}
+
+/// The operator's own identity in a project, as in the web UI's overseer send.
+const OVERSEER_NAME: &str = "HumanOverseer";
+
+/// Make sure `HumanOverseer` exists in `project_slug`, so a tool can act as
+/// it. Registered without name validation, as the web UI does, because the
+/// name is outside the adjective+noun vocabulary.
+fn ensure_overseer(ctx: &McpContext, project_slug: &str) -> Result<(), String> {
+    use asupersync::Outcome;
+    let pool = mcp_agent_mail_tools::tool_util::get_db_pool().map_err(|err| err.to_string())?;
+    let project = match block_on(mcp_agent_mail_db::queries::get_project_by_slug(
+        ctx.cx(),
+        &pool,
+        project_slug,
+    )) {
+        Outcome::Ok(project) => project,
+        Outcome::Err(err) => return Err(format!("project {project_slug}: {err}")),
+        Outcome::Cancelled(_) | Outcome::Panicked(_) => {
+            return Err(format!("project {project_slug}: lookup did not complete"));
+        }
+    };
+    match block_on(mcp_agent_mail_db::queries::insert_system_agent(
+        ctx.cx(),
+        &pool,
+        project.id.unwrap_or(0),
+        OVERSEER_NAME,
+        "am-tui",
+        "human",
+        "Human operator providing guidance and oversight to agents",
+    )) {
+        Outcome::Ok(_) => Ok(()),
+        Outcome::Err(err) => Err(format!("{OVERSEER_NAME}: {err}")),
+        Outcome::Cancelled(_) | Outcome::Panicked(_) => {
+            Err(format!("{OVERSEER_NAME}: registration did not complete"))
+        }
+    }
 }
 
 impl Default for ReservationsScreen {
@@ -1594,6 +1753,10 @@ impl MailScreen for ReservationsScreen {
                 }
                 KeyCode::Char('x') => {
                     self.show_released = !self.show_released;
+                    self.rebuild_sorted();
+                }
+                KeyCode::Char('X') if self.agent_filter.is_some() => {
+                    self.agent_filter = None;
                     self.rebuild_sorted();
                 }
                 KeyCode::Char('n') => self.open_create_form(),
@@ -1680,8 +1843,11 @@ impl MailScreen for ReservationsScreen {
                 screen: "reservations".to_string(),
                 scope: "file_reservations.list".to_string(),
                 query_params: format!(
-                    "show_released={};sort_col={};sort_asc={};active={};exclusive={};shared={};expired={}",
-                    self.show_released, self.sort_col, self.sort_asc,
+                    "show_released={};agent={};sort_col={};sort_asc={};active={};exclusive={};shared={};expired={}",
+                    self.show_released,
+                    self.agent_filter.as_deref().unwrap_or("all"),
+                    self.sort_col,
+                    self.sort_asc,
                     a, e, s, x,
                 ),
                 raw_count,
@@ -1701,6 +1867,17 @@ impl MailScreen for ReservationsScreen {
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
         self.focused_synthetic.as_ref()
+    }
+
+    fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
+        let (name, ids) = operation.split_once(':').unwrap_or((operation, ""));
+        let result = match name {
+            "renew" => self.renew_or_release(ids, false),
+            "release" => self.renew_or_release(ids, true),
+            "force_release" => self.force_release(ids),
+            _ => return Cmd::None,
+        };
+        operator_result(name, result)
     }
 
     fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
@@ -1828,8 +2005,14 @@ impl MailScreen for ReservationsScreen {
         } else {
             format!("  selected:{}", self.selected_reservation_keys.len())
         };
+        // The filter leads the line: with the detail panel open the table
+        // column is too narrow for the tail of it.
+        let agent_label = self
+            .agent_filter
+            .as_ref()
+            .map_or_else(String::new, |agent| format!(" Agent: {agent} (X clears) ·"));
         let summary_base = format!(
-            " {active} active  {exclusive} exclusive  {shared} shared{selected_label}   Sort: {sort_label}{sort_indicator} {released_label}",
+            "{agent_label} {active} active  {exclusive} exclusive  {shared} shared{selected_label}   Sort: {sort_label}{sort_indicator} {released_label}",
         );
         let critical_alert = if expired > 0 {
             format!("  CRITICAL: {expired} expired")
@@ -1981,7 +2164,9 @@ impl MailScreen for ReservationsScreen {
             .border_style(Style::default().fg(tp.panel_border));
         let inner = block.inner(table_area);
         let rows_empty = rows.is_empty();
-        let row_mismatch = rows_empty && !self.show_released && db_active_total > 0;
+        // Only an unfiltered view can contradict the DB total.
+        let row_mismatch =
+            rows_empty && !self.show_released && self.agent_filter.is_none() && db_active_total > 0;
 
         let table = Table::new(rows, col_widths)
             .header(header)
@@ -2027,11 +2212,18 @@ impl MailScreen for ReservationsScreen {
                         frame,
                     );
             } else {
-                let hint = if self.show_released {
+                let hint = if self.agent_filter.is_some() {
+                    "Press 'X' to show every agent's reservations."
+                } else if self.show_released {
                     "No reservations match current filters. Press 'x' to toggle released."
                 } else {
-                    "Use `file_reservation_paths` to reserve files. Press 'r' to refresh."
+                    // The table refreshes itself; `r` does nothing here.
+                    "Press n to reserve (agents use file_reservation_paths)."
                 };
+                let title = self.agent_filter.as_ref().map_or_else(
+                    || "No Active Reservations".to_string(),
+                    |agent| format!("No Reservations Held by {agent}"),
+                );
                 crate::tui_panel_helpers::render_empty_state(
                     frame,
                     Rect::new(
@@ -2041,7 +2233,7 @@ impl MailScreen for ReservationsScreen {
                         inner.height.saturating_sub(1),
                     ),
                     "\u{1f512}",
-                    "No Active Reservations",
+                    &title,
                     hint,
                 );
             }
@@ -2105,6 +2297,10 @@ impl MailScreen for ReservationsScreen {
                 action: "Toggle show released",
             },
             HelpEntry {
+                key: "X",
+                action: "Clear agent filter",
+            },
+            HelpEntry {
                 key: "n",
                 action: "Open create reservation form",
             },
@@ -2150,18 +2346,16 @@ impl MailScreen for ReservationsScreen {
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
-        if let DeepLinkTarget::ReservationByAgent(agent) = target {
-            // Find the first reservation for this agent and select it
-            if let Some(pos) = self.sorted_keys.iter().position(|key| {
-                self.reservations
-                    .get(key)
-                    .is_some_and(|r| r.agent == *agent)
-            }) {
-                self.table_state.selected = Some(pos);
-                return true;
-            }
-        }
-        false
+        let DeepLinkTarget::ReservationByAgent(agent) = target else {
+            return false;
+        };
+        // Narrow the table to this agent. An agent holding nothing gets an
+        // empty table that says so, not everyone else's reservations.
+        self.agent_filter = Some(agent.clone());
+        self.rebuild_sorted();
+        self.table_state.selected = (!self.sorted_keys.is_empty()).then_some(0);
+        self.detail_scroll = 0;
+        true
     }
 
     fn copyable_content(&self) -> Option<String> {
@@ -3586,6 +3780,109 @@ mod tests {
         assert!(screen.reservations.is_empty());
     }
 
+    fn list_reservation(screen: &mut ReservationsScreen, id: i64, project: &str, path: &str) {
+        screen.reservations.insert(
+            reservation_key(project, "BlueLake", path),
+            ActiveReservation {
+                reservation_id: Some(id),
+                agent: "BlueLake".into(),
+                path_pattern: path.into(),
+                exclusive: true,
+                granted_ts: 1_000_000,
+                ttl_s: 3600,
+                project: project.into(),
+                released: false,
+            },
+        );
+        screen.rebuild_sorted();
+    }
+
+    fn released_in_db(id: i64) -> bool {
+        crate::tui_screens::with_operator_test_conn(|conn| {
+            let rows = conn
+                .query_sync(
+                    "SELECT released_ts IS NOT NULL AS released FROM file_reservations WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(id)],
+                )
+                .expect("reservation row");
+            rows[0].get_named::<i64>("released").expect("released") == 1
+        })
+    }
+
+    #[test]
+    fn action_menu_reservation_writes_reach_the_mailbox() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["BlueLake"]);
+            let granted: serde_json::Value = serde_json::from_str(
+                &block_on(mcp_agent_mail_tools::reservations::file_reservation_paths(
+                    &operator_tool_context(),
+                    project_key.to_string(),
+                    "BlueLake".to_string(),
+                    vec!["src/**".to_string(), "docs/**".to_string()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                    None,
+                ))
+                .expect("file_reservation_paths"),
+            )
+            .expect("grant JSON");
+            let src = granted["granted"][0]["id"].as_i64().expect("src id");
+            let docs = granted["granted"][1]["id"].as_i64().expect("docs id");
+            let mut screen = ReservationsScreen::new();
+            list_reservation(&mut screen, src, &slug, "src/**");
+            list_reservation(&mut screen, docs, &slug, "docs/**");
+
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action(&format!("renew:{src}"), ""));
+            assert_eq!((status.as_str(), op.as_str()), ("ok", "renew"), "{text}");
+            assert!(text.contains("renewed 1"), "{text}");
+
+            // BlueLake just registered, so the tool refuses to force-release
+            // its lock, and the row stays listed.
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action(&format!("force_release:{src}"), ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("refusing forced release"), "{text}");
+            assert!(!released_in_db(src));
+            assert_eq!(screen.sorted_keys.len(), 2);
+
+            // An expired lock can be force-released, as HumanOverseer.
+            crate::tui_screens::with_operator_test_conn(|conn| {
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = 1 WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(docs)],
+                )
+                .expect("expire docs reservation");
+            });
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action(&format!("force_release:{docs}"), ""));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "force_release"),
+                "{text}"
+            );
+            assert!(released_in_db(docs));
+
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action(&format!("release:{src}"), ""));
+            assert_eq!((status.as_str(), op.as_str()), ("ok", "release"), "{text}");
+            assert!(text.contains("released 1"), "{text}");
+            assert!(released_in_db(src));
+            assert_eq!(
+                screen.sorted_keys,
+                [] as [String; 0],
+                "released rows leave the table"
+            );
+
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action("release:999999", ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("no longer listed"), "{text}");
+        });
+    }
+
     #[test]
     fn contextual_actions_use_reservation_id_in_operation_payload() {
         let mut screen = ReservationsScreen::new();
@@ -3830,42 +4127,102 @@ mod tests {
     }
 
     #[test]
-    fn deep_link_reservation_by_agent() {
+    fn deep_link_by_agent_filters_the_table_to_that_agent() {
         use crate::tui_screens::DeepLinkTarget;
 
         let state = test_state();
         let mut screen = ReservationsScreen::new();
+        for (agent, path) in [
+            ("BlueLake", "src/**/*.rs"),
+            ("RedStone", "tests/*.rs"),
+            ("BlueLake", "docs/**"),
+        ] {
+            let _ = state.push_event(MailEvent::reservation_granted(
+                agent,
+                vec![path.to_string()],
+                true,
+                3600,
+                "proj",
+            ));
+        }
+        assert!(screen.ingest_events(&state));
+        screen.rebuild_sorted();
+        let visible_agents = |screen: &ReservationsScreen| -> Vec<String> {
+            screen
+                .sorted_keys
+                .iter()
+                .map(|key| screen.reservations[key].agent.clone())
+                .collect()
+        };
+        assert_eq!(visible_agents(&screen).len(), 3);
 
-        // Add some reservations
+        assert!(screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("RedStone".into())));
+        // Only RedStone's row remains, not everyone's with the cursor moved.
+        assert_eq!(visible_agents(&screen), ["RedStone"]);
+        assert_eq!(screen.table_state.selected, Some(0));
+
+        // The filter survives later rebuilds (new events, sort changes).
         let _ = state.push_event(MailEvent::reservation_granted(
             "BlueLake",
-            vec!["src/**/*.rs".to_string()],
-            true,
-            3600,
-            "proj",
-        ));
-        let _ = state.push_event(MailEvent::reservation_granted(
-            "RedStone",
-            vec!["tests/*.rs".to_string()],
+            vec!["bench/**".to_string()],
             false,
-            1800,
+            600,
             "proj",
         ));
+        assert!(screen.ingest_events(&state));
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('s'))), &state);
+        assert_eq!(visible_agents(&screen), ["RedStone"]);
 
-        let changed = screen.ingest_events(&state);
-        assert!(changed);
-        screen.rebuild_sorted();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Agent: RedStone (X clears) · 4 active"),
+            "{text}"
+        );
 
-        // Deep-link to RedStone's reservation
-        let handled =
-            screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("RedStone".into()));
-        assert!(handled);
-        assert!(screen.table_state.selected.is_some());
+        // An agent holding nothing gets an empty table that says so, and no
+        // stale-poller warning even though the DB holds other agents' rows.
+        state.update_db_stats(DbStatSnapshot {
+            file_reservations: 4,
+            timestamp_micros: 1,
+            ..Default::default()
+        });
+        assert!(screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("Unknown".into())));
+        assert_eq!(screen.sorted_keys, [] as [String; 0]);
+        assert_eq!(screen.table_state.selected, None);
+        let mut frame = Frame::new(140, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+        let text = buffer_to_text(&frame.buffer);
+        assert!(text.contains("No Reservations Held by Unknown"), "{text}");
+        assert!(!text.contains("detail rows are unavailable"), "{text}");
 
-        // Deep-link to unknown agent
-        let handled =
-            screen.receive_deep_link(&DeepLinkTarget::ReservationByAgent("Unknown".into()));
-        assert!(!handled);
+        // X clears the filter and every agent's rows come back.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.agent_filter, None);
+        assert_eq!(visible_agents(&screen).len(), 4);
+    }
+
+    #[test]
+    fn filter_presets_carry_the_agent_filter() {
+        let mut screen = ReservationsScreen::new();
+        screen.agent_filter = Some("RedStone".to_string());
+        let with_agent = screen.snapshot_filter_values();
+        assert_eq!(
+            with_agent.get("agent").map(String::as_str),
+            Some("RedStone")
+        );
+
+        screen.agent_filter = None;
+        let without_agent = screen.snapshot_filter_values();
+        assert!(!without_agent.contains_key("agent"));
+
+        screen.apply_preset_values(&with_agent);
+        assert_eq!(screen.agent_filter.as_deref(), Some("RedStone"));
+        // Loading a preset saved without an agent shows every agent again.
+        screen.apply_preset_values(&without_agent);
+        assert_eq!(screen.agent_filter, None);
     }
 
     #[test]

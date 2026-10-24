@@ -23,9 +23,10 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
 - [ ] Build both `am` and `mcp-agent-mail` for Linux x86_64 GNU, Linux aarch64
   GNU, Linux x86_64 musl, macOS aarch64, macOS x86_64, and Windows x86_64 MSVC.
   Retain native execution receipts; cross-compilation alone is not native proof.
-- [ ] Run the bounded black-box release smoke (br-kp1in.14, about 15 minutes) on
-  the exact packaged Linux x86_64 `am`, with the previous release as the
-  same-invocation control:
+- [ ] Run the bounded black-box release smoke (br-kp1in.14; about 20 minutes
+  per arm since the 60-agent swarm phase, br-kp1in.34) on the exact packaged
+  Linux x86_64 `am` the installer serves (the static musl archive, plus the
+  glibc archive), with the previous release as the same-invocation control:
   `AM_RELEASE_SMOKE_BIN=<candidate am> AM_RELEASE_SMOKE_CONTROL_BIN=<previous am> tests/e2e/test_release_smoke.sh`.
   Attach `release_smoke_receipt.json` to the candidate record. Tag only when
   `candidate_verdict` is `PASS` at the default (release) bounds and the
@@ -41,6 +42,9 @@ commit, dependency revisions, exact commands, binary hashes, and terminal result
   from release-archive checksums; synchronize the ACFS repository if they change.
 - [ ] Push the release source to `main` and synchronize the legacy branch as
   required by `AGENTS.md`. Verify public downloads and installation after publishing.
+  The release is blocked until both branch names resolve to the release commit:
+  `git ls-remote origin refs/heads/main refs/heads/master` must print one SHA
+  twice, and that SHA is the one recorded for the release.
 
 The runtime router, `TOOL_CLUSTER_MAP`, `ALL_SCREEN_IDS`, the Clap command tree,
 and Cargo workspace membership are the inventory authorities. Run the existing

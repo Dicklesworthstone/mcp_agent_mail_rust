@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+mod worker;
+
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::Config;
@@ -27,11 +29,11 @@ use mcp_agent_mail_db::ack_scan::{
     AckEscalationOutcome, AckEscalationRequest, AckScanCursor, MAX_ACK_SCAN_PAGE_SIZE,
     grant_ack_escalation, overdue_ack_page,
 };
-use mcp_agent_mail_db::{DbPool, DbPoolConfig, create_pool, micros_to_iso, now_micros, queries};
+use mcp_agent_mail_db::{DbPool, micros_to_iso, now_micros, queries};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{info, warn};
 
 const ACK_SCAN_SLICE_BUDGET: Duration = Duration::from_millis(25);
@@ -70,7 +72,7 @@ pub fn start(config: &Config) {
             .name("ack-ttl-scan".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
-                ack_ttl_loop(&config);
+                worker::run(&config);
             }) {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -97,97 +99,6 @@ pub fn shutdown() {
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
-}
-
-fn ack_ttl_loop(config: &Config) {
-    let interval = Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));
-    let startup_delay = interval.min(Duration::from_secs(8));
-
-    let mut pool_config = DbPoolConfig::from_env();
-    pool_config.database_url.clone_from(&config.database_url);
-    pool_config.min_connections = 1;
-    pool_config.max_connections = 1;
-    pool_config.warmup_connections = 0;
-    // HTTP/TUI startup already runs readiness_check with migrations before
-    // this worker starts, so keep the worker path lean.
-    pool_config.run_migrations = false;
-    let pool = match create_pool(&pool_config) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "ack TTL worker: failed to create DB pool, exiting");
-            return;
-        }
-    };
-
-    info!(
-        interval_secs = interval.as_secs(),
-        ttl_seconds = config.ack_ttl_seconds,
-        escalation_enabled = config.ack_escalation_enabled,
-        escalation_mode = %config.ack_escalation_mode,
-        "ACK TTL scan worker started"
-    );
-
-    if startup_delay > Duration::ZERO {
-        info!(
-            startup_delay_secs = startup_delay.as_secs(),
-            "ACK TTL worker startup delay engaged"
-        );
-        if sleep_with_shutdown(startup_delay) {
-            return;
-        }
-    }
-
-    let mut state = AckScanState::default();
-    loop {
-        if SHUTDOWN.load(Ordering::Acquire) {
-            info!("ACK TTL scan worker shutting down");
-            return;
-        }
-        let started = Instant::now();
-        let result = run_ack_ttl_slice(
-            config,
-            &pool,
-            &mut state,
-            || SHUTDOWN.load(Ordering::Acquire),
-            || started.elapsed() < ACK_SCAN_SLICE_BUDGET,
-        );
-        let failed = result.is_err();
-        match result {
-            Ok((scanned, overdue)) => {
-                if overdue > 0 {
-                    info!(
-                        event = "ack_ttl_scan",
-                        scanned,
-                        overdue,
-                        lap_incomplete = state.cursor.is_some(),
-                        "ACK TTL scan slice completed"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(error = %error, "ACK TTL scan slice failed; retaining continuation");
-            }
-        }
-        // No database/write lease survives the slice call. A failed read must
-        // not inherit the fast continuation cadence and create a retry storm.
-        let delay = next_ack_scan_delay(interval, state.cursor.is_some(), failed);
-        if sleep_with_shutdown(delay) {
-            return;
-        }
-    }
-}
-
-fn sleep_with_shutdown(duration: Duration) -> bool {
-    let mut remaining = duration;
-    while !remaining.is_zero() {
-        if SHUTDOWN.load(Ordering::Acquire) {
-            return true;
-        }
-        let chunk = remaining.min(Duration::from_secs(1));
-        std::thread::sleep(chunk);
-        remaining = remaining.saturating_sub(chunk);
-    }
-    false
 }
 
 /// Run one bounded page without wall-clock scheduling noise in legacy fixtures.
@@ -293,13 +204,34 @@ fn run_ack_ttl_slice(
     }
     // #219: keep generation exclusion through this page's escalations only.
     // Returning releases it BEFORE the worker pauses or reads its next page.
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    // Background scans must defer rather than wait behind recovery. In
+    // particular, the blocking bootstrap handoff's thread-local exemption is
+    // not permission for a nested scan to write during promotion. Refusal
+    // leaves the cursor and warning history untouched and uses normal backoff.
+    let _write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or_else(|| "ACK scan deferred: recovery write admission is busy".to_string())?;
     if stop() {
         return Ok((0, 0));
     }
     let cx = block_on(async {
         Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
     });
+    // Establish a durable generation before any automatic reservation is granted.
+    // Otherwise a fresh database may reuse an old id-N.json artifact filename.
+    if config.ack_escalation_enabled
+        && config
+            .ack_escalation_mode
+            .eq_ignore_ascii_case("file_reservation")
+    {
+        match block_on(queries::db_generation_id(&cx, pool)) {
+            Outcome::Ok(Some(_)) => {}
+            other => {
+                return Err(format!(
+                    "ACK escalation generation admission failed: {other:?}"
+                ));
+            }
+        }
+    }
     let now = now_micros();
     let ttl_us = i64::try_from(config.ack_ttl_seconds)
         .unwrap_or(1800)
@@ -640,14 +572,31 @@ mod tests {
     ) -> mcp_agent_mail_db::ProjectRow {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
-            || match block_on(async { queries::ensure_project(cx, pool, human_key).await }) {
-                Outcome::Ok(project) => project,
-                other => panic!("ensure_project failed: {other:?}"),
-            },
+            || ensure_test_project_in_current_env(cx, pool, human_key),
         )
     }
 
+    /// For callers already inside an env-override scope that sets
+    /// AM_ALLOW_EPHEMERAL_PROJECT_ROOTS: the override lock is not reentrant, so
+    /// nesting ensure_ephemeral_test_project there deadlocks.
+    fn ensure_test_project_in_current_env(
+        cx: &Cx,
+        pool: &DbPool,
+        human_key: &str,
+    ) -> mcp_agent_mail_db::ProjectRow {
+        match block_on(async { queries::ensure_project(cx, pool, human_key).await }) {
+            Outcome::Ok(project) => project,
+            other => panic!("ensure_project failed: {other:?}"),
+        }
+    }
+
     fn seed_unacked_message() -> (tempfile::TempDir, DbPool, Cx, queries::UnackedMessageRow) {
+        seed_unacked_message_with(ensure_ephemeral_test_project)
+    }
+
+    fn seed_unacked_message_with(
+        ensure_project: fn(&Cx, &DbPool, &str) -> mcp_agent_mail_db::ProjectRow,
+    ) -> (tempfile::TempDir, DbPool, Cx, queries::UnackedMessageRow) {
         let tmp = tempfile::tempdir().unwrap();
         let pool = make_test_pool(&tmp);
         let cx = Cx::for_testing();
@@ -656,7 +605,7 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
         let human_key = project_root.to_string_lossy().to_string();
 
-        let project = ensure_ephemeral_test_project(&cx, &pool, &human_key);
+        let project = ensure_project(&cx, &pool, &human_key);
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
@@ -1741,6 +1690,192 @@ mod tests {
             Outcome::Ok(rows) => rows,
             other => panic!("read observed grants: {other:?}"),
         }
+    }
+
+    /// The barrier is process-global. Run admission interleavings alone so
+    /// unrelated parallel tests neither hold a writer nor inherit our gate.
+    fn admission_case_ran_in_child() -> bool {
+        const CHILD: &str = "AM_TEST_ACK_SCAN_ADMISSION_CHILD";
+        let test_name = std::thread::current()
+            .name()
+            .expect("named test thread")
+            .to_string();
+        if std::env::var(CHILD).ok().as_deref() == Some(test_name.as_str()) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &test_name)
+            .output()
+            .expect("run isolated ACK admission test");
+        assert!(
+            output.status.success(),
+            "isolated ACK admission failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ACK admission case completed"),
+            "the child must actually execute the selected test"
+        );
+        true
+    }
+
+    #[test]
+    fn recovery_contention_preserves_ack_tail_and_resumes_real_escalation() {
+        if admission_case_ran_in_child() {
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            |_| {
+                let (tmp, pool, cx, original) =
+                    seed_unacked_message_with(ensure_test_project_in_current_env);
+                seed_more_overdue(&cx, &pool, &original, 1..=2);
+                // Seed the durable generation before the first lap. Enabling
+                // escalation later seeds it (0b694c35), and a changed generation
+                // restarts the lap, which is not the property under test here.
+                let _ = seeded_generation(&cx, &pool);
+                let mut config = escalation_config(&tmp);
+                config.ack_escalation_enabled = false;
+                let mut state = AckScanState::default();
+                run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap();
+                assert_eq!(
+                    run_ack_ttl_slice(&config, &pool, &mut state, || false, || false).unwrap(),
+                    (3, 1)
+                );
+                let cursor = state.cursor.clone();
+                let identity = state.identity.clone();
+                let warned = state.warned.clone();
+                let current = state.current.clone();
+                assert!(cursor.is_some());
+                config.ack_escalation_enabled = true;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let observed = std::thread::scope(|scope| {
+                    let promotion =
+                        mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle()
+                            .expect("isolated process has no active writer");
+                    let worker = scope.spawn(|| {
+                        let result = run_ack_ttl_cycle_with_state(&config, &pool, &mut state);
+                        let _ = tx.send(result);
+                    });
+                    let result = rx.recv_timeout(Duration::from_secs(2));
+                    // Release BEFORE joining/asserting, including on the old
+                    // blocking implementation. A failing regression must not hang.
+                    drop(promotion);
+                    worker.join().unwrap();
+                    result
+                });
+                let error = observed
+                    .expect("ACK admission waited behind another thread's promotion")
+                    .expect_err("promotion must refuse background admission");
+                assert!(error.contains("ACK scan deferred"), "{error}");
+                assert_eq!(state.cursor, cursor);
+                assert_eq!(state.identity, identity);
+                assert_eq!(state.warned, warned);
+                assert_eq!(state.current, current);
+                assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+                assert!(!config.storage_root.exists());
+                assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                // The resumed page must observe an ACK which arrived while it was
+                // deferred, rather than escalating a retained stale row payload.
+                match block_on(queries::acknowledge_message(
+                    &cx,
+                    &pool,
+                    original.agent_id,
+                    original.message_id + 1,
+                )) {
+                    Outcome::Ok(_) => {}
+                    other => panic!("ACK while scan deferred: {other:?}"),
+                }
+                assert_eq!(
+                    run_ack_ttl_cycle_with_state(&config, &pool, &mut state).unwrap(),
+                    (1, 1)
+                );
+                assert!(state.cursor.is_none());
+                let claims = claim_rows(&cx, &pool, original.project_id);
+                assert_eq!(claims.len(), 1);
+                assert_eq!(claims[0].agent_id, original.agent_id);
+                assert_eq!(claims[0].reason, "ack-overdue");
+                assert!(claims[0].released_ts.is_none());
+                assert!(config.storage_root.exists());
+                assert_eq!(state.warned.len(), 2);
+            },
+        );
+        println!("ACK admission case completed");
+    }
+
+    #[test]
+    fn promotion_owner_does_not_bypass_ack_scan_admission() {
+        if admission_case_ran_in_child() {
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            |_| {
+                let (tmp, pool, cx, original) =
+                    seed_unacked_message_with(ensure_test_project_in_current_env);
+                let mut config = escalation_config(&tmp);
+                config.ack_escalation_enabled = false;
+                let mut state = AckScanState::default();
+                let promotion =
+                    mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle()
+                        .unwrap();
+                let result = run_ack_ttl_cycle_with_state(&config, &pool, &mut state);
+                drop(promotion);
+                let error = result.expect_err("bootstrap's owner exemption is not a scan permit");
+                assert!(error.contains("ACK scan deferred"), "{error}");
+                assert!(state.identity.is_none());
+                assert!(state.cursor.is_none());
+                assert!(state.current.is_empty());
+                assert!(state.warned.is_empty());
+                assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+                assert!(!config.storage_root.exists());
+                assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+            },
+        );
+        println!("ACK admission case completed");
+    }
+
+    #[test]
+    fn shutdown_after_ack_admission_releases_the_generation_lease() {
+        if admission_case_ran_in_child() {
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            |_| {
+                let (tmp, pool, cx, original) =
+                    seed_unacked_message_with(ensure_test_project_in_current_env);
+                let config = escalation_config(&tmp);
+                let mut state = AckScanState::default();
+                let mut checks = 0;
+                let result = run_ack_ttl_slice(
+                    &config,
+                    &pool,
+                    &mut state,
+                    || {
+                        checks += 1;
+                        checks == 2
+                    },
+                    || true,
+                )
+                .unwrap();
+                assert_eq!(checks, 2);
+                assert_eq!(result, (0, 0));
+                assert!(state.identity.is_none());
+                assert!(state.cursor.is_none());
+                assert!(state.current.is_empty());
+                assert!(claim_rows(&cx, &pool, original.project_id).is_empty());
+                assert!(!config.storage_root.exists());
+                assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+                let promotion =
+                    mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle()
+                        .expect("shutdown must not leak an admitted writer");
+                drop(promotion);
+            },
+        );
+        println!("ACK admission case completed");
     }
 
     #[test]

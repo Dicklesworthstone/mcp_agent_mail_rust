@@ -1,0 +1,285 @@
+{
+ "experiment": "fb25 (fy24 redesign): direct-reservation fence admission levers, paired-concurrent",
+ "rule": "scratchpad fy24_rule.txt REDESIGN, FROZEN 2026-10-23T18:10:36Z before any run",
+ "bins": {
+  "xb25": "762592007c08e0d9780645f44b80ec29dd4c294d7c3faef5af8c596ba16455f9",
+  "INC_v0.3.39": "aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805"
+ },
+ "xb25_tree": "main f7b44878 + L2 + GW + env knobs (crates diff 0e6b8514828e); pre-dates Jeff's fence releases 80b42457/b6935d10",
+ "arms_env": {
+  "L2": "budget 500 ms, pause 10 ms, give-way 0",
+  "GW": "budget 500, pause 1, give-way 5 ms",
+  "B5": "budget 5000, pause 10, give-way 0",
+  "INC": "published v0.3.39"
+ },
+ "harness": "paced_swarm.py, 60 agents/arm, 3 projects, 300 s; host load 41-98 (shared by all arms)",
+ "windows": [
+  {
+   "window": 1,
+   "period_s": 6,
+   "start_order": [
+    "L2",
+    "GW",
+    "B5",
+    "INC"
+   ],
+   "arms": {
+    "L2": {
+     "reserve_n": 886,
+     "reserve_errors": 124,
+     "reserve_p50_s": 0.887,
+     "reserve_p99_s": 6.101,
+     "send_ok": 2820,
+     "send_p50_s": 8.279,
+     "send_p99_s": 30.012,
+     "non_reservation_errors": 180
+    },
+    "GW": {
+     "reserve_n": 886,
+     "reserve_errors": 20,
+     "reserve_p50_s": 0.693,
+     "reserve_p99_s": 5.152,
+     "send_ok": 2838,
+     "send_p50_s": 8.531,
+     "send_p99_s": 30.011,
+     "non_reservation_errors": 162
+    },
+    "B5": {
+     "reserve_n": 886,
+     "reserve_errors": 9,
+     "reserve_p50_s": 1.087,
+     "reserve_p99_s": 8.142,
+     "send_ok": 2808,
+     "send_p50_s": 7.817,
+     "send_p99_s": 30.01,
+     "non_reservation_errors": 193
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 4,
+     "reserve_p50_s": 1.151,
+     "reserve_p99_s": 7.834,
+     "send_ok": 2672,
+     "send_p50_s": 9.229,
+     "send_p99_s": 30.021,
+     "non_reservation_errors": 328
+    }
+   }
+  },
+  {
+   "window": 2,
+   "period_s": 6,
+   "start_order": [
+    "GW",
+    "B5",
+    "INC",
+    "L2"
+   ],
+   "arms": {
+    "GW": {
+     "reserve_n": 886,
+     "reserve_errors": 11,
+     "reserve_p50_s": 0.89,
+     "reserve_p99_s": 8.226,
+     "send_ok": 2837,
+     "send_p50_s": 12.244,
+     "send_p99_s": 30.022,
+     "non_reservation_errors": 166
+    },
+    "B5": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.972,
+     "reserve_p99_s": 6.911,
+     "send_ok": 2813,
+     "send_p50_s": 12.585,
+     "send_p99_s": 30.028,
+     "non_reservation_errors": 188
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 11,
+     "reserve_p50_s": 1.332,
+     "reserve_p99_s": 25.261,
+     "send_ok": 2443,
+     "send_p50_s": 14.064,
+     "send_p99_s": 30.045,
+     "non_reservation_errors": 566
+    },
+    "L2": {
+     "reserve_n": 886,
+     "reserve_errors": 32,
+     "reserve_p50_s": 0.747,
+     "reserve_p99_s": 4.263,
+     "send_ok": 2965,
+     "send_p50_s": 10.306,
+     "send_p99_s": 30.003,
+     "non_reservation_errors": 35
+    }
+   }
+  },
+  {
+   "window": 3,
+   "period_s": 6,
+   "start_order": [
+    "B5",
+    "INC",
+    "L2",
+    "GW"
+   ],
+   "arms": {
+    "B5": {
+     "reserve_n": 886,
+     "reserve_errors": 1,
+     "reserve_p50_s": 0.859,
+     "reserve_p99_s": 8.42,
+     "send_ok": 2799,
+     "send_p50_s": 13.474,
+     "send_p99_s": 30.026,
+     "non_reservation_errors": 201
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 15,
+     "reserve_p50_s": 1.296,
+     "reserve_p99_s": 30.004,
+     "send_ok": 2318,
+     "send_p50_s": 14.052,
+     "send_p99_s": 30.038,
+     "non_reservation_errors": 700
+    },
+    "L2": {
+     "reserve_n": 886,
+     "reserve_errors": 8,
+     "reserve_p50_s": 0.866,
+     "reserve_p99_s": 7.037,
+     "send_ok": 2857,
+     "send_p50_s": 12.638,
+     "send_p99_s": 30.06,
+     "non_reservation_errors": 143
+    },
+    "GW": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.827,
+     "reserve_p99_s": 6.617,
+     "send_ok": 2830,
+     "send_p50_s": 15.439,
+     "send_p99_s": 30.084,
+     "non_reservation_errors": 171
+    }
+   }
+  },
+  {
+   "window": 4,
+   "period_s": 2,
+   "start_order": [
+    "L2",
+    "GW",
+    "B5"
+   ],
+   "arms": {
+    "L2": {
+     "reserve_n": 2633,
+     "reserve_errors": 294,
+     "reserve_p50_s": 0.816,
+     "reserve_p99_s": 3.578,
+     "send_ok": 8971,
+     "send_p50_s": 8.845,
+     "send_p99_s": 25.283,
+     "non_reservation_errors": 29
+    },
+    "GW": {
+     "reserve_n": 2633,
+     "reserve_errors": 35,
+     "reserve_p50_s": 0.663,
+     "reserve_p99_s": 3.774,
+     "send_ok": 8956,
+     "send_p50_s": 8.855,
+     "send_p99_s": 26.692,
+     "non_reservation_errors": 44
+    },
+    "B5": {
+     "reserve_n": 2633,
+     "reserve_errors": 20,
+     "reserve_p50_s": 0.952,
+     "reserve_p99_s": 6.966,
+     "send_ok": 8998,
+     "send_p50_s": 8.89,
+     "send_p99_s": 25.901,
+     "non_reservation_errors": 3
+    }
+   }
+  },
+  {
+   "window": 5,
+   "period_s": 2,
+   "start_order": [
+    "B5",
+    "GW",
+    "L2"
+   ],
+   "arms": {
+    "B5": {
+     "reserve_n": 2633,
+     "reserve_errors": 164,
+     "reserve_p50_s": 1.379,
+     "reserve_p99_s": 13.025,
+     "send_ok": 8989,
+     "send_p50_s": 9.202,
+     "send_p99_s": 24.354,
+     "non_reservation_errors": 11
+    },
+    "GW": {
+     "reserve_n": 2633,
+     "reserve_errors": 141,
+     "reserve_p50_s": 0.758,
+     "reserve_p99_s": 3.881,
+     "send_ok": 8992,
+     "send_p50_s": 9.803,
+     "send_p99_s": 23.244,
+     "non_reservation_errors": 8
+    },
+    "L2": {
+     "reserve_n": 2633,
+     "reserve_errors": 599,
+     "reserve_p50_s": 0.976,
+     "reserve_p99_s": 4.187,
+     "send_ok": 8991,
+     "send_p50_s": 9.499,
+     "send_p99_s": 24.869,
+     "non_reservation_errors": 9
+    }
+   }
+  }
+ ],
+ "pooled_p6_per_1000": {
+  "L2": 61.7,
+  "GW": 11.7,
+  "B5": 3.8,
+  "INC": 11.3
+ },
+ "pooled_p6_reserve_p99_s": {
+  "L2": 5.57,
+  "GW": 6.72,
+  "B5": 7.64,
+  "INC": 24.21
+ },
+ "pooled_p2_per_1000": {
+  "L2": 169.6,
+  "GW": 33.4,
+  "B5": 34.9
+ },
+ "primary": {
+  "M-B5": "PASS (0.061 <= 0.25; 3.8 <= INC+10 = 21.3)",
+  "M-GW": "PASS (0.189 <= 0.5)"
+ },
+ "guards": {
+  "reserve p99 <= INC": "PASS both",
+  "send p99 <= 1.2x L2": "PASS both (all arms at the 30 s ceiling at P6)",
+  "sends ok >= 0.95x L2": "PASS (GW 0.984, B5 0.974)",
+  "non-reservation errors <= L2+5 (363)": "FAIL both (GW 499, B5 582; all are send_message 30 s timeouts; per-window L2 180/35/143, GW 162/166/171, B5 193/188/201)",
+  "P2": "PASS both"
+ },
+ "verdict": "LOSS for both levers under the frozen rule (non-reservation-error guard)."
+}

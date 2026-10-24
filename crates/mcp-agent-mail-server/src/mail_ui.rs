@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod unified;
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -21,6 +23,7 @@ use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
 use mcp_agent_mail_db::pool::DbPool;
+use mcp_agent_mail_db::search_planner::TextFieldScope;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
 use mcp_agent_mail_storage::{self as storage, ensure_archive_root};
@@ -832,14 +835,58 @@ first body
             },
         )
         .expect("insert recipe");
+        live_conn
+            .execute_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at) VALUES (77, 'pinned-proj', '/pinned-proj', 0)",
+                &[],
+            )
+            .expect("insert pinned project");
+        let pinned_id = mcp_agent_mail_db::search_recipes::insert_recipe(
+            &live_conn,
+            &mcp_agent_mail_db::search_recipes::SearchRecipe {
+                name: "Pinned project recipe".to_string(),
+                scope_mode: mcp_agent_mail_db::search_recipes::ScopeMode::Project,
+                scope_id: Some(77),
+                ..Default::default()
+            },
+        )
+        .expect("insert pinned recipe");
         drop(live_conn);
 
-        let recipes = with_mail_ui_env(&storage_root, &db_path, load_recipes);
+        let recipes = with_mail_ui_env(&storage_root, &db_path, || {
+            load_recipes("ahead-project", None)
+        });
+        let live = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Live saved recipe")
+            .expect("live recipe listed");
         assert!(
-            recipes
-                .iter()
-                .any(|recipe| recipe.name == "Live saved recipe")
+            live.href.starts_with("/mail/ahead-project/search?"),
+            "{}",
+            live.href
         );
+        let pinned = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Pinned project recipe")
+            .expect("pinned recipe listed");
+        // A project-scoped saved search opens in its own project.
+        assert!(
+            pinned.href.starts_with("/mail/pinned-proj/search?"),
+            "{}",
+            pinned.href
+        );
+        assert!(pinned.href.ends_with(&format!("recipe={pinned_id}")));
+        assert_eq!(pinned.use_count, 0);
+
+        // Following its link counts a use.
+        let recipes = with_mail_ui_env(&storage_root, &db_path, || {
+            load_recipes("ahead-project", Some(pinned_id))
+        });
+        let pinned = recipes
+            .iter()
+            .find(|recipe| recipe.name == "Pinned project recipe")
+            .expect("pinned recipe listed");
+        assert_eq!(pinned.use_count, 1);
     }
 
     #[test]
@@ -906,6 +953,127 @@ first body
             .expect("attachments route should return html");
         assert!(html.contains("artifact.txt"), "{html}");
         assert!(html.contains("128"), "{html}");
+    }
+
+    #[test]
+    fn overseer_compose_offers_active_agents_and_not_itself() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("overseer-recipients");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-overseer-{}", unique_nonce()),
+        )));
+        let pid = project.id.unwrap_or(0);
+        outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            pid,
+            "CopperHawk",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let retired = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            pid,
+            "SilverFern",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            retired.id.unwrap_or(0),
+            Some(1),
+        )));
+        outcome_ok(block_on(queries::insert_system_agent(
+            &cx,
+            &pool,
+            pid,
+            OVERSEER_AGENT_NAME,
+            "WebUI",
+            "Human",
+            "operator",
+        )));
+
+        let html = render_overseer_compose(&cx, &pool, &project.slug)
+            .expect("overseer compose should render")
+            .expect("overseer compose returns html");
+        assert!(html.contains("CopperHawk"), "{html}");
+        assert!(
+            !html.contains("SilverFern"),
+            "retired agents are not recipients"
+        );
+        assert!(
+            !html.contains(OVERSEER_AGENT_NAME),
+            "the overseer does not write to itself"
+        );
+    }
+
+    #[test]
+    fn project_page_hides_deregistered_agents_and_sets_retired_ones_apart() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("project-page-roster");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-project-roster-{}", unique_nonce()),
+        )));
+        let pid = project.id.unwrap_or(0);
+        let register = |name: &str| {
+            outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, pid, name, "test", "test", None, None, None,
+            )))
+        };
+        register("CopperHawk");
+        let retired = register("SilverFern");
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            retired.id.unwrap_or(0),
+            Some(1),
+        )));
+        let gone = register("AmberCove");
+        outcome_ok(block_on(queries::set_agent_retired_at(
+            &cx,
+            &pool,
+            gone.id.unwrap_or(0),
+            Some(2),
+        )));
+        outcome_ok(block_on(queries::deregister_agent(
+            &cx,
+            &pool,
+            gone.id.unwrap_or(0),
+            3,
+        )));
+
+        let html = render_project(&cx, &pool, &project.slug, false)
+            .expect("project page should render")
+            .expect("project page returns html");
+        assert!(
+            !html.contains("AmberCove"),
+            "deregistered agents never return, so the page does not list them"
+        );
+        assert!(html.contains("1 active · 1 retired"), "{html}");
+        let retired_section = html
+            .find("data-retired-agents")
+            .expect("retired agents get their own section");
+        let active = html.find("CopperHawk").expect("active agent listed");
+        let retired = html.find("SilverFern").expect("retired agent listed");
+        assert!(active < retired_section, "active agents come first");
+        assert!(
+            retired > retired_section,
+            "retired agents are listed in the retired section"
+        );
     }
 
     #[test]
@@ -1489,6 +1657,22 @@ first body
             html.contains("window.agentMailNavigate = function"),
             "base.html must DEFINE window.agentMailNavigate, not just reference it: {html}"
         );
+        // "Copy link" buttons call agentMailAbsoluteUrl; it was never defined,
+        // so every click threw before copying.
+        assert!(
+            html.contains("window.agentMailAbsoluteUrl = function"),
+            "base.html must DEFINE window.agentMailAbsoluteUrl: {html}"
+        );
+        // Server-rendered links, GET forms and fetch() calls carry the token
+        // through these hooks; without them every plain href 401s.
+        for hook in [
+            "window.agentMailWithToken = function",
+            "document.addEventListener('click', carryOnLink, true)",
+            "document.addEventListener('submit', function (event)",
+            "window.fetch = function (input, init)",
+        ] {
+            assert!(html.contains(hook), "base.html must install {hook}: {html}");
+        }
     }
 }
 
@@ -1909,17 +2093,48 @@ mod utility_tests {
     }
 
     #[test]
-    fn apply_mail_search_field_scope_prefixes_query() {
+    fn mail_search_field_is_a_search_parameter_not_a_query_prefix() {
         assert_eq!(
-            apply_mail_search_field_scope("deploy", "subject"),
-            "subject:deploy"
+            mail_search_text_fields(&parse_mail_search_field_scope("field=subject")),
+            TextFieldScope::Subject
         );
         assert_eq!(
-            apply_mail_search_field_scope("deploy", "body"),
-            "body_md:deploy"
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=body")),
+            TextFieldScope::Body
         );
-        assert_eq!(apply_mail_search_field_scope("deploy", ""), "deploy");
-        assert_eq!(apply_mail_search_field_scope("", "subject"), "");
+        assert_eq!(
+            mail_search_text_fields(&parse_mail_search_field_scope("field=both")),
+            TextFieldScope::SubjectAndBody
+        );
+        // A project/product scope value is not a field scope.
+        assert_eq!(
+            mail_search_text_fields(&parse_mail_search_field_scope("scope=project")),
+            TextFieldScope::SubjectAndBody
+        );
+    }
+
+    #[test]
+    fn inbox_pages_reach_past_the_newest_ten_thousand() {
+        assert_eq!(inbox_fetch_window(1, 50), (0, 51));
+        assert_eq!(inbox_fetch_window(2, 50), (50, 101));
+        // The default page size: page 3 must read past row 20,000.
+        assert_eq!(inbox_fetch_window(3, 10_000), (20_000, 30_001));
+        assert_eq!(
+            inbox_fetch_window(0, 0),
+            (0, 2),
+            "page and limit floor at 1"
+        );
+    }
+
+    #[test]
+    fn mail_search_direction_needs_an_agent() {
+        assert_eq!(parse_mail_search_direction("direction=inbox", ""), "");
+        assert_eq!(parse_mail_search_direction("direction=outbox", ""), "");
+        assert_eq!(
+            parse_mail_search_direction("direction=inbox", "BlueLake"),
+            "inbox"
+        );
+        assert_eq!(parse_mail_search_direction("q=x", "BlueLake"), "");
     }
 
     #[test]
@@ -1927,7 +2142,8 @@ mod utility_tests {
         assert_eq!(parse_mail_search_order("order=time"), "time");
         assert_eq!(parse_mail_search_order("sort=relevance"), "relevance");
         assert_eq!(parse_mail_search_order("sort=newest"), "time");
-        assert_eq!(parse_mail_search_order("sort=oldest"), "time");
+        // Saved searches carry sort=oldest; it is its own order, not newest.
+        assert_eq!(parse_mail_search_order("sort=oldest"), "oldest");
     }
 
     #[test]
@@ -3224,6 +3440,17 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
+    unified::collect(cx, pool, projects_rows, limit, filter_importance)
+}
+
+#[cfg(test)]
+fn reference_collect_unified_message_aggregates(
+    cx: &Cx,
+    pool: &DbPool,
+    projects_rows: &[ProjectRow],
+    limit: usize,
+    filter_importance: Option<&str>,
+) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
     // Applying the importance filter after a tight per-agent inbox window can
     // hide matching messages behind newer non-matching rows. Over-fetch when a
     // server-side importance filter is active so the filtered unified view stays
@@ -3391,7 +3618,11 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
 #[derive(Serialize)]
 struct ProjectCtx {
     project: ProjectView,
+    /// Agents that are not retired, most recently active first.
     agents: Vec<AgentView>,
+    /// Retired agents, listed apart from the active ones. Deregistered agents
+    /// appear in neither list (GH#358).
+    retired_agents: Vec<AgentView>,
     static_export: bool,
 }
 
@@ -3411,6 +3642,8 @@ struct AgentView {
     model: String,
     task_description: String,
     last_active: String,
+    /// Display timestamp of retirement; empty for an active agent.
+    retired_at: String,
 }
 
 fn project_view(p: &ProjectRow) -> ProjectView {
@@ -3454,6 +3687,7 @@ fn agent_view(a: &AgentRow) -> AgentView {
         model: a.model.clone(),
         task_description: a.task_description.clone(),
         last_active: ts_display(a.last_active_ts),
+        retired_at: ts_display_opt(a.retired_at),
     }
 }
 
@@ -3464,12 +3698,18 @@ fn render_project(
     static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
+    // The roster keeps retired agents but drops permanent deregistrations,
+    // which can never return (GH#358). It is ordered most recently active
+    // first, and the partition below keeps that order within each list.
+    let roster = block_on_outcome(cx, queries::list_agent_roster(cx, pool, p.id.unwrap_or(0)))?;
+    let (retired, active): (Vec<_>, Vec<_>) =
+        roster.iter().partition(|agent| agent.retired_at.is_some());
     render(
         "mail_project.html",
         ProjectCtx {
             project: project_view(&p),
-            agents: agents.iter().map(agent_view).collect(),
+            agents: active.into_iter().map(agent_view).collect(),
+            retired_agents: retired.into_iter().map(agent_view).collect(),
             static_export,
         },
     )
@@ -3507,6 +3747,16 @@ struct InboxMessage {
     read: bool,
 }
 
+/// `(offset, rows to fetch)` for inbox page `page` (1-based) of `limit` rows:
+/// offset-based like Python, fetching through the page plus one row so "Older
+/// Messages" shows exactly when there is more. Python fetched a fixed 10,000
+/// rows and paged inside them, so nothing older than those was reachable.
+fn inbox_fetch_window(page: usize, limit: usize) -> (usize, usize) {
+    let limit = limit.max(1);
+    let offset = page.max(1).saturating_sub(1).saturating_mul(limit);
+    (offset, offset.saturating_add(limit).saturating_add(1))
+}
+
 fn render_inbox(
     cx: &Cx,
     pool: &DbPool,
@@ -3521,14 +3771,15 @@ fn render_inbox(
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
     let aid = a.id.unwrap_or(0);
 
-    // Fetch a generous amount, then paginate client-side (Python parity).
-    let fetch_limit = 10_000;
+    let page = page.max(1);
+    let (offset, fetch_limit) = inbox_fetch_window(page, limit);
     let inbox = block_on_outcome(
         cx,
         queries::fetch_inbox(cx, pool, pid, aid, false, None, fetch_limit),
     )?;
     let total = inbox.len();
-    let candidate_root_ids: Vec<i64> = inbox
+    let page_rows: Vec<_> = inbox.iter().skip(offset).take(limit).collect();
+    let candidate_root_ids: Vec<i64> = page_rows
         .iter()
         .filter_map(|row| {
             if explicit_thread_ref(row.message.thread_id.as_deref()).is_none() {
@@ -3540,11 +3791,8 @@ fn render_inbox(
         .collect();
     let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
 
-    // Offset-based pagination (Python: offset = (page - 1) * limit).
-    let page = page.max(1);
-    let offset = (page - 1).saturating_mul(limit.max(1));
     let mut items = Vec::new();
-    for row in inbox.iter().skip(offset).take(limit) {
+    for row in page_rows {
         let m = &row.message;
         let thread_id = display_thread_ref_for_message(
             m.id.unwrap_or(0),
@@ -3927,7 +4175,10 @@ struct RecipeView {
     id: i64,
     name: String,
     description: String,
-    route: String,
+    /// Where the saved search opens: its pinned project's search page for a
+    /// Project/Product scope, else this project's, tagged with the recipe id
+    /// so opening it counts a use.
+    href: String,
     pinned: bool,
     use_count: i64,
 }
@@ -3966,23 +4217,31 @@ fn parse_mail_search_field_scope(query: &str) -> String {
     String::new()
 }
 
-fn apply_mail_search_field_scope(query: &str, field_scope: &str) -> String {
-    if query.is_empty() {
-        return String::new();
-    }
+/// The search service's field scope for a normalized `field` parameter.
+fn mail_search_text_fields(field_scope: &str) -> TextFieldScope {
     match field_scope {
-        "subject" => format!("subject:{query}"),
-        "body" => format!("body_md:{query}"),
-        _ => query.to_string(),
+        "subject" => TextFieldScope::Subject,
+        "body" => TextFieldScope::Body,
+        _ => TextFieldScope::SubjectAndBody,
     }
 }
 
 fn normalize_mail_search_order(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "relevance" => Some("relevance"),
-        "time" | "newest" | "oldest" => Some("time"),
+        "time" | "newest" => Some("time"),
+        "oldest" => Some("oldest"),
         _ => None,
     }
+}
+
+/// Inbox/Outbox are relative to an agent. With "All agents" no search path
+/// applies them, so they are not kept as a filter: the form then shows
+/// "Any", which is what the results are.
+fn parse_mail_search_direction(query: &str, agent_filter: &str) -> String {
+    extract_query_str(query, "direction")
+        .filter(|_| !agent_filter.is_empty())
+        .unwrap_or_default()
 }
 
 fn parse_mail_search_order(query: &str) -> String {
@@ -4195,7 +4454,7 @@ fn render_search(
     let agent_filter = extract_query_str(query_str, "agent").unwrap_or_default();
     let thread_filter = extract_query_str(query_str, "thread").unwrap_or_default();
     let ack_filter = extract_query_str(query_str, "ack").unwrap_or_else(|| "any".to_string());
-    let direction_filter = extract_query_str(query_str, "direction").unwrap_or_default();
+    let direction_filter = parse_mail_search_direction(query_str, &agent_filter);
     let from_date = extract_query_str(query_str, "from_date").unwrap_or_default();
     let to_date = extract_query_str(query_str, "to_date").unwrap_or_default();
 
@@ -4215,10 +4474,10 @@ fn render_search(
             max_ts: parse_date_to_micros_end(&to_date),
         };
 
-        let ranking = if order == "time" {
-            RankingMode::Recency
-        } else {
-            RankingMode::Relevance
+        let ranking = match order.as_str() {
+            "time" => RankingMode::Recency,
+            "oldest" => RankingMode::Oldest,
+            _ => RankingMode::Relevance,
         };
 
         let direction = match direction_filter.as_str() {
@@ -4228,10 +4487,10 @@ fn render_search(
         };
 
         let ack_required = parse_ack_filter_param(&ack_filter);
-        let scoped_query = apply_mail_search_field_scope(&q, &field_scope);
 
         let search_query = SearchQuery {
-            text: scoped_query,
+            text: q.clone(),
+            text_fields: mail_search_text_fields(&field_scope),
             doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
             project_id: Some(pid),
             product_id: None,
@@ -4299,7 +4558,8 @@ fn render_search(
     let agents: Vec<AgentView> = agents_rows.iter().map(agent_view).collect();
 
     // ── Load saved recipes ──────────────────────────────────────────
-    let recipes = load_recipes();
+    let opened_recipe = extract_query_str(query_str, "recipe").and_then(|id| id.parse().ok());
+    let recipes = load_recipes(&p.slug, opened_recipe);
 
     let result_count = results.len();
     let deep_link = build_search_deep_link(project_slug, query_str);
@@ -4340,7 +4600,9 @@ fn render_search(
 /// Recipes are operator-local metadata, not archive-backed state, so they must
 /// come from the configured live sqlite file even when the rest of the page is
 /// rendered from an archive-backed observability snapshot.
-fn load_recipes() -> Vec<RecipeView> {
+/// Saved searches for the sidebar of `project_slug`'s search page. `opened`
+/// is the recipe whose link was just followed; its use count goes up first.
+fn load_recipes(project_slug: &str, opened: Option<i64>) -> Vec<RecipeView> {
     let config = Config::from_env();
     // `list_recipes` self-heals its schema with idempotent DDL, so this
     // apparently read-only route must hold the promotion lease from before the
@@ -4351,16 +4613,39 @@ fn load_recipes() -> Vec<RecipeView> {
     };
     // Wrap in DbConnGuard so the live metadata connection closes at scope exit.
     let conn = mcp_agent_mail_db::guard_db_conn(conn, "mail_ui::load_recipes");
+    if let Some(recipe_id) = opened {
+        let _ = mcp_agent_mail_db::search_recipes::touch_recipe(&conn, recipe_id);
+    }
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
+    let pinned_project_slug = |project_id: i64| {
+        conn.query_sync(
+            "SELECT slug FROM projects WHERE id = ?",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project_id)],
+        )
+        .ok()?
+        .first()?
+        .get_named::<String>("slug")
+        .ok()
+    };
     recipes
         .iter()
-        .map(|r| RecipeView {
-            id: r.id.unwrap_or(0),
-            name: r.name.clone(),
-            description: r.description.clone(),
-            route: r.route_string(),
-            pinned: r.pinned,
-            use_count: r.use_count,
+        .map(|r| {
+            let id = r.id.unwrap_or(0);
+            let slug = r
+                .scope_id
+                .filter(|_| r.scope_mode != mcp_agent_mail_db::search_recipes::ScopeMode::Global)
+                .and_then(pinned_project_slug)
+                .unwrap_or_else(|| project_slug.to_string());
+            let route = r.route_string();
+            let separator = if route.contains('?') { '&' } else { '?' };
+            RecipeView {
+                id,
+                name: r.name.clone(),
+                description: r.description.clone(),
+                href: format!("/mail/{slug}{route}{separator}recipe={id}"),
+                pinned: r.pinned,
+                use_count: r.use_count,
+            }
         })
         .collect()
 }
@@ -4676,12 +4961,21 @@ fn render_overseer_compose(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
+    // Recipients are the agents still working here: not retired ones, and
+    // not HumanOverseer, which the first overseer send registers.
+    let agents = block_on_outcome(
+        cx,
+        queries::list_active_agents_bounded(cx, pool, pid, None, None),
+    )?;
     render(
         "overseer_compose.html",
         OverseerComposeCtx {
             project: project_view(&p),
-            agents: agents.iter().map(agent_view).collect(),
+            agents: agents
+                .iter()
+                .filter(|agent| agent.name != OVERSEER_AGENT_NAME)
+                .map(agent_view)
+                .collect(),
         },
     )
 }
@@ -5525,6 +5819,7 @@ const OVERSEER_PREAMBLE: &str = "---\n\n\
     ---\n\n";
 
 const OVERSEER_SEND_INTENT: &str = "human_overseer_send";
+const OVERSEER_AGENT_NAME: &str = "HumanOverseer";
 const OVERSEER_REASON_MAX_CHARS: usize = 500;
 const OVERSEER_MAX_RECIPIENTS: usize = 100;
 
@@ -5624,19 +5919,20 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
     if subject.is_empty() {
         return Err(err("Subject is required"));
     }
-    if subject.len() > 200 {
+    // Limits count characters, as the form's counters do, not UTF-8 bytes.
+    if subject.chars().count() > 200 {
         return Err(err("Subject too long (maximum 200 characters)"));
     }
     if body_md.is_empty() {
         return Err(err("Message body is required"));
     }
-    if body_md.len() > 50_000 {
+    if body_md.chars().count() > 50_000 {
         return Err(err("Message body too long (maximum 50,000 characters)"));
     }
     if reason.is_empty() {
         return Err(err("Intervention reason is required"));
     }
-    if reason.len() > OVERSEER_REASON_MAX_CHARS {
+    if reason.chars().count() > OVERSEER_REASON_MAX_CHARS {
         return Err(err("Intervention reason too long (maximum 500 characters)"));
     }
 
@@ -5677,7 +5973,7 @@ fn handle_overseer_send(
             cx,
             pool,
             pid,
-            "HumanOverseer",
+            OVERSEER_AGENT_NAME,
             "WebUI",
             "Human",
             "Human operator providing guidance and oversight to agents",
@@ -5751,7 +6047,7 @@ fn handle_overseer_send(
         "recipient_count": valid_names.len(),
         "thread_id": thread_id,
         "audit": {
-            "actor": "HumanOverseer",
+            "actor": OVERSEER_AGENT_NAME,
             "human_overseer": true,
             "contact_policy_bypass": true,
             "reason": parsed.reason,
@@ -6356,6 +6652,108 @@ mod fresh_eyes_regression_tests {
     }
 
     #[test]
+    fn handle_mark_all_read_clears_shared_and_mixed_inboxes_for_only_the_viewer() {
+        for mixed in [false, true] {
+            let runtime = message_fixture_runtime();
+            let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(30));
+            let label = if mixed {
+                "mail-ui-all-read-mixed"
+            } else {
+                "mail-ui-all-read-shared"
+            };
+            let pool = make_test_pool(label);
+            let project = outcome_ok(block_on(queries::ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/{label}"),
+            )));
+            let project_id = project.id.expect("project id");
+            let sender = outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, project_id, "RedFox", "test", "test", None, None, None,
+            )));
+            let viewer = outcome_ok(block_on(queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+            )));
+            let peer = outcome_ok(block_on(queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )));
+            let viewer_id = viewer.id.expect("viewer id");
+            let peer_id = peer.id.expect("peer id");
+            let mut deliveries = vec![
+                ("first shared", false, true),
+                ("second shared", false, true),
+            ];
+            if mixed {
+                deliveries.extend([("direct", true, false), ("direct and shared", true, true)]);
+            }
+            let expected_marked = deliveries.len();
+            for (subject, direct, shared) in deliveries {
+                let recipients = if direct {
+                    vec![(viewer_id, "to")]
+                } else {
+                    Vec::new()
+                };
+                outcome_ok(block_on(queries::create_message_with_recipients_topic(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.expect("sender id"),
+                    subject,
+                    "Body",
+                    None,
+                    None,
+                    None,
+                    "normal",
+                    true,
+                    "[]",
+                    &recipients,
+                    shared.then_some("to"),
+                )));
+            }
+
+            let payload = handle_mark_all_read(&cx, &pool, &project.slug, "BlueLake")
+                .expect("all-read route succeeds")
+                .expect("JSON response");
+            let response: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(response["success"], true);
+            assert_eq!(response["marked_count"], expected_marked);
+            assert!(
+                outcome_ok(block_on(queries::fetch_inbox_unread(
+                    &cx, &pool, project_id, viewer_id, false, None, 100,
+                )))
+                .is_empty()
+            );
+            let peer_unread = outcome_ok(block_on(queries::fetch_inbox_unread(
+                &cx, &pool, project_id, peer_id, false, None, 100,
+            )));
+            assert_eq!(peer_unread.len(), if mixed { 3 } else { 2 });
+            let unacked = outcome_ok(block_on(queries::fetch_unacked_for_agent(
+                &cx, &pool, project_id, viewer_id, 100,
+            )));
+            assert_eq!(
+                unacked.len(),
+                expected_marked,
+                "reading never acknowledges mail"
+            );
+            assert!(unacked.iter().all(|row| row.read_ts.is_some()));
+
+            let payload = handle_mark_all_read(&cx, &pool, &project.slug, "BlueLake")
+                .expect("repeated all-read succeeds")
+                .expect("JSON response");
+            let response: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(response["marked_count"], 0);
+        }
+    }
+
+    #[test]
     fn sibling_update_route_persists_and_index_renders_both_orientations() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-sibling");
@@ -6697,6 +7095,19 @@ mod overseer_form_validation_tests {
         body["subject"] = json!("x".repeat(201));
         let body = body.to_string();
         let (status, msg) = parse_err_message(&body);
+        assert_eq!(status, 400);
+        assert_eq!(msg, "Subject too long (maximum 200 characters)");
+    }
+
+    #[test]
+    fn parse_overseer_body_limits_count_characters_not_bytes() {
+        // 200 two-byte characters fit the 200-character subject the form allows.
+        let mut body = valid_body(json!(["BlueLake"]));
+        body["subject"] = json!("é".repeat(200));
+        body["reason"] = json!("ü".repeat(500));
+        assert!(parse_overseer_body(&body.to_string()).is_ok());
+        body["subject"] = json!("é".repeat(201));
+        let (status, msg) = parse_err_message(&body.to_string());
         assert_eq!(status, 400);
         assert_eq!(msg, "Subject too long (maximum 200 characters)");
     }

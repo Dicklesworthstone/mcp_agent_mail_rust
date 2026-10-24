@@ -1,9 +1,18 @@
-Destructively wipe all Agent Mail state (optionally archiving first)
+Destructively wipe all Agent Mail state (optionally archiving first).
+
+Agent Mail processes holding the mailbox are stopped for the wipe: a service-manager unit (systemd user service, LaunchAgent) is stopped through its manager and started again afterwards; any other Agent Mail process holding the mailbox is terminated.
 
 Usage: am clear-and-reset-everything [OPTIONS]
 
 Options:
-  -f, --force       Skip the final destructive confirmation prompt (still asks about creating an archive).
-      --archive     Attempt a pre-reset archive before deleting data (default: prompt when interactive).
-      --no-archive  Skip creating a pre-reset archive.
-  -h, --help        Print help
+  -f, --force
+          Skip every prompt (archives first unless --no-archive is given).
+
+      --archive
+          Attempt a pre-reset archive before deleting data (default: prompt when interactive).
+
+      --no-archive
+          Skip creating a pre-reset archive.
+
+  -h, --help
+          Print help (see a summary with '-h')

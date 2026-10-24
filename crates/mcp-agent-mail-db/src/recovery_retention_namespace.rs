@@ -1,6 +1,8 @@
 //! Descriptor-bound namespace operations for recovery-debris consolidation.
 //!
-//! No source is copied or deleted. Each path component is opened without
+//! Consolidation never copies or deletes a source. The separate snapshot
+//! reclamation primitive deletes only files admitted by snapshot authority.
+//! Each path component is opened without
 //! following user-controlled symlinks; rename and durability sync use the same
 //! retained directory handles. A changed namespace after a completed move is
 //! an error, not permission to retry or to overwrite a replacement pathname.
@@ -21,7 +23,10 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// One newly claimed quarantine, retained across all moves in a batch.
-/// Dropping it closes the handle; it never removes the directory or evidence.
+///
+/// Dropping it releases the directory lease and closes the handle; it never
+/// removes the directory or evidence. Empty-directory reclamation must acquire
+/// this same lease, so a newly claimed batch remains live before its first move.
 #[derive(Debug)]
 pub struct ReclaimDirectory {
     file: File,
@@ -98,6 +103,58 @@ impl std::fmt::Display for CompletedReclaimMove {
 }
 
 impl std::error::Error for CompletedReclaimMove {}
+
+/// Size of the namespace entry that was removed.
+///
+/// Allocated bytes describe
+/// the inode's blocks before unlink, not a measurement of filesystem free
+/// space (snapshots, compression, and unrelated IO can change that separately).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimedFileBytes {
+    pub logical_bytes: u64,
+    pub allocated_bytes: Option<u64>,
+}
+
+/// An unlink completed, but its directory durability could not be confirmed.
+///
+/// The caller must report this separately from both retained and durably
+/// deleted files, and must never retry against the old pathname blindly.
+#[derive(Debug)]
+pub struct CompletedReclaimDelete {
+    source: PathBuf,
+    bytes: ReclaimedFileBytes,
+    error: io::Error,
+}
+
+impl CompletedReclaimDelete {
+    #[must_use]
+    pub fn from_io_error(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn bytes(&self) -> ReclaimedFileBytes {
+        self.bytes
+    }
+}
+
+impl std::fmt::Display for CompletedReclaimDelete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backup unlink completed for {}; directory durability is unconfirmed: {}; do not retry against this pathname without a new inventory",
+            self.source.display(),
+            self.error,
+        )
+    }
+}
+
+impl std::error::Error for CompletedReclaimDelete {}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
@@ -212,12 +269,16 @@ pub(super) fn claim_reclaim_directory(path: &Path) -> io::Result<ReclaimDirector
         .parent()
         .ok_or_else(|| invalid("quarantine has no parent"))?;
     let parent = open_directory(parent_path, true)?;
+    // Serialize the mkdir/open/lease window with empty-directory reclamation
+    // by other databases sharing this quarantine parent.
+    fs2::FileExt::try_lock_exclusive(&parent)?;
     validate_directory(parent_path, &parent)?;
     rustix::fs::mkdirat(&parent, name, Mode::RWXU).map_err(io::Error::from)?;
     let file = File::from(
         rustix::fs::openat(&parent, name, DIRECTORY_FLAGS, Mode::empty())
             .map_err(io::Error::from)?,
     );
+    fs2::FileExt::try_lock_exclusive(&file)?;
     // Preserve the newly created directory on every error. No cleanup by
     // pathname is safe once the namespace might have been replaced.
     parent.sync_all()?;
@@ -312,6 +373,478 @@ fn validate_inventoried_file(file: &File, expected: &Metadata) -> io::Result<()>
     {
         return Err(invalid(
             "rotation source no longer matches its inventoried regular, single-link file",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_delete_inventory(file: &File, expected: &Metadata) -> io::Result<()> {
+    validate_inventoried_file(file, expected)?;
+    let current = file.metadata()?;
+    // Unlike a move, unlink admission has no intended inode metadata change.
+    // ctime catches in-place edits even if an external writer restores mtime.
+    if expected.ctime() != current.ctime() || expected.ctime_nsec() != current.ctime_nsec() {
+        return Err(invalid("backup changed after deletion inventory"));
+    }
+    Ok(())
+}
+
+/// Remove an inventoried, empty native rotation directory.
+///
+/// The caller owns naming/policy admission; this boundary refuses live
+/// leases, open readers, replaced inodes and symlinked ancestors. `rmdir`
+/// atomically refuses any child added after inventory, so this can never
+/// remove recovery evidence.
+pub fn delete_empty_reclaim_directory(source: &Path, inventoried: &Metadata) -> io::Result<()> {
+    delete_empty_reclaim_directory_with(
+        source,
+        inventoried,
+        |parent, name| {
+            rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+        },
+        File::sync_all,
+    )
+}
+
+fn delete_empty_reclaim_directory_with<U, S>(
+    source: &Path,
+    inventoried: &Metadata,
+    mut unlink: U,
+    mut sync: S,
+) -> io::Result<()>
+where
+    U: FnMut(&File, &OsStr) -> io::Result<()>,
+    S: FnMut(&File) -> io::Result<()>,
+{
+    let source = absolute_spelling(source)?;
+    let parent_path = source
+        .parent()
+        .ok_or_else(|| invalid("reclaim directory has no parent"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| invalid("reclaim directory has no name"))?;
+    let parent = open_directory(parent_path, false)?;
+    fs2::FileExt::try_lock_exclusive(&parent)?;
+    let directory = File::from(rustix::fs::openat(
+        &parent,
+        name,
+        DIRECTORY_FLAGS,
+        Mode::empty(),
+    )?);
+    let current = directory.metadata()?;
+    if !inventoried.file_type().is_dir()
+        || inventoried.dev() != current.dev()
+        || inventoried.ino() != current.ino()
+    {
+        return Err(invalid("empty rotation directory changed after inventory"));
+    }
+    fs2::FileExt::try_lock_exclusive(&directory)?;
+    ensure_no_other_file_readers(&source, &directory)?;
+    let expected = rustix::fs::fstat(&directory)?;
+    sync(&parent)?;
+    validate_directory(parent_path, &parent)?;
+    validate_source_entry(&parent, name, &expected)?;
+    unlink(&parent, name)?;
+    if let Err(error) = sync(&parent).and_then(|()| validate_directory(parent_path, &parent)) {
+        return Err(io::Error::other(CompletedReclaimDelete {
+            source,
+            // Directory removal is accounted separately from payload bytes.
+            bytes: ReclaimedFileBytes::default(),
+            error,
+        }));
+    }
+    Ok(())
+}
+
+/// Remove one admitted superseded snapshot through its retained parent. Never
+/// follows symlinks, traverses directories, or accepts hard-linked aliases.
+pub fn delete_inventoried_file(
+    source: &Path,
+    inventoried: &Metadata,
+) -> io::Result<ReclaimedFileBytes> {
+    delete_inventoried_file_with(
+        source,
+        inventoried,
+        |parent, name| {
+            rustix::fs::unlinkat(parent, name, AtFlags::empty()).map_err(io::Error::from)
+        },
+        File::sync_all,
+    )
+}
+
+fn delete_inventoried_file_with<U, S>(
+    source: &Path,
+    inventoried: &Metadata,
+    mut unlink: U,
+    mut sync: S,
+) -> io::Result<ReclaimedFileBytes>
+where
+    U: FnMut(&File, &OsStr) -> io::Result<()>,
+    S: FnMut(&File) -> io::Result<()>,
+{
+    let source = absolute_spelling(source)?;
+    let parent_path = source
+        .parent()
+        .ok_or_else(|| invalid("backup has no parent"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| invalid("backup has no name"))?;
+    let parent = open_directory(parent_path, false)?;
+    let file = File::from(rustix::fs::openat(
+        &parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    validate_delete_inventory(&file, inventoried)?;
+    // Snapshot admission excludes cooperating readers throughout this call.
+    // Also refuse an ordinary observed reader or advisory file lock: unlinking
+    // an inode still held open would neither free its blocks nor preserve its
+    // pathname for a reader that needs to reopen it.
+    fs2::FileExt::try_lock_exclusive(&file)?;
+    ensure_no_other_file_readers(&source, &file)?;
+    let expected = rustix::fs::fstat(&file)?;
+    sync(&parent)?;
+    validate_directory(parent_path, &parent)?;
+    validate_source_entry(&parent, name, &expected)?;
+    validate_delete_inventory(&file, inventoried)?;
+    let metadata = file.metadata()?;
+    let bytes = ReclaimedFileBytes {
+        logical_bytes: metadata.len(),
+        allocated_bytes: metadata.blocks().checked_mul(512),
+    };
+    unlink(&parent, name)?;
+    drop(file);
+    if let Err(error) = sync(&parent).and_then(|()| validate_directory(parent_path, &parent)) {
+        return Err(io::Error::other(CompletedReclaimDelete {
+            source,
+            bytes,
+            error,
+        }));
+    }
+    Ok(bytes)
+}
+
+/// Check observable readers without opening the candidate at all. Closing a
+/// fresh descriptor could release a same-process SQLite reader's POSIX locks,
+/// so canonical verification must perform this preflight before its first open.
+pub fn preflight_inventoried_file_readers(source: &Path, inventoried: &Metadata) -> io::Result<()> {
+    ensure_no_file_readers(source, inventoried, None)
+}
+
+fn ensure_no_other_file_readers(source: &Path, retained: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    ensure_no_file_readers(source, &retained.metadata()?, Some(retained.as_raw_fd()))
+}
+
+/// External readers do not necessarily participate in snapshot admission.
+/// All same-owner processes must be observable; other users' readable handles
+/// are checked opportunistically. Linux normally denies inspection of root
+/// and other users' processes to an unprivileged mailbox owner, which must not
+/// permanently disable cleanup. This is not an atomic exclusion of external
+/// opens or invisible other-user readers. `SnapshotAuthority` supplies atomic
+/// exclusion for Agent Mail publishers and verified restore readers, while
+/// accounting reports unlinked allocation rather than a free-space delta.
+#[cfg(target_os = "linux")]
+fn ensure_no_file_readers(
+    source: &Path,
+    retained_identity: &Metadata,
+    excluded_descriptor: Option<i32>,
+) -> io::Result<()> {
+    const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
+    let canonical_source = source.canonicalize()?;
+    let own_pid = std::process::id();
+    let effective_user = process_reader_uids(Path::new("/proc/self"))?[1];
+    let mut remaining = MAX_READER_INVENTORY_ENTRIES;
+    let mut charge = || -> io::Result<()> {
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("open-reader inventory exceeded its bounded scan"))?;
+        Ok(())
+    };
+    for entry in std::fs::read_dir("/proc")? {
+        charge()?;
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let descriptors = match std::fs::read_dir(entry.path().join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && reader_inventory_denial_is_foreign(&entry.path(), effective_user)? =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        for descriptor in descriptors {
+            charge()?;
+            let descriptor = descriptor?;
+            if pid == own_pid
+                && excluded_descriptor.is_some_and(|excluded| {
+                    descriptor
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<i32>().ok())
+                        == Some(excluded)
+                })
+            {
+                continue;
+            }
+            let target = match std::fs::read_link(descriptor.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && reader_inventory_denial_is_foreign(&entry.path(), effective_user)? =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let same_inode = if target == canonical_source {
+                true
+            } else {
+                match descriptor_references_inode(&entry.path(), &descriptor, retained_identity) {
+                    Ok(same_inode) => same_inode,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::PermissionDenied
+                            && reader_inventory_denial_is_foreign(
+                                &entry.path(),
+                                effective_user,
+                            )? =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if same_inode {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("backup has an active file reader in process {pid}"),
+                ));
+            }
+        }
+        if retained_identity.file_type().is_file() {
+            ensure_no_mapped_file_readers(
+                &entry.path(),
+                pid,
+                effective_user,
+                retained_identity,
+                &mut charge,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Mappings retain an inode after the process closes its last descriptor.
+/// Match the kernel's device/inode record, including mappings through removed
+/// aliases, without opening a candidate or relying on a displayed pathname.
+#[cfg(target_os = "linux")]
+fn ensure_no_mapped_file_readers(
+    process: &Path,
+    process_id: u32,
+    effective_user: u32,
+    retained: &Metadata,
+    mut charge: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Read as _;
+
+    const MAX_PROCESS_MAP_BYTES: u64 = 8 * 1024 * 1024;
+    let maps_file = match File::open(process.join("maps")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && reader_inventory_denial_is_foreign(process, effective_user)? =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut maps = Vec::new();
+    maps_file
+        .take(MAX_PROCESS_MAP_BYTES + 1)
+        .read_to_end(&mut maps)?;
+    if u64::try_from(maps.len()).unwrap_or(u64::MAX) > MAX_PROCESS_MAP_BYTES {
+        return Err(invalid("open-reader mappings exceeded their bounded scan"));
+    }
+    for line in maps
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        charge()?;
+        // Only numeric fields are UTF-8: a mapped pathname may contain any
+        // non-NUL Unix bytes and is not part of this identity comparison.
+        let mut fields = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty());
+        let device = fields
+            .nth(3)
+            .ok_or_else(|| invalid("open-reader mapping has no device record"))?;
+        let inode = fields
+            .next()
+            .ok_or_else(|| invalid("open-reader mapping has no inode record"))?;
+        let inode = std::str::from_utf8(inode)
+            .map_err(io::Error::other)?
+            .parse::<u64>()
+            .map_err(io::Error::other)?;
+        if inode != retained.ino() {
+            continue;
+        }
+        let device = std::str::from_utf8(device).map_err(io::Error::other)?;
+        let (major, minor) = device
+            .split_once(':')
+            .ok_or_else(|| invalid("open-reader mapping has an invalid device record"))?;
+        let major = u64::from_str_radix(major, 16).map_err(io::Error::other)?;
+        let minor = u64::from_str_radix(minor, 16).map_err(io::Error::other)?;
+        if major == nix::sys::stat::major(retained.dev())
+            && minor == nix::sys::stat::minor(retained.dev())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("backup has an active memory mapping in process {process_id}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `read_link` alone misses an open hard-link alias whose directory entry has
+/// already been unlinked. Read the kernel's inode hint before a device/inode
+/// stat, avoiding unrelated storage IO for descriptors on blocked filesystems.
+#[cfg(target_os = "linux")]
+fn descriptor_references_inode(
+    process: &Path,
+    descriptor: &std::fs::DirEntry,
+    retained: &Metadata,
+) -> io::Result<bool> {
+    use std::io::Read as _;
+
+    let mut info = Vec::new();
+    File::open(process.join("fdinfo").join(descriptor.file_name()))?
+        .take(4096)
+        .read_to_end(&mut info)?;
+    let inode = info
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"ino:"))
+        .ok_or_else(|| invalid("open-reader descriptor has no bounded inode record"))?;
+    let inode = std::str::from_utf8(inode)
+        .map_err(io::Error::other)?
+        .trim()
+        .parse::<u64>()
+        .map_err(io::Error::other)?;
+    if inode != retained.ino() {
+        return Ok(false);
+    }
+    let observed = std::fs::metadata(descriptor.path())?;
+    Ok(observed.dev() == retained.dev() && observed.ino() == retained.ino())
+}
+
+/// A nondumpable process has root-owned proc entries even when its effective
+/// user is the mailbox owner. Inspect the kernel's bounded UID record before
+/// treating an inaccessible process as another user's observer limitation.
+#[cfg(target_os = "linux")]
+fn process_reader_uids(process: &Path) -> io::Result<[u32; 4]> {
+    use std::io::Read as _;
+
+    const MAX_PROCESS_STATUS_BYTES: usize = 64 * 1024;
+    let mut status = Vec::new();
+    File::open(process.join("status"))?
+        .take(MAX_PROCESS_STATUS_BYTES as u64 + 1)
+        .read_to_end(&mut status)?;
+    if status.len() > MAX_PROCESS_STATUS_BYTES {
+        return Err(invalid(
+            "open-reader process status exceeded its bounded scan",
+        ));
+    }
+    let line = status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"Uid:"))
+        .ok_or_else(|| invalid("open-reader process status has no UID record"))?;
+    let mut values = std::str::from_utf8(line)
+        .map_err(io::Error::other)?
+        .split_whitespace();
+    let mut uids = [0; 4];
+    for uid in &mut uids {
+        *uid = values
+            .next()
+            .ok_or_else(|| invalid("open-reader process UID record is incomplete"))?
+            .parse()
+            .map_err(io::Error::other)?;
+    }
+    if values.next().is_some() {
+        return Err(invalid("open-reader process UID record is ambiguous"));
+    }
+    Ok(uids)
+}
+
+#[cfg(target_os = "linux")]
+fn reader_inventory_denial_is_foreign(process: &Path, own_uid: u32) -> io::Result<bool> {
+    match process_reader_uids(process) {
+        Ok(uids) => Ok(!uids.contains(&own_uid)),
+        // A process that exited between the denial and status inspection no
+        // longer retains a descriptor. Other unavailable evidence refuses.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_no_file_readers(
+    source: &Path,
+    _retained_identity: &Metadata,
+    excluded_descriptor: Option<i32>,
+) -> io::Result<()> {
+    let output = std::process::Command::new("lsof")
+        .args(["-n", "-P", "-Fpf", "--"])
+        .arg(source)
+        .output()?;
+    if excluded_descriptor.is_none()
+        && output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && output.stderr.is_empty()
+    {
+        // lsof reports no matches with status 1. No descriptor was opened by
+        // preflight itself, so an empty, otherwise clean inventory is expected.
+        return Ok(());
+    }
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(io::Error::other("open-reader inventory unavailable"));
+    }
+    let output = std::str::from_utf8(&output.stdout).map_err(io::Error::other)?;
+    let mut current_pid = None;
+    let mut observed_self = false;
+    for line in output.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            current_pid = Some(pid.parse::<u32>().map_err(io::Error::other)?);
+        } else if let Some(descriptor) = line.strip_prefix('f') {
+            if current_pid == Some(std::process::id())
+                && excluded_descriptor
+                    .is_some_and(|excluded| descriptor.parse::<i32>().ok() == Some(excluded))
+            {
+                observed_self = true;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "backup has an active file reader or mapping",
+                ));
+            }
+        }
+    }
+    if excluded_descriptor.is_some() && !observed_self {
+        return Err(io::Error::other(
+            "open-reader inventory omitted retained file",
         ));
     }
     Ok(())
@@ -483,6 +1016,599 @@ mod tests {
 
     fn fixture() -> PathBuf {
         tempfile::tempdir().unwrap().keep().canonicalize().unwrap()
+    }
+
+    #[test]
+    fn empty_directory_reclamation_excludes_live_batches_and_parent_claims() {
+        let root = fixture();
+        let path = root.join("rotation");
+        let batch = ReclaimDirectory::claim(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        assert!(delete_empty_reclaim_directory(&path, &inventoried).is_err());
+        assert!(path.is_dir());
+        drop(batch);
+
+        let parent = File::open(&root).unwrap();
+        fs2::FileExt::try_lock_exclusive(&parent).unwrap();
+        assert!(delete_empty_reclaim_directory(&path, &inventoried).is_err());
+        let new_batch = root.join("not-yet-claimed");
+        assert!(ReclaimDirectory::claim(&new_batch).is_err());
+        assert!(!new_batch.exists());
+        drop(parent);
+
+        delete_empty_reclaim_directory(&path, &inventoried).unwrap();
+        assert!(!path.exists());
+        let batch = ReclaimDirectory::claim(&new_batch).unwrap();
+        assert!(batch.path().is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_directory_reclamation_preserves_an_ordinary_open_reader() {
+        let root = fixture();
+        let path = root.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let reader = File::open(&path).unwrap();
+        let error = delete_empty_reclaim_directory(&path, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(reader);
+        delete_empty_reclaim_directory(&path, &inventoried).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn empty_directory_reclamation_rejects_replacement_symlinks_and_new_evidence() {
+        let root = fixture();
+        let path = root.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let original = root.join("original");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(delete_empty_reclaim_directory(&path, &inventoried).is_err());
+        assert!(path.is_dir());
+        assert!(original.is_dir());
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        assert!(delete_empty_reclaim_directory(&link, &inventoried).is_err());
+        let parent_link = root.join("parent-link");
+        std::os::unix::fs::symlink(&root, &parent_link).unwrap();
+        assert!(
+            delete_empty_reclaim_directory(&parent_link.join("original"), &inventoried).is_err()
+        );
+
+        let error = delete_empty_reclaim_directory_with(
+            &original,
+            &inventoried,
+            |parent, name| {
+                // A recovery writer arrives after the last empty-directory
+                // inventory and identity check, immediately before rmdir.
+                std::fs::write(original.join("recovery-receipt.json"), b"keep").unwrap();
+                rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+            },
+            File::sync_all,
+        )
+        .unwrap_err();
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert_eq!(
+            std::fs::read(original.join("recovery-receipt.json")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn empty_directory_reclamation_reports_completed_unconfirmed_removal() {
+        let root = fixture();
+        let path = root.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let mut syncs = 0;
+        let error = delete_empty_reclaim_directory_with(
+            &path,
+            &inventoried,
+            |parent, name| {
+                rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+            },
+            |parent| {
+                syncs += 1;
+                if syncs == 2 {
+                    Err(io::Error::other("injected directory sync failure"))
+                } else {
+                    parent.sync_all()
+                }
+            },
+        )
+        .unwrap_err();
+        let completed = CompletedReclaimDelete::from_io_error(&error).unwrap();
+        assert_eq!(completed.source(), path);
+        assert_eq!(completed.bytes(), ReclaimedFileBytes::default());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn empty_directory_reclamation_never_follows_a_replaced_parent() {
+        let root = fixture();
+        let parent_path = root.join("reclaimable");
+        std::fs::create_dir(&parent_path).unwrap();
+        let path = parent_path.join("rotation");
+        std::fs::create_dir(&path).unwrap();
+        let inventoried = std::fs::metadata(&path).unwrap();
+        let old_parent = root.join("retained-parent");
+        let error = delete_empty_reclaim_directory_with(
+            &path,
+            &inventoried,
+            |parent, name| {
+                std::fs::rename(&parent_path, &old_parent).unwrap();
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("evidence"), b"keep replacement").unwrap();
+                rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io::Error::from)
+            },
+            File::sync_all,
+        )
+        .unwrap_err();
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_some());
+        assert!(!old_parent.join("rotation").exists());
+        assert_eq!(
+            std::fs::read(path.join("evidence")).unwrap(),
+            b"keep replacement"
+        );
+    }
+
+    #[test]
+    fn deletion_refuses_replacements_links_and_symlinked_parents() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"original").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let retained = root.join("retained");
+        std::fs::rename(&source, &retained).unwrap();
+        std::fs::write(&source, b"replaced").unwrap();
+        assert!(delete_inventoried_file(&source, &inventoried).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"replaced");
+        let alias = root.join("alias");
+        std::fs::hard_link(&retained, &alias).unwrap();
+        assert!(delete_inventoried_file(&alias, &std::fs::metadata(&alias).unwrap()).is_err());
+        let symlink = root.join("symlink");
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        assert!(
+            delete_inventoried_file(&symlink, &std::fs::symlink_metadata(&symlink).unwrap())
+                .is_err()
+        );
+        let parent_alias = root.join("parent-alias");
+        std::os::unix::fs::symlink(&root, &parent_alias).unwrap();
+        assert!(
+            delete_inventoried_file(
+                &parent_alias.join("generation"),
+                &std::fs::metadata(&source).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(retained).unwrap(), b"original");
+        assert_eq!(std::fs::read(source).unwrap(), b"replaced");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_preflight_preserves_same_process_posix_locks() {
+        use nix::fcntl::{FcntlArg, fcntl};
+
+        const CHILD_SOURCE: &str = "MCP_AGENT_MAIL_RECLAIM_POSIX_LOCK_PROBE";
+        let request = || nix::libc::flock {
+            l_type: i16::try_from(nix::libc::F_WRLCK).unwrap(),
+            l_whence: i16::try_from(nix::libc::SEEK_SET).unwrap(),
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        if let Some(source) = std::env::var_os(CHILD_SOURCE) {
+            let reader = File::open(source).unwrap();
+            let mut observed = request();
+            fcntl(&reader, FcntlArg::F_GETLK(&mut observed)).unwrap();
+            assert_eq!(observed.l_type, i16::try_from(nix::libc::F_RDLCK).unwrap());
+            return;
+        }
+
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"same-process SQLite reader lock").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let reader = File::open(&source).unwrap();
+        let mut shared = request();
+        shared.l_type = i16::try_from(nix::libc::F_RDLCK).unwrap();
+        fcntl(&reader, FcntlArg::F_SETLK(&shared)).unwrap();
+
+        let error = preflight_inventoried_file_readers(&source, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        // F_GETLK ignores locks owned by its own process. A real second
+        // process proves that preflight did not close a new candidate handle
+        // and silently discard this process's existing SQLite-style lock.
+        let full_name = concat!(
+            module_path!(),
+            "::reader_preflight_preserves_same_process_posix_locks"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", full_name.split_once("::").unwrap().1])
+            .env(CHILD_SOURCE, &source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "preflight released a reader lock: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        drop(reader);
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"same-process SQLite reader lock"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_retains_an_open_reader_then_reclaims_after_it_closes() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"retained recovery bytes").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let reader = File::open(&source).unwrap();
+        let error = delete_inventoried_file(&source, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert_eq!(std::fs::read(&source).unwrap(), b"retained recovery bytes");
+        drop(reader);
+
+        let bytes = delete_inventoried_file(&source, &inventoried).unwrap();
+        assert_eq!(bytes.logical_bytes, inventoried.len());
+        assert_eq!(bytes.allocated_bytes, inventoried.blocks().checked_mul(512));
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_retains_a_reader_opened_through_an_unlinked_alias() {
+        let root = fixture();
+        let source = root.join("generation");
+        let alias = root.join("reader-alias");
+        std::fs::write(&source, b"recovery inode retained through another name").unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+        let reader = File::open(&alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        assert_eq!(inventoried.nlink(), 1);
+
+        let error = delete_inventoried_file(&source, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert!(source.exists());
+        drop(reader);
+        assert_eq!(
+            delete_inventoried_file(&source, &inventoried)
+                .unwrap()
+                .logical_bytes,
+            inventoried.len()
+        );
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_retains_a_mapping_after_its_descriptor_and_alias_are_removed() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        const CONTENT: &[u8] = b"recovery bytes retained only by a memory mapping";
+        const READY: &str = "mapping without a descriptor ready";
+        const READER: &str = r#"
+import mmap
+import os
+import sys
+
+alias = sys.argv[1]
+with open(alias, "rb") as reader:
+    identity = os.fstat(reader.fileno())
+    mapping = mmap.mmap(reader.fileno(), 0, access=mmap.ACCESS_READ)
+# Python before 3.13 duplicates the descriptor inside mmap. Close every copy
+# explicitly, then avoid opening files until mapping.close() so its cleanup
+# cannot close a subsequently reused descriptor.
+for name in os.listdir("/proc/self/fd"):
+    descriptor = int(name)
+    try:
+        observed = os.fstat(descriptor)
+    except OSError:
+        continue
+    if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+        os.close(descriptor)
+os.unlink(alias)
+print("mapping without a descriptor ready", flush=True)
+assert sys.stdin.readline().strip() == "release"
+assert mapping[:] == b"recovery bytes retained only by a memory mapping"
+mapping.close()
+"#;
+
+        let root = fixture();
+        let source = root.join("generation");
+        let alias = root.join("mapped-reader-alias");
+        std::fs::write(&source, CONTENT).unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+        let mut child = std::process::Command::new("python3")
+            .args(["-u", "-c", READER])
+            .arg(&alias)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), READY);
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let child_descriptors = PathBuf::from(format!("/proc/{}/fd", child.id()));
+        let reader_has_descriptor = std::fs::read_dir(child_descriptors).unwrap().any(|entry| {
+            let observed = std::fs::metadata(entry.unwrap().path()).unwrap();
+            observed.dev() == inventoried.dev() && observed.ino() == inventoried.ino()
+        });
+
+        let preflight = preflight_inventoried_file_readers(&source, &inventoried);
+        let deletion = delete_inventoried_file(&source, &inventoried);
+        let retained = std::fs::read(&source);
+        writeln!(child.stdin.take().unwrap(), "release").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        assert!(!reader_has_descriptor, "fixture must hold only a mapping");
+        assert!(!alias.exists());
+        assert_eq!(inventoried.nlink(), 1);
+        for result in [preflight, deletion.map(|_| ())] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(error.to_string().contains("memory mapping"));
+            assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        }
+        assert_eq!(retained.unwrap(), CONTENT);
+        assert_eq!(
+            delete_inventoried_file(&source, &inventoried)
+                .unwrap()
+                .logical_bytes,
+            inventoried.len()
+        );
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_works_for_an_unprivileged_owner_with_protected_foreign_processes() {
+        use std::os::unix::process::CommandExt as _;
+
+        const CHILD: &str = "MCP_AGENT_MAIL_RECLAIM_UNPRIVILEGED_CHILD";
+        let own_uid = std::fs::metadata("/proc/self").unwrap().uid();
+        if own_uid == 0 && std::env::var_os(CHILD).is_none() {
+            let full_name = concat!(
+                module_path!(),
+                "::deletion_works_for_an_unprivileged_owner_with_protected_foreign_processes"
+            );
+            let test_name = full_name.split_once("::").unwrap().1;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("TMPDIR", "/tmp")
+                .uid(65_534)
+                .gid(65_534)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "unprivileged deletion failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        if std::env::var_os(CHILD).is_some() {
+            assert_ne!(own_uid, 0);
+            let protected = std::fs::read_dir("/proc/1/fd").unwrap_err();
+            assert!(matches!(
+                protected.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+            ));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("generation");
+        std::fs::write(&source, b"owned backup").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let bytes = delete_inventoried_file(&source, &inventoried).unwrap();
+        assert_eq!(bytes.logical_bytes, inventoried.len());
+        assert!(!source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_retains_a_nondumpable_same_user_reader() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::Stdio;
+
+        const CHILD_SOURCE: &str = "MCP_AGENT_MAIL_RECLAIM_NONDUMPABLE_SOURCE";
+        const READY: &str = "nondumpable backup reader ready";
+        if let Some(source) = std::env::var_os(CHILD_SOURCE) {
+            let _reader = File::open(source).unwrap();
+            nix::sys::prctl::set_dumpable(false).unwrap();
+            println!("{READY}");
+            std::io::stdout().flush().unwrap();
+            let mut release = String::new();
+            std::io::stdin().read_line(&mut release).unwrap();
+            return;
+        }
+
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"protected same-user recovery bytes").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let full_name = concat!(
+            module_path!(),
+            "::deletion_retains_a_nondumpable_same_user_reader"
+        );
+        let test_name = full_name.split_once("::").unwrap().1;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_SOURCE, &source)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "reader exited before readiness"
+            );
+            if line.contains(READY) {
+                break;
+            }
+            line.clear();
+        }
+        let child_proc = PathBuf::from(format!("/proc/{}", child.id()));
+        assert_eq!(
+            process_reader_uids(&child_proc).unwrap()[1],
+            process_reader_uids(Path::new("/proc/self")).unwrap()[1],
+        );
+        let descriptors_hidden = std::fs::read_dir(child_proc.join("fd"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+        let result = delete_inventoried_file(&source, &inventoried);
+        writeln!(child.stdin.take().unwrap(), "release").unwrap();
+        assert!(child.wait().unwrap().success());
+        let error = result.unwrap_err();
+        if descriptors_hidden {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        } else {
+            // A fully privileged observer can inspect the child, in which
+            // case the actual reader (or another protected process) refuses.
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+            ));
+        }
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"protected same-user recovery bytes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_refuses_an_active_advisory_reader_lock() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"reader-locked backup").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let reader = File::open(&source).unwrap();
+        fs2::FileExt::try_lock_shared(&reader).unwrap();
+        let error = delete_inventoried_file(&source, &inventoried).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(source.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_permission_failure_retains_bytes_and_does_not_claim_unlink() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"permission-protected backup").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let mut attempted = false;
+        let error = delete_inventoried_file_with(
+            &source,
+            &inventoried,
+            |_, _| {
+                attempted = true;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            File::sync_all,
+        )
+        .unwrap_err();
+        assert!(attempted, "fault must occur at the real unlink boundary");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(CompletedReclaimDelete::from_io_error(&error).is_none());
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"permission-protected backup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_reports_post_unlink_sync_failure_without_retrying_a_replacement() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"old completed backup").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let mut sync_count = 0;
+        let error = delete_inventoried_file_with(
+            &source,
+            &inventoried,
+            |parent, name| {
+                rustix::fs::unlinkat(parent, name, AtFlags::empty()).map_err(io::Error::from)
+            },
+            |directory| {
+                sync_count += 1;
+                if sync_count == 2 {
+                    Err(io::Error::other(
+                        "injected directory-sync failure after unlink",
+                    ))
+                } else {
+                    directory.sync_all()
+                }
+            },
+        )
+        .unwrap_err();
+        let completed = CompletedReclaimDelete::from_io_error(&error).unwrap();
+        assert_eq!(completed.source(), source);
+        assert_eq!(completed.bytes().logical_bytes, inventoried.len());
+        assert_eq!(
+            completed.bytes().allocated_bytes,
+            inventoried.blocks().checked_mul(512)
+        );
+        assert!(!source.exists(), "unlink took place despite the sync error");
+
+        std::fs::write(&source, b"new evidence at reused pathname").unwrap();
+        assert!(delete_inventoried_file(&source, &inventoried).is_err());
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"new evidence at reused pathname"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletion_accounting_distinguishes_sparse_length_from_allocated_blocks() {
+        let root = fixture();
+        let source = root.join("sparse-generation");
+        let file = File::create(&source).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let inventoried = std::fs::metadata(&source).unwrap();
+        let bytes = delete_inventoried_file(&source, &inventoried).unwrap();
+        assert_eq!(bytes.logical_bytes, 32 * 1024 * 1024);
+        assert_eq!(bytes.allocated_bytes, inventoried.blocks().checked_mul(512));
+    }
+
+    #[test]
+    fn deletion_refuses_same_length_edits_with_restored_mtime() {
+        let root = fixture();
+        let source = root.join("generation");
+        std::fs::write(&source, b"original bytes").unwrap();
+        let inventoried = std::fs::metadata(&source).unwrap();
+        std::fs::write(&source, b"modified bytes").unwrap();
+        File::open(&source)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(inventoried.modified().unwrap()))
+            .unwrap();
+        assert!(delete_inventoried_file(&source, &inventoried).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"modified bytes");
     }
 
     #[test]

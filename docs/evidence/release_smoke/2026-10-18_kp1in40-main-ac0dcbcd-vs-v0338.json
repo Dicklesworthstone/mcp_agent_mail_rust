@@ -1,0 +1,1085 @@
+{
+ "schema": "br-kp1in.40 closing v1",
+ "rule": "br-kp1in.40 closing re-measurement (written 2026-10-14 ~07:20Z, before the landing push, before any build or run of B).\n\nQuestion: with br-qctx4 (direct inbox read single-table/rowid-driven), br-kp1in.40's probe (no shared-mailbox join for a\nproject without deliveries) and, if it lands, br-g11iy (no write transaction for already-read rows) on main, are inbox\nreads at equal send rate still slower than shipped v0.3.38?\n\nSame experiment and thresholds as kp140_attr_rule.txt (which found v0.3.39 READS SLOWER: 0.834x reads, p50 1.19x,\np99 1.24x):\n- mixed_rate.py, 2 senders A->B paced at 4 sends/s total (open loop), 2 closed-loop readers fetch_inbox(B, limit 20,\n  mark_read=false), 1 search loop, 1 Hz health, 300 s. Order A B B A, host lock, nothing else of mine on the host.\n- A = shipped v0.3.38 glibc artifact (am 171713fa, scratchpad build33/v038/am), as in kp140_attr.\n- B = main at the pushed landing commit, built with run_release_build4.sh (dist features: --no-default-features\n  --features portable), am SHA recorded per run.\n- Validity: every run completes >= 1,140 of 1,200 scheduled sends.\n\nDecision:\n  READS NOT SLOWER: pooled B read count >= 0.90 x A AND pooled B read p99 <= 1.5 x A. Then br-kp1in.40's regression is\n    resolved at equal offered load: the bead closes with this evidence plus kp140_attr's attribution (the closed-loop\n    soak still measures send-rate-driven inbox growth; that harness property is reported, not chased).\n  READS SLOWER: either half fails. Then the bead stays open with the per-window read p50 vs sends_before for both arms,\n    and the next attribution step (evidence-ledger phases) runs before any further code change.\nReported, not deciding: Mode R (mark_read=true) A B B A on the same two binaries; read p50; send p50/p99.\n",
+ "arms": {
+  "A": {
+   "what": "shipped v0.3.38 glibc artifact",
+   "am_sha256": "171713fa43e891f8a3430fc4f0218ff966c78465f53a79eb65253370762dfe3c"
+  },
+  "B": {
+   "what": "main ac0dcbcd, portable release build (run_release_build4.sh)",
+   "am_sha256": "1b0ff39d52ff041dd8f115c9021ad18398593edf3e6e468a9ac88322661442de"
+  }
+ },
+ "harness": "mixed_rate.py: 2 senders paced at 4 sends/s total, 2 closed-loop readers fetch_inbox(limit 20), 1 search loop, 1 Hz health, 300 s; Mode P mark_read=false (decisive), Mode R mark_read=true (reported); A B B A per mode",
+ "host": "thinkstation1 (64 cores), host lock held, no other measurement of mine running",
+ "runs": [
+  {
+   "run": "1-P-A",
+   "mode": "P",
+   "arm": "A",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.0944,
+     "p99": 0.2544,
+     "mean": 0.11602
+    },
+    "read": {
+     "n_ok": 81745,
+     "n_err": 0,
+     "p50": 0.007,
+     "p99": 0.0135,
+     "mean": 0.00733
+    },
+    "search": {
+     "n_ok": 984,
+     "n_err": 0,
+     "p50": 0.2773,
+     "p99": 0.668,
+     "mean": 0.30488
+    },
+    "health": {
+     "n_ok": 275,
+     "n_err": 0,
+     "p50": 0.0765,
+     "p99": 0.1879,
+     "mean": 0.09363
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 14161,
+      "p50": 0.004,
+      "p99": 0.0054
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 11240,
+      "p50": 0.0051,
+      "p99": 0.0067
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 9665,
+      "p50": 0.006,
+      "p99": 0.0077
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 8245,
+      "p50": 0.0069,
+      "p99": 0.0095
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 7635,
+      "p50": 0.0076,
+      "p99": 0.0101
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 7009,
+      "p50": 0.0083,
+      "p99": 0.0112
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 6482,
+      "p50": 0.009,
+      "p99": 0.0125
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 6244,
+      "p50": 0.0094,
+      "p99": 0.0129
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 5748,
+      "p50": 0.0101,
+      "p99": 0.014
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 5316,
+      "p50": 0.0107,
+      "p99": 0.0157
+     }
+    }
+   ],
+   "mark_read": false
+  },
+  {
+   "run": "2-P-B",
+   "mode": "P",
+   "arm": "B",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.0387,
+     "p99": 0.0943,
+     "mean": 0.04075
+    },
+    "read": {
+     "n_ok": 69909,
+     "n_err": 0,
+     "p50": 0.0077,
+     "p99": 0.0176,
+     "mean": 0.00858
+    },
+    "search": {
+     "n_ok": 2812,
+     "n_err": 0,
+     "p50": 0.0414,
+     "p99": 0.2797,
+     "mean": 0.10669
+    },
+    "health": {
+     "n_ok": 283,
+     "n_err": 0,
+     "p50": 0.0613,
+     "p99": 0.0859,
+     "mean": 0.06036
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 13161,
+      "p50": 0.0044,
+      "p99": 0.0066
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 10566,
+      "p50": 0.0055,
+      "p99": 0.008
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 8552,
+      "p50": 0.0068,
+      "p99": 0.0115
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 7443,
+      "p50": 0.0078,
+      "p99": 0.0104
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 6443,
+      "p50": 0.009,
+      "p99": 0.0127
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 5888,
+      "p50": 0.01,
+      "p99": 0.0138
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 5105,
+      "p50": 0.0114,
+      "p99": 0.0152
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 4657,
+      "p50": 0.0125,
+      "p99": 0.017
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 4265,
+      "p50": 0.0137,
+      "p99": 0.0188
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 3829,
+      "p50": 0.0149,
+      "p99": 0.0229
+     }
+    }
+   ],
+   "mark_read": false
+  },
+  {
+   "run": "3-P-B",
+   "mode": "P",
+   "arm": "B",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.0379,
+     "p99": 0.0969,
+     "mean": 0.03974
+    },
+    "read": {
+     "n_ok": 70016,
+     "n_err": 1,
+     "p50": 0.0076,
+     "p99": 0.0177,
+     "mean": 0.00856
+    },
+    "search": {
+     "n_ok": 2768,
+     "n_err": 0,
+     "p50": 0.0419,
+     "p99": 0.2881,
+     "mean": 0.10839
+    },
+    "health": {
+     "n_ok": 283,
+     "n_err": 0,
+     "p50": 0.0609,
+     "p99": 0.086,
+     "mean": 0.06042
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 13277,
+      "p50": 0.0043,
+      "p99": 0.0061
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 10553,
+      "p50": 0.0054,
+      "p99": 0.0077
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 8531,
+      "p50": 0.0068,
+      "p99": 0.0091
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 7514,
+      "p50": 0.0077,
+      "p99": 0.0102
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 6463,
+      "p50": 0.0091,
+      "p99": 0.0121
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 5861,
+      "p50": 0.01,
+      "p99": 0.0137
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 5145,
+      "p50": 0.0113,
+      "p99": 0.0158
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 4605,
+      "p50": 0.0127,
+      "p99": 0.0174
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 4239,
+      "p50": 0.0137,
+      "p99": 0.0195
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 3828,
+      "p50": 0.0153,
+      "p99": 0.0198
+     }
+    }
+   ],
+   "mark_read": false
+  },
+  {
+   "run": "4-P-A",
+   "mode": "P",
+   "arm": "A",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.0811,
+     "p99": 0.1801,
+     "mean": 0.08853
+    },
+    "read": {
+     "n_ok": 81929,
+     "n_err": 0,
+     "p50": 0.0069,
+     "p99": 0.0136,
+     "mean": 0.00732
+    },
+    "search": {
+     "n_ok": 1133,
+     "n_err": 0,
+     "p50": 0.2661,
+     "p99": 0.5031,
+     "mean": 0.26499
+    },
+    "health": {
+     "n_ok": 279,
+     "n_err": 0,
+     "p50": 0.0709,
+     "p99": 0.1372,
+     "mean": 0.07581
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 14258,
+      "p50": 0.004,
+      "p99": 0.0055
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 11190,
+      "p50": 0.005,
+      "p99": 0.0068
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 9684,
+      "p50": 0.006,
+      "p99": 0.0079
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 8343,
+      "p50": 0.0068,
+      "p99": 0.0096
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 7753,
+      "p50": 0.0075,
+      "p99": 0.0099
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 7085,
+      "p50": 0.0082,
+      "p99": 0.0114
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 6577,
+      "p50": 0.0089,
+      "p99": 0.0121
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 6026,
+      "p50": 0.0095,
+      "p99": 0.0135
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 5698,
+      "p50": 0.0102,
+      "p99": 0.0141
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 5314,
+      "p50": 0.0109,
+      "p99": 0.0154
+     }
+    }
+   ],
+   "mark_read": false
+  },
+  {
+   "run": "5-R-A",
+   "mode": "R",
+   "arm": "A",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.1136,
+     "p99": 0.2259,
+     "mean": 0.11656
+    },
+    "read": {
+     "n_ok": 15356,
+     "n_err": 0,
+     "p50": 0.036,
+     "p99": 0.0948,
+     "mean": 0.03907
+    },
+    "search": {
+     "n_ok": 868,
+     "n_err": 0,
+     "p50": 0.3381,
+     "p99": 0.5547,
+     "mean": 0.34563
+    },
+    "health": {
+     "n_ok": 276,
+     "n_err": 0,
+     "p50": 0.0871,
+     "p99": 0.1642,
+     "mean": 0.09064
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 2524,
+      "p50": 0.0219,
+      "p99": 0.0766
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 1099,
+      "p50": 0.051,
+      "p99": 0.1009
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 2011,
+      "p50": 0.0243,
+      "p99": 0.0868
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 1379,
+      "p50": 0.0422,
+      "p99": 0.0877
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 1637,
+      "p50": 0.0278,
+      "p99": 0.0922
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 1456,
+      "p50": 0.0395,
+      "p99": 0.0872
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 1429,
+      "p50": 0.0398,
+      "p99": 0.0914
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 1458,
+      "p50": 0.0399,
+      "p99": 0.0817
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 981,
+      "p50": 0.0593,
+      "p99": 0.1081
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 1382,
+      "p50": 0.0359,
+      "p99": 0.1333
+     }
+    }
+   ],
+   "mark_read": true
+  },
+  {
+   "run": "6-R-B",
+   "mode": "R",
+   "arm": "B",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.039,
+     "p99": 0.09,
+     "mean": 0.04116
+    },
+    "read": {
+     "n_ok": 63189,
+     "n_err": 0,
+     "p50": 0.0078,
+     "p99": 0.0409,
+     "mean": 0.00949
+    },
+    "search": {
+     "n_ok": 2746,
+     "n_err": 0,
+     "p50": 0.0427,
+     "p99": 0.2931,
+     "mean": 0.10925
+    },
+    "health": {
+     "n_ok": 283,
+     "n_err": 0,
+     "p50": 0.0618,
+     "p99": 0.0999,
+     "mean": 0.06256
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 12223,
+      "p50": 0.0044,
+      "p99": 0.0239
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 9463,
+      "p50": 0.0056,
+      "p99": 0.0304
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 7760,
+      "p50": 0.0069,
+      "p99": 0.031
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 6791,
+      "p50": 0.0079,
+      "p99": 0.0323
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 5843,
+      "p50": 0.0092,
+      "p99": 0.0363
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 5205,
+      "p50": 0.0103,
+      "p99": 0.0402
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 4528,
+      "p50": 0.0117,
+      "p99": 0.044
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 4228,
+      "p50": 0.0127,
+      "p99": 0.0449
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 3792,
+      "p50": 0.014,
+      "p99": 0.0508
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 3356,
+      "p50": 0.0158,
+      "p99": 0.05
+     }
+    }
+   ],
+   "mark_read": true
+  },
+  {
+   "run": "7-R-B",
+   "mode": "R",
+   "arm": "B",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.0385,
+     "p99": 0.0912,
+     "mean": 0.04015
+    },
+    "read": {
+     "n_ok": 63978,
+     "n_err": 0,
+     "p50": 0.0078,
+     "p99": 0.0396,
+     "mean": 0.00937
+    },
+    "search": {
+     "n_ok": 2706,
+     "n_err": 0,
+     "p50": 0.0433,
+     "p99": 0.3024,
+     "mean": 0.11086
+    },
+    "health": {
+     "n_ok": 283,
+     "n_err": 0,
+     "p50": 0.0625,
+     "p99": 0.1242,
+     "mean": 0.06223
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 12290,
+      "p50": 0.0043,
+      "p99": 0.0208
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 9759,
+      "p50": 0.0054,
+      "p99": 0.0326
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 7716,
+      "p50": 0.0069,
+      "p99": 0.0318
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 6776,
+      "p50": 0.0078,
+      "p99": 0.0328
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 5924,
+      "p50": 0.0092,
+      "p99": 0.0349
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 5280,
+      "p50": 0.0102,
+      "p99": 0.0396
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 4643,
+      "p50": 0.0115,
+      "p99": 0.0426
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 4288,
+      "p50": 0.0127,
+      "p99": 0.0397
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 3842,
+      "p50": 0.0139,
+      "p99": 0.0487
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 3460,
+      "p50": 0.0155,
+      "p99": 0.0504
+     }
+    }
+   ],
+   "mark_read": true
+  },
+  {
+   "run": "8-R-A",
+   "mode": "R",
+   "arm": "A",
+   "valid": true,
+   "sends_ok": 1200,
+   "kinds": {
+    "send": {
+     "n_ok": 1200,
+     "n_err": 0,
+     "p50": 0.1103,
+     "p99": 0.2148,
+     "mean": 0.1115
+    },
+    "read": {
+     "n_ok": 15852,
+     "n_err": 2,
+     "p50": 0.0347,
+     "p99": 0.0967,
+     "mean": 0.03784
+    },
+    "search": {
+     "n_ok": 866,
+     "n_err": 0,
+     "p50": 0.3421,
+     "p99": 0.5348,
+     "mean": 0.34683
+    },
+    "health": {
+     "n_ok": 276,
+     "n_err": 0,
+     "p50": 0.0863,
+     "p99": 0.1606,
+     "mean": 0.08771
+    }
+   },
+   "windows": [
+    {
+     "t": 0,
+     "sends_before": 0,
+     "read": {
+      "n": 2694,
+      "p50": 0.02,
+      "p99": 0.0808
+     }
+    },
+    {
+     "t": 30,
+     "sends_before": 120,
+     "read": {
+      "n": 2106,
+      "p50": 0.0257,
+      "p99": 0.0778
+     }
+    },
+    {
+     "t": 60,
+     "sends_before": 240,
+     "read": {
+      "n": 1229,
+      "p50": 0.0474,
+      "p99": 0.0932
+     }
+    },
+    {
+     "t": 90,
+     "sends_before": 360,
+     "read": {
+      "n": 2101,
+      "p50": 0.0261,
+      "p99": 0.0868
+     }
+    },
+    {
+     "t": 120,
+     "sends_before": 480,
+     "read": {
+      "n": 1196,
+      "p50": 0.0457,
+      "p99": 0.1
+     }
+    },
+    {
+     "t": 150,
+     "sends_before": 600,
+     "read": {
+      "n": 1285,
+      "p50": 0.0544,
+      "p99": 0.1078
+     }
+    },
+    {
+     "t": 180,
+     "sends_before": 720,
+     "read": {
+      "n": 1526,
+      "p50": 0.0373,
+      "p99": 0.0931
+     }
+    },
+    {
+     "t": 210,
+     "sends_before": 840,
+     "read": {
+      "n": 1107,
+      "p50": 0.054,
+      "p99": 0.1053
+     }
+    },
+    {
+     "t": 240,
+     "sends_before": 960,
+     "read": {
+      "n": 1555,
+      "p50": 0.036,
+      "p99": 0.0964
+     }
+    },
+    {
+     "t": 270,
+     "sends_before": 1080,
+     "read": {
+      "n": 1053,
+      "p50": 0.0554,
+      "p99": 0.1
+     }
+    }
+   ],
+   "mark_read": true
+  }
+ ],
+ "pooled": {
+  "mode_P_peek": {
+   "reads_B_over_A": 0.855,
+   "read_p50_B_over_A": 1.105,
+   "read_p99_B_over_A": 1.304,
+   "send_p50_B_over_A": 0.447,
+   "send_p99_B_over_A": 0.392,
+   "reads": {
+    "A": 163674,
+    "B": 139925
+   },
+   "all_runs_valid": true
+  },
+  "mode_R_mark_read": {
+   "reads_B_over_A": 4.075,
+   "read_p50_B_over_A": 0.22,
+   "read_p99_B_over_A": 0.42,
+   "send_p50_B_over_A": 0.348,
+   "send_p99_B_over_A": 0.413,
+   "reads": {
+    "A": 31208,
+    "B": 127167
+   },
+   "all_runs_valid": true
+  }
+ },
+ "verdict": "READS SLOWER"
+}

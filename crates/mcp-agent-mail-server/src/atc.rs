@@ -7,6 +7,8 @@
 //! Population hydration yields between bounded slices before inference resumes.
 //! A reset invalidates in-flight reports before replacing planning state. Old
 //! reports cannot spend the new epoch's budget or publish reservation actions.
+//! Within an epoch, an older or repeated actionable report cannot follow a
+//! newer admitted tick. Empty hydration progress does not replenish mail budget.
 
 #[path = "atc_engine.rs"]
 mod engine;
@@ -52,6 +54,16 @@ impl DeliveryState {
 
     fn accepts_epoch(&self, epoch: &Arc<()>) -> bool {
         !self.reset_in_progress && Arc::ptr_eq(&self.epoch, epoch)
+    }
+
+    fn accepts_report(&self, epoch: &Arc<()>, report: &AtcTickReport) -> bool {
+        self.accepts_epoch(epoch)
+            && self.last_tick_count.is_none_or(|last| {
+                report.summary.tick_count > last
+                    || (report.summary.tick_count == last
+                        && report.effects.is_empty()
+                        && report.actions.is_empty())
+            })
     }
 }
 
@@ -138,6 +150,8 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
 /// Inference yields while a population refresh is incomplete. A concurrent reset
 /// cancels this call's publication, including critical reservation actions; their
 /// optional-mail exemption is not permission to cross a planning reset.
+/// Reports superseded at admission by a newer tick are discarded as well.
+/// Population authority is revalidated at admission, not just during planning.
 #[must_use]
 pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     let epoch = capture_delivery_epoch()?;
@@ -155,8 +169,13 @@ fn admit_report_with_activity(
     now_micros: i64,
     mut last_activity: impl FnMut(&str) -> Option<i64>,
 ) -> Option<AtcTickReport> {
-    if !delivery_epoch_is_current(epoch) {
-        return None;
+    {
+        let state = delivery_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.accepts_report(epoch, &report) {
+            return None;
+        }
     }
     // Never acquire the engine mutex while owning delivery admission. Engine
     // diagnostics can themselves inspect delivery metrics. These observations
@@ -176,13 +195,29 @@ fn admit_report_with_activity(
                 .or_insert_with(|| last_activity(&effect.agent));
         }
     }
+    // Match reset's hydration -> delivery order. Keep population authority
+    // stable from revalidation through admission; a refresh alone can revoke
+    // targets even when no newer tick has reached the delivery boundary.
+    let mut population_scope = population::lock_report_scope();
     let mut state = delivery_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !state.accepts_epoch(epoch) {
+    if !state.accepts_report(epoch, &report) {
         // Do not start a tick, consume cooldowns, move fairness, or overwrite
-        // the successor epoch's summary for a discarded planning result.
+        // a newer tick's summary. Another caller may have admitted that tick
+        // while this one sampled activity without holding the admission lock.
+        // Critical effects bypass optional-mail limits, never report ordering.
         return None;
+    }
+    if !population_scope.revalidate(&mut report, now_micros) {
+        return None;
+    }
+    if state.last_tick_count == Some(report.summary.tick_count) {
+        // Hydration can yield repeatedly without advancing the engine tick.
+        // accepts_report allows this only for empty progress, which must not
+        // refill the same tick's budget or replace its admitted effect count.
+        report.summary.kernel.pending_effects = 0;
+        return Some(report);
     }
     let before = state.admission.stats();
     state.admission.begin_tick(now_micros);
@@ -207,8 +242,9 @@ fn admit_report_with_activity(
     state.last_effect_count = report.effects.len();
     let after = state.admission.stats();
     drop(state);
-    // Subscribers may inspect delivery metrics. Never invoke them under the
-    // admission mutex, including the first capacity warning.
+    drop(population_scope);
+    // Subscribers may inspect delivery and population metrics. Never invoke
+    // them under either mutex, including the first capacity warning.
     if before.capacity_suppressed == 0 && after.capacity_suppressed > 0 {
         tracing::warn!(
             tracked_keys = after.tracked_keys,
@@ -281,11 +317,13 @@ fn notification_class(kind: &str, family: &str, high_risk: bool) -> Option<Notif
 enum ActionKey {
     Probe(String),
     Advisory(String, String),
+    Release(String),
 }
 
 fn effect_action_key(effect: &AtcEffectPlan) -> Option<ActionKey> {
     match effect.kind.as_str() {
         "probe_agent" => Some(ActionKey::Probe(effect.agent.clone())),
+        "release_reservations_requested" => Some(ActionKey::Release(effect.agent.clone())),
         "send_advisory" => effect
             .message
             .as_ref()
@@ -301,11 +339,13 @@ fn retain_actions(actions: &mut Vec<AtcTickAction>, retained: &mut HashMap<Actio
             AtcTickAction::SendAdvisory { agent, message } => {
                 ActionKey::Advisory(agent.clone(), message.clone())
             }
-            AtcTickAction::ReleaseReservations { .. } => return true,
+            AtcTickAction::ReleaseReservations { agent } => ActionKey::Release(agent.clone()),
         };
         // An action can outlive the bounded ledger entry needed to construct
         // its effect. Without a retained effect it has no delivery entitlement:
-        // otherwise the action-only API could bypass the passive policy.
+        // otherwise the action-only API could bypass the admission boundary.
+        // Releases bypass optional-mail limits, not the need for a matching
+        // retained release proposal. One proposal authorizes only one action.
         let Some(remaining) = retained.get_mut(&key) else {
             return false;
         };
@@ -573,6 +613,205 @@ mod admission_boundary_tests {
     }
 
     #[test]
+    fn older_report_cannot_follow_a_newer_admitted_tick_or_sample_activity() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut older = passive_report(200_000_000);
+        let release = staged_report(201_000_000);
+        older.effects.extend(release.effects);
+        older.actions.extend(release.actions);
+        let newer = staged_report(202_000_000);
+        let newer_tick = newer.summary.tick_count;
+        assert!(newer_tick > older.summary.tick_count);
+        let admitted = admit_report(&epoch, newer, 202_000_000).unwrap();
+        assert_eq!(admitted.effects.len(), 1);
+        assert_eq!(admitted.actions.len(), 1);
+        let before = atc_delivery_stats();
+        assert!(
+            admit_report_with_activity(&epoch, older, 203_000_000, |_| {
+                panic!("superseded report must not query activity")
+            })
+            .is_none()
+        );
+        let state = delivery_state().lock().unwrap();
+        assert_eq!(state.last_tick_count, Some(newer_tick));
+        assert_eq!(state.last_effect_count, 1);
+        assert_eq!(state.admission.stats(), before);
+        assert!(state.last_notification_key.is_none());
+        drop(state);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn report_order_is_rechecked_after_an_unlocked_activity_observation() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut older = passive_report(200_000_000);
+        let release = staged_report(201_000_000);
+        older.effects.extend(release.effects);
+        older.actions.extend(release.actions);
+        let newer = staged_report(202_000_000);
+        let newer_tick = newer.summary.tick_count;
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let old_epoch = Arc::clone(&epoch);
+            let worker = scope.spawn(move || {
+                admit_report_with_activity(&old_epoch, older, 200_000_000, |_| {
+                    started_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Some(1_000_000)
+                })
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let admitted = admit_report(&epoch, newer, 202_000_000).unwrap();
+            assert_eq!(admitted.effects.len(), 1);
+            assert_eq!(admitted.actions.len(), 1);
+            resume_tx.send(()).unwrap();
+            assert!(worker.join().unwrap().is_none());
+        });
+        let state = delivery_state().lock().unwrap();
+        assert_eq!(state.last_tick_count, Some(newer_tick));
+        assert_eq!(state.last_effect_count, 1);
+        assert_eq!(state.admission.stats(), AtcDeliveryStats::default());
+        drop(state);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn repeated_tick_cannot_republish_effects_or_action_only_releases() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        for (keep_effects, keep_actions) in [(true, true), (true, false), (false, true)] {
+            reset_global_atc_state_for_test(&config);
+            let epoch = capture_delivery_epoch().unwrap();
+            let first = admit_report(&epoch, staged_report(200_000_000), 200_000_000).unwrap();
+            // Stage a replay of the accepted tick, including both output APIs.
+            let mut repeated = staged_report(201_000_000);
+            repeated.summary.tick_count = first.summary.tick_count;
+            if !keep_effects {
+                repeated.effects.clear();
+            }
+            if !keep_actions {
+                repeated.actions.clear();
+            }
+            assert!(admit_report(&epoch, repeated, 201_000_000).is_none());
+            let state = delivery_state().lock().unwrap();
+            assert_eq!(state.last_tick_count, Some(first.summary.tick_count));
+            assert_eq!(state.last_effect_count, 1);
+            assert_eq!(state.admission.stats(), AtcDeliveryStats::default());
+        }
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn repeated_empty_progress_does_not_refill_budget_or_erase_admitted_effects() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let admitted = admit_report(&epoch, staged_report(200_000_000), 200_000_000).unwrap();
+        {
+            let mut state = delivery_state().lock().unwrap();
+            for index in 0..delivery::MAX_NOTIFICATIONS_PER_TICK {
+                assert_eq!(
+                    state.admission.admit(
+                        Notification {
+                            key: &format!("conflict:{index}"),
+                            class: NotificationClass::Conflict,
+                            last_activity_micros: None,
+                            cooldown_micros: 1_000_000,
+                        },
+                        200_000_000,
+                    ),
+                    Admission::Admitted
+                );
+            }
+        }
+        let before = atc_delivery_stats();
+        for _ in 0..32 {
+            let mut summary = engine::atc_summary().unwrap();
+            summary.completeness = SnapshotCompleteness::Partial;
+            let progress = AtcTickReport {
+                summary,
+                effects: Vec::new(),
+                actions: Vec::new(),
+            };
+            let returned = admit_report(&epoch, progress, 201_000_000).unwrap();
+            assert_eq!(returned.summary.tick_count, admitted.summary.tick_count);
+            assert_eq!(returned.summary.kernel.pending_effects, 0);
+            assert_eq!(atc_delivery_stats(), before);
+        }
+        let mut state = delivery_state().lock().unwrap();
+        assert_eq!(state.last_effect_count, 1);
+        assert_eq!(
+            state.admission.admit(
+                Notification {
+                    key: "conflict:after-progress",
+                    class: NotificationClass::Conflict,
+                    last_activity_micros: None,
+                    cooldown_micros: 1_000_000,
+                },
+                201_000_000,
+            ),
+            Admission::Deferred,
+            "empty progress must not mint another delivery budget"
+        );
+        drop(state);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn tick_order_does_not_depend_on_wall_clock_order() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let first = admit_report(&epoch, staged_report(200_000_000), 200_000_000).unwrap();
+        let second = admit_report(&epoch, staged_report(199_000_000), 199_000_000).unwrap();
+        assert!(second.summary.tick_count > first.summary.tick_count);
+        assert_eq!(second.effects.len(), 1);
+        assert_eq!(second.actions.len(), 1);
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn successive_public_empty_ticks_continue_to_make_progress() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let mut previous_tick = 0;
+        for step in 0..32 {
+            let report = atc_tick_report(200_000_000 + step).unwrap();
+            assert!(report.summary.tick_count > previous_tick);
+            previous_tick = report.summary.tick_count;
+            assert!(report.effects.is_empty() && report.actions.is_empty());
+        }
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
     fn activity_observer_can_read_metrics_and_reset_before_admission() {
         let _guard = GLOBAL_ATC_TEST_LOCK
             .lock()
@@ -786,7 +1025,8 @@ mod admission_boundary_tests {
             },
         ];
         let key = ActionKey::Advisory("BlueFox".into(), "released".into());
-        retain_actions(&mut actions, &mut HashMap::from([(key, 1)]));
+        let release = ActionKey::Release("BlueFox".into());
+        retain_actions(&mut actions, &mut HashMap::from([(key, 1), (release, 1)]));
         assert_eq!(actions.len(), 2);
         assert!(matches!(
             actions[0],
@@ -838,6 +1078,128 @@ mod admission_boundary_tests {
         ];
         retain_actions(&mut actions, &mut HashMap::new());
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn orphaned_release_is_withheld_without_an_installed_population_scope() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        let mut report = staged_report(200_000_000);
+        // No DB population was installed. The delivery boundary itself must
+        // protect the action-only API when proposal construction lost evidence.
+        report.effects.clear();
+        assert_eq!(report.actions.len(), 1);
+        let admitted = admit_report(&epoch, report, 200_000_000).unwrap();
+        assert!(admitted.effects.is_empty() && admitted.actions.is_empty());
+        assert_eq!(admitted.summary.kernel.pending_effects, 0);
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn unrelated_or_unknown_effect_cannot_authorize_a_release_action() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let epoch = capture_delivery_epoch().unwrap();
+        for (kind, agent) in [
+            ("release_reservations_requested", "RedFox"),
+            ("send_advisory", "BlueFox"),
+            ("future_mutation", "BlueFox"),
+        ] {
+            let mut report = staged_report(200_000_000);
+            report.effects[0].kind = kind.into();
+            report.effects[0].agent = agent.into();
+            report.effects[0].message = Some("outcome notice".into());
+            let admitted = admit_report(&epoch, report, 200_000_000).unwrap();
+            assert_eq!(admitted.effects.len(), 1, "critical effects remain exempt");
+            assert!(admitted.actions.is_empty(), "kind={kind}, agent={agent}");
+        }
+        assert_eq!(atc_delivery_stats(), AtcDeliveryStats::default());
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn retained_release_proposals_bound_action_multiplicity() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        for expected in [1, 2] {
+            reset_global_atc_state_for_test(&config);
+            let epoch = capture_delivery_epoch().unwrap();
+            let mut report = staged_report(200_000_000);
+            if expected == 2 {
+                report.effects.extend(staged_report(201_000_000).effects);
+            }
+            report.actions = vec![
+                AtcTickAction::ReleaseReservations {
+                    agent: "BlueFox".into(),
+                };
+                10_000
+            ];
+            report.actions.push(AtcTickAction::ReleaseReservations {
+                agent: "RedFox".into(),
+            });
+            let admitted = admit_report(&epoch, report, 202_000_000).unwrap();
+            assert_eq!(admitted.effects.len(), expected);
+            assert_eq!(admitted.actions.len(), expected);
+            assert!(admitted.actions.iter().all(|action| matches!(
+                action,
+                AtcTickAction::ReleaseReservations { agent } if agent == "BlueFox"
+            )));
+        }
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn release_pair_survives_zero_optional_budget_while_conflict_is_deferred() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = enabled_config();
+        reset_global_atc_state_for_test(&config);
+        let mut report = staged_report(200_000_000);
+        let mut conflict = staged_report(201_000_000);
+        let effect = &mut conflict.effects[0];
+        effect.kind = "send_advisory".into();
+        effect.message = Some("resolve conflict".into());
+        effect.semantics.family = "deadlock_remediation".into();
+        effect.semantics.high_risk_intervention = false;
+        report.effects.extend(conflict.effects);
+        report.actions.push(AtcTickAction::SendAdvisory {
+            agent: "BlueFox".into(),
+            message: "resolve conflict".into(),
+        });
+        let mut admission = NotificationAdmission::new(0);
+        let mut cursor = None;
+        // Without begin_tick, the optional budget is zero. Matching a release
+        // to its proposal must not turn it into an optional notification.
+        admit_effects(
+            &mut report.effects,
+            &mut report.actions,
+            &mut admission,
+            &mut cursor,
+            202_000_000,
+            |_| panic!("critical release must not consult passive activity"),
+        );
+        assert_eq!(report.effects.len(), 1);
+        assert_eq!(report.effects[0].kind, "release_reservations_requested");
+        assert_eq!(report.actions.len(), 1);
+        assert!(matches!(
+            report.actions[0],
+            AtcTickAction::ReleaseReservations { .. }
+        ));
+        assert_eq!(admission.stats().admitted, 0);
+        assert_eq!(admission.stats().deferred, 1);
+        assert!(cursor.is_none());
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]

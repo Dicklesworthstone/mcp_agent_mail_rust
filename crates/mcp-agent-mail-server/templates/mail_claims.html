@@ -19,7 +19,8 @@
               <strong>Advisory system:</strong> Reservations are <em>signals</em>, not hard locks.
               Agents can still edit files, but they'll see warnings if conflicts exist.
               <span class="inline-block mt-1">
-                Install a <a href="/mail/archive/guide#enforcement" class="underline font-medium hover:text-blue-700 dark:hover:text-blue-300">pre-commit hook</a> to enforce reservations at commit time.
+                Install the pre-commit guard to enforce reservations at commit time:
+                <code class="font-mono text-xs">am guard install {{ project.slug }} /path/to/repo</code>.
               </span>
             </div>
           </div>

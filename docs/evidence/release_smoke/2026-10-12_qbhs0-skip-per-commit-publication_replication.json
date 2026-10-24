@@ -1,0 +1,346 @@
+{
+  "schema": "br-qbhs0-ab-v1",
+  "bead": "br-qbhs0",
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "experiment": "replication of the skip-per-commit-publication experiment (first run: 2026-10-12_qbhs0-skip-per-commit-publication_ab.json, NOT a win on its error guard)",
+  "decision_rule_fixed_before_the_run": "nopub replication (br-qbhs0). Written 2026-10-12 ~18:15Z, after the first nopub A/B (93b86415, NOT a win: its\nerror guard failed 6 vs 1) and before any replication run. This is a new experiment with its own rule. It does not\nre-decide the first one.\n\nSame binaries: base = build19/base3 (main 2dd72851, sha c5c84438); nopub = build25/nopub (2dd72851 +\nnopub_v1.patch, sha 1401e554). paced_swarm.py now records every non-ok call's payload in errors.json.\n\nRuns (60 agents, 300 s, fresh mailbox each, WAL sampled every 5 s):\n  P2 at period 2 s, 5 per arm: base nopub nopub base base nopub nopub base base nopub.\n  P6 at period 6 s, 2 per arm: nopub base base nopub.\n\nDecision:\n  S1. Pooled P2 send p50 and p90 for nopub <= 0.85x base.\n  E1 (error rate). Total P2 client errors for nopub <= base + 5 (over 5 runs per arm). At P6, nopub <= base + 3.\n  E2 (no visibility failures). No nopub error payload mentions a probe miss, a compensating delete, a message\n     that is missing or not visible, or a durability failure. Matched by case-insensitive substrings: \"probe\",\n     \"compensat\", \"not visible\", \"missing\", \"durab\".\n  G1. Pooled P6 send p50 and p90 <= 1.05x base.\n  G2. fetch_inbox pooled p50 <= 1.10x base at both periods.\n  G3. Peak WAL median <= 1.5x base at both periods.\n  C (from the first rule, still required). C1 db lib full with no new failures (the warmup-timing failure is\n     rerun on a normal worker), C2 tools it and conformance pass, C3 visibility test passes.\n\nWIN only if S1, E1, E2, G1-G3 and C all hold. Even then it changes a cross-process publication contract, so it\ngoes to the owner with both A/Bs before landing. Otherwise LOSS / NOT A WIN, reported, not landed.\n",
+  "builds": {
+    "base": {
+      "release_am_sha256": "c5c84438f979c22a3b40f01750866aa0242ab4d4c3a517edcd689f2fed61421a"
+    },
+    "nopub": {
+      "release_am_sha256": "1401e554bb1703135a8d94e899c85c5de97d5978e16cd0dc0e3a385f1015d131",
+      "patch_sha256": "8a1848b3b7f2a07e784d6266f62cce41971a92aff49f8c1ce470705a97347362"
+    }
+  },
+  "runs": [
+    {
+      "run": "1-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.439,
+        "p90": 1.286,
+        "p99": 3.151
+      },
+      "fetch_p50": 0.116,
+      "send_fetch_errors": 2,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 61.509,
+          "type": "RESOURCE_BUSY"
+        },
+        {
+          "tool": "fetch_inbox",
+          "t": 614.201,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16504752
+    },
+    {
+      "run": "2-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.32,
+        "p90": 0.933,
+        "p99": 1.453
+      },
+      "fetch_p50": 0.118,
+      "send_fetch_errors": 1,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 0.633,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16912632
+    },
+    {
+      "run": "3-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.298,
+        "p90": 0.96,
+        "p99": 1.547
+      },
+      "fetch_p50": 0.118,
+      "send_fetch_errors": 0,
+      "error_payloads": [],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16789032
+    },
+    {
+      "run": "4-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.554,
+        "p90": 1.58,
+        "p99": 3.233
+      },
+      "fetch_p50": 0.116,
+      "send_fetch_errors": 0,
+      "error_payloads": [],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16896152
+    },
+    {
+      "run": "5-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.577,
+        "p90": 1.623,
+        "p99": 3.253
+      },
+      "fetch_p50": 0.117,
+      "send_fetch_errors": 0,
+      "error_payloads": [
+        {
+          "tool": "file_reservation_paths",
+          "t": 489.44,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 19067392
+    },
+    {
+      "run": "6-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.311,
+        "p90": 0.922,
+        "p99": 1.75
+      },
+      "fetch_p50": 0.119,
+      "send_fetch_errors": 0,
+      "error_payloads": [],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16797272
+    },
+    {
+      "run": "7-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.282,
+        "p90": 0.851,
+        "p99": 1.581
+      },
+      "fetch_p50": 0.116,
+      "send_fetch_errors": 1,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 211.577,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16912632
+    },
+    {
+      "run": "8-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.486,
+        "p90": 1.328,
+        "p99": 3.29
+      },
+      "fetch_p50": 0.118,
+      "send_fetch_errors": 0,
+      "error_payloads": [],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 17118632
+    },
+    {
+      "run": "9-base-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.578,
+        "p90": 1.805,
+        "p99": 3.282
+      },
+      "fetch_p50": 0.121,
+      "send_fetch_errors": 3,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 167.341,
+          "type": "RESOURCE_BUSY"
+        },
+        {
+          "tool": "fetch_inbox",
+          "t": 172.376,
+          "type": "RESOURCE_BUSY"
+        },
+        {
+          "tool": "fetch_inbox",
+          "t": 601.934,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 17551232
+    },
+    {
+      "run": "10-nopub-p2",
+      "send": {
+        "n": 9000,
+        "p50": 0.304,
+        "p90": 1.1,
+        "p99": 2.256
+      },
+      "fetch_p50": 0.12,
+      "send_fetch_errors": 1,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 132.133,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16953832
+    },
+    {
+      "run": "11-nopub-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.087,
+        "p90": 0.156,
+        "p99": 0.433
+      },
+      "fetch_p50": 0.058,
+      "send_fetch_errors": 0,
+      "error_payloads": [],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16368792
+    },
+    {
+      "run": "12-base-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.105,
+        "p90": 0.342,
+        "p99": 3.097
+      },
+      "fetch_p50": 0.056,
+      "send_fetch_errors": 0,
+      "error_payloads": [],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16764312
+    },
+    {
+      "run": "13-base-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.106,
+        "p90": 0.317,
+        "p99": 1.882
+      },
+      "fetch_p50": 0.059,
+      "send_fetch_errors": 1,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 27.968,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16842592
+    },
+    {
+      "run": "14-nopub-p6",
+      "send": {
+        "n": 3000,
+        "p50": 0.085,
+        "p90": 0.15,
+        "p99": 0.415
+      },
+      "fetch_p50": 0.056,
+      "send_fetch_errors": 1,
+      "error_payloads": [
+        {
+          "tool": "fetch_inbox",
+          "t": 270.786,
+          "type": "RESOURCE_BUSY"
+        }
+      ],
+      "visibility_signature_errors": 0,
+      "wal_peak_bytes": 16290512
+    }
+  ],
+  "pooled": {
+    "base-p2": {
+      "send": {
+        "p50": 0.526,
+        "p90": 1.524,
+        "p99": 3.261
+      },
+      "fetch_p50": 0.117,
+      "send_fetch_errors": 5,
+      "visibility_signature_errors": 0,
+      "wal_peak_median": 17118632
+    },
+    "nopub-p2": {
+      "send": {
+        "p50": 0.302,
+        "p90": 0.943,
+        "p99": 1.755
+      },
+      "fetch_p50": 0.118,
+      "send_fetch_errors": 3,
+      "visibility_signature_errors": 0,
+      "wal_peak_median": 16912632
+    },
+    "nopub-p6": {
+      "send": {
+        "p50": 0.086,
+        "p90": 0.153,
+        "p99": 0.426
+      },
+      "fetch_p50": 0.057,
+      "send_fetch_errors": 1,
+      "visibility_signature_errors": 0,
+      "wal_peak_median": 16329652.0
+    },
+    "base-p6": {
+      "send": {
+        "p50": 0.106,
+        "p90": 0.328,
+        "p99": 2.662
+      },
+      "fetch_p50": 0.057,
+      "send_fetch_errors": 1,
+      "visibility_signature_errors": 0,
+      "wal_peak_median": 16803452.0
+    }
+  },
+  "verdict": "Perf and error conditions of nopub2_rule all hold: S1 P2 send p50 0.575x / p90 0.619x (p99 0.538x); E1 P2 errors 3 vs 5, P6 1 vs 1; E2 zero visibility-signature errors (every error payload in both arms is RESOURCE_BUSY / busy_retryable); G1 P6 p50 0.816x / p90 0.468x (p99 0.160x); G2 fetch 1.007x / 1.000x; G3 WAL peak median 0.99x / 0.97x. Correctness: C1, C2 and C3 all pass. WIN under nopub2_rule. NOT landed: per the rule this changes the cross-process publication contract, so the result goes to the owner before landing.",
+  "correctness": {
+    "C3_visibility_test": "pass (commits_are_visible_to_fresh_and_canonical_readers_without_a_checkpoint)",
+    "C2_tools_it": "124 passed / 0 failed",
+    "C2_conformance": "83 + 3 passed / 0 failed",
+    "C1_db_lib_full": "3498 passed / 1 failed / 8 pre-existing ignores; the 1 is pool::tests::pool_warmup_opens_connections (warmup opened 1 of 5 connections inside its 10 s budget while the whole run took 5,711 s on an overloaded worker; warmup never commits). Targeted rerun: first attempt hit an openssl-sys build-script failure on worker hz4 (infrastructure, no test ran); requeued. Rerun 2026-10-12 20:56Z: pool_warmup_opens_connections ok, pool_warmup_zero_is_noop ok, commits_are_visible... ok (3/0, 1.22 s). C1 holds."
+  },
+  "durability_fsync_check": {
+    "method": "strace -f -y -e trace=fsync,fdatasync around each release binary; heavy_inbox.py with 30 seeded + 100 timed sends (130 commits plus setup) on a fresh mailbox",
+    "base_fsyncs": {
+      "storage.sqlite3-wal": 128,
+      "storage.sqlite3": 218,
+      "storage.sqlite3-wal-cert-head": 107,
+      "archive files (fdatasync)": 404
+    },
+    "nopub_fsyncs": {
+      "storage.sqlite3-wal": 128,
+      "storage.sqlite3": 26,
+      "storage.sqlite3-wal-cert-head": 11,
+      "archive files (fdatasync)": 404
+    },
+    "reading": "Both builds fsync the WAL once per commit, so commit durability against power loss / OS crash is unchanged. nopub drops about 2.2 main-file and cert-head fsyncs per commit, all of which came from the per-commit PASSIVE checkpoint. That is the '~26 ms of fsync per commit' br-qbhs0 was opened for."
+  }
+}

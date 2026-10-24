@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.37"
+version = "0.3.39"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -27,17 +27,17 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.10.0", package = "fastmcp-rust" }
-fastmcp-core = "0.10.0"
-fastmcp-server = "0.10.0"
-fastmcp-transport = "0.10.0"
-fastmcp-protocol = "0.10.0"
+fastmcp = { version = "0.13.0", package = "fastmcp-rust" }
+fastmcp-core = "0.13.0"
+fastmcp-server = "0.13.0"
+fastmcp-transport = "0.13.0"
+fastmcp-protocol = "0.13.0"
 
 # br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
 # The embedded Beads library retains its older private runtime graph.
 asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
-fsqlite = "=0.4.9"
-fsqlite-types = "=0.4.9"
+fsqlite = "=0.4.10"
+fsqlite-types = "=0.4.10"
 
 sqlmodel = "=0.5.0"
 sqlmodel-core = "=0.5.0"
@@ -75,7 +75,7 @@ mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
 mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
-franken-agent-detection = "0.2.2"
+franken-agent-detection = "0.3.7"
 cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
 serde = { version = "1", features = ["derive"] }
@@ -87,7 +87,7 @@ json5 = "1.3.1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 web-time = "1.1.0"
-comrak = { version = "0.55.0", default-features = false }
+comrak = { version = "0.56.0", default-features = false }
 include_dir = "0.7.4"
 minijinja = "2.15.1"
 ammonia = "4.2.0"
@@ -195,20 +195,9 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# Preserve GH321 proposal negotiation and GH332 empty-extension-header admission
-# on FastMCP's Asupersync 0.5 line; registry 0.10.0 predates both fixes.
-# Keep all framework crates together.
-fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-core = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-transport = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-protocol = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-console = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-client = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
-fastmcp-derive = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "03b5274544048babf6b358874310038a9ee4f76a" }
 # Beads 0.5.4 still embeds the 0.3 engine. Preserve its qualified WAL,
 # read-only snapshot, DDL, prepared binding and Windows identity fixes.
-# The mailbox uses registry FrankenSQLite 0.4.9 (no patch).
+# The mailbox uses registry FrankenSQLite 0.4.10 (no patch).
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
@@ -230,10 +219,12 @@ fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev
 fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
 # The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# registry FrankenSQLite 0.4.9 and pinned FastMCP 0.10.0.
+# registry FrankenSQLite 0.4.10 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
 # the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).
+# 0.4.10 adds the b-tree insert-in-transaction (bd-obwsy) and retried-fsync
+# (bd-alyrn) integrity fixes and max-rowid parity (br-9pnpe).
 # No mutable sibling checkout is required.
 #
 # beads_rust =0.6.0 is published and resolves from crates.io. Do not patch it

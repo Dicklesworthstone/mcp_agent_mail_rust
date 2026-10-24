@@ -86,6 +86,68 @@ pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, co
     }
 }
 
+/// Write the `.signal` file `send_message` writes for each to/cc recipient,
+/// for a message a tool inserts directly (force-release notes), so signal
+/// watchers hear about it as well as inbox pollers. Best-effort, like the
+/// send path's.
+pub(crate) fn signal_direct_recipient(
+    config: &Config,
+    project_slug: &str,
+    recipient: &str,
+    from: &str,
+    message: &mcp_agent_mail_db::MessageRow,
+) {
+    let meta = mcp_agent_mail_storage::NotificationMessage {
+        id: message.id,
+        from: Some(from.to_string()),
+        subject: Some(message.subject.clone()),
+        importance: Some(message.importance.clone()),
+    };
+    let outcome = mcp_agent_mail_storage::emit_notification_signal(
+        config,
+        project_slug,
+        recipient,
+        Some(&meta),
+    );
+    tracing::debug!(recipient, ?outcome, "direct message notification signal");
+}
+
+/// Archive envelope of a system notice (contact request, contact approval,
+/// reservation notice): one sender, TO recipients only, no attachments.
+///
+/// It must carry the keys `send_message` writes, in the same order, because
+/// the DB-to-archive reconciler renders that envelope for any message it finds
+/// missing from the archive, and key order is part of the file bytes
+/// (`preserve_order`). Notices written without `topic` differed from the
+/// reconciler's copy of the same message. When the reconciler repaired a
+/// notice whose queued write had not drained yet, that write met a same-path
+/// file with different content and was refused as a canonical-id collision.
+/// That latched archive durability, after which every write was refused.
+pub(crate) fn notice_archive_json(
+    message: &mcp_agent_mail_db::MessageRow,
+    from: &str,
+    to: &[String],
+    project_key: &str,
+    project_slug: &str,
+) -> serde_json::Value {
+    json!({
+        "id": message.id.unwrap_or(0),
+        "from": from,
+        "to": to,
+        "cc": [],
+        "bcc": [],
+        "subject": &message.subject,
+        "created": micros_to_iso(message.created_ts),
+        "thread_id": &message.thread_id,
+        "topic": &message.topic,
+        "project": project_key,
+        "project_slug": project_slug,
+        "importance": &message.importance,
+        "ack_required": message.ack_required != 0,
+        "attachments": [],
+    })
+}
+
 /// Write a message bundle to the git archive (best-effort).
 /// Failures are logged but never fail the tool call.
 ///
@@ -271,6 +333,35 @@ fn agent_deregistered_error(agent: &mcp_agent_mail_db::AgentRow) -> McpError {
         ),
         false,
         json!({ "agent_name": agent.name }),
+    )
+}
+
+/// The #122 write-back latch refusal shared by `send_message` and
+/// `reply_message`. The server discharges the latch itself once the archive
+/// reconciler re-archives every failed message (br-6r7k2), so the text must
+/// not send operators to `am doctor repair` alone: that refuses a live owner.
+fn durability_degraded_error() -> McpError {
+    let stats = mcp_agent_mail_storage::wbq_stats();
+    legacy_tool_error(
+        "DURABILITY_DEGRADED",
+        format!(
+            "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
+             last failure at us={}); refusing new messages until the failed write-backs are \
+             verified in the archive. The server re-archives failed messages and lifts this \
+             refusal by itself once disk pressure is below critical (it retries about once a \
+             minute; /health/durability shows the state). If it persists, a supervised restart \
+             reruns the archive reconcile, or run `am doctor repair` after draining the server \
+             (repair refuses a live owner).",
+            stats.unrecoverable_errors, stats.last_unrecoverable_error_us
+        ),
+        true,
+        json!({
+            "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+            "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+            "wbq_errors_total": stats.errors,
+            "wbq_enqueued_total": stats.enqueued,
+            "wbq_drained_total": stats.drained,
+        }),
     )
 }
 
@@ -477,6 +568,17 @@ enum ContactPolicyDecision {
     BlockAll,
 }
 
+/// A stored contact policy as one of the four known policies; anything else
+/// is treated as `auto`.
+fn normalized_contact_policy(policy_raw: &str) -> &'static str {
+    match policy_raw.to_lowercase().as_str() {
+        "open" => "open",
+        "contacts_only" => "contacts_only",
+        "block_all" => "block_all",
+        _ => "auto",
+    }
+}
+
 fn contact_policy_decision(
     sender_name: &str,
     recipient_name: &str,
@@ -489,10 +591,7 @@ fn contact_policy_decision(
         return ContactPolicyDecision::Allow;
     }
 
-    let mut policy = policy_raw.to_lowercase();
-    if !["open", "auto", "contacts_only", "block_all"].contains(&policy.as_str()) {
-        policy = "auto".to_string();
-    }
+    let policy = normalized_contact_policy(policy_raw);
 
     // 2) block_all is an immediate hard stop.
     if policy == "block_all" {
@@ -563,6 +662,178 @@ fn reservations_prove_shared_scope_for_contact(
             sender_pattern.overlaps(recipient_pattern)
         })
     })
+}
+
+/// Evidence for the contact-policy decision of each recipient of one send.
+#[derive(Default)]
+struct ContactEvidence {
+    /// Allowed under `auto` by thread participation or shared reservations.
+    auto_ok_names: HashSet<String>,
+    /// Allowed under `auto` by a recent message exchange.
+    recent_ids: HashSet<i64>,
+    /// Approved links, which satisfy `auto` and `contacts_only`.
+    approved_ids: HashSet<i64>,
+}
+
+/// Gather contact evidence lazily (br-qbhs0) for `recipients` of `sender`.
+///
+/// Every source is a read that can only turn a recipient's decision into
+/// Allow. So sources run cheapest first, each only for the recipients still
+/// waiting on evidence, and the chain stops once none waits. Recipients whose
+/// policy needs no evidence (`open`, `block_all`, the sender itself) never
+/// trigger a lookup, and only `auto` recipients consult recency, thread
+/// participation and shared reservations. Decisions match the eager lookups
+/// every send used to make: 62 ms p50 of a 136 ms send at 10 sends/s, including
+/// a 500-row thread participant scan and every active reservation in the
+/// project. Each source keeps its fail-open behaviour.
+#[allow(clippy::too_many_arguments)]
+async fn gather_contact_evidence<'a>(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    sender_id: i64,
+    sender_name: &str,
+    recipients: impl IntoIterator<Item = &'a mcp_agent_mail_db::AgentRow>,
+    thread_id: &str,
+    since_ts: i64,
+) -> ContactEvidence {
+    let mut evidence = ContactEvidence::default();
+    let waiting: Vec<&mcp_agent_mail_db::AgentRow> = recipients
+        .into_iter()
+        .filter(|agent| agent.name != sender_name)
+        .filter(|agent| {
+            matches!(
+                normalized_contact_policy(&agent.contact_policy),
+                "auto" | "contacts_only"
+            )
+        })
+        .collect();
+    let ids_of = |agents: &[&mcp_agent_mail_db::AgentRow]| -> Vec<i64> {
+        let mut ids: Vec<i64> = agents
+            .iter()
+            .filter_map(|agent| agent.id)
+            .filter(|id| *id != sender_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+
+    let candidate_ids = ids_of(&waiting);
+    if candidate_ids.is_empty() {
+        return evidence;
+    }
+    evidence.approved_ids = contact_ids_or_fail_open(
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_approved_contact_ids(
+                ctx.cx(),
+                pool,
+                project_id,
+                sender_id,
+                &candidate_ids,
+            )
+            .await,
+        ),
+        &candidate_ids,
+        "list_approved_contact_ids",
+    );
+
+    // Only `auto` recipients can be allowed by anything but an approval.
+    let mut auto_waiting: Vec<&mcp_agent_mail_db::AgentRow> = waiting
+        .into_iter()
+        .filter(|agent| normalized_contact_policy(&agent.contact_policy) == "auto")
+        .filter(|agent| {
+            !agent
+                .id
+                .is_some_and(|id| evidence.approved_ids.contains(&id))
+        })
+        .collect();
+    let auto_ids = ids_of(&auto_waiting);
+    if auto_ids.is_empty() {
+        return evidence;
+    }
+    evidence.recent_ids = contact_ids_or_fail_open(
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
+                ctx.cx(),
+                pool,
+                project_id,
+                sender_id,
+                &auto_ids,
+                since_ts,
+            )
+            .await,
+        ),
+        &auto_ids,
+        "list_recent_contact_agent_ids",
+    );
+    auto_waiting.retain(|agent| !agent.id.is_some_and(|id| evidence.recent_ids.contains(&id)));
+
+    if !auto_waiting.is_empty() && !thread_id.is_empty() {
+        // GH#260: join-free, body-free participant lookup. The previous
+        // `list_thread_messages` + `list_message_recipient_names_for_messages`
+        // pair materialized full bodies and used OR-disjunct / IN+JOIN query
+        // shapes that FrankenSQLite executes as whole-table nested loops, so
+        // one send into a ≥500-message thread on a large mailbox burned CPU
+        // for minutes behind the global message-write serializer and wedged
+        // every other send.
+        let participants = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_thread_participant_names(
+                ctx.cx(),
+                pool,
+                project_id,
+                thread_id,
+                500,
+            )
+            .await,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
+            );
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .contact_enforcement_bypass_total
+                .inc();
+            Vec::new()
+        });
+        evidence.auto_ok_names.extend(participants);
+        auto_waiting.retain(|agent| !evidence.auto_ok_names.contains(&agent.name));
+    }
+
+    if !auto_waiting.is_empty() {
+        // Allow if sender and recipient share overlapping active file reservations.
+        let reservations = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), pool, project_id).await,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("contact enforcement: get_active_reservations failed (fail-open): {e}");
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .contact_enforcement_bypass_total
+                .inc();
+            Vec::new()
+        });
+        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
+            HashMap::with_capacity(reservations.len());
+        for res in reservations {
+            patterns_by_agent.entry(res.agent_id).or_default().push(
+                (*mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(&res.path_pattern))
+                    .clone(),
+            );
+        }
+        if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
+            for agent in auto_waiting {
+                if let Some(rec_id) = agent.id
+                    && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
+                    && reservations_prove_shared_scope_for_contact(sender_patterns, rec_patterns)
+                {
+                    evidence.auto_ok_names.insert(agent.name.clone());
+                }
+            }
+        }
+    }
+    evidence
 }
 
 /// br-kp1in.15: find a non-blocked contact of `sender` in ANOTHER project whose
@@ -670,6 +941,134 @@ fn split_qualified_recipient(raw: &str) -> McpResult<Option<(String, String)>> {
     let name =
         mcp_agent_mail_core::models::normalize_agent_name(name).unwrap_or_else(|| name.to_string());
     Ok(Some((name, project.to_string())))
+}
+
+// ---------------------------------------------------------------------------
+// Project-addressed shared mailboxes (GH#282)
+// ---------------------------------------------------------------------------
+//
+// `project:<slug>` (or `project:<human_key>`) addresses the sender's own
+// project mailbox. The message is stored once with one project delivery; every
+// active agent of the project reads it from its inbox. It is never broadcast:
+// no per-agent rows, signals or archive copies are fanned out.
+
+/// The shared-mailbox address taken out of the recipient lists, if any.
+#[derive(Debug, Clone)]
+struct ProjectMailboxRecipient {
+    /// `to` or `cc`: the slot the address was written in (`to` wins).
+    kind: &'static str,
+    /// Canonical address, `project:<slug>`.
+    address: String,
+}
+
+/// Remove shared-mailbox addresses from `to`/`cc`/`bcc` and validate them.
+///
+/// The address must name the sender's own project (by slug or human key):
+/// a shared mailbox has no agent whose contact policy could admit a
+/// cross-project delivery. BCC is refused because every agent of the project
+/// sees the message.
+async fn take_project_mailbox_recipient(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    sender_project: &mcp_agent_mail_db::ProjectRow,
+    to: &mut Vec<String>,
+    cc: &mut Vec<String>,
+    bcc: &[String],
+) -> McpResult<Option<ProjectMailboxRecipient>> {
+    use mcp_agent_mail_db::project_mailbox::{
+        parse_project_mailbox_address, project_mailbox_address,
+    };
+
+    if let Some(raw) = bcc
+        .iter()
+        .find(|name| parse_project_mailbox_address(name).is_some())
+    {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "'{}' is a project mailbox, which every agent of the project reads; it cannot \
+                 be a bcc recipient. Put it in to or cc.",
+                raw.trim()
+            ),
+            true,
+            json!({ "field": "bcc", "error_detail": raw.trim() }),
+        ));
+    }
+
+    let mut kind: Option<&'static str> = None;
+    for (slot, names) in [("to", &mut *to), ("cc", &mut *cc)] {
+        let mut kept = Vec::with_capacity(names.len());
+        for raw in names.drain(..) {
+            let Some(ident) = parse_project_mailbox_address(&raw) else {
+                kept.push(raw);
+                continue;
+            };
+            if ident.is_empty() {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "Invalid recipient '{}': a project mailbox is addressed as \
+                         'project:<slug>' (see resource://projects).",
+                        raw.trim()
+                    ),
+                    true,
+                    json!({ "field": slot, "error_detail": raw.trim() }),
+                ));
+            }
+            let names_sender_project = ident == sender_project.slug
+                || ident == sender_project.human_key
+                || match resolve_existing_project(ctx, pool, ident).await {
+                    Ok(project) => project.id == sender_project.id,
+                    Err(_) => false,
+                };
+            if !names_sender_project {
+                return Err(legacy_tool_error(
+                    "INVALID_ARGUMENT",
+                    format!(
+                        "'{}' does not name this project's mailbox. A project mailbox can only \
+                         be addressed from inside its own project ('{}'); to reach agents of \
+                         another project, address each one as 'Name@project' over an approved \
+                         contact link.",
+                        raw.trim(),
+                        project_mailbox_address(&sender_project.slug)
+                    ),
+                    true,
+                    json!({
+                        "field": slot,
+                        "error_detail": raw.trim(),
+                        "project_mailbox": project_mailbox_address(&sender_project.slug),
+                    }),
+                ));
+            }
+            if kind.is_none() {
+                kind = Some(slot);
+            }
+        }
+        *names = kept;
+    }
+    Ok(kind.map(|kind| ProjectMailboxRecipient {
+        kind,
+        address: project_mailbox_address(&sender_project.slug),
+    }))
+}
+
+/// Recipient lists for envelopes, archives and responses: the agent names
+/// plus the shared-mailbox address in the slot it was written in.
+fn with_project_mailbox_address(
+    to: &[String],
+    cc: &[String],
+    mailbox: Option<&ProjectMailboxRecipient>,
+) -> (Vec<String>, Vec<String>) {
+    let mut to = to.to_vec();
+    let mut cc = cc.to_vec();
+    if let Some(mailbox) = mailbox {
+        if mailbox.kind == "cc" {
+            cc.push(mailbox.address.clone());
+        } else {
+            to.push(mailbox.address.clone());
+        }
+    }
+    (to, cc)
 }
 
 /// Whether any recipient in the three lists is project-qualified.
@@ -1617,6 +2016,21 @@ pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> 
     Ok(())
 }
 
+/// [`normalize_send_message_arguments`] for `reply_message`.
+///
+/// A reply's `to` is optional (omitted = reply to the original sender), so an
+/// explicit `null` means omitted, as it does for every optional parameter,
+/// instead of the "must be a list" refusal `send_message` gives its required
+/// `to`.
+pub fn normalize_reply_message_arguments(arguments: &mut Value) -> McpResult<()> {
+    if let Some(args) = arguments.as_object_mut()
+        && args.get("to").is_some_and(Value::is_null)
+    {
+        args.remove("to");
+    }
+    normalize_send_message_arguments(arguments)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn push_recipient(
     ctx: &McpContext,
@@ -2081,6 +2495,71 @@ fn redacted_send_target_outcomes(
     outcomes
 }
 
+/// How a send's sender was proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderProof {
+    /// No proof: the trusted-local default.
+    Unverified,
+    /// A matching `sender_token`.
+    Token,
+    /// The caller's MCP session established this agent (GH#279, opt-in).
+    Session,
+}
+
+impl SenderProof {
+    const fn verified(self) -> bool {
+        !matches!(self, Self::Unverified)
+    }
+}
+
+/// Sender proof for a send or reply, including the caller's MCP session
+/// (GH#279). A supplied token is always checked; without one, an agent this
+/// session holds is verified by the session, also under the fail-closed send
+/// profile. A session that holds another identity in the project cannot send
+/// as this agent by naming it.
+fn verify_sender(
+    ctx: &McpContext,
+    sender: &mcp_agent_mail_db::AgentRow,
+    sender_name: &str,
+    sender_token: Option<&str>,
+    require_verified_sender: bool,
+) -> McpResult<SenderProof> {
+    let token = sender_token.filter(|token| !token.is_empty());
+    if token.is_none() && crate::session_identity::holds(ctx, sender.id) {
+        return Ok(SenderProof::Session);
+    }
+    let verified = verify_sender_identity(
+        sender_name,
+        token,
+        sender.registration_token.as_deref(),
+        require_verified_sender,
+    )?;
+    crate::session_identity::authorize_actor(ctx, sender, verified, "send messages")?;
+    Ok(if verified {
+        SenderProof::Token
+    } else {
+        SenderProof::Unverified
+    })
+}
+
+/// Mark a session-verified send so audit and diagnostics can tell it from a
+/// token-verified one (`"sender_verification": "session"`).
+fn with_sender_proof_marker(response_json: String, proof: SenderProof) -> String {
+    if proof != SenderProof::Session {
+        return response_json;
+    }
+    match serde_json::from_str::<Value>(&response_json) {
+        Ok(Value::Object(mut map)) => {
+            map.insert(
+                "sender_verification".to_string(),
+                Value::String("session".to_string()),
+            );
+            serde_json::to_string(&Value::Object(map)).unwrap_or(response_json)
+        }
+        _ => response_json,
+    }
+}
+
 fn verify_sender_identity(
     sender_name: &str,
     sender_token: Option<&str>,
@@ -2166,9 +2645,18 @@ pub struct InboxMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_ts: Option<String>,
     pub kind: String,
+    /// `"project"` when the message reached this inbox through the project's
+    /// shared mailbox (GH#282) rather than as a direct to/cc/bcc delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
+}
+
+/// The `via` marker of an inbox row with recipient `kind`.
+pub(crate) fn inbox_via(kind: &str) -> Option<String> {
+    (kind == mcp_agent_mail_db::project_mailbox::PROJECT_MAILBOX_KIND).then(|| kind.to_string())
 }
 
 /// Project-scoped message returned by `fetch_topic`.
@@ -2430,12 +2918,14 @@ async fn try_replay_message(
         &project.human_key,
     )
     .await?;
-    let verified_sender = verify_sender_identity(
+    let sender_proof = verify_sender(
+        ctx,
+        &sender,
         sender_name,
         sender_token,
-        sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    let verified_sender = sender_proof.verified();
     let claim = mcp_agent_mail_db::IdempotencyClaim {
         project_id: project.id.unwrap_or(0),
         tool: if reply_to.is_some() {
@@ -2477,7 +2967,7 @@ async fn try_replay_message(
                 reply_to,
                 verified_sender,
             )
-            .map(Some)
+            .map(|json| Some(with_sender_proof_marker(json, sender_proof)))
         }
         Some(Err(conflict)) => Err(crate::idempotency::idempotency_conflict_error(&conflict)),
         None => Ok(None),
@@ -2511,7 +3001,7 @@ async fn try_replay_message(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\n    `Name@project` (project slug or human key) addresses an agent in another project;\n    see Edge cases.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- A plain name addresses this project only: a name that is not registered here but is your contact (or a product peer) in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- `Name@project` (or `project:<project>#Name`) is resolved in that project only, never auto-registered, and delivered only over an approved, unexpired contact link with that agent (else CONTACT_REQUIRED / CONTACT_BLOCKED). The message is stored in the recipient's project, so it is read, acknowledged and replied to there; the delivery's `project` names it. One message lives in one project, so qualified and local recipients cannot be mixed in one call.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
+    description = "Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.\n\nDiscovery\n---------\nTo discover available agent names for recipients, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nWhat this does\n--------------\n- Stores message (and recipients) in the database; updates sender's activity\n- Writes a canonical `.md` under `messages/YYYY/MM/`\n- Writes sender outbox and per-recipient inbox copies\n- Optionally converts referenced images to WebP and embeds small images inline\n- Supports explicit attachments via `attachment_paths` in addition to inline references\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`).\nsender_name : str\n    Must match an agent registered in the project.\nto : list[str]\n    Primary recipients (agent names). At least one of to/cc/bcc must be non-empty.\n    `Name@project` (project slug or human key) addresses an agent in another project;\n    see Edge cases. `project:<slug>` addresses this project's shared mailbox\n    (stored once; every other agent of the project reads it); see Edge cases.\nsubject : str\n    Short subject line that will be visible in inbox/outbox and search results.\nbody_md : str\n    GitHub-Flavored Markdown body. Image references can be file paths or data URIs.\ncc, bcc : Optional[list[str]]\n    Additional recipients by name.\nattachment_paths : Optional[list[str]]\n    Extra file paths to include as attachments; will be converted to WebP and stored.\nconvert_images : Optional[bool]\n    Overrides server default for image conversion/inlining. If None, server settings apply.\n    Note: sender attachments_policy \"inline\"/\"file\" always forces conversion/inlining.\nimportance : str\n    One of {\"low\",\"normal\",\"high\",\"urgent\"} (free form tolerated; used by filters).\nack_required : bool\n    If true, recipients should call `acknowledge_message` after reading.\nthread_id : Optional[str]\n    If provided, message will be associated with an existing thread.\nbroadcast : bool\n    Reserved for schema compatibility only. `broadcast=true` is intentionally\n    rejected to prevent agent spam; address agents explicitly instead.\ntopic : Optional[str]\n    Optional case-insensitive tag (1-64 ASCII characters). It must begin with an\n    alphanumeric character; remaining characters may also include `.`, `_`, or `-`.\n    Replies inherit the original message's topic.\nsender_token : Optional[str]\n    Registration token returned by `register_agent`. If provided and valid,\n    the response includes `verified_sender: true`. If provided but mismatched,\n    the call is rejected. If omitted, the message sends but with `verified_sender: false`.\n\nReturns\n-------\ndict\n    {\n      \"deliveries\": [ { \"project\": str, \"payload\": { ... message payload ... } } ],\n      \"count\": int,\n      \"verified_sender\": bool\n    }\n\nEdge cases\n----------\n- If no recipients are given, the call fails.\n- Unknown recipient names in the same project are auto-registered as placeholder agents (program/model `unknown`, profile archived) while MESSAGING_AUTO_REGISTER_RECIPIENTS is on (default) and the registration proof gate is off; otherwise the send fails fast. Register recipients first when they need a real identity.\n- A plain name addresses this project only: a name that is not registered here but is your contact (or a product peer) in another project is refused with CROSS_PROJECT_RECIPIENT (never auto-registered locally).\n- `Name@project` (or `project:<project>#Name`) is resolved in that project only, never auto-registered, and delivered only over an approved, unexpired contact link with that agent (else CONTACT_REQUIRED / CONTACT_BLOCKED). The message is stored in the recipient's project, so it is read, acknowledged and replied to there; the delivery's `project` names it. One message lives in one project, so qualified and local recipients cannot be mixed in one call.\n- `project:<slug>` (or `project:<human_key>`) in `to` or `cc` addresses the sender's own project mailbox. The message is stored ONCE with one project delivery, not copied per agent: every other non-retired agent of the project that was registered when it was sent sees it in `fetch_inbox` with `via: \"project\"` (an agent whose contact_policy is `block_all` opts out; a direct to/cc/bcc delivery to the same agent takes precedence). Each agent's read/ack state is its own (`acknowledge_message`, `mark_message_read`); `get_message_delivery_receipt` reports them under `project_mailbox`. It can be combined with named recipients, cannot be bcc, and cannot name another project. This is not `broadcast`: nothing is fanned out.\n- Non-absolute attachment paths are resolved relative to the project archive root.\n- `broadcast=true` is intentionally rejected.\n\nDo / Don't\n----------\nDo:\n- Keep subjects concise and specific (aim for \u{2264} 80 characters).\n- Use `thread_id` (or `reply_message`) to keep related discussion in a single thread.\n- Address only relevant recipients; use CC/BCC sparingly and intentionally.\n- Prefer Markdown links; attach images only when they materially aid understanding. The server\n  auto-converts images to WebP and may inline small images depending on policy.\n\nDon't:\n- Send large, repeated binaries\u{2014}reuse prior attachments via `attachment_paths` when possible.\n- Change topics mid-thread\u{2014}start a new thread for a new subject.\n- Broadcast to \"all\" agents unnecessarily\u{2014}target just the agents who need to act.\n\nExamples\n--------\n1) Simple message:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Plan for /api/users\",\"body_md\":\"See below.\"\n}}}\n```\n\n2) Inline image (auto-convert to WebP and inline if small):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6a\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Diagram\",\"body_md\":\"![diagram](docs/flow.png)\",\"convert_images\":true\n}}}\n```\n\n3) Explicit attachments:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"6b\",\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"sender_name\":\"GreenCastle\",\"to\":[\"BlueLake\"],\n  \"subject\":\"Screenshots\",\"body_md\":\"Please review.\",\"attachment_paths\":[\"shots/a.png\",\"shots/b.png\"]\n}}}\n```\n\nIdempotency\n-----------\nidempotency_key : Optional[str]\n    Optional client key that makes this send safe to retry after a timeout. A retry\n    with the same key and identical arguments replays the original result (same\n    message id) with \"idempotent_replay\": true and does NOT create a second message\n    or a second git-archive write. Reusing the key with different arguments returns\n    error type IDEMPOTENCY_KEY_CONFLICT. Keys are scoped per (project, tool) and\n    retained for a configurable window (default 24h; AM_IDEMPOTENCY_RETENTION_SECS).\n    Omit to preserve default behavior."
 )]
 pub async fn send_message(
     ctx: &McpContext,
@@ -2773,25 +3263,7 @@ effective_free_bytes={free}"
     // writes in that state would issue more such IDs and produce silent
     // data loss. Refuse loud and direct the operator at the recovery path.
     if mcp_agent_mail_storage::durability_degraded() {
-        let stats = mcp_agent_mail_storage::wbq_stats();
-        return Err(legacy_tool_error(
-            "DURABILITY_DEGRADED",
-            format!(
-                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
-                 last failure at us={}); refusing to accept new messages until operator clears the \
-                 durability flag via `am doctor repair` (which will also recover any in-memory \
-                 rows that never persisted)",
-                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
-            ),
-            true,
-            json!({
-                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
-                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
-                "wbq_errors_total": stats.errors,
-                "wbq_enqueued_total": stats.enqueued,
-                "wbq_drained_total": stats.drained,
-            }),
-        ));
+        return Err(durability_degraded_error());
     }
 
     let pool = get_db_pool()?;
@@ -2799,14 +3271,20 @@ effective_free_bytes={free}"
     let project_id = project.id.unwrap_or(0);
     let base_dir = Path::new(&project.human_key);
 
+    // GH#282: take the shared-mailbox address out of the agent lists before
+    // any name is parsed as an agent or a project-qualified agent.
+    let mut to = to;
+    let mut cc_list = cc.unwrap_or_default();
+    let bcc_list = bcc.unwrap_or_default();
+    let project_mailbox =
+        take_project_mailbox_recipient(ctx, &pool, &project, &mut to, &mut cc_list, &bcc_list)
+            .await?;
+
     // A qualified send validates its thread in the project that stores the
     // message, once that is resolved (after sender verification). A delegated
     // reply inherits an already-validated thread from its parent.
-    let has_qualified_recipients = any_qualified_recipient(
-        to.iter()
-            .chain(cc.iter().flatten())
-            .chain(bcc.iter().flatten()),
-    );
+    let has_qualified_recipients =
+        any_qualified_recipient(to.iter().chain(&cc_list).chain(&bcc_list));
     if !has_qualified_recipients
         && reply.is_none()
         && let Some(ref tid) = thread_id
@@ -2839,12 +3317,14 @@ effective_free_bytes={free}"
     // The opt-in fail-closed profile rejects missing/unavailable proof before
     // recipient resolution, auto-registration, contact handshakes, DB writes,
     // notifications, or archive dispatch can occur.
-    let verified_sender = verify_sender_identity(
+    let sender_proof = verify_sender(
+        ctx,
+        &sender,
         &sender_name,
         sender_token.as_deref(),
-        sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    let verified_sender = sender_proof.verified();
     crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
@@ -2852,8 +3332,8 @@ effective_free_bytes={free}"
         let sender_lower = sender_name.trim().to_ascii_lowercase();
         let all_named: Vec<&str> = to
             .iter()
-            .chain(cc.iter().flatten())
-            .chain(bcc.iter().flatten())
+            .chain(&cc_list)
+            .chain(&bcc_list)
             .map(String::as_str)
             .collect();
         if all_named
@@ -2870,10 +3350,7 @@ effective_free_bytes={free}"
     }
 
     // Validate recipients
-    let cc_list = cc.unwrap_or_default();
-    let bcc_list = bcc.unwrap_or_default();
-
-    if !has_any_recipients(&to, &cc_list, &bcc_list) {
+    if project_mailbox.is_none() && !has_any_recipients(&to, &cc_list, &bcc_list) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             "At least one recipient is required. Provide agent names in to, cc, or bcc.",
@@ -2890,6 +3367,12 @@ effective_free_bytes={free}"
     // qualified send, the recipients' own project, which then stores it.
     let routed = route_qualified_recipients(ctx, &pool, &project, to, cc_list, bcc_list).await?;
     let foreign_project = routed.foreign_project;
+    if let (Some(mailbox), Some(foreign)) = (&project_mailbox, &foreign_project) {
+        return Err(mixed_project_recipients_error(
+            &[project.human_key.as_str(), foreign.human_key.as_str()],
+            std::slice::from_ref(&mailbox.address),
+        ));
+    }
     let (to, cc_list, bcc_list) = (routed.to, routed.cc, routed.bcc);
     let (local_to, local_cc, local_bcc): (&[String], &[String], &[String]) =
         if foreign_project.is_some() {
@@ -3085,75 +3568,6 @@ effective_free_bytes={free}"
     // Enforce contact policies (best-effort parity with legacy). A qualified
     // send was already held to an approved cross-project link above.
     if config.contact_enforcement_enabled && foreign_project.is_none() {
-        let mut auto_ok_names: HashSet<String> = HashSet::new();
-
-        if let Some(thread) = thread_id.as_deref() {
-            let thread = thread.trim();
-            if !thread.is_empty() {
-                // GH#260: join-free, body-free participant lookup. The previous
-                // `list_thread_messages` + `list_message_recipient_names_for_messages`
-                // pair materialized full bodies and used OR-disjunct / IN+JOIN
-                // query shapes that FrankenSQLite executes as whole-table nested
-                // loops, so one send into a ≥500-message thread on a large
-                // mailbox burned CPU for minutes behind the global message-write
-                // serializer and wedged every other send.
-                let participants = db_outcome_to_mcp_result(
-                    mcp_agent_mail_db::queries::list_thread_participant_names(
-                        ctx.cx(),
-                        &pool,
-                        project_id,
-                        thread,
-                        500,
-                    )
-                    .await,
-                )
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
-                    );
-                    mcp_agent_mail_core::global_metrics()
-                        .tools
-                        .contact_enforcement_bypass_total
-                        .inc();
-                    Vec::new()
-                });
-                for name in participants {
-                    auto_ok_names.insert(name);
-                }
-            }
-        }
-
-        // Allow if sender and recipient share overlapping active file reservations.
-        let reservations = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
-        )
-        .unwrap_or_else(|e| {
-            tracing::warn!("contact enforcement: get_active_reservations failed (fail-open): {e}");
-            mcp_agent_mail_core::global_metrics()
-                .tools
-                .contact_enforcement_bypass_total
-                .inc();
-            Vec::new()
-        });
-        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
-            HashMap::with_capacity(reservations.len());
-        for res in reservations {
-            patterns_by_agent.entry(res.agent_id).or_default().push(
-                (*mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(&res.path_pattern))
-                    .clone(),
-            );
-        }
-        if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
-            for agent in recipient_map.values() {
-                if let Some(rec_id) = agent.id
-                    && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
-                    && reservations_prove_shared_scope_for_contact(sender_patterns, rec_patterns)
-                {
-                    auto_ok_names.insert(agent.name.clone());
-                }
-            }
-        }
-
         let now_micros = mcp_agent_mail_db::now_micros();
         let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(i64::MAX);
         let ttl_micros = ttl_seconds.saturating_mul(1_000_000);
@@ -3167,36 +3581,21 @@ effective_free_bytes={free}"
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
 
-        let recent_set = contact_ids_or_fail_open(
-            db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    sender_id,
-                    &candidate_ids,
-                    since_ts,
-                )
-                .await,
-            ),
-            &candidate_ids,
-            "list_recent_contact_agent_ids",
-        );
-
-        let approved_set = contact_ids_or_fail_open(
-            db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_approved_contact_ids(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    sender_id,
-                    &candidate_ids,
-                )
-                .await,
-            ),
-            &candidate_ids,
-            "list_approved_contact_ids",
-        );
+        let ContactEvidence {
+            auto_ok_names,
+            recent_ids: recent_set,
+            approved_ids: approved_set,
+        } = gather_contact_evidence(
+            ctx,
+            &pool,
+            project_id,
+            sender_id,
+            &sender.name,
+            recipient_map.values(),
+            thread_id.as_deref().map_or("", str::trim),
+            since_ts,
+        )
+        .await;
 
         let mut blocked: Vec<(String, String)> = Vec::new();
 
@@ -3315,14 +3714,9 @@ effective_free_bytes={free}"
                 blocked.retain(|(name, _kind)| {
                     if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
                         let rec_id = agent.id.unwrap_or(0);
-                        let mut policy = agent.contact_policy.to_lowercase();
-                        if !["open", "auto", "contacts_only", "block_all"]
-                            .contains(&policy.as_str())
-                        {
-                            policy = "auto".to_string();
-                        }
+                        let policy = normalized_contact_policy(&agent.contact_policy);
                         let approved = approved_set.contains(&rec_id);
-                        let is_blocked = match policy.as_str() {
+                        let is_blocked = match policy {
                             "open" => false,
                             "auto" | "contacts_only" => !approved,
                             _ => true, // block_all
@@ -3427,6 +3821,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(false),
                 &attachments_json,
                 &recipient_refs,
+                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
                 claim,
             )
             .await,
@@ -3453,6 +3848,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(false),
                 &attachments_json,
                 &recipient_refs,
+                project_mailbox.as_ref().map(|mailbox| mailbox.kind),
             )
             .await,
         )?;
@@ -3467,10 +3863,16 @@ effective_free_bytes={free}"
             message,
             reply_to,
             verified_sender,
-        );
+        )
+        .map(|json| with_sender_proof_marker(json, sender_proof));
     }
 
     let message_id = message.id.unwrap_or(0);
+    let (envelope_to, envelope_cc) = with_project_mailbox_address(
+        &resolved_to,
+        &resolved_cc_recipients,
+        project_mailbox.as_ref(),
+    );
 
     // On an idempotent replay, skip all one-time side effects (search indexing,
     // notification signals, git archive) — the original send already performed
@@ -3550,11 +3952,13 @@ effective_free_bytes={free}"
             all_recipient_names.sort_unstable();
             all_recipient_names.dedup();
 
+            // The shared-mailbox address is part of the envelope but gets no
+            // per-agent inbox copy (it is not an agent).
             let msg_json = serde_json::json!({
                 "id": message_id,
                 "from": &sender.name,
-                "to": &resolved_to,
-                "cc": &resolved_cc_recipients,
+                "to": &envelope_to,
+                "cc": &envelope_cc,
                 "bcc": &resolved_bcc_recipients,
                 "subject": &message.subject,
                 "created": micros_to_iso(message.created_ts),
@@ -3579,11 +3983,8 @@ effective_free_bytes={free}"
     }
 
     let response = if config.messaging_fail_closed_send_profile {
-        let target_outcomes = redacted_send_target_outcomes(
-            &resolved_to,
-            &resolved_cc_recipients,
-            &resolved_bcc_recipients,
-        );
+        let target_outcomes =
+            redacted_send_target_outcomes(&envelope_to, &envelope_cc, &resolved_bcc_recipients);
         if let Some(parent) = reply_to {
             serde_json::to_string(&RedactedReplyMessageReceipt {
                 receipt_mode: "redacted".to_string(),
@@ -3624,8 +4025,8 @@ effective_free_bytes={free}"
             created_ts: Some(micros_to_iso(message.created_ts)),
             attachments: all_attachment_meta,
             from: sender.name.clone(),
-            to: resolved_to.into_vec(),
-            cc: resolved_cc_recipients.into_vec(),
+            to: envelope_to,
+            cc: envelope_cc,
             bcc: resolved_bcc_recipients.into_vec(),
         };
         recorded_message_payload_response(delivery, payload, reply_to, verified_sender)
@@ -3641,6 +4042,7 @@ effective_free_bytes={free}"
 
     response
         .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map(|json| with_sender_proof_marker(json, sender_proof))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -3691,7 +4093,11 @@ pub async fn reply_message(
     let bcc = normalize_optional_agent_names(bcc);
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
-    // Fingerprint the normalized reply payload (only when a key was supplied).
+    // Presence changes reply semantics: omitted recipients default to the
+    // original sender, omitted prefix means "Re:", and omitted ACK inherits.
+    // Keep those distinct from explicit empty/false values before replay.
+    // The added presence fields intentionally conflict with older, ambiguous
+    // reply fingerprints rather than reinterpret a retained key's intent.
     let idempotency_fingerprint = idempotency_key.as_ref().map(|_| {
         let sorted = |v: Option<&Vec<String>>| {
             let mut x = v.cloned().unwrap_or_default();
@@ -3707,11 +4113,17 @@ pub async fn reply_message(
                 ("sender", sender_name.clone()),
                 ("body_md", body_md.clone()),
                 ("to", sorted(to.as_ref())),
+                ("to_provided", to.is_some().to_string()),
                 ("cc", sorted(cc.as_ref())),
                 ("bcc", sorted(bcc.as_ref())),
                 ("subject_prefix", subject_prefix.clone().unwrap_or_default()),
+                (
+                    "subject_prefix_provided",
+                    subject_prefix.is_some().to_string(),
+                ),
                 ("importance", importance.clone().unwrap_or_default()),
                 ("ack_required", ack_required.unwrap_or(false).to_string()),
+                ("ack_required_provided", ack_required.is_some().to_string()),
                 ("attachments", atts.join("\u{1f}")),
                 (
                     "convert_images",
@@ -3801,25 +4213,7 @@ effective_free_bytes={free}"
     // writes in that state would issue more such IDs and produce silent
     // data loss. Refuse loud and direct the operator at the recovery path.
     if mcp_agent_mail_storage::durability_degraded() {
-        let stats = mcp_agent_mail_storage::wbq_stats();
-        return Err(legacy_tool_error(
-            "DURABILITY_DEGRADED",
-            format!(
-                "Storage write-back queue has unrecoverable errors ({} ops failed after retries; \
-                 last failure at us={}); refusing to accept new messages until operator clears the \
-                 durability flag via `am doctor repair` (which will also recover any in-memory \
-                 rows that never persisted)",
-                stats.unrecoverable_errors, stats.last_unrecoverable_error_us
-            ),
-            true,
-            json!({
-                "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
-                "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
-                "wbq_errors_total": stats.errors,
-                "wbq_enqueued_total": stats.enqueued,
-                "wbq_drained_total": stats.drained,
-            }),
-        ));
+        return Err(durability_degraded_error());
     }
 
     let pool = get_db_pool()?;
@@ -3921,12 +4315,14 @@ effective_free_bytes={free}"
     // missing/unverifiable token REFUSES before any thread resolution or
     // write. Reply is a message-creation path — it must not be the token-free
     // way to speak as another agent.
-    let verified_sender = verify_sender_identity(
+    let sender_proof = verify_sender(
+        ctx,
+        &sender,
         &sender_name,
         sender_token.as_deref(),
-        sender.registration_token.as_deref(),
         config.messaging_fail_closed_send_profile,
     )?;
+    let verified_sender = sender_proof.verified();
     crate::tool_util::touch_acting_agent(ctx, &pool, sender.id).await;
 
     // Resolve original sender name for default recipient
@@ -3996,13 +4392,20 @@ effective_free_bytes={free}"
     // that came from another project, or an explicit `Name@project`) is stored
     // in that agent's project. Hand it to the send path, which owns
     // qualified-recipient routing and the approved-contact requirement, before
-    // any attachment is written to this project's archive.
-    if any_qualified_recipient(
+    // any attachment is written to this project's archive. A reply that
+    // (also) addresses the project mailbox (GH#282) takes the same path,
+    // which owns shared-mailbox validation and delivery.
+    let explicit_recipients = || {
         to.iter()
             .flatten()
             .chain(cc.iter().flatten())
-            .chain(bcc.iter().flatten()),
-    ) {
+            .chain(bcc.iter().flatten())
+    };
+    if any_qualified_recipient(explicit_recipients())
+        || explicit_recipients().any(|name| {
+            mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_some()
+        })
+    {
         return Box::pin(send_message_routed(
             ctx,
             project_key,
@@ -4221,65 +4624,6 @@ effective_free_bytes={free}"
     }
 
     if config.contact_enforcement_enabled {
-        let mut auto_ok_names: HashSet<String> = HashSet::new();
-
-        if !thread_id.is_empty() {
-            // GH#260: see send_message — narrow join-free participant lookup.
-            let participants = db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_thread_participant_names(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    &thread_id,
-                    500,
-                )
-                .await,
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "contact enforcement: list_thread_participant_names failed (fail-open): {e}"
-                );
-                mcp_agent_mail_core::global_metrics()
-                    .tools
-                    .contact_enforcement_bypass_total
-                    .inc();
-                Vec::new()
-            });
-            for name in participants {
-                auto_ok_names.insert(name);
-            }
-        }
-
-        let reservations = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::get_active_reservations(ctx.cx(), &pool, project_id).await,
-        )
-        .unwrap_or_else(|e| {
-            tracing::warn!("contact enforcement: get_active_reservations failed (fail-open): {e}");
-            mcp_agent_mail_core::global_metrics()
-                .tools
-                .contact_enforcement_bypass_total
-                .inc();
-            Vec::new()
-        });
-        let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
-            HashMap::with_capacity(reservations.len());
-        for res in reservations {
-            patterns_by_agent.entry(res.agent_id).or_default().push(
-                (*mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(&res.path_pattern))
-                    .clone(),
-            );
-        }
-        if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
-            for agent in recipient_map.values() {
-                if let Some(rec_id) = agent.id
-                    && let Some(rec_patterns) = patterns_by_agent.get(&rec_id)
-                    && reservations_prove_shared_scope_for_contact(sender_patterns, rec_patterns)
-                {
-                    auto_ok_names.insert(agent.name.clone());
-                }
-            }
-        }
-
         let now_micros = mcp_agent_mail_db::now_micros();
         let ttl_seconds = i64::try_from(config.contact_auto_ttl_seconds).unwrap_or(i64::MAX);
         let ttl_micros = ttl_seconds.saturating_mul(1_000_000);
@@ -4293,36 +4637,21 @@ effective_free_bytes={free}"
         candidate_ids.sort_unstable();
         candidate_ids.dedup();
 
-        let recent_set = contact_ids_or_fail_open(
-            db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_recent_contact_agent_ids(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    sender_id,
-                    &candidate_ids,
-                    since_ts,
-                )
-                .await,
-            ),
-            &candidate_ids,
-            "list_recent_contact_agent_ids",
-        );
-
-        let approved_set = contact_ids_or_fail_open(
-            db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::list_approved_contact_ids(
-                    ctx.cx(),
-                    &pool,
-                    project_id,
-                    sender_id,
-                    &candidate_ids,
-                )
-                .await,
-            ),
-            &candidate_ids,
-            "list_approved_contact_ids",
-        );
+        let ContactEvidence {
+            auto_ok_names,
+            recent_ids: recent_set,
+            approved_ids: approved_set,
+        } = gather_contact_evidence(
+            ctx,
+            &pool,
+            project_id,
+            sender_id,
+            &sender.name,
+            recipient_map.values(),
+            &thread_id,
+            since_ts,
+        )
+        .await;
 
         let mut blocked: Vec<String> = Vec::new();
         for name in resolved_to
@@ -4419,12 +4748,7 @@ effective_free_bytes={free}"
                 blocked.retain(|name| {
                     if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
                         let rec_id = agent.id.unwrap_or(0);
-                        let mut policy = agent.contact_policy.to_lowercase();
-                        if !["open", "auto", "contacts_only", "block_all"]
-                            .contains(&policy.as_str())
-                        {
-                            policy = "auto".to_string();
-                        }
+                        let policy = normalized_contact_policy(&agent.contact_policy);
                         let approved = approved_set.contains(&rec_id);
                         if policy == "open" {
                             return false;
@@ -4481,6 +4805,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
                 &recipient_refs,
+                None,
                 claim,
             )
             .await,
@@ -4507,6 +4832,7 @@ effective_free_bytes={free}"
                 ack_required.unwrap_or(original.ack_required != 0),
                 &attachments_json,
                 &recipient_refs,
+                None,
             )
             .await,
         )?;
@@ -4521,7 +4847,8 @@ effective_free_bytes={free}"
             reply,
             Some(message_id),
             verified_sender,
-        );
+        )
+        .map(|json| with_sender_proof_marker(json, sender_proof));
     }
 
     let reply_id = reply.id.unwrap_or(0);
@@ -4704,6 +5031,7 @@ effective_free_bytes={free}"
 
     response
         .map(|json| crate::idempotency::with_replay_marker(json, idempotent_replay))
+        .map(|json| with_sender_proof_marker(json, sender_proof))
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
@@ -4819,6 +5147,7 @@ pub async fn fetch_inbox(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     phase.mark("scope_resolution");
 
@@ -4894,6 +5223,7 @@ pub async fn fetch_inbox(
                 created_ts: Some(micros_to_iso(row.message.created_ts)),
                 read_ts: row.read_ts.map(micros_to_iso),
                 ack_ts: row.ack_ts.map(micros_to_iso),
+                via: inbox_via(&row.kind),
                 kind: row.kind,
                 attachments,
                 body_md: if include_body {
@@ -4940,7 +5270,27 @@ pub async fn fetch_inbox(
     // `mark_read=false` skips this entirely: a non-consuming peek (GH#207)
     // must leave read state untouched.
     if mark_read.unwrap_or(true) && !messages.is_empty() {
-        let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+        let (ids, shared_ids) = unread_receipt_targets(&messages);
+        if let Some(live_sqlite_path) = read_pool.live_sqlite_path()
+            && !shared_ids.is_empty()
+        {
+            match mcp_agent_mail_db::project_mailbox::mark_project_mailbox_read_batch_sync(
+                live_sqlite_path,
+                agent_id,
+                &shared_ids,
+            ) {
+                Ok(Some(batch)) => {
+                    apply_auto_read_timestamp(&mut messages, &batch.message_ids, batch.read_ts);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    agent_id = agent_id,
+                    count = shared_ids.len(),
+                    error = %e,
+                    "project mailbox auto-mark-read on fetch_inbox failed"
+                ),
+            }
+        }
         if let Some(live_sqlite_path) = read_pool.live_sqlite_path() {
             match mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,
@@ -5139,9 +5489,9 @@ pub async fn fetch_inbox_events(
     // Cursor delivery is a durable database contract. Do not use the
     // archive-reconstruction read pool here: an archive snapshot has no
     // independent event sequence and would turn a degraded source into a
-    // dishonest empty monitor page.
+    // dishonest empty monitor page. Reading events never creates a project.
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent = resolve_agent(
         ctx,
@@ -5152,6 +5502,7 @@ pub async fn fetch_inbox_events(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "read mail")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5252,7 +5603,7 @@ pub async fn get_message_delivery_receipt(
     message_id: i64,
 ) -> McpResult<String> {
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let receipt = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_message_delivery_receipt(
@@ -5292,14 +5643,62 @@ pub async fn get_message_delivery_receipt(
         })
         .collect::<Vec<_>>();
 
-    serde_json::to_string(&json!({
+    let mut response = json!({
         "message_id": receipt.message_id,
         "project_id": receipt.project_id,
         "persisted": true,
         "persisted_at": micros_to_iso(receipt.persisted_ts),
         "recipients": recipients,
-    }))
-    .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+    });
+    // GH#282: one delivery to the project's shared mailbox, with the lazily
+    // recorded state of every agent that can see it.
+    if let Some(mailbox) = receipt.project_mailbox {
+        let acknowledged = mailbox
+            .agents
+            .iter()
+            .filter(|agent| agent.ack_ts.is_some())
+            .count();
+        let read = mailbox
+            .agents
+            .iter()
+            .filter(|agent| agent.read_ts.is_some())
+            .count();
+        response["project_mailbox"] = json!({
+            "address": mcp_agent_mail_db::project_mailbox::project_mailbox_address(&project.slug),
+            "kind": mailbox.kind,
+            "delivered_at": micros_to_iso(mailbox.delivered_ts),
+            "visible_agents": mailbox.agents.len(),
+            "read_count": read,
+            "acknowledged_count": acknowledged,
+            "agents": mailbox.agents.iter().map(|agent| json!({
+                "agent": agent.agent_name,
+                "read": agent.read_ts.is_some(),
+                "read_at": agent.read_ts.map(micros_to_iso),
+                "acknowledged": agent.ack_ts.is_some(),
+                "acknowledged_at": agent.ack_ts.map(micros_to_iso),
+            })).collect::<Vec<_>>(),
+        });
+    }
+    serde_json::to_string(&response)
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, format!("JSON error: {error}")))
+}
+
+/// The fetched rows that still need this agent's read receipt, as
+/// `(direct, shared)` message IDs. GH#282: shared-mailbox rows record the
+/// agent's own lazy receipt; direct rows update their recipient row. A row
+/// that already carries a receipt needs no write, so re-reading an
+/// already-read inbox never opens a write transaction.
+fn unread_receipt_targets(messages: &[InboxMessage]) -> (Vec<i64>, Vec<i64>) {
+    let mut direct = Vec::with_capacity(messages.len());
+    let mut shared = Vec::new();
+    for message in messages.iter().filter(|message| message.read_ts.is_none()) {
+        if message.via.is_some() {
+            shared.push(message.id);
+        } else {
+            direct.push(message.id);
+        }
+    }
+    (direct, shared)
 }
 
 fn apply_auto_read_timestamp(
@@ -5340,7 +5739,7 @@ pub async fn mark_message_read(
     let agent_name = normalize_agent_name_or_original(agent_name);
 
     let pool = get_db_pool()?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     let agent = resolve_agent(
@@ -5352,6 +5751,7 @@ pub async fn mark_message_read(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "mark mail read")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5458,6 +5858,7 @@ pub async fn mark_all_read(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "mark mail read")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5743,6 +6144,7 @@ pub async fn acknowledge_message(
 ) -> McpResult<String> {
     let agent_name = normalize_agent_name_or_original(agent_name);
     let config = Config::get();
+    let authorization = crate::session_identity::ActorAuthorizationSnapshot::capture(ctx)?;
     let idempotency_key =
         crate::idempotency::normalize_idempotency_key(idempotency_key.as_deref())?;
     // Fingerprint the normalized ack payload (only when a key was supplied). The
@@ -5759,11 +6161,17 @@ pub async fn acknowledge_message(
         ),
     });
 
-    // Each step that can hit a corrupt/busy/unavailable DB queues a durable
-    // ack intent (fail-soft) rather than dropping a closeout acknowledgement.
+    // A durable intent is an accepted future mutation. If this session has a
+    // binding that could constrain an unresolved actor, preserve the original
+    // DB error so the caller retries after authorization becomes possible.
+    // Trusted-local callers and already-authorized actors keep fail-soft ACKs.
     let pool = match get_db_pool() {
         Ok(pool) => pool,
         Err(error) => {
+            if !authorization.permits_unresolved_actor(None) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -5775,9 +6183,13 @@ pub async fn acknowledge_message(
             );
         }
     };
-    let project = match resolve_project(ctx, &pool, &project_key).await {
+    let project = match resolve_existing_project(ctx, &pool, &project_key).await {
         Ok(project) => project,
         Err(error) if mcp_error_supports_ack_intent(&error) => {
+            if !authorization.permits_unresolved_actor(None) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -5804,6 +6216,10 @@ pub async fn acknowledge_message(
     {
         Ok(agent) => agent,
         Err(error) if mcp_error_supports_ack_intent(&error) => {
+            if !authorization.permits_unresolved_actor(Some(project_id)) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -5816,6 +6232,7 @@ pub async fn acknowledge_message(
         }
         Err(error) => return Err(error),
     };
+    authorization.authorize(ctx, &agent, "acknowledge mail")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -5845,6 +6262,7 @@ pub async fn acknowledge_message(
         if let Outcome::Err(error) = &idem_outcome
             && db_error_supports_ack_intent(error)
         {
+            ctx.ensure_live()?;
             return queued_ack_intent_response(
                 &config,
                 &project_key,
@@ -5877,6 +6295,7 @@ pub async fn acknowledge_message(
         {
             Outcome::Ok(value) => value,
             Outcome::Err(error) if db_error_supports_ack_intent(&error) => {
+                ctx.ensure_live()?;
                 return queued_ack_intent_response(
                     &config,
                     &project_key,
@@ -6721,6 +7140,305 @@ mod tests {
     }
 
     #[test]
+    fn ack_outage_cannot_queue_unresolved_session_actors() {
+        let _lock = MESSAGING_THREAD_ID_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for enabled in [true, false] {
+            let tmp = tempfile::tempdir().expect("ack identity outage fixture");
+            let root = tmp.path().canonicalize().expect("canonical fixture root");
+            let blocked_parent = root.join("database-parent-is-a-file");
+            std::fs::write(&blocked_parent, b"blocked database parent").expect("block database");
+            let unavailable_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &blocked_parent.join("mailbox.sqlite3"),
+            );
+            let archive = root.join("archive");
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", &unavailable_url),
+                    ("STORAGE_ROOT", archive.to_str().unwrap()),
+                    (
+                        "MESSAGING_SESSION_IDENTITY",
+                        if enabled { "true" } else { "false" },
+                    ),
+                ],
+                || {
+                    let pool = DbPool::new(&DbPoolConfig {
+                        database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                            &root.join("live.sqlite3"),
+                        ),
+                        ..DbPoolConfig::default()
+                    })
+                    .expect("independent live mailbox");
+                    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+                    rt.block_on(async {
+                        let cx = Cx::current().expect("test context");
+                        let project =
+                            ensure_project_row(&cx, &pool, "/tmp/ack-identity-outage").await;
+                        let project_id = project.id.unwrap();
+                        let alice = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                        let bob = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                        let message_id = create_ack_test_message(
+                            &cx,
+                            &pool,
+                            project_id,
+                            alice.id.unwrap(),
+                            &[(alice.id.unwrap(), "cc"), (bob.id.unwrap(), "to")],
+                        )
+                        .await;
+                        let bound = McpContext::with_state(
+                            cx.clone(),
+                            1,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        crate::session_identity::bind(
+                            &bound,
+                            project_id,
+                            alice.id.unwrap(),
+                            &alice.name,
+                        );
+                        assert_eq!(
+                            crate::session_identity::session_bindings(&bound).is_empty(),
+                            !enabled
+                        );
+                        let config = Config::get();
+                        for name in [&alice.name, &bob.name] {
+                            for key in [None, Some("ack-identity-outage-key".to_string())] {
+                                let result = acknowledge_message(
+                                    &bound,
+                                    project.human_key.clone(),
+                                    name.clone(),
+                                    message_id,
+                                    key,
+                                )
+                                .await;
+                                if enabled {
+                                    let error = result.expect_err(
+                                        "cannot accept an unresolved actor during outage",
+                                    );
+                                    assert!(
+                                        mcp_error_supports_ack_intent(&error),
+                                        "preserve database error: {error}"
+                                    );
+                                    assert!(
+                                        mcp_error_cause(&error)
+                                            .contains(blocked_parent.to_str().unwrap())
+                                    );
+                                    assert_eq!(
+                                        crate::degraded_intents::read_queued_ack_intents(&config)
+                                            .unwrap(),
+                                        Vec::<crate::degraded_intents::QueuedAckIntent>::new()
+                                    );
+                                } else {
+                                    let queued: Value = serde_json::from_str(
+                                        &result.expect("default-off durable closeout"),
+                                    )
+                                    .unwrap();
+                                    assert_eq!(queued["queued"], true);
+                                    assert_eq!(queued["acknowledged"], false);
+                                }
+                            }
+                        }
+                        let unbound = McpContext::with_state(
+                            cx.clone(),
+                            2,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        replay_queued_ack_intents(&unbound, &pool, &config).await;
+                        let state = queries::fetch_inbox(
+                            &cx,
+                            &pool,
+                            project_id,
+                            bob.id.unwrap(),
+                            false,
+                            None,
+                            10,
+                        )
+                        .await
+                        .into_result()
+                        .expect("actual recipient state");
+                        assert_eq!(state[0].ack_ts.is_none(), enabled);
+                        assert_eq!(state[0].read_ts.is_none(), enabled);
+
+                        // A separately unbound caller keeps the original durable
+                        // closeout behavior, and a cancelled call never appends.
+                        let cancelled = McpContext::with_state(
+                            cx.clone(),
+                            3,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        cancelled.request_cancellation().cancel();
+                        acknowledge_message(
+                            &cancelled,
+                            project.human_key.clone(),
+                            bob.name.clone(),
+                            message_id,
+                            None,
+                        )
+                        .await
+                        .expect_err("cancelled request must not queue");
+                        assert_eq!(
+                            crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                            Vec::<crate::degraded_intents::QueuedAckIntent>::new()
+                        );
+                        let queued: Value = serde_json::from_str(
+                            &acknowledge_message(
+                                &unbound,
+                                project.human_key.clone(),
+                                bob.name.clone(),
+                                message_id,
+                                None,
+                            )
+                            .await
+                            .expect("unbound outage closeout"),
+                        )
+                        .unwrap();
+                        assert_eq!(queued["queued"], true);
+                        replay_queued_ack_intents(&unbound, &pool, &config).await;
+                        let state = queries::fetch_inbox(
+                            &cx,
+                            &pool,
+                            project_id,
+                            bob.id.unwrap(),
+                            false,
+                            None,
+                            10,
+                        )
+                        .await
+                        .into_result()
+                        .expect("replayed recipient state");
+                        assert!(state[0].ack_ts.is_some());
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_ack_write_failure_queues_and_replays_under_another_session() {
+        with_messaging_mailbox(&[("MESSAGING_SESSION_IDENTITY", "true")], |_| {
+            let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+            rt.block_on(async {
+                let cx = Cx::current().expect("test context");
+                let pool = get_db_pool().expect("live pool");
+                let project =
+                    ensure_project_row(&cx, &pool, "/tmp/authorized-ack-write-failure").await;
+                let project_id = project.id.unwrap();
+                let alice = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+                let bob = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+                let queued_id = create_ack_test_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    alice.id.unwrap(),
+                    &[(bob.id.unwrap(), "to")],
+                )
+                .await;
+                let trigger_id = create_ack_test_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    bob.id.unwrap(),
+                    &[(alice.id.unwrap(), "to")],
+                )
+                .await;
+                let alice_ctx =
+                    McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                let bob_ctx =
+                    McpContext::with_state(cx.clone(), 2, fastmcp_core::SessionState::new());
+                crate::session_identity::bind(
+                    &alice_ctx,
+                    project_id,
+                    alice.id.unwrap(),
+                    &alice.name,
+                );
+                crate::session_identity::bind(&bob_ctx, project_id, bob.id.unwrap(), &bob.name);
+                let conn = pool.acquire(&cx).await.into_result().expect("connection");
+                conn.execute_sync(
+                    "CREATE TRIGGER reject_test_ack BEFORE UPDATE ON message_recipients \
+                     BEGIN SELECT RAISE(ABORT, 'ack storage unavailable in identity test'); END;",
+                    &[],
+                )
+                .expect("force a real receipt-write failure");
+                drop(conn);
+                let refusal = acknowledge_message(
+                    &alice_ctx,
+                    project.human_key.clone(),
+                    bob.name.clone(),
+                    queued_id,
+                    None,
+                )
+                .await
+                .expect_err("borrowed actor must not reach failing write");
+                assert_eq!(
+                    crate::tool_error_code(&refusal),
+                    Some("SESSION_IDENTITY_MISMATCH")
+                );
+                let config = Config::get();
+                assert_eq!(
+                    crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                    Vec::<crate::degraded_intents::QueuedAckIntent>::new()
+                );
+                for key in [None, Some("authorized-outage-key".to_string())] {
+                    let queued: Value = serde_json::from_str(
+                        &acknowledge_message(
+                            &bob_ctx,
+                            project.human_key.clone(),
+                            bob.name.clone(),
+                            queued_id,
+                            key,
+                        )
+                        .await
+                        .expect("authorized actor keeps durable closeout"),
+                    )
+                    .unwrap();
+                    assert_eq!(queued["queued"], true);
+                }
+                let intents = crate::degraded_intents::read_queued_ack_intents(&config).unwrap();
+                assert_eq!(intents.len(), 2);
+                assert!(
+                    intents
+                        .iter()
+                        .all(|intent| intent.failure.stage == "acknowledge_message")
+                );
+                assert!(intents.iter().all(|intent| {
+                    intent
+                        .failure
+                        .error_detail
+                        .contains("ack storage unavailable in identity test")
+                }));
+                let conn = pool.acquire(&cx).await.into_result().expect("connection");
+                conn.execute_sync("DROP TRIGGER reject_test_ack", &[])
+                    .expect("restore receipt writes");
+                drop(conn);
+
+                // Alice's legitimate ACK triggers Bob's previously authorized
+                // durable intent. Replay must not impersonate Alice as Bob.
+                acknowledge_message(
+                    &alice_ctx,
+                    project.human_key.clone(),
+                    alice.name,
+                    trigger_id,
+                    None,
+                )
+                .await
+                .expect("another session triggers accepted intent replay");
+                assert_eq!(
+                    crate::degraded_intents::read_queued_ack_intents(&config).unwrap(),
+                    Vec::<crate::degraded_intents::QueuedAckIntent>::new()
+                );
+                let state =
+                    queries::fetch_inbox(&cx, &pool, project_id, bob.id.unwrap(), false, None, 10)
+                        .await
+                        .into_result()
+                        .expect("replayed Bob receipt");
+                assert!(state[0].ack_ts.is_some());
+                assert!(state[0].read_ts.is_some());
+            });
+        });
+    }
+
+    #[test]
     fn keyed_ack_intent_replay_rejects_used_key_after_database_unavailability() {
         let _lock = MESSAGING_THREAD_ID_TEST_LOCK
             .lock()
@@ -7536,6 +8254,16 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn normalized_contact_policy_is_case_insensitive_and_defaults_to_auto() {
+        assert_eq!(normalized_contact_policy("OPEN"), "open");
+        assert_eq!(normalized_contact_policy("Contacts_Only"), "contacts_only");
+        assert_eq!(normalized_contact_policy("block_all"), "block_all");
+        assert_eq!(normalized_contact_policy("auto"), "auto");
+        assert_eq!(normalized_contact_policy(""), "auto");
+        assert_eq!(normalized_contact_policy("contacts only"), "auto");
     }
 
     #[test]
@@ -8423,6 +9151,7 @@ mod tests {
             read_ts: None,
             ack_ts: None,
             kind: "to".into(),
+            via: None,
             attachments: vec![],
             body_md: None,
         };
@@ -8449,6 +9178,7 @@ mod tests {
             read_ts: None,
             ack_ts: None,
             kind: "to".into(),
+            via: None,
             attachments: vec![json!({"path": "img.webp", "type": "file"})],
             body_md: Some("Hello world".into()),
         };
@@ -8501,6 +9231,7 @@ mod tests {
             read_ts: None,
             ack_ts: None,
             kind: "to".into(),
+            via: None,
             attachments: vec![],
             body_md: None,
         };
@@ -8533,6 +9264,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "to".into(),
+                via: None,
                 attachments: vec![],
                 body_md: None,
             },
@@ -8553,6 +9285,7 @@ mod tests {
                 read_ts: Some(old_read_at.clone()),
                 ack_ts: None,
                 kind: "to".into(),
+                via: None,
                 attachments: vec![],
                 body_md: None,
             },
@@ -8573,6 +9306,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "to".into(),
+                via: None,
                 attachments: vec![],
                 body_md: None,
             },
@@ -8585,6 +9319,57 @@ mod tests {
         assert_eq!(messages[0].read_ts.as_deref(), Some(batch_read_at.as_str()));
         assert_eq!(messages[1].read_ts.as_deref(), Some(old_read_at.as_str()));
         assert_eq!(messages[2].read_ts, None);
+    }
+
+    #[test]
+    fn unread_receipt_targets_skip_rows_that_are_already_read() {
+        let unread = InboxMessage {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: None,
+            topic: None,
+            subject: "unread".into(),
+            importance: "normal".into(),
+            ack_required: false,
+            from: "BlueLake".into(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            read_ts: None,
+            ack_ts: None,
+            kind: "to".into(),
+            via: None,
+            attachments: vec![],
+            body_md: None,
+        };
+        let read = InboxMessage {
+            id: 2,
+            read_ts: Some("2026-02-06T00:30:00Z".into()),
+            ..unread.clone()
+        };
+        let shared_unread = InboxMessage {
+            id: 3,
+            kind: mcp_agent_mail_db::project_mailbox::PROJECT_MAILBOX_KIND.into(),
+            via: inbox_via(mcp_agent_mail_db::project_mailbox::PROJECT_MAILBOX_KIND),
+            ..unread.clone()
+        };
+        let shared_read = InboxMessage {
+            id: 4,
+            read_ts: Some("2026-02-06T00:30:00Z".into()),
+            ..shared_unread.clone()
+        };
+
+        let (direct, shared) =
+            unread_receipt_targets(&[unread, read.clone(), shared_unread, shared_read.clone()]);
+        assert_eq!(direct, vec![1]);
+        assert_eq!(shared, vec![3]);
+        assert_eq!(
+            unread_receipt_targets(&[read, shared_read]),
+            (vec![], vec![]),
+            "an already-read inbox must not ask for a write"
+        );
     }
 
     #[test]
@@ -9825,6 +10610,93 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("must be a string"), "{}", err.message);
+    }
+
+    #[test]
+    fn notice_archive_envelope_matches_the_shared_key_order() {
+        let message = mcp_agent_mail_db::MessageRow {
+            id: Some(1261),
+            project_id: 2,
+            sender_id: 14,
+            thread_id: None,
+            topic: None,
+            subject: "Contact approved: SageCastle -> CrimsonLake".to_string(),
+            body_md: "approved".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: 1_792_519_750_137_117,
+            recipients_json: String::new(),
+            attachments: "[]".to_string(),
+        };
+        let envelope = notice_archive_json(
+            &message,
+            "SageCastle",
+            &["CrimsonLake".to_string()],
+            "/proj2",
+            "proj2",
+        );
+        let keys: Vec<&str> = envelope
+            .as_object()
+            .expect("envelope object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // The DB-to-archive reconciler renders exactly these keys (pinned in
+        // mcp-agent-mail-storage); a notice without `topic` once collided with
+        // its repaired copy and latched archive durability.
+        assert_eq!(keys, mcp_agent_mail_storage::MESSAGE_ARCHIVE_ENVELOPE_KEYS);
+        assert_eq!(envelope["topic"], Value::Null);
+        assert_eq!(envelope["created"], "2026-10-20T18:09:10.137117Z");
+    }
+
+    #[test]
+    fn direct_messages_signal_their_recipient_like_send_message() {
+        let dir = tempfile::tempdir().expect("signals dir");
+        let config = Config {
+            notifications_enabled: true,
+            notifications_signals_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let message = mcp_agent_mail_db::MessageRow {
+            id: Some(41),
+            project_id: 1,
+            sender_id: 2,
+            thread_id: None,
+            topic: None,
+            subject: "[file-reservations] Released stale lock on src/a.rs".to_string(),
+            body_md: String::new(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: 0,
+            recipients_json: String::new(),
+            attachments: "[]".to_string(),
+        };
+        let slug = "direct-signal-test";
+        signal_direct_recipient(&config, slug, "AmberRiver", "BlueLake", &message);
+        let agents = dir.path().join("projects").join(slug).join("agents");
+        let body = std::fs::read_to_string(agents.join("AmberRiver.signal"))
+            .expect("the recipient's signal file");
+        let signal: Value = serde_json::from_str(&body).expect("signal JSON");
+        assert_eq!(signal["message_id"].as_i64(), Some(41), "{body}");
+        assert!(
+            !agents.join("BlueLake.signal").exists(),
+            "only the recipient is signalled"
+        );
+    }
+
+    #[test]
+    fn reply_treats_null_to_as_omitted_but_send_still_refuses_it() {
+        let mut reply = json!({"project_key": "/p", "message_id": 7, "to": null});
+        normalize_reply_message_arguments(&mut reply).expect("null to is omitted on reply");
+        assert!(reply.get("to").is_none(), "{reply}");
+
+        let mut send = json!({"project_key": "/p", "to": null});
+        let err = normalize_send_message_arguments(&mut send).expect_err("send needs a to list");
+        assert!(
+            err.message.contains("list of agent names"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

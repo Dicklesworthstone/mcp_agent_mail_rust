@@ -3487,6 +3487,55 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
 }
 
 #[test]
+fn agents_create_offline_validates_policy_and_mints_a_sender_token() {
+    let env = TestEnv::new();
+    let project_dir = env.tmp.path().join("create-proj");
+    std::fs::create_dir_all(&project_dir).expect("project dir");
+    let project_key = project_dir.display().to_string();
+    let create = |extra: &[&str]| {
+        let mut args = vec![
+            "agents",
+            "create",
+            "-p",
+            project_key.as_str(),
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        run_am(&env.base_env(), Some(env.tmp.path()), &args, None)
+    };
+
+    // No daemon answers (HTTP_PORT=1), so this is the local path; it must
+    // apply the tool's validation rather than write the row directly.
+    let bad = create(&["--attachments-policy", "bogus"]);
+    assert!(
+        !bad.status.success(),
+        "an invalid attachments policy must be refused offline too\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let out = create(&["-n", "BlueLake"]);
+    assert!(
+        out.status.success(),
+        "expected success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["name"], "BlueLake", "{value}");
+    assert!(
+        value["registration_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()),
+        "an offline-created agent gets a sender token: {value}"
+    );
+}
+
+#[test]
 fn projects_adopt_dry_run_accepts_slug_identifiers() {
     let env = TestEnv::new();
     let (source_slug, target_slug, _source_key, _target_key) = seed_projects_for_adopt(&env, true);
@@ -5778,6 +5827,95 @@ fn clear_and_reset_with_force_and_no_archive_succeeds() {
     );
 }
 
+/// A running server holds the mailbox activity locks for its whole life. The
+/// reset must stop it rather than fail "Resource is temporarily busy", then
+/// wipe the mailbox it served.
+#[cfg(target_os = "linux")]
+#[test]
+fn clear_and_reset_stops_a_running_server_holding_the_mailbox() {
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("serve-http.log");
+    let log = std::fs::File::create(&log_path).expect("create server log");
+    let mut server = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("AM_ATC_ENABLED", "false")
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["serve-http", "--no-tui", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().expect("clone server log"))
+        .stderr(log)
+        .spawn()
+        .expect("start HTTP server");
+
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut serving = false;
+    while Instant::now() < deadline && matches!(server.try_wait(), Ok(None)) {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+            && env.db_path.exists()
+        {
+            serving = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !serving {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!(
+            "server never started serving:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
+    }
+
+    let out = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .current_dir(env.tmp.path())
+        .args(["clear-and-reset-everything", "--force", "--no-archive"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run clear-and-reset-everything");
+
+    // Reap the server whatever the outcome, so a failure cannot leak it.
+    let exit_deadline = Instant::now() + Duration::from_secs(30);
+    let mut server_exited = false;
+    while Instant::now() < exit_deadline {
+        if matches!(server.try_wait(), Ok(Some(_))) {
+            server_exited = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !server_exited {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reset must stop the running server instead of failing busy\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Stopping Agent Mail process pid {}", server.id())),
+        "reset should name the server it stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        server_exited,
+        "the server holding the mailbox should have been stopped"
+    );
+    assert!(
+        !env.db_path.exists(),
+        "database should be removed after the reset\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ---- Archive commands ----
 
 #[test]
@@ -6792,6 +6930,31 @@ fn check_serve_http_client_config_setup(setup: bool) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    // Liveness answers as soon as the listener serves, but `--setup` repairs
+    // client configs only after the server's own readiness self-probe, so
+    // stopping on the first 200 raced the repair. With setup, wait (bounded)
+    // for every client config to name this server; without it, give a wrong
+    // startup rewrite the same chance to land before asserting it did not.
+    if healthy {
+        if setup {
+            let expected = format!("http://127.0.0.1:{port}/mcp/");
+            let clients: Vec<_> = config_paths
+                .iter()
+                .filter(|path| **path != env.user_config_env_path())
+                .collect();
+            let settle_deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < settle_deadline
+                && matches!(child.try_wait(), Ok(None))
+                && !clients.iter().all(|path| {
+                    std::fs::read_to_string(path).is_ok_and(|content| content.contains(&expected))
+                })
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+        } else {
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
     // Reap this test's own server before assertions, including startup failures.
     let _ = child.kill();
     let _ = child.wait();
@@ -7186,5 +7349,134 @@ fn service_install_renders_descriptor_limit_and_upgrades_an_older_unit() {
     assert!(
         daemon_reload < restart,
         "reload must precede restart: {calls}"
+    );
+}
+
+/// Hermetic env for one `am` run against a private HOME and mailbox. The
+/// listener port is one nothing listens on, so mutations take the local path
+/// instead of reaching a live daemon.
+fn user_env_guard_env(root: &Path, port: u16) -> Vec<(String, String)> {
+    let home = root.join("home");
+    let storage = root.join("storage");
+    [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", home.display().to_string()),
+        (
+            "XDG_CONFIG_HOME",
+            home.join(".config").display().to_string(),
+        ),
+        (
+            "XDG_DATA_HOME",
+            home.join(".local/share").display().to_string(),
+        ),
+        ("XDG_CACHE_HOME", home.join(".cache").display().to_string()),
+        ("STORAGE_ROOT", storage.display().to_string()),
+        (
+            "DATABASE_URL",
+            format!("sqlite:///{}/storage.sqlite3", storage.display()),
+        ),
+        ("AM_INTERFACE_MODE", "cli".to_string()),
+        ("AM_ATC_ENABLED", "false".to_string()),
+        ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1".to_string()),
+        ("HTTP_HOST", "127.0.0.1".to_string()),
+        ("HTTP_PORT", port.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
+/// br-ww5js: through the real `execute` path, an unsafe (symlinked) user
+/// `config.env` makes config-consuming mutations fail closed before they open
+/// any mailbox state and without echoing the credential, while an exempt
+/// reflection verb still runs. The control arm, with a regular private
+/// `config.env`, shows the same registration does create the mailbox, so the
+/// missing storage in the unsafe arm is the guard's doing.
+#[cfg(unix)]
+#[test]
+fn unsafe_user_config_env_blocks_mutations_before_side_effects() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let port = unused_loopback_port();
+    let unsafe_root = tmp.path().join("unsafe");
+    let control_root = tmp.path().join("control");
+    for root in [&unsafe_root, &control_root] {
+        std::fs::create_dir_all(root.join("home/.config/mcp-agent-mail")).expect("config dir");
+        std::fs::create_dir_all(root.join("project")).expect("project dir");
+    }
+    let elsewhere = tmp.path().join("elsewhere.env");
+    std::fs::write(&elsewhere, "HTTP_BEARER_TOKEN=elsewhere-secret\n").expect("target env");
+    std::os::unix::fs::symlink(
+        &elsewhere,
+        unsafe_root.join("home/.config/mcp-agent-mail/config.env"),
+    )
+    .expect("symlinked config.env");
+    let control_env = control_root.join("home/.config/mcp-agent-mail/config.env");
+    std::fs::write(&control_env, "HTTP_BEARER_TOKEN=control-secret\n").expect("control env");
+    std::fs::set_permissions(
+        &control_env,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("chmod control env");
+
+    let project = unsafe_root.join("project");
+    let project_key = project.to_str().expect("utf-8 project path");
+    let env = user_env_guard_env(&unsafe_root, port);
+    // Temp paths contain no whitespace, so each command splits into its argv.
+    for command in [
+        format!("agents register --project {project_key} --program x --model y"),
+        format!(
+            "mail send --project {project_key} --from BlueLake --to RedStone --subject s --body b"
+        ),
+        format!("file_reservations reserve {project_key} BlueLake src/**"),
+        "doctor fix --yes".to_string(),
+    ] {
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let out = run_am_hermetic(&env, Some(&project), &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must fail closed: {stdout}");
+        assert!(
+            stderr.contains("refusing unsafe user configuration authority"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !format!("{stdout}{stderr}").contains("elsewhere-secret"),
+            "{args:?} disclosed the credential"
+        );
+        assert!(
+            !unsafe_root.join("storage").exists(),
+            "{args:?} created mailbox state despite the unsafe authority"
+        );
+    }
+    let reflection = run_am_hermetic(
+        &env,
+        Some(&project),
+        &["doctor", "capabilities", "--format", "json"],
+    );
+    assert!(
+        reflection.status.success(),
+        "exempt reflection must still run"
+    );
+    assert!(!unsafe_root.join("storage").exists());
+
+    let control_project = control_root.join("project");
+    let control_command = format!(
+        "agents register --project {} --program x --model y",
+        control_project.display()
+    );
+    let control_args: Vec<&str> = control_command.split_whitespace().collect();
+    let control = run_am_hermetic(
+        &user_env_guard_env(&control_root, port),
+        Some(&control_project),
+        &control_args,
+    );
+    assert!(
+        control.status.success(),
+        "control registration: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(
+        control_root.join("storage").exists(),
+        "control must create the mailbox"
     );
 }

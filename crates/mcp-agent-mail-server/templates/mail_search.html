@@ -136,7 +136,11 @@
             <button type="button" data-search-quick-control @click="order = 'time'"
               :class="order === 'time' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1">
-              <i data-lucide="clock" class="w-3.5 h-3.5"></i> Time</button>
+              <i data-lucide="clock" class="w-3.5 h-3.5"></i> Newest</button>
+            <button type="button" data-search-quick-control @click="order = 'oldest'"
+              :class="order === 'oldest' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
+              class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1">
+              <i data-lucide="history" class="w-3.5 h-3.5"></i> Oldest</button>
           </div>
         </div>
 
@@ -194,7 +198,7 @@
 
           <!-- Direction -->
           <div>
-            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Direction</label>
+            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Direction <span class="font-normal text-slate-400">(of the agent above)</span></label>
             <div class="flex items-center gap-2">
               <label class="inline-flex items-center gap-1.5 cursor-pointer">
                 <input type="radio" name="direction" value="" {% if not direction %}checked{% endif %} class="text-primary-600">
@@ -241,7 +245,7 @@
 
           <!-- Date Range -->
           <div>
-            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Date Range</label>
+            <label class="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-2">Date Range <span class="font-normal text-slate-400">(UTC days)</span></label>
             <div class="flex items-center gap-2">
               <input type="date" name="from_date" value="{{ from_date }}"
                 class="flex-1 px-3 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg text-sm text-slate-900 dark:text-white"
@@ -314,7 +318,7 @@
                 <i data-lucide="list" class="w-5 h-5 text-primary-600 dark:text-primary-400"></i>
                 <h3 class="text-lg font-semibold text-slate-900 dark:text-white">Results</h3>
                 <span class="px-2 py-1 bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300 text-xs font-medium rounded-full">
-                  {{ result_count }} found
+                  {{ result_count }} shown
                 </span>
               </div>
               {% if deep_link %}
@@ -332,11 +336,13 @@
 
           <div class="divide-y divide-slate-200 dark:divide-slate-700">
             {% for r in results %}
-              <a href="/mail/{{ project.slug }}/message/{{ r.id }}"
-                 class="block p-6 hover:bg-slate-50 dark:hover:bg-slate-900 transition-all duration-200 group">
+              {# Sibling links, not one outer link: an <a> inside an <a> makes the
+                 HTML parser close the outer one, which left the snippet and
+                 "View message" unclickable on threaded results. #}
+              <div class="block p-6 hover:bg-slate-50 dark:hover:bg-slate-900 transition-all duration-200 group">
                 <div class="flex items-start justify-between mb-2">
                   <h4 class="text-base font-semibold text-slate-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors flex-1 mr-3">
-                    {{ r.subject }}
+                    <a href="/mail/{{ project.slug }}/message/{{ r.id }}">{{ r.subject }}</a>
                   </h4>
                   <div class="flex items-center gap-2 flex-shrink-0">
                     {% if r.ack_required %}
@@ -363,7 +369,7 @@
                     <span>{{ r.created_relative }}</span>
                   </div>
                   {% if r.thread_id %}
-                    <a href="{{ r.thread_url }}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()">
+                    <a href="{{ r.thread_url }}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
                       <i data-lucide="message-circle" class="w-3.5 h-3.5"></i>
                       <span class="font-mono text-xs">{{ r.thread_id }}</span>
                     </a>
@@ -371,16 +377,16 @@
                 </div>
 
                 {% if r.snippet %}
-                  <div class="text-sm text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-3 line-clamp-3">
+                  <a href="/mail/{{ project.slug }}/message/{{ r.id }}" class="block text-sm text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-3 line-clamp-3">
                     {{ r.snippet | safe }}
-                  </div>
+                  </a>
                 {% endif %}
 
-                <div class="flex items-center gap-2 mt-2 text-primary-600 dark:text-primary-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                <a href="/mail/{{ project.slug }}/message/{{ r.id }}" class="flex items-center gap-2 mt-2 text-primary-600 dark:text-primary-400 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity">
                   <span class="text-sm font-medium">View message</span>
                   <i data-lucide="arrow-right" class="w-4 h-4 group-hover:translate-x-1 transition-transform"></i>
-                </div>
-              </a>
+                </a>
+              </div>
             {% endfor %}
           </div>
 
@@ -428,7 +434,7 @@
         </div>
         <div class="divide-y divide-slate-100 dark:divide-slate-700 max-h-96 overflow-y-auto">
           {% for recipe in recipes %}
-          <a href="/mail/{{ project.slug }}{{ recipe.route }}"
+          <a href="{{ recipe.href }}"
              class="block px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-900 transition-colors group">
             <div class="flex items-center gap-2 mb-1">
               {% if recipe.pinned %}
@@ -548,8 +554,9 @@
       switch ((value || '').trim().toLowerCase()) {
         case 'time':
         case 'newest':
-        case 'oldest':
           return 'time';
+        case 'oldest':
+          return 'oldest';
         case 'relevance':
         default:
           return 'relevance';
@@ -706,6 +713,9 @@
       filtered.sort((left, right) => {
         if (order === 'time') {
           return right._createdMs - left._createdMs || right.id - left.id;
+        }
+        if (order === 'oldest') {
+          return left._createdMs - right._createdMs || left.id - right.id;
         }
         return right._score - left._score || right._createdMs - left._createdMs || right.id - left.id;
       });

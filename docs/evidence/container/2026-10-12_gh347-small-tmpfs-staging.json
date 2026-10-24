@@ -1,0 +1,40 @@
+{
+  "issue": "GH#347",
+  "bead": "br-zsdxp",
+  "date": "2026-10-12",
+  "host": "ts1 (Ubuntu 26.04, glibc 2.43, docker)",
+  "question": "Does the server survive startup when /tmp is a small tmpfs that takes the 1 MiB staging probe but not a copy of the mailbox family?",
+  "setup": {
+    "container": "ubuntu:26.04 (sha256:6e92c4fd8dfdf7276d56743a65002a91c9eb35dbe7af327e6c85bd204b646156), --read-only root, --user host uid, entrypoint mcp-agent-mail serve --no-tui with the published image's environment (HTTP_HOST=0.0.0.0, STORAGE_ROOT=/data/mailbox, TUI_ENABLED=false, AM_INTERFACE_MODE=mcp, RUST_LOG=info) plus HTTP_BEARER_TOKEN",
+    "binary": "bind-mounted read-only at /usr/local/bin/mcp-agent-mail; ubuntu:26.04 instead of the published Debian 13 image because main release builds need GLIBC_2.43",
+    "mailbox": "built by v0.3.38 itself over MCP (1 project, 2 agents, 81 messages with 30 KB bodies), stopped gracefully; storage.sqlite3 2,867,200 B, -wal 5,141,792 B, -shm 32,768 B",
+    "tmpfs": "/tmp size = staged family pages (1967) + 4 pages = 8,073,216 B, the reporter's shape (4,092 of 4,096 pages used)",
+    "shapes": {
+      "inplace": "the original mailbox directory: the native staging path copies the family without -shm, the copy fits, and opening it maps a fresh -shm",
+      "copy": "cp -a of the same mailbox: inode identity changes, the namespace record no longer matches, the raw staging path also copies -shm and runs out of space"
+    }
+  },
+  "binaries": {
+    "v0.3.38": {"path": "~/.local/bin/mcp-agent-mail (signed release)", "sha256": "7a7d164bb39edf7f6a71cae3286ae01d2b04721c47caee3841cdee17e333238e"},
+    "main": {"commit": "2dd728513891a52525885b00cf7d5d6755b5f7b3", "build": "rch release, scratchpad build19/base3", "sha256": "919f5f2fab1c1aa57b69c34679d81c2a07838b831f9f33d74fb539766cc2ab1c"},
+    "fix": {"commit": "2dd72851 + this change (the two doc comments split for clippy after the build; no code difference)", "build": "rch release, scratchpad build20/fix347", "sha256": "1bf56c277599b340aeb415358bb067d4c99bf9d7f475af3d0f69960d48703325"}
+  },
+  "results": [
+    {"case": "inplace", "binary": "v0.3.38", "outcome": "exit 135 (SIGBUS) after startup; last log line the WAL-FEC WARN, exactly the reporter's symptom"},
+    {"case": "inplace", "binary": "main", "outcome": "exit 135 (SIGBUS)"},
+    {"case": "inplace", "binary": "fix", "outcome": "up and serving after 40 s; graceful stop exit 0", "log": "Temp directory /tmp cannot hold mailbox probe copies (no space left on device for a private probe copy: /tmp has 7884 KiB free, the mailbox family needs about 9020 KiB); staging them under /data/mailbox/diagnostics/staging instead. Free space there or point TMPDIR at a writable filesystem."},
+    {"case": "copy", "binary": "v0.3.38", "outcome": "exit 1: the staging ENOSPC was read as mailbox damage, the database was reconstructed from the archive, then promotion failed on the same ENOSPC (br-txx8u, fixed on main after v0.3.38)"},
+    {"case": "copy", "binary": "main", "outcome": "exit 1, no reconstruction: 'Database sanity probe could not run because the host is out of disk space ... mailbox health could not be determined'"},
+    {"case": "copy", "binary": "fix", "outcome": "up and serving after 40 s; same staging-fallback warning as inplace; graceful stop exit 0"},
+    {"case": "copy, 64 MiB tmpfs (control)", "binary": "fix", "outcome": "up and serving; no warning; no diagnostics/staging directory created, so a temp directory with room keeps staging"}
+  ],
+  "earlier_controls": [
+    "published ghcr v0.3.38 image (sha256:cc1424e79d4ea2f912a17da754e168a3a75ff656cc112c06fdfa5d465a8df3f7), in place, same tmpfs sizing: exit 135",
+    "published ghcr v0.3.38 image, same mailbox, 64 MiB tmpfs: healthy",
+    "published ghcr v0.3.38 image, copied mailbox, 256 MiB tmpfs: healthy (copying a mailbox is not itself a fault)"
+  ],
+  "not_covered": [
+    "a storage filesystem that is itself too full for the fallback: covered only by the unit test staging_root_keeps_the_temp_directory_when_no_location_has_room (startup keeps /tmp, and each staging call then refuses with StorageFull instead of crashing)",
+    "the engine root cause: FrankenSQLite extends -shm sparsely before MAP_SHARED, so a live mailbox whose own filesystem fills can still SIGBUS (Dicklesworthstone/frankensqlite#506)"
+  ]
+}

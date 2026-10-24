@@ -661,6 +661,72 @@ fn proactive_backup_health(
     }
 }
 
+/// `(status, detail)` for verified-snapshot metadata and periodic backup
+/// retention (GH#355). Unrecognized metadata makes every verified backup
+/// fail and parks rotation, and a footprint at the producer's limit pauses
+/// automatic backups: both leave the mailbox without a fresh restore point,
+/// so they fail. Legacy metadata is replaced by the next verified backup.
+fn backup_retention_health(
+    metadata_path: &Path,
+    metadata: &mcp_agent_mail_db::snapshot::SnapshotMetadataState,
+    footprint: &mcp_agent_mail_server::backup_rotation::PeriodicBackupFootprint,
+    periodic_reclamation: bool,
+) -> (&'static str, String) {
+    use mcp_agent_mail_db::snapshot::SnapshotMetadataState;
+
+    let mut status = "ok";
+    let mut problems = Vec::new();
+    let label = match metadata {
+        SnapshotMetadataState::Absent => "none",
+        SnapshotMetadataState::Current => "current",
+        SnapshotMetadataState::Legacy => {
+            status = "warn";
+            problems.push(format!(
+                "{} is an unversioned record written by v0.3.13-v0.3.30; the next verified backup keeps it as a .legacy-<sha256>.json sibling and replaces it",
+                metadata_path.display()
+            ));
+            "legacy"
+        }
+        SnapshotMetadataState::Unrecognized(reason) => {
+            status = "fail";
+            problems.push(format!(
+                "verified backups cannot replace {} and rotation keeps every backup generation while it is there ({reason}); next: move that file aside, keeping it as evidence, so the next verified backup records fresh metadata",
+                metadata_path.display()
+            ));
+            "unrecognized"
+        }
+    };
+    if footprint.publication_refused() {
+        status = "fail";
+        let remedy = if !periodic_reclamation {
+            "automatic deletion is off (AM_BACKUP_ROTATION_DELETE=false, or a platform without it), so old timestamped .bak files must be removed by hand"
+        } else if *metadata == SnapshotMetadataState::Current {
+            "retention deletes the superseded generations it can prove came from this mailbox, a bounded batch per backup attempt; if backup_images stops falling, stop the server and remove the remaining old timestamped .bak files by hand, keeping the plain .bak and the newest few"
+        } else {
+            "retention deletes nothing until a verified backup records current metadata, and the server makes only one verified repair backup while over the limit; if snapshot_metadata is still not current after the next backup attempt, stop the server and remove old timestamped .bak files by hand, keeping the plain .bak and the newest few"
+        };
+        problems.push(format!(
+            "automatic backups are paused: {} backup images and {} retained (plus {} for the next backup) are at the limit of {} images or {}; {remedy}",
+            footprint.images,
+            crate::format_bytes(footprint.retained_bytes),
+            crate::format_bytes(footprint.projected_bytes),
+            footprint.image_limit,
+            crate::format_bytes(footprint.byte_limit),
+        ));
+    }
+    let mut detail = format!(
+        "snapshot_metadata={label} backup_images={}/{} retained={}",
+        footprint.images,
+        footprint.image_limit,
+        crate::format_bytes(footprint.retained_bytes),
+    );
+    for problem in problems {
+        detail.push_str("; ");
+        detail.push_str(&problem);
+    }
+    (status, detail)
+}
+
 /// Read-only retention footprint for the same mailbox selected by the health
 /// probe. The resident total de-duplicates archive-reconcile files, which are
 /// visible both to direct backup rotation and recovery-debris reclaim.
@@ -669,18 +735,54 @@ fn proactive_backup_health(
 /// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]) so
 /// the MCP `health_check` `retention` block and this `am doctor health`
 /// surface consume ONE implementation (GH#210).
-fn doctor_retention_resident_stats(
+struct DoctorRetentionHealth {
+    stats: mcp_agent_mail_db::recovery_retention::RetentionResidentStats,
+    staging: mcp_agent_mail_db::recovery_retention::staging::AutomaticBackupStagingAssessment,
+}
+
+fn doctor_retention_health(
     probe_target: &DoctorLiveProbeTarget,
-) -> Result<mcp_agent_mail_db::recovery_retention::RetentionResidentStats, String> {
+) -> Result<Option<DoctorRetentionHealth>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&probe_target.database_url) {
+        return Ok(None);
+    }
     let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
         .map_err(|error| format!("resolving live database path: {error}"))?;
     let database_path = PathBuf::from(&resolved.canonical_path);
-    mcp_agent_mail_db::recovery_retention::retention_resident_stats(
+    let stats = mcp_agent_mail_db::recovery_retention::retention_resident_stats(
         &probe_target.storage_root,
         &database_path,
         None,
     )
-    .map_err(|error| format!("inspecting direct backup retention: {error}"))
+    .map_err(|error| format!("inspecting retained recovery evidence: {error}"))?;
+    let staging = mcp_agent_mail_db::recovery_retention::staging::assess_automatic_backup_staging(
+        &database_path,
+        stats.proactive_backup_staging,
+    )
+    .map_err(|error| format!("automatic backup staging assessment unavailable: {error}"))?;
+    Ok(Some(DoctorRetentionHealth { stats, staging }))
+}
+
+fn doctor_backup_retention_health(
+    probe_target: &DoctorLiveProbeTarget,
+) -> Result<(&'static str, String), String> {
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&probe_target.database_url)
+        .map_err(|error| format!("resolving live database path: {error}"))?;
+    let database_path = PathBuf::from(&resolved.canonical_path);
+    let metadata = mcp_agent_mail_db::snapshot::snapshot_metadata_state(&database_path)
+        .map_err(|error| format!("inspecting snapshot metadata: {error}"))?;
+    let footprint = mcp_agent_mail_server::backup_rotation::periodic_backup_footprint(
+        &probe_target.storage_root,
+        &database_path,
+        mcp_agent_mail_server::backup_rotation::resolved_keep_per_kind(),
+    )
+    .map_err(|error| format!("inspecting periodic backups: {error}"))?;
+    Ok(backup_retention_health(
+        &mcp_agent_mail_db::snapshot::snapshot_meta_path(&database_path),
+        &metadata,
+        &footprint,
+        cfg!(unix) && mcp_agent_mail_server::backup_rotation::periodic_reclamation_enabled(),
+    ))
 }
 
 fn format_resident_to_live_database_ratio(
@@ -3484,7 +3586,7 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
             let (status, detail) = proactive_backup_health(
                 probe_target
                     .integrity_guard_enabled
-                    .unwrap_or(config.integrity_check_on_startup),
+                    .unwrap_or(config.integrity_guard_enabled),
                 probe_target.integrity_guard_enabled.is_some(),
                 backup_age_secs,
                 owner_age_secs,
@@ -3580,13 +3682,13 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
         }
     }
 
-    // GH#210: make retention debt visible in the cheap health surface. This
-    // is informational rather than a mailbox-integrity failure: forensics are
-    // evidence, and reclaim only moves them into a reversible staging area.
-    // The ratio uses the exact live mailbox target selected above, never the
-    // CLI's potentially unrelated XDG default.
-    match doctor_retention_resident_stats(&probe_target) {
-        Ok(stats) => {
+    // Retention and staging refusal are operational degradation. They must
+    // affect this health result without becoming mailbox-corruption claims.
+    // Use the exact live mailbox target selected above and the producer's
+    // shared count/projected-byte assessment; byte alarms cannot mask refusal.
+    let mut backup_health_unavailable_or_blocked = false;
+    match doctor_retention_health(&probe_target) {
+        Ok(Some(DoctorRetentionHealth { stats, staging })) => {
             let live_database = stats
                 .live_database_bytes
                 .map_or_else(|| "unavailable".to_string(), crate::format_bytes);
@@ -3595,19 +3697,75 @@ pub fn handle_health(target: &std::path::Path) -> CliResult<()> {
                 stats.live_database_bytes,
             );
             ftui_runtime::ftui_println!(
-                "retention_resident: {} active artifact(s) (recovery_debris={} direct_backups={} reclaimable_staged={}) resident={} live_db={} ratio={}",
-                stats.recovery_debris_artifacts + stats.direct_backup_only_artifacts,
+                "retention_resident: {} active artifact(s) (recovery_debris={} direct_backups={} reclaimable_staged={}) resident={} live_db={} ratio={} staging_artifacts={} resident_attention={}",
+                stats.recovery_debris_artifacts
+                    + stats.direct_backup_only_artifacts
+                    + stats.proactive_backup_staging.artifacts(),
                 stats.recovery_debris_artifacts,
                 stats.direct_backup_only_artifacts,
                 crate::format_bytes(stats.reclaimable_staging_bytes),
                 crate::format_bytes(stats.resident_bytes),
                 live_database,
                 ratio,
+                stats.proactive_backup_staging.artifacts(),
+                stats.resident_attention(config.doctor_retention_alert_bytes),
+            );
+            if stats.resident_attention(config.doctor_retention_alert_bytes) {
+                backup_health_unavailable_or_blocked = true;
+                ftui_runtime::ftui_println!(
+                    "retention_resident: warn retained recovery evidence exceeds the configured absolute and live-database ratio thresholds; inspect the retained evidence and am doctor reclaim --dry-run (lists reclaimable debris only); this is not database corruption"
+                );
+            }
+            match staging.check_budget() {
+                Ok(()) => ftui_runtime::ftui_println!(
+                    "automatic_backup_staging: ok retained_artifacts={}/{} retained_bytes={} projected_bytes={} byte_limit={}",
+                    staging.inventory.artifacts(),
+                    mcp_agent_mail_db::recovery_retention::staging::MAX_RETAINED_STAGES,
+                    staging.inventory.bytes,
+                    staging.projected_bytes,
+                    staging.byte_limit,
+                ),
+                Err(error) => {
+                    backup_health_unavailable_or_blocked = true;
+                    ftui_runtime::ftui_println!(
+                        "automatic_backup_staging: fail (automatic backups refused: {error}); {}",
+                        mcp_agent_mail_db::recovery_retention::staging::STAGING_REMEDIATION,
+                    );
+                }
+            }
+        }
+        Ok(None) => {
+            ftui_runtime::ftui_println!(
+                "automatic_backup_staging: not_applicable (in-memory mailbox)"
             );
         }
         Err(error) => {
-            ftui_runtime::ftui_println!("retention_resident: not_run ({error})");
+            backup_health_unavailable_or_blocked = true;
+            ftui_runtime::ftui_println!(
+                "automatic_backup_staging: unavailable ({error}); inspect mailbox paths and permissions; no clean backup staging budget was established"
+            );
         }
+    }
+
+    // GH#355: metadata that verified backups cannot replace, or a periodic
+    // footprint at the producer's limit, silently stopped fresh restore
+    // points while this command still reported a healthy mailbox.
+    if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&probe_target.database_url) {
+        match doctor_backup_retention_health(&probe_target) {
+            Ok((status, detail)) => {
+                ftui_runtime::ftui_println!("backup_retention: {status} ({detail})");
+                if status == "fail" {
+                    backup_health_unavailable_or_blocked = true;
+                }
+            }
+            Err(error) => {
+                backup_health_unavailable_or_blocked = true;
+                ftui_runtime::ftui_println!("backup_retention: unavailable ({error})");
+            }
+        }
+    }
+    if backup_health_unavailable_or_blocked {
+        return Err(CliError::ExitCode(1));
     }
 
     let root = runs::doctor_root(target);
@@ -3933,6 +4091,199 @@ mod tests {
         ] {
             let (status, detail) = proactive_backup_health(guard, true, age, owner, true);
             assert_eq!(status, "ok", "{age:?} {owner:?} {guard}: {detail}");
+        }
+    }
+
+    #[test]
+    fn backup_retention_health_fails_when_backups_cannot_refresh() {
+        use mcp_agent_mail_db::snapshot::SnapshotMetadataState;
+        use mcp_agent_mail_server::backup_rotation::PeriodicBackupFootprint;
+
+        let meta = Path::new("/mail/storage.sqlite3.bak.meta.json");
+        let footprint = |images, retained_bytes| PeriodicBackupFootprint {
+            images,
+            retained_bytes,
+            projected_bytes: 1024,
+            image_limit: 6,
+            byte_limit: 512 * 1024 * 1024,
+        };
+        let healthy = footprint(3, 3 * 1024);
+
+        for state in [
+            SnapshotMetadataState::Absent,
+            SnapshotMetadataState::Current,
+        ] {
+            let (status, detail) = backup_retention_health(meta, &state, &healthy, true);
+            assert_eq!(status, "ok", "{state:?}: {detail}");
+            assert!(detail.contains("backup_images=3/6"), "{detail}");
+        }
+
+        // A legacy record is replaced by the next verified backup.
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Legacy, &healthy, true);
+        assert_eq!(status, "warn", "{detail}");
+        assert!(detail.contains("snapshot_metadata=legacy"), "{detail}");
+        assert!(detail.contains("v0.3.13-v0.3.30"), "{detail}");
+
+        // Metadata verified backups refuse to replace stops restore points.
+        let unrecognized = SnapshotMetadataState::Unrecognized(
+            "snapshot metadata refuses to replace unrecognized regular file".to_string(),
+        );
+        let (status, detail) = backup_retention_health(meta, &unrecognized, &healthy, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains(meta.to_str().unwrap()), "{detail}");
+        assert!(detail.contains("move that file aside"), "{detail}");
+
+        // GH#355's mailbox: 784 generations, 24.7 GiB, automatic backups paused.
+        // Without current metadata nothing can be deleted until a verified
+        // repair backup lands, so the operator is told what to do otherwise.
+        let backlog = footprint(784, 24_700 * 1024 * 1024);
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Legacy, &backlog, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("backup_images=784/6"), "{detail}");
+        assert!(detail.contains("automatic backups are paused"), "{detail}");
+        assert!(detail.contains("one verified repair backup"), "{detail}");
+        assert!(
+            detail.contains("remove old timestamped .bak files"),
+            "{detail}"
+        );
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Current, &backlog, true);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("bounded batch"), "{detail}");
+        assert!(detail.contains("stops falling"), "{detail}");
+        assert!(!detail.contains("one verified repair backup"), "{detail}");
+        let (status, detail) =
+            backup_retention_health(meta, &SnapshotMetadataState::Current, &backlog, false);
+        assert_eq!(status, "fail", "{detail}");
+        assert!(detail.contains("removed by hand"), "{detail}");
+
+        // The byte limit alone also pauses the producer.
+        let (status, detail) = backup_retention_health(
+            meta,
+            &SnapshotMetadataState::Current,
+            &footprint(2, 512 * 1024 * 1024),
+            true,
+        );
+        assert_eq!(status, "fail", "{detail}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_reports_snapshot_metadata_that_blocks_backups() {
+        // GH#355: a stale sidecar blocked rotation and every verified backup
+        // while `am doctor health` printed "ok: live mailbox healthy".
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        /// (label, sidecar, .bak generations, exits 1, expected output)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            usize,
+            bool,
+            &'static [&'static str],
+        );
+        let cases: [Case; 4] = [
+            (
+                "clean",
+                None,
+                0,
+                false,
+                &["backup_retention: ok", "snapshot_metadata=none"],
+            ),
+            (
+                "legacy record, no backlog",
+                Some("legacy"),
+                2,
+                false,
+                &["backup_retention: warn", "snapshot_metadata=legacy"],
+            ),
+            (
+                "unrecognized record",
+                Some("unrecognized"),
+                2,
+                true,
+                &["backup_retention: fail", "move that file aside"],
+            ),
+            (
+                "legacy record with a stranded backlog",
+                Some("legacy"),
+                40,
+                true,
+                &[
+                    "backup_retention: fail",
+                    "snapshot_metadata=legacy",
+                    "backup_images=40/",
+                    "automatic backups are paused",
+                ],
+            ),
+        ];
+        for (label, metadata, generations, fails, expected) in cases {
+            let target = tempfile::tempdir().unwrap();
+            let storage_root = tempfile::tempdir().unwrap();
+            let db_path = storage_root.path().join("storage.sqlite3");
+            let db_url = format!("sqlite:///{}", db_path.display());
+            seed_healthy_live_mailbox(&db_path);
+            let meta_path = storage_root.path().join("storage.sqlite3.bak.meta.json");
+            // The v0.3.30 shape from the report: no schema, size or SHA-256.
+            let meta_bytes = metadata.map(|kind| match kind {
+                "legacy" => serde_json::to_vec_pretty(&serde_json::json!({
+                    "created_us": 1_789_546_475_731_049_i64,
+                    "integrity_verified": true,
+                    "integrity_kind": "integrity_check",
+                    "schema_version": 1,
+                    "row_counts": {"agents": 21, "messages": 5257},
+                    "source_path": db_path.to_str().unwrap(),
+                    "snapshot_path": format!("{}.bak", db_path.display()),
+                    "binary_version": "0.3.30"
+                }))
+                .unwrap(),
+                _ => b"operator evidence, not snapshot metadata".to_vec(),
+            });
+            if let Some(bytes) = &meta_bytes {
+                fs::write(&meta_path, bytes).unwrap();
+            }
+            if generations > 0 {
+                fs::copy(&db_path, storage_root.path().join("storage.sqlite3.bak")).unwrap();
+            }
+            for index in 1..generations {
+                fs::copy(
+                    &db_path,
+                    storage_root
+                        .path()
+                        .join(format!("storage.sqlite3.bak.20260921_{index:06}")),
+                )
+                .unwrap();
+            }
+
+            let (result, output) =
+                run_health_capturing(target.path(), &db_url, storage_root.path());
+
+            for needle in expected {
+                assert!(output.contains(needle), "{label}: {needle:?} in:\n{output}");
+            }
+            if fails {
+                assert!(
+                    matches!(result, Err(CliError::ExitCode(1))),
+                    "{label}: {result:?}\n{output}"
+                );
+                assert!(
+                    !output.contains("ok: live mailbox healthy"),
+                    "{label}:\n{output}"
+                );
+            } else {
+                assert!(result.is_ok(), "{label}: {result:?}\n{output}");
+                assert!(
+                    output.contains("ok: live mailbox healthy"),
+                    "{label}:\n{output}"
+                );
+            }
+            // Health is read-only: the metadata is reported, never replaced.
+            if let Some(bytes) = meta_bytes {
+                assert_eq!(fs::read(&meta_path).unwrap(), bytes, "{label}");
+            }
         }
     }
 
@@ -4684,6 +5035,147 @@ mod tests {
             output.contains("ratio="),
             "health must expose the resident/live-DB ratio:\n{output}"
         );
+    }
+
+    fn capture_retention_health(
+        target: &Path,
+        storage_root: &Path,
+        primary: &Path,
+        alert_bytes: &str,
+    ) -> (CliResult<()>, String) {
+        let db_url = format!("sqlite:///{}", primary.display());
+        let storage_root_s = storage_root.display().to_string();
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_s),
+                ("HTTP_PORT", "47351"),
+                ("DOCTOR_RETENTION_ALERT_BYTES", alert_bytes),
+            ],
+            || handle_health(target),
+        );
+        let output = capture.drain_to_string();
+        drop(capture);
+        (result, output)
+    }
+
+    #[test]
+    fn memory_mailbox_has_no_filesystem_backup_staging_assessment() {
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: PathBuf::from("/not-inspected-by-retention"),
+            ..Config::default()
+        };
+        let target = doctor_live_probe_target_from_server_config(&config, None);
+        assert!(matches!(doctor_retention_health(&target), Ok(None)));
+    }
+
+    #[test]
+    fn doctor_health_fails_on_retained_stages_with_byte_alerts_disabled() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for legacy in [false, true] {
+            let target = tempfile::tempdir().unwrap().keep();
+            let root = tempfile::tempdir().unwrap().keep();
+            let primary = root.join("storage.sqlite3");
+            seed_healthy_live_mailbox(&primary);
+            let mut evidence = Vec::new();
+            for ordinal in 0..3 {
+                let path = if legacy {
+                    root.join(format!(".snapshot-inspect-{ordinal}.sqlite3"))
+                } else {
+                    let stage = root.join(format!(".mcp-agent-mail-proactive-backup-{ordinal}"));
+                    std::fs::create_dir(&stage).unwrap();
+                    stage.join("snapshot.sqlite3")
+                };
+                std::fs::write(&path, b"retained evidence").unwrap();
+                evidence.push(path);
+            }
+            let (result, output) = capture_retention_health(&target, &root, &primary, "0");
+            assert!(
+                matches!(result, Err(CliError::ExitCode(1))),
+                "{result:?}\n{output}"
+            );
+            assert!(output.contains("automatic_backup_staging: fail (automatic backups refused: 3 retained staging artifacts"), "{output}");
+            assert!(output.contains("resident_attention=false"), "{output}");
+            assert!(
+                output.contains("am doctor reclaim does not move these stages"),
+                "{output}"
+            );
+            assert!(!output.contains("ok: live mailbox healthy"), "{output}");
+            for path in evidence {
+                assert_eq!(std::fs::read(path).unwrap(), b"retained evidence");
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_health_applies_resident_attention_without_calling_evidence_corrupt() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let target = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep();
+        let primary = root.join("storage.sqlite3");
+        seed_healthy_live_mailbox(&primary);
+        let forensic = root.join("doctor/forensics/storage.sqlite3/retained-incident/sqlite");
+        std::fs::create_dir_all(&forensic).unwrap();
+        let evidence = forensic.join("storage.sqlite3");
+        let bytes = std::fs::metadata(&primary)
+            .unwrap()
+            .len()
+            .checked_mul(21)
+            .unwrap();
+        std::fs::File::create(&evidence)
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        let (result, output) = capture_retention_health(&target, &root, &primary, "1");
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "{result:?}\n{output}"
+        );
+        assert!(output.contains("resident_attention=true"), "{output}");
+        assert!(output.contains("automatic_backup_staging: ok"), "{output}");
+        assert!(
+            output.contains("this is not database corruption"),
+            "{output}"
+        );
+        let (disabled, output) = capture_retention_health(&target, &root, &primary, "0");
+        assert!(disabled.is_ok(), "{disabled:?}\n{output}");
+        assert!(output.contains("resident_attention=false"), "{output}");
+        assert_eq!(std::fs::metadata(evidence).unwrap().len(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_health_fails_when_staging_inventory_is_unavailable() {
+        let _guard = DOCTOR_HEALTH_STDIO_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let target = tempfile::tempdir().unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep();
+        let primary = root.join("storage.sqlite3");
+        seed_healthy_live_mailbox(&primary);
+        let outside = root.join("outside-evidence");
+        std::fs::write(&outside, b"preserved").unwrap();
+        let alias = root.join(".snapshot-inspect-aliased.sqlite3");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let (result, output) = capture_retention_health(&target, &root, &primary, "0");
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "{result:?}\n{output}"
+        );
+        assert!(
+            output.contains("automatic_backup_staging: unavailable"),
+            "{output}"
+        );
+        assert!(!output.contains("automatic backups refused"), "{output}");
+        assert!(!output.contains("ok: live mailbox healthy"), "{output}");
+        assert_eq!(std::fs::read_link(alias).unwrap(), outside);
+        assert_eq!(std::fs::read(outside).unwrap(), b"preserved");
     }
 
     #[test]

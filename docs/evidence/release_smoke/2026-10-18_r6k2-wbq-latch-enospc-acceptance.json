@@ -1,0 +1,777 @@
+{
+ "schema": "br-6r7k2 acceptance v1",
+ "bead": "br-6r7k2",
+ "author": "CopperGoose (Claude Opus 5.5)",
+ "claim_under_test": "5f577775 (+ ac929af8, 4625eb9b): the WBQ durability latch clears in-process once the failed write-back is reconciled; that commit made no runtime ENOSPC/HTTP acceptance claim",
+ "rule": "br-6r7k2 acceptance probe (written 2026-10-18 ~14:45Z, before the probe script ran even once).\n\nClaim under test: Jeff's 5f577775 (+ ac929af8, 4625eb9b) clears the WBQ durability latch in-process once the failed\nwrite-back is reconciled. 5f577775 says \"no runtime ENOSPC/HTTP acceptance claim\"; this is that acceptance run.\nBead done-when: \"arm the latch with a simulated ENOSPC on one archive write, restore the disk, and then, without a\nrestart, sends succeed within about 2 min. The missing archive file is written, and /health/durability returns to\nhealthy.\"\n\nArms: B = main ac0dcbcd portable release (build34, contains all three commits). A = shipped v0.3.38 image binary\n(no in-process clear) = planted negative: the same probe must FAIL on A, or the probe cannot detect the defect.\nOrder A then B. Host lock held.\n\nSetup per arm: ghcr v0.3.38 image (B: build34 mcp-agent-mail bind-mounted over /usr/local/bin/mcp-agent-mail),\narchive STORAGE_ROOT=/data/mailbox on a 32 MB tmpfs at /data, database on a host bind mount\n(DATABASE_URL=sqlite:////db/storage.sqlite3), disk thresholds scaled to the tmpfs (fatal 1 MB, critical 2, warning 3;\ncheck interval default 60 s), bearer token, HTTP over a published loopback port.\n\nSteps: 3 warm-up sends must succeed and be archived. Fill /data with a zero filler outside STORAGE_ROOT until ENOSPC,\nthen send message M at once. Precondition ARMED: within 300 s /health/durability reports allows_writes=false with\nwrite_gate DURABILITY_DEGRADED. Then restore space by remounting /data at 256 MB (no file is removed). Poll health\nevery 5 s and try one send every 15 s for 600 s.\n\nDecision per arm:\n  NOT ARMED: precondition fails -> INCONCLUSIVE for that arm (reported; no claim).\n  PASS: without a server restart (same container start time, RestartCount 0, same server pid), within 180 s of the\n    remount: a send succeeds, M's archive file exists, and /health/durability shows allows_writes=true with no\n    write_gate.\n  FAIL: ARMED but PASS not met within 600 s.\nbr-6r7k2 closes (citing 5f577775 and this run) only if B PASSES and A FAILS. If B passes in 180..600 s, it is a FAIL\nunder this rule (the bead asks about 2 min), reported with the time. The unrepairable-case acceptance (\"latch stays\nwhen the reconcile cannot repair\") is NOT exercised here; it rests on 5f577775's unit tests and is stated as such.\nThe guidance-text half of the bead (refusal + /health say only `am doctor repair`) is separate work.\n\nAmendment 2026-10-18 14:44Z, while A runs and before B starts, after seeing A's live /health/durability: v0.3.38's\nhealth has no write_gate field (main added it in apply_wbq_write_gate), and its degraded_read_only state there comes\nfrom disk pressure, not the latch. So the script's ARMED check cannot fire on A. A's server log shows the latch armed\n0.3 s after the fill (\"[wbq-drain] op failed after retries ... refusing further writes\"). For A only, ARMED is judged\nbehaviourally from the recorded events: a send refused with DURABILITY_DEGRADED. A's planted-negative FAIL then means\nevery after-restore send in the 600 s window is refused with DURABILITY_DEGRADED. B's precondition, PASS criteria\nand script are unchanged.\n\nAddendum 2026-10-18 15:00Z, after A and B ran, adding a STRICTER requirement (nothing relaxed): B's disk was full\nfor only ~8 s, so the 60 s disk sampler never recorded critical/fatal pressure, and seed_retries skips while pressure\nis critical. The studio outage held the disk full for an hour or more. B2 = B with the full disk held 300 s after\nARMED (as A effectively was) before the remount. Same PASS criteria (<= 180 s after the remount, no restart). br-6r7k2\ncloses only if B PASS, B2 PASS and A FAIL.\n",
+ "binaries": {
+  "A": "ghcr.io/dicklesworthstone/mcp_agent_mail_rust:v0.3.38 image binary (revision f9c68b4e)",
+  "B_and_B2": {
+   "what": "main ac0dcbcd portable release build",
+   "mcp_agent_mail_sha256": "ca05cee28f6585f30f5221a9efcbd5eef5fb8ba4d7c741697afd41effbfcdd96"
+  }
+ },
+ "harness": "r6k2_probe.py: docker, archive on a 32 MB tmpfs (/data), database on a host bind mount, disk thresholds scaled (fatal 1 MB, critical 2, warning 3; 60 s sampler), zero filler outside STORAGE_ROOT until ENOSPC, then send M; restore = remount /data at 256 MB (nothing removed); health every 5 s, one send every 15 s for up to 600 s",
+ "arms": {
+  "A": {
+   "summary": {
+    "label": "A",
+    "container": "r6k2-A-1792334499",
+    "server_binary": "image v0.3.38",
+    "m_id": 5,
+    "armed_after_fill_s": null,
+    "first_ok_after_restore_s": null,
+    "healthy_after_restore_s": 0.1,
+    "m_archived_after_restore_s": 5.1,
+    "no_restart": true,
+    "verdict": "NOT ARMED (inconclusive)"
+   },
+   "events": [
+    {
+     "t": 0.52,
+     "kind": "docker_run",
+     "rc": 0,
+     "out": "b215c9c3c177acae13b7",
+     "err": ""
+    },
+    {
+     "t": 2.63,
+     "kind": "up",
+     "state": "2026-10-18T14:41:39.77660012Z 0 2896511 true",
+     "version": "mcp-agent-mail 0.3.38",
+     "health": {
+      "durability_state": "healthy",
+      "allows_writes": true
+     }
+    },
+    {
+     "t": 2.93,
+     "kind": "warmup_send",
+     "i": 0,
+     "err": false,
+     "id": 2
+    },
+    {
+     "t": 2.98,
+     "kind": "warmup_send",
+     "i": 1,
+     "err": false,
+     "id": 3
+    },
+    {
+     "t": 3.02,
+     "kind": "warmup_send",
+     "i": 2,
+     "err": false,
+     "id": 4
+    },
+    {
+     "t": 8.14,
+     "kind": "archived_md",
+     "files": "4",
+     "df": "tmpfs              32768   272     32496   1% /data"
+    },
+    {
+     "t": 8.23,
+     "kind": "filled",
+     "out": "33275904 bytes (33 MB, 32 MiB) copied, 0.0220679 s, 1.5 GB/s\ntmpfs              32768 32768         0 100% /data"
+    },
+    {
+     "t": 8.28,
+     "kind": "send_M",
+     "err": false,
+     "id": 5,
+     "result": "ok"
+    },
+    {
+     "t": 309.36,
+     "kind": "not_armed",
+     "health": {
+      "durability_state": "degraded_read_only",
+      "allows_writes": false
+     }
+    },
+    {
+     "t": 309.48,
+     "kind": "remounted",
+     "rc": 0,
+     "err": "",
+     "df": "tmpfs             262144 32768    229376  13% /data"
+    },
+    {
+     "t": 309.48,
+     "kind": "healthy",
+     "after_s": 0.1,
+     "health": {
+      "durability_state": "healthy",
+      "allows_writes": true
+     }
+    },
+    {
+     "t": 309.54,
+     "kind": "send_after_restore",
+     "n": 1,
+     "after_s": 0.1,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 314.6,
+     "kind": "m_archived",
+     "after_s": 5.1,
+     "path": "/data/mailbox/projects/db-proj6r7k2/messages/2026/10/2026-10-18T14-41-47Z__m-during-enospc__5.md"
+    },
+    {
+     "t": 324.62,
+     "kind": "send_after_restore",
+     "n": 2,
+     "after_s": 15.2,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 339.64,
+     "kind": "send_after_restore",
+     "n": 3,
+     "after_s": 30.2,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 354.66,
+     "kind": "send_after_restore",
+     "n": 4,
+     "after_s": 45.2,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 369.68,
+     "kind": "send_after_restore",
+     "n": 5,
+     "after_s": 60.3,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 384.71,
+     "kind": "send_after_restore",
+     "n": 6,
+     "after_s": 75.3,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 399.73,
+     "kind": "send_after_restore",
+     "n": 7,
+     "after_s": 90.3,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 414.75,
+     "kind": "send_after_restore",
+     "n": 8,
+     "after_s": 105.3,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 429.78,
+     "kind": "send_after_restore",
+     "n": 9,
+     "after_s": 120.3,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 444.8,
+     "kind": "send_after_restore",
+     "n": 10,
+     "after_s": 135.4,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 459.82,
+     "kind": "send_after_restore",
+     "n": 11,
+     "after_s": 150.4,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 474.85,
+     "kind": "send_after_restore",
+     "n": 12,
+     "after_s": 165.4,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 489.87,
+     "kind": "send_after_restore",
+     "n": 13,
+     "after_s": 180.4,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 504.9,
+     "kind": "send_after_restore",
+     "n": 14,
+     "after_s": 195.5,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 519.92,
+     "kind": "send_after_restore",
+     "n": 15,
+     "after_s": 210.5,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 534.95,
+     "kind": "send_after_restore",
+     "n": 16,
+     "after_s": 225.5,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 549.97,
+     "kind": "send_after_restore",
+     "n": 17,
+     "after_s": 240.5,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 565.0,
+     "kind": "send_after_restore",
+     "n": 18,
+     "after_s": 255.6,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 580.02,
+     "kind": "send_after_restore",
+     "n": 19,
+     "after_s": 270.6,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 595.05,
+     "kind": "send_after_restore",
+     "n": 20,
+     "after_s": 285.6,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 610.07,
+     "kind": "send_after_restore",
+     "n": 21,
+     "after_s": 300.6,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 625.09,
+     "kind": "send_after_restore",
+     "n": 22,
+     "after_s": 315.7,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 640.12,
+     "kind": "send_after_restore",
+     "n": 23,
+     "after_s": 330.7,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 655.14,
+     "kind": "send_after_restore",
+     "n": 24,
+     "after_s": 345.7,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 670.16,
+     "kind": "send_after_restore",
+     "n": 25,
+     "after_s": 360.7,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 685.18,
+     "kind": "send_after_restore",
+     "n": 26,
+     "after_s": 375.8,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 700.21,
+     "kind": "send_after_restore",
+     "n": 27,
+     "after_s": 390.8,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 715.23,
+     "kind": "send_after_restore",
+     "n": 28,
+     "after_s": 405.8,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 730.25,
+     "kind": "send_after_restore",
+     "n": 29,
+     "after_s": 420.8,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 745.27,
+     "kind": "send_after_restore",
+     "n": 30,
+     "after_s": 435.8,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 760.3,
+     "kind": "send_after_restore",
+     "n": 31,
+     "after_s": 450.9,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 775.32,
+     "kind": "send_after_restore",
+     "n": 32,
+     "after_s": 465.9,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 790.34,
+     "kind": "send_after_restore",
+     "n": 33,
+     "after_s": 480.9,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 805.37,
+     "kind": "send_after_restore",
+     "n": 34,
+     "after_s": 495.9,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 820.39,
+     "kind": "send_after_restore",
+     "n": 35,
+     "after_s": 511.0,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 835.41,
+     "kind": "send_after_restore",
+     "n": 36,
+     "after_s": 526.0,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 850.43,
+     "kind": "send_after_restore",
+     "n": 37,
+     "after_s": 541.0,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 865.46,
+     "kind": "send_after_restore",
+     "n": 38,
+     "after_s": 556.0,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 880.48,
+     "kind": "send_after_restore",
+     "n": 39,
+     "after_s": 571.1,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 895.5,
+     "kind": "send_after_restore",
+     "n": 40,
+     "after_s": 586.1,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 910.61,
+     "kind": "final",
+     "state_before_fill": "2026-10-18T14:41:39.77660012Z 0 2896511 true",
+     "state_after": "2026-10-18T14:41:39.77660012Z 0 2896511 true",
+     "git_log": "a87bd3a repair: reconcile message 5 archive\n78a8fae batch: 7 events (2026-10-18T14:41:42Z \u2013 2026-10-18T14:41:42Z)\n46076d6 chore: initialize archive"
+    }
+   ],
+   "server_log_lines": [
+    "\u001b[2m2026-10-18T14:41:48.144428Z\u001b[0m \u001b[31mERROR\u001b[0m [wbq-drain] op failed after retries: I/O error: No space left on device (os error 28) \u2014 durability degraded, refusing further writes until operator intervention",
+    "\u001b[2m2026-10-18T14:42:41.732082Z\u001b[0m \u001b[33m WARN\u001b[0m disk pressure level changed \u001b[3mfrom\u001b[0m\u001b[2m=\u001b[0m\"ok\" \u001b[3mto\u001b[0m\u001b[2m=\u001b[0m\"fatal\" \u001b[3mstorage_free_bytes\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mdb_free_bytes\u001b[0m\u001b[2m=\u001b[0m98735579136 \u001b[3meffective_free_bytes\u001b[0m\u001b[2m=\u001b[0m0",
+    "\u001b[2m2026-10-18T14:47:41.763625Z\u001b[0m \u001b[33m WARN\u001b[0m disk pressure level changed \u001b[3mfrom\u001b[0m\u001b[2m=\u001b[0m\"fatal\" \u001b[3mto\u001b[0m\u001b[2m=\u001b[0m\"ok\" \u001b[3mstorage_free_bytes\u001b[0m\u001b[2m=\u001b[0m234819584 \u001b[3mdb_free_bytes\u001b[0m\u001b[2m=\u001b[0m98642538496 \u001b[3meffective_free_bytes\u001b[0m\u001b[2m=\u001b[0m234819584"
+   ]
+  },
+  "B": {
+   "summary": {
+    "label": "B",
+    "container": "r6k2-B-1792335412",
+    "server_binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build34/main_ac0dcbcd/mcp-agent-mail",
+    "m_id": 5,
+    "armed_after_fill_s": 2.1,
+    "first_ok_after_restore_s": 15.2,
+    "healthy_after_restore_s": 5.1,
+    "m_archived_after_restore_s": 5.1,
+    "no_restart": true,
+    "verdict": "PASS"
+   },
+   "events": [
+    {
+     "t": 0.41,
+     "kind": "docker_run",
+     "rc": 0,
+     "out": "a1e935fc280d5c218795",
+     "err": ""
+    },
+    {
+     "t": 2.51,
+     "kind": "up",
+     "state": "2026-10-18T14:56:52.781458738Z 0 2924817 true",
+     "version": "mcp-agent-mail 0.3.39",
+     "health": {
+      "durability_state": "healthy",
+      "allows_writes": true
+     }
+    },
+    {
+     "t": 2.81,
+     "kind": "warmup_send",
+     "i": 0,
+     "err": false,
+     "id": 2
+    },
+    {
+     "t": 2.85,
+     "kind": "warmup_send",
+     "i": 1,
+     "err": false,
+     "id": 3
+    },
+    {
+     "t": 2.89,
+     "kind": "warmup_send",
+     "i": 2,
+     "err": false,
+     "id": 4
+    },
+    {
+     "t": 8.01,
+     "kind": "archived_md",
+     "files": "4",
+     "df": "tmpfs              32768   272     32496   1% /data"
+    },
+    {
+     "t": 8.12,
+     "kind": "filled",
+     "out": "33275904 bytes (33 MB, 32 MiB) copied, 0.0222693 s, 1.5 GB/s\ntmpfs              32768 32768         0 100% /data"
+    },
+    {
+     "t": 8.16,
+     "kind": "send_M",
+     "err": false,
+     "id": 5,
+     "result": "ok"
+    },
+    {
+     "t": 10.18,
+     "kind": "armed",
+     "health": {
+      "durability_state": "degraded_read_only",
+      "allows_writes": false,
+      "write_gate": "DURABILITY_DEGRADED"
+     }
+    },
+    {
+     "t": 10.18,
+     "kind": "send_while_armed",
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 10.3,
+     "kind": "remounted",
+     "rc": 0,
+     "err": "",
+     "df": "tmpfs             262144 32768    229376  13% /data"
+    },
+    {
+     "t": 10.37,
+     "kind": "send_after_restore",
+     "n": 1,
+     "after_s": 0.1,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 15.38,
+     "kind": "healthy",
+     "after_s": 5.1,
+     "health": {
+      "durability_state": "healthy",
+      "allows_writes": true
+     }
+    },
+    {
+     "t": 15.44,
+     "kind": "m_archived",
+     "after_s": 5.1,
+     "path": "/data/mailbox/projects/db-proj6r7k2/messages/2026/10/2026-10-18T14-57-00Z__m-during-enospc__5.md"
+    },
+    {
+     "t": 25.5,
+     "kind": "send_after_restore",
+     "n": 2,
+     "after_s": 15.2,
+     "err": false,
+     "result": "ok"
+    },
+    {
+     "t": 25.58,
+     "kind": "final",
+     "state_before_fill": "2026-10-18T14:56:52.781458738Z 0 2924817 true",
+     "state_after": "2026-10-18T14:56:52.781458738Z 0 2924817 true",
+     "git_log": "b18e9ca repair: reconcile message 5 archive\n0149eba batch: 7 events (2026-10-18T14:56:55Z \u2013 2026-10-18T14:56:55Z)\n8222a43 chore: initialize archive"
+    }
+   ],
+   "server_log_lines": [
+    "\u001b[2m2026-10-18T14:57:01.060341Z\u001b[0m \u001b[31mERROR\u001b[0m [wbq-drain] op failed after retries: I/O error: No space left on device (os error 28) \u2014 durability degraded, refusing further writes until operator intervention",
+    "\u001b[2m2026-10-18T14:57:04.614734Z\u001b[0m \u001b[32m INFO\u001b[0m all tracked WBQ failures verified in the archive; write refusal cleared \u001b[3mevent\u001b[0m\u001b[2m=\u001b[0m\"wbq_durability_recovered\" \u001b[3mmessage_id\u001b[0m\u001b[2m=\u001b[0m5 \u001b[3mfailure_timestamp_us\u001b[0m\u001b[2m=\u001b[0m1792335421060298"
+   ]
+  },
+  "B2": {
+   "summary": {
+    "label": "B2",
+    "container": "r6k2-B2-1792336204",
+    "server_binary": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build34/main_ac0dcbcd/mcp-agent-mail",
+    "m_id": 5,
+    "armed_after_fill_s": 2.1,
+    "first_ok_after_restore_s": 76.0,
+    "healthy_after_restore_s": 65.9,
+    "m_archived_after_restore_s": 65.9,
+    "no_restart": true,
+    "verdict": "PASS"
+   },
+   "events": [
+    {
+     "t": 0.46,
+     "kind": "docker_run",
+     "rc": 0,
+     "out": "16c5de9933c3162d26c7",
+     "err": ""
+    },
+    {
+     "t": 2.56,
+     "kind": "up",
+     "state": "2026-10-18T15:10:04.948607424Z 0 3392810 true",
+     "version": "mcp-agent-mail 0.3.39",
+     "health": {
+      "durability_state": "healthy",
+      "allows_writes": true
+     }
+    },
+    {
+     "t": 2.85,
+     "kind": "warmup_send",
+     "i": 0,
+     "err": false,
+     "id": 2
+    },
+    {
+     "t": 2.89,
+     "kind": "warmup_send",
+     "i": 1,
+     "err": false,
+     "id": 3
+    },
+    {
+     "t": 2.93,
+     "kind": "warmup_send",
+     "i": 2,
+     "err": false,
+     "id": 4
+    },
+    {
+     "t": 8.03,
+     "kind": "archived_md",
+     "files": "4",
+     "df": "tmpfs              32768   272     32496   1% /data"
+    },
+    {
+     "t": 8.12,
+     "kind": "filled",
+     "out": "33275904 bytes (33 MB, 32 MiB) copied, 0.0191971 s, 1.7 GB/s\ntmpfs              32768 32768         0 100% /data"
+    },
+    {
+     "t": 8.17,
+     "kind": "send_M",
+     "err": false,
+     "id": 5,
+     "result": "ok"
+    },
+    {
+     "t": 10.18,
+     "kind": "armed",
+     "health": {
+      "durability_state": "degraded_read_only",
+      "allows_writes": false,
+      "write_gate": "DURABILITY_DEGRADED"
+     }
+    },
+    {
+     "t": 10.18,
+     "kind": "send_while_armed",
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 10.18,
+     "kind": "holding_full_disk",
+     "secs": 300
+    },
+    {
+     "t": 310.19,
+     "kind": "held",
+     "health": {
+      "durability_state": "degraded_read_only",
+      "allows_writes": false,
+      "write_gate": "DURABILITY_DEGRADED"
+     }
+    },
+    {
+     "t": 310.31,
+     "kind": "remounted",
+     "rc": 0,
+     "err": "",
+     "df": "tmpfs             262144 32768    229376  13% /data"
+    },
+    {
+     "t": 310.38,
+     "kind": "send_after_restore",
+     "n": 1,
+     "after_s": 0.1,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 325.58,
+     "kind": "send_after_restore",
+     "n": 2,
+     "after_s": 15.3,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 340.77,
+     "kind": "send_after_restore",
+     "n": 3,
+     "after_s": 30.5,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 355.97,
+     "kind": "send_after_restore",
+     "n": 4,
+     "after_s": 45.6,
+     "err": true,
+     "result": "DISK_FULL"
+    },
+    {
+     "t": 371.17,
+     "kind": "send_after_restore",
+     "n": 5,
+     "after_s": 60.9,
+     "err": true,
+     "result": "DURABILITY_DEGRADED"
+    },
+    {
+     "t": 376.18,
+     "kind": "healthy",
+     "after_s": 65.9,
+     "health": {
+      "durability_state": "healthy",
+      "allows_writes": true
+     }
+    },
+    {
+     "t": 376.24,
+     "kind": "m_archived",
+     "after_s": 65.9,
+     "path": "/data/mailbox/projects/db-proj6r7k2/messages/2026/10/2026-10-18T15-10-12Z__m-during-enospc__5.md"
+    },
+    {
+     "t": 386.33,
+     "kind": "send_after_restore",
+     "n": 6,
+     "after_s": 76.0,
+     "err": false,
+     "result": "ok"
+    },
+    {
+     "t": 386.4,
+     "kind": "final",
+     "state_before_fill": "2026-10-18T15:10:04.948607424Z 0 3392810 true",
+     "state_after": "2026-10-18T15:10:04.948607424Z 0 3392810 true",
+     "git_log": "2f41898 repair: reconcile message 5 archive\nf5a3c42 batch: 7 events (2026-10-18T15:10:07Z \u2013 2026-10-18T15:10:07Z)\n8625b73 chore: initialize archive"
+    }
+   ],
+   "server_log_lines": [
+    "\u001b[2m2026-10-18T15:10:13.229613Z\u001b[0m \u001b[31mERROR\u001b[0m [wbq-drain] op failed after retries: I/O error: No space left on device (os error 28) \u2014 durability degraded, refusing further writes until operator intervention",
+    "\u001b[2m2026-10-18T15:11:06.746761Z\u001b[0m \u001b[33m WARN\u001b[0m disk pressure level changed \u001b[3mfrom\u001b[0m\u001b[2m=\u001b[0m\"ok\" \u001b[3mto\u001b[0m\u001b[2m=\u001b[0m\"fatal\" \u001b[3mstorage_free_bytes\u001b[0m\u001b[2m=\u001b[0m0 \u001b[3mdb_free_bytes\u001b[0m\u001b[2m=\u001b[0m98153136128 \u001b[3meffective_free_bytes\u001b[0m\u001b[2m=\u001b[0m0",
+    "\u001b[2m2026-10-18T15:16:06.782991Z\u001b[0m \u001b[33m WARN\u001b[0m disk pressure level changed \u001b[3mfrom\u001b[0m\u001b[2m=\u001b[0m\"fatal\" \u001b[3mto\u001b[0m\u001b[2m=\u001b[0m\"ok\" \u001b[3mstorage_free_bytes\u001b[0m\u001b[2m=\u001b[0m234881024 \u001b[3mdb_free_bytes\u001b[0m\u001b[2m=\u001b[0m98152361984 \u001b[3meffective_free_bytes\u001b[0m\u001b[2m=\u001b[0m234881024",
+    "\u001b[2m2026-10-18T15:16:16.824191Z\u001b[0m \u001b[32m INFO\u001b[0m all tracked WBQ failures verified in the archive; write refusal cleared \u001b[3mevent\u001b[0m\u001b[2m=\u001b[0m\"wbq_durability_recovered\" \u001b[3mmessage_id\u001b[0m\u001b[2m=\u001b[0m5 \u001b[3mfailure_timestamp_us\u001b[0m\u001b[2m=\u001b[0m1792336213229549"
+   ]
+  }
+ },
+ "verdict": {
+  "A": "FAIL (planted negative met): ARMED by behaviour; M re-archived 5.1 s after the remount, yet all 40 sends in the 600 s window were refused (4 DISK_FULL while the 60 s disk sample was stale, 36 DURABILITY_DEGRADED); after the remount its /health/durability reported healthy with allows_writes=true while refusing every send",
+  "B": "PASS (full disk ~8 s; the sampler never recorded critical pressure)",
+  "B2": "PASS (full disk held 300 s; pressure fatal 15:11:06 to 15:16:06)"
+ },
+ "not_exercised": "the unrepairable case (latch stays when the reconcile cannot repair) at runtime; see the durability unit-test lane cited on the bead"
+}

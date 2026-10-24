@@ -1,0 +1,668 @@
+diff --git a/crates/mcp-agent-mail-storage/src/lib.rs b/crates/mcp-agent-mail-storage/src/lib.rs
+index bcb8247d..7f854548 100644
+--- a/crates/mcp-agent-mail-storage/src/lib.rs
++++ b/crates/mcp-agent-mail-storage/src/lib.rs
+@@ -9609,15 +9609,72 @@ fn append_message_bundle_files(
+     rel_paths: &mut Vec<String>,
+     existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
+ ) -> Result<MessageBundleCommitMeta> {
++    let prepared = prepare_message_bundle_files(archive, entry, existing_ids)?;
++    let mut writes = StagedArchiveWrites::default();
++    let mut targets = Vec::new();
++    prepared.stage(&mut writes, &mut targets)?;
++    writes.publish()?;
++    record_published_paths(archive, &targets, rel_paths)?;
++    finish_message_bundle(
++        archive,
++        entry,
++        &prepared.paths.canonical,
++        &prepared.timestamp_str,
++        rel_paths,
++    )
++}
++
++/// One message's canonical, outbox and inbox copies, rendered and checked for
++/// a canonical-id collision but not yet written.
++struct PreparedMessageBundle {
++    paths: MessageArchivePaths,
++    full_content: String,
++    /// The BCC-redacted inbox rendering, when it differs from `full_content`.
++    inbox_content: Option<String>,
++    timestamp_str: String,
++}
++
++impl PreparedMessageBundle {
++    /// Stage the canonical, outbox and inbox copies, in that order, into
++    /// `writes` (creating parent directories), and record their targets.
++    fn stage(&self, writes: &mut StagedArchiveWrites, targets: &mut Vec<PathBuf>) -> Result<()> {
++        let inbox_content = self.inbox_content.as_deref().unwrap_or(&self.full_content);
++        let copies = [
++            (&self.paths.canonical, self.full_content.as_str()),
++            (&self.paths.outbox, self.full_content.as_str()),
++        ]
++        .into_iter()
++        .chain(self.paths.inbox.iter().map(|path| (path, inbox_content)));
++        for (path, content) in copies {
++            ensure_parent_dir(path)?;
++            writes.add(path.clone(), content.as_bytes())?;
++            targets.push(path.clone());
++        }
++        Ok(())
++    }
++}
++
++/// Record the repo-relative paths of published archive files.
++fn record_published_paths(
++    archive: &ProjectArchive,
++    targets: &[PathBuf],
++    rel_paths: &mut Vec<String>,
++) -> Result<()> {
++    for path in targets {
++        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, path)?);
++    }
++    Ok(())
++}
++
++fn prepare_message_bundle_files(
++    archive: &ProjectArchive,
++    entry: MessageBundleBatchEntry<'_>,
++    existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
++) -> Result<PreparedMessageBundle> {
+     let message = entry.message;
+     let body_md = entry.body_md;
+-    let sender = entry.sender;
+-    let recipients = entry.recipients;
+-    let extra_paths = entry.extra_paths;
+-
+-    let visible_recipients = message_visible_recipients(message);
+     let (paths, _created, timestamp_str) =
+-        message_paths_for_bundle(archive, message, sender, recipients)?;
++        message_paths_for_bundle(archive, message, entry.sender, entry.recipients)?;
+ 
+     let full_content = render_message_bundle_content(message, body_md)?;
+     let inbox_message = redact_message_bcc_for_inbox(message);
+@@ -9626,7 +9683,6 @@ fn append_message_bundle_files(
+     } else {
+         Some(render_message_bundle_content(&inbox_message, body_md)?)
+     };
+-    let inbox_content_ref = inbox_content.as_deref().unwrap_or(&full_content);
+ 
+     if let Some(existing_ids) = existing_ids {
+         reject_canonical_message_id_collision_from_index(
+@@ -9639,38 +9695,40 @@ fn append_message_bundle_files(
+         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
+     }
+ 
+-    write_text(&paths.canonical, &full_content, true)?;
+-    rel_paths.push(rel_path_cached(
+-        &archive.canonical_repo_root,
+-        &paths.canonical,
+-    )?);
+-
+-    write_text(&paths.outbox, &full_content, true)?;
+-    rel_paths.push(rel_path_cached(
+-        &archive.canonical_repo_root,
+-        &paths.outbox,
+-    )?);
+-
+-    for inbox_path in &paths.inbox {
+-        write_text(inbox_path, inbox_content_ref, true)?;
+-        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
+-    }
++    Ok(PreparedMessageBundle {
++        paths,
++        full_content,
++        inbox_content,
++        timestamp_str,
++    })
++}
+ 
++/// After a message's files are published: append it to its thread digest and
++/// record its attachment paths.
++fn finish_message_bundle(
++    archive: &ProjectArchive,
++    entry: MessageBundleBatchEntry<'_>,
++    canonical: &Path,
++    timestamp_str: &str,
++    rel_paths: &mut Vec<String>,
++) -> Result<MessageBundleCommitMeta> {
++    let message = entry.message;
++    let visible_recipients = message_visible_recipients(message);
+     if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
+         let thread_id = thread_id.trim();
+         if !thread_id.is_empty() {
+-            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
++            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, canonical)?;
+             if let Ok(digest_rel) = update_thread_digest(
+                 archive,
+                 thread_id,
+-                sender,
++                entry.sender,
+                 &visible_recipients,
+                 message
+                     .get("subject")
+                     .and_then(serde_json::Value::as_str)
+                     .unwrap_or(""),
+-                &timestamp_str,
+-                body_md,
++                timestamp_str,
++                entry.body_md,
+                 &canonical_rel,
+             ) {
+                 rel_paths.push(digest_rel);
+@@ -9678,16 +9736,16 @@ fn append_message_bundle_files(
+         }
+     }
+ 
+-    for p in extra_paths {
++    for p in entry.extra_paths {
+         let p = validate_repo_relative_path("extra_path", p)?;
+         rel_paths.push(p.to_string());
+     }
+ 
+     Ok(build_message_bundle_commit_meta(
+         message,
+-        sender,
++        entry.sender,
+         &visible_recipients,
+-        &timestamp_str,
++        timestamp_str,
+     ))
+ }
+ 
+@@ -9835,49 +9893,74 @@ pub fn write_message_batch_bundle(
+             )?;
+         }
+ 
+-        for entry in entries {
+-            let commit_meta = match append_message_bundle_files(
+-                archive,
+-                *entry,
+-                &mut rel_paths,
+-                Some(&existing_message_ids),
+-            ) {
+-                Ok(meta) => meta,
+-                Err(err) => {
+-                    let error_kind = err.to_string();
+-                    let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
+-                    tracing::error!(
+-                        target: "mcp_agent_mail::storage::archive::batch_write",
+-                        repo_slug = repo_slug,
+-                        caller = caller,
+-                        args_hash = %args_hash,
+-                        duration_ms = duration_ms,
+-                        outcome = "error",
+-                        git_version = git_version,
+-                        batch_id = %args_hash,
+-                        files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+-                        total_bytes = total_bytes,
+-                        error_kind = %error_kind,
+-                        "disk_phase"
+-                    );
+-                    tracing::error!(
+-                        target: "mcp_agent_mail::storage::archive::batch_write",
+-                        repo_slug = repo_slug,
+-                        caller = caller,
+-                        args_hash = %args_hash,
+-                        duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+-                        outcome = "error",
+-                        git_version = git_version,
+-                        batch_id = %args_hash,
+-                        total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+-                        message_count = message_count,
+-                        success = false,
+-                        error_kind = %error_kind,
+-                        "complete"
+-                    );
+-                    return Err(err);
+-                }
+-            };
++        // Stage the whole batch and sync its files in groups rather than one
++        // file at a time: this writer holds the publication fence throughout
++        // (br-9ott5). A failure before publication leaves no entry half
++        // written; renames still run in entry order.
++        let written = (|| {
++            let mut writes = StagedArchiveWrites::default();
++            let mut targets = Vec::new();
++            let mut published = Vec::with_capacity(entries.len());
++            for entry in entries {
++                let bundle =
++                    prepare_message_bundle_files(archive, *entry, Some(&existing_message_ids))?;
++                bundle.stage(&mut writes, &mut targets)?;
++                published.push((bundle.paths.canonical, bundle.timestamp_str));
++            }
++            writes.publish()?;
++            record_published_paths(archive, &targets, &mut rel_paths)?;
++            entries
++                .iter()
++                .zip(published)
++                .map(|(entry, (canonical, timestamp_str))| {
++                    finish_message_bundle(
++                        archive,
++                        *entry,
++                        &canonical,
++                        &timestamp_str,
++                        &mut rel_paths,
++                    )
++                })
++                .collect::<Result<Vec<_>>>()
++        })();
++        let commit_metas = match written {
++            Ok(metas) => metas,
++            Err(err) => {
++                let error_kind = err.to_string();
++                let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
++                tracing::error!(
++                    target: "mcp_agent_mail::storage::archive::batch_write",
++                    repo_slug = repo_slug,
++                    caller = caller,
++                    args_hash = %args_hash,
++                    duration_ms = duration_ms,
++                    outcome = "error",
++                    git_version = git_version,
++                    batch_id = %args_hash,
++                    files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
++                    total_bytes = total_bytes,
++                    error_kind = %error_kind,
++                    "disk_phase"
++                );
++                tracing::error!(
++                    target: "mcp_agent_mail::storage::archive::batch_write",
++                    repo_slug = repo_slug,
++                    caller = caller,
++                    args_hash = %args_hash,
++                    duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
++                    outcome = "error",
++                    git_version = git_version,
++                    batch_id = %args_hash,
++                    total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
++                    message_count = message_count,
++                    success = false,
++                    error_kind = %error_kind,
++                    "complete"
++                );
++                return Err(err);
++            }
++        };
++        for commit_meta in commit_metas {
+             if entries.len() == 1 {
+                 single_auto_commit_message = Some(commit_meta.auto_commit_message);
+             }
+@@ -13839,26 +13922,52 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
+ /// (br-9bwnb). Staging needs no publication fence: readers only open named
+ /// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
+ /// Whatever is still staged when this drops is removed.
++#[derive(Default)]
+ struct StagedArchiveWrites {
+     /// `(temp path, target path)` pairs not yet renamed into place.
+     staged: Vec<(PathBuf, PathBuf)>,
++    /// Open temp files written but not yet synced, at most
++    /// [`MAX_PARALLEL_ARCHIVE_SYNCS`] of them.
++    unsynced: Vec<fs::File>,
+ }
+ 
+ impl StagedArchiveWrites {
+-    /// Write and `fdatasync` each file under a temp name beside its target.
++    /// Stage every file and sync it before returning.
+     fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
+-        let mut writes = Self {
+-            staged: Vec::with_capacity(files.len()),
+-        };
++        let mut writes = Self::default();
+         for (path, data) in files {
+-            let tmp_path = stage_atomic_write(&path, &data, true)?;
+-            writes.staged.push((tmp_path, path));
++            writes.add(path, &data)?;
+         }
++        writes.sync()?;
+         Ok(writes)
+     }
+ 
++    /// Write `data` under a temp name beside `path`. Its `fdatasync` joins the
++    /// current group, which is synced once it holds
++    /// [`MAX_PARALLEL_ARCHIVE_SYNCS`] files (see [`sync_archive_file_group`]);
++    /// that also bounds how many temp files are open at once.
++    fn add(&mut self, path: PathBuf, data: &[u8]) -> Result<()> {
++        let (tmp_path, file) = stage_atomic_write_unsynced(&path, data)?;
++        self.staged.push((tmp_path, path));
++        self.unsynced.push(file);
++        if self.unsynced.len() == MAX_PARALLEL_ARCHIVE_SYNCS {
++            self.sync()?;
++        }
++        Ok(())
++    }
++
++    /// `fdatasync` every added file that is not synced yet.
++    fn sync(&mut self) -> Result<()> {
++        sync_archive_file_group(&self.unsynced)?;
++        self.unsynced.clear();
++        Ok(())
++    }
++
+     /// Rename every staged file into place inside one archive mutation window.
++    /// Files still unsynced are synced first: nothing is published before its
++    /// data is durable.
+     fn publish(mut self) -> Result<()> {
++        self.sync()?;
+         let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+             return Ok(());
+         };
+@@ -13883,10 +13992,83 @@ impl Drop for StagedArchiveWrites {
+     }
+ }
+ 
++/// Most archive files staged before their group is synced, and so the most
++/// `fdatasync` calls (and open temp files) one group has at once.
++const MAX_PARALLEL_ARCHIVE_SYNCS: usize = 16;
++
++/// Make the data of every file in `files` durable, syncing them concurrently.
++///
++/// Each `fdatasync` on ext4 waits for a journal commit, about 9 ms on a busy
++/// host, and syncing a group's files one after another pays one commit per
++/// file: the WBQ drain spent 76% of its time in those waits under swarm load,
++/// holding the publication fence (br-9ott5). Syncs issued concurrently join
++/// one commit, so a 7-file group takes ~20 ms instead of ~64 ms. Every file is
++/// still synced before this returns, so callers keep "data durable before
++/// rename". A thread that cannot be spawned syncs its file inline instead.
++fn sync_archive_file_group(files: &[fs::File]) -> std::io::Result<()> {
++    let Some((first, rest)) = files.split_first() else {
++        return Ok(());
++    };
++    std::thread::scope(|scope| {
++        let pending = rest
++            .iter()
++            .map(|file| {
++                std::thread::Builder::new()
++                    .name("archive-sync".to_string())
++                    .spawn_scoped(scope, || file.sync_data())
++                    .map_err(|_| file)
++            })
++            .collect::<Vec<_>>();
++        let mut result = first.sync_data();
++        note_archive_group_sync(&result);
++        for spawned in pending {
++            let synced = match spawned {
++                Ok(handle) => handle.join().unwrap_or_else(|_| {
++                    Err(std::io::Error::other("archive file sync thread panicked"))
++                }),
++                Err(file) => file.sync_data(),
++            };
++            note_archive_group_sync(&synced);
++            if result.is_ok() {
++                result = synced;
++            }
++        }
++        result
++    })
++}
++
++#[cfg(test)]
++thread_local! {
++    /// Completed file syncs [`sync_archive_file_group`] returned on this thread.
++    static ARCHIVE_GROUP_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
++#[cfg(test)]
++fn note_archive_group_sync(synced: &std::io::Result<()>) {
++    if synced.is_ok() {
++        ARCHIVE_GROUP_SYNCS.with(|count| count.set(count.get() + 1));
++    }
++}
++
++#[cfg(not(test))]
++const fn note_archive_group_sync(_synced: &std::io::Result<()>) {}
++
+ /// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
+ /// return the temp path for the caller to rename into place. `create_new`
+ /// means a pre-existing file or symlink at a temp name is never clobbered.
+ fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
++    let (tmp_path, file) = stage_atomic_write_unsynced(path, data)?;
++    if sync && let Err(err) = file.sync_data() {
++        drop(file);
++        let _ = fs::remove_file(&tmp_path);
++        return Err(err.into());
++    }
++    Ok(tmp_path)
++}
++
++/// [`stage_atomic_write`] without the sync. The open temp file is returned so
++/// a caller staging several files can sync them as one group.
++fn stage_atomic_write_unsynced(path: &Path, data: &[u8]) -> Result<(PathBuf, fs::File)> {
+     use std::io::Write as _;
+ 
+     #[cfg(test)]
+@@ -13919,20 +14101,17 @@ fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
+         let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+         let tmp_path = atomic_write_tmp_path(parent, path, seq);
+ 
+-        let result: std::io::Result<()> = (|| {
++        let result: std::io::Result<fs::File> = (|| {
+             let mut f = fs::OpenOptions::new()
+                 .write(true)
+                 .create_new(true)
+                 .open(&tmp_path)?;
+             f.write_all(data)?;
+-            if sync {
+-                f.sync_data()?;
+-            }
+-            Ok(())
++            Ok(f)
+         })();
+ 
+         match result {
+-            Ok(()) => return Ok(tmp_path),
++            Ok(file) => return Ok((tmp_path, file)),
+             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+             Err(err) => {
+                 // Best-effort cleanup of temp files we created. If the path
+@@ -16639,6 +16818,210 @@ mod tests {
+         );
+     }
+ 
++    fn temp_files_under(root: &Path) -> Vec<PathBuf> {
++        let mut found = Vec::new();
++        let mut dirs = vec![root.to_path_buf()];
++        while let Some(dir) = dirs.pop() {
++            for entry in fs::read_dir(&dir).unwrap().flatten() {
++                let path = entry.path();
++                if entry.file_type().unwrap().is_dir() {
++                    dirs.push(path);
++                } else if entry.file_name().to_string_lossy().starts_with(".tmp-") {
++                    found.push(path);
++                }
++            }
++        }
++        found
++    }
++
++    fn archive_group_syncs() -> usize {
++        ARCHIVE_GROUP_SYNCS.with(std::cell::Cell::get)
++    }
++
++    /// br-9ott5: staging syncs every file, in groups of at most
++    /// `MAX_PARALLEL_ARCHIVE_SYNCS`, before anything is renamed into place.
++    #[test]
++    fn staged_archive_writes_sync_every_file_before_publication() {
++        let tmp = TempDir::new().unwrap();
++        let count = MAX_PARALLEL_ARCHIVE_SYNCS * 2 + 3;
++        let body = |i: usize| format!("{{\"i\":{i}}}");
++        let files = (0..count)
++            .map(|i| (tmp.path().join(format!("f{i}.json")), body(i).into_bytes()))
++            .collect::<Vec<_>>();
++
++        let before = archive_group_syncs();
++        let staged = StagedArchiveWrites::stage(files).unwrap();
++        assert_eq!(
++            archive_group_syncs() - before,
++            count,
++            "every staged file is synced before stage returns"
++        );
++        assert_eq!(staged_temp_files(tmp.path()).len(), count);
++        assert!(
++            !tmp.path().join("f0.json").exists(),
++            "nothing is published before publish()"
++        );
++
++        staged.publish().unwrap();
++        assert!(staged_temp_files(tmp.path()).is_empty());
++        for i in 0..count {
++            assert_eq!(
++                fs::read_to_string(tmp.path().join(format!("f{i}.json"))).unwrap(),
++                body(i)
++            );
++        }
++    }
++
++    /// Files added below a full group stay unsynced until publication, which
++    /// syncs them before renaming anything.
++    #[test]
++    fn staged_archive_writes_publish_syncs_files_left_pending() {
++        let tmp = TempDir::new().unwrap();
++        let mut writes = StagedArchiveWrites::default();
++        let before = archive_group_syncs();
++        for i in 0..3 {
++            writes
++                .add(tmp.path().join(format!("p{i}.json")), b"{}")
++                .unwrap();
++        }
++        assert_eq!(archive_group_syncs() - before, 0, "a partial group waits");
++        assert_eq!(staged_temp_files(tmp.path()).len(), 3);
++
++        writes.publish().unwrap();
++        assert_eq!(
++            archive_group_syncs() - before,
++            3,
++            "publication syncs every pending file first"
++        );
++        assert!(staged_temp_files(tmp.path()).is_empty());
++        for i in 0..3 {
++            assert_eq!(
++                fs::read_to_string(tmp.path().join(format!("p{i}.json"))).unwrap(),
++                "{}"
++            );
++        }
++    }
++
++    /// br-9ott5: a WBQ batch syncs each bundle file (canonical, outbox, every
++    /// inbox) before publishing it, and leaves no temp file behind.
++    #[test]
++    fn write_message_batch_bundle_syncs_every_bundle_file() {
++        let tmp = TempDir::new().unwrap();
++        let config = test_config(tmp.path());
++        let archive = ensure_archive(&config, "proj").unwrap();
++        let recipients = vec!["RecipientOne".to_string(), "RecipientTwo".to_string()];
++        let messages = (0..3)
++            .map(|i| {
++                serde_json::json!({
++                    "id": 80 + i,
++                    "subject": format!("Synced batch entry {i}"),
++                    "created_ts": format!("2026-01-15T10:0{i}:00Z"),
++                    "project": "proj",
++                })
++            })
++            .collect::<Vec<_>>();
++        let entries = messages
++            .iter()
++            .map(|message| MessageBundleBatchEntry {
++                message,
++                body_md: "synced body",
++                sender: "SenderAgent",
++                recipients: &recipients,
++                extra_paths: &[],
++            })
++            .collect::<Vec<_>>();
++
++        let before = archive_group_syncs();
++        write_message_batch_bundle(&archive, &config, &entries, None).unwrap();
++        assert_eq!(
++            archive_group_syncs() - before,
++            messages.len() * (2 + recipients.len()),
++            "canonical, outbox and both inbox copies of every message are synced"
++        );
++        for message in &messages {
++            let (paths, _, _) =
++                message_paths_for_bundle(&archive, message, "SenderAgent", &recipients).unwrap();
++            for path in [&paths.canonical, &paths.outbox]
++                .into_iter()
++                .chain(&paths.inbox)
++            {
++                let text = fs::read_to_string(path).unwrap();
++                assert!(
++                    text.contains("synced body"),
++                    "{} lacks the body",
++                    path.display()
++                );
++                assert!(text.contains(&format!("\"id\": {}", message["id"])));
++            }
++        }
++        assert!(temp_files_under(&archive.root).is_empty());
++    }
++
++    /// A batch whose later file cannot be staged publishes none of its entries.
++    /// Writing entries one at a time left the first entry and the second's
++    /// canonical file behind.
++    #[cfg(unix)]
++    #[test]
++    fn write_message_batch_bundle_publishes_nothing_when_a_later_file_cannot_be_staged() {
++        use std::os::unix::fs::symlink;
++
++        let tmp = TempDir::new().unwrap();
++        let config = test_config(tmp.path());
++        let archive = ensure_archive(&config, "proj").unwrap();
++        let recipients = vec!["RecipientAgent".to_string()];
++        let first = serde_json::json!({
++            "id": 91,
++            "subject": "First entry",
++            "created_ts": "2026-01-15T11:00:00Z",
++            "project": "proj",
++        });
++        let second = serde_json::json!({
++            "id": 92,
++            "subject": "Second entry",
++            "created_ts": "2026-01-15T11:01:00Z",
++            "project": "proj",
++        });
++        let (first_paths, _, _) =
++            message_paths_for_bundle(&archive, &first, "SenderAgent", &recipients).unwrap();
++        let (second_paths, _, _) =
++            message_paths_for_bundle(&archive, &second, "SenderAgent", &recipients).unwrap();
++        let outside = tmp.path().join("outside.md");
++        fs::write(&outside, "outside").unwrap();
++        ensure_parent_dir(&second_paths.outbox).unwrap();
++        symlink(&outside, &second_paths.outbox).unwrap();
++        let entries = [&first, &second].map(|message| MessageBundleBatchEntry {
++            message,
++            body_md: "body",
++            sender: "SenderAgent",
++            recipients: &recipients,
++            extra_paths: &[],
++        });
++
++        let err = write_message_batch_bundle(&archive, &config, &entries, None)
++            .expect_err("a symlinked bundle target refuses the batch");
++        assert!(
++            err.to_string()
++                .contains("refusing to write through symlink"),
++            "unexpected error: {err}"
++        );
++        for path in [
++            &first_paths.canonical,
++            &first_paths.outbox,
++            &second_paths.canonical,
++        ]
++        .into_iter()
++        .chain(&first_paths.inbox)
++        {
++            assert!(
++                !path.exists(),
++                "{} was published although the batch failed before publication",
++                path.display()
++            );
++        }
++        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
++        assert!(temp_files_under(&archive.root).is_empty());
++    }
++
+     #[test]
+     fn test_write_message_bundle_rejects_path_traversal_agent_names() {
+         let tmp = TempDir::new().unwrap();

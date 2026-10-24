@@ -21,7 +21,8 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    deregister_agent, ensure_project, register_agent, retire_agent, unretire_agent,
+    deregister_agent, ensure_project, file_reservation_paths, register_agent,
+    release_file_reservations, renew_file_reservations, retire_agent, unretire_agent,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -257,6 +258,171 @@ fn http_with_valid_token_is_allowed_for_every_lifecycle_tool() {
         let gone: Value = serde_json::from_str(&gone).expect("deregister JSON");
         assert_eq!(gone["status"], "deregistered");
         assert_lifecycle_discovery(&ctx, &project_key, "GreenCastle", "deregistered").await;
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn authorized_lifecycle_transitions_revoke_new_reservations_but_allow_release_and_replay() {
+    run_with_fresh_state(|_cx, project_key| async move {
+        let cx = Cx::current().expect("runtime context for reservation writes");
+        let lifecycle_ctx = McpContext::new(cx.clone(), 1);
+        // Use a separate, unbound trusted-local caller so lifecycle enforcement
+        // cannot accidentally be supplied only by session-identity eviction.
+        let reservation_ctx = McpContext::new(cx, 2);
+        ensure_project(&lifecycle_ctx, project_key.clone(), None)
+            .await
+            .expect("project");
+        let token = register(&lifecycle_ctx, &project_key, "GreenCastle").await;
+        mcp_agent_mail_storage::wbq_flush();
+        mcp_agent_mail_storage::flush_async_commits();
+
+        let grant = file_reservation_paths(
+            &reservation_ctx,
+            project_key.clone(),
+            "GreenCastle".into(),
+            vec!["src/held.rs".into()],
+            Some(3600),
+            Some(true),
+            Some("lifecycle test".into()),
+            Some("lifecycle-original".into()),
+        )
+        .await
+        .expect("active owner can reserve");
+        let grant: Value = serde_json::from_str(&grant).unwrap();
+        let id = grant["granted"][0]["id"].as_i64().expect("reservation id");
+        retire_agent(
+            &lifecycle_ctx,
+            project_key.clone(),
+            "GreenCastle".into(),
+            Some(token.clone()),
+            None,
+            None,
+            opt(HTTP),
+        )
+        .await
+        .expect("authorized HTTP retirement");
+
+        for permanent in [false, true] {
+            if permanent {
+                deregister_agent(
+                    &lifecycle_ctx,
+                    project_key.clone(),
+                    "GreenCastle".into(),
+                    Some(token.clone()),
+                    None,
+                    None,
+                    opt(HTTP),
+                )
+                .await
+                .expect("authorized HTTP deregistration");
+            }
+            let expected = if permanent {
+                "AGENT_DEREGISTERED"
+            } else {
+                "AGENT_RETIRED"
+            };
+            for path in ["src/new.rs", "src/held.rs"] {
+                let error = file_reservation_paths(
+                    &reservation_ctx,
+                    project_key.clone(),
+                    "GreenCastle".into(),
+                    vec![path.into()],
+                    Some(7200),
+                    Some(true),
+                    Some("new work".into()),
+                    None,
+                )
+                .await
+                .expect_err("inactive owner cannot acquire or reacquire");
+                assert_eq!(error_payload(&error)["type"], expected);
+                assert_eq!(
+                    error_payload(&error)["data"]["reservation_acquire"]["blocks_edits"],
+                    true
+                );
+            }
+            let error = renew_file_reservations(
+                &reservation_ctx,
+                project_key.clone(),
+                "GreenCastle".into(),
+                Some(600),
+                None,
+                None,
+            )
+            .await
+            .expect_err("inactive owner cannot renew");
+            assert_eq!(error_payload(&error)["type"], expected);
+
+            let released = release_file_reservations(
+                &reservation_ctx,
+                project_key.clone(),
+                "GreenCastle".into(),
+                None,
+                None,
+            )
+            .await
+            .expect("inactive owner may release leases");
+            let released: Value = serde_json::from_str(&released).unwrap();
+            assert_eq!(released["released"], 1);
+
+            let replay = file_reservation_paths(
+                &reservation_ctx,
+                project_key.clone(),
+                "GreenCastle".into(),
+                vec!["src/held.rs".into()],
+                Some(3600),
+                Some(true),
+                Some("lifecycle test".into()),
+                Some("lifecycle-original".into()),
+            )
+            .await
+            .expect("read-only historical replay remains available");
+            let replay: Value = serde_json::from_str(&replay).unwrap();
+            assert_eq!(replay["idempotent_replay"], true);
+            assert_eq!(replay["granted"][0]["id"], id);
+
+            if !permanent {
+                unretire_agent(
+                    &lifecycle_ctx,
+                    project_key.clone(),
+                    "GreenCastle".into(),
+                    Some(token.clone()),
+                    None,
+                    None,
+                    opt(HTTP),
+                )
+                .await
+                .expect("authorized unretirement");
+                mcp_agent_mail_storage::wbq_flush();
+                mcp_agent_mail_storage::flush_async_commits();
+                let active_grant = file_reservation_paths(
+                    &reservation_ctx,
+                    project_key.clone(),
+                    "GreenCastle".into(),
+                    vec!["src/restored.rs".into()],
+                    Some(3600),
+                    Some(true),
+                    None,
+                    None,
+                )
+                .await
+                .expect("unretirement restores acquisition");
+                let active_grant: Value = serde_json::from_str(&active_grant).unwrap();
+                assert_eq!(active_grant["granted"].as_array().unwrap().len(), 1);
+                let renewed = renew_file_reservations(
+                    &reservation_ctx,
+                    project_key.clone(),
+                    "GreenCastle".into(),
+                    Some(600),
+                    None,
+                    None,
+                )
+                .await
+                .expect("unretirement restores renewal");
+                let renewed: Value = serde_json::from_str(&renewed).unwrap();
+                assert_eq!(renewed["renewed"], 1);
+            }
+        }
     });
 }
 

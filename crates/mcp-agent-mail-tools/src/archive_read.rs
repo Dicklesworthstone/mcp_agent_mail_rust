@@ -3,9 +3,11 @@
 //! Degraded mailbox reads are expensive: they replay the Git archive and merge
 //! readable live-only state into a disposable `SQLite` database.  This module
 //! gives every tool and resource in a process one owner for that work.  A
-//! snapshot is published only after indexed archive markers and exact live
-//! database generations taken before and after reconstruction agree, and its
-//! pool is incapable of mutation.
+//! snapshot is published only after indexed archive markers (including
+//! available cross-process epoch tokens) and exact live database generations
+//! taken before and after reconstruction agree, and its pool is incapable of
+//! mutation. These markers detect observed remote changes; they do not hold a
+//! cross-process mutation lease.
 
 use asupersync::Cx;
 use sha2::{Digest, Sha256};
@@ -1395,6 +1397,10 @@ mod tests {
             ..mcp_agent_mail_core::Config::default()
         };
         mcp_agent_mail_storage::ensure_archive_root(&config).expect("initialize archive root");
+        write_archive_fixture_files(root);
+    }
+
+    fn write_archive_fixture_files(root: &Path) {
         let project = root.join("projects").join("single-flight-project");
         let agent = project.join("agents").join("Alice");
         let messages = project.join("messages").join("2026").join("07");
@@ -1542,8 +1548,12 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_for_test();
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage_root = directory.path().join("archive");
-        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        let fixture_root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical fixture root");
+        let storage_root = fixture_root.join("archive");
+        let sqlite_path = fixture_root.join("missing-live.sqlite3");
         write_archive_fixture(&storage_root);
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let slot = slot_for(scope(&storage_root, &sqlite_path).expect("scope")).expect("slot");
@@ -1611,6 +1621,171 @@ mod tests {
         let moved = exact_generation(&scope, Instant::now() + Duration::from_secs(5))
             .expect("moved generation");
         assert_ne!(moved, first);
+    }
+
+    #[test]
+    fn cached_snapshot_refreshes_after_remote_uncommitted_native_profile_write() {
+        const CHILD_ROOT: &str = "AM_TEST_REMOTE_ARCHIVE_PROFILE_ROOT";
+        const CHILD_COMPLETE: &str = "remote native profile write complete";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            use std::io::Write as _;
+
+            let config = mcp_agent_mail_core::Config {
+                storage_root: PathBuf::from(root),
+                ..mcp_agent_mail_core::Config::default()
+            };
+            let archive = mcp_agent_mail_storage::open_archive(&config, "single-flight-project")
+                .expect("open child archive")
+                .expect("existing child project");
+            mcp_agent_mail_storage::write_agent_profile_with_config(
+                &archive,
+                &config,
+                &serde_json::json!({
+                    "name": "Alice",
+                    "program": "remote-native",
+                    "model": "test",
+                    "registered_ts": "2026-07-19T00:00:00Z",
+                }),
+            )
+            .expect("complete native profile mutation in another process");
+            println!("{CHILD_COMPLETE}");
+            std::io::stdout().flush().expect("flush child completion");
+            // The physical write has completed, but its queued Git commit is
+            // deliberately left pending, as after a CLI exits or a crash.
+            std::process::exit(0);
+        }
+
+        fn index_signature(git_dir: &Path) -> [u8; 32] {
+            let mut hasher = Sha256::new();
+            for exact in [false, true] {
+                hash_tree(
+                    git_dir,
+                    &git_dir.join("index"),
+                    &mut hasher,
+                    exact,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .expect("sample index metadata and bytes");
+            }
+            hasher.finalize().into()
+        }
+
+        fn snapshot_program(snapshot: &SharedSnapshot) -> String {
+            private_snapshot_probe(snapshot.path())
+                .expect("open immutable snapshot")
+                .query_sync("SELECT program FROM agents WHERE name = 'Alice'", &[])
+                .expect("read reconstructed profile")[0]
+                .get_named::<String>("program")
+                .expect("profile program")
+        }
+
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_for_test();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage_root = directory.path().join("archive");
+        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        // Bootstrap directly so the parent's storage index-sync worker cannot
+        // invalidate the snapshot and hide a missing remote epoch observation.
+        let repo = git2::Repository::init(&storage_root).expect("initialize fixture repo");
+        write_archive_fixture_files(&storage_root);
+        let mut index = repo.index().expect("fixture index");
+        let tree_id = index.write_tree().expect("empty initial tree");
+        index.write().expect("write initial shared index");
+        let tree = repo.find_tree(tree_id).expect("initial tree");
+        let signature = git2::Signature::now("Test", "test@example.com").expect("fixture author");
+        let head_before = repo
+            .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .expect("initial HEAD");
+        fs::write(
+            repo.path()
+                .join(mcp_agent_mail_storage::ARCHIVE_EPOCH_FILE_NAME),
+            format!("1{}", "ab".repeat(16)),
+        )
+        .expect("seed existing archive epoch protocol");
+
+        let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
+        let cx = Cx::for_testing();
+        let acquire = || {
+            acquire_if_needed(&storage_root, &sqlite_path, &database_url, &cx)
+                .expect("acquire degraded read")
+                .expect("missing live database requires a snapshot")
+        };
+        let first = acquire();
+        assert_eq!(snapshot_program(&first), "test");
+        assert!(
+            Arc::ptr_eq(&first, &acquire()),
+            "warm reads must use the cache"
+        );
+        let slot = slot_for(scope(&storage_root, &sqlite_path).expect("scope")).expect("slot");
+        assert_eq!(slot.reconstructions.load(Ordering::Acquire), 1);
+        let archive_before = mcp_agent_mail_storage::archive_read_generation(&storage_root)
+            .expect("archive generation before child");
+        let index_before = index_signature(repo.path());
+        let local_epoch_before = mcp_agent_mail_storage::archive_mutation_epoch();
+        let writer_epoch_before = WRITER_EPOCH.load(Ordering::Acquire);
+        let live_before = snapshot_family(&sqlite_path);
+
+        // The real ref lock prevents the child coalescer from advancing HEAD
+        // even if it runs before process::exit. Native commits build private
+        // indexes under that lock, leaving the shared index unchanged too.
+        let refname = repo
+            .head()
+            .expect("fixture HEAD")
+            .name()
+            .expect("HEAD ref")
+            .to_string();
+        let mut transaction = repo.transaction().expect("reference transaction");
+        transaction.lock_ref(&refname).expect("hold HEAD ref");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "archive_read::tests::cached_snapshot_refreshes_after_remote_uncommitted_native_profile_write",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, &storage_root)
+            .env("AM_ARCHIVE_BATCH_MS", "5000")
+            .output()
+            .expect("run remote native writer");
+        drop(transaction);
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(CHILD_COMPLETE),
+            "remote writer must execute and complete:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            repo.head().expect("unchanged HEAD").target(),
+            Some(head_before)
+        );
+        assert_eq!(index_signature(repo.path()), index_before);
+        assert_eq!(
+            mcp_agent_mail_storage::archive_mutation_epoch(),
+            local_epoch_before
+        );
+        assert_eq!(WRITER_EPOCH.load(Ordering::Acquire), writer_epoch_before);
+        assert_eq!(snapshot_family(&sqlite_path), live_before);
+        assert_ne!(
+            mcp_agent_mail_storage::archive_read_generation(&storage_root)
+                .expect("archive generation after child"),
+            archive_before,
+            "only the persisted epoch can expose this completed remote write"
+        );
+
+        let refreshed = acquire();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(snapshot_program(&refreshed), "remote-native");
+        assert_eq!(
+            snapshot_program(&first),
+            "test",
+            "prior snapshots stay immutable"
+        );
+        assert_eq!(slot.reconstructions.load(Ordering::Acquire), 2);
+        assert_eq!(snapshot_family(&sqlite_path), live_before);
+        drop((first, refreshed));
+        reset_for_test();
     }
 
     #[test]

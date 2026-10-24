@@ -1,0 +1,913 @@
+{
+ "schema": "br-kp1in.13 / br-kp1in.19 ab18 SP + L2 + L3 vs main v1",
+ "rule": "ab18: archive drain and reservation-artifact durability on main. Candidate = SP + L2 + L3, vs main. DRAFT, written before any ab18\nbuild or run. The base commit and arm hashes are filled in when the br-tsqvm fix lands, before the first run, and the file then gets a\nFROZEN line.\n\nDISCLOSED CONTEXT. Everything below was seen before this rule.\n- ab16 (SP vs main 8e912cc1) was a LOSS on its primary: the soak WBQ 10 s window failed for SP.\n- In smoke 1 the post-swarm un-archived counts were 7,330 for base and 8,656 for SP. The soak convergence check failed in both arms.\n- Paced diagnostics on main (draindiag, draindiag2):\n  - the WBQ is 4,000-5,000 deep at the end of a run, with a 67 s p50 lag;\n  - message batches average 2.3 messages, because bundles for several projects interleave with other ops;\n  - the drain thread spends 79% of its time in fsync waits (jbd2) and 11% in futex waits;\n  - about 2,400 release-artifact retries per run flood the WBQ. They exist because direct reservation writes are refused by the\n    zero-wait fence admission: about 91% of grants on base, about 66% with SP.\n- Since fdece065 (on base), a refused synchronous grant/renew publication is no longer a WARN plus a successful lease. The\n  tool returns RESERVATION_ARCHIVE_UNAVAILABLE (\"Do NOT edit the requested paths\"). DirectArchiveWrite::Failed covers\n  fence-busy LockContention (storage lib.rs write_op_sync_direct_with_cancel). The WARN line PA counts is still emitted,\n  and on base each refusal should now also be a file_reservation_paths tool error. No ab18 data has been seen.\n- ab17 (L2) was withdrawn before running because both of its arms carried br-tsqvm. That bug latched durability in 1 of about 15\n  paced runs (6,743 errors).\n\nARMS (portable release, same host, host lock):\n- base = main 2b5d14d7 + tsqvm_v1.patch (229c4d79), worktree rc1020f, crates diff hash af51a3426ded. The br-tsqvm commit pushed\n  to main must have `git diff 2b5d14d7 <commit> -- crates` hashing to the same value. Build: build36/ab18b_base.\n- cand = base + SP (parallel bundle staging) + L2 (bounded 500 ms direct fence admission) + L3 (per-archive grouping of bundles\n  within a drained pass). Patch spl2l3_v1_combined.patch (911983f3), which applies to base with offsets only. Worktree rc1020e,\n  crates diff hash eb58308263cd. Build: build36/ab18b_cand.\n- Provenance per arm: the build log diff hash, am sha256, and the SP marker string \"archive staging worker panicked\" present\n  in cand and absent in base.\n- Not used: build36/ab18_cand (fdece065 + tsqvm + spl2l3, am 2470db8e). Main had moved 8 commits by the time it finished,\n  including 757d309a, which changes reservation publication in storage lib.rs (the PA path).\n\nRUNS: as in ab16 (load gate < 8, foreign-CPU validity, re-queue up to 6 h).\n- P2: base cand cand base base cand.\n- P6: cand base base cand.\n- Release smoke in both orders (cand_vs_base, base_vs_cand).\n- The paced server env adds RUST_LOG=info,mcp_agent_mail::storage::archive::batch_write=info with AM_ALLOW_DEBUG_STARTUP_LOGS=1, for\n  batch-size reporting. It is the same in both arms.\n\nPRIMARY. Both must hold.\n- PA (reservation artifacts reach the archive the guard reads): pooled valid P2 and P6, grant-time refusals (\"WARN reservation\n  archive write ... synchronous reservation archive write failed\") per 1,000 file_reservation_paths calls, for cand, are <= 10% of\n  base's rate AND <= 50.\n- PB (the archive keeps up with the mail; the br-kp1in.13 probe): in EACH smoke order, cand passes the soak check \"WBQ drained_total\n  advances in every 10s window with queued work\" AND the soak check \"archive converges after load stops\", with soak sends >= 4000.\n\nGUARDS (any failure = LOSS):\n- G1 throughput: P2 completion median cand <= 1.05x base; smoke swarm acked sends cand >= 0.95x base in each order.\n- G2 failures:\n  - swarm 30 s timeouts cand <= base + 5 in each order;\n  - smoke tool errors (swarm + soak) <= base + 5 in each order;\n  - paced errors <= base + 5 (P2) and <= base + 3 (P6);\n  - cand crash phase PASS;\n  - integrity_check ok;\n  - dispatch zombies for cand == 0 or <= base's, in each order;\n  - no \"canonical message id ... already exists\" error in any cand server log.\n- G3 latency below saturation:\n  - P6 send p99 and last-60 s send p90 cand <= 1.2x base;\n  - P6 file_reservation_paths p99 and release p99 cand <= base + 0.5 s;\n  - every P6 completion <= 330 s.\n- G4 reads: smoke soak reads cand >= 0.90x base and soak fetch_inbox p99 <= 1.3x base, in each order.\n- G5 convergence: post-swarm un-archived cand <= base + 2% of cand's acked swarm sends, in each order.\n- C gate on cand:\n  - storage lib nextest (the only allowed failure is br-3ukrb's pre-existing test, failing identically on base);\n  - storage + tools clippy -D warnings;\n  - workspace prodcheck (lib+bins);\n  - tools it and conformance.\n\nREPORTED, not gated:\n- P2 send p50/p90, with the closed-loop caveat (see ab16_rule.txt \"GATE DEFECT\");\n- end-of-run WBQ depth and lag;\n- messages per batch;\n- release-artifact refusals;\n- reservation p50/p99;\n- paced tool errors per tool, especially file_reservation_paths and renew (the fdece065 user-visible effect).\n\nDECISION:\n- WIN only if PA, PB, G1-G5 and C all hold.\n- A WIN lands SP+L2+L3 with this rule, the evidence and ab16's integrity split cited. It is reported to the owner, who can revert.\n  SP's earlier vetoes came from the saturated-send-latency guard replaced in ab16_rule.txt. The primaries here are the bead\n  probes, not that guard.\n- LOSS: one line on br-kp1in.13 and br-kp1in.19; nothing lands.\n\nFROZEN 2026-10-20T23:42Z, before any ab18 run (no ab18 directory exists).\n- base am sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254 (build36/ab18b_base; log diff=af51a3426ded;\n  SP marker absent). Tree = 2b5d14d7 + local fix commit 62b93dc6, whose `git diff 2b5d14d7 62b93dc6 -- crates` hashes\n  af51a3426ded. The pushed commit id is appended after the push; the tree hash stays the check.\n- cand am sha256 af441f8dc875fad44a9b1da5c6b85e73b58d7616fa618a54e24454dd59eed32b (build36/ab18b_cand; log diff=eb58308263cd;\n  SP marker present). Patches: tsqvm_v1.patch 229c4d79 + spl2l3_v1_combined.patch 911983f3.\n- Gate and threshold edits after this line are not allowed. Data-free corrections (a path or a parser bug) get an appended,\n  dated note that names what changed.\n",
+ "binaries": {
+  "base": {
+   "am_sha256": "3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/ab18b_base/am"
+  },
+  "cand": {
+   "am_sha256": "af441f8dc875fad44a9b1da5c6b85e73b58d7616fa618a54e24454dd59eed32b",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/ab18b_cand/am"
+  }
+ },
+ "provenance": {
+  "base": "start 2026-10-20T20:17:24Z wt=/data/projects/mcp_agent_mail_rust-rc1020f head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=af51a3426ded features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1227854,vmi1293453,hz1,hz2,hz3 jobs=2",
+  "cand": "start 2026-10-20T20:17:26Z wt=/data/projects/mcp_agent_mail_rust-rc1020e head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=eb58308263cd features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1227854,vmi1293453,hz1,hz2,hz3 jobs=2"
+ },
+ "run_log": "P1 p2 base start 2026-10-20T23:42:07Z load=4.48 4.52 4.57\nP1 p2 base exit=0 end 2026-10-20T23:53:09Z foreign_samples=0\nP2 p2 cand start 2026-10-20T23:53:29Z load=7.84 9.67 7.69\nP2 p2 cand exit=0 end 2026-10-21T00:04:19Z foreign_samples=0\nP3 p2 cand start 2026-10-21T00:05:19Z load=7.29 10.29 9.37\nP3 p2 cand exit=0 end 2026-10-21T00:15:43Z foreign_samples=0\nP4 p2 base start 2026-10-21T00:17:03Z load=7.66 10.37 10.01\nP4 p2 base exit=0 end 2026-10-21T00:26:54Z foreign_samples=0\nP5 p2 base start 2026-10-21T00:27:34Z load=7.46 10.46 10.45\nP5 p2 base exit=0 end 2026-10-21T00:35:35Z foreign_samples=0\nP6 p2 cand start 2026-10-21T00:36:15Z load=6.85 10.01 10.47\nP6 p2 cand exit=0 end 2026-10-21T00:45:13Z foreign_samples=0\nP7 p6 cand start 2026-10-21T00:46:13Z load=7.23 9.96 10.37\nP7 p6 cand exit=0 end 2026-10-21T00:51:22Z foreign_samples=0\nP8 p6 base start 2026-10-21T00:52:02Z load=6.98 8.14 9.42\nP8 p6 base exit=0 end 2026-10-21T00:57:11Z foreign_samples=0\nP9 p6 base start 2026-10-21T00:57:11Z load=6.87 7.65 8.87\nP9 p6 base exit=0 end 2026-10-21T01:02:20Z foreign_samples=0\nP10 p6 cand start 2026-10-21T01:02:40Z load=6.82 7.96 8.73\nP10 p6 cand exit=0 end 2026-10-21T01:07:49Z foreign_samples=0\nR cand_vs_base start 2026-10-21T01:07:49Z load=7.61 7.74 8.41\nR cand_vs_base exit=1 end 2026-10-21T02:22:54Z foreign_samples=0\nR base_vs_cand start 2026-10-21T02:22:54Z load=4.44 4.61 5.62\nR base_vs_cand exit=1 end 2026-10-21T03:32:01Z foreign_samples=0\ndone 2026-10-21T03:32:01Z\n",
+ "paced_runs": [
+  {
+   "run": "1-p2-base",
+   "completion_s": 619.6,
+   "tool_errors": 2417,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2417
+   },
+   "collision_errors": 0,
+   "grants": 2633,
+   "refusals": {
+    "grant_first": 2417,
+    "release_first": 2427,
+    "reconcile_on_read_refused": 3254
+   },
+   "grant_refusals_per_1000": 918.0,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0481,
+     "p90": 0.438,
+     "p99": 1.1346
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1571,
+     "p90": 0.7831,
+     "p99": 1.6257
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2613,
+     "p90": 0.9207,
+     "p99": 1.8747
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 3.564,
+     "p90": 4.8727,
+     "p99": 9.2662
+    }
+   }
+  },
+  {
+   "run": "2-p2-cand",
+   "completion_s": 634.5,
+   "tool_errors": 788,
+   "tool_errors_by_tool": {
+    "fetch_inbox": 1,
+    "file_reservation_paths": 787
+   },
+   "collision_errors": 0,
+   "grants": 2633,
+   "refusals": {
+    "grant_first": 787,
+    "release_first": 767,
+    "reconcile_on_read_refused": 1759
+   },
+   "grant_refusals_per_1000": 298.9,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.052,
+     "p90": 0.4794,
+     "p99": 1.3222
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.8107,
+     "p90": 1.6897,
+     "p99": 2.7133
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 1.0153,
+     "p90": 1.9802,
+     "p99": 3.037
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 3.133,
+     "p90": 4.8146,
+     "p99": 8.4877
+    }
+   }
+  },
+  {
+   "run": "3-p2-cand",
+   "completion_s": 612.0,
+   "tool_errors": 757,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 757
+   },
+   "collision_errors": 0,
+   "grants": 2633,
+   "refusals": {
+    "grant_first": 757,
+    "release_first": 723,
+    "reconcile_on_read_refused": 1569
+   },
+   "grant_refusals_per_1000": 287.5,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0461,
+     "p90": 0.4571,
+     "p99": 1.4057
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.7426,
+     "p90": 1.6258,
+     "p99": 2.6498
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.9385,
+     "p90": 1.9391,
+     "p99": 3.0591
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.9752,
+     "p90": 5.0232,
+     "p99": 9.9288
+    }
+   }
+  },
+  {
+   "run": "4-p2-base",
+   "completion_s": 546.6,
+   "tool_errors": 2476,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2476
+   },
+   "collision_errors": 0,
+   "grants": 2633,
+   "refusals": {
+    "grant_first": 2476,
+    "release_first": 2488,
+    "reconcile_on_read_refused": 3267
+   },
+   "grant_refusals_per_1000": 940.4,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0437,
+     "p90": 0.355,
+     "p99": 1.0857
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.146,
+     "p90": 0.7133,
+     "p99": 1.5474
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2293,
+     "p90": 0.8785,
+     "p99": 1.8799
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 3.0551,
+     "p90": 4.2591,
+     "p99": 9.2074
+    }
+   }
+  },
+  {
+   "run": "5-p2-base",
+   "completion_s": 440.7,
+   "tool_errors": 2444,
+   "tool_errors_by_tool": {
+    "fetch_inbox": 1,
+    "file_reservation_paths": 2443
+   },
+   "collision_errors": 0,
+   "grants": 2633,
+   "refusals": {
+    "grant_first": 2443,
+    "release_first": 2449,
+    "reconcile_on_read_refused": 3695
+   },
+   "grant_refusals_per_1000": 927.8,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0407,
+     "p90": 0.2434,
+     "p99": 0.7896
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1367,
+     "p90": 0.5934,
+     "p99": 1.2009
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2036,
+     "p90": 0.7786,
+     "p99": 1.5271
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.4945,
+     "p90": 3.5498,
+     "p99": 7.0598
+    }
+   }
+  },
+  {
+   "run": "6-p2-cand",
+   "completion_s": 524.0,
+   "tool_errors": 792,
+   "tool_errors_by_tool": {
+    "fetch_inbox": 2,
+    "file_reservation_paths": 790
+   },
+   "collision_errors": 0,
+   "grants": 2633,
+   "refusals": {
+    "grant_first": 790,
+    "release_first": 777,
+    "reconcile_on_read_refused": 1881
+   },
+   "grant_refusals_per_1000": 300.0,
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.045,
+     "p90": 0.3557,
+     "p99": 1.084
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.7243,
+     "p90": 1.6058,
+     "p99": 2.4171
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.9262,
+     "p90": 1.7959,
+     "p99": 2.8293
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.5705,
+     "p90": 4.2072,
+     "p99": 7.1632
+    }
+   }
+  },
+  {
+   "run": "7-p6-cand",
+   "completion_s": 300.1,
+   "tool_errors": 5,
+   "tool_errors_by_tool": {
+    "fetch_inbox": 1,
+    "file_reservation_paths": 4
+   },
+   "collision_errors": 0,
+   "grants": 886,
+   "refusals": {
+    "grant_first": 4,
+    "release_first": 2,
+    "reconcile_on_read_refused": 4
+   },
+   "grant_refusals_per_1000": 4.5,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0269,
+     "p90": 0.0941,
+     "p99": 0.3629
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.1323,
+     "p90": 0.2876,
+     "p99": 0.7781
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.181,
+     "p90": 0.4349,
+     "p99": 1.006
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1154,
+     "p90": 2.3226,
+     "p99": 9.1212
+    }
+   }
+  },
+  {
+   "run": "8-p6-base",
+   "completion_s": 300.1,
+   "tool_errors": 685,
+   "tool_errors_by_tool": {
+    "fetch_inbox": 1,
+    "file_reservation_paths": 684
+   },
+   "collision_errors": 0,
+   "grants": 886,
+   "refusals": {
+    "grant_first": 684,
+    "release_first": 675,
+    "reconcile_on_read_refused": 238
+   },
+   "grant_refusals_per_1000": 772.0,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0269,
+     "p90": 0.0841,
+     "p99": 0.2797
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0897,
+     "p90": 0.1775,
+     "p99": 0.4142
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1179,
+     "p90": 0.265,
+     "p99": 0.6727
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1134,
+     "p90": 0.2591,
+     "p99": 1.6672
+    }
+   }
+  },
+  {
+   "run": "9-p6-base",
+   "completion_s": 300.1,
+   "tool_errors": 674,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 674
+   },
+   "collision_errors": 0,
+   "grants": 886,
+   "refusals": {
+    "grant_first": 674,
+    "release_first": 697,
+    "reconcile_on_read_refused": 313
+   },
+   "grant_refusals_per_1000": 760.7,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0288,
+     "p90": 0.1263,
+     "p99": 0.6325
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0924,
+     "p90": 0.2332,
+     "p99": 0.9715
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1276,
+     "p90": 0.3899,
+     "p99": 1.5426
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.125,
+     "p90": 3.56,
+     "p99": 8.8405
+    }
+   }
+  },
+  {
+   "run": "10-p6-cand",
+   "completion_s": 300.1,
+   "tool_errors": 0,
+   "tool_errors_by_tool": {},
+   "collision_errors": 0,
+   "grants": 886,
+   "refusals": {
+    "grant_first": 0,
+    "release_first": 1,
+    "reconcile_on_read_refused": 2
+   },
+   "grant_refusals_per_1000": 0.0,
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0299,
+     "p90": 0.1508,
+     "p99": 0.4881
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.134,
+     "p90": 0.3376,
+     "p99": 0.9044
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.2111,
+     "p90": 0.5313,
+     "p99": 1.1186
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1272,
+     "p90": 2.6294,
+     "p99": 8.4
+    }
+   }
+  }
+ ],
+ "paced_pooled": {
+  "p2-base": {
+   "runs": 3,
+   "completion_median_s": 546.6306,
+   "completion_s": [
+    619.6,
+    546.6,
+    440.7
+   ],
+   "send_p50": 3.0304,
+   "send_p99": 8.519,
+   "late60_send_p90": 4.4073,
+   "tool_errors": 7337,
+   "grants": 7899,
+   "grant_refused": 7336,
+   "grant_refusals_per_1000": 928.7,
+   "reserve_p50": 0.145,
+   "reserve_p99": 1.5212,
+   "release_p99": 1.8106
+  },
+  "p2-cand": {
+   "runs": 3,
+   "completion_median_s": 611.9981,
+   "completion_s": [
+    634.5,
+    612.0,
+    524.0
+   ],
+   "send_p50": 2.9171,
+   "send_p99": 8.322,
+   "late60_send_p90": 3.5504,
+   "tool_errors": 2337,
+   "grants": 7899,
+   "grant_refused": 2334,
+   "grant_refusals_per_1000": 295.5,
+   "reserve_p50": 0.7573,
+   "reserve_p99": 2.6144,
+   "release_p99": 3.0191
+  },
+  "p6-cand": {
+   "runs": 2,
+   "completion_median_s": 300.1333,
+   "completion_s": [
+    300.1,
+    300.1
+   ],
+   "send_p50": 0.1205,
+   "send_p99": 8.7119,
+   "late60_send_p90": 0.173,
+   "tool_errors": 5,
+   "grants": 1772,
+   "grant_refused": 4,
+   "grant_refusals_per_1000": 2.3,
+   "reserve_p50": 0.1333,
+   "reserve_p99": 0.863,
+   "release_p99": 1.0897
+  },
+  "p6-base": {
+   "runs": 2,
+   "completion_median_s": 300.1448,
+   "completion_s": [
+    300.1,
+    300.1
+   ],
+   "send_p50": 0.1188,
+   "send_p99": 7.2272,
+   "late60_send_p90": 0.1736,
+   "tool_errors": 1359,
+   "grants": 1772,
+   "grant_refused": 1358,
+   "grant_refusals_per_1000": 766.4,
+   "reserve_p50": 0.091,
+   "reserve_p99": 0.7191,
+   "release_p99": 1.3112
+  }
+ },
+ "smoke": [
+  {
+   "run": "cand_vs_base",
+   "started_at": "2026-10-21T01:07:50Z",
+   "arms": {
+    "cand": {
+     "harness_arm": "candidate",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "FAIL",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": false,
+     "soak_converged": false,
+     "soak_convergence_detail": "archive=13653 db=14074 last=sqlite is ahead of the archive by 421 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=2, agents=3, messages=13653, db projects=2, agents=3, messages=14074",
+     "collision_errors": 0,
+     "soak_counts": {
+      "send": 13452,
+      "read": 110130,
+      "search": 1087,
+      "health": 256,
+      "err": 0
+     },
+     "soak_fetch_p99_s": 0.010161161422729492,
+     "soak_zombies_max": null,
+     "swarm_acked_sends": 7013,
+     "swarm_zombies_max": 0,
+     "swarm_timeouts_30s": 0,
+     "swarm_tool_errors": 1769,
+     "soak_errors": 0,
+     "swarm_tools": {
+      "send_message": {
+       "n": 7013,
+       "p50_s": 2.449883222579956,
+       "p99_s": 7.663020610809326,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "fetch_inbox": {
+       "n": 7013,
+       "p50_s": 0.049936771392822266,
+       "p99_s": 1.1408236026763916,
+       "timeouts": 0,
+       "tool_errors": {
+        "RESOURCE_BUSY": 1
+       }
+      },
+      "acknowledge_message": {
+       "n": 2984,
+       "p50_s": 0.03298616409301758,
+       "p99_s": 1.3044073581695557,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "file_reservation_paths": {
+       "n": 2085,
+       "p50_s": 1.5017008781433105,
+       "p99_s": 3.546834945678711,
+       "timeouts": 0,
+       "tool_errors": {
+        "RESERVATION_ARCHIVE_UNAVAILABLE": 1768
+       }
+      },
+      "release_file_reservations": {
+       "n": 2078,
+       "p50_s": 1.6850016117095947,
+       "p99_s": 4.4741034507751465,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "search_messages": {
+       "n": 699,
+       "p50_s": 0.3061950206756592,
+       "p99_s": 0.6377789974212646,
+       "timeouts": 0,
+       "tool_errors": {}
+      }
+     },
+     "post_swarm_unarchived": 6006,
+     "convergence_detail": "archive=15588 db=21594 last=sqlite is ahead of the archive by 6006 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=5, agents=63, messages=15588, db projects=5, agents=63, messages=21594",
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ],
+     "server_log_refusals_whole_run": {
+      "grant_first": 1768,
+      "release_first": 1787,
+      "reconcile_on_read_refused": 5364
+     },
+     "swarm_grants": 2085
+    },
+    "base": {
+     "harness_arm": "control",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "FAIL",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": false,
+     "soak_converged": true,
+     "soak_convergence_detail": "archive=13553 db=13553",
+     "collision_errors": 0,
+     "soak_counts": {
+      "send": 12962,
+      "read": 109445,
+      "search": 804,
+      "health": 269,
+      "err": 0
+     },
+     "soak_fetch_p99_s": 0.009533166885375977,
+     "soak_zombies_max": null,
+     "swarm_acked_sends": 9106,
+     "swarm_zombies_max": 0,
+     "swarm_timeouts_30s": 0,
+     "swarm_tool_errors": 2597,
+     "soak_errors": 0,
+     "swarm_tools": {
+      "send_message": {
+       "n": 9106,
+       "p50_s": 2.3586225509643555,
+       "p99_s": 6.138821125030518,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "fetch_inbox": {
+       "n": 9100,
+       "p50_s": 0.044109344482421875,
+       "p99_s": 0.7752106189727783,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "file_reservation_paths": {
+       "n": 2669,
+       "p50_s": 0.13766121864318848,
+       "p99_s": 1.167508840560913,
+       "timeouts": 0,
+       "tool_errors": {
+        "RESERVATION_ARCHIVE_UNAVAILABLE": 2597
+       }
+      },
+      "release_file_reservations": {
+       "n": 2666,
+       "p50_s": 0.19672513008117676,
+       "p99_s": 1.5626020431518555,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "search_messages": {
+       "n": 922,
+       "p50_s": 0.3844330310821533,
+       "p99_s": 0.7602396011352539,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "acknowledge_message": {
+       "n": 4084,
+       "p50_s": 0.03095388412475586,
+       "p99_s": 0.7869901657104492,
+       "timeouts": 0,
+       "tool_errors": {}
+      }
+     },
+     "post_swarm_unarchived": 6048,
+     "convergence_detail": "archive=17133 db=23181 last=sqlite is ahead of the archive by 6048 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=5, agents=63, messages=17133, db projects=5, agents=63, messages=23181",
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ],
+     "server_log_refusals_whole_run": {
+      "grant_first": 2597,
+      "release_first": 2595,
+      "reconcile_on_read_refused": 4211
+     },
+     "swarm_grants": 2669
+    }
+   }
+  },
+  {
+   "run": "base_vs_cand",
+   "started_at": "2026-10-21T02:22:54Z",
+   "arms": {
+    "base": {
+     "harness_arm": "candidate",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "FAIL",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": false,
+     "soak_converged": true,
+     "soak_convergence_detail": "archive=13142 db=13142",
+     "collision_errors": 0,
+     "soak_counts": {
+      "send": 12550,
+      "read": 106379,
+      "search": 791,
+      "health": 268,
+      "err": 1
+     },
+     "soak_fetch_p99_s": 0.011137723922729492,
+     "soak_zombies_max": null,
+     "swarm_acked_sends": 8194,
+     "swarm_zombies_max": 0,
+     "swarm_timeouts_30s": 0,
+     "swarm_tool_errors": 2372,
+     "soak_errors": 1,
+     "swarm_tools": {
+      "send_message": {
+       "n": 8194,
+       "p50_s": 2.8314788341522217,
+       "p99_s": 7.993852376937866,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "fetch_inbox": {
+       "n": 8192,
+       "p50_s": 0.045126914978027344,
+       "p99_s": 0.8107728958129883,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "file_reservation_paths": {
+       "n": 2433,
+       "p50_s": 0.13031840324401855,
+       "p99_s": 1.3102617263793945,
+       "timeouts": 0,
+       "tool_errors": {
+        "RESERVATION_ARCHIVE_UNAVAILABLE": 2372
+       }
+      },
+      "release_file_reservations": {
+       "n": 2430,
+       "p50_s": 0.18558835983276367,
+       "p99_s": 1.355180263519287,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "search_messages": {
+       "n": 828,
+       "p50_s": 0.30755066871643066,
+       "p99_s": 0.7054989337921143,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "acknowledge_message": {
+       "n": 3663,
+       "p50_s": 0.03013134002685547,
+       "p99_s": 0.778475284576416,
+       "timeouts": 0,
+       "tool_errors": {}
+      }
+     },
+     "post_swarm_unarchived": 7458,
+     "convergence_detail": "archive=14389 db=21847 last=sqlite is ahead of the archive by 7458 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=5, agents=63, messages=14389, db projects=5, agents=63, messages=21847",
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ],
+     "server_log_refusals_whole_run": {
+      "grant_first": 2372,
+      "release_first": 2376,
+      "reconcile_on_read_refused": 2206
+     },
+     "swarm_grants": 2433
+    },
+    "cand": {
+     "harness_arm": "control",
+     "verdict": "FAIL",
+     "phase_verdicts": {
+      "flow": "PASS",
+      "cross_project": "PASS",
+      "storm": "PASS",
+      "crash": "PASS",
+      "soak": "FAIL",
+      "swarm": "FAIL"
+     },
+     "soak_wbq_ok": false,
+     "soak_converged": false,
+     "soak_convergence_detail": "archive=12244 db=14353 last=sqlite is ahead of the archive by 2109 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=2, agents=3, messages=12244, db projects=2, agents=3, messages=14353",
+     "collision_errors": 0,
+     "soak_counts": {
+      "send": 13721,
+      "read": 113153,
+      "search": 1125,
+      "health": 260,
+      "err": 0
+     },
+     "soak_fetch_p99_s": 0.009781360626220703,
+     "soak_zombies_max": null,
+     "swarm_acked_sends": 6880,
+     "swarm_zombies_max": 0,
+     "swarm_timeouts_30s": 0,
+     "swarm_tool_errors": 1773,
+     "soak_errors": 0,
+     "swarm_tools": {
+      "send_message": {
+       "n": 6880,
+       "p50_s": 2.718590497970581,
+       "p99_s": 7.440673589706421,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "fetch_inbox": {
+       "n": 6878,
+       "p50_s": 0.05243396759033203,
+       "p99_s": 1.098116397857666,
+       "timeouts": 0,
+       "tool_errors": {
+        "RESOURCE_BUSY": 1
+       }
+      },
+      "file_reservation_paths": {
+       "n": 2041,
+       "p50_s": 1.4716291427612305,
+       "p99_s": 3.269690990447998,
+       "timeouts": 0,
+       "tool_errors": {
+        "RESERVATION_ARCHIVE_UNAVAILABLE": 1772
+       }
+      },
+      "acknowledge_message": {
+       "n": 2934,
+       "p50_s": 0.03271746635437012,
+       "p99_s": 1.1273012161254883,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "release_file_reservations": {
+       "n": 2037,
+       "p50_s": 1.6369190216064453,
+       "p99_s": 3.780855417251587,
+       "timeouts": 0,
+       "tool_errors": {}
+      },
+      "search_messages": {
+       "n": 672,
+       "p50_s": 0.30745625495910645,
+       "p99_s": 0.7381536960601807,
+       "timeouts": 0,
+       "tool_errors": {}
+      }
+     },
+     "post_swarm_unarchived": 6354,
+     "convergence_detail": "archive=15395 db=21749 last=sqlite is ahead of the archive by 6354 message(s) (queued archive writes or writes that never landed; compare queues.archive_lag): archive projects=5, agents=63, messages=15395, db projects=5, agents=63, messages=21749",
+     "crash_verdict": "PASS",
+     "integrity_ok": [
+      true,
+      true
+     ],
+     "server_log_refusals_whole_run": {
+      "grant_first": 1772,
+      "release_first": 1777,
+      "reconcile_on_read_refused": 4898
+     },
+     "swarm_grants": 2041
+    }
+   }
+  }
+ ],
+ "checks": {
+  "PRIMARY P2 grant refusals/1000 cand <= 10% of base and <= 50": false,
+  "PRIMARY P6 grant refusals/1000 cand <= 10% of base and <= 50": true,
+  "PB soak WBQ 10s window AND soak convergence pass for cand, each order, soak sends >= 4000": false,
+  "G2 no canonical-id collision errors in any cand server log (paced + smoke)": true,
+  "G1 P2 completion median cand <= 1.05x base": false,
+  "G1 swarm acked sends cand >= 0.95x base each order": false,
+  "G2 swarm 30s timeouts cand <= base + 5 each order": true,
+  "G2 smoke errors (swarm + soak) cand <= base + 5 each order": true,
+  "G2 paced errors cand <= base + 5 (P2), + 3 (P6)": true,
+  "G2 cand crash PASS and integrity_check ok": true,
+  "G2 dispatch zombies cand == 0 or <= base, each order (soak and swarm)": true,
+  "G3 P6 below saturation (every completion <= 330 s)": true,
+  "G3 P6 send p99 and late-60s p90 cand <= 1.2x base": false,
+  "G3 P6 reserve p99 and release p99 cand <= base + 0.5 s": true,
+  "G4 soak reads cand >= 0.90x base and fetch p99 <= 1.3x, each order": true,
+  "G5 post-swarm unarchived cand <= base + 2% of cand acked, each order": true
+ },
+ "measured_verdict": "LOSS (see failed checks)"
+}

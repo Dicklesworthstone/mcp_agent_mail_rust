@@ -853,6 +853,13 @@ impl TimelineScreen {
             .min(self.active_row_count().saturating_sub(1));
     }
 
+    /// Re-derive the visible rows after a filter change from the action menu.
+    fn refilter_after_action(&mut self) {
+        self.invalidate_combined_cache();
+        self.clamp_cursor_for_mode();
+        self.prune_selection_to_visible();
+    }
+
     fn visible_action_rows(&self) -> Vec<TimelineActionRow> {
         match self.view_mode {
             TimelineViewMode::Events | TimelineViewMode::LogViewer => self
@@ -1664,6 +1671,61 @@ impl MailScreen for TimelineScreen {
         }
     }
 
+    /// The `.` menu's event actions act on this screen. Their context names
+    /// the event by sequence number (`event:{seq}`); it is not a timestamp,
+    /// and the menu's labels are display text, not search terms.
+    fn handle_action(&mut self, operation: &str, context: &str) -> Cmd<MailScreenMsg> {
+        // A commit row's details live in the archive browser, as with Enter.
+        if context.starts_with("commit:") && operation == "view_details" {
+            return Cmd::Msg(MailScreenMsg::Navigate(MailScreenId::ArchiveBrowser));
+        }
+        let Some(seq) = context
+            .strip_prefix("event:")
+            .and_then(|seq| seq.parse::<u64>().ok())
+        else {
+            return Cmd::None;
+        };
+        let Some((kind, source)) = self
+            .pane
+            .entries
+            .iter()
+            .find(|entry| entry.seq == seq)
+            .map(|entry| (entry.display.kind, entry.source))
+        else {
+            return Cmd::None;
+        };
+        match operation
+            .split_once(':')
+            .map_or(operation, |(name, _)| name)
+        {
+            "view_details" => {
+                let key = TimelineSelectionKey::Event { seq };
+                if let Some(row) = self
+                    .visible_action_rows()
+                    .iter()
+                    .position(|row| row.key == key)
+                {
+                    self.pane.cursor = row;
+                    self.pane.follow = false;
+                }
+                if !self.dock.visible {
+                    self.dock.visible = true;
+                    self.dock_changed();
+                }
+            }
+            "filter_kind" => {
+                self.pane.kind_filter = HashSet::from([kind]);
+                self.refilter_after_action();
+            }
+            "filter_source" => {
+                self.pane.source_filter = HashSet::from([source]);
+                self.refilter_after_action();
+            }
+            _ => return Cmd::None,
+        }
+        Cmd::msg(MailScreenMsg::Noop)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
         self.last_visible_at.set(Some(Instant::now()));
@@ -1942,6 +2004,13 @@ impl MailScreen for TimelineScreen {
                 entry.action = ActionKind::CopyToClipboard(current.copy_text.clone());
                 entry.keybinding = Some("y".to_string());
             }
+        }
+        // Commits have no event type or source to filter on.
+        if matches!(current.key, TimelineSelectionKey::Commit { .. }) {
+            actions.retain(|entry| {
+                !matches!(&entry.action, ActionKind::Execute(op)
+                    if op.starts_with("filter_kind:") || op.starts_with("filter_source:"))
+            });
         }
         let context_id = match &current.key {
             TimelineSelectionKey::Event { seq } => format!("event:{seq}"),
@@ -3820,6 +3889,65 @@ mod tests {
                 .contains(&MailEventKind::HttpRequest)
         );
         assert!(screen.pane.source_filter.contains(&EventSource::Http));
+    }
+
+    #[test]
+    fn action_menu_filters_and_details_act_on_the_timeline_itself() {
+        let mut screen = TimelineScreen::new();
+        screen.pane.verbosity = VerbosityTier::All;
+        push_event_entry(
+            &mut screen.pane,
+            1,
+            MailEvent::http_request("GET", "/one", 200, 1, "127.0.0.1"),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            2,
+            MailEvent::message_sent(2, "A", vec!["B".to_string()], "s", "t", "p", ""),
+        );
+        push_event_entry(
+            &mut screen.pane,
+            3,
+            MailEvent::http_request("GET", "/three", 200, 1, "127.0.0.1"),
+        );
+        let handled = |cmd: &Cmd<MailScreenMsg>| matches!(cmd, Cmd::Msg(MailScreenMsg::Noop));
+
+        // Handled here, so the app never turns the label into a text search.
+        let cmd = screen.handle_action("filter_kind:msgsent", "event:2");
+        assert!(handled(&cmd));
+        assert_eq!(
+            screen.pane.kind_filter,
+            HashSet::from([MailEventKind::MessageSent])
+        );
+        assert_eq!(screen.pane.filtered_len(), 1);
+
+        screen.pane.kind_filter.clear();
+        let cmd = screen.handle_action("filter_source:http", "event:3");
+        assert!(handled(&cmd));
+        assert_eq!(
+            screen.pane.source_filter,
+            HashSet::from([EventSource::Http])
+        );
+        assert_eq!(screen.pane.filtered_len(), 2);
+
+        // The context is a sequence number, not a timestamp: details select
+        // event 3 (second visible row), not the oldest row, and open the dock.
+        screen.pane.cursor = 0;
+        screen.dock.visible = false;
+        let cmd = screen.handle_action("view_details", "event:3");
+        assert!(handled(&cmd));
+        assert_eq!(screen.pane.cursor, 1);
+        assert!(screen.dock.visible);
+
+        // Unknown events and other operations fall through to the app.
+        assert!(matches!(
+            screen.handle_action("filter_kind:x", "event:99"),
+            Cmd::None
+        ));
+        assert!(matches!(
+            screen.handle_action("acknowledge", "event:1"),
+            Cmd::None
+        ));
     }
 
     #[test]

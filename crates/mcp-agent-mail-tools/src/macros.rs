@@ -25,7 +25,10 @@ use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
+    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
+};
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -54,6 +57,10 @@ pub struct PreparedThread {
     pub summary: ThreadSummary,
     pub examples: Vec<ExampleMessage>,
     pub total_messages: i64,
+    /// True when the summary was refined with the conformance fixture's
+    /// canned text instead of a model (test harness only; br-kp1in.21).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_stub: bool,
 }
 
 /// File reservation cycle response
@@ -92,6 +99,11 @@ pub const WELCOME_SKIPPED_CONTACT_PENDING: &str = "contact_not_approved: the wel
 pub const WELCOME_SKIPPED_CONTACT_BLOCKED: &str = "contact_blocked: the target has blocked \
      contact from this requester; auto_accept does not override a block, so the link stays \
      blocked and no welcome was sent (only the target can unblock it with respond_contact)";
+
+/// Reason reported when only one of `welcome_subject` / `welcome_body` was
+/// given: a welcome needs both, and it is not sent half-written.
+pub const WELCOME_SKIPPED_INCOMPLETE: &str = "welcome_incomplete: a welcome needs both \
+     welcome_subject and welcome_body; only one was given, so no welcome was sent";
 
 fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
     serde_json::from_str(&payload)
@@ -375,7 +387,10 @@ pub async fn macro_prepare_thread(
 
     let should_register = register_if_missing.unwrap_or(true);
     let agent = if should_register {
-        let agent_json = crate::identity::register_agent(
+        // Refresh (or create) the profile as register_agent does, but leave a
+        // running agent's registration token alone: rotating it here would
+        // make that agent's next verified send fail with a token mismatch.
+        let agent_json = crate::identity::register_agent_with_token_policy(
             ctx,
             project.human_key.clone(),
             program,
@@ -387,6 +402,7 @@ pub async fn macro_prepare_thread(
             None,
             None,
             registration_proof,
+            crate::identity::TokenPolicy::KeepExisting,
         )
         .await?;
         parse_json(agent_json, "agent")?
@@ -413,6 +429,7 @@ pub async fn macro_prepare_thread(
 
     // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
     let config = &mcp_agent_mail_core::Config::get();
+    let mut llm_stub = false;
     if use_llm && config.llm_enabled {
         let start_idx = messages.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
         let msg_tuples: Vec<(i64, String, String, String)> = messages[start_idx..]
@@ -428,6 +445,7 @@ pub async fn macro_prepare_thread(
             Ok(output) => {
                 if let Some(parsed) = llm::parse_json_safely(&output.content) {
                     summary = llm::merge_single_thread_summary(&summary, &parsed);
+                    llm_stub = output.is_conformance_fixture();
                 } else {
                     tracing::debug!(
                         "macro_prepare_thread.llm_skipped: could not parse LLM response"
@@ -459,6 +477,7 @@ pub async fn macro_prepare_thread(
         total_messages,
         summary,
         examples,
+        llm_stub,
     };
 
     let inbox_json = crate::messaging::fetch_inbox(
@@ -501,7 +520,15 @@ pub async fn macro_prepare_thread(
     }
     tracing::debug!("Inbox limit: {}", inbox_limit);
 
-    serde_json::to_string(&response)
+    let mut value = serde_json::to_value(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))?;
+    // The agent object always carries `registration_token`, as the Python
+    // response did; a token this call kept (or did not mint) is null, never
+    // the running agent's credential.
+    if let Some(agent) = value.get_mut("agent").and_then(Value::as_object_mut) {
+        agent.entry("registration_token").or_insert(Value::Null);
+    }
+    serde_json::to_string(&value)
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
@@ -695,8 +722,94 @@ pub async fn macro_contact_handshake(
         mcp_agent_mail_core::models::normalize_agent_name(&target_agent).unwrap_or(target_agent);
     let target_resolution =
         crate::contacts::resolve_contact_target(&target_agent, to_project.as_deref(), &project_key);
+    let should_auto_accept = auto_accept.unwrap_or(false);
+
+    // A handshake has two actors when it auto-accepts: the requester and the
+    // recipient deciding the link. Check both on the read-only lane before
+    // implicit registration, project creation, link refresh, or intro mail.
+    // Empty proof inventory does not imply trusted-local authority: capacity
+    // eviction can leave restrictions even after every live proof was unbound.
+    // Freeze the complete authorization state before the first database await.
+    let authorization = crate::session_identity::ActorAuthorizationSnapshot::capture(ctx)?;
+    if !authorization.permits_unresolved_actor(None) {
+        let read_pool = get_coalescer_bypass_read_db_pool()?;
+        match resolve_existing_project(ctx, &read_pool, &project_key).await {
+            Ok(project) => {
+                let project_id = project.id.unwrap_or(0);
+                match resolve_agent(
+                    ctx,
+                    &read_pool,
+                    project_id,
+                    &from_agent,
+                    &project.slug,
+                    &project.human_key,
+                )
+                .await
+                {
+                    Ok(agent) => authorization.authorize(ctx, &agent, "request contacts")?,
+                    Err(error)
+                        if register_if_missing != Some(false)
+                            && tool_error_code(&error) == Some("NOT_FOUND") =>
+                    {
+                        // Use this preflight's snapshot, not a later session
+                        // read that could have lost the requester's restriction.
+                        authorization.authorize(
+                            ctx,
+                            &mcp_agent_mail_db::AgentRow {
+                                project_id,
+                                name: from_agent.clone(),
+                                ..Default::default()
+                            },
+                            "auto-register a contact requester",
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error)
+                if register_if_missing != Some(false)
+                    && tool_error_code(&error) == Some("NOT_FOUND") =>
+            {
+                // No project or agent row exists yet. No id can match a held
+                // proof; saturated eviction history must refuse this path too,
+                // before resolve_project creates anything. This projection is
+                // authorization input only and is never persisted.
+                authorization.authorize(
+                    ctx,
+                    &mcp_agent_mail_db::AgentRow {
+                        name: from_agent.clone(),
+                        ..Default::default()
+                    },
+                    "auto-register a contact requester in a new project",
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        if should_auto_accept {
+            let project =
+                resolve_existing_project(ctx, &read_pool, &target_resolution.project_key).await?;
+            let target = resolve_agent(
+                ctx,
+                &read_pool,
+                project.id.unwrap_or(0),
+                &target_resolution.agent_name,
+                &project.slug,
+                &project.human_key,
+            )
+            .await?;
+            authorization.authorize(ctx, &target, "respond to contact requests")?;
+        }
+    }
+
+    ctx.ensure_live()?;
     let pool = get_db_pool()?;
-    let source_project = resolve_project(ctx, &pool, &project_key).await?;
+    // register_if_missing=false means nothing is created implicitly: a missing
+    // source project is NOT_FOUND here, before the contact flow's own check.
+    let source_project = if register_if_missing == Some(false) {
+        resolve_existing_project(ctx, &pool, &project_key).await?
+    } else {
+        resolve_project(ctx, &pool, &project_key).await?
+    };
     let source_project_key = source_project.human_key.clone();
     let target_project = resolve_project(ctx, &pool, &target_resolution.project_key).await?;
     let target_project_key = target_project.human_key.clone();
@@ -705,7 +818,6 @@ pub async fn macro_contact_handshake(
             .unwrap_or_else(|| target_resolution.agent_name.clone());
     let is_cross_project = source_project.id != target_project.id;
 
-    let should_auto_accept = auto_accept.unwrap_or(false);
     let ttl = match ttl_seconds {
         Some(t) if t > 0 => t.clamp(60, 31_536_000), // consistent with other macros
         _ => 604_800,                                // 7 days
@@ -842,7 +954,11 @@ pub async fn macro_contact_handshake(
                 Err(error) => return Err(error),
             }
         }
-        _ => None,
+        (Some(_), None) | (None, Some(_)) => {
+            welcome_skipped_reason = Some(WELCOME_SKIPPED_INCOMPLETE.to_string());
+            None
+        }
+        (None, None) => None,
     };
 
     let welcome_sent = welcome_val.is_some();
@@ -1159,13 +1275,24 @@ mod tests {
                 created_ts: "2026-01-01T00:00:00Z".into(),
             }],
             total_messages: 5,
+            llm_stub: false,
         };
         let json = serde_json::to_string(&thread).unwrap();
+        // A model-refined or heuristic summary carries no stub marker.
+        assert!(!json.contains("llm_stub"), "{json}");
         let parsed: PreparedThread = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.thread_id, "TKT-42");
         assert_eq!(parsed.total_messages, 5);
         assert_eq!(parsed.examples.len(), 1);
         assert_eq!(parsed.summary.participants, vec!["Alice"]);
+        assert!(!parsed.llm_stub);
+
+        let stubbed = PreparedThread {
+            llm_stub: true,
+            ..parsed
+        };
+        let json = serde_json::to_string(&stubbed).unwrap();
+        assert!(json.contains("\"llm_stub\":true"), "{json}");
     }
 
     // -----------------------------------------------------------------------
@@ -1214,6 +1341,7 @@ mod tests {
                 },
                 examples: Vec::new(),
                 total_messages: 0,
+                llm_stub: false,
             },
             inbox: Vec::new(),
         };
@@ -1456,6 +1584,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "direct".into(),
+                via: None,
                 attachments: Vec::new(),
                 body_md: Some("Body text".into()),
             }],
@@ -1513,6 +1642,7 @@ mod tests {
                 },
                 examples: Vec::new(),
                 total_messages: 0,
+                llm_stub: false,
             },
             inbox: Vec::new(),
         };

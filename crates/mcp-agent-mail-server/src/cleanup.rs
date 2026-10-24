@@ -18,7 +18,7 @@ use mcp_agent_mail_db::{
     queries::{
         self, get_agent_last_mail_activity, list_unreleased_file_reservations,
         project_ids_with_active_reservations, prune_released_file_reservations,
-        release_expired_reservations, release_reservations_by_ids_returning_ids,
+        release_expired_reservations,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -67,6 +67,93 @@ impl CleanupProbeCache {
             now_us.saturating_sub(entry.last_used_us) <= PROBE_CACHE_RETENTION_US
         });
     }
+}
+
+/// Bind cleanup mutations and their queued terminal artifacts to one mailbox
+/// generation. Recovery cannot promote a replacement while this lease lives.
+struct CleanupArchiveScope<'a> {
+    pool: &'a DbPool,
+    generation: Option<String>,
+    _write_activity: mcp_agent_mail_db::write_barrier::WriteActivityGuard,
+}
+
+impl<'a> CleanupArchiveScope<'a> {
+    fn begin(cx: &Cx, pool: &'a DbPool) -> Result<Self, String> {
+        let write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        let generation = cleanup_archive_generation(cx, pool)?;
+        Ok(Self {
+            pool,
+            generation,
+            _write_activity: write_activity,
+        })
+    }
+
+    fn verify(&self, cx: &Cx) -> Result<(), String> {
+        if cleanup_archive_generation(cx, self.pool)? != self.generation {
+            return Err(
+                "cleanup archive generation changed; refusing stale release artifacts".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Read through the same authoritative pool as the cleanup operation. Never
+/// seed an identity after releasing a row or turn an unreadable identity into
+/// legacy publication. An absent table/row is the explicit unseeded case.
+fn cleanup_archive_generation(cx: &Cx, pool: &DbPool) -> Result<Option<String>, String> {
+    let conn = match block_on(pool.acquire(cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => {
+            return Err(format!(
+                "cleanup archive generation checkout failed: {error}"
+            ));
+        }
+        Outcome::Cancelled(reason) => {
+            return Err(format!(
+                "cleanup archive generation checkout cancelled: {reason:?}"
+            ));
+        }
+        Outcome::Panicked(panic) => {
+            return Err(format!(
+                "cleanup archive generation checkout panicked: {}",
+                panic.message()
+            ));
+        }
+    };
+    let tables = conn
+        .query_sync(
+            "SELECT type FROM sqlite_master WHERE name = 'db_identity' COLLATE NOCASE",
+            &[],
+        )
+        .map_err(|error| format!("cleanup archive identity schema read failed: {error}"))?;
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    if tables.len() != 1 || tables[0].get_named::<String>("type").ok().as_deref() != Some("table") {
+        return Err("cleanup archive identity is not a database table".into());
+    }
+    let rows = conn
+        .query_sync(
+            "SELECT singleton, generation_id FROM db_identity LIMIT 2",
+            &[],
+        )
+        .map_err(|error| format!("cleanup archive generation read failed: {error}"))?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let generation = row
+        .get_named::<String>("generation_id")
+        .map_err(|error| format!("cleanup archive generation decode failed: {error}"))?;
+    if rows.len() != 1
+        || row.get_named::<i64>("singleton").ok() != Some(0)
+        || generation.is_empty()
+        || generation.len() > 256
+        || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("cleanup archive generation is not a valid hex identity".into());
+    }
+    Ok(Some(generation))
 }
 
 /// Start the file reservation cleanup worker (if enabled).
@@ -222,10 +309,6 @@ fn run_cleanup_cycle_with_cache(
     pool: &DbPool,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<(usize, usize), String> {
-    // #219: reservation release/prune UPDATEs and DELETEs hit the live
-    // mailbox; hold the in-process write lease for the whole cycle so a
-    // recovery promotion cannot swap the database mid-write.
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
     // This worker runs on a dedicated OS thread outside the async runtime, so
     // there is no parent Cx to derive from. Borrow the runtime-backed ambient
     // Cx<cap::All> that `Runtime::block_on` installs (INFINITE budget, correct
@@ -236,6 +319,9 @@ fn run_cleanup_cycle_with_cache(
     let cx = block_on(async {
         Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
     });
+    // #219: keep generation exclusion through release, artifact capture, and
+    // pruning. Capture identity before any mutation, never after a file swap.
+    let archive_scope = CleanupArchiveScope::begin(&cx, pool)?;
 
     // Get all project IDs with active reservations.
     let project_ids =
@@ -293,7 +379,8 @@ fn run_cleanup_cycle_with_cache(
 
         // Write archive artifacts for released reservations.
         if !expired_ids.is_empty()
-            && let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &expired_ids)
+            && let Err(err) =
+                write_cleanup_artifacts(config, &archive_scope, &cx, *pid, &expired_ids)
         {
             warn!(
                 project_id = *pid,
@@ -304,7 +391,7 @@ fn run_cleanup_cycle_with_cache(
             );
         }
         if !stale_ids.is_empty()
-            && let Err(err) = write_cleanup_artifacts(config, pool, &cx, *pid, &stale_ids)
+            && let Err(err) = write_cleanup_artifacts(config, &archive_scope, &cx, *pid, &stale_ids)
         {
             warn!(
                 project_id = *pid,
@@ -374,6 +461,50 @@ fn detect_and_release_stale(
     project_id: i64,
     probe_cache: &mut CleanupProbeCache,
 ) -> Result<Vec<i64>, String> {
+    collect_stale_reservations(config, pool, cx, project_id, probe_cache)?
+        .release(cx, pool, project_id)
+}
+
+struct StaleReservationScan {
+    candidates: Vec<queries::StaleReservationCandidate>,
+    observed_at: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+}
+
+impl StaleReservationScan {
+    fn release(self, cx: &Cx, pool: &DbPool, project_id: i64) -> Result<Vec<i64>, String> {
+        // No database connection is held across filesystem or git probes. The
+        // release transaction must therefore revalidate the captured evidence,
+        // including activity committed after the last probe and before admission.
+        match block_on(queries::release_stale_reservations(
+            cx,
+            pool,
+            project_id,
+            &self.candidates,
+            self.observed_at,
+            self.inactivity_us,
+            self.grace_us,
+        )) {
+            Outcome::Ok(released_ids) => Ok(released_ids),
+            other => Err(format!("failed to release stale reservations: {other:?}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StaleAgentObservation {
+    last_active_ts: i64,
+    last_mail_activity_ts: Option<i64>,
+}
+
+fn collect_stale_reservations(
+    config: &Config,
+    pool: &DbPool,
+    cx: &Cx,
+    project_id: i64,
+    probe_cache: &mut CleanupProbeCache,
+) -> Result<StaleReservationScan, String> {
     let inactivity_us = i64::try_from(config.file_reservation_inactivity_seconds)
         .unwrap_or(1800)
         .saturating_mul(1_000_000);
@@ -381,10 +512,16 @@ fn detect_and_release_stale(
         .unwrap_or(900)
         .saturating_mul(1_000_000);
     let now = now_micros();
+    let mut scan = StaleReservationScan {
+        candidates: Vec::new(),
+        observed_at: now,
+        inactivity_us,
+        grace_us,
+    };
 
     let active = active_reservations_for_stale_cleanup(cx, pool, project_id, now)?;
     if active.is_empty() {
-        return Ok(Vec::new());
+        return Ok(scan);
     }
 
     // Project workspace is identical for every reservation in this cycle.
@@ -393,69 +530,32 @@ fn detect_and_release_stale(
 
     // Many reservations share the same agent and/or path pattern. Cache activity
     // checks within a cycle to avoid repeated DB + git process work.
-    let mut inactive_agent_cache: HashMap<i64, bool> = HashMap::new();
-    let mut recent_mail_cache: HashMap<i64, bool> = HashMap::new();
+    let mut stale_agent_cache: HashMap<i64, Option<StaleAgentObservation>> = HashMap::new();
     let mut recent_path_activity_cache: HashMap<String, bool> = HashMap::new();
-    let mut stale_ids = Vec::new();
 
-    for res in &active {
-        // Check agent inactivity, cached by agent id.
-        let agent_inactive = inactive_agent_cache
+    for res in active {
+        // Retain the actual observation, not just an inactive flag: a fresh
+        // heartbeat or mail action during a later path probe cancels this scan's
+        // authority to revoke the holder's leases.
+        let observation = stale_agent_cache
             .get(&res.agent_id)
             .copied()
             .unwrap_or_else(|| {
-                let computed = match block_on(async {
-                    // Cleanup may revoke a live claim. A process-local cached
-                    // profile cannot establish inactivity after another writer
-                    // refreshed the heartbeat or enabled reaper exemption.
-                    queries::get_agent_by_id_fresh(cx, pool, res.agent_id).await
-                }) {
-                    Outcome::Ok(agent) => {
-                        agent.id == Some(res.agent_id)
-                            && agent.project_id == project_id
-                            && agent.reaper_exempt == 0
-                            && now.saturating_sub(agent.last_active_ts) > inactivity_us
-                    }
-                    _ => false, // Skip stale classification when agent lookup fails.
-                };
-                inactive_agent_cache.insert(res.agent_id, computed);
+                let computed = stale_agent_observation(
+                    cx,
+                    pool,
+                    project_id,
+                    res.agent_id,
+                    now,
+                    inactivity_us,
+                    grace_us,
+                );
+                stale_agent_cache.insert(res.agent_id, computed);
                 computed
             });
-        if !agent_inactive {
-            continue; // Agent is recently active, not stale.
-        }
-
-        // Check mail activity grace period, cached by agent id.
-        let recent_mail = recent_mail_cache
-            .get(&res.agent_id)
-            .copied()
-            .unwrap_or_else(|| {
-                let computed = match block_on(async {
-                    get_agent_last_mail_activity(cx, pool, res.agent_id, project_id).await
-                }) {
-                    Outcome::Ok(last_mail) => {
-                        last_mail.is_some_and(|ts| now.saturating_sub(ts) <= grace_us)
-                    }
-                    other => {
-                        // Unavailable evidence is not a negative activity
-                        // signal. Keep this agent's claims for this cycle and
-                        // retry the read on the next cycle, including after
-                        // cancellation or a database worker panic.
-                        warn!(
-                            project_id,
-                            agent_id = res.agent_id,
-                            outcome = ?other,
-                            "cleanup: mail activity unavailable; preserving reservations"
-                        );
-                        true
-                    }
-                };
-                recent_mail_cache.insert(res.agent_id, computed);
-                computed
-            });
-        if recent_mail {
-            continue; // Recent mail activity, not stale.
-        }
+        let Some(observation) = observation else {
+            continue;
+        };
 
         // Check filesystem/git activity, cached by path pattern.
         let normalized_pattern = normalize_path_pattern_key(&res.path_pattern);
@@ -479,21 +579,62 @@ fn detect_and_release_stale(
             continue;
         }
 
-        // All checks negative — reservation is stale.
-        if let Some(id) = res.id {
-            stale_ids.push(id);
+        // The external probes found no activity. Retain the complete database
+        // proof for validation under the release transaction's writer lock.
+        if res.id.is_some() {
+            scan.candidates.push(queries::StaleReservationCandidate {
+                reservation: res,
+                agent_last_active_ts: observation.last_active_ts,
+                last_mail_activity_ts: observation.last_mail_activity_ts,
+            });
         }
     }
 
-    if stale_ids.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(scan)
+}
 
-    // Bulk-release stale reservations.
-    match block_on(async { release_reservations_by_ids_returning_ids(cx, pool, &stale_ids).await })
-    {
-        Outcome::Ok(released_ids) => Ok(released_ids),
-        other => Err(format!("failed to release stale reservations: {other:?}")),
+fn stale_agent_observation(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    now: i64,
+    inactivity_us: i64,
+    grace_us: i64,
+) -> Option<StaleAgentObservation> {
+    // Cleanup may revoke a live claim. A process-local cached profile cannot
+    // establish inactivity after another writer refreshes the heartbeat or
+    // enables reaper exemption.
+    let agent = match block_on(queries::get_agent_by_id_fresh(cx, pool, agent_id)) {
+        Outcome::Ok(agent)
+            if agent.id == Some(agent_id)
+                && agent.project_id == project_id
+                && agent.reaper_exempt == 0
+                && now.saturating_sub(agent.last_active_ts) > inactivity_us =>
+        {
+            agent
+        }
+        _ => return None,
+    };
+    match block_on(get_agent_last_mail_activity(cx, pool, agent_id, project_id)) {
+        Outcome::Ok(last_mail) if last_mail.is_none_or(|ts| now.saturating_sub(ts) > grace_us) => {
+            Some(StaleAgentObservation {
+                last_active_ts: agent.last_active_ts,
+                last_mail_activity_ts: last_mail,
+            })
+        }
+        Outcome::Ok(_) => None,
+        other => {
+            // Unavailable evidence is not a negative activity signal. Retry
+            // next cycle, including after cancellation or a DB worker panic.
+            warn!(
+                project_id,
+                agent_id,
+                outcome = ?other,
+                "cleanup: mail activity unavailable; preserving reservations"
+            );
+            None
+        }
     }
 }
 
@@ -1117,14 +1258,16 @@ fn collect_matching_paths(base: &Path, pattern: &str) -> Vec<std::path::PathBuf>
     }
 }
 
-/// Record cleanup releases to logs (best-effort).
+/// Publish terminal cleanup records under the generation that released them.
 fn write_cleanup_artifacts(
     config: &Config,
-    pool: &DbPool,
+    scope: &CleanupArchiveScope<'_>,
     cx: &Cx,
     project_id: i64,
     released_ids: &[i64],
 ) -> Result<(), String> {
+    scope.verify(cx)?;
+    let pool = scope.pool;
     let Outcome::Ok(project) =
         block_on(async { queries::get_project_by_id(cx, pool, project_id).await })
     else {
@@ -1149,11 +1292,21 @@ fn write_cleanup_artifacts(
     let mut res_jsons = Vec::new();
     for row in target_reservations {
         if let Some(id) = row.id {
+            if row.project_id != project_id {
+                return Err(format!(
+                    "cleanup artifact reservation {id} belongs to another project"
+                ));
+            }
             // We need the agent name, which isn't in FileReservationRow, so we look it up
             let agent_name = match block_on(async {
                 queries::get_agent_by_id_fresh(cx, pool, row.agent_id).await
             }) {
-                Outcome::Ok(agent) => agent.name,
+                Outcome::Ok(agent) if agent.project_id == project_id => agent.name,
+                Outcome::Ok(_) => {
+                    return Err(format!(
+                        "cleanup artifact owner for reservation {id} belongs to another project"
+                    ));
+                }
                 Outcome::Err(error) => {
                     return Err(format!(
                         "cleanup artifact agent lookup failed for reservation {id}: {error}"
@@ -1175,8 +1328,9 @@ fn write_cleanup_artifacts(
                 format!("cleanup artifact generation requires released_ts for reservation {id}")
             })?;
 
-            res_jsons.push(serde_json::json!({
+            let mut artifact = serde_json::json!({
                 "id": id,
+                "project": &project.human_key,
                 "agent": agent_name,
                 "path_pattern": row.path_pattern,
                 "exclusive": row.exclusive != 0,
@@ -1184,10 +1338,15 @@ fn write_cleanup_artifacts(
                 "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
                 "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
                 "released_ts": mcp_agent_mail_db::micros_to_iso(released_ts),
-            }));
+            });
+            if let Some(generation) = &scope.generation {
+                artifact["db_generation"] = serde_json::json!(generation);
+            }
+            res_jsons.push(artifact);
         }
     }
 
+    scope.verify(cx)?;
     if !res_jsons.is_empty() {
         let op = mcp_agent_mail_storage::WriteOp::FileReservation {
             project_slug: project.slug.clone(),
@@ -1915,6 +2074,74 @@ mod tests {
     }
 
     #[test]
+    fn stale_cleanup_revalidates_activity_after_real_filesystem_scan() {
+        for case in ["unchanged", "renewed", "heartbeat"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pool, cx, project_id, agent_id, reservation_id, _, _) =
+                seed_active_reservation(&tmp);
+            let config = stale_cleanup_test_config(&tmp);
+            let mut probe_cache = CleanupProbeCache::default();
+            let scan =
+                collect_stale_reservations(&config, &pool, &cx, project_id, &mut probe_cache)
+                    .expect("real stale filesystem/git scan");
+            assert_eq!(scan.candidates.len(), 1, "{case}");
+            assert_eq!(scan.candidates[0].reservation.id, Some(reservation_id));
+
+            // This is the exact production boundary between the completed
+            // external probe and the DB release transaction, without a timing
+            // race or a substitute query implementation in the test.
+            match case {
+                "renewed" => {
+                    let renewed = block_on(queries::renew_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_id,
+                        7200,
+                        None,
+                        Some(&[reservation_id]),
+                    ))
+                    .into_result()
+                    .expect("renew after classification");
+                    assert!(renewed[0].expires_ts > scan.candidates[0].reservation.expires_ts);
+                }
+                "heartbeat" => {
+                    assert!(
+                        block_on(queries::touch_agent(&cx, &pool, agent_id))
+                            .into_result()
+                            .expect("heartbeat after classification")
+                    );
+                }
+                _ => {}
+            }
+            let released = scan
+                .release(&cx, &pool, project_id)
+                .expect("guarded release");
+            if case == "unchanged" {
+                assert_eq!(released, vec![reservation_id]);
+            } else {
+                assert!(
+                    released.is_empty(),
+                    "{case}: no terminal artifact may be requested"
+                );
+                assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+                let conn = match block_on(pool.acquire(&cx)) {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("ledger connection: {error}"),
+                    Outcome::Cancelled(reason) => panic!("ledger cancelled: {reason:?}"),
+                    Outcome::Panicked(payload) => panic!("ledger panicked: {payload:?}"),
+                };
+                assert!(
+                    conn.query_sync("SELECT reservation_id FROM file_reservation_releases", &[])
+                        .expect("release ledger")
+                        .is_empty(),
+                    "{case}: no release marker"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn detect_and_release_stale_errors_when_workspace_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, _agent_id, reservation_id, human_key, _pattern) =
@@ -1952,6 +2179,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
+        let scope = CleanupArchiveScope::begin(&cx, &pool).unwrap();
 
         match fastmcp_core::block_on(async {
             queries::release_reservations_by_ids(&cx, &pool, &[reservation_id]).await
@@ -1967,7 +2195,7 @@ mod tests {
             .system
             .disk_pressure_level
             .set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
-        let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
+        let result = write_cleanup_artifacts(&config, &scope, &cx, project_id, &[reservation_id]);
         metrics.system.disk_pressure_level.set(previous_pressure);
 
         assert_eq!(
@@ -1981,6 +2209,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
+        let scope = CleanupArchiveScope::begin(&cx, &pool).unwrap();
 
         match fastmcp_core::block_on(async {
             queries::release_reservations_by_ids(&cx, &pool, &[reservation_id]).await
@@ -2003,7 +2232,7 @@ mod tests {
         drop(conn);
 
         let config = Config::from_env();
-        let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
+        let result = write_cleanup_artifacts(&config, &scope, &cx, project_id, &[reservation_id]);
         assert!(
             result
                 .expect_err("missing reservation lookup should fail cleanup artifact generation")
@@ -2016,14 +2245,218 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cx, project_id, _agent_id, reservation_id, _human_key, _pattern) =
             seed_active_reservation(&tmp);
+        let scope = CleanupArchiveScope::begin(&cx, &pool).unwrap();
 
         let config = Config::from_env();
-        let result = write_cleanup_artifacts(&config, &pool, &cx, project_id, &[reservation_id]);
+        let result = write_cleanup_artifacts(&config, &scope, &cx, project_id, &[reservation_id]);
         assert!(
             result
                 .expect_err("active reservation should not fabricate a release timestamp")
                 .contains("requires released_ts")
         );
+    }
+
+    fn cleanup_fixture_sql(pool: &DbPool, cx: &Cx, sql: &str) {
+        let conn = match block_on(pool.acquire(cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(error) => panic!("acquire cleanup fixture: {error}"),
+            Outcome::Cancelled(reason) => panic!("cleanup fixture cancelled: {reason:?}"),
+            Outcome::Panicked(panic) => panic!("cleanup fixture panicked: {}", panic.message()),
+        };
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        conn.execute_raw(sql).unwrap();
+        conn.execute_raw("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn cleanup_cycle_publishes_generation_bound_terminal_artifacts() {
+        // Isolate the real WBQ, disk-pressure metric, and guard identity from
+        // other tests. The child drives the production cleanup and guard APIs.
+        const CHILD: &str = "AM_TEST_CLEANUP_TERMINAL_ARCHIVE";
+        if std::env::var_os(CHILD).is_none() {
+            let current = std::thread::current();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", current.name().unwrap(), "--nocapture"])
+                .env(CHILD, "1")
+                .env("AGENT_NAME", "BlueLake")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        for identity in ["stamped", "unseeded", "legacy-table"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pool, cx, project_id, agent_id, reservation_id, human_key, pattern) =
+                seed_active_reservation(&tmp);
+            let generation = if identity == "stamped" {
+                match block_on(queries::db_generation_id(&cx, &pool)) {
+                    Outcome::Ok(Some(generation)) => Some(generation),
+                    other => panic!("seed cleanup fixture identity: {other:?}"),
+                }
+            } else {
+                if identity == "legacy-table" {
+                    cleanup_fixture_sql(
+                        &pool,
+                        &cx,
+                        "ALTER TABLE db_identity RENAME TO cleanup_saved_db_identity",
+                    );
+                }
+                assert_eq!(cleanup_archive_generation(&cx, &pool).unwrap(), None);
+                None
+            };
+            cleanup_fixture_sql(&pool, &cx, "UPDATE agents SET last_active_ts = 0");
+            let project = match block_on(queries::get_project_by_id(&cx, &pool, project_id)) {
+                Outcome::Ok(project) => project,
+                other => panic!("read cleanup project: {other:?}"),
+            };
+            let agent = match block_on(queries::get_agent_by_id_fresh(&cx, &pool, agent_id)) {
+                Outcome::Ok(agent) => agent,
+                other => panic!("read cleanup owner: {other:?}"),
+            };
+            let row = match block_on(queries::get_reservations_by_ids(
+                &cx,
+                &pool,
+                &[reservation_id],
+            )) {
+                Outcome::Ok(mut rows) if rows.len() == 1 => rows.remove(0),
+                other => panic!("read cleanup claim: {other:?}"),
+            };
+            // Fresh reads must win over a cached owner name and heartbeat.
+            let mut stale_owner = agent.clone();
+            stale_owner.name = "StaleCacheOwner".into();
+            stale_owner.last_active_ts = now_micros().saturating_add(3_600_000_000);
+            mcp_agent_mail_db::cache::read_cache()
+                .put_agent_scoped(&pool.sqlite_identity_key(), &stale_owner);
+
+            let mut config = stale_cleanup_test_config(&tmp);
+            config.file_reservations_retention_days = 0;
+            let archive = mcp_agent_mail_storage::ensure_archive(&config, &project.slug).unwrap();
+            let mut active = serde_json::json!({
+                "id": reservation_id,
+                "project": human_key,
+                "agent": agent.name,
+                "path_pattern": pattern,
+                "exclusive": row.exclusive != 0,
+                "reason": row.reason,
+                "created_ts": mcp_agent_mail_db::micros_to_iso(row.created_ts),
+                "expires_ts": mcp_agent_mail_db::micros_to_iso(row.expires_ts),
+            });
+            if let Some(generation) = &generation {
+                active["db_generation"] = serde_json::json!(generation);
+            }
+            mcp_agent_mail_storage::write_file_reservation_record(&archive, &config, &active)
+                .unwrap();
+            let paths = vec![pattern.clone()];
+            let conflicts = mcp_agent_mail_guard::guard_check(
+                &archive.root,
+                Path::new(&human_key),
+                &paths,
+                false,
+            )
+            .unwrap();
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|conflict| conflict.holder == "GreenLake")
+            );
+
+            assert_eq!(run_cleanup_cycle(&config, &pool).unwrap(), (1, 1));
+            assert_eq!(
+                mcp_agent_mail_storage::wbq_flush_status(),
+                mcp_agent_mail_storage::WbqFlushOutcome::Drained,
+            );
+            mcp_agent_mail_storage::flush_async_commits();
+            let stable = archive.root.join("file_reservations").join(
+                mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                    generation.as_deref(),
+                    reservation_id,
+                ),
+            );
+            let terminal = std::fs::read(&stable).expect("cleanup must publish the stable record");
+            let published: serde_json::Value = serde_json::from_slice(&terminal).unwrap();
+            assert_eq!(published["project"], human_key);
+            assert_eq!(published["agent"], "GreenLake");
+            assert_eq!(published["path_pattern"], pattern);
+            assert!(published["released_ts"].as_str().is_some());
+            assert_eq!(published["db_generation"].as_str(), generation.as_deref());
+            assert_eq!(cleanup_archive_generation(&cx, &pool).unwrap(), generation);
+            if generation.is_some() {
+                assert!(matches!(
+                    mcp_agent_mail_storage::write_file_reservation_record(
+                        &archive, &config, &active,
+                    ),
+                    Err(
+                        mcp_agent_mail_storage::StorageError::ReservationPublicationConflict { .. }
+                    )
+                ));
+                assert_eq!(std::fs::read(&stable).unwrap(), terminal);
+            }
+            assert!(
+                mcp_agent_mail_guard::guard_check(
+                    &archive.root,
+                    Path::new(&human_key),
+                    &paths,
+                    false,
+                )
+                .unwrap()
+                .is_empty(),
+                "cleanup release must unblock the guard ({identity})"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_artifacts_refuse_a_generation_changed_after_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, cx, project_id, _, reservation_id, _, _) = seed_active_reservation(&tmp);
+        assert!(matches!(
+            block_on(queries::db_generation_id(&cx, &pool)),
+            Outcome::Ok(Some(_))
+        ));
+        let scope = CleanupArchiveScope::begin(&cx, &pool).unwrap();
+        assert!(matches!(
+            block_on(queries::release_reservations_by_ids(
+                &cx,
+                &pool,
+                &[reservation_id]
+            )),
+            Outcome::Ok(1)
+        ));
+        cleanup_fixture_sql(
+            &pool,
+            &cx,
+            "UPDATE db_identity SET generation_id = '11223344' WHERE singleton = 0",
+        );
+        let config = stale_cleanup_test_config(&tmp);
+        let error = write_cleanup_artifacts(&config, &scope, &cx, project_id, &[reservation_id])
+            .expect_err("an old release must not be relabeled with the replacement generation");
+        assert!(error.contains("generation changed"), "{error}");
+        assert!(!config.storage_root.exists());
+    }
+
+    #[test]
+    fn cleanup_cycle_refuses_invalid_or_unreadable_generation_before_releasing() {
+        for sql in [
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, '')",
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, '../foreign')",
+            "ALTER TABLE db_identity RENAME COLUMN generation_id TO unreadable_generation",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (pool, cx, project_id, _, reservation_id, _, _) = seed_active_reservation(&tmp);
+            cleanup_fixture_sql(&pool, &cx, sql);
+            let config = stale_cleanup_test_config(&tmp);
+            let error = run_cleanup_cycle(&config, &pool)
+                .expect_err("unreadable generation is not permission for a legacy release");
+            assert!(error.contains("generation"), "{error}");
+            assert_reservation_unreleased(&pool, &cx, project_id, reservation_id);
+            assert!(!config.storage_root.exists());
+        }
     }
 
     fn stale_cleanup_test_config(tmp: &tempfile::TempDir) -> Config {

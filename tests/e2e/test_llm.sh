@@ -7,7 +7,8 @@
 # 3. Invalid LLM stub triggers fallback to non-LLM summary
 # 4. Multi-thread summarize with LLM stub returns aggregate digest
 #
-# All tests use MCP_AGENT_MAIL_LLM_STUB=1 for deterministic offline output.
+# All tests use MCP_AGENT_MAIL_LLM_STUB=1 for deterministic offline output; the
+# server honors it only with AM_TEST_MODE=1 (br-kp1in.21).
 
 set -euo pipefail
 
@@ -57,6 +58,7 @@ if ! e2e_start_server_with_logs "${DB_PATH}" "${STORAGE_ROOT}" "llm" \
     "HTTP_RATE_LIMIT_ENABLED=0" \
     "HTTP_JWT_ENABLED=0" \
     "MCP_AGENT_MAIL_LLM_STUB=1" \
+    "AM_TEST_MODE=1" \
     "LLM_ENABLED=1"; then
     e2e_fail "server failed to start"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
@@ -161,6 +163,9 @@ e2e_assert_contains "stub participant GreenCastle" "$summary_text" "GreenCastle"
 # Stub returns specific key_points
 e2e_assert_contains "stub key_point API migration" "$summary_text" "API migration"
 
+# br-kp1in.21: canned fixture text is marked as such (serialized only when true)
+e2e_assert_contains "stubbed summary carries llm_stub" "$summary_text" '"llm_stub"'
+
 # ---------------------------------------------------------------------------
 # Case 2: summarize_thread with llm_mode=false (heuristic only)
 # ---------------------------------------------------------------------------
@@ -179,6 +184,8 @@ heuristic_text="$(extract_text "$heuristic_result")"
 # Heuristic mode should still have structure
 e2e_assert_contains "heuristic has thread_id" "$heuristic_text" "thread_id"
 e2e_assert_contains "heuristic has summary" "$heuristic_text" "summary"
+e2e_assert_not_contains "heuristic summary has no llm_stub" "$heuristic_text" "llm_stub"
+e2e_assert_not_contains "heuristic summary has no fixture text" "$heuristic_text" "API migration planned"
 
 e2e_save_artifact "case2_heuristic_text.json" "$heuristic_text"
 
@@ -224,6 +231,7 @@ prepare_text="$(extract_text "$prepare_result")"
 
 # macro_prepare_thread should return a summary with thread info
 e2e_assert_contains "prepare has summary" "$prepare_text" "summary"
+e2e_assert_contains "stubbed prepare_thread carries llm_stub" "$prepare_text" '"llm_stub"'
 
 e2e_save_artifact "case4_prepare_text.json" "$prepare_text"
 

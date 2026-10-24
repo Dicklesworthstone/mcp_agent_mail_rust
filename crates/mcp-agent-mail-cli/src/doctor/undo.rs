@@ -471,6 +471,12 @@ struct StoredAction {
     /// post-fix, undo refuses to clobber their changes.
     #[serde(default)]
     after_hash: String,
+    /// Planned atomic replacement, not evidence that publication happened.
+    /// Older pending records lack this witness and cannot authorize restore.
+    #[serde(default)]
+    expected_after_hash: Option<String>,
+    #[serde(default)]
+    expected_after_mode: Option<u32>,
     /// Pass-4 fix: when the same file is mutated multiple times in one run,
     /// each mutation gets its own backup at `backups/seq_<started_at_ns>/<rel>`.
     /// Undo uses this to find the correct per-mutation backup.
@@ -487,6 +493,109 @@ struct StoredAction {
     before_mode: Option<u32>,
     #[serde(default)]
     ok: bool,
+}
+
+/// Compare the permissions actually representable on this platform. Unix
+/// records may include file-type bits; Windows maps the owner-write bit to
+/// the read-only attribute in the mutation chokepoint.
+fn mode_matches(metadata: &fs::Metadata, mode: u32) -> bool {
+    #[cfg(unix)]
+    {
+        platform::permission_mode(metadata) == mode & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.permissions().readonly() == (mode & 0o200 == 0)
+    }
+}
+
+/// Read the hash and mode from the same held regular-file handle.
+fn regular_file_state(path: &Path) -> std::io::Result<(String, fs::Metadata)> {
+    let mut file = platform::open_regular_file_no_follow(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 65_536];
+    loop {
+        let len = file.read(&mut buffer)?;
+        if len == 0 {
+            break;
+        }
+        hasher.update(&buffer[..len]);
+    }
+    Ok((
+        format!("sha256:{}", hex::encode(hasher.finalize())),
+        file.metadata()?,
+    ))
+}
+
+/// A pending line is intent, not evidence of publication. Return None for
+/// an unchanged pre-state, or the verified planned hash for normal undo.
+/// Unknown or changed post-states must never authorize replacing a file.
+fn pending_write_after_hash(
+    action: &StoredAction,
+    target_file: &Path,
+    backup_file: &Path,
+) -> std::io::Result<Option<String>> {
+    if action.op != "WriteFile" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "pending {} for {} has no verifiable replacement; live target unchanged",
+                action.op, action.path,
+            ),
+        ));
+    }
+    let backup_present = match fs::symlink_metadata(backup_file) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let existed_before =
+        action.before_mode.is_some() || action.before_hash != EMPTY_FILE_SHA256 || backup_present;
+    let (current_hash, metadata) = match regular_file_state(target_file) {
+        Ok(state) => state,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !existed_before => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if existed_before
+        && current_hash == action.before_hash
+        && action
+            .before_mode
+            .is_none_or(|mode| mode_matches(&metadata, mode))
+    {
+        return Ok(None);
+    }
+    let (Some(expected_hash), Some(expected_mode)) =
+        (&action.expected_after_hash, action.expected_after_mode)
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "pending WriteFile for {} lacks a planned replacement witness; live target unchanged",
+                action.path,
+            ),
+        ));
+    };
+    if current_hash != *expected_hash || !mode_matches(&metadata, expected_mode) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "pending target {} no longer matches the original or planned replacement; refusing to clobber user changes",
+                action.path,
+            ),
+        ));
+    }
+    if existed_before && !backup_present {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "pending backup missing for {}; live target unchanged",
+                action.path
+            ),
+        ));
+    }
+    Ok(Some(expected_hash.clone()))
 }
 
 fn per_mutation_backup_dir(backups_dir: &Path, started_at_ns: u128) -> PathBuf {
@@ -794,188 +903,9 @@ pub fn run_undo_with_scopes(
     // Process in reverse raw mutation order (most recent mutation first).
     actions.reverse();
 
-    for action in actions {
-        // Detect crash-window: phase=pending without subsequent completed.
-        if action.phase.as_deref() == Some("pending") {
-            // Mutation crashed mid-flight. Backup exists at
-            // `backups/seq_<started_at_ns>/<rel>`. Restore from it.
-            // We do NOT validate after_hash because the mutation may not
-            // have completed (or may have completed after the pending log
-            // but before the completed log was flushed).
-            let target_file = logged_target_path(target, &action.path)?;
-            // Round-6 Gemini F1 (P0): scope check.
-            if let Err(e) = enforce_scope(write_scopes, &target_file) {
-                if strict {
-                    return Err(e);
-                }
-                summary.failures.push(format!("{e}"));
-                continue;
-            }
-            let backup_file = action_backup_file(&backups_dir, &action)?;
-            if dry_run {
-                if backup_file.exists()
-                    && let Err(e) = verify_backup_file(&backup_file, &action.before_hash)
-                {
-                    if strict {
-                        return Err(e);
-                    }
-                    summary.failures.push(e.to_string());
-                    continue;
-                }
-                eprintln!(
-                    "[dry-run] crash-window recovery: would restore {} from backup",
-                    target_file.display()
-                );
-                continue;
-            }
-            // Round-10: per-path lock acquisition. The chokepoint
-            // takes `.<basename>.doctor-lock` exclusive for every
-            // mutation; undo must match so concurrent fix+undo
-            // can't tear the file between hash/write.
-            let _crash_target_lock: Option<std::fs::File> = match acquire_target_lock(&target_file)
-            {
-                Ok(g) => g,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if strict {
-                        return Err(e);
-                    }
-                    summary.failures.push(format!(
-                        "crash-window restore: {} held by concurrent fix; skipping",
-                        target_file.display()
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    if strict {
-                        return Err(e);
-                    }
-                    summary.failures.push(format!(
-                        "could not acquire crash-window lock on {}: {}",
-                        target_file.display(),
-                        e,
-                    ));
-                    continue;
-                }
-            };
-            if backup_file.exists() {
-                // Round-8 Gemini F1 (P2): DbExec/DbMigrate
-                // crash-window parent-dir recreation must use
-                // the tight 0o700 mode, matching the completed-
-                // branch behavior (round-5 Gemini F6). Other ops
-                // keep `fs::create_dir_all` (default umask).
-                let is_db_op = matches!(action.op.as_str(), "DbExec" | "DbMigrate");
-                if let Some(parent) = target_file.parent() {
-                    if is_db_op {
-                        ensure_parent_dir_strict(parent)?;
-                    } else {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
-                // Round-7 Gemini F5 (P2): DbExec/DbMigrate crash-
-                // window restore routes through the streaming
-                // `atomic_restore_db` to avoid materializing
-                // multi-GB SQLite DBs into memory. Other ops keep
-                // the in-memory atomic_write_file path because
-                // their backups are bounded by config/source-file
-                // size. before_hash is empty for crash-window
-                // records (post-state may not match anything), so
-                // we skip the post-rename re-check by passing
-                // None.
-                //
-                // Round-8 Gemini F4 (P3): DbExec/DbMigrate
-                // default mode tightens to 0o600 (sensitive DB
-                // storage), matching the completed branch. Other
-                // ops keep 0o644.
-                let restore_mode = if is_db_op {
-                    action.before_mode.unwrap_or(0o600)
-                } else {
-                    action.before_mode.unwrap_or(0o644)
-                };
-                let restore_result = if is_db_op {
-                    atomic_restore_db(
-                        &backup_file,
-                        &target_file,
-                        &action.before_hash,
-                        None,
-                        restore_mode,
-                    )
-                } else {
-                    // Round-8 Gemini F3 (P2): post-restore
-                    // hash verification was missing for non-DB
-                    // crash-window restores. Mirror the
-                    // completed-branch Codex-C2 defense.
-                    match read_verified_backup(&backup_file, &action.before_hash) {
-                        Ok(bytes) => {
-                            let write_res = super::mutate::atomic_write_file(
-                                &target_file,
-                                &bytes,
-                                restore_mode,
-                            );
-                            if write_res.is_err() {
-                                write_res
-                            // Round-9 (Gemini F2 P3 clarification):
-                            // `.is_empty()` only matches the
-                            // literal empty string `""` from
-                            // legacy / partial-flush actions.jsonl.
-                            // The 0-byte file case uses the
-                            // 71-char `EMPTY_FILE_SHA256` sentinel,
-                            // so `.is_empty()` is `false` and the
-                            // hash check correctly fires.
-                            } else if !action.before_hash.is_empty() {
-                                match read_regular_file_no_follow(&target_file) {
-                                    Ok(restored) => {
-                                        let restored_hash = sha256_hex(&restored);
-                                        if restored_hash != action.before_hash {
-                                            Err(std::io::Error::other(format!(
-                                                "crash-window post-restore hash mismatch: expected {}, got {}",
-                                                action.before_hash, restored_hash,
-                                            )))
-                                        } else {
-                                            Ok(())
-                                        }
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                };
-                match restore_result {
-                    Ok(()) => summary.actions_replayed += 1,
-                    Err(e) => {
-                        if strict {
-                            return Err(e);
-                        }
-                        summary.failures.push(format!(
-                            "crash-window restore failed for {}: {e}",
-                            action.path,
-                        ));
-                    }
-                }
-            } else if action.before_hash == EMPTY_FILE_SHA256 {
-                // File didn't exist before mutation. If it now exists,
-                // mutation probably succeeded — quarantine the post-state.
-                if target_file.exists() {
-                    let quarantine =
-                        run_artifact_path(&run_dir, "quarantine_crash_window", &action.path)?;
-                    if let Some(parent) = quarantine.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let _ = fs::rename(&target_file, &quarantine);
-                }
-            } else {
-                summary
-                    .failures
-                    .push(format!("crash-window: backup missing for {}", action.path));
-            }
-            continue;
-        }
-
-        // Normal completed-line processing follows.
-        if !action.ok {
+    for mut action in actions {
+        let pending = action.phase.as_deref() == Some("pending");
+        if !pending && !action.ok {
             // The mutation failed; mutate() already attempted rollback. Skip.
             summary.actions_skipped += 1;
             continue;
@@ -1035,12 +965,35 @@ pub fn run_undo_with_scopes(
         // old flat layout `backups/<rel>`.
         let backup_file = action_backup_file(&backups_dir, &action)?;
 
+        if pending {
+            match pending_write_after_hash(&action, &target_file, &backup_file) {
+                Ok(None) => {
+                    summary.actions_skipped += 1;
+                    continue;
+                }
+                Ok(Some(after_hash)) => action.after_hash = after_hash,
+                Err(error) => {
+                    if strict {
+                        return Err(error);
+                    }
+                    summary.failures.push(format!(
+                        "pending recovery refused for {}: {error}",
+                        action.path,
+                    ));
+                    continue;
+                }
+            }
+        }
+
         match action.op.as_str() {
             "WriteFile" | "AppendFile" | "Chmod" => {
                 if !backup_file.exists() {
-                    if action.before_hash == EMPTY_FILE_SHA256 {
-                        // before_hash of empty file: target didn't exist before
-                        // the mutation. Undo by quarantining the new file.
+                    if action.before_hash == EMPTY_FILE_SHA256 && action.before_mode.is_none() {
+                        // An absent target and an existing empty file share
+                        // the empty-content hash. Only the absent target has
+                        // no recorded mode; a lost backup must never turn an
+                        // existing empty file into a newly created file.
+                        // Undo a genuinely new file by quarantining it.
                         //
                         // C3 fix: BEFORE quarantining, verify the live file
                         // still matches `after_hash`. If not, the user (or
@@ -1946,6 +1899,8 @@ mod tests {
             "phase": phase,
             "before_hash": sha256_hex(before),
             "after_hash": if phase == "pending" { String::new() } else { sha256_hex(after) },
+            "expected_after_hash": if phase == "pending" { Some(sha256_hex(after)) } else { None },
+            "expected_after_mode": if phase == "pending" { Some(0o600) } else { None },
             "before_mode": 0o600,
             "ok": phase == "completed",
         });
@@ -2006,7 +1961,7 @@ mod tests {
                 let td = TempDir::new().unwrap();
                 let (target, _) =
                     backup_check_fixture(&td, "WriteFile", "pending", b"before", b"after");
-                fs::write(&target, b"after").unwrap();
+                super::super::mutate::atomic_write_file(&target, b"after", 0o600).unwrap();
                 let result = test_undo(td.path(), BACKUP_CHECK_RUN, dry_run, strict);
                 assert_backup_check_refusal(&td, result, strict, dry_run);
                 assert_eq!(fs::read(&target).unwrap(), b"after");
@@ -2499,6 +2454,132 @@ mod tests {
     }
 
     #[test]
+    fn completed_empty_original_missing_backup_never_quarantines() {
+        for op_name in ["WriteFile", "AppendFile", "Chmod"] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let target = td.path().join("original-empty.txt");
+                    super::super::mutate::atomic_write_file(&target, b"", 0o640).unwrap();
+                    let run_id = "2026-10-23T00-00-01Z__completed-empty-missing-backup";
+                    let ctx = make_ctx(&td, run_id);
+                    let op = match op_name {
+                        "WriteFile" => Op::WriteFile {
+                            content: b"doctor replacement\n".to_vec(),
+                            mode: 0o600,
+                        },
+                        "AppendFile" => Op::AppendFile {
+                            content: b"doctor appended\n".to_vec(),
+                        },
+                        "Chmod" => Op::Chmod { mode: 0o600 },
+                        _ => unreachable!(),
+                    };
+                    mutate(&ctx, &target, op).unwrap();
+                    let run_dir = ctx.run_dir.clone();
+                    drop(ctx);
+                    let actions = fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
+                    let action: StoredAction =
+                        serde_json::from_str(actions.lines().last().unwrap()).unwrap();
+                    assert_eq!(action.phase.as_deref(), Some("completed"));
+                    assert!(action.ok);
+                    assert_eq!(action.before_hash, EMPTY_FILE_SHA256);
+                    assert!(action.before_mode.is_some());
+                    let backup = action_backup_file(&run_dir.join("backups"), &action).unwrap();
+                    let retained_backup = backup.with_extension("retained");
+                    fs::rename(&backup, &retained_backup).unwrap();
+                    let after_bytes = fs::read(&target).unwrap();
+                    let after_mode = platform::permission_mode(&fs::metadata(&target).unwrap());
+
+                    let result = test_undo(td.path(), run_id, dry_run, strict);
+                    if strict {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        assert!(error.to_string().contains("backup missing"));
+                    } else {
+                        let summary = result.unwrap();
+                        assert_eq!(summary.actions_replayed, 0);
+                        assert_eq!(summary.actions_skipped, 0);
+                        assert_eq!(summary.failures.len(), 1);
+                        assert!(summary.failures[0].contains("backup missing"));
+                    }
+                    assert_eq!(fs::read(&target).unwrap(), after_bytes, "{op_name}");
+                    assert_eq!(
+                        platform::permission_mode(&fs::metadata(&target).unwrap()),
+                        after_mode,
+                        "{op_name}"
+                    );
+                    assert!(fs::read(&retained_backup).unwrap().is_empty());
+                    assert!(!run_dir.join("quarantine_undo").exists());
+                    assert!(!undo_complete(td.path(), run_id));
+                    if dry_run {
+                        assert!(!run_dir.join("undo.lock").exists());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_new_empty_file_still_quarantines() {
+        for op_name in ["WriteFile", "AppendFile"] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let target = td.path().join("created-empty.txt");
+                    let run_id = "2026-10-23T00-00-02Z__completed-new-empty";
+                    let ctx = make_ctx(&td, run_id);
+                    let op = match op_name {
+                        "WriteFile" => Op::WriteFile {
+                            content: Vec::new(),
+                            mode: 0o600,
+                        },
+                        "AppendFile" => Op::AppendFile {
+                            content: Vec::new(),
+                        },
+                        _ => unreachable!(),
+                    };
+                    mutate(&ctx, &target, op).unwrap();
+                    let run_dir = ctx.run_dir.clone();
+                    drop(ctx);
+                    let actions = fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
+                    let action: StoredAction =
+                        serde_json::from_str(actions.lines().last().unwrap()).unwrap();
+                    assert_eq!(action.phase.as_deref(), Some("completed"));
+                    assert!(action.ok);
+                    assert_eq!(action.before_hash, EMPTY_FILE_SHA256);
+                    assert!(action.before_mode.is_none());
+                    assert!(fs::read(&target).unwrap().is_empty());
+                    assert!(
+                        !action_backup_file(&run_dir.join("backups"), &action)
+                            .unwrap()
+                            .exists()
+                    );
+                    let after_mode = platform::permission_mode(&fs::metadata(&target).unwrap());
+
+                    let summary = test_undo(td.path(), run_id, dry_run, strict).unwrap();
+                    assert_eq!(summary.actions_replayed, 1, "{op_name}");
+                    assert_eq!(summary.actions_skipped, 0);
+                    assert!(summary.failures.is_empty());
+                    let quarantine = run_dir.join("quarantine_undo").join("created-empty.txt");
+                    let retained = if dry_run {
+                        assert!(!quarantine.exists());
+                        &target
+                    } else {
+                        assert!(!target.exists());
+                        &quarantine
+                    };
+                    assert!(fs::read(retained).unwrap().is_empty());
+                    assert_eq!(
+                        platform::permission_mode(&fs::metadata(retained).unwrap()),
+                        after_mode
+                    );
+                    assert_eq!(undo_complete(td.path(), run_id), !dry_run);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn undo_codex_c1_refuses_user_modified_post_fix_writefile() {
         // Codex round-2 C1: in the WriteFile branch (non-empty backup),
         // undo verifies after_hash before clobbering user edits.
@@ -2775,115 +2856,246 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pass5_g_crash_window_recovery() {
-        // Pass-5 G-Crash-Window: simulate a crash mid-mutation by writing
-        // ONLY the pending line (no completed line). Run undo: must
-        // recognize the crash-window and restore from backup.
-        let td = TempDir::new().unwrap();
-        let target = td.path().join("crash.txt");
-        std::fs::write(&target, b"original\n").unwrap();
-        let run_id = "2026-05-10T07-00-00Z__crashwindow";
-        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+    const PENDING_WRITE_RUN: &str = "2026-10-23T00-00-00Z__pending-write";
 
-        // Manually write the backup (as if mutate's step 5 had completed).
-        let started_at_ns: u128 = 12_345_000_000;
-        let backup_dir = run_dir
-            .join("backups")
-            .join(format!("seq_{:026}", started_at_ns));
-        fs::create_dir_all(&backup_dir).unwrap();
-        std::fs::write(backup_dir.join("crash.txt"), b"original\n").unwrap();
+    fn retain_pending_action(run_dir: &Path) -> serde_json::Value {
+        let actions = fs::read_to_string(run_dir.join("actions.jsonl")).unwrap();
+        let lines: Vec<_> = actions.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let pending: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(pending["phase"], "pending");
+        assert_eq!(pending["ok"], false);
+        assert_eq!(pending["after_hash"], "");
+        // Simulate publication followed by a crash before completion fsync.
+        fs::write(run_dir.join("actions.jsonl"), format!("{}\n", lines[0])).unwrap();
+        pending
+    }
 
-        // Manually write a "pending" actions.jsonl line (as if mutate had
-        // recorded its intent before crashing).
-        let pending = serde_json::json!({
-            "path": "crash.txt",
-            "op": "WriteFile",
-            "before_hash": sha256_hex(b"original\n"),
-            "after_hash": "",
-            "started_at_ns": started_at_ns,
-            "finished_at_ns": 0,
-            "run_id": run_id,
-            "fixer_id": "test-fixer",
-            "ok": false,
-            "phase": "pending",
-            "before_mode": 0o644,
-        });
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(run_dir.join("actions.jsonl"))
-            .unwrap();
-        f.write_all(serde_json::to_string(&pending).unwrap().as_bytes())
-            .unwrap();
-        f.write_all(b"\n").unwrap();
-        drop(f);
+    fn pending_write_fixture(
+        td: &TempDir,
+        before: Option<&[u8]>,
+        after: &[u8],
+    ) -> (PathBuf, PathBuf) {
+        let target = td.path().join("pending.txt");
+        if let Some(bytes) = before {
+            super::super::mutate::atomic_write_file(&target, bytes, 0o644).unwrap();
+        }
+        let ctx = make_ctx(td, PENDING_WRITE_RUN);
+        mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: after.to_vec(),
+                mode: 0o600,
+            },
+        )
+        .unwrap();
+        let run_dir = ctx.run_dir.clone();
+        drop(ctx);
+        let pending = retain_pending_action(&run_dir);
+        assert_eq!(pending["expected_after_hash"], sha256_hex(after));
+        assert_eq!(pending["expected_after_mode"], 0o600);
+        (target, run_dir)
+    }
 
-        // Simulate the post-crash state: file was mutated but completion
-        // never logged.
-        std::fs::write(&target, b"halfway through mutation\n").unwrap();
-
-        // Run undo. It should detect the crash-window and restore.
-        let summary = test_undo(td.path(), run_id, false, true).unwrap();
-        assert_eq!(
-            summary.actions_replayed, 1,
-            "crash-window recovery should count as 1 replay"
-        );
-        // File restored byte-identical to original.
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "original\n",
-            "crash-window restore must produce byte-identical original"
-        );
+    fn assert_pending_refused(
+        td: &TempDir,
+        result: std::io::Result<UndoSummary>,
+        strict: bool,
+        dry_run: bool,
+    ) {
+        if strict {
+            assert!(result.is_err());
+        } else {
+            let summary = result.unwrap();
+            assert_eq!(summary.actions_replayed, 0);
+            assert_eq!(summary.actions_skipped, 0);
+            assert_eq!(summary.failures.len(), 1);
+        }
+        assert!(!undo_complete(td.path(), PENDING_WRITE_RUN));
+        if dry_run {
+            let run_dir = doctor_root(td.path()).join("runs").join(PENDING_WRITE_RUN);
+            assert!(!run_dir.join("undo.lock").exists());
+        }
     }
 
     #[test]
-    fn pass5_g_crash_window_dry_run_does_not_restore() {
-        // Same setup as above, but dry_run=true. Must NOT restore.
+    fn pending_write_restores_only_verified_publication() {
+        for before in [b"original\n".as_slice(), b"".as_slice()] {
+            for dry_run in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, _) = pending_write_fixture(&td, Some(before), b"doctor replacement\n");
+                let summary = test_undo(td.path(), PENDING_WRITE_RUN, dry_run, true).unwrap();
+                assert_eq!(summary.actions_replayed, 1);
+                assert!(summary.failures.is_empty());
+                if dry_run {
+                    assert_eq!(fs::read(&target).unwrap(), b"doctor replacement\n");
+                    assert!(!undo_complete(td.path(), PENDING_WRITE_RUN));
+                } else {
+                    assert_eq!(fs::read(&target).unwrap(), before);
+                    assert!(mode_matches(&fs::metadata(&target).unwrap(), 0o644));
+                    let repeated = test_undo(td.path(), PENDING_WRITE_RUN, false, true).unwrap();
+                    assert_eq!(repeated.actions_replayed, 0);
+                    assert_eq!(repeated.actions_skipped, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_write_unpublished_is_noop() {
+        for before in [Some(b"original\n".as_slice()), Some(b"".as_slice()), None] {
+            for dry_run in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, _) = pending_write_fixture(&td, before, b"doctor replacement\n");
+                if let Some(bytes) = before {
+                    super::super::mutate::atomic_write_file(&target, bytes, 0o644).unwrap();
+                } else {
+                    fs::rename(&target, td.path().join("retained-publication")).unwrap();
+                }
+                let summary = test_undo(td.path(), PENDING_WRITE_RUN, dry_run, true).unwrap();
+                assert_eq!(summary.actions_replayed, 0);
+                assert_eq!(summary.actions_skipped, 1);
+                assert!(summary.failures.is_empty());
+                if let Some(bytes) = before {
+                    assert_eq!(fs::read(&target).unwrap(), bytes);
+                } else {
+                    assert!(!target.exists());
+                }
+                assert_eq!(undo_complete(td.path(), PENDING_WRITE_RUN), !dry_run);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_write_preserves_post_crash_edits() {
+        for before in [Some(b"original\n".as_slice()), None] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let (target, run_dir) =
+                        pending_write_fixture(&td, before, b"doctor replacement\n");
+                    super::super::mutate::atomic_write_file(&target, b"later user edit\n", 0o600)
+                        .unwrap();
+                    let result = test_undo(td.path(), PENDING_WRITE_RUN, dry_run, strict);
+                    assert_pending_refused(&td, result, strict, dry_run);
+                    assert_eq!(fs::read(&target).unwrap(), b"later user edit\n");
+                    assert!(!run_dir.join("quarantine_undo").exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_write_preserves_mode_only_changes() {
+        for strict in [false, true] {
+            for dry_run in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, _) =
+                    pending_write_fixture(&td, Some(b"original\n"), b"doctor replacement\n");
+                let file = platform::open_regular_file_no_follow(&target).unwrap();
+                platform::set_permission_mode(&file, 0o640).unwrap();
+                drop(file);
+                let result = test_undo(td.path(), PENDING_WRITE_RUN, dry_run, strict);
+                assert_pending_refused(&td, result, strict, dry_run);
+                assert_eq!(fs::read(&target).unwrap(), b"doctor replacement\n");
+                assert!(mode_matches(&fs::metadata(&target).unwrap(), 0o640));
+            }
+        }
+    }
+
+    #[test]
+    fn pending_write_created_file_quarantines_verified_publication() {
+        for after in [b"doctor replacement\n".as_slice(), b"".as_slice()] {
+            for dry_run in [false, true] {
+                let td = TempDir::new().unwrap();
+                let (target, run_dir) = pending_write_fixture(&td, None, after);
+                let summary = test_undo(td.path(), PENDING_WRITE_RUN, dry_run, true).unwrap();
+                assert_eq!(summary.actions_replayed, 1);
+                assert!(summary.failures.is_empty());
+                let quarantine = run_dir.join("quarantine_undo").join("pending.txt");
+                if dry_run {
+                    assert_eq!(fs::read(&target).unwrap(), after);
+                    assert!(!quarantine.exists());
+                } else {
+                    assert!(!target.exists());
+                    assert_eq!(fs::read(quarantine).unwrap(), after);
+                    let repeated = test_undo(td.path(), PENDING_WRITE_RUN, false, true).unwrap();
+                    assert_eq!(repeated.actions_skipped, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_write_legacy_log_never_authorizes_unverified_restore() {
+        for unchanged in [false, true] {
+            for strict in [false, true] {
+                for dry_run in [false, true] {
+                    let td = TempDir::new().unwrap();
+                    let (target, run_dir) =
+                        pending_write_fixture(&td, Some(b"original\n"), b"doctor replacement\n");
+                    let action_path = run_dir.join("actions.jsonl");
+                    let mut pending: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&action_path).unwrap()).unwrap();
+                    let object = pending.as_object_mut().unwrap();
+                    object.remove("expected_after_hash");
+                    object.remove("expected_after_mode");
+                    fs::write(action_path, format!("{pending}\n")).unwrap();
+                    if unchanged {
+                        super::super::mutate::atomic_write_file(&target, b"original\n", 0o644)
+                            .unwrap();
+                    }
+                    let result = test_undo(td.path(), PENDING_WRITE_RUN, dry_run, strict);
+                    if unchanged {
+                        let summary = result.unwrap();
+                        assert_eq!(summary.actions_replayed, 0);
+                        assert_eq!(summary.actions_skipped, 1);
+                        assert_eq!(fs::read(&target).unwrap(), b"original\n");
+                    } else {
+                        assert_pending_refused(&td, result, strict, dry_run);
+                        assert_eq!(fs::read(&target).unwrap(), b"doctor replacement\n");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_write_missing_empty_original_backup_refuses_quarantine() {
         let td = TempDir::new().unwrap();
-        let target = td.path().join("crash.txt");
-        std::fs::write(&target, b"original\n").unwrap();
-        let run_id = "2026-05-10T07-00-00Z__crashdryrun";
-        let run_dir = scaffold_run_dir(td.path(), run_id).unwrap();
+        let (target, run_dir) = pending_write_fixture(&td, Some(b""), b"doctor replacement\n");
+        let action: StoredAction =
+            serde_json::from_slice(&fs::read(run_dir.join("actions.jsonl")).unwrap()).unwrap();
+        let backup = action_backup_file(&run_dir.join("backups"), &action).unwrap();
+        fs::rename(&backup, backup.with_extension("retained")).unwrap();
+        let result = test_undo(td.path(), PENDING_WRITE_RUN, false, true);
+        assert_pending_refused(&td, result, true, false);
+        assert_eq!(fs::read(&target).unwrap(), b"doctor replacement\n");
+        assert!(!run_dir.join("quarantine_undo").exists());
+    }
 
-        let started_at_ns: u128 = 99_999_000_000;
-        let backup_dir = run_dir
-            .join("backups")
-            .join(format!("seq_{:026}", started_at_ns));
-        fs::create_dir_all(&backup_dir).unwrap();
-        std::fs::write(backup_dir.join("crash.txt"), b"original\n").unwrap();
-
-        let pending = serde_json::json!({
-            "path": "crash.txt",
-            "op": "WriteFile",
-            "before_hash": sha256_hex(b"original\n"),
-            "after_hash": "",
-            "started_at_ns": started_at_ns,
-            "finished_at_ns": 0,
-            "run_id": run_id,
-            "fixer_id": "test-fixer",
-            "ok": false,
-            "phase": "pending",
-        });
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(run_dir.join("actions.jsonl"))
-            .unwrap();
-        f.write_all(serde_json::to_string(&pending).unwrap().as_bytes())
-            .unwrap();
-        f.write_all(b"\n").unwrap();
-        drop(f);
-
-        std::fs::write(&target, b"halfway through mutation\n").unwrap();
-
-        let _ = test_undo(td.path(), run_id, true, true).unwrap();
-        // Dry-run must not write.
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "halfway through mutation\n",
-            "dry-run must not restore"
-        );
+    #[test]
+    fn pending_append_without_result_witness_preserves_live_file() {
+        let td = TempDir::new().unwrap();
+        let target = td.path().join("pending.txt");
+        fs::write(&target, b"original\n").unwrap();
+        let ctx = make_ctx(&td, PENDING_WRITE_RUN);
+        mutate(
+            &ctx,
+            &target,
+            Op::AppendFile {
+                content: b"appended\n".to_vec(),
+            },
+        )
+        .unwrap();
+        let run_dir = ctx.run_dir.clone();
+        drop(ctx);
+        retain_pending_action(&run_dir);
+        let result = test_undo(td.path(), PENDING_WRITE_RUN, false, true);
+        assert_pending_refused(&td, result, true, false);
+        assert_eq!(fs::read(&target).unwrap(), b"original\nappended\n");
     }
 
     #[test]

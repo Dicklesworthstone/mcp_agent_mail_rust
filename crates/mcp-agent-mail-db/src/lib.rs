@@ -56,7 +56,13 @@ pub mod mail_explorer;
 pub mod mailbox_verdict;
 pub mod migrate;
 pub mod models;
+pub mod never_written_pages;
+#[path = "pool_registry.rs"]
 pub mod pool;
+#[path = "pool.rs"]
+mod pool_impl;
+pub mod product_inbox;
+pub mod project_mailbox;
 pub mod queries;
 pub mod query_assistance;
 pub mod query_plan_diagnostics;
@@ -181,6 +187,13 @@ pub mod search_v3 {
     ) -> Result<(usize, usize), String> {
         Ok((0, 0))
     }
+
+    /// Tantivy is disabled, so no other process can hold an index writer
+    /// this one contends for (br-kp1in.18).
+    #[must_use]
+    pub fn is_writer_held_elsewhere(_error: &str) -> bool {
+        false
+    }
 }
 
 // Semantic/hybrid search modules (feature-gated)
@@ -202,6 +215,7 @@ pub mod search_two_tier;
 pub mod search_vector_index;
 pub mod timestamps;
 pub mod tracking;
+pub mod unacked_inbox;
 
 pub use atc_queries::{
     CompactSummary, ExperienceStream, ExpiredExperienceCandidate, OpenExperienceFilter,
@@ -300,6 +314,7 @@ pub use pool::{
     ensure_sqlite_file_healthy_with_archive,
     evaluate_write_route,
     get_cached_pool,
+    get_or_create_live_query_only_pool,
     get_or_create_pool,
     inspect_mailbox_db_inventory,
     inspect_mailbox_recovery_lock,

@@ -5,6 +5,8 @@
 //! definitions from [`mcp_agent_mail_db::mail_explorer`] for consistency
 //! with the MCP tool surface.
 
+mod deliveries;
+
 use asupersync::Outcome;
 use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
 use ftui::text::{Line, Text};
@@ -12,7 +14,7 @@ use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Event, Frame, KeyCode, KeyEventKind, Modifiers, Style};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, Style};
 use ftui_runtime::program::Cmd;
 use ftui_widgets::StatefulWidget;
 use ftui_widgets::input::TextInput;
@@ -163,6 +165,17 @@ const fn group_label(g: GroupMode) -> &'static str {
         GroupMode::Project => "Project",
         GroupMode::Thread => "Thread",
         GroupMode::Agent => "Agent",
+    }
+}
+
+/// SQL predicates over `messages m` joined to effective delivery rows `r`.
+/// Shared by the inbound and outbound queries, including shared receipts.
+const fn recipient_state_predicates(filter: AckFilter) -> &'static [&'static str] {
+    match filter {
+        AckFilter::PendingAck => &["m.ack_required = 1", "r.ack_ts IS NULL"],
+        AckFilter::Acknowledged => &["m.ack_required = 1", "r.ack_ts IS NOT NULL"],
+        AckFilter::Unread => &["r.read_ts IS NULL"],
+        AckFilter::All => &[],
     }
 }
 
@@ -644,6 +657,7 @@ impl MailExplorerScreen {
 
         // Truncate
         all_entries.truncate(MAX_ENTRIES);
+        group_entries(&mut all_entries, self.group_mode);
         self.entries = all_entries;
 
         let rendered_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
@@ -938,20 +952,17 @@ impl MailExplorerScreen {
         }
 
         // Ack filter
-        match self.ack_filter {
-            AckFilter::PendingAck => {
-                conditions.push("m.ack_required = 1".to_string());
-                conditions.push("r.ack_ts IS NULL".to_string());
-            }
-            AckFilter::Acknowledged => {
-                conditions.push("m.ack_required = 1".to_string());
-                conditions.push("r.ack_ts IS NOT NULL".to_string());
-            }
-            AckFilter::Unread => {
-                conditions.push("r.read_ts IS NULL".to_string());
-            }
-            AckFilter::All => {}
-        }
+        conditions.extend(
+            recipient_state_predicates(self.ack_filter)
+                .iter()
+                .map(ToString::to_string),
+        );
+        let source = deliveries::source(
+            conn,
+            candidate_ids,
+            recipient_agent_ids.as_ref(),
+            &mut params,
+        )?;
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -963,7 +974,7 @@ impl MailExplorerScreen {
             "SELECT DISTINCT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, \
              m.created_ts, m.thread_id, m.sender_id AS raw_sender_id, \
              m.project_id AS raw_project_id, s.name AS sender_name, p.slug AS project_slug \
-             FROM message_recipients r \
+             FROM {source} r \
              JOIN messages m ON m.id = r.message_id \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
@@ -977,7 +988,7 @@ impl MailExplorerScreen {
             .map_err(|e| format!("Inbound query: {e}"))?;
 
         let message_ids = collect_message_ids(&rows);
-        let recipient_map = recipient_names_by_message(conn, &message_ids)?;
+        let recipient_map = deliveries::recipient_names(conn, &message_ids, false)?;
         let status_map =
             self.inbound_status_by_message(conn, &message_ids, recipient_agent_ids.as_ref())?;
 
@@ -1021,6 +1032,21 @@ impl MailExplorerScreen {
             return Ok(Vec::new());
         }
 
+        // Ack and read state belong to recipients: a sent message matches
+        // when any of its recipients is in that state (e.g. still owes an
+        // ack). Joined rather than a correlated EXISTS, like the inbound query.
+        let recipient_state = recipient_state_predicates(self.ack_filter);
+        let (recipient_join, distinct) = if recipient_state.is_empty() {
+            (String::new(), "")
+        } else {
+            conditions.extend(recipient_state.iter().map(ToString::to_string));
+            let source = deliveries::source(conn, candidate_ids, None, &mut params)?;
+            (
+                format!(" JOIN {source} r ON r.message_id = m.id"),
+                "DISTINCT ",
+            )
+        };
+
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
@@ -1028,10 +1054,10 @@ impl MailExplorerScreen {
         };
 
         let sql = format!(
-            "SELECT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, m.sender_id AS raw_sender_id, m.project_id AS raw_project_id, \
-             s.name AS sender_name, p.slug AS project_slug \
-             FROM messages m \
+            "SELECT {distinct}m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required, \
+             m.created_ts, m.thread_id, m.sender_id AS raw_sender_id, \
+             m.project_id AS raw_project_id, s.name AS sender_name, p.slug AS project_slug \
+             FROM messages m{recipient_join} \
              LEFT JOIN agents s ON s.id = m.sender_id \
              LEFT JOIN projects p ON p.id = m.project_id \
              WHERE 1=1{where_clause} \
@@ -1155,6 +1181,8 @@ impl MailExplorerScreen {
             }
             AckFilter::All => {}
         }
+        let candidates = message_ids.iter().copied().collect();
+        let source = deliveries::source(conn, Some(&candidates), recipient_agent_ids, &mut params)?;
 
         let where_clause = format!(" WHERE {}", conditions.join(" AND "));
         let sql = format!(
@@ -1163,7 +1191,7 @@ impl MailExplorerScreen {
              SUM(CASE WHEN ack_ts IS NULL THEN 1 ELSE 0 END) AS pending_ack_count, \
              MAX(read_ts) AS latest_read_ts, \
              MAX(ack_ts) AS latest_ack_ts \
-             FROM message_recipients{where_clause} \
+             FROM {source}{where_clause} \
              GROUP BY message_id"
         );
 
@@ -1248,7 +1276,11 @@ fn append_message_id_slice_filter_for_column(
         return false;
     }
 
-    let placeholders = vec!["?"; ids.len()].join(", ");
+    let first = params.len() + 1;
+    let placeholders = (first..first + ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     conditions.push(format!("{column} IN ({placeholders})"));
     params.extend(ids.iter().copied().map(Value::BigInt));
     true
@@ -1268,10 +1300,7 @@ fn append_agent_id_filter_for_column(
     }
 
     let ids: Vec<i64> = agent_ids.iter().copied().collect();
-    let placeholders = vec!["?"; ids.len()].join(", ");
-    conditions.push(format!("{column} IN ({placeholders})"));
-    params.extend(ids.into_iter().map(Value::BigInt));
-    true
+    append_message_id_slice_filter_for_column(column, conditions, params, &ids)
 }
 
 fn resolve_agent_ids_by_name(
@@ -1313,50 +1342,7 @@ fn recipient_names_by_message(
     conn: &DbConn,
     message_ids: &[i64],
 ) -> Result<std::collections::HashMap<i64, String>, String> {
-    if message_ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let mut conditions = Vec::new();
-    let mut params = Vec::new();
-    if !append_message_id_slice_filter_for_column(
-        "mr.message_id",
-        &mut conditions,
-        &mut params,
-        message_ids,
-    ) {
-        return Ok(std::collections::HashMap::new());
-    }
-    let where_clause = format!(" WHERE {}", conditions.join(" AND "));
-    let sql = format!(
-        "SELECT mr.message_id, mr.agent_id AS raw_agent_id, a.name AS agent_name \
-         FROM message_recipients mr \
-         LEFT JOIN agents a ON a.id = mr.agent_id{where_clause} \
-         ORDER BY mr.message_id ASC, \
-         CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END ASC, \
-         mr.agent_id ASC"
-    );
-
-    conn.query_sync(&sql, &params)
-        .map_err(|e| format!("Recipient lookup query: {e}"))
-        .map(|rows| {
-            let mut grouped: std::collections::HashMap<i64, Vec<String>> =
-                std::collections::HashMap::new();
-            for row in rows {
-                let Ok(message_id) = row.get_named::<i64>("message_id") else {
-                    continue;
-                };
-                let agent_name = read_agent_label(&row, "agent_name", "raw_agent_id");
-                let names = grouped.entry(message_id).or_default();
-                if !names.iter().any(|existing| existing == &agent_name) {
-                    names.push(agent_name);
-                }
-            }
-            grouped
-                .into_iter()
-                .map(|(message_id, names)| (message_id, names.join(", ")))
-                .collect()
-        })
+    deliveries::recipient_names(conn, message_ids, true)
 }
 
 impl Default for MailExplorerScreen {
@@ -1514,8 +1500,8 @@ impl MailScreen for MailExplorerScreen {
                             self.pressure_dirty = true;
                         }
                     }
-                    // Clear all
-                    KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                    // Clear all (not Ctrl+C: the shell always takes it)
+                    KeyCode::Char('X') => {
                         self.search_input.clear();
                         self.reset_filters();
                     }
@@ -1634,6 +1620,7 @@ impl MailScreen for MailExplorerScreen {
                 frame,
                 results_area,
                 &self.entries,
+                self.group_mode,
                 &mut self.list_state.borrow_mut(),
                 results_focused,
             );
@@ -1690,7 +1677,7 @@ impl MailScreen for MailExplorerScreen {
                 action: "Scroll detail",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear all",
             },
             HelpEntry {
@@ -1752,8 +1739,11 @@ impl MailScreen for MailExplorerScreen {
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
         match target {
+            // Every producer ("View inbox", "Fetch inbox for X") asks for the
+            // agent's inbox, not everything the agent also sent.
             DeepLinkTarget::ExplorerForAgent(name) => {
                 self.agent_filter.clone_from(name);
+                self.direction = Direction::Inbound;
                 self.search_dirty = true;
                 self.debounce_remaining = 0;
                 true
@@ -1841,6 +1831,25 @@ fn stable_hash<T: Hash>(value: T) -> u64 {
     hasher.finish()
 }
 
+/// Keep each group's rows together: groups in key order, rows in their sort
+/// order within a group. Keys match the `mail_explorer` API's grouping.
+fn group_entries(entries: &mut [DisplayEntry], mode: GroupMode) {
+    let key = |entry: &DisplayEntry| match mode {
+        GroupMode::None => String::new(),
+        GroupMode::Project => entry.project_slug.clone(),
+        GroupMode::Thread => entry
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| "(no thread)".to_string()),
+        GroupMode::Agent if entry.direction == Direction::Inbound => entry.sender_name.clone(),
+        GroupMode::Agent => entry.to_agents.clone(),
+    };
+    if mode != GroupMode::None {
+        // Stable, so the sort order survives within each group.
+        entries.sort_by_cached_key(key);
+    }
+}
+
 fn sort_entries(entries: &mut [DisplayEntry], mode: SortMode) {
     match mode {
         SortMode::DateDesc => entries.sort_by_key(|e| std::cmp::Reverse(e.created_ts)),
@@ -1925,7 +1934,9 @@ fn compute_stats(entries: &[DisplayEntry]) -> ExplorerStats {
 fn collect_agent_names<'a>(agents: &mut std::collections::HashSet<&'a str>, names_csv: &'a str) {
     for raw in names_csv.split(',') {
         let name = raw.trim();
-        if !name.is_empty() {
+        if !name.is_empty()
+            && mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_none()
+        {
             agents.insert(name);
         }
     }
@@ -2124,12 +2135,17 @@ fn render_results(
     frame: &mut Frame<'_>,
     area: Rect,
     entries: &[DisplayEntry],
+    group_mode: GroupMode,
     list_state: &mut VirtualizedListState,
     focused: bool,
 ) {
     let tp = crate::tui_theme::TuiThemePalette::current();
+    let title = match group_mode {
+        GroupMode::None => "Messages".to_string(),
+        grouped => format!("Messages · grouped by {}", group_label(grouped)),
+    };
     let block = Block::default()
-        .title("Messages")
+        .title(&title)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::tui_theme::focus_border_color(&tp, focused)));
     let inner = block.inner(area);
@@ -2478,6 +2494,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui::Modifiers;
     use ftui_harness::buffer_to_text;
     use std::collections::HashSet;
 
@@ -2941,7 +2958,53 @@ mod tests {
             screen.receive_deep_link(&DeepLinkTarget::ExplorerForAgent("Fox".to_string()));
         assert!(handled);
         assert_eq!(screen.agent_filter, "Fox");
+        assert_eq!(
+            screen.direction,
+            Direction::Inbound,
+            "an inbox, not sent mail"
+        );
         assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn fetch_outbound_honours_the_ack_filter_through_recipient_state() {
+        let conn = DbConn::open_memory().expect("open memory db");
+        create_explorer_query_schema(&conn);
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug) VALUES (1, 'alpha');
+             INSERT INTO agents (id, name) VALUES (1, 'Sender'), (2, 'BlueLake'), (3, 'RedFox');
+             INSERT INTO messages
+                (id, project_id, sender_id, subject, topic, body_md, importance, ack_required, created_ts, thread_id)
+             VALUES
+                (10, 1, 1, 'owes an ack', NULL, 'b', 'normal', 1, 1000, 't'),
+                (11, 1, 1, 'fully acked', NULL, 'b', 'normal', 1, 1100, 't'),
+                (12, 1, 1, 'no ack asked', NULL, 'b', 'normal', 0, 1200, 't');
+             INSERT INTO message_recipients (message_id, agent_id, read_ts, ack_ts) VALUES
+                (10, 2, 1200, 1300),
+                (10, 3, NULL, NULL),
+                (11, 2, 1150, 1160),
+                (12, 2, 1250, NULL),
+                (12, 3, 1260, NULL);",
+        )
+        .expect("seed outbound rows");
+
+        let ids = |filter: AckFilter| {
+            let mut screen = MailExplorerScreen::new();
+            screen.ack_filter = filter;
+            let mut ids: Vec<i64> = screen
+                .fetch_outbound(&conn, None)
+                .expect("fetch outbound")
+                .iter()
+                .map(|entry| entry.message_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(AckFilter::All), [10, 11, 12]);
+        // Before the fix every sent message passed every ack filter.
+        assert_eq!(ids(AckFilter::PendingAck), [10], "RedFox still owes 10");
+        assert_eq!(ids(AckFilter::Acknowledged), [10, 11]);
+        assert_eq!(ids(AckFilter::Unread), [10], "only 10 has an unread copy");
     }
 
     #[test]
@@ -2961,6 +3024,42 @@ mod tests {
         assert_eq!(entries[0].message_id, 2);
         assert_eq!(entries[1].message_id, 3);
         assert_eq!(entries[2].message_id, 1);
+    }
+
+    #[test]
+    fn group_mode_keeps_each_group_contiguous_in_sort_order() {
+        let entry = |id, ts, project: &str| {
+            let mut entry = test_entry(id, ts, Direction::Inbound);
+            entry.project_slug = project.to_string();
+            entry
+        };
+        let mut entries = vec![
+            entry(1, 400, "beta"),
+            entry(2, 300, "alpha"),
+            entry(3, 200, "beta"),
+            entry(4, 100, "alpha"),
+        ];
+        sort_entries(&mut entries, SortMode::DateDesc);
+
+        let mut flat = entries.clone();
+        group_entries(&mut flat, GroupMode::None);
+        let ids = |rows: &[DisplayEntry]| rows.iter().map(|e| e.message_id).collect::<Vec<_>>();
+        assert_eq!(ids(&flat), [1, 2, 3, 4], "Flat keeps the sort order");
+
+        group_entries(&mut entries, GroupMode::Project);
+        // Before the fix every group mode rendered this interleaved list.
+        assert_eq!(
+            ids(&entries),
+            [2, 4, 1, 3],
+            "alpha's rows, then beta's, newest first"
+        );
+
+        // Agent groups inbound rows by sender and sent rows by recipients.
+        let mut sent = test_entry(5, 50, Direction::Outbound);
+        sent.to_agents = "AAA".to_string();
+        let mut rows = vec![test_entry(6, 60, Direction::Inbound), sent];
+        group_entries(&mut rows, GroupMode::Agent);
+        assert_eq!(ids(&rows), [5, 6]);
     }
 
     #[test]
@@ -3291,6 +3390,21 @@ mod tests {
             bindings.iter().any(|h| h.key == "P"),
             "P keybinding should be listed"
         );
+    }
+
+    #[test]
+    fn capital_x_clears_search_and_filters_from_the_result_list() {
+        let mut screen = MailExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.search_input.set_value("deploy");
+        screen.direction = Direction::Inbound;
+        screen.agent_filter = "TestAgent".to_string();
+        assert_eq!(screen.focus, Focus::ResultList);
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.search_input.value(), "");
+        assert_eq!(screen.direction, Direction::All);
+        assert_eq!(screen.agent_filter, "");
     }
 
     #[test]

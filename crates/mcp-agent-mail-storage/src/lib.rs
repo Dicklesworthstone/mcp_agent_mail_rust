@@ -70,6 +70,9 @@ pub enum StorageError {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    #[error("Reservation {id} archive publication refused: {message}")]
+    ReservationPublicationConflict { id: i64, message: String },
+
     #[error("Archive not initialized")]
     NotInitialized,
 }
@@ -555,6 +558,55 @@ fn fence_contention_report(
     })
 }
 
+/// Contended fence waits in progress: wait sequence number to the wait's start
+/// in µs since the epoch. The oldest start is published as
+/// `storage.archive_fence_wait_since_us`, so a timeout that is still waiting
+/// behind the fence names it instead of reporting an unattributed stall
+/// (br-9bwnb).
+static FENCE_WAITS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+static FENCE_WAIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One contended fence wait, registered until it drops.
+struct FenceWait {
+    seq: u64,
+}
+
+impl FenceWait {
+    fn begin() -> Self {
+        let seq = FENCE_WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.insert(seq, now_micros_u64());
+        publish_oldest_fence_wait(&waits);
+        Self { seq }
+    }
+}
+
+impl Drop for FenceWait {
+    fn drop(&mut self) {
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.remove(&self.seq);
+        publish_oldest_fence_wait(&waits);
+    }
+}
+
+/// The earliest start among `waits`, or zero when none. Sequence order need
+/// not match start order: a wait may take its number, then lose the race for
+/// the map to a later one.
+fn oldest_fence_wait_start(waits: &BTreeMap<u64, u64>) -> u64 {
+    waits.values().copied().min().unwrap_or(0)
+}
+
+fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_fence_wait_since_us
+        .set(oldest_fence_wait_start(waits));
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -571,9 +623,11 @@ impl FenceLease {
             Err(std::sync::TryLockError::WouldBlock) => {
                 let blocker = archive_publication_fence_holder();
                 let started = Instant::now();
+                let wait = FenceWait::begin();
                 let guard = ARCHIVE_PUBLICATION_FENCE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(wait);
                 if let Some(report) =
                     fence_contention_report(started.elapsed(), site, blocker.as_ref())
                 {
@@ -715,10 +769,16 @@ fn rewrite_archive_epoch_file(git_dir: &Path) {
 
 /// Read and validate the persisted mutation-epoch token from `git_dir`.
 /// Returns `None` when the file is missing or does not parse (unknown format
-/// version, empty/non-hex token), which readers treat as "no epoch protocol"
-/// and fall back to their conservative full-scan gate.
+/// version, empty/non-hex token). Callers requiring the epoch protocol then
+/// fall back to their conservative inventory gate.
 fn read_archive_epoch_token(git_dir: &Path) -> Option<String> {
-    let bytes = fs::read(git_dir.join(ARCHIVE_EPOCH_FILE_NAME)).ok()?;
+    // Every indexed read samples this file. Keep both allocation and I/O
+    // bounded even when a malformed control file is unexpectedly large.
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &git_dir.join(ARCHIVE_EPOCH_FILE_NAME),
+        129,
+    )
+    .ok()?;
     let (&version, token) = bytes.split_first()?;
     if version != ARCHIVE_EPOCH_FORMAT_VERSION
         || token.is_empty()
@@ -836,14 +896,19 @@ pub fn archive_mutations_active() -> usize {
     ARCHIVE_MUTATIONS_ACTIVE.load(Ordering::Acquire)
 }
 
-/// O(1) archive marker for consumers that need to fence an archive-backed
+/// O(1) archive marker for consumers that need to validate an archive-backed
 /// read without walking the `projects/` working tree.
 ///
 /// The marker combines the resolved Git `HEAD`, the Git index's filesystem
-/// generation, and the in-process physical-mutation epoch.  Archive readers
-/// must sample it before and after their reconstruction and compare the two
-/// markers; storage writers advance the epoch on both edges of every physical
-/// mutation window.  This deliberately does not try to discover arbitrary
+/// generation, the in-process physical-mutation epoch, and the persisted
+/// per-repo epoch token when available. Archive readers compare markers around
+/// reconstruction so completed remote writes invalidate cached reads even
+/// before the Git coalescer advances `HEAD` or the index.
+///
+/// This is an observation, not cross-process exclusion: a remote mutation can
+/// span both samples, and persisted token writes are best-effort. Equal markers
+/// do not authorize archive publication, deletion, or durability-debt clearance.
+/// This deliberately does not try to discover arbitrary
 /// uncoordinated writes beneath `projects/`: the storage write API and Git
 /// index/ref protocol are the archive authorities, and a full tree scan made
 /// the read gate scale with the whole mailbox instead of the read operation.
@@ -852,6 +917,7 @@ pub struct ArchiveReadGeneration {
     head: Option<git2::Oid>,
     index: ArchiveReadIndexStamp,
     mutation_epoch: u64,
+    epoch_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -962,13 +1028,20 @@ fn archive_read_head(repo: &Repository) -> Result<Option<git2::Oid>> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Sample the indexed/incremental generation marker for an archive root.
 ///
 /// This is constant with respect to archive working-tree size: it resolves
-/// `HEAD` and stats the Git index, rather than recursively hashing
-/// `projects/`. A concurrent in-process storage mutation or a Git
-/// `index.lock` is reported as contention so callers can retry instead of
-/// publishing a mixed read.
+/// `HEAD`, samples the Git index and reads the small persisted epoch token,
+/// rather than recursively hashing `projects/`. A concurrent in-process storage
+/// mutation, Git `index.lock`, or token change during sampling is reported as
+/// contention. The token remains optional for uninitialized/older archives;
+/// its appearance or disappearance also changes the returned generation.
 pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGeneration> {
     let mutation_epoch = archive_mutation_epoch();
     if archive_mutations_active() != 0 {
@@ -996,16 +1069,27 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
                 head: None,
                 index: ArchiveReadIndexStamp::default(),
                 mutation_epoch,
+                epoch_token: None,
             });
         }
         Err(error) => return Err(error.into()),
     };
+    let token_before = read_archive_epoch_token(repo.path());
     let head_before = archive_read_head(&repo)?;
     let index_before = archive_read_index_stamp(repo.path())?;
+    #[cfg(test)]
+    {
+        let hook = ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     let head_after = archive_read_head(&repo)?;
     let index_after = archive_read_index_stamp(repo.path())?;
+    let token_after = read_archive_epoch_token(repo.path());
     if head_before != head_after
         || index_before != index_after
+        || token_before != token_after
         || archive_mutations_active() != 0
         || archive_mutation_epoch() != mutation_epoch
     {
@@ -1018,16 +1102,15 @@ pub fn archive_read_generation(storage_root: &Path) -> Result<ArchiveReadGenerat
         head: head_after,
         index: index_after,
         mutation_epoch,
+        epoch_token: token_after,
     })
 }
 
-/// Persisted cross-process archive read stamp: the O(1) generation marker
-/// (`HEAD` + Git index stamp + in-process mutation epoch) combined with the
-/// per-repo epoch token every physical mutation window rewrites on disk.
+/// Archive read generation with a present, valid persisted epoch token.
 ///
-/// Two equal stamps sampled around an archive read guarantee no mutation
-/// window — in this process or any other — touched the archive in between,
-/// without walking the working tree.
+/// Like [`ArchiveReadGeneration`], this detects observed remote token changes
+/// without walking the working tree. It does not exclude a remote mutation
+/// spanning both samples and must not be used as publication/deletion authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEpochReadStamp {
     generation: ArchiveReadGeneration,
@@ -1044,24 +1127,13 @@ pub struct ArchiveEpochReadStamp {
 /// - `Err(..)`: contention (active mutation window, Git `index.lock`, token
 ///   rewritten mid-sample). Callers must not cache the read.
 pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpochReadStamp>> {
-    let storage_root = mcp_agent_mail_core::disk::simplify_verbatim_path(storage_root);
-    let git_dir = match Repository::open(&storage_root) {
-        Ok(repo) => repo.path().to_path_buf(),
-        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(token_before) = read_archive_epoch_token(&git_dir) else {
+    let generation = archive_read_generation(storage_root)?;
+    let Some(epoch_token) = generation.epoch_token.clone() else {
         return Ok(None);
     };
-    let generation = archive_read_generation(&storage_root)?;
-    if read_archive_epoch_token(&git_dir).as_deref() != Some(token_before.as_str()) {
-        return Err(StorageError::LockContention {
-            message: "archive epoch token changed while being sampled".to_string(),
-        });
-    }
     Ok(Some(ArchiveEpochReadStamp {
         generation,
-        epoch_token: token_before,
+        epoch_token,
     }))
 }
 
@@ -1255,6 +1327,30 @@ std::thread_local! {
     // tests can let the real drain finish before the enqueue call returns.
     static WBQ_AFTER_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    // Inject a failure after the real drain has entered its archive mutation
+    // window, so panic regressions exercise lock unwinding and queue progress.
+    static WBQ_BEFORE_EXECUTE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    // Observe a real failed attempt after its guards unwind and before retry
+    // backoff, so liveness tests do not depend on catching a timed sleep.
+    static WBQ_BEFORE_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn wbq_run_before_execute_test_hook() {
+    let hook = WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn wbq_run_before_retry_test_hook() {
+    let hook = WBQ_BEFORE_RETRY_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn wbq_try_send_counted(
@@ -1423,13 +1519,30 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
 pub fn write_op_sync(op: &WriteOp) -> Result<()> {
     let metrics = mcp_agent_mail_core::global_metrics();
     let started = Instant::now();
-    let result = wbq_execute_op(op, "archive-sync");
+    let result =
+        std::panic::catch_unwind(|| wbq_execute_op(op, "archive-sync")).unwrap_or_else(|_| {
+            // Unwind the writer's mutation/project guards before accounting
+            // for failure. The durable backlog must retain its journal and
+            // advance its retry budget instead of losing its only drainer.
+            // The panic hook already records the payload; do not copy possible
+            // message content into storage diagnostics or the dead-letter log.
+            Err(StorageError::Io(std::io::Error::other(
+                "archive write panicked; the affected operation requires reconciliation",
+            )))
+        });
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
         .storage
         .archive_direct_write_latency_us
         .record(duration_as_micros_u64(started.elapsed()));
-    note_archive_write_outcome(op, result.is_err());
+    // A version refusal preserves newer reservation evidence; it is not a
+    // broken Git repository and must not trigger automatic archive repair.
+    if !matches!(
+        &result,
+        Err(StorageError::ReservationPublicationConflict { .. })
+    ) {
+        note_archive_write_outcome(op, result.is_err());
+    }
     if result.is_err() {
         metrics.storage.archive_direct_write_errors_total.add(1);
     }
@@ -1474,8 +1587,10 @@ pub enum DirectArchiveWrite {
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-#[must_use]
-pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+fn write_op_sync_direct_with_cancel(
+    op: &WriteOp,
+    mut cancelled: impl FnMut() -> bool,
+) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     let disk_pressure = metrics.system.disk_pressure_level.load();
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
@@ -1487,6 +1602,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             .add(1);
         return DirectArchiveWrite::SkippedDiskCritical;
     }
+
+    // GH#351: direct request-path publication must never enter the blocking
+    // ARCHIVE_PUBLICATION_FENCE.lock() path. Admit through the same native
+    // mutation guard used by recovery: try_lock first, preserve the existing
+    // fence -> epoch -> filesystem ordering, and refuse contention before any
+    // mutation bookkeeping changes. wbq_execute_op's guards are then nested on
+    // this thread and therefore reuse this already-held publication window.
+    let _publication =
+        match ArchiveMutationGuard::try_begin_repair(write_op_storage_root(op), &mut cancelled) {
+            Ok(guard) => guard,
+            Err(error) => return DirectArchiveWrite::Failed(error),
+        };
+
     let started = Instant::now();
     let result = wbq_execute_op(op, "archive-direct");
     metrics.storage.archive_direct_writes_total.add(1);
@@ -1494,7 +1622,12 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
         .storage
         .archive_direct_write_latency_us
         .record(duration_as_micros_u64(started.elapsed()));
-    note_archive_write_outcome(op, result.is_err());
+    if !matches!(
+        &result,
+        Err(StorageError::ReservationPublicationConflict { .. })
+    ) {
+        note_archive_write_outcome(op, result.is_err());
+    }
     match result {
         Ok(()) => DirectArchiveWrite::Written,
         Err(error) => {
@@ -1502,6 +1635,19 @@ pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
             DirectArchiveWrite::Failed(error)
         }
     }
+}
+
+/// Cancellation-aware direct writer for request paths with an asupersync
+/// context. Cancellation racing fence admission exits before any archive
+/// mutation bookkeeping or filesystem publication begins.
+#[must_use]
+pub fn write_op_sync_direct_cancellable(cx: &asupersync::Cx, op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || cx.checkpoint().is_err())
+}
+
+#[must_use]
+pub fn write_op_sync_direct(op: &WriteOp) -> DirectArchiveWrite {
+    write_op_sync_direct_with_cancel(op, || false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,8 +2390,9 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
 }
 
 /// Background drain loop. Single drainer, so the front entry is stable across
-/// the unlocked `write_op_sync` call (only pushes append to the back). Never
-/// returns; a panic is caught by `ensure_drain`'s respawn.
+/// the unlocked `write_op_sync` call (only pushes append to the back). Writer
+/// panics become failed attempts in `write_op_sync`, so they retain the journal
+/// for retry and eventually reach the normal dead-letter bound.
 ///
 /// Materialization is via `write_op_sync` (NOT `wbq_enqueue`): the write-behind
 /// queue is in-memory, so handing the op back to it and dropping the journal
@@ -2789,11 +2936,11 @@ pub fn wbq_stats() -> WbqStats {
     }
 }
 
-/// Returns true when WBQ has experienced at least one retry-exhausted
-/// failure since the last operator clear. While true, the API layer
-/// must refuse new writes — accepting them would issue IDs from the
-/// in-memory allocator that the storage layer has already proven it
-/// can't persist. See #122.
+/// Returns true while a retry-exhausted WBQ failure remains unverified.
+/// The API must refuse new writes while this latch is set. Exact failed
+/// message witnesses can be discharged by verified DB-to-Git reconciliation;
+/// unknown or unsupported failures still require an explicit operator clear.
+/// Lifetime error counters remain unchanged by either recovery path. See #122.
 #[must_use]
 pub fn durability_degraded() -> bool {
     mcp_agent_mail_core::global_metrics()
@@ -2813,10 +2960,7 @@ pub fn durability_degraded() -> bool {
 /// semantics). Calling this without those preconditions just re-enables
 /// the bug.
 pub fn clear_durability_degraded() {
-    mcp_agent_mail_core::global_metrics()
-        .storage
-        .wbq_last_unrecoverable_error_us
-        .set(0);
+    recovery::message_reconcile::database::durability::clear_by_operator();
 }
 
 // ---------------------------------------------------------------------------
@@ -3329,12 +3473,12 @@ fn wbq_drain_loop(
         while idx < batch.len() {
             let end = wbq_message_bundle_batch_end(&batch, idx);
             let envelopes = &batch[idx..end];
-            let result = if envelopes.len() > 1 {
-                wbq_execute_message_bundle_batch(envelopes)
-            } else {
-                wbq_execute_op(&envelopes[0].op, "wbq-drain")
-            };
+            let result = wbq_execute_envelopes(envelopes);
             let group_failed = result.is_err();
+            let reservation_version_refused = matches!(
+                &result,
+                Err(StorageError::ReservationPublicationConflict { .. })
+            );
             for envelope in envelopes {
                 let latency_us = u64::try_from(
                     envelope
@@ -3347,9 +3491,8 @@ fn wbq_drain_loop(
                 metrics.storage.wbq_queue_latency_us.record(latency_us);
             }
             if let Err(error) = result {
-                // Retry budget was already exhausted inside wbq_execute_op /
-                // wbq_execute_message_bundle_batch. Reaching this branch means
-                // the row enqueued via the API was never persisted — that's
+                // Execution exhausted its retry budget or panicked. Reaching
+                // this branch means archive persistence is not confirmed — that's
                 // a durability failure that must be visible to the API gate
                 // so future send_message calls refuse instead of accepting
                 // writes that will silently disappear. See #122.
@@ -3358,10 +3501,9 @@ fn wbq_drain_loop(
                     .storage
                     .wbq_unrecoverable_errors_total
                     .add(unrecoverable);
-                metrics
-                    .storage
-                    .wbq_last_unrecoverable_error_us
-                    .set(now_micros_u64());
+                recovery::message_reconcile::database::durability::record_failures(
+                    envelopes.iter().map(|envelope| envelope.op.as_ref()),
+                );
                 if envelopes.len() > 1 {
                     tracing::error!(
                         "[wbq-drain] batched message-bundle run failed after retries ({} ops): {error} — durability degraded, refusing further writes until operator intervention",
@@ -3379,7 +3521,12 @@ fn wbq_drain_loop(
             // failures on one archive trips a bounded boot-check self-heal +
             // actionable escalation instead of degrading silently; a success
             // resets that archive's counter. (br-bvq1x.9.8 Part 3)
-            note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
+            // Version refusal is not Git corruption. Keep the durability
+            // failure above: a refused mixed reservation batch may include
+            // other accepted rows that still lack archive coverage.
+            if !reservation_version_refused {
+                note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
+            }
             idx = end;
         }
 
@@ -3437,7 +3584,7 @@ fn wbq_drain_loop(
                 }
 
                 wbq_mark_batch_in_flight(std::slice::from_ref(&envelope));
-                let r = wbq_execute_op(&envelope.op, "wbq-drain");
+                let r = wbq_execute_envelopes(std::slice::from_ref(&envelope));
                 let latency_us = u64::try_from(
                     envelope
                         .enqueued_at
@@ -3456,10 +3603,9 @@ fn wbq_drain_loop(
                     // accepted but never persisted. #122.
                     metrics.storage.wbq_errors_total.inc();
                     metrics.storage.wbq_unrecoverable_errors_total.inc();
-                    metrics
-                        .storage
-                        .wbq_last_unrecoverable_error_us
-                        .set(now_micros_u64());
+                    recovery::message_reconcile::database::durability::record_failures(
+                        std::iter::once(envelope.op.as_ref()),
+                    );
                     tracing::error!(
                         "[wbq-drain post-shutdown] op failed after retries: {error} — row will not persist"
                     );
@@ -3504,6 +3650,27 @@ fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize 
     end
 }
 
+/// Keep an archive-writer panic inside its group, after mutation and project
+/// guards have unwound. A dequeued batch is no longer in the receiver slot or
+/// queue-depth count, so respawning a dead drain cannot salvage it. Returning
+/// an error instead sends EVERY op in the possibly partially written group
+/// through the normal durability ledger while later groups keep draining.
+/// Panics are not retried here; deterministic failures must not spin forever.
+fn wbq_execute_envelopes(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    std::panic::catch_unwind(|| match envelopes {
+        [] => Ok(()),
+        [envelope] => wbq_execute_op(&envelope.op, "wbq-drain"),
+        _ => wbq_execute_message_bundle_batch(envelopes),
+    })
+    .unwrap_or_else(|_| {
+        // The panic hook already records the panic. Do not copy an arbitrary
+        // payload (which may contain message content) into storage diagnostics.
+        Err(StorageError::Io(std::io::Error::other(
+            "archive write panicked; the affected operations require reconciliation",
+        )))
+    })
+}
+
 /// Storage root mutated by a write-behind op, used to anchor the persisted
 /// archive mutation epoch (GH#235).
 fn write_op_storage_root(op: &WriteOp) -> &Path {
@@ -3517,16 +3684,23 @@ fn write_op_storage_root(op: &WriteOp) -> &Path {
 }
 
 fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
-    let _mutation = envelopes
-        .first()
-        .map_or_else(ArchiveMutationGuard::begin, |envelope| {
-            ArchiveMutationGuard::begin_at(write_op_storage_root(envelope.op.as_ref()))
-        });
     debug_assert!(!envelopes.is_empty());
 
     let mut attempts = 0;
     loop {
-        match wbq_execute_message_bundle_batch_inner(envelopes) {
+        let result = {
+            let _mutation =
+                envelopes
+                    .first()
+                    .map_or_else(ArchiveMutationGuard::begin, |envelope| {
+                        ArchiveMutationGuard::begin_at(write_op_storage_root(envelope.op.as_ref()))
+                    });
+            wbq_execute_message_bundle_batch_inner(envelopes)
+        };
+        // Every attempt keeps fence-before-project-lock ordering and repeats
+        // the immutable-message no-clobber checks. A failed attempt has fully
+        // unwound before backoff, just as a final failed attempt already does.
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempts += 1;
@@ -3541,6 +3715,8 @@ fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
                         tracing::warn!(
                             "[wbq-drain] batch failed (attempt {attempts}/3): {e}, retrying..."
                         );
+                        #[cfg(test)]
+                        wbq_run_before_retry_test_hook();
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
                     _ => return Err(e),
@@ -3551,6 +3727,9 @@ fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
 }
 
 fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    #[cfg(test)]
+    wbq_run_before_execute_test_hook();
+
     let Some(WriteOp::MessageBundle {
         project_slug,
         config,
@@ -3601,10 +3780,35 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
     // documented (and debug-asserted) not to initiate archive writes. Keep it
     // that way: never acquire the fence from code already holding a
     // per-project archive lock.
-    let _mutation = ArchiveMutationGuard::begin_at(write_op_storage_root(op));
+    //
+    // A reservation op takes no outer window (br-9bwnb): it stages and syncs
+    // its artifacts outside the fence and holds it only to rename them into
+    // place, and it takes no per-project archive lock. Holding the fence
+    // across its fsyncs serialized every agent's reservation behind every
+    // other's, the swarm-scale p99 of ~25 s.
+    // Immutable messages can release their window during retry backoff:
+    // every attempt rechecks canonical identity under its project lock.
+    // Mutable profiles/signals retain one window across retries so an older
+    // failed write cannot interleave with and replace a newer publication.
+    let _mutation = if matches!(
+        op,
+        WriteOp::FileReservation { .. } | WriteOp::MessageBundle { .. }
+    ) {
+        None
+    } else {
+        Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
+    };
     let mut attempts = 0;
     loop {
-        match wbq_execute_op_inner(op) {
+        let result = {
+            let _message_attempt = if matches!(op, WriteOp::MessageBundle { .. }) {
+                Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
+            } else {
+                None
+            };
+            wbq_execute_op_inner(op)
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempts += 1;
@@ -3619,6 +3823,8 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
                         tracing::warn!(
                             "[{log_context}] op failed (attempt {attempts}/3): {e}, retrying..."
                         );
+                        #[cfg(test)]
+                        wbq_run_before_retry_test_hook();
                         std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
                     }
                     _ => return Err(e),
@@ -3629,6 +3835,9 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
 }
 
 fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
+    #[cfg(test)]
+    wbq_run_before_execute_test_hook();
+
     match op {
         WriteOp::MessageBundle {
             project_slug,
@@ -6568,6 +6777,11 @@ fn coalescer_commit_with_retry(
     // Try lock-free commit first (avoids index.lock entirely)
     {
         let repo = Repository::open(repo_root)?;
+        // Blob filter attribute lookup otherwise loads and parses the entire
+        // on-disk index on every commit, scaling with all archive history.
+        // The lock-free tree builder does not use this in-memory index.
+        let mut empty_index = git2::Index::new_ext(repo.object_format())?;
+        repo.set_index(&mut empty_index)?;
         let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
         let commit_start = std::time::Instant::now();
         match commit_paths_lockfree(&repo, config, message, &refs) {
@@ -7554,6 +7768,11 @@ pub fn commit_paths_with_retry(
     // Try lock-free commit first (avoids index.lock entirely)
     {
         let repo = Repository::open(repo_root)?;
+        // Blob filter attribute lookup otherwise loads and parses the entire
+        // on-disk index on every commit, scaling with all archive history.
+        // The lock-free tree builder does not use this in-memory index.
+        let mut empty_index = git2::Index::new_ext(repo.object_format())?;
+        repo.set_index(&mut empty_index)?;
         let commit_start = std::time::Instant::now();
         match commit_paths_lockfree(&repo, config, message, rel_paths) {
             Ok(()) => {
@@ -8066,8 +8285,16 @@ fn archive_storage_root(config: &Config) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const ARCHIVE_GITIGNORE_HEADER: &str = "# Agent Mail runtime artifacts";
-const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
-    &[".mailbox.activity.lock", "diagnostics/", "search_index/"];
+/// `.tmp-*` covers atomic-write temp files (`atomic_write_tmp_path`): staged
+/// reservation artifacts exist outside the publication fence (br-9bwnb), so a
+/// concurrent `commit_all` must never publish one. No archive name can match
+/// it: thread ids and project slugs never start with a dot.
+const ARCHIVE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".mailbox.activity.lock",
+    "diagnostics/",
+    "search_index/",
+    ".tmp-*",
+];
 
 /// Ensure the global archive root directory exists and is a git repository.
 ///
@@ -8265,6 +8492,12 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
+    // A cached repo is no mutation: like `ensure_dir`, it must not wait for
+    // the global publication fence (br-9bwnb: every reservation write opens
+    // its archive here before staging outside the fence).
+    if repo_cache_contains(root) {
+        return Ok(false);
+    }
     let _mutation = ArchiveMutationGuard::begin_at(root);
     if repo_cache_contains(root) {
         return Ok(false);
@@ -8480,7 +8713,222 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
     format!("{subject}\n\n{}", lines.join("\n"))
 }
 
+fn reservation_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value.as_str().and_then(|text| {
+            let text = text.trim();
+            mcp_agent_mail_core::timestamps::iso_to_micros(text)
+                .or_else(|| text.parse::<i64>().ok())
+        })
+    })
+}
+
+/// Match the guard's release-marker semantics, including legacy zero sentinels.
+/// An unrecognized nonempty textual marker already makes the guard ignore the
+/// artifact, so an ordinary ACTIVE write must not erase it either.
+fn reservation_publication_is_released(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().is_some_and(|value| value > 0.0),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty()
+                || text.eq_ignore_ascii_case("null")
+                || text.eq_ignore_ascii_case("none")
+                || text == "0"
+            {
+                return false;
+            }
+            if text
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-'))
+            {
+                return text.parse::<f64>().is_ok_and(|value| value > 0.0);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn reservation_publication_conflict(id: i64, message: impl Into<String>) -> StorageError {
+    StorageError::ReservationPublicationConflict {
+        id,
+        message: message.into(),
+    }
+}
+
+// Match the guard's artifact bound on both sides of a replacement. Do not
+// publish a generation-stamped artifact that future release validation (or
+// the guard itself) cannot read.
+const MAX_RESERVATION_PUBLICATION_BYTES: u64 = 1024 * 1024;
+
+/// A generation-stamped row has an immutable owner and creation identity.
+/// Expiry only increases; release is terminal. Reacquisition can change the
+/// reason and exclusive mode without increasing expiry, so neither field can
+/// serve as an immutable identity or a revision number here.
+fn validate_reservation_publication_version(
+    id: i64,
+    incoming: &serde_json::Value,
+    published: &serde_json::Value,
+) -> Result<()> {
+    for field in ["id", "project", "agent", "path_pattern", "db_generation"] {
+        if let (Some(before), Some(after)) = (published.get(field), incoming.get(field)) {
+            if !before.is_null() && !after.is_null() && before != after {
+                return Err(reservation_publication_conflict(
+                    id,
+                    format!("immutable {field} conflicts with the published generation; retained"),
+                ));
+            }
+        }
+    }
+    fn owner(record: &serde_json::Value) -> Option<&str> {
+        record["agent_name"]
+            .as_str()
+            .or_else(|| record["agent"].as_str())
+            .map(str::trim)
+    }
+    fn pattern(record: &serde_json::Value) -> Option<&str> {
+        record["path_pattern"]
+            .as_str()
+            .or_else(|| record["path"].as_str())
+            .map(str::trim)
+    }
+    for (field, before, after) in [
+        ("guard owner", owner(published), owner(incoming)),
+        ("guard path", pattern(published), pattern(incoming)),
+    ] {
+        if let (Some(before), Some(after)) = (before, after)
+            && before != after
+        {
+            return Err(reservation_publication_conflict(
+                id,
+                format!("immutable {field} conflicts with the published generation; retained"),
+            ));
+        }
+    }
+    if let (Some(before), Some(after)) = (published.get("created_ts"), incoming.get("created_ts")) {
+        let same = match (
+            reservation_publication_timestamp(before),
+            reservation_publication_timestamp(after),
+        ) {
+            (Some(before), Some(after)) => before == after,
+            _ => before == after || before.is_null() || after.is_null(),
+        };
+        if !same {
+            return Err(reservation_publication_conflict(
+                id,
+                "creation identity conflicts with the published generation; retained",
+            ));
+        }
+    }
+    let incoming_released = reservation_publication_is_released(&incoming["released_ts"]);
+    if reservation_publication_is_released(&published["released_ts"]) && !incoming_released {
+        return Err(reservation_publication_conflict(
+            id,
+            "a terminal release is already published; refusing the stale active snapshot",
+        ));
+    }
+    // A terminal release must win even if its captured expiry predates a
+    // concurrent renewal. Only two ACTIVE versions are ordered by expiry.
+    if !incoming_released
+        && let (Some(before), Some(after)) = (
+            reservation_publication_timestamp(&published["expires_ts"]),
+            reservation_publication_timestamp(&incoming["expires_ts"]),
+        )
+        && after < before
+    {
+        return Err(reservation_publication_conflict(
+            id,
+            "a later active expiry is already published; refusing to shorten guard coverage",
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck the whole batch while holding both publication locks, before any
+/// stable artifact or reusable digest alias is replaced. Repeated IDs in the
+/// same batch are checked against the preceding candidate as well as disk.
+fn validate_reservation_publications(checks: &[(PathBuf, i64, serde_json::Value)]) -> Result<()> {
+    let mut previous: HashMap<&Path, &serde_json::Value> = HashMap::new();
+    for (path, id, incoming) in checks {
+        if let Some(published) = previous.get(path.as_path()) {
+            validate_reservation_publication_version(*id, incoming, published)?;
+        } else {
+            match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                path,
+                MAX_RESERVATION_PUBLICATION_BYTES,
+            ) {
+                Ok(bytes) => {
+                    // A malformed old artifact has no usable lifecycle
+                    // evidence. Preserve the existing repair behavior for it.
+                    if let Ok(published) = serde_json::from_slice(&bytes) {
+                        validate_reservation_publication_version(*id, incoming, &published)?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    return Err(reservation_publication_conflict(
+                        *id,
+                        format!(
+                            "existing stable artifact cannot be safely read; retained: {error}"
+                        ),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        previous.insert(path.as_path(), incoming);
+    }
+    Ok(())
+}
+
+fn publish_reservation_writes(
+    archive: &ProjectArchive,
+    staged: StagedArchiveWrites,
+    checks: &[(PathBuf, i64, serde_json::Value)],
+) -> Result<()> {
+    let root = archive_project_root_checked(archive)?;
+    let _mutation = ArchiveMutationGuard::begin_at(&root);
+    // The fence serializes threads in this process; the ordinary project
+    // lock also excludes a terminal reconciler or writer in another process.
+    // Never add a 60-second project-lock wait to the direct request path.
+    let process_lock = archive_process_lock(archive)?;
+    let _process = match process_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(StorageError::LockContention {
+                message: "reservation publication project lock busy".to_string(),
+            });
+        }
+    };
+    let mut lock = FileLock::new(root.join(".archive.lock"))
+        .with_timeout(Duration::ZERO)
+        .with_max_retries(0);
+    lock.acquire()?;
+    validate_reservation_publications(checks)?;
+    let result = staged.publish();
+    lock.release()?;
+    result
+}
+
 /// Write file reservation records to the archive and commit.
+///
+/// Every artifact is written and synced under a temp name before this writer
+/// takes its publication window; callers can still retain an outer window.
+/// This writer's fence covers version validation and the publication renames
+/// (br-9bwnb). Durability on return is unchanged: data is synced before rename,
+/// exactly as `atomic_write_bytes` does it.
+/// Canonical generation-stamped working artifacts are checked under the
+/// project lock as well: a delayed ACTIVE snapshot cannot erase a terminal
+/// release or shorten a published renewal. This does not order equal-expiry
+/// intent changes, reconstruct missing working artifacts from Git, or make
+/// the separate database mutation atomic with publication.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -8493,6 +8941,7 @@ pub fn write_file_reservation_records(
     let repo_root = archive_repo_root_checked(archive)?;
     let mut rel_paths = Vec::new();
     let mut entries = Vec::new();
+    let mut publication_checks = Vec::new();
     let mut normalized_reservations = Vec::with_capacity(reservations.len());
     for res in reservations {
         let path_pattern = res
@@ -8531,7 +8980,9 @@ pub fn write_file_reservation_records(
     let reservation_dir = project_root.join("file_reservations");
     ensure_dir(&reservation_dir)?;
 
+    let mut files = Vec::with_capacity(normalized_reservations.len() * 2);
     for (normalized, path_pattern, agent_name) in normalized_reservations {
+        let content = serde_json::to_string_pretty(&normalized)?.into_bytes();
         // Legacy path: sha1(path_pattern).json
         let digest = {
             let mut hasher = sha1::Sha1::new();
@@ -8539,8 +8990,8 @@ pub fn write_file_reservation_records(
             hex::encode(hasher.finalize())
         };
         let legacy_path = reservation_dir.join(format!("{digest}.json"));
-        write_json(&legacy_path, &normalized, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
+        files.push((legacy_path, content.clone()));
 
         // Stable per-reservation artifact, keyed by (db_generation, id). The
         // generation token (br-n8qh6) makes the name unique across DB
@@ -8557,12 +9008,35 @@ pub fn write_file_reservation_records(
                     generation, id,
                 ),
             );
-            write_json(&id_path, &normalized, true)?;
+            // Unversioned rows can reuse IDs after a legacy DB rebuild. Only
+            // canonical generation-stamped paths carry enough identity for
+            // lifecycle ordering; legacy/no-ID writes keep their semantics.
+            if id_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(
+                    mcp_agent_mail_core::reservation_artifact::parse_reservation_artifact_filename,
+                )
+                .is_some_and(|parsed| parsed.generation.is_some() && parsed.id == id)
+            {
+                if u64::try_from(content.len()).unwrap_or(u64::MAX)
+                    > MAX_RESERVATION_PUBLICATION_BYTES
+                {
+                    return Err(reservation_publication_conflict(
+                        id,
+                        "candidate exceeds the guard's artifact size limit; nothing published",
+                    ));
+                }
+                publication_checks.push((id_path.clone(), id, normalized.clone()));
+            }
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
+            files.push((id_path, content));
         }
 
         entries.push((agent_name, path_pattern));
     }
+    let staged = StagedArchiveWrites::stage(files)?;
+    publish_reservation_writes(archive, staged, &publication_checks)?;
 
     let commit_msg = build_file_reservation_commit_message(&entries);
     enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
@@ -8744,6 +9218,31 @@ pub fn message_paths(
         inbox,
     })
 }
+
+/// Keys of a message's archive envelope, in the order every writer emits them;
+/// a reply appends `reply_to`.
+///
+/// The canonical file is the pretty-printed envelope (key order preserved), and
+/// the canonical-id collision check refuses a same-path file with different
+/// bytes. The tool-side writers and the DB-to-archive reconciler must therefore
+/// render a message identically. Otherwise a reconciler repair that races a
+/// still-queued write turns that write into a durability failure.
+pub const MESSAGE_ARCHIVE_ENVELOPE_KEYS: [&str; 14] = [
+    "id",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "created",
+    "thread_id",
+    "topic",
+    "project",
+    "project_slug",
+    "importance",
+    "ack_required",
+    "attachments",
+];
 
 fn render_message_bundle_content(message: &serde_json::Value, body_md: &str) -> Result<String> {
     let frontmatter = serde_json::to_string_pretty(message)?;
@@ -9211,15 +9710,72 @@ fn append_message_bundle_files(
     rel_paths: &mut Vec<String>,
     existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
 ) -> Result<MessageBundleCommitMeta> {
+    let prepared = prepare_message_bundle_files(archive, entry, existing_ids)?;
+    let mut writes = StagedArchiveWrites::default();
+    let mut targets = Vec::new();
+    prepared.stage(&mut writes, &mut targets)?;
+    writes.publish()?;
+    record_published_paths(archive, &targets, rel_paths)?;
+    finish_message_bundle(
+        archive,
+        entry,
+        &prepared.paths.canonical,
+        &prepared.timestamp_str,
+        rel_paths,
+    )
+}
+
+/// One message's canonical, outbox and inbox copies, rendered and checked for
+/// a canonical-id collision but not yet written.
+struct PreparedMessageBundle {
+    paths: MessageArchivePaths,
+    full_content: String,
+    /// The BCC-redacted inbox rendering, when it differs from `full_content`.
+    inbox_content: Option<String>,
+    timestamp_str: String,
+}
+
+impl PreparedMessageBundle {
+    /// Stage the canonical, outbox and inbox copies, in that order, into
+    /// `writes` (creating parent directories), and record their targets.
+    fn stage(&self, writes: &mut StagedArchiveWrites, targets: &mut Vec<PathBuf>) -> Result<()> {
+        let inbox_content = self.inbox_content.as_deref().unwrap_or(&self.full_content);
+        let copies = [
+            (&self.paths.canonical, self.full_content.as_str()),
+            (&self.paths.outbox, self.full_content.as_str()),
+        ]
+        .into_iter()
+        .chain(self.paths.inbox.iter().map(|path| (path, inbox_content)));
+        for (path, content) in copies {
+            ensure_parent_dir(path)?;
+            writes.add(path.clone(), content.as_bytes())?;
+            targets.push(path.clone());
+        }
+        Ok(())
+    }
+}
+
+/// Record the repo-relative paths of published archive files.
+fn record_published_paths(
+    archive: &ProjectArchive,
+    targets: &[PathBuf],
+    rel_paths: &mut Vec<String>,
+) -> Result<()> {
+    for path in targets {
+        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, path)?);
+    }
+    Ok(())
+}
+
+fn prepare_message_bundle_files(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    existing_ids: Option<&HashMap<i64, Vec<PathBuf>>>,
+) -> Result<PreparedMessageBundle> {
     let message = entry.message;
     let body_md = entry.body_md;
-    let sender = entry.sender;
-    let recipients = entry.recipients;
-    let extra_paths = entry.extra_paths;
-
-    let visible_recipients = message_visible_recipients(message);
     let (paths, _created, timestamp_str) =
-        message_paths_for_bundle(archive, message, sender, recipients)?;
+        message_paths_for_bundle(archive, message, entry.sender, entry.recipients)?;
 
     let full_content = render_message_bundle_content(message, body_md)?;
     let inbox_message = redact_message_bcc_for_inbox(message);
@@ -9228,7 +9784,6 @@ fn append_message_bundle_files(
     } else {
         Some(render_message_bundle_content(&inbox_message, body_md)?)
     };
-    let inbox_content_ref = inbox_content.as_deref().unwrap_or(&full_content);
 
     if let Some(existing_ids) = existing_ids {
         reject_canonical_message_id_collision_from_index(
@@ -9241,38 +9796,40 @@ fn append_message_bundle_files(
         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
     }
 
-    write_text(&paths.canonical, &full_content, true)?;
-    rel_paths.push(rel_path_cached(
-        &archive.canonical_repo_root,
-        &paths.canonical,
-    )?);
+    Ok(PreparedMessageBundle {
+        paths,
+        full_content,
+        inbox_content,
+        timestamp_str,
+    })
+}
 
-    write_text(&paths.outbox, &full_content, true)?;
-    rel_paths.push(rel_path_cached(
-        &archive.canonical_repo_root,
-        &paths.outbox,
-    )?);
-
-    for inbox_path in &paths.inbox {
-        write_text(inbox_path, inbox_content_ref, true)?;
-        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
-    }
-
+/// After a message's files are published: append it to its thread digest and
+/// record its attachment paths.
+fn finish_message_bundle(
+    archive: &ProjectArchive,
+    entry: MessageBundleBatchEntry<'_>,
+    canonical: &Path,
+    timestamp_str: &str,
+    rel_paths: &mut Vec<String>,
+) -> Result<MessageBundleCommitMeta> {
+    let message = entry.message;
+    let visible_recipients = message_visible_recipients(message);
     if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
         let thread_id = thread_id.trim();
         if !thread_id.is_empty() {
-            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+            let canonical_rel = rel_path_cached(&archive.canonical_repo_root, canonical)?;
             if let Ok(digest_rel) = update_thread_digest(
                 archive,
                 thread_id,
-                sender,
+                entry.sender,
                 &visible_recipients,
                 message
                     .get("subject")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
-                &timestamp_str,
-                body_md,
+                timestamp_str,
+                entry.body_md,
                 &canonical_rel,
             ) {
                 rel_paths.push(digest_rel);
@@ -9280,16 +9837,16 @@ fn append_message_bundle_files(
         }
     }
 
-    for p in extra_paths {
+    for p in entry.extra_paths {
         let p = validate_repo_relative_path("extra_path", p)?;
         rel_paths.push(p.to_string());
     }
 
     Ok(build_message_bundle_commit_meta(
         message,
-        sender,
+        entry.sender,
         &visible_recipients,
-        &timestamp_str,
+        timestamp_str,
     ))
 }
 
@@ -9437,49 +9994,74 @@ pub fn write_message_batch_bundle(
             )?;
         }
 
-        for entry in entries {
-            let commit_meta = match append_message_bundle_files(
-                archive,
-                *entry,
-                &mut rel_paths,
-                Some(&existing_message_ids),
-            ) {
-                Ok(meta) => meta,
-                Err(err) => {
-                    let error_kind = err.to_string();
-                    let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
-                    tracing::error!(
-                        target: "mcp_agent_mail::storage::archive::batch_write",
-                        repo_slug = repo_slug,
-                        caller = caller,
-                        args_hash = %args_hash,
-                        duration_ms = duration_ms,
-                        outcome = "error",
-                        git_version = git_version,
-                        batch_id = %args_hash,
-                        files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
-                        total_bytes = total_bytes,
-                        error_kind = %error_kind,
-                        "disk_phase"
-                    );
-                    tracing::error!(
-                        target: "mcp_agent_mail::storage::archive::batch_write",
-                        repo_slug = repo_slug,
-                        caller = caller,
-                        args_hash = %args_hash,
-                        duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
-                        outcome = "error",
-                        git_version = git_version,
-                        batch_id = %args_hash,
-                        total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
-                        message_count = message_count,
-                        success = false,
-                        error_kind = %error_kind,
-                        "complete"
-                    );
-                    return Err(err);
-                }
-            };
+        // Stage the whole batch and sync its files in groups rather than one
+        // file at a time: this writer holds the publication fence throughout
+        // (br-9ott5). A failure before publication leaves no entry half
+        // written; renames still run in entry order.
+        let written = (|| {
+            let mut writes = StagedArchiveWrites::default();
+            let mut targets = Vec::new();
+            let mut published = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let bundle =
+                    prepare_message_bundle_files(archive, *entry, Some(&existing_message_ids))?;
+                bundle.stage(&mut writes, &mut targets)?;
+                published.push((bundle.paths.canonical, bundle.timestamp_str));
+            }
+            writes.publish()?;
+            record_published_paths(archive, &targets, &mut rel_paths)?;
+            entries
+                .iter()
+                .zip(published)
+                .map(|(entry, (canonical, timestamp_str))| {
+                    finish_message_bundle(
+                        archive,
+                        *entry,
+                        &canonical,
+                        &timestamp_str,
+                        &mut rel_paths,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        })();
+        let commit_metas = match written {
+            Ok(metas) => metas,
+            Err(err) => {
+                let error_kind = err.to_string();
+                let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
+                tracing::error!(
+                    target: "mcp_agent_mail::storage::archive::batch_write",
+                    repo_slug = repo_slug,
+                    caller = caller,
+                    args_hash = %args_hash,
+                    duration_ms = duration_ms,
+                    outcome = "error",
+                    git_version = git_version,
+                    batch_id = %args_hash,
+                    files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+                    total_bytes = total_bytes,
+                    error_kind = %error_kind,
+                    "disk_phase"
+                );
+                tracing::error!(
+                    target: "mcp_agent_mail::storage::archive::batch_write",
+                    repo_slug = repo_slug,
+                    caller = caller,
+                    args_hash = %args_hash,
+                    duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+                    outcome = "error",
+                    git_version = git_version,
+                    batch_id = %args_hash,
+                    total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+                    message_count = message_count,
+                    success = false,
+                    error_kind = %error_kind,
+                    "complete"
+                );
+                return Err(err);
+            }
+        };
+        for commit_meta in commit_metas {
             if entries.len() == 1 {
                 single_auto_commit_message = Some(commit_meta.auto_commit_message);
             }
@@ -10879,12 +11461,43 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
 ///
 /// `path_filter` is relative to the project's archive root (e.g.
 /// `agents/BlueLake`); the `projects/<slug>/` repo prefix is applied
-/// internally.
+/// internally. This is best-effort history enrichment: the scan is bounded by
+/// work and elapsed time. Use [`get_recent_commit_history`] when the caller
+/// needs to distinguish a budget-limited result from exhausted history.
+///
+/// Commits follow the lazy traversal from HEAD, which is newest-first for the
+/// archive's append-only history. Imported merges retain all-parent traversal;
+/// neither merges nor skewed commit clocks imply a global timestamp ordering.
 pub fn get_recent_commits(
     archive: &ProjectArchive,
     limit: usize,
     path_filter: Option<&str>,
 ) -> Result<Vec<CommitInfo>> {
+    get_recent_commit_history(archive, limit, path_filter).map(|history| history.commits)
+}
+
+/// The completed portion of a recent-commit scan.
+#[derive(Debug, Default)]
+pub struct RecentCommitHistory {
+    pub commits: Vec<CommitInfo>,
+    /// Commits examined, including those that did not match the path filter.
+    pub scanned_commits: usize,
+    /// A work/time budget stopped the scan before the requested limit or the
+    /// end of history. Older matching commits may exist.
+    pub truncated: bool,
+}
+
+/// Get recent archive commits together with the scan's completion status.
+///
+/// Path and ordering semantics are the same as [`get_recent_commits`]. The time
+/// budget is cooperative: a single filesystem or libgit2 call cannot be
+/// interrupted, but no further object load is started after the deadline.
+pub fn get_recent_commit_history(
+    archive: &ProjectArchive,
+    limit: usize,
+    path_filter: Option<&str>,
+) -> Result<RecentCommitHistory> {
+    let started = Instant::now();
     let repo = open_archive_repo_checked(archive)?;
     // The filter is PROJECT-relative (e.g. `agents/BlueLake`). The shared
     // archive repo nests every project under `projects/<slug>/`, so the tree
@@ -10898,50 +11511,95 @@ pub fn get_recent_commits(
                 .map(|filter| format!("projects/{}/{}", archive.slug, filter))
         })
         .transpose()?;
-    let path_filter = path_filter.as_deref();
+    let history = collect_recent_commits(
+        &repo,
+        limit,
+        path_filter.as_deref(),
+        recent_commits_scan_budget(),
+        &mut || started.elapsed() < RECENT_COMMITS_TIME_BUDGET,
+    )?;
+    if history.truncated {
+        tracing::debug!(
+            scanned_commits = history.scanned_commits,
+            returned_commits = history.commits.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "Recent archive history enrichment reached its scan budget"
+        );
+    }
+    Ok(history)
+}
+
+fn collect_recent_commits(
+    repo: &Repository,
+    limit: usize,
+    path_filter: Option<&str>,
+    scan_budget: usize,
+    within_time_budget: &mut impl FnMut() -> bool,
+) -> Result<RecentCommitHistory> {
+    let mut history = RecentCommitHistory::default();
+    if limit == 0 {
+        return Ok(history);
+    }
+    if !within_time_budget() {
+        history.truncated = true;
+        return Ok(history);
+    }
+
+    // push_head() reports a generic reference error for an unborn branch in
+    // libgit2 1.9. Use head() to distinguish an empty repository from a broken
+    // reference without treating corrupt or missing commit objects as empty.
+    match repo.head() {
+        Ok(_) => {}
+        Err(error) if error.code() == ErrorCode::UnbornBranch => return Ok(history),
+        Err(error) => return Err(error.into()),
+    }
+    if !within_time_budget() {
+        history.truncated = true;
+        return Ok(history);
+    }
 
     let mut revwalk = repo.revwalk()?;
+    // TIME sorting makes libgit2 pre-walk the whole repository before yielding
+    // the first commit. NONE is lazy and retains merged side histories. A
+    // first-parent-only walk would silently lose imported archive activity.
+    revwalk.set_sorting(git2::Sort::NONE)?;
     revwalk.push_head()?;
-    revwalk.set_sorting(git2::Sort::TIME)?;
+    let mut path_filter = path_filter.map(CommitPathFilter::new);
 
-    let mut commits = Vec::new();
-
-    // Hard ceiling on how many commits we will examine when a path filter is
-    // present. Without it, a filter that matches fewer than `limit` commits
-    // (e.g. a freshly registered agent whose archive path barely appears in
-    // history) forces a walk over the *entire* archive history — the whois CPU
-    // bomb in #200. The per-commit check below is O(path-depth) tree lookups,
-    // so this budget bounds worst-case work to a small, quick scan while still
-    // finding recent matches for any active agent. Best-effort enrichment only;
-    // truncation just yields fewer "recent commits", never incorrect data.
-    let scan_budget = path_filter.map(|_| recent_commits_scan_budget());
-    let mut scanned: usize = 0;
-
-    for oid_result in revwalk {
-        if commits.len() >= limit {
+    while history.commits.len() < limit {
+        // Check BEFORE next(): a for loop fetches another Git object before
+        // its body can notice the limit/deadline.
+        if history.scanned_commits >= scan_budget || !within_time_budget() {
+            history.truncated = true;
             break;
         }
-        if let Some(budget) = scan_budget {
-            if scanned >= budget {
-                break;
-            }
-            scanned += 1;
-        }
+        let Some(oid_result) = revwalk.next() else {
+            break;
+        };
         let oid = oid_result?;
+        if !within_time_budget() {
+            history.truncated = true;
+            break;
+        }
         let commit = repo.find_commit(oid)?;
+        history.scanned_commits += 1;
 
-        // Optional path filter
-        if let Some(filter) = path_filter {
-            let dominated = commit_touches_path(&repo, &commit, filter);
-            if !dominated {
-                continue;
+        if let Some(filter) = path_filter.as_mut() {
+            match filter.commit_touches_path(repo, &commit, within_time_budget)? {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    history.truncated = true;
+                    break;
+                }
             }
         }
 
         let author = commit.author();
-        commits.push(CommitInfo {
-            sha: oid.to_string(),
-            short_sha: oid.to_string()[..7.min(oid.to_string().len())].to_string(),
+        let sha = oid.to_string();
+        history.commits.push(CommitInfo {
+            short_sha: sha[..7.min(sha.len())].to_string(),
+            sha,
             author: author.name().unwrap_or("unknown").to_string(),
             email: author.email().unwrap_or("").to_string(),
             date: {
@@ -10959,12 +11617,14 @@ pub fn get_recent_commits(
         });
     }
 
-    Ok(commits)
+    Ok(history)
 }
 
-/// Default hard ceiling on commits examined by [`get_recent_commits`] when a
-/// path filter is present. Overridable via `AM_RECENT_COMMITS_SCAN_BUDGET`.
-const DEFAULT_RECENT_COMMITS_SCAN_BUDGET: usize = 20_000;
+/// Default hard ceiling on commits examined by [`get_recent_commits`].
+/// Overridable via `AM_RECENT_COMMITS_SCAN_BUDGET`; the independent time budget
+/// still applies even when an operator allows a deeper history window.
+const DEFAULT_RECENT_COMMITS_SCAN_BUDGET: usize = 1_000;
+const RECENT_COMMITS_TIME_BUDGET: Duration = Duration::from_millis(100);
 
 fn recent_commits_scan_budget() -> usize {
     mcp_agent_mail_core::config::env_value("AM_RECENT_COMMITS_SCAN_BUDGET")
@@ -10973,42 +11633,122 @@ fn recent_commits_scan_budget() -> usize {
         .unwrap_or(DEFAULT_RECENT_COMMITS_SCAN_BUDGET)
 }
 
-/// Check if a commit touches files under a given path prefix.
-///
-/// Fast path (non-root commits): compare the object id of the tree/blob entry
-/// at `path_prefix` between this commit and its first parent. Anything that
-/// changes under a directory changes that directory's subtree oid, so an
-/// unchanged oid means nothing under the path was touched — an O(path-depth)
-/// check that loads only the trees along the path. The previous implementation
-/// ran a full, un-pathspec'd `diff_tree_to_tree` per commit, which loads every
-/// tree in the commit and was the dominant cost in the whois CPU storm (#200).
-fn commit_touches_path(_repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
-    let filter = Path::new(path_prefix);
-    let tree = match commit.tree() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CommitPathEntry {
+    oid: git2::Oid,
+    mode: i32,
+}
 
-    // Root commit: no parent to diff against; inspect the tree directly.
-    if commit.parent_count() == 0 {
-        return tree_contains_prefix(&tree, filter);
+/// A request-local cache of tiny tree-entry identities, not tree objects.
+/// Comparing every common ancestor first avoids expanding an unchanged large
+/// project/agents subtree. Memoizing entries also avoids reading each parent
+/// tree again when it becomes the next commit in an append-only history.
+struct CommitPathFilter<'a> {
+    components: Vec<&'a str>,
+    entries: HashMap<(git2::Oid, usize), Option<CommitPathEntry>>,
+    tree_loads: usize,
+}
+
+impl<'a> CommitPathFilter<'a> {
+    fn new(path_prefix: &'a str) -> Self {
+        Self {
+            components: Path::new(path_prefix)
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .collect(),
+            entries: HashMap::new(),
+            tree_loads: 0,
+        }
     }
 
-    let Ok(parent) = commit.parent(0) else {
-        return false;
-    };
-    let Ok(parent_tree) = parent.tree() else {
-        return false;
-    };
+    // None means the cooperative time budget expired. A false result always
+    // means an actual unchanged/absent path, never an interrupted comparison.
+    fn commit_touches_path(
+        &mut self,
+        repo: &Repository,
+        commit: &git2::Commit<'_>,
+        within_time_budget: &mut impl FnMut() -> bool,
+    ) -> Result<Option<bool>> {
+        if !within_time_budget() {
+            return Ok(None);
+        }
+        let parent = if commit.parent_count() == 0 {
+            None
+        } else {
+            Some(commit.parent(0)?.tree_id())
+        };
+        let as_tree = |oid| CommitPathEntry {
+            oid,
+            mode: 0o040_000,
+        };
+        let mut current = Some(as_tree(commit.tree_id()));
+        let mut parent = parent.map(as_tree);
+        for depth in 0..self.components.len() {
+            if current == parent {
+                return Ok(Some(false));
+            }
+            let std::ops::ControlFlow::Continue(next_current) =
+                self.child_entry(repo, current, depth, within_time_budget)?
+            else {
+                return Ok(None);
+            };
+            let std::ops::ControlFlow::Continue(next_parent) =
+                self.child_entry(repo, parent, depth, within_time_budget)?
+            else {
+                return Ok(None);
+            };
+            current = next_current;
+            parent = next_parent;
+        }
+        // Include additions, deletions, content changes, and file-mode-only
+        // changes. Comparing only blob ids misses chmod on an exact file path.
+        Ok(Some(current != parent))
+    }
 
-    // `get_path` resolves the entry (blob or subtree) at the exact path,
-    // returning Err when absent. Presence-or-oid change ⇒ the path was touched.
-    // This matches the prior component-wise prefix semantics: a directory's
-    // subtree oid captures every descendant, and sibling names that merely
-    // share a textual prefix (`name` vs `name2`) resolve to distinct entries.
-    let current = tree.get_path(filter).ok().map(|entry| entry.id());
-    let parent = parent_tree.get_path(filter).ok().map(|entry| entry.id());
-    current != parent
+    fn child_entry(
+        &mut self,
+        repo: &Repository,
+        entry: Option<CommitPathEntry>,
+        depth: usize,
+        within_time_budget: &mut impl FnMut() -> bool,
+    ) -> Result<std::ops::ControlFlow<(), Option<CommitPathEntry>>> {
+        if !within_time_budget() {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
+        let Some(entry) = entry.filter(|entry| entry.mode == 0o040_000) else {
+            return Ok(std::ops::ControlFlow::Continue(None));
+        };
+        let key = (entry.oid, depth);
+        if let Some(cached) = self.entries.get(&key) {
+            return Ok(std::ops::ControlFlow::Continue(*cached));
+        }
+        let tree = repo.find_tree(entry.oid)?;
+        self.tree_loads += 1;
+        let child = tree
+            .get_name(self.components[depth])
+            .map(|child| CommitPathEntry {
+                oid: child.id(),
+                mode: child.filemode(),
+            });
+        // Bound memory even if the caller raises the work budget or supplies a
+        // very deep path. Cached values contain no blobs or tree contents.
+        if self.entries.len() >= 256 {
+            self.entries.clear();
+        }
+        self.entries.insert(key, child);
+        Ok(std::ops::ControlFlow::Continue(child))
+    }
+}
+
+/// Compare a path against the first parent, including its creation in a root
+/// commit. The recent-history scanner reuses the matcher across commits and
+/// supplies a time budget; callers here retain their existing boolean API.
+fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
+    CommitPathFilter::new(path_prefix)
+        .commit_touches_path(repo, commit, &mut || true)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 /// Find the commit that introduced a specific file path.
@@ -12203,31 +12943,6 @@ pub fn read_agent_profile(
     Ok(Some(value))
 }
 
-fn repo_path_matches_filter(candidate: &Path, filter: &Path) -> bool {
-    candidate == filter || candidate.starts_with(filter)
-}
-
-/// Check if a tree has any entry with the given repo-relative path prefix.
-fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &Path) -> bool {
-    let mut found = false;
-    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        let Ok(name) = entry.name() else {
-            return git2::TreeWalkResult::Ok;
-        };
-        let candidate = if root.is_empty() {
-            PathBuf::from(name)
-        } else {
-            Path::new(root).join(name)
-        };
-        if repo_path_matches_filter(&candidate, prefix) {
-            found = true;
-            return git2::TreeWalkResult::Abort;
-        }
-        git2::TreeWalkResult::Ok
-    });
-    found
-}
-
 /// Collect lock status information for diagnostics.
 pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
     let root = archive_storage_root(config);
@@ -13290,9 +14005,172 @@ fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
 /// The temp file is created in the same directory as the target so that
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
-    use std::io::Write as _;
-
     let _mutation = ArchiveMutationGuard::begin_at(path);
+
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
+
+    let tmp_path = stage_atomic_write(path, data, sync)?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// Archive files written and synced under temp names beside their targets,
+/// then renamed into place together inside one archive mutation window
+/// (br-9bwnb). Staging needs no publication fence: readers only open named
+/// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
+/// Whatever is still staged when this drops is removed.
+#[derive(Default)]
+struct StagedArchiveWrites {
+    /// `(temp path, target path)` pairs not yet renamed into place.
+    staged: Vec<(PathBuf, PathBuf)>,
+    /// Open temp files written but not yet synced, at most
+    /// [`MAX_PARALLEL_ARCHIVE_SYNCS`] of them.
+    unsynced: Vec<fs::File>,
+}
+
+impl StagedArchiveWrites {
+    /// Stage every file and sync it before returning.
+    fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
+        let mut writes = Self::default();
+        for (path, data) in files {
+            writes.add(path, &data)?;
+        }
+        writes.sync()?;
+        Ok(writes)
+    }
+
+    /// Write `data` under a temp name beside `path`. Its `fdatasync` joins the
+    /// current group, which is synced once it holds
+    /// [`MAX_PARALLEL_ARCHIVE_SYNCS`] files (see [`sync_archive_file_group`]);
+    /// that also bounds how many temp files are open at once.
+    fn add(&mut self, path: PathBuf, data: &[u8]) -> Result<()> {
+        let (tmp_path, file) = stage_atomic_write_unsynced(&path, data)?;
+        self.staged.push((tmp_path, path));
+        self.unsynced.push(file);
+        if self.unsynced.len() == MAX_PARALLEL_ARCHIVE_SYNCS {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// `fdatasync` every added file that is not synced yet.
+    fn sync(&mut self) -> Result<()> {
+        sync_archive_file_group(&self.unsynced)?;
+        self.unsynced.clear();
+        Ok(())
+    }
+
+    /// Rename every staged file into place inside one archive mutation window.
+    /// Files still unsynced are synced first: nothing is published before its
+    /// data is durable.
+    fn publish(mut self) -> Result<()> {
+        self.sync()?;
+        let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+            return Ok(());
+        };
+        let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        let mut pending = std::mem::take(&mut self.staged).into_iter();
+        while let Some((tmp_path, path)) = pending.next() {
+            if let Err(err) = fs::rename(&tmp_path, &path) {
+                let _ = fs::remove_file(&tmp_path);
+                self.staged.extend(pending);
+                return Err(err.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedArchiveWrites {
+    fn drop(&mut self) {
+        for (tmp_path, _) in &self.staged {
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+}
+
+/// Most archive files staged before their group is synced, and so the most
+/// `fdatasync` calls (and open temp files) one group has at once.
+const MAX_PARALLEL_ARCHIVE_SYNCS: usize = 16;
+
+/// Make the data of every file in `files` durable, syncing them concurrently.
+///
+/// Each `fdatasync` on ext4 waits for a journal commit, about 9 ms on a busy
+/// host, and syncing a group's files one after another pays one commit per
+/// file: the WBQ drain spent 76% of its time in those waits under swarm load,
+/// holding the publication fence (br-9ott5). Syncs issued concurrently join
+/// one commit, so a 7-file group takes ~20 ms instead of ~64 ms. Every file is
+/// still synced before this returns, so callers keep "data durable before
+/// rename". A thread that cannot be spawned syncs its file inline instead.
+fn sync_archive_file_group(files: &[fs::File]) -> std::io::Result<()> {
+    let Some((first, rest)) = files.split_first() else {
+        return Ok(());
+    };
+    std::thread::scope(|scope| {
+        let pending = rest
+            .iter()
+            .map(|file| {
+                std::thread::Builder::new()
+                    .name("archive-sync".to_string())
+                    .spawn_scoped(scope, || file.sync_data())
+                    .map_err(|_| file)
+            })
+            .collect::<Vec<_>>();
+        let mut result = first.sync_data();
+        note_archive_group_sync(&result);
+        for spawned in pending {
+            let synced = match spawned {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(std::io::Error::other("archive file sync thread panicked"))
+                }),
+                Err(file) => file.sync_data(),
+            };
+            note_archive_group_sync(&synced);
+            if result.is_ok() {
+                result = synced;
+            }
+        }
+        result
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Completed file syncs [`sync_archive_file_group`] returned on this thread.
+    static ARCHIVE_GROUP_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_archive_group_sync(synced: &std::io::Result<()>) {
+    if synced.is_ok() {
+        ARCHIVE_GROUP_SYNCS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+#[cfg(not(test))]
+const fn note_archive_group_sync(_synced: &std::io::Result<()>) {}
+
+/// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
+/// return the temp path for the caller to rename into place. `create_new`
+/// means a pre-existing file or symlink at a temp name is never clobbered.
+fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
+    let (tmp_path, file) = stage_atomic_write_unsynced(path, data)?;
+    if sync && let Err(err) = file.sync_data() {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(tmp_path)
+}
+
+/// [`stage_atomic_write`] without the sync. The open temp file is returned so
+/// a caller staging several files can sync them as one group.
+fn stage_atomic_write_unsynced(path: &Path, data: &[u8]) -> Result<(PathBuf, fs::File)> {
+    use std::io::Write as _;
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
@@ -13324,21 +14202,17 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
         let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = atomic_write_tmp_path(parent, path, seq);
 
-        let result: std::io::Result<()> = (|| {
+        let result: std::io::Result<fs::File> = (|| {
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&tmp_path)?;
             f.write_all(data)?;
-            if sync {
-                f.sync_data()?;
-            }
-            fs::rename(&tmp_path, path)?;
-            Ok(())
+            Ok(f)
         })();
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(file) => return Ok((tmp_path, file)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 // Best-effort cleanup of temp files we created. If the path
@@ -14256,6 +15130,49 @@ mod tests {
     /// publication fence that a draining write-behind batch holds (observed:
     /// inbox reads waiting 25-30 s); a real archive mutation still waits.
     #[test]
+    fn oldest_fence_wait_is_the_earliest_start_not_the_lowest_sequence() {
+        assert_eq!(oldest_fence_wait_start(&BTreeMap::new()), 0);
+        // Wait 7 took its number first but registered after wait 8.
+        let waits = BTreeMap::from([(7, 2_000), (8, 1_000), (9, 3_000)]);
+        assert_eq!(oldest_fence_wait_start(&waits), 1_000);
+    }
+
+    /// br-9bwnb: a thread blocked on the held fence is visible to timeout
+    /// diagnostics while it waits. Without the registration the live wait age
+    /// stays zero and a timed-out reservation reads as unattributed.
+    #[test]
+    fn a_contended_fence_wait_is_visible_to_timeout_diagnostics() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let waiter = std::thread::spawn(|| drop(ArchiveMutationGuard::begin()));
+
+        let gauge = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_fence_wait_since_us;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gauge.load() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let waiting = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(30_000_000);
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        waiter.join().expect("waiter thread");
+
+        assert!(
+            waiting.archive_fence_wait_us >= 20_000,
+            "a blocked fence wait must have a live age: {waiting:?}"
+        );
+    }
+
+    #[test]
     fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
         let cached_dir = tmp.path().join("cached");
@@ -15024,6 +15941,496 @@ mod tests {
         }
     }
 
+    fn publication_test_reservation(id: i64, generation: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "project": "/repo",
+            "agent": "GreenCastle",
+            "path_pattern": format!("src/{id}.rs"),
+            "exclusive": true,
+            "reason": "editing",
+            "created_ts": "2026-10-01T00:00:00Z",
+            "expires_ts": "2030-10-01T00:00:00Z",
+            "db_generation": generation,
+        })
+    }
+
+    fn publication_test_paths(
+        archive: &ProjectArchive,
+        record: &serde_json::Value,
+    ) -> (PathBuf, PathBuf) {
+        let dir = archive.root.join("file_reservations");
+        let stable = dir.join(
+            mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+                record["db_generation"].as_str(),
+                record["id"].as_i64().unwrap(),
+            ),
+        );
+        let alias = dir.join(format!(
+            "{}.json",
+            hex::encode(sha1::Sha1::digest(
+                record["path_pattern"].as_str().unwrap().as_bytes()
+            ))
+        ));
+        (stable, alias)
+    }
+
+    #[test]
+    fn reservation_publication_never_reactivates_a_published_terminal_generation() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-terminal").unwrap();
+        let active = publication_test_reservation(7, "AABBccdd");
+        write_file_reservation_record(&archive, &config, &active).unwrap();
+        let mut released = active.clone();
+        released["released_ts"] = serde_json::json!("2026-10-02T00:00:00Z");
+        write_file_reservation_record(&archive, &config, &released).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        let terminal = fs::read(&stable).unwrap();
+        let error = write_file_reservation_record(&archive, &config, &active).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ReservationPublicationConflict { id: 7, .. }
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+
+        // Reusing an ID in a different database generation is a different
+        // lease. The former generation remains untouched.
+        let mut replacement = active;
+        replacement["db_generation"] = serde_json::json!("11223344");
+        replacement["agent"] = serde_json::json!("BlueLake");
+        write_file_reservation_record(&archive, &config, &replacement).unwrap();
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert!(publication_test_paths(&archive, &replacement).0.exists());
+    }
+
+    #[test]
+    fn reservation_publication_preserves_renewals_but_accepts_an_older_expiry_release() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-renewal").unwrap();
+        let active = publication_test_reservation(8, "aabbccdd");
+        let mut renewed = active.clone();
+        renewed["expires_ts"] = serde_json::json!("2030-10-02T00:00:00Z");
+        write_file_reservation_record(&archive, &config, &renewed).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        let latest = fs::read(&stable).unwrap();
+        let error = write_file_reservation_record(&archive, &config, &active).unwrap_err();
+        assert!(error.to_string().contains("shorten guard coverage"));
+        assert_eq!(fs::read(&stable).unwrap(), latest);
+        assert_eq!(fs::read(&alias).unwrap(), latest);
+
+        // Reacquisition can change intent with the same expiry. No revision
+        // number exists for ordering those changes, so they remain supported.
+        renewed["exclusive"] = serde_json::json!(false);
+        renewed["reason"] = serde_json::json!("observe");
+        renewed["created_ts"] = serde_json::json!(
+            mcp_agent_mail_core::timestamps::iso_to_micros("2026-10-01T00:00:00Z").unwrap()
+        );
+        write_file_reservation_record(&archive, &config, &renewed).unwrap();
+
+        let mut released = active;
+        released["released_ts"] = serde_json::json!(42);
+        write_file_reservation_record(&archive, &config, &released).unwrap();
+        let published: serde_json::Value =
+            serde_json::from_slice(&fs::read(&stable).unwrap()).unwrap();
+        assert_eq!(published["released_ts"], 42);
+        assert_eq!(fs::read(&alias).unwrap(), fs::read(&stable).unwrap());
+    }
+
+    #[test]
+    fn reservation_publication_checks_the_entire_batch_and_repeated_ids_before_renaming() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-batch").unwrap();
+        let active = publication_test_reservation(9, "aabbccdd");
+        let mut released = active.clone();
+        released["released_ts"] = serde_json::json!("released");
+        write_file_reservation_record(&archive, &config, &released).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        let terminal = fs::read(&stable).unwrap();
+        let fresh = publication_test_reservation(10, "aabbccdd");
+        let (fresh_stable, fresh_alias) = publication_test_paths(&archive, &fresh);
+        write_file_reservation_records(&archive, &config, &[fresh.clone(), active]).unwrap_err();
+        assert!(!fresh_stable.exists());
+        assert!(!fresh_alias.exists());
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+
+        let mut renewed = fresh.clone();
+        renewed["expires_ts"] = serde_json::json!("2031-10-01T00:00:00Z");
+        write_file_reservation_records(&archive, &config, &[renewed, fresh]).unwrap_err();
+        assert!(!fresh_stable.exists());
+        assert!(!fresh_alias.exists());
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn reservation_publication_preserves_immutable_and_guard_visible_identity() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-identity").unwrap();
+        let original = publication_test_reservation(11, "aabbccdd");
+        write_file_reservation_record(&archive, &config, &original).unwrap();
+        let (stable, alias) = publication_test_paths(&archive, &original);
+        let bytes = fs::read(&stable).unwrap();
+        for (field, replacement) in [
+            ("project", "/different"),
+            ("agent", "BlueLake"),
+            ("agent_name", "BlueLake"),
+            ("path_pattern", "other.rs"),
+            ("created_ts", "2026-10-02T00:00:00Z"),
+        ] {
+            let mut conflicting = original.clone();
+            conflicting[field] = serde_json::json!(replacement);
+            let error = write_file_reservation_record(&archive, &config, &conflicting).unwrap_err();
+            assert!(matches!(
+                error,
+                StorageError::ReservationPublicationConflict { id: 11, .. }
+            ));
+            assert_eq!(fs::read(&stable).unwrap(), bytes, "{field}");
+            assert_eq!(fs::read(&alias).unwrap(), bytes, "{field}");
+        }
+        // Old spellings are interpreted like the guard, not silently ignored.
+        let mut previous = original.clone();
+        previous.as_object_mut().unwrap().remove("path_pattern");
+        previous["path"] = serde_json::json!("a/different/path");
+        fs::write(&stable, serde_json::to_vec(&previous).unwrap()).unwrap();
+        write_file_reservation_record(&archive, &config, &original).unwrap_err();
+        previous = original.clone();
+        previous["agent_name"] = serde_json::json!("BlueLake");
+        fs::write(&stable, serde_json::to_vec(&previous).unwrap()).unwrap();
+        write_file_reservation_record(&archive, &config, &original).unwrap_err();
+    }
+
+    #[test]
+    fn reservation_publication_keeps_legacy_repairs_and_zero_release_sentinels() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-legacy").unwrap();
+        let original = publication_test_reservation(12, "aabbccdd");
+        for marker in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("0.0"),
+            serde_json::json!("None"),
+        ] {
+            let mut active = original.clone();
+            active["released_ts"] = marker;
+            write_file_reservation_record(&archive, &config, &active).unwrap();
+            write_file_reservation_record(&archive, &config, &original).unwrap();
+        }
+        let (stable, _) = publication_test_paths(&archive, &original);
+        fs::write(&stable, b"{malformed").unwrap();
+        write_file_reservation_record(&archive, &config, &original).unwrap();
+
+        for generation in [None, Some("historic-generation")] {
+            let mut legacy = publication_test_reservation(13, "aabbccdd");
+            legacy["db_generation"] = serde_json::json!(generation);
+            legacy["released_ts"] = serde_json::json!("released");
+            write_file_reservation_record(&archive, &config, &legacy).unwrap();
+            legacy["released_ts"] = serde_json::Value::Null;
+            legacy["agent"] = serde_json::json!("BlueLake");
+            write_file_reservation_record(&archive, &config, &legacy).unwrap();
+        }
+        let mut no_id = original;
+        no_id.as_object_mut().unwrap().remove("id");
+        no_id["released_ts"] = serde_json::json!("released");
+        write_file_reservation_record(&archive, &config, &no_id).unwrap();
+        no_id["released_ts"] = serde_json::Value::Null;
+        write_file_reservation_record(&archive, &config, &no_id).unwrap();
+    }
+
+    #[test]
+    fn reservation_publication_rechecks_a_release_that_wins_during_staging() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-race").unwrap();
+        let active = publication_test_reservation(14, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &active);
+        ensure_dir(stable.parent().unwrap()).unwrap();
+        // The stale writer must sync its real files while this thread holds
+        // the fence. Publish a terminal release before admitting its rename.
+        let fence = ArchiveMutationGuard::begin_at(&archive.repo_root);
+        let writer_archive = archive.clone();
+        let writer_config = config.clone();
+        let writer_record = active.clone();
+        let writer = std::thread::spawn(move || {
+            write_file_reservation_record(&writer_archive, &writer_config, &writer_record)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while staged_temp_files(stable.parent().unwrap()).len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let staged = staged_temp_files(stable.parent().unwrap()).len();
+        let mut released = active;
+        released["released_ts"] = serde_json::json!("2026-10-02T00:00:00Z");
+        let release = write_file_reservation_record(&archive, &config, &released);
+        let terminal = fs::read(&stable);
+        drop(fence);
+        let result = writer.join().unwrap();
+        assert_eq!(staged, 2, "staging must precede publication admission");
+        release.unwrap();
+        let terminal = terminal.unwrap();
+        assert!(matches!(
+            result,
+            Err(StorageError::ReservationPublicationConflict { id: 14, .. })
+        ));
+        assert_eq!(fs::read(&stable).unwrap(), terminal);
+        assert_eq!(fs::read(&alias).unwrap(), terminal);
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn reservation_publication_defers_while_another_process_owns_the_project() {
+        use fs2::FileExt;
+        const CHILD_ROOT: &str = "AM_TEST_RESERVATION_PUBLICATION_LOCK_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(root.join(".archive.lock"))
+                .unwrap();
+            lock.try_lock_exclusive().unwrap();
+            fs::write(root.join("publication-lock-ready"), b"held").unwrap();
+            let mut byte = [0_u8; 1];
+            let _ = std::io::stdin().read(&mut byte).unwrap();
+            lock.unlock().unwrap();
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-foreign-lock").unwrap();
+        let current = std::thread::current();
+        let test_name = current.name().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ROOT, &archive.root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = archive.root.join("publication-lock-ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let observed = ready.exists();
+        let record = publication_test_reservation(15, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &record);
+        let started = Instant::now();
+        let result = observed.then(|| write_file_reservation_record(&archive, &config, &record));
+        let elapsed = started.elapsed();
+        let no_publication = !stable.exists() && !alias.exists();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "lock holder failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(observed, "child must hold the real project flock");
+        assert!(matches!(result, Some(Err(StorageError::LockTimeout(_)))));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "foreign lock wait: {elapsed:?}"
+        );
+        assert!(
+            no_publication,
+            "no artifact may publish without the project lock"
+        );
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+        write_file_reservation_record(&archive, &config, &record).unwrap();
+        assert!(stable.exists());
+        assert!(alias.exists());
+    }
+
+    #[test]
+    fn reservation_publication_bounds_candidates_before_any_file_is_staged() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path());
+        let archive = ensure_archive(&config, "publication-bound").unwrap();
+        let fresh = publication_test_reservation(16, "aabbccdd");
+        let (stable, alias) = publication_test_paths(&archive, &fresh);
+        let mut oversized = publication_test_reservation(17, "aabbccdd");
+        oversized["reason"] = serde_json::json!("x".repeat(1024 * 1024));
+        let error =
+            write_file_reservation_records(&archive, &config, &[fresh, oversized]).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::ReservationPublicationConflict { id: 17, .. }
+        ));
+        assert!(!stable.exists());
+        assert!(!alias.exists());
+        assert!(staged_temp_files(stable.parent().unwrap()).is_empty());
+    }
+
+    fn staged_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.starts_with(".tmp-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// br-9bwnb: a reservation write syncs its artifacts outside the archive
+    /// publication fence and takes the fence only to rename them into place.
+    /// While another writer holds the fence the artifacts are staged but not
+    /// visible; once it is released they publish and no temp file remains.
+    #[test]
+    fn reservation_writes_stage_outside_the_fence_and_publish_inside_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        // A cached archive and directory are no mutation; warm both first.
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 7,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let writer = std::thread::spawn(move || wbq_execute_op(&op, "br-9bwnb-test"));
+
+        // The legacy and id artifacts both stage while the fence is held.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        let id_artifact = reservation_dir.join("id-7.json");
+        let published_while_held = id_artifact.exists();
+        let released_at = Instant::now();
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("reservation write");
+        let after_release = released_at.elapsed();
+
+        assert_eq!(
+            staged.len(),
+            2,
+            "both artifacts must sync outside the held fence: {staged:?}"
+        );
+        assert!(
+            !published_while_held,
+            "publication must wait for the held fence"
+        );
+        // The grant's latency under a held archive commit is the hold plus its
+        // renames: the syncs already ran, and the git commit is queued, not
+        // awaited. Its slow part never starts after the fence frees.
+        assert!(
+            after_release < Duration::from_secs(1),
+            "the write took {after_release:?} after the fence was released"
+        );
+        let id_json = fs::read_to_string(&id_artifact).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&id_json).unwrap();
+        assert_eq!(written["path_pattern"], "src/**");
+        let legacy = reservation_dir.join(format!(
+            "{}.json",
+            hex::encode(sha1::Sha1::digest(b"src/**"))
+        ));
+        assert_eq!(fs::read_to_string(legacy).unwrap(), id_json);
+        assert!(
+            staged_temp_files(&reservation_dir).is_empty(),
+            "publication leaves no temp file"
+        );
+    }
+
+    /// br-9bwnb: a staged temp file is no archive state. The overload
+    /// `commit_all` adds the whole worktree; it must never publish a temp file
+    /// another writer staged outside the fence, while the artifact beside it
+    /// is committed. Dropping an unpublished stage removes its temp file.
+    #[test]
+    fn commit_all_never_publishes_a_staged_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let staged =
+            StagedArchiveWrites::stage(vec![(reservation_dir.join("id-1.json"), b"{}".to_vec())])
+                .unwrap();
+        fs::write(reservation_dir.join("id-2.json"), "{}").unwrap();
+        assert_eq!(staged_temp_files(&reservation_dir).len(), 1);
+
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        commit_all(&repo, &config, "overload snapshot").unwrap();
+
+        let committed = repo
+            .head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(Path::new("projects/proj/file_reservations"))
+            .unwrap()
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.name().ok().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(committed, ["id-2.json"]);
+        drop(staged);
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    /// A failed publication stops at the failing rename and removes every
+    /// temp file it still owns.
+    #[test]
+    fn staged_archive_writes_clean_up_after_a_failed_publication() {
+        let tmp = TempDir::new().unwrap();
+        // A file cannot be renamed over a non-empty directory.
+        let blocked = tmp.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "keep").unwrap();
+        let later = tmp.path().join("later.json");
+        let staged = StagedArchiveWrites::stage(vec![
+            (blocked.clone(), b"{}".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        assert_eq!(staged_temp_files(tmp.path()).len(), 2);
+
+        staged
+            .publish()
+            .expect_err("a rename over a non-empty directory fails");
+
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        assert_eq!(fs::read_to_string(blocked.join("keep")).unwrap(), "keep");
+        assert!(!later.exists(), "publication stops at the failed rename");
+    }
+
     #[test]
     fn test_write_message_bundle() {
         let tmp = TempDir::new().unwrap();
@@ -15512,6 +16919,210 @@ mod tests {
         );
     }
 
+    fn temp_files_under(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(path);
+                } else if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    fn archive_group_syncs() -> usize {
+        ARCHIVE_GROUP_SYNCS.with(std::cell::Cell::get)
+    }
+
+    /// br-9ott5: staging syncs every file, in groups of at most
+    /// `MAX_PARALLEL_ARCHIVE_SYNCS`, before anything is renamed into place.
+    #[test]
+    fn staged_archive_writes_sync_every_file_before_publication() {
+        let tmp = TempDir::new().unwrap();
+        let count = MAX_PARALLEL_ARCHIVE_SYNCS * 2 + 3;
+        let body = |i: usize| format!("{{\"i\":{i}}}");
+        let files = (0..count)
+            .map(|i| (tmp.path().join(format!("f{i}.json")), body(i).into_bytes()))
+            .collect::<Vec<_>>();
+
+        let before = archive_group_syncs();
+        let staged = StagedArchiveWrites::stage(files).unwrap();
+        assert_eq!(
+            archive_group_syncs() - before,
+            count,
+            "every staged file is synced before stage returns"
+        );
+        assert_eq!(staged_temp_files(tmp.path()).len(), count);
+        assert!(
+            !tmp.path().join("f0.json").exists(),
+            "nothing is published before publish()"
+        );
+
+        staged.publish().unwrap();
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        for i in 0..count {
+            assert_eq!(
+                fs::read_to_string(tmp.path().join(format!("f{i}.json"))).unwrap(),
+                body(i)
+            );
+        }
+    }
+
+    /// Files added below a full group stay unsynced until publication, which
+    /// syncs them before renaming anything.
+    #[test]
+    fn staged_archive_writes_publish_syncs_files_left_pending() {
+        let tmp = TempDir::new().unwrap();
+        let mut writes = StagedArchiveWrites::default();
+        let before = archive_group_syncs();
+        for i in 0..3 {
+            writes
+                .add(tmp.path().join(format!("p{i}.json")), b"{}")
+                .unwrap();
+        }
+        assert_eq!(archive_group_syncs() - before, 0, "a partial group waits");
+        assert_eq!(staged_temp_files(tmp.path()).len(), 3);
+
+        writes.publish().unwrap();
+        assert_eq!(
+            archive_group_syncs() - before,
+            3,
+            "publication syncs every pending file first"
+        );
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        for i in 0..3 {
+            assert_eq!(
+                fs::read_to_string(tmp.path().join(format!("p{i}.json"))).unwrap(),
+                "{}"
+            );
+        }
+    }
+
+    /// br-9ott5: a WBQ batch syncs each bundle file (canonical, outbox, every
+    /// inbox) before publishing it, and leaves no temp file behind.
+    #[test]
+    fn write_message_batch_bundle_syncs_every_bundle_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let recipients = vec!["RecipientOne".to_string(), "RecipientTwo".to_string()];
+        let messages = (0..3)
+            .map(|i| {
+                serde_json::json!({
+                    "id": 80 + i,
+                    "subject": format!("Synced batch entry {i}"),
+                    "created_ts": format!("2026-01-15T10:0{i}:00Z"),
+                    "project": "proj",
+                })
+            })
+            .collect::<Vec<_>>();
+        let entries = messages
+            .iter()
+            .map(|message| MessageBundleBatchEntry {
+                message,
+                body_md: "synced body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            })
+            .collect::<Vec<_>>();
+
+        let before = archive_group_syncs();
+        write_message_batch_bundle(&archive, &config, &entries, None).unwrap();
+        assert_eq!(
+            archive_group_syncs() - before,
+            messages.len() * (2 + recipients.len()),
+            "canonical, outbox and both inbox copies of every message are synced"
+        );
+        for message in &messages {
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, message, "SenderAgent", &recipients).unwrap();
+            for path in [&paths.canonical, &paths.outbox]
+                .into_iter()
+                .chain(&paths.inbox)
+            {
+                let text = fs::read_to_string(path).unwrap();
+                assert!(
+                    text.contains("synced body"),
+                    "{} lacks the body",
+                    path.display()
+                );
+                assert!(text.contains(&format!("\"id\": {}", message["id"])));
+            }
+        }
+        assert!(temp_files_under(&archive.root).is_empty());
+    }
+
+    /// A batch whose later file cannot be staged publishes none of its entries.
+    /// Writing entries one at a time left the first entry and the second's
+    /// canonical file behind.
+    #[cfg(unix)]
+    #[test]
+    fn write_message_batch_bundle_publishes_nothing_when_a_later_file_cannot_be_staged() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let recipients = vec!["RecipientAgent".to_string()];
+        let first = serde_json::json!({
+            "id": 91,
+            "subject": "First entry",
+            "created_ts": "2026-01-15T11:00:00Z",
+            "project": "proj",
+        });
+        let second = serde_json::json!({
+            "id": 92,
+            "subject": "Second entry",
+            "created_ts": "2026-01-15T11:01:00Z",
+            "project": "proj",
+        });
+        let (first_paths, _, _) =
+            message_paths_for_bundle(&archive, &first, "SenderAgent", &recipients).unwrap();
+        let (second_paths, _, _) =
+            message_paths_for_bundle(&archive, &second, "SenderAgent", &recipients).unwrap();
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, "outside").unwrap();
+        ensure_parent_dir(&second_paths.outbox).unwrap();
+        symlink(&outside, &second_paths.outbox).unwrap();
+        let entries = [&first, &second].map(|message| MessageBundleBatchEntry {
+            message,
+            body_md: "body",
+            sender: "SenderAgent",
+            recipients: &recipients,
+            extra_paths: &[],
+        });
+
+        let err = write_message_batch_bundle(&archive, &config, &entries, None)
+            .expect_err("a symlinked bundle target refuses the batch");
+        assert!(
+            err.to_string()
+                .contains("refusing to write through symlink"),
+            "unexpected error: {err}"
+        );
+        for path in [
+            &first_paths.canonical,
+            &first_paths.outbox,
+            &second_paths.canonical,
+        ]
+        .into_iter()
+        .chain(&first_paths.inbox)
+        {
+            assert!(
+                !path.exists(),
+                "{} was published although the batch failed before publication",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+        assert!(temp_files_under(&archive.root).is_empty());
+    }
+
     #[test]
     fn test_write_message_bundle_rejects_path_traversal_agent_names() {
         let tmp = TempDir::new().unwrap();
@@ -15954,6 +17565,10 @@ mod tests {
         let outside = outside_tmp.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
 
+        // Production order: the fence before the test lock. Holding only the
+        // test lock here while `write_text` waits on the fence would deadlock
+        // against a concurrent atomic write that holds the fence.
+        let _mutation = ArchiveMutationGuard::begin();
         let _guard = atomic_write_test_guard();
         ATOMIC_WRITE_TMP_COUNTER.store(0, Ordering::Relaxed);
         for seq in 0..8 {
@@ -19203,6 +20818,11 @@ mod tests {
             sample_epoch_stamp_for_test(&config.storage_root).is_none(),
             "a non-hex token must disable the epoch protocol"
         );
+        fs::write(&epoch_path, format!("1{}", "ab".repeat(65))).unwrap();
+        assert!(
+            sample_epoch_stamp_for_test(&config.storage_root).is_none(),
+            "an oversized token must disable the epoch protocol"
+        );
     }
 
     #[test]
@@ -19483,6 +21103,255 @@ mod tests {
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
     }
 
+    #[test]
+    fn wbq_message_retry_backoff_releases_fence_for_reservations() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_message_retry_backoff_releases_fence_for_reservations",
+        ) {
+            return;
+        }
+
+        for message_count in [1_i64, 2] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let reservation_project = "retry-unrelated-reservation";
+            let reservation_archive = ensure_archive(&config, reservation_project).unwrap();
+            let message_project = "retry-obstructed-messages";
+            let obstructed = reservation_archive
+                .repo_root
+                .join("projects")
+                .join(message_project);
+            let retained = obstructed.with_extension("retained");
+            // An ordinary file in place of the project directory makes the
+            // first real archive attempt fail with a retryable I/O error.
+            fs::write(&obstructed, b"temporary directory obstruction").unwrap();
+            let reservation = publication_test_reservation(message_count, "aabbccdd");
+            let reservation_op = WriteOp::FileReservation {
+                project_slug: reservation_project.to_string(),
+                config: config.clone(),
+                reservations: vec![reservation.clone()],
+            };
+            let retained_for_retry = retained.clone();
+            WBQ_BEFORE_RETRY_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Another thread cannot reuse the failing writer's nested
+                    // guard. Admission therefore proves the global fence is
+                    // available before its retry, without racing a sleep.
+                    let result = std::thread::spawn(move || write_op_sync_direct(&reservation_op))
+                        .join()
+                        .unwrap();
+                    assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+                    flush_async_commits();
+                    fs::rename(&obstructed, &retained_for_retry).unwrap();
+                }));
+            });
+
+            let envelopes: Vec<_> = (41..41 + message_count)
+                .map(|id| WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(backlog_test_message_op(&config, message_project, id)),
+                })
+                .collect();
+            wbq_execute_envelopes(&envelopes).expect(
+                "both single and batched messages must succeed after the obstruction clears",
+            );
+            flush_async_commits();
+            assert_eq!(
+                fs::read(&retained).unwrap(),
+                b"temporary directory obstruction",
+                "the real failed attempt must have reached its retry boundary",
+            );
+            let (stable, alias) = publication_test_paths(&reservation_archive, &reservation);
+            for path in [stable, alias] {
+                let published: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(published, reservation);
+            }
+
+            let message_archive = ensure_archive(&config, message_project).unwrap();
+            for envelope in &envelopes {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    sender,
+                    recipients,
+                    ..
+                } = envelope.op.as_ref()
+                else {
+                    unreachable!();
+                };
+                let (paths, _, _) =
+                    message_paths_for_bundle(&message_archive, message_json, sender, recipients)
+                        .unwrap();
+                for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                    let (message, body) = read_message_file(path).unwrap();
+                    assert_eq!(message["id"], message_json["id"]);
+                    assert_eq!(body.trim(), body_md.as_str());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wbq_drain_survives_writer_panics_without_losing_remaining_ops() {
+        const CHILD: &str = "AM_TEST_WBQ_PANIC_SCENARIO";
+        const COMPLETED: &str = "WBQ writer panic recovery verified";
+        let Ok(scenario) = std::env::var(CHILD) else {
+            // Failure accounting and the durability ledger are process-wide.
+            // Isolate both the single/batched paths and the final shutdown drain
+            // from other tests instead of resetting their shared state.
+            for scenario in ["single", "batch", "shutdown"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::wbq_drain_survives_writer_panics_without_losing_remaining_ops",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, scenario)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            }
+            return;
+        };
+
+        let final_drain = scenario == "shutdown";
+        let group_size: u64 = if scenario == "batch" { 2 } else { 1 };
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "wbq-panic-recovery";
+        let archive = ensure_archive(&config, project).unwrap();
+        let partial_op = backlog_test_message_op(&config, project, 41);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let depth = Arc::new(AtomicU64::new(0));
+        let profile_op = |name: &str| WriteOp::AgentProfile {
+            project_slug: project.to_string(),
+            config: config.clone(),
+            agent_json: serde_json::json!({"name": name, "program": "test", "model": "test"}),
+        };
+        if final_drain {
+            tx.send(WbqMsg::Shutdown).unwrap();
+            assert_eq!(
+                wbq_enqueue_with_sender(&tx, &depth, profile_op("WarmupAgent")),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        for id in 41..41 + i64::try_from(group_size).unwrap() {
+            assert_eq!(
+                wbq_enqueue_with_sender(&tx, &depth, backlog_test_message_op(&config, project, id)),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        // The profile separates message groups without using a fake writer.
+        assert_eq!(
+            wbq_enqueue_with_sender(&tx, &depth, profile_op("FollowingAgent")),
+            WbqEnqueueResult::Enqueued,
+        );
+        assert_eq!(
+            wbq_enqueue_with_sender(&tx, &depth, backlog_test_message_op(&config, project, 99)),
+            WbqEnqueueResult::Enqueued,
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(WbqMsg::Flush(done_tx)).unwrap();
+
+        let worker_depth = Arc::clone(&depth);
+        let panic_archive = archive.clone();
+        let worker = std::thread::spawn(move || {
+            let inject_panic: Box<dyn FnOnce()> = Box::new(move || {
+                // Materialize only the first message before the batch fails.
+                // All its ops still need verification, including this one.
+                wbq_execute_op_inner(&partial_op).unwrap();
+                let _: Result<()> = with_project_lock(&panic_archive, || {
+                    panic!("injected archive writer panic after partial materialization");
+                });
+            });
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(if final_drain {
+                    // The first batch consumes Shutdown + one healthy warmup
+                    // op; the next execution is in the final-drain branch.
+                    Box::new(move || {
+                        WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                            *slot.borrow_mut() = Some(inject_panic);
+                        });
+                    })
+                } else {
+                    inject_panic
+                });
+            });
+            wbq_drain_loop(
+                Arc::new(Mutex::new(Some(rx))),
+                worker_depth,
+                8,
+                if final_drain { 1 } else { 8 },
+            );
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a panicked write must not lose later writes or the flush acknowledgement");
+        if !final_drain {
+            assert!(
+                !worker.is_finished(),
+                "the archive worker must remain alive"
+            );
+            tx.send(WbqMsg::Shutdown).unwrap();
+        }
+        worker.join().expect("the archive panic must be contained");
+        flush_async_commits();
+
+        let stats = wbq_stats();
+        assert_eq!(stats.enqueued, group_size + 2 + u64::from(final_drain));
+        assert_eq!(stats.drained, stats.enqueued);
+        assert_eq!(stats.errors, group_size);
+        assert_eq!(stats.unrecoverable_errors, group_size);
+        assert!(
+            durability_degraded(),
+            "partial writes must not report healthy"
+        );
+        assert!(stats.last_unrecoverable_error_us > 0);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        assert!(
+            read_agent_profile(&archive, "FollowingAgent")
+                .unwrap()
+                .is_some()
+        );
+
+        for id in [41, 99] {
+            let WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                ..
+            } = backlog_test_message_op(&config, project, id)
+            else {
+                unreachable!();
+            };
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+            for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+                let (message, body) = read_message_file(path).unwrap();
+                assert_eq!(message["id"], id);
+                assert_eq!(body.trim(), body_md);
+            }
+        }
+        if group_size == 2 {
+            let mut missing_paths = Vec::new();
+            collect_canonical_message_paths_with_id(
+                &archive.root.join("messages"),
+                42,
+                &mut missing_paths,
+            );
+            assert!(missing_paths.is_empty());
+        }
+        println!("{COMPLETED}");
+    }
+
     // ── Ack-fast durable archive retry backlog (br-ack-fast-storage-commit-reply-3ac88) ──
 
     fn backlog_test_message_op(config: &Config, slug: &str, id: i64) -> WriteOp {
@@ -19612,6 +21481,217 @@ mod tests {
         // The message is now durably in the git archive.
         let archive = ensure_archive(&config, "local-drain").unwrap();
         assert!(!get_recent_commits(&archive, 4, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_retries_partial_bundle_after_writer_panic() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_retries_partial_bundle_after_writer_panic",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "backlog-panic-partial").unwrap();
+        let op = backlog_test_message_op(&config, "backlog-panic-partial", 8081);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = &op
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, message_json, sender, recipients).unwrap();
+        let canonical_content = render_message_bundle_content(message_json, body_md).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push(op, 8_192), ArchiveBacklogPush::Queued);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        let panic_archive = archive.clone();
+        let partial_path = paths.canonical.clone();
+        let partial_content = canonical_content.clone();
+        WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let _: Result<()> = with_project_lock(&panic_archive, || {
+                    // Publish one real, durable copy before unwinding both
+                    // locks. Retry must preserve it and fill the missing copies.
+                    ensure_parent_dir(&partial_path)?;
+                    let mut writes = StagedArchiveWrites::default();
+                    writes.add(partial_path, partial_content.as_bytes())?;
+                    writes.publish()?;
+                    panic!("injected archive writer panic after canonical publication");
+                });
+            }));
+        });
+
+        let errors_before = mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_direct_write_errors_total
+            .load();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(1)
+        ));
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(
+            std::fs::read_to_string(&paths.canonical).unwrap(),
+            canonical_content
+        );
+        assert!(!paths.outbox.exists());
+        assert!(!paths.inbox[0].exists());
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .archive_direct_write_errors_total
+                .load(),
+            errors_before + 1
+        );
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        flush_async_commits();
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(!journal.exists());
+        let resolved = journal
+            .parent()
+            .unwrap()
+            .join("resolved")
+            .join(journal.file_name().unwrap());
+        assert_eq!(std::fs::read(resolved).unwrap(), journal_bytes);
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), canonical_content);
+        }
+        let mut canonical_paths = Vec::new();
+        collect_canonical_message_paths_with_id(
+            &archive.root.join("messages"),
+            8081,
+            &mut canonical_paths,
+        );
+        assert_eq!(canonical_paths, vec![paths.canonical]);
+    }
+
+    #[test]
+    fn archive_backlog_dead_letters_writer_panics_and_drains_following_mail() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_dead_letters_writer_panics_and_drains_following_mail",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "backlog-panic-poison";
+        let archive = ensure_archive(&config, project).unwrap();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, project, 8082), 8_192),
+            ArchiveBacklogPush::Queued
+        );
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let journal_bytes = std::fs::read(&journal).unwrap();
+        assert_eq!(
+            backlog.push(backlog_test_message_op(&config, project, 8083), 8_192),
+            ArchiveBacklogPush::Queued
+        );
+
+        for attempt in 1..=ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            let panic_archive = archive.clone();
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let _: Result<()> = with_project_lock(&panic_archive, || {
+                        panic!("private message content from injected writer panic");
+                    });
+                }));
+            });
+            let outcome = backlog.drain_step();
+            if attempt < ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+                assert!(matches!(outcome, ArchiveBacklogDrainStep::RetryLater(n) if n == attempt));
+                assert_eq!(backlog.backlog_state().0, 2);
+                assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+            } else {
+                assert!(matches!(outcome, ArchiveBacklogDrainStep::DeadLettered));
+            }
+        }
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert!(!journal.exists());
+        let failed = journal
+            .parent()
+            .unwrap()
+            .join("failed")
+            .join(journal.file_name().unwrap());
+        assert_eq!(std::fs::read(failed).unwrap(), journal_bytes);
+        let ledger =
+            std::fs::read_to_string(config.storage_root.join("doctor/backlog_dead_letter.jsonl"))
+                .unwrap();
+        let records: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["attempts"], ARCHIVE_BACKLOG_MAX_ATTEMPTS);
+        assert_eq!(records[0]["op"]["message_json"]["id"], 8082);
+        assert!(
+            records[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("archive write panicked")
+        );
+        assert!(!ledger.contains("private message content"));
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        flush_async_commits();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Empty
+        ));
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            sender,
+            recipients,
+            ..
+        } = backlog_test_message_op(&config, project, 8083)
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            let (message, body) = read_message_file(path).unwrap();
+            assert_eq!(message["id"], 8083);
+            assert_eq!(body.trim(), body_md);
+        }
     }
 
     #[test]
@@ -23029,6 +25109,72 @@ mod tests {
     }
 
     #[test]
+    fn archive_read_generation_tracks_external_epoch_changes_without_git_changes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let epoch_path = repo.path().join(ARCHIVE_EPOCH_FILE_NAME);
+        with_archive_snapshot_publication_fence(|| {
+            let absent = archive_read_generation(tmp.path()).unwrap();
+            assert!(absent.epoch_token.is_none());
+            fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+            let first = archive_read_generation(tmp.path()).unwrap();
+            assert_ne!(
+                absent, first,
+                "a newly participating writer invalidates reads"
+            );
+
+            // Disk-only rewrite models another process: no local counter,
+            // commit or index change can explain the invalidation.
+            fs::write(&epoch_path, format!("1{}", "cd".repeat(16))).unwrap();
+            let second = archive_read_generation(tmp.path()).unwrap();
+            assert_eq!(first.head, second.head);
+            assert_eq!(first.index, second.index);
+            assert_eq!(first.mutation_epoch, second.mutation_epoch);
+            assert_ne!(first, second);
+
+            fs::rename(&epoch_path, tmp.path().join("retained-epoch")).unwrap();
+            let missing = archive_read_generation(tmp.path()).unwrap();
+            assert!(missing.epoch_token.is_none());
+            assert_ne!(
+                second, missing,
+                "losing the token cannot retain a cached read"
+            );
+        });
+    }
+
+    #[test]
+    fn archive_read_generation_rejects_an_epoch_rewrite_during_sampling() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let epoch_path = repo.path().join(ARCHIVE_EPOCH_FILE_NAME);
+        with_archive_snapshot_publication_fence(|| {
+            fs::write(&epoch_path, format!("1{}", "ab".repeat(16))).unwrap();
+            let before = archive_read_generation(tmp.path()).unwrap();
+            ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::write(&epoch_path, format!("1{}", "cd".repeat(16))).unwrap();
+                }));
+            });
+            let sampled = archive_read_generation(tmp.path());
+            let pending =
+                ARCHIVE_READ_AFTER_FIRST_SAMPLE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            assert!(
+                pending.is_none(),
+                "the real sampling path must run the rewrite"
+            );
+            assert!(
+                matches!(sampled, Err(StorageError::LockContention { message })
+                if message.contains("changed while being sampled"))
+            );
+            let after = archive_read_generation(tmp.path()).unwrap();
+            assert_eq!(before.head, after.head);
+            assert_eq!(before.index, after.index);
+            assert_eq!(before.mutation_epoch, after.mutation_epoch);
+            assert_ne!(before, after);
+        });
+    }
+
+    #[test]
     fn archive_read_generation_refuses_an_active_git_index_lock() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -23156,12 +25302,9 @@ mod tests {
             r#"{"a":1}"#,
             "touch AgentA",
         );
-        // Commit times have one-second resolution and the budget walk below
-        // relies on Sort::TIME ordering; same-second ties break arbitrarily
-        // (on fast hosts all six commits land in one second and the AgentA
-        // commit can be visited inside the budget window). Guarantee the
-        // AgentB commits are strictly newer.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // The lazy append-only walk follows ancestry even when all commits
+        // have the same one-second timestamp. No sleep or process-global
+        // environment override is needed to make this fixture deterministic.
         for i in 0..5 {
             commit_file(
                 "agents/AgentB",
@@ -23179,7 +25322,19 @@ mod tests {
         // AgentB filter returns its commits and never the AgentA one.
         let b_hits = get_recent_commits(&archive, 10, Some("agents/AgentB")).unwrap();
         assert_eq!(b_hits.len(), 5, "all five AgentB commits match");
-        assert!(b_hits.iter().all(|c| c.summary.starts_with("touch AgentB")));
+        assert_eq!(
+            b_hits
+                .iter()
+                .map(|c| c.summary.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "touch AgentB 4",
+                "touch AgentB 3",
+                "touch AgentB 2",
+                "touch AgentB 1",
+                "touch AgentB 0"
+            ]
+        );
 
         // A never-committed path yields nothing (and, crucially, returns).
         let ghost = get_recent_commits(&archive, 10, Some("agents/Ghost")).unwrap();
@@ -23188,16 +25343,426 @@ mod tests {
         // Tight budget: only the 3 newest commits (all AgentB) are examined, so
         // the older AgentA commit falls outside the scan window and is skipped —
         // proving the budget bounds the walk instead of scanning all history.
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("AM_RECENT_COMMITS_SCAN_BUDGET", "3")],
-            || {
-                let bounded = get_recent_commits(&archive, 10, Some("agents/AgentA")).unwrap();
-                assert!(
-                    bounded.is_empty(),
-                    "budget=3 must stop before reaching the older AgentA commit"
-                );
-            },
+        let bounded = collect_recent_commits(
+            &repo,
+            10,
+            Some("projects/recent-commits-filter/agents/AgentA"),
+            3,
+            &mut || true,
+        )
+        .unwrap();
+        assert!(
+            bounded.commits.is_empty(),
+            "budget=3 must stop before reaching the older AgentA commit"
         );
+        assert_eq!(bounded.scanned_commits, 3);
+        assert!(bounded.truncated);
+    }
+
+    /// Construct real Git objects with explicit ancestry/timestamps, independent
+    /// of the archive commit queue, filesystem mtimes, and process environment.
+    fn recent_history_fixture_commit(
+        repo: &Repository,
+        parents: &[git2::Oid],
+        updates: &[(&str, Option<&str>)],
+        timestamp: i64,
+        message: &str,
+    ) -> git2::Oid {
+        let parents: Vec<_> = parents
+            .iter()
+            .map(|oid| repo.find_commit(*oid).unwrap())
+            .collect();
+        let base = parents.first().map(|parent| parent.tree().unwrap());
+        let updates: Vec<_> = updates
+            .iter()
+            .map(|(path, body)| {
+                (
+                    path.to_string(),
+                    body.map(|body| repo.blob(body.as_bytes()).unwrap()),
+                )
+            })
+            .collect();
+        let tree_oid = build_tree_with_updates(repo, base.as_ref(), &updates).unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::new(
+            "HistoryTest",
+            "history@example.test",
+            &git2::Time::new(timestamp, 0),
+        )
+        .unwrap();
+        let parent_refs: Vec<_> = parents.iter().collect();
+        repo.commit(None, &signature, &signature, message, &tree, &parent_refs)
+            .unwrap()
+    }
+
+    fn recent_history_fixture_head(repo: &Repository, oid: git2::Oid) {
+        repo.reference("refs/heads/main", oid, true, "recent history fixture")
+            .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+    }
+
+    #[test]
+    fn recent_commit_history_bounds_unrelated_work_and_keeps_deletions() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("agents/BlueLake/profile.json", Some("base"))],
+            1_000,
+            "root profile",
+        );
+        let deletion = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/BlueLake/profile.json", None)],
+            2_000,
+            "delete profile",
+        );
+        let mut tip = deletion;
+        for number in 0..8 {
+            tip = recent_history_fixture_commit(
+                &repo,
+                &[tip],
+                &[("agents/RedFox/profile.json", Some(&format!("{number}")))],
+                3_000 + number,
+                &format!("unrelated activity {number}"),
+            );
+        }
+        recent_history_fixture_head(&repo, tip);
+        let bounded = collect_recent_commits(
+            &repo,
+            5,
+            Some("agents/BlueLake/profile.json"),
+            3,
+            &mut || true,
+        )
+        .unwrap();
+        assert_eq!(bounded.scanned_commits, 3);
+        assert!(bounded.commits.is_empty());
+        assert!(bounded.truncated);
+
+        let complete = collect_recent_commits(
+            &repo,
+            5,
+            Some("agents/BlueLake/profile.json"),
+            20,
+            &mut || true,
+        )
+        .unwrap();
+        assert_eq!(complete.scanned_commits, 10);
+        assert!(!complete.truncated);
+        assert_eq!(
+            complete
+                .commits
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect::<Vec<_>>(),
+            [deletion.to_string(), root.to_string()],
+        );
+        let unfiltered = collect_recent_commits(&repo, 5, None, 3, &mut || true).unwrap();
+        assert_eq!(unfiltered.commits.len(), 3);
+        assert!(unfiltered.truncated);
+    }
+
+    #[test]
+    fn recent_commit_history_preserves_ancestry_with_skewed_timestamps() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("agents/BlueLake/profile.json", Some("root"))],
+            3_000,
+            "root with a future clock",
+        );
+        let middle = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/BlueLake/profile.json", Some("middle"))],
+            1_000,
+            "middle with an older clock",
+        );
+        let tip = recent_history_fixture_commit(
+            &repo,
+            &[middle],
+            &[("agents/BlueLake/profile.json", Some("tip"))],
+            1_000,
+            "tip with a tied clock",
+        );
+        recent_history_fixture_head(&repo, tip);
+
+        let history =
+            collect_recent_commits(&repo, 10, Some("agents/BlueLake"), 10, &mut || true).unwrap();
+        assert_eq!(
+            history
+                .commits
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect::<Vec<_>>(),
+            [tip.to_string(), middle.to_string(), root.to_string()],
+        );
+        assert!(!history.truncated);
+        assert_eq!(history.scanned_commits, 3);
+
+        let limited =
+            collect_recent_commits(&repo, 1, Some("agents/BlueLake"), 10, &mut || true).unwrap();
+        assert_eq!(limited.commits.len(), 1);
+        assert_eq!(limited.commits[0].sha, tip.to_string());
+        assert_eq!(limited.scanned_commits, 1);
+        assert!(
+            !limited.truncated,
+            "fulfilling the requested limit is a complete result"
+        );
+    }
+
+    #[test]
+    fn recent_commit_history_keeps_merge_side_activity_and_first_parent_diff() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("agents/BlueLake/profile.json", Some("base"))],
+            1_000,
+            "root",
+        );
+        let main = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/RedFox/profile.json", Some("main"))],
+            2_000,
+            "main activity",
+        );
+        let side = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("agents/BlueLake/profile.json", Some("side"))],
+            2_001,
+            "side activity",
+        );
+        let merge = recent_history_fixture_commit(
+            &repo,
+            &[main, side],
+            &[("agents/BlueLake/profile.json", Some("side"))],
+            3_000,
+            "merge side activity",
+        );
+        recent_history_fixture_head(&repo, merge);
+
+        let history =
+            collect_recent_commits(&repo, 10, Some("agents/BlueLake"), 10, &mut || true).unwrap();
+        assert_eq!(history.commits[0].sha, merge.to_string());
+        let shas: BTreeSet<_> = history
+            .commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect();
+        assert_eq!(
+            shas,
+            BTreeSet::from([merge.to_string(), side.to_string(), root.to_string()])
+        );
+        assert_eq!(
+            history.commits.len(),
+            3,
+            "shared merge ancestors must not be duplicated"
+        );
+        assert_eq!(history.scanned_commits, 4);
+        assert!(!history.truncated);
+    }
+
+    #[test]
+    fn recent_commit_history_deadline_keeps_completed_matches() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let unborn = collect_recent_commits(&repo, 8, None, 100, &mut || true).unwrap();
+        assert!(unborn.commits.is_empty());
+        assert!(!unborn.truncated);
+        let mut parent = None;
+        let mut oids = Vec::new();
+        for number in 0..8 {
+            let oid = recent_history_fixture_commit(
+                &repo,
+                &parent.into_iter().collect::<Vec<_>>(),
+                &[("profile.json", Some(&format!("{number}")))],
+                1_000 + number,
+                &format!("activity {number}"),
+            );
+            parent = Some(oid);
+            oids.push(oid);
+        }
+        recent_history_fixture_head(&repo, *oids.last().unwrap());
+
+        // A deterministic clock advancing at every cooperative checkpoint.
+        // Git object reads and history traversal remain real; only the clock
+        // is controlled so this cannot depend on CI speed or thread sleeps.
+        let mut elapsed = Duration::ZERO;
+        let history = collect_recent_commits(&repo, 8, None, 100, &mut || {
+            elapsed += Duration::from_millis(20);
+            elapsed < RECENT_COMMITS_TIME_BUDGET
+        })
+        .unwrap();
+        assert!(history.truncated);
+        assert!(
+            !history.commits.is_empty(),
+            "completed matches must survive deadline exhaustion"
+        );
+        assert!(history.commits.len() < oids.len());
+        for (actual, expected) in history.commits.iter().zip(oids.iter().rev()) {
+            assert_eq!(actual.sha, expected.to_string());
+        }
+
+        let expired = collect_recent_commits(&repo, 8, None, 100, &mut || false).unwrap();
+        assert!(expired.truncated);
+        assert!(expired.commits.is_empty());
+        assert_eq!(expired.scanned_commits, 0);
+        let zero_limit = collect_recent_commits(&repo, 0, None, 100, &mut || false).unwrap();
+        assert!(!zero_limit.truncated);
+        assert!(zero_limit.commits.is_empty());
+        assert_eq!(zero_limit.scanned_commits, 0);
+    }
+
+    #[test]
+    fn recent_commit_history_deadline_interrupts_tree_descent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("projects/p/agents/BlueLake/profile.json", Some("profile"))],
+            1_000,
+            "root",
+        );
+        let commit = repo.find_commit(root).unwrap();
+        let mut filter = CommitPathFilter::new("projects/p/agents/BlueLake/profile.json");
+        let mut elapsed = Duration::ZERO;
+        let interrupted = filter
+            .commit_touches_path(&repo, &commit, &mut || {
+                elapsed += Duration::from_millis(25);
+                elapsed < RECENT_COMMITS_TIME_BUDGET
+            })
+            .unwrap();
+        assert_eq!(
+            interrupted, None,
+            "an incomplete tree lookup must not report a non-match"
+        );
+        assert_eq!(
+            filter.tree_loads, 1,
+            "no deeper Git tree may be loaded past the deadline"
+        );
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &commit, &mut || true)
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn recent_commit_path_filter_skips_large_unchanged_subtrees() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let paths: Vec<_> = (0..2_048)
+            .map(|number| format!("agents/Agent{number:04}/profile.json"))
+            .collect();
+        let updates: Vec<_> = paths
+            .iter()
+            .map(|path| (path.as_str(), Some("profile")))
+            .collect();
+        let root = recent_history_fixture_commit(&repo, &[], &updates, 1_000, "large root");
+        let tip = recent_history_fixture_commit(
+            &repo,
+            &[root],
+            &[("unrelated.json", Some("change"))],
+            2_000,
+            "unrelated change",
+        );
+        let commit = repo.find_commit(tip).unwrap();
+        let mut filter = CommitPathFilter::new("agents/Agent1024/profile.json");
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            filter.tree_loads, 2,
+            "only the two root trees are needed; agents is unchanged"
+        );
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            filter.tree_loads, 2,
+            "a repeated parent/tree identity must reuse the local entry cache"
+        );
+
+        let root_commit = repo.find_commit(root).unwrap();
+        assert_eq!(
+            filter
+                .commit_touches_path(&repo, &root_commit, &mut || true)
+                .unwrap(),
+            Some(true)
+        );
+        let mut missing = CommitPathFilter::new("agents/Ghost/profile.json");
+        assert_eq!(
+            missing
+                .commit_touches_path(&repo, &root_commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            missing.tree_loads, 2,
+            "a root commit lookup must not recursively walk 2,048 profiles"
+        );
+        let mut sibling = CommitPathFilter::new("agents/Agent102/profile.json");
+        assert_eq!(
+            sibling
+                .commit_touches_path(&repo, &root_commit, &mut || true)
+                .unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn recent_commit_path_filter_includes_file_mode_changes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let root = recent_history_fixture_commit(
+            &repo,
+            &[],
+            &[("profile.json", Some("same bytes"))],
+            1_000,
+            "root",
+        );
+        let parent = repo.find_commit(root).unwrap();
+        let tree = parent.tree().unwrap();
+        let blob = tree.get_name("profile.json").unwrap().id();
+        let mut builder = repo.treebuilder(Some(&tree)).unwrap();
+        builder.insert("profile.json", blob, 0o100_755).unwrap();
+        let changed_tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::new(
+            "HistoryTest",
+            "history@example.test",
+            &git2::Time::new(2_000, 0),
+        )
+        .unwrap();
+        let changed = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "mode only",
+                &changed_tree,
+                &[&parent],
+            )
+            .unwrap();
+        let commit = repo.find_commit(changed).unwrap();
+        assert!(commit_touches_path(&repo, &commit, "profile.json"));
+        assert!(!commit_touches_path(&repo, &commit, "profile.json/child"));
     }
 
     /// br-bvq1x.9.7 (ts2): an interrupted gc/repack can leave the branch tip
@@ -24329,6 +26894,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark; unreliable under CI/parallel test load — run with --ignored"]
     fn spill_path_btreeset_benchmark_random_order_stability() {
         use std::time::Instant;
 

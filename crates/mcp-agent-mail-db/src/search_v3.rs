@@ -159,7 +159,8 @@ impl TantivyBridge {
         let compiled = compile_filters(&filter, &self.handles);
 
         // Build text query
-        let parser = LexicalParser::with_defaults(self.handles.subject, self.handles.body);
+        let parser = LexicalParser::with_defaults(self.handles.subject, self.handles.body)
+            .with_text_fields(query.text_fields);
         let outcome = parser.parse(&self.index, &query.text);
 
         let text_query: Box<dyn Query> = match outcome {
@@ -658,6 +659,20 @@ struct MessageWatermark {
 pub(crate) struct LexicalChangeClock {
     revision: i64,
     rewrite_revision: i64,
+}
+
+#[cfg(feature = "hybrid")]
+impl LexicalChangeClock {
+    /// A tail scan is safe only while the source has no rewrites or clock reset.
+    pub(crate) const fn allows_append_from(self, previous: Self) -> bool {
+        self.revision >= previous.revision && self.rewrite_revision == previous.rewrite_revision
+    }
+
+    pub(crate) fn insertions_since(self, previous: Self) -> Option<u64> {
+        self.allows_append_from(previous)
+            .then(|| u64::try_from(self.revision - previous.revision).ok())
+            .flatten()
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -2107,7 +2122,7 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     static BRIDGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    use crate::search_planner::{DocKind, SearchQuery as PlannerQuery};
+    use crate::search_planner::{DocKind, SearchQuery as PlannerQuery, TextFieldScope};
     use tantivy::{TantivyDocument, doc};
 
     fn setup_bridge_with_docs() -> TantivyBridge {
@@ -2184,6 +2199,35 @@ mod tests {
         let results = bridge.search(&query);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn text_field_scope_keeps_every_term_to_its_field() {
+        let bridge = setup_bridge_with_docs();
+        let ids = |text: &str, scope: TextFieldScope| -> Vec<i64> {
+            let mut query = PlannerQuery::messages(text, 1);
+            query.text_fields = scope;
+            let mut ids: Vec<i64> = bridge.search(&query).iter().map(|r| r.id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        // "review" is only in message 1's subject; "steps" only in message
+        // 2's body.
+        assert_eq!(ids("review", TextFieldScope::SubjectAndBody), [1]);
+        assert_eq!(ids("review", TextFieldScope::Subject), [1]);
+        assert_eq!(ids("review", TextFieldScope::Body), [] as [i64; 0]);
+        assert_eq!(ids("steps", TextFieldScope::Subject), [] as [i64; 0]);
+        assert_eq!(ids("steps", TextFieldScope::Body), [2]);
+        // Every word is scoped, not only the first: "engine" is in message
+        // 2's body, not its subject.
+        assert_eq!(ids("steps engine", TextFieldScope::Body), [2]);
+        assert_eq!(
+            ids("checklist engine", TextFieldScope::Subject),
+            [] as [i64; 0]
+        );
+        // Prefix queries are scoped too.
+        assert_eq!(ids("revi*", TextFieldScope::Subject), [1]);
+        assert_eq!(ids("revi*", TextFieldScope::Body), [] as [i64; 0]);
     }
 
     #[test]
@@ -4306,9 +4350,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_bridge_for_tests();
         let source = tempfile::TempDir::new().unwrap();
+        let source_root = source.path().canonicalize().unwrap();
         let index = tempfile::TempDir::new().unwrap();
         let db_path = create_test_db(
-            source.path(),
+            &source_root,
             &[(
                 1,
                 "guarded refresh",
@@ -4981,7 +5026,11 @@ mod tests {
     fn resolve_search_sqlite_path_from_database_url_treats_three_slashes_as_absolute_even_when_relative_shadow_is_missing()
      {
         let dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = dir.path().join("backfill-missing-relative.sqlite3");
+        let absolute_db = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("backfill-missing-relative.sqlite3");
         std::fs::write(&absolute_db, b"seed").expect("write absolute db");
 
         let relative_path = absolute_db

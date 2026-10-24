@@ -283,6 +283,148 @@ impl HealthSignals {
 
         HealthLevel::Green
     }
+
+    /// Explain the observed pressure using the same signals as classification.
+    /// Resource values must come from the snapshot used to construct these
+    /// signals. No probes run here, and stale samples are explicitly excluded.
+    #[must_use]
+    pub fn pressure_detail(
+        &self,
+        system: &crate::metrics::SystemMetricsSnapshot,
+        config: &crate::Config,
+    ) -> String {
+        let mut details = self.queue_pressure_details();
+        for (name, measurement, bytes, level, stale, thresholds) in [
+            (
+                "memory",
+                "rss",
+                system.memory_rss_bytes,
+                self.memory_pressure_level,
+                self.memory_pressure_stale,
+                [
+                    config.memory_warning_mb,
+                    config.memory_critical_mb,
+                    config.memory_fatal_mb,
+                ],
+            ),
+            (
+                "disk",
+                "free",
+                system.disk_effective_free_bytes,
+                self.disk_pressure_level,
+                self.disk_pressure_stale,
+                [
+                    config.disk_space_warning_mb,
+                    config.disk_space_critical_mb,
+                    config.disk_space_fatal_mb,
+                ],
+            ),
+        ] {
+            if stale {
+                details.push(format!(
+                    "{name} pressure sample stale or unavailable; excluded from classification"
+                ));
+            } else if level > 0 {
+                let (label, threshold) = match level {
+                    1 => ("warning", thresholds[0]),
+                    2 => ("critical", thresholds[1]),
+                    _ => ("fatal", thresholds[2]),
+                };
+                details.push(format!(
+                    "{name} {measurement}={bytes} bytes ({} MiB), pressure={label}, configured {label} threshold={threshold} MiB",
+                    bytes / (1024 * 1024)
+                ));
+            }
+        }
+        if details.is_empty() {
+            "no active pressure thresholds breached".to_string()
+        } else {
+            details.join("; ")
+        }
+    }
+
+    fn queue_pressure_details(&self) -> Vec<String> {
+        let signals = [
+            (
+                "pool acquire p95",
+                self.pool_acquire_p95_us,
+                "us",
+                yellow::POOL_ACQUIRE_P95_US,
+                red::POOL_ACQUIRE_P95_US,
+            ),
+            (
+                "pool utilization",
+                self.pool_utilization_pct,
+                "%",
+                yellow::POOL_UTIL_PCT,
+                red::POOL_UTIL_PCT,
+            ),
+            (
+                "pool utilization above 80% for",
+                self.pool_over_80_for_s,
+                "s",
+                yellow::OVER_80_DURATION_S,
+                red::OVER_80_DURATION_S,
+            ),
+            (
+                "write-behind queue depth",
+                self.wbq_depth_pct,
+                "%",
+                yellow::WBQ_DEPTH_PCT,
+                red::WBQ_DEPTH_PCT,
+            ),
+            (
+                "write-behind queue wait p95",
+                self.wbq_queue_p95_us,
+                "us",
+                yellow::QUEUE_WAIT_P95_US,
+                red::QUEUE_WAIT_P95_US,
+            ),
+            (
+                "write-behind queue above 80% for",
+                self.wbq_over_80_for_s,
+                "s",
+                yellow::OVER_80_DURATION_S,
+                red::OVER_80_DURATION_S,
+            ),
+            (
+                "commit queue depth",
+                self.commit_depth_pct,
+                "%",
+                yellow::COMMIT_DEPTH_PCT,
+                red::COMMIT_DEPTH_PCT,
+            ),
+            (
+                "commit queue wait p95",
+                self.commit_queue_p95_us,
+                "us",
+                yellow::QUEUE_WAIT_P95_US,
+                red::QUEUE_WAIT_P95_US,
+            ),
+            (
+                "commit queue above 80% for",
+                self.commit_over_80_for_s,
+                "s",
+                yellow::OVER_80_DURATION_S,
+                red::OVER_80_DURATION_S,
+            ),
+        ];
+        signals
+            .into_iter()
+            .filter_map(|(name, observed, unit, warning, critical)| {
+                let (level, threshold) = if observed >= critical {
+                    ("red", critical)
+                } else if observed >= warning {
+                    ("yellow", warning)
+                } else {
+                    return None;
+                };
+                Some(format!(
+                    "{name}={observed}{unit} >= {level} threshold={threshold}{unit}"
+                ))
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,8 +581,21 @@ pub fn cached_health_level() -> HealthLevel {
 ///
 /// Returns `(new_level, changed)`. Call this periodically (e.g., every
 /// 250ms alongside pool stats sampling) or on each `health_check`.
+#[must_use]
 pub fn refresh_health_level() -> (HealthLevel, bool) {
-    let new = compute_health_level();
+    let snapshot = global_metrics().snapshot();
+    refresh_health_level_from_snapshot(&snapshot, now_micros_u64())
+}
+
+/// Update cached health from an already-observed metrics snapshot.
+///
+/// Health responses use this to keep their level and explanatory signals on
+/// one observation, even if a sampler updates the live metrics while rendering.
+pub fn refresh_health_level_from_snapshot(
+    snapshot: &GlobalMetricsSnapshot,
+    now_us: u64,
+) -> (HealthLevel, bool) {
+    let new = HealthSignals::from_snapshot(snapshot, now_us).classify();
     let prev = CURRENT_LEVEL.swap(new as u8, Ordering::Relaxed);
     let changed = prev != new as u8;
     if changed {
@@ -723,6 +878,104 @@ mod tests {
         s.memory_pressure_level = 0;
         s.disk_pressure_level = red::RESOURCE_PRESSURE_LEVEL;
         assert_eq!(s.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn pressure_detail_attributes_idle_red_to_memory_with_observed_rss() {
+        let config = crate::Config {
+            memory_warning_mb: 2048,
+            memory_critical_mb: 4096,
+            memory_fatal_mb: 8192,
+            ..crate::Config::default()
+        };
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.system.memory_rss_bytes = 9 * 1024 * 1024 * 1024;
+        snap.system.memory_last_sample_us = now_us;
+        // Old queue and pool latency must not get blamed when they are idle.
+        snap.db.pool_acquire_latency_us.p95 = 500_000;
+        snap.storage.wbq_queue_latency_us.p95 = 500_000;
+        snap.storage.commit_queue_latency_us.p95 = 500_000;
+
+        for (level, label, threshold, expected) in [
+            (1, "warning", 2048, HealthLevel::Yellow),
+            (2, "critical", 4096, HealthLevel::Red),
+            (3, "fatal", 8192, HealthLevel::Red),
+        ] {
+            snap.system.memory_pressure_level = level;
+            let signals = HealthSignals::from_snapshot(&snap, now_us);
+            assert_eq!(signals.classify(), expected);
+            let detail = signals.pressure_detail(&snap.system, &config);
+            assert!(detail.contains("memory rss=9663676416 bytes (9216 MiB)"));
+            assert!(detail.contains(&format!("pressure={label}")));
+            assert!(detail.contains(&format!("configured {label} threshold={threshold} MiB")));
+            assert!(!detail.contains("pool"), "{detail}");
+            assert!(!detail.contains("queue"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn pressure_detail_keeps_disk_and_concurrent_queue_causes() {
+        let config = crate::Config {
+            disk_space_critical_mb: 100,
+            ..crate::Config::default()
+        };
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.system.disk_pressure_level = 2;
+        snap.system.disk_last_sample_us = now_us;
+        snap.system.disk_effective_free_bytes = 80 * 1024 * 1024;
+        snap.storage.wbq_depth = 80;
+        snap.storage.wbq_capacity = 100;
+        snap.storage.wbq_enqueued_total = 80;
+        snap.storage.commit_pending_requests = 50;
+        snap.storage.commit_soft_cap = 100;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.classify(), HealthLevel::Red);
+        let detail = signals.pressure_detail(&snap.system, &config);
+        assert!(detail.contains("disk free=83886080 bytes (80 MiB)"));
+        assert!(detail.contains("configured critical threshold=100 MiB"));
+        assert!(detail.contains("write-behind queue depth=80% >= red threshold=80%"));
+        assert!(detail.contains("commit queue depth=50% >= yellow threshold=50%"));
+        assert!(!detail.contains("memory"), "{detail}");
+    }
+
+    #[test]
+    fn pressure_detail_excludes_stale_samples_and_explains_live_pressure() {
+        let config = crate::Config::default();
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.system.memory_pressure_level = 3;
+        snap.system.memory_last_sample_us = 0;
+        snap.system.disk_pressure_level = 3;
+        snap.system.disk_last_sample_us =
+            now_us - (RESOURCE_PRESSURE_STALE_AFTER_S + 1) * 1_000_000;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+        let detail = signals.pressure_detail(&snap.system, &config);
+        assert!(detail.contains("memory pressure sample stale or unavailable; excluded"));
+        assert!(detail.contains("disk pressure sample stale or unavailable; excluded"));
+        assert!(!detail.contains("pressure=fatal"), "{detail}");
+
+        snap.db.pool_utilization_pct = 90;
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+        assert_eq!(signals.classify(), HealthLevel::Red);
+        let detail = signals.pressure_detail(&snap.system, &config);
+        assert!(detail.contains("pool utilization=90% >= red threshold=90%"));
+        assert!(detail.contains("memory pressure sample stale or unavailable; excluded"));
+    }
+
+    #[test]
+    fn pressure_detail_healthy_snapshot_has_no_breach() {
+        let snap = GlobalMetrics::default().snapshot();
+        let signals = HealthSignals::from_snapshot(&snap, 1_000_000_000);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+        assert_eq!(
+            signals.pressure_detail(&snap.system, &crate::Config::default()),
+            "no active pressure thresholds breached"
+        );
     }
 
     #[test]

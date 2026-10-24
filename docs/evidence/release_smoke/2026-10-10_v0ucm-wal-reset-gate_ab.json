@@ -1,0 +1,2321 @@
+{
+  "schema": "br-v0ucm-ab-v1",
+  "beads": [
+    "br-v0ucm",
+    "br-9bwnb"
+  ],
+  "issue": "GH#345",
+  "author": "CopperGoose (Claude Opus 5.5)",
+  "changes_under_test": {
+    "gate (br-v0ucm)": "db pool.rs WalResetGate: DbPool::acquire waits (bounded 2 s) while closed. queries.rs commit_tx: when the post-commit PASSIVE checkpoint is refused and the WAL exceeds journal_size_limit (min 1 MiB), close the gate, retry a zero-wait PRAGMA wal_checkpoint(TRUNCATE) every 1 ms until in-flight transactions drain (250 ms budget, 1 s cooldown on failure), reopen; a truncate also publishes the commit so the connection is kept.",
+    "9bwnb (br-9bwnb)": "storage lib.rs: reservation artifacts written + fdatasynced under .tmp-* names outside ARCHIVE_PUBLICATION_FENCE; the fence covers only the renames."
+  },
+  "attribution": "Paced 60-agent load on the 9bwnb build with commit_tx debug tracing: 100% of contended post-commit checkpoints return busy=1 checkpointed=0 (fsqlite-core 0.4.10 refuses any checkpoint while a concurrent transaction is active). The WAL reset only in idle gaps (17-32 MB) until load became continuous at ~140 s, then grew ~1 MB/s to 322 MB; every retired-and-reopened connection rescans it.",
+  "decision_rule_predeclared_2026_10_10T11_36Z": "gate9 vs base WIN iff in BOTH rounds reservation p50 and p90 >= 2x better, last-60s send p90 <= 2x base, errors not higher; gate vs base no-regression: p50/p90 within +25%; gate9 vs patched: last-window send p90 drops, WAL peak < 64 MB.",
+  "builds": {
+    "base": {
+      "source": "origin/main f1fc184c (clean)",
+      "release_am_sha256": "1d4d18edffccbf195649966e418a458058246e73d0135842850603b633913e64"
+    },
+    "patched": {
+      "source": "f1fc184c + br-9bwnb storage patch",
+      "release_am_sha256": "720aff60f77418032ef21de9ccc4e046658db821f58bfe265a8a6a14afaa5d92"
+    },
+    "gate": {
+      "source": "f1fc184c + WAL reset gate",
+      "patch_sha256": "bceb07028d5fe4f52566876e096053266bd2eb263057bb166a12c329da8296a2",
+      "release_am_sha256": "299f2890f505745b5c7d7e3f65e962a0baac8a1da2379ac438d737c32c1eb612"
+    },
+    "gate9": {
+      "source": "f1fc184c + br-9bwnb + WAL reset gate",
+      "patch_sha256": "47fc1dcd37584a3b67546fad41ab03c8e3cff56093bfb8597c6074470873fe27",
+      "release_am_sha256": "9ee501c695596f96deddb8e107539b5c3db779c5b5917e0a288e870c29e6fe45"
+    }
+  },
+  "paced_equal_load": {
+    "method": "paced_swarm.py: 60 agents, one iteration per agent every 6 s on a fixed schedule (send, fetch, 30% reserve+release), 300 s; identical offered load for all builds; WAL file size sampled every 5 s",
+    "order_base_gate9_gate_patched_patched_gate_gate9_base": [
+      {
+        "run": "1-base",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "7.03",
+          "4.65",
+          "3.29"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.06,
+            "p90": 0.124,
+            "p99": 0.348,
+            "max": 0.842,
+            "mean": 0.076,
+            "outcomes": {
+              "ok": 2999,
+              "error": 1
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.156,
+            "p90": 14.953,
+            "p99": 19.558,
+            "max": 22.239,
+            "mean": 10.491,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.302,
+            "p90": 15.751,
+            "p99": 19.61,
+            "max": 20.864,
+            "mean": 10.579,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.141,
+            "p90": 0.324,
+            "p99": 1.454,
+            "max": 4.051,
+            "mean": 0.204,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 17,
+          "archive_wbq_p99_ms": 13744,
+          "archive_commit_queue_p99_ms": 380503,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 223,
+            "slow": 16
+          },
+          "30": {
+            "calls": 214,
+            "slow": 0
+          },
+          "60": {
+            "calls": 224,
+            "slow": 0
+          },
+          "90": {
+            "calls": 226,
+            "slow": 0
+          },
+          "120": {
+            "calls": 270,
+            "slow": 0
+          },
+          "150": {
+            "calls": 213,
+            "slow": 0
+          },
+          "180": {
+            "calls": 215,
+            "slow": 0
+          },
+          "210": {
+            "calls": 243,
+            "slow": 0
+          },
+          "240": {
+            "calls": 261,
+            "slow": 0
+          },
+          "270": {
+            "calls": 200,
+            "slow": 0
+          },
+          "300": {
+            "calls": 224,
+            "slow": 0
+          },
+          "330": {
+            "calls": 243,
+            "slow": 0
+          },
+          "360": {
+            "calls": 244,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 30603392,
+        "wal_samples_5s": 79,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.315,
+            1.096
+          ],
+          [
+            0.121,
+            0.271
+          ],
+          [
+            0.117,
+            0.197
+          ],
+          [
+            0.123,
+            0.186
+          ],
+          [
+            0.149,
+            0.251
+          ]
+        ]
+      },
+      {
+        "run": "2-gate9",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "5.08",
+          "5.29",
+          "3.98"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.056,
+            "p90": 0.113,
+            "p99": 0.294,
+            "max": 0.837,
+            "mean": 0.07,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.169,
+            "p90": 2.502,
+            "p99": 8.319,
+            "max": 11.196,
+            "mean": 0.766,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.216,
+            "p90": 1.866,
+            "p99": 7.746,
+            "max": 11.965,
+            "mean": 0.683,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.139,
+            "p90": 0.399,
+            "p99": 3.577,
+            "max": 4.955,
+            "mean": 0.295,
+            "outcomes": {
+              "ok": 2999,
+              "error": 1
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 6086,
+          "archive_commit_queue_p99_ms": 42741,
+          "git_commit_p99_ms": 263
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 278,
+            "slow": 83
+          },
+          "30": {
+            "calls": 322,
+            "slow": 11
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16970312,
+        "wal_samples_5s": 61,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.386,
+            2.863
+          ],
+          [
+            0.129,
+            0.229
+          ],
+          [
+            0.12,
+            0.189
+          ],
+          [
+            0.133,
+            0.186
+          ],
+          [
+            0.144,
+            0.209
+          ]
+        ]
+      },
+      {
+        "run": "3-gate",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "4.97",
+          "4.91",
+          "4.21"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.055,
+            "p90": 0.115,
+            "p99": 0.291,
+            "max": 1.132,
+            "mean": 0.07,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.348,
+            "p90": 14.936,
+            "p99": 18.166,
+            "max": 19.246,
+            "mean": 10.397,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.704,
+            "p90": 15.704,
+            "p99": 18.372,
+            "max": 21.904,
+            "mean": 10.831,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.128,
+            "p90": 0.319,
+            "p99": 1.382,
+            "max": 2.521,
+            "mean": 0.19,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 12109,
+          "archive_commit_queue_p99_ms": 382177,
+          "git_commit_p99_ms": 7116
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 236,
+            "slow": 8
+          },
+          "30": {
+            "calls": 211,
+            "slow": 0
+          },
+          "60": {
+            "calls": 206,
+            "slow": 0
+          },
+          "90": {
+            "calls": 223,
+            "slow": 0
+          },
+          "120": {
+            "calls": 248,
+            "slow": 0
+          },
+          "150": {
+            "calls": 202,
+            "slow": 0
+          },
+          "180": {
+            "calls": 204,
+            "slow": 0
+          },
+          "210": {
+            "calls": 257,
+            "slow": 0
+          },
+          "240": {
+            "calls": 236,
+            "slow": 0
+          },
+          "270": {
+            "calls": 273,
+            "slow": 0
+          },
+          "300": {
+            "calls": 196,
+            "slow": 0
+          },
+          "330": {
+            "calls": 245,
+            "slow": 0
+          },
+          "360": {
+            "calls": 263,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16772552,
+        "wal_samples_5s": 80,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.291,
+            1.161
+          ],
+          [
+            0.124,
+            0.311
+          ],
+          [
+            0.105,
+            0.194
+          ],
+          [
+            0.107,
+            0.187
+          ],
+          [
+            0.125,
+            0.22
+          ]
+        ]
+      },
+      {
+        "run": "4-patched",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "9.49",
+          "6.74",
+          "5.11"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.074,
+            "p90": 0.26,
+            "p99": 0.631,
+            "max": 0.921,
+            "mean": 0.121,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.254,
+            "p90": 3.14,
+            "p99": 8.098,
+            "max": 11.192,
+            "mean": 0.985,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.328,
+            "p90": 2.471,
+            "p99": 8.326,
+            "max": 11.084,
+            "mean": 1.004,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.191,
+            "p90": 7.888,
+            "p99": 10.086,
+            "max": 11.652,
+            "mean": 1.582,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 263,
+          "database_write_p99_ms": 66,
+          "archive_wbq_p99_ms": 5089,
+          "archive_commit_queue_p99_ms": 50074,
+          "git_commit_p99_ms": 263
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 263,
+            "slow": 64
+          },
+          "30": {
+            "calls": 337,
+            "slow": 2
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 289,
+            "slow": 213
+          },
+          "270": {
+            "calls": 194,
+            "slow": 194
+          },
+          "300": {
+            "calls": 117,
+            "slow": 116
+          }
+        },
+        "wal_bytes_peak": 191007352,
+        "wal_samples_5s": 67,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.377,
+            2.168
+          ],
+          [
+            0.13,
+            0.227
+          ],
+          [
+            0.126,
+            0.186
+          ],
+          [
+            0.213,
+            0.388
+          ],
+          [
+            6.42,
+            9.103
+          ]
+        ]
+      },
+      {
+        "run": "5-patched",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "10.06",
+          "8.60",
+          "6.35"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.089,
+            "p90": 0.353,
+            "p99": 0.618,
+            "max": 1.142,
+            "mean": 0.151,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.388,
+            "p90": 3.112,
+            "p99": 7.392,
+            "max": 10.018,
+            "mean": 1.045,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.514,
+            "p90": 3.117,
+            "p99": 8.65,
+            "max": 11.507,
+            "mean": 1.194,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.275,
+            "p90": 10.092,
+            "p99": 13.546,
+            "max": 14.637,
+            "mean": 2.562,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 263,
+          "database_write_p99_ms": 66,
+          "archive_wbq_p99_ms": 5004,
+          "archive_commit_queue_p99_ms": 49323,
+          "git_commit_p99_ms": 263
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 271,
+            "slow": 26
+          },
+          "30": {
+            "calls": 329,
+            "slow": 0
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 297,
+            "slow": 184
+          },
+          "240": {
+            "calls": 195,
+            "slow": 195
+          },
+          "270": {
+            "calls": 178,
+            "slow": 178
+          },
+          "300": {
+            "calls": 143,
+            "slow": 143
+          },
+          "330": {
+            "calls": 86,
+            "slow": 86
+          },
+          "360": {
+            "calls": 1,
+            "slow": 1
+          }
+        },
+        "wal_bytes_peak": 249552552,
+        "wal_samples_5s": 74,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.359,
+            1.589
+          ],
+          [
+            0.127,
+            0.216
+          ],
+          [
+            0.13,
+            0.183
+          ],
+          [
+            0.481,
+            4.756
+          ],
+          [
+            8.842,
+            11.255
+          ]
+        ]
+      },
+      {
+        "run": "6-gate",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "4.65",
+          "5.77",
+          "5.79"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.054,
+            "p90": 0.118,
+            "p99": 0.291,
+            "max": 0.94,
+            "mean": 0.07,
+            "outcomes": {
+              "ok": 2998,
+              "error": 2
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.046,
+            "p90": 15.085,
+            "p99": 18.093,
+            "max": 20.473,
+            "mean": 10.382,
+            "outcomes": {
+              "ok": 885,
+              "error": 1
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.718,
+            "p90": 16.052,
+            "p99": 20.214,
+            "max": 22.73,
+            "mean": 11.112,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.127,
+            "p90": 0.311,
+            "p99": 2.362,
+            "max": 3.775,
+            "mean": 0.209,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 17700,
+          "archive_commit_queue_p99_ms": 383437,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 229,
+            "slow": 42
+          },
+          "30": {
+            "calls": 206,
+            "slow": 0
+          },
+          "60": {
+            "calls": 218,
+            "slow": 0
+          },
+          "90": {
+            "calls": 209,
+            "slow": 0
+          },
+          "120": {
+            "calls": 275,
+            "slow": 0
+          },
+          "150": {
+            "calls": 200,
+            "slow": 0
+          },
+          "180": {
+            "calls": 199,
+            "slow": 0
+          },
+          "210": {
+            "calls": 228,
+            "slow": 0
+          },
+          "240": {
+            "calls": 282,
+            "slow": 0
+          },
+          "270": {
+            "calls": 222,
+            "slow": 0
+          },
+          "300": {
+            "calls": 202,
+            "slow": 0
+          },
+          "330": {
+            "calls": 223,
+            "slow": 0
+          },
+          "360": {
+            "calls": 301,
+            "slow": 0
+          },
+          "390": {
+            "calls": 6,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16797272,
+        "wal_samples_5s": 80,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.307,
+            1.98
+          ],
+          [
+            0.116,
+            0.286
+          ],
+          [
+            0.105,
+            0.201
+          ],
+          [
+            0.114,
+            0.2
+          ],
+          [
+            0.118,
+            0.197
+          ]
+        ]
+      },
+      {
+        "run": "7-gate9",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "6.33",
+          "6.21",
+          "5.99"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.056,
+            "p90": 0.111,
+            "p99": 0.273,
+            "max": 0.742,
+            "mean": 0.069,
+            "outcomes": {
+              "ok": 2998,
+              "error": 2
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 0.166,
+            "p90": 3.485,
+            "p99": 7.723,
+            "max": 11.075,
+            "mean": 0.875,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 0.217,
+            "p90": 3.267,
+            "p99": 7.571,
+            "max": 11.699,
+            "mean": 0.87,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.139,
+            "p90": 0.401,
+            "p99": 2.401,
+            "max": 3.41,
+            "mean": 0.244,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 5092,
+          "archive_commit_queue_p99_ms": 53399,
+          "git_commit_p99_ms": 263
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 254,
+            "slow": 43
+          },
+          "30": {
+            "calls": 346,
+            "slow": 2
+          },
+          "60": {
+            "calls": 300,
+            "slow": 0
+          },
+          "90": {
+            "calls": 300,
+            "slow": 0
+          },
+          "120": {
+            "calls": 300,
+            "slow": 0
+          },
+          "150": {
+            "calls": 300,
+            "slow": 0
+          },
+          "180": {
+            "calls": 300,
+            "slow": 0
+          },
+          "210": {
+            "calls": 300,
+            "slow": 0
+          },
+          "240": {
+            "calls": 300,
+            "slow": 0
+          },
+          "270": {
+            "calls": 300,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16677792,
+        "wal_samples_5s": 61,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.393,
+            1.824
+          ],
+          [
+            0.125,
+            0.221
+          ],
+          [
+            0.121,
+            0.179
+          ],
+          [
+            0.133,
+            0.188
+          ],
+          [
+            0.145,
+            0.219
+          ]
+        ]
+      },
+      {
+        "run": "8-base",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "4.74",
+          "5.30",
+          "5.64"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.059,
+            "p90": 0.117,
+            "p99": 0.305,
+            "max": 0.652,
+            "mean": 0.073,
+            "outcomes": {
+              "ok": 2997,
+              "error": 3
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 10.731,
+            "p90": 15.514,
+            "p99": 20.868,
+            "max": 21.867,
+            "mean": 10.456,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.514,
+            "p90": 15.997,
+            "p99": 18.721,
+            "max": 21.854,
+            "mean": 10.763,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.135,
+            "p90": 0.299,
+            "p99": 1.536,
+            "max": 2.274,
+            "mean": 0.195,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 17,
+          "archive_wbq_p99_ms": 11477,
+          "archive_commit_queue_p99_ms": 382061,
+          "git_commit_p99_ms": 9621
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 217,
+            "slow": 6
+          },
+          "30": {
+            "calls": 224,
+            "slow": 0
+          },
+          "60": {
+            "calls": 217,
+            "slow": 0
+          },
+          "90": {
+            "calls": 232,
+            "slow": 0
+          },
+          "120": {
+            "calls": 249,
+            "slow": 0
+          },
+          "150": {
+            "calls": 195,
+            "slow": 0
+          },
+          "180": {
+            "calls": 214,
+            "slow": 0
+          },
+          "210": {
+            "calls": 236,
+            "slow": 0
+          },
+          "240": {
+            "calls": 253,
+            "slow": 0
+          },
+          "270": {
+            "calls": 259,
+            "slow": 0
+          },
+          "300": {
+            "calls": 197,
+            "slow": 0
+          },
+          "330": {
+            "calls": 242,
+            "slow": 0
+          },
+          "360": {
+            "calls": 265,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 27674072,
+        "wal_samples_5s": 79,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.28,
+            1.31
+          ],
+          [
+            0.119,
+            0.299
+          ],
+          [
+            0.118,
+            0.207
+          ],
+          [
+            0.123,
+            0.208
+          ],
+          [
+            0.128,
+            0.202
+          ]
+        ]
+      }
+    ],
+    "early_order_base_gate_gate_base": [
+      {
+        "run": "1-base",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "4.38",
+          "4.39",
+          "3.81"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.058,
+            "p90": 0.115,
+            "p99": 0.299,
+            "max": 0.578,
+            "mean": 0.071,
+            "outcomes": {
+              "ok": 2999,
+              "error": 1
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.379,
+            "p90": 15.797,
+            "p99": 18.499,
+            "max": 19.931,
+            "mean": 10.635,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.383,
+            "p90": 15.858,
+            "p99": 19.101,
+            "max": 20.432,
+            "mean": 10.636,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.138,
+            "p90": 0.303,
+            "p99": 0.871,
+            "max": 1.774,
+            "mean": 0.178,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 17,
+          "archive_wbq_p99_ms": 13432,
+          "archive_commit_queue_p99_ms": 385677,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 231,
+            "slow": 0
+          },
+          "30": {
+            "calls": 233,
+            "slow": 0
+          },
+          "60": {
+            "calls": 194,
+            "slow": 0
+          },
+          "90": {
+            "calls": 228,
+            "slow": 0
+          },
+          "120": {
+            "calls": 259,
+            "slow": 0
+          },
+          "150": {
+            "calls": 196,
+            "slow": 0
+          },
+          "180": {
+            "calls": 217,
+            "slow": 0
+          },
+          "210": {
+            "calls": 209,
+            "slow": 0
+          },
+          "240": {
+            "calls": 264,
+            "slow": 0
+          },
+          "270": {
+            "calls": 212,
+            "slow": 0
+          },
+          "300": {
+            "calls": 203,
+            "slow": 0
+          },
+          "330": {
+            "calls": 272,
+            "slow": 0
+          },
+          "360": {
+            "calls": 271,
+            "slow": 0
+          },
+          "390": {
+            "calls": 11,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 32683992,
+        "wal_samples_5s": 80,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.274,
+            0.754
+          ],
+          [
+            0.119,
+            0.251
+          ],
+          [
+            0.122,
+            0.209
+          ],
+          [
+            0.117,
+            0.181
+          ],
+          [
+            0.138,
+            0.208
+          ]
+        ]
+      },
+      {
+        "run": "2-gate",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "5.47",
+          "5.21",
+          "4.45"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.057,
+            "p90": 0.117,
+            "p99": 0.302,
+            "max": 0.779,
+            "mean": 0.073,
+            "outcomes": {
+              "ok": 2998,
+              "error": 2
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.306,
+            "p90": 15.66,
+            "p99": 19.027,
+            "max": 19.857,
+            "mean": 10.76,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.415,
+            "p90": 16.136,
+            "p99": 19.326,
+            "max": 20.332,
+            "mean": 10.899,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.131,
+            "p90": 0.335,
+            "p99": 2.143,
+            "max": 2.927,
+            "mean": 0.212,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 15403,
+          "archive_commit_queue_p99_ms": 384365,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 214,
+            "slow": 36
+          },
+          "30": {
+            "calls": 195,
+            "slow": 0
+          },
+          "60": {
+            "calls": 226,
+            "slow": 0
+          },
+          "90": {
+            "calls": 187,
+            "slow": 0
+          },
+          "120": {
+            "calls": 220,
+            "slow": 0
+          },
+          "150": {
+            "calls": 265,
+            "slow": 0
+          },
+          "180": {
+            "calls": 205,
+            "slow": 0
+          },
+          "210": {
+            "calls": 198,
+            "slow": 0
+          },
+          "240": {
+            "calls": 274,
+            "slow": 0
+          },
+          "270": {
+            "calls": 284,
+            "slow": 0
+          },
+          "300": {
+            "calls": 199,
+            "slow": 0
+          },
+          "330": {
+            "calls": 224,
+            "slow": 0
+          },
+          "360": {
+            "calls": 283,
+            "slow": 0
+          },
+          "390": {
+            "calls": 26,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16409992,
+        "wal_samples_5s": 80,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.342,
+            1.931
+          ],
+          [
+            0.118,
+            0.331
+          ],
+          [
+            0.106,
+            0.193
+          ],
+          [
+            0.115,
+            0.192
+          ],
+          [
+            0.127,
+            0.217
+          ]
+        ]
+      },
+      {
+        "run": "3-gate",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "4.78",
+          "5.39",
+          "4.84"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.058,
+            "p90": 0.121,
+            "p99": 0.293,
+            "max": 1.177,
+            "mean": 0.073,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.528,
+            "p90": 15.616,
+            "p99": 18.299,
+            "max": 21.136,
+            "mean": 10.649,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 11.857,
+            "p90": 16.123,
+            "p99": 18.218,
+            "max": 23.313,
+            "mean": 10.852,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.131,
+            "p90": 0.307,
+            "p99": 0.944,
+            "max": 2.492,
+            "mean": 0.178,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 9,
+          "archive_wbq_p99_ms": 13675,
+          "archive_commit_queue_p99_ms": 385738,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 228,
+            "slow": 1
+          },
+          "30": {
+            "calls": 185,
+            "slow": 0
+          },
+          "60": {
+            "calls": 222,
+            "slow": 0
+          },
+          "90": {
+            "calls": 247,
+            "slow": 0
+          },
+          "120": {
+            "calls": 215,
+            "slow": 0
+          },
+          "150": {
+            "calls": 240,
+            "slow": 0
+          },
+          "180": {
+            "calls": 194,
+            "slow": 0
+          },
+          "210": {
+            "calls": 242,
+            "slow": 0
+          },
+          "240": {
+            "calls": 232,
+            "slow": 0
+          },
+          "270": {
+            "calls": 257,
+            "slow": 0
+          },
+          "300": {
+            "calls": 227,
+            "slow": 0
+          },
+          "330": {
+            "calls": 222,
+            "slow": 0
+          },
+          "360": {
+            "calls": 280,
+            "slow": 0
+          },
+          "390": {
+            "calls": 9,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 16957952,
+        "wal_samples_5s": 80,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.293,
+            0.819
+          ],
+          [
+            0.122,
+            0.29
+          ],
+          [
+            0.119,
+            0.245
+          ],
+          [
+            0.114,
+            0.195
+          ],
+          [
+            0.126,
+            0.202
+          ]
+        ]
+      },
+      {
+        "run": "4-base",
+        "period_s": 6.0,
+        "agents": 60,
+        "secs": 300,
+        "loadavg_end": [
+          "5.55",
+          "5.14",
+          "4.88"
+        ],
+        "tools": {
+          "fetch_inbox": {
+            "n": 3000,
+            "p50": 0.06,
+            "p90": 0.113,
+            "p99": 0.293,
+            "max": 0.871,
+            "mean": 0.073,
+            "outcomes": {
+              "ok": 3000
+            }
+          },
+          "file_reservation_paths": {
+            "n": 886,
+            "p50": 11.333,
+            "p90": 15.222,
+            "p99": 19.145,
+            "max": 19.987,
+            "mean": 10.646,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "release_file_reservations": {
+            "n": 886,
+            "p50": 10.569,
+            "p90": 16.016,
+            "p99": 20.112,
+            "max": 21.303,
+            "mean": 10.508,
+            "outcomes": {
+              "ok": 886
+            }
+          },
+          "send_message": {
+            "n": 3000,
+            "p50": 0.14,
+            "p90": 0.329,
+            "p99": 1.901,
+            "max": 3.562,
+            "mean": 0.217,
+            "outcomes": {
+              "ok": 3000
+            }
+          }
+        },
+        "server_p99_ms": {
+          "pool_acquire_p99_ms": 66,
+          "database_write_p99_ms": 17,
+          "archive_wbq_p99_ms": 12582,
+          "archive_commit_queue_p99_ms": 383968,
+          "git_commit_p99_ms": 8389
+        },
+        "send_slow_ge_2s_by_30s_window": {
+          "0": {
+            "calls": 215,
+            "slow": 25
+          },
+          "30": {
+            "calls": 223,
+            "slow": 0
+          },
+          "60": {
+            "calls": 208,
+            "slow": 0
+          },
+          "90": {
+            "calls": 229,
+            "slow": 0
+          },
+          "120": {
+            "calls": 251,
+            "slow": 0
+          },
+          "150": {
+            "calls": 216,
+            "slow": 0
+          },
+          "180": {
+            "calls": 226,
+            "slow": 0
+          },
+          "210": {
+            "calls": 211,
+            "slow": 0
+          },
+          "240": {
+            "calls": 224,
+            "slow": 0
+          },
+          "270": {
+            "calls": 241,
+            "slow": 0
+          },
+          "300": {
+            "calls": 248,
+            "slow": 0
+          },
+          "330": {
+            "calls": 217,
+            "slow": 0
+          },
+          "360": {
+            "calls": 280,
+            "slow": 0
+          },
+          "390": {
+            "calls": 11,
+            "slow": 0
+          }
+        },
+        "wal_bytes_peak": 32902352,
+        "wal_samples_5s": 80,
+        "send_p50_p90_by_60s_window": [
+          [
+            0.301,
+            1.739
+          ],
+          [
+            0.125,
+            0.27
+          ],
+          [
+            0.108,
+            0.211
+          ],
+          [
+            0.123,
+            0.205
+          ],
+          [
+            0.151,
+            0.244
+          ]
+        ]
+      }
+    ]
+  },
+  "release_smoke_ab": [
+    {
+      "started_at": "2026-10-10T14:13:10Z",
+      "finished_at": "2026-10-10T14:51:50Z",
+      "host": "thinkstation1",
+      "cpu_governors": [
+        "powersave"
+      ],
+      "swarm_agents": 60,
+      "swarm_secs": 480,
+      "arms": [
+        {
+          "harness_arm": "candidate",
+          "build": "gate9",
+          "binary_sha256": "9ee501c695596f96deddb8e107539b5c3db779c5b5917e0a288e870c29e6fe45",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "4.36",
+            "5.21",
+            "5.61"
+          ],
+          "loadavg_end": [
+            "1.49",
+            "5.51",
+            "6.76"
+          ],
+          "swarm_checks": [
+            {
+              "name": "register 60 swarm agents",
+              "ok": true,
+              "detail": "60/60"
+            },
+            {
+              "name": "send_message p99 <= 5.0s at 60 agents",
+              "ok": true,
+              "detail": "{'n': 6668, 'p50_s': 0.542747974395752, 'p99_s': 4.175295829772949, 'max_s': 7.042419910430908}"
+            },
+            {
+              "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1970, 'p50_s': 4.620562553405762, 'p99_s': 14.557499170303345, 'max_s': 19.57497549057007}"
+            },
+            {
+              "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1938, 'p50_s': 4.443536758422852, 'p99_s': 14.893306970596313, 'max_s': 20.927715063095093}"
+            },
+            {
+              "name": "zero 30 s dispatch timeouts",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "zero tool errors",
+              "ok": false,
+              "detail": "{'fetch_inbox': {'RESOURCE_BUSY': 1}, 'file_reservation_paths': {'RESOURCE_BUSY': 1}}"
+            },
+            {
+              "name": "no connection errors outside the SIGKILL window",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791642308, 'drained_total': 645, 'depth_at_open': 18, 'depth_at_close': 78}]"
+            },
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "archive converges to DB after the swarm without client reads (<= 300s)",
+              "ok": true,
+              "detail": "archive=12820 db=12820"
+            },
+            {
+              "name": "zero HTTP server restarts and no EMFILE",
+              "ok": true,
+              "detail": "{'markers': [], 'emfile': False}"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            },
+            {
+              "name": "all 6668 acknowledged swarm sends survive SIGKILL",
+              "ok": true,
+              "detail": "lost=[]"
+            }
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 3867,
+            "ge_5s": 506,
+            "p50_ms": 3139,
+            "p90_ms": 5314,
+            "max_ms": 14358,
+            "top_waiter_sites": [
+              [
+                "lib.rs:13368",
+                3744
+              ],
+              [
+                "lib.rs:7444",
+                123
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3523",
+                2118
+              ],
+              [
+                "lib.rs:3613",
+                1514
+              ],
+              [
+                "lib.rs:13368",
+                170
+              ],
+              [
+                "lib.rs:7444",
+                59
+              ]
+            ]
+          }
+        },
+        {
+          "harness_arm": "control",
+          "build": "base",
+          "binary_sha256": "1d4d18edffccbf195649966e418a458058246e73d0135842850603b633913e64",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "PASS",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "1.49",
+            "5.51",
+            "6.76"
+          ],
+          "loadavg_end": [
+            "3.07",
+            "4.92",
+            "6.00"
+          ],
+          "swarm_checks": [
+            {
+              "name": "register 60 swarm agents",
+              "ok": true,
+              "detail": "60/60"
+            },
+            {
+              "name": "send_message p99 <= 5.0s at 60 agents",
+              "ok": true,
+              "detail": "{'n': 3696, 'p50_s': 0.17301464080810547, 'p99_s': 4.833876371383667, 'max_s': 6.013620376586914}"
+            },
+            {
+              "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1063, 'p50_s': 12.470561265945435, 'p99_s': 22.25385046005249, 'max_s': 25.80836319923401}"
+            },
+            {
+              "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1035, 'p50_s': 13.323414325714111, 'p99_s': 24.480198860168457, 'max_s': 27.374406814575195}"
+            },
+            {
+              "name": "zero 30 s dispatch timeouts",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "zero tool errors",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "no connection errors outside the SIGKILL window",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=[23, 24] unobserved=0 stalled=[{'t': 1791643527, 'drained_total': 796, 'depth_at_open': 18, 'depth_at_close': 61}]"
+            },
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "archive converges to DB after the swarm without client reads (<= 300s)",
+              "ok": true,
+              "detail": "archive=6429 db=6429"
+            },
+            {
+              "name": "zero HTTP server restarts and no EMFILE",
+              "ok": true,
+              "detail": "{'markers': [], 'emfile': False}"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            },
+            {
+              "name": "all 3696 acknowledged swarm sends survive SIGKILL",
+              "ok": true,
+              "detail": "lost=[]"
+            }
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 5325,
+            "ge_5s": 2103,
+            "p50_ms": 4039,
+            "p90_ms": 7734,
+            "max_ms": 14080,
+            "top_waiter_sites": [
+              [
+                "lib.rs:3604",
+                5180
+              ],
+              [
+                "lib.rs:7434",
+                98
+              ],
+              [
+                "lib.rs:3523",
+                47
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3604",
+                4999
+              ],
+              [
+                "lib.rs:3523",
+                280
+              ],
+              [
+                "lib.rs:7434",
+                34
+              ],
+              [
+                "an unrecorded holder",
+                11
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-10-10T15:04:54Z",
+      "finished_at": "2026-10-10T15:43:31Z",
+      "host": "thinkstation1",
+      "cpu_governors": [
+        "powersave"
+      ],
+      "swarm_agents": 60,
+      "swarm_secs": 480,
+      "arms": [
+        {
+          "harness_arm": "candidate",
+          "build": "base",
+          "binary_sha256": "1d4d18edffccbf195649966e418a458058246e73d0135842850603b633913e64",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "PASS",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "3.56",
+            "5.33",
+            "5.63"
+          ],
+          "loadavg_end": [
+            "3.58",
+            "4.55",
+            "5.54"
+          ],
+          "swarm_checks": [
+            {
+              "name": "register 60 swarm agents",
+              "ok": true,
+              "detail": "60/60"
+            },
+            {
+              "name": "send_message p99 <= 5.0s at 60 agents",
+              "ok": true,
+              "detail": "{'n': 3500, 'p50_s': 0.18336153030395508, 'p99_s': 4.137963771820068, 'max_s': 5.1215338706970215}"
+            },
+            {
+              "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1012, 'p50_s': 13.183787107467651, 'p99_s': 24.085540533065796, 'max_s': 25.20313310623169}"
+            },
+            {
+              "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 987, 'p50_s': 13.688026428222656, 'p99_s': 24.744108200073242, 'max_s': 25.326285123825073}"
+            },
+            {
+              "name": "zero 30 s dispatch timeouts",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "zero tool errors",
+              "ok": false,
+              "detail": "{'send_message': {'RESOURCE_BUSY': 3}}"
+            },
+            {
+              "name": "no connection errors outside the SIGKILL window",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": false,
+              "detail": "samples=[23, 23] unobserved=0 stalled=[{'t': 1791645127, 'drained_total': 2356, 'depth_at_open': 90, 'depth_at_close': 106}]"
+            },
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "archive converges to DB after the swarm without client reads (<= 300s)",
+              "ok": true,
+              "detail": "archive=6517 db=6517"
+            },
+            {
+              "name": "zero HTTP server restarts and no EMFILE",
+              "ok": true,
+              "detail": "{'markers': [], 'emfile': False}"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            },
+            {
+              "name": "all 3497 acknowledged swarm sends survive SIGKILL",
+              "ok": true,
+              "detail": "lost=[]"
+            }
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 5139,
+            "ge_5s": 2098,
+            "p50_ms": 4317,
+            "p90_ms": 8177,
+            "max_ms": 13793,
+            "top_waiter_sites": [
+              [
+                "lib.rs:3604",
+                4999
+              ],
+              [
+                "lib.rs:7434",
+                97
+              ],
+              [
+                "lib.rs:3523",
+                43
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3604",
+                4819
+              ],
+              [
+                "lib.rs:3523",
+                270
+              ],
+              [
+                "lib.rs:7434",
+                34
+              ],
+              [
+                "an unrecorded holder",
+                16
+              ]
+            ]
+          }
+        },
+        {
+          "harness_arm": "control",
+          "build": "gate9",
+          "binary_sha256": "9ee501c695596f96deddb8e107539b5c3db779c5b5917e0a288e870c29e6fe45",
+          "verdict": "FAIL",
+          "phases": {
+            "flow": "PASS",
+            "cross_project": "PASS",
+            "storm": "PASS",
+            "crash": "PASS",
+            "soak": "FAIL",
+            "swarm": "FAIL"
+          },
+          "loadavg_start": [
+            "3.58",
+            "4.55",
+            "5.54"
+          ],
+          "loadavg_end": [
+            "1.50",
+            "5.28",
+            "7.31"
+          ],
+          "swarm_checks": [
+            {
+              "name": "register 60 swarm agents",
+              "ok": true,
+              "detail": "60/60"
+            },
+            {
+              "name": "send_message p99 <= 5.0s at 60 agents",
+              "ok": true,
+              "detail": "{'n': 6668, 'p50_s': 0.5629751682281494, 'p99_s': 4.100361347198486, 'max_s': 6.704870939254761}"
+            },
+            {
+              "name": "file_reservation_paths p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1942, 'p50_s': 4.933984756469727, 'p99_s': 14.581623792648315, 'max_s': 19.65346884727478}"
+            },
+            {
+              "name": "release_file_reservations p99 <= 5.0s at 60 agents",
+              "ok": false,
+              "detail": "{'n': 1923, 'p50_s': 4.720491647720337, 'p99_s': 15.828354835510254, 'max_s': 20.364787340164185}"
+            },
+            {
+              "name": "zero 30 s dispatch timeouts",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "zero tool errors",
+              "ok": false,
+              "detail": "{'send_message': {'RESOURCE_BUSY': 2}, 'fetch_inbox': {'RESOURCE_BUSY': 1}}"
+            },
+            {
+              "name": "no connection errors outside the SIGKILL window",
+              "ok": true,
+              "detail": "{}"
+            },
+            {
+              "name": "WBQ drained_total advances in every 10s window with queued work",
+              "ok": true,
+              "detail": "samples=[23, 23] unobserved=0 stalled=[]"
+            },
+            {
+              "name": "storage.sqlite3 descriptors bounded (<= 64)",
+              "ok": true,
+              "detail": "max=2"
+            },
+            {
+              "name": "no dispatch zombies",
+              "ok": true,
+              "detail": "max=0"
+            },
+            {
+              "name": "archive converges to DB after the swarm without client reads (<= 300s)",
+              "ok": true,
+              "detail": "archive=12761 db=12761"
+            },
+            {
+              "name": "zero HTTP server restarts and no EMFILE",
+              "ok": true,
+              "detail": "{'markers': [], 'emfile': False}"
+            },
+            {
+              "name": "server exits within 60 s of SIGTERM",
+              "ok": true,
+              "detail": ""
+            },
+            {
+              "name": "full PRAGMA integrity_check ok (independent C SQLite, server stopped)",
+              "ok": true,
+              "detail": "{'sqlite_version': '3.46.1', 'rows': ['ok']}"
+            },
+            {
+              "name": "all 6666 acknowledged swarm sends survive SIGKILL",
+              "ok": true,
+              "detail": "lost=[]"
+            }
+          ],
+          "fence_contention": {
+            "contended_waits_ge_2s": 3657,
+            "ge_5s": 664,
+            "p50_ms": 3663,
+            "p90_ms": 5898,
+            "max_ms": 14365,
+            "top_waiter_sites": [
+              [
+                "lib.rs:13368",
+                3540
+              ],
+              [
+                "lib.rs:7444",
+                117
+              ]
+            ],
+            "top_holder_sites": [
+              [
+                "lib.rs:3523",
+                1762
+              ],
+              [
+                "lib.rs:3613",
+                1703
+              ],
+              [
+                "lib.rs:13368",
+                127
+              ],
+              [
+                "lib.rs:7444",
+                60
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "verdict": "WIN under the predeclared paced rule, with one new red release-smoke check that is explained below. These are equal-offered-load results (60 agents, one iteration every 6 s, 300 s, two mirrored rounds, same invocation).\n- gate9 vs base: reservation p50 0.169/0.166 s vs 11.16/10.73 s; reservation p90 2.50/3.49 s vs 14.95/15.51 s; send p90 in the last 60 s 0.21/0.22 s vs 0.25/0.20 s; WAL peak 17.0/16.7 MB vs 30.6/27.7 MB; errors 1/2 vs 1/3, all immediate.\n- The gate alone is latency-neutral (every p50/p90 within +4% of base) and halves the WAL peak.\n- 9bwnb alone reproduces the 8-11 s send flip (last-60 s send p90 9.10/11.25 s, WAL 191/250 MB). The gate removes the flip.\n- Cost: gate9's overall send p90 is 0.40 vs 0.30-0.32 s and its send p99 is 2.4-3.6 vs 1.5 s. All of it falls in the first minute.\n\nRelease smoke, both orders (closed loop):\n- The swarm phase completes 6668 sends vs 3500-3696, with send p99 4.10-4.18 s vs 4.14-4.83 s (both under 5 s).\n- Reservation p50 is 4.6-4.9 s vs 12.5-13.2 s. p99 is 14.6 s vs 22.3-24.1 s, so both arms still fail the 5 s bound. The remaining tail is the WBQ drain holding the fence through message-bundle fsyncs (br-kp1in.13).\n- Tool errors are the same rate in both arms (RESOURCE_BUSY 5 in ~17k calls vs 3 in ~9k). There are zero 30 s dispatch timeouts, every acknowledged send survives SIGKILL, and integrity_check is ok.\n- NEW RED: in the soak phase, gate9 completes 5110-5158 sends vs 1759-2041. The check 'WBQ drained_total advances in every 10s window with queued work' then fails in both orders, while base passes it. The drain is not stuck. It writes 2.5x more artifacts (archive 5674 vs 2261, converged after load), and health's own stall verdict agrees with the counters. drained_total is bumped once per drain batch, and at 3x input the batches outlast the 10 s window. This is archive lag under higher throughput. The check is unchanged. A follow-up bead tracks it with br-kp1in.13."
+}

@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 ///
@@ -1391,6 +1391,8 @@ fn setup_fixture_env() -> FixtureEnv {
         ("LLM_ENABLED", "1"),
         ("LLM_DEFAULT_MODEL", "conformance-stub"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        // The fixture switch is honored only inside a declared test harness.
+        ("AM_TEST_MODE", "1"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),
@@ -4126,6 +4128,13 @@ fn llm_mode_parameter_accepted_by_tools() {
         ("TOON_TRU_BIN", ""),
         ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+        // The conformance fixture switch, as the fixture runner sets it.
+        ("LLM_ENABLED", "1"),
+        ("LLM_DEFAULT_MODEL", "conformance-stub"),
+        ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        ("AM_TEST_MODE", "1"),
+        // The product bus (summarize_thread_product) is gated on worktrees.
+        ("WORKTREES_ENABLED", "1"),
     ]);
     initialize_runtime_mailbox(&db_url);
 
@@ -4186,6 +4195,16 @@ fn llm_mode_parameter_accepted_by_tools() {
         "Testing llm_mode=false parameter.",
         Some("llm-test-thread"),
     );
+    insert_test_message(
+        &cx,
+        &pool,
+        project_id,
+        "GreenCastle",
+        "BlueLake",
+        "LLM mode second thread",
+        "A second thread for the multi-thread digest.",
+        Some("llm-test-thread-2"),
+    );
 
     // summarize_thread with llm_mode=false should succeed (no LLM call attempted).
     let params = CallToolParams {
@@ -4217,6 +4236,10 @@ fn llm_mode_parameter_accepted_by_tools() {
         Some("llm-test-thread"),
         "thread_id should match"
     );
+    // br-kp1in.21 negative: the fixture switch is on, but llm_mode=false never
+    // reaches it, so the heuristic summary carries neither marker nor canned text.
+    assert!(json.get("llm_stub").is_none(), "{json}");
+    assert!(!json.to_string().contains(LLM_FIXTURE_KEY_POINT), "{json}");
 
     // macro_prepare_thread with llm_mode=false should succeed.
     let params = CallToolParams {
@@ -4233,16 +4256,130 @@ fn llm_mode_parameter_accepted_by_tools() {
         meta: None,
     };
     let result = fastmcp_core::block_on(router.handle_tools_call(
-        &McpContext::new(cx, req_id),
+        &McpContext::new(cx.clone(), req_id),
         params,
         SessionState::new(),
         None,
         None,
     ));
+    req_id += 1;
     let call_result = result.expect("macro_prepare_thread should not fail with llm_mode=false");
     assert!(
         !call_result.is_error,
         "macro_prepare_thread should succeed with llm_mode=false: {:?}",
         call_result.content
     );
+    let json = decode_json_from_tool_content(&call_result.content)
+        .expect("macro_prepare_thread should return JSON");
+    assert!(json["thread"].get("llm_stub").is_none(), "{json}");
+
+    // br-kp1in.21: every response refined with the fixture's canned text says
+    // so, on each LLM-refined path, next to the canned text itself.
+    let call = |name: &str, arguments: Value, id: u64| -> Value {
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &McpContext::new(cx.clone(), id),
+            CallToolParams {
+                name: name.to_string(),
+                arguments: Some(arguments),
+                meta: None,
+            },
+            SessionState::new(),
+            None,
+            None,
+        ));
+        let call_result = result.unwrap_or_else(|e| panic!("{name} failed: {e}"));
+        assert!(
+            !call_result.is_error,
+            "{name} returned an error: {:?}",
+            call_result.content
+        );
+        decode_json_from_tool_content(&call_result.content)
+            .unwrap_or_else(|e| panic!("{name} should return JSON: {e}"))
+    };
+
+    let single = call(
+        "summarize_thread",
+        serde_json::json!({
+            "project_key": project_key.as_str(),
+            "thread_id": "llm-test-thread",
+            "llm_mode": true
+        }),
+        req_id,
+    );
+    assert!(
+        single.to_string().contains(LLM_FIXTURE_KEY_POINT),
+        "{single}"
+    );
+    assert_eq!(single["llm_stub"], Value::Bool(true), "{single}");
+
+    let multi = call(
+        "summarize_thread",
+        serde_json::json!({
+            "project_key": project_key.as_str(),
+            "thread_id": "llm-test-thread,llm-test-thread-2",
+            "llm_mode": true
+        }),
+        req_id + 1,
+    );
+    assert!(
+        multi.to_string().contains(LLM_FIXTURE_DIGEST_KEY_POINT),
+        "{multi}"
+    );
+    assert_eq!(multi["llm_stub"], Value::Bool(true), "{multi}");
+
+    let prepared = call(
+        "macro_prepare_thread",
+        serde_json::json!({
+            "project_key": project_key.as_str(),
+            "agent_name": "GreenCastle",
+            "thread_id": "llm-test-thread",
+            "program": "test",
+            "model": "test-model",
+            "register_if_missing": false,
+            "llm_mode": true
+        }),
+        req_id + 2,
+    );
+    assert!(
+        prepared.to_string().contains(LLM_FIXTURE_KEY_POINT),
+        "{prepared}"
+    );
+    assert_eq!(
+        prepared["thread"]["llm_stub"],
+        Value::Bool(true),
+        "{prepared}"
+    );
+
+    let product_key = "0123456789abcdef0123";
+    call(
+        "ensure_product",
+        serde_json::json!({ "product_key": product_key, "name": "LlmStubBus" }),
+        req_id + 3,
+    );
+    call(
+        "products_link",
+        serde_json::json!({ "product_key": product_key, "project_key": project_key.as_str() }),
+        req_id + 4,
+    );
+    let product = call(
+        "summarize_thread_product",
+        serde_json::json!({
+            "product_key": product_key,
+            "thread_id": "llm-test-thread",
+            "llm_mode": true
+        }),
+        req_id + 5,
+    );
+    assert!(
+        product.to_string().contains(LLM_FIXTURE_KEY_POINT),
+        "{product}"
+    );
+    assert_eq!(product["llm_stub"], Value::Bool(true), "{product}");
 }
+
+/// Key points that only the conformance fixture completion produces
+/// (`mcp_agent_mail_tools::llm`'s fixture text for single-thread summaries and
+/// multi-thread digests).
+const LLM_FIXTURE_KEY_POINT: &str = "API migration planned for next sprint";
+const LLM_FIXTURE_DIGEST_KEY_POINT: &str =
+    "API schema and DB migration are the two main workstreams";

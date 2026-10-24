@@ -194,7 +194,7 @@ if command -v minisign >/dev/null 2>&1; then
     MINISIGN_KEY_DIR="${WORK}/minisign"
     mkdir -p "${MINISIGN_KEY_DIR}"
     if minisign -G -W -f -p "${MINISIGN_KEY_DIR}/minisign.pub" -s "${MINISIGN_KEY_DIR}/minisign.key" >/dev/null 2>&1 \
-        && minisign -S -W -s "${MINISIGN_KEY_DIR}/minisign.key" -m "${ASSET_DIR}/SHA256SUMS" -t "e2e mock release v${CURRENT_VERSION}" >/dev/null 2>&1; then
+        && minisign -S -W -s "${MINISIGN_KEY_DIR}/minisign.key" -m "${ASSET_DIR}/SHA256SUMS" -t "mcp_agent_mail_rust v${CURRENT_VERSION} SHA256SUMS" >/dev/null 2>&1; then
         MINISIGN_PUBKEY_LINE="$(tail -n 1 "${MINISIGN_KEY_DIR}/minisign.pub")"
         e2e_save_artifact "mock_minisign.pub" "$(cat "${MINISIGN_KEY_DIR}/minisign.pub")"
         e2e_save_artifact "mock_SHA256SUMS.minisig" "$(cat "${ASSET_DIR}/SHA256SUMS.minisig")"

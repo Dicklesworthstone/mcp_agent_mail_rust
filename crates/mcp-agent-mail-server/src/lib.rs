@@ -79,6 +79,7 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
 pub mod maintenance;
@@ -2855,7 +2856,14 @@ pub(crate) fn resolve_server_sync_sqlite_path(path: &str) -> String {
 fn guard_raw_live_sqlite_engine_open(path: &Path, context: &str) -> std::io::Result<()> {
     let nonclean_authority = match mcp_agent_mail_db::recovery_breaker::load(path) {
         Ok(Some(state)) if state.tripped || state.consecutive_failures > 0 => {
-            let fingerprint = mcp_agent_mail_db::recovery_breaker::fingerprint_db(path);
+            // br-r6psd: this server process normally already holds live
+            // FrankenSQLite pool connections on `path`. Hashing the main inode
+            // through an ad-hoc descriptor would, on close, release every
+            // classic `fcntl` lock they hold (Linux), and its raw format can
+            // never match the lock-neutral record the pool writes (br-oyget).
+            // Use the pool's own descriptor-neutral fingerprint instead.
+            let fingerprint =
+                mcp_agent_mail_db::pool::recovery_breaker_fingerprint(path, Some(&state));
             state.applies_to(&fingerprint).then(|| {
                 format!(
                     "durable recovery-breaker state records {} failed attempt(s) for this recovery lineage{}",
@@ -3323,6 +3331,11 @@ fn trusted_platform_snapshot_temp_alias(_candidate: &Path) -> std::io::Result<Op
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
+    // Startup moves staging here when $TMPDIR cannot hold a probe copy
+    // (br-txx8u); every snapshot must follow it.
+    if let Some(fallback) = mcp_agent_mail_db::pool::snapshot_temp_root_fallback() {
+        return validate_snapshot_temp_dir(&fallback, "staging fallback");
+    }
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
             continue;
@@ -6107,20 +6120,25 @@ fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+    fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
+    let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
          client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
          database_write_p99_ms={}; archive_wbq_p99_ms={}; \
          archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
+         archive_fence_wait_ms={}; archive_fence_holder={fence_holder}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
          blocking_dispatch_zombies_expired={}; \
          blocking_dispatch_timeouts_total={}. \
-         (archive stages are off the request path since ack-fast: archive \
-         lag cannot cause a tool timeout; archive_commit_queue is \
-         enqueue-to-durable queue latency, not pure git work.)",
+         (the archive write-behind queue and commit queue are off the request \
+         path since ack-fast, and archive_commit_queue is enqueue-to-durable \
+         queue latency, not pure git work; reservation artifacts are written \
+         on the request path and wait for the archive publication fence, \
+         whose oldest live wait is archive_fence_wait_ms.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6130,6 +6148,7 @@ fn dispatch_timeout_error_text(
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
         micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
         micros_to_millis_ceil(diagnostics.git_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_fence_wait_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.zombies_expired,
@@ -6141,9 +6160,15 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
+    let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder();
     McpError::new(
         McpErrorCode::InternalError,
-        dispatch_timeout_error_text(method, dispatch_timeout_secs, &diagnostics),
+        dispatch_timeout_error_text(
+            method,
+            dispatch_timeout_secs,
+            &diagnostics,
+            fence_holder.as_ref(),
+        ),
     )
 }
 
@@ -11346,6 +11371,8 @@ struct HttpState {
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
     /// Aggregates the failed-request WARN for repeated 401/404 probes.
     probe_rejection_log: HttpProbeRejectionLog,
+    /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
+    http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11540,6 +11567,7 @@ impl HttpState {
             ws_state_fallback,
             request_diagnostics,
             probe_rejection_log: HttpProbeRejectionLog::default(),
+            http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11762,6 +11790,25 @@ impl HttpState {
             return self.error_response(&req, 404, "Not Found");
         }
 
+        // GH#279: a Streamable HTTP client ends its MCP session with DELETE.
+        if self.config.messaging_session_identity && matches!(req.method, Http1Method::Delete) {
+            let principal = http_sessions::principal_digest(header_value(&req, "authorization"));
+            let ended = header_value(&req, http_sessions::MCP_SESSION_ID_HEADER)
+                .is_some_and(|id| self.http_sessions.terminate(id, principal));
+            if !ended {
+                return self.error_response(&req, 404, "Not Found");
+            }
+            let mut resp = Http1Response::new(204, default_reason(204), Vec::new());
+            apply_cors_headers(
+                &mut resp,
+                self.cors_origin(&req),
+                self.config.http_cors_allow_credentials,
+                &self.config.http_cors_allow_methods,
+                &self.config.http_cors_allow_headers,
+            );
+            return resp;
+        }
+
         if !matches!(req.method, Http1Method::Post) {
             return self.error_response(&req, 405, "Method Not Allowed");
         }
@@ -11806,18 +11853,56 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let response = self.dispatch(json_rpc).await.map_or_else(
-            || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
-            |resp| HttpResponse::ok().with_json(&resp),
-        );
+        let (session_state, new_session_id) = self.resolve_mcp_session(&req, &json_rpc);
+        let response = self
+            .dispatch_with_session(json_rpc, session_state)
+            .await
+            .map_or_else(
+                || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
+                |resp| HttpResponse::ok().with_json(&resp),
+            );
 
-        to_http1_response(
+        let mut out = to_http1_response(
             response,
             self.cors_origin(&req),
             self.config.http_cors_allow_credentials,
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
-        )
+        );
+        if let Some(id) = new_session_id {
+            out.headers
+                .push((http_sessions::MCP_SESSION_ID_HEADER.to_string(), id));
+            out.headers.push((
+                "access-control-expose-headers".to_string(),
+                http_sessions::MCP_SESSION_ID_HEADER.to_string(),
+            ));
+        }
+        out
+    }
+
+    /// The MCP session a request belongs to (GH#279, opt-in). `initialize`
+    /// starts a session whose id is returned to the client; any other request
+    /// joins the live session named by its `Mcp-Session-Id` header, provided
+    /// it carries the same authorization the session was created under.
+    /// Otherwise the request is stateless, exactly as with the feature off.
+    fn resolve_mcp_session(
+        &self,
+        req: &Http1Request,
+        request: &JsonRpcRequest,
+    ) -> (Option<SessionState>, Option<String>) {
+        if !self.config.messaging_session_identity {
+            return (None, None);
+        }
+        let principal = http_sessions::principal_digest(header_value(req, "authorization"));
+        if request.method == "initialize" {
+            return self
+                .http_sessions
+                .create(principal)
+                .map_or((None, None), |(id, state)| (Some(state), Some(id)));
+        }
+        let state = header_value(req, http_sessions::MCP_SESSION_ID_HEADER)
+            .and_then(|id| self.http_sessions.lookup(id, principal));
+        (state, None)
     }
 
     fn emit_http_request_log(
@@ -11949,6 +12034,13 @@ impl HttpState {
                 // archive or diagnostic scans and make a live listener look
                 // dead under contention.
                 body["durability_state"] = serde_json::json!("not_probed");
+                // The write-back latch is one atomic load, so it is cheap enough here.
+                // Still 200: the listener is alive and reads still work, and the
+                // archive reconciler lifts the latch once the failed write-backs
+                // are re-archived, so a supervisor restart loop would not help.
+                if mcp_agent_mail_storage::durability_degraded() {
+                    body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
+                }
                 return Some(self.health_json_response(req, 200, &body));
             }
             "/health/durability" => {
@@ -11964,7 +12056,7 @@ impl HttpState {
                     &self.config.database_url,
                     self.config.storage_root.as_path(),
                 );
-                let body = durability.map_or_else(
+                let mut body = durability.map_or_else(
                     || {
                         serde_json::json!({
                             "durability_state": "unknown",
@@ -11979,6 +12071,11 @@ impl HttpState {
                             "allows_writes": state.allows_writes(),
                         })
                     },
+                );
+                apply_wbq_write_gate(
+                    &mut body,
+                    mcp_agent_mail_storage::durability_degraded()
+                        .then(mcp_agent_mail_storage::wbq_stats),
                 );
                 return Some(self.health_json_response(req, 200, &body));
             }
@@ -12977,7 +13074,20 @@ to skip auth for local requests.</p>
         None
     }
 
+    /// Stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.dispatch_with_session(request, None).await
+    }
+
+    /// Dispatch one JSON-RPC request. `session` is the persistent state of the
+    /// caller's MCP session (GH#279) when it has one; otherwise each request
+    /// gets fresh, request-local state.
+    async fn dispatch_with_session(
+        &self,
+        request: JsonRpcRequest,
+        session: Option<SessionState>,
+    ) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
@@ -12990,7 +13100,11 @@ to skip auth for local requests.</p>
             let id = request.id.clone();
             let outcome = std::thread::scope(|scope| {
                 scope
-                    .spawn(|| self.dispatch_inner(request))
+                    .spawn(|| {
+                        let cx = self.request_cx();
+                        let cancel = DispatchCancel::new();
+                        self.dispatch_inner_with_cx(request, session, &cx, &cancel)
+                    })
                     .join()
                     .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             });
@@ -13037,7 +13151,7 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
+            move |cancel| arc_self.dispatch_inner_with_cx(request, session, &worker_cx, &cancel),
         )
         .await;
 
@@ -13049,17 +13163,19 @@ to skip auth for local requests.</p>
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Synchronous stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
         let cx = self.request_cx();
         let cancel = DispatchCancel::new();
-        self.dispatch_inner_with_cx(request, &cx, &cancel)
+        self.dispatch_inner_with_cx(request, None, &cx, &cancel)
     }
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_inner_with_cx(
         &self,
         request: JsonRpcRequest,
+        session_state: Option<SessionState>,
         cx: &Cx,
         cancel: &DispatchCancel,
     ) -> Result<serde_json::Value, McpError> {
@@ -13070,8 +13186,19 @@ to skip auth for local requests.</p>
         // fastmcp's router handlers now take a request-scoped `McpContext`
         // instead of a bare `Cx`; the budget travels inside the context
         // (handlers enforce it via `budget_error`) rather than as an
-        // explicit argument.
-        let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
+        // explicit argument. The router derives tool/resource/prompt contexts
+        // from this context, so attach the same session bag used for catalog
+        // filtering; the separate router argument does not install it. Keep
+        // stateless contexts without a bag so macros cannot bind identities
+        // to a session that does not exist.
+        let request_ctx = session_state
+            .as_ref()
+            .map_or_else(
+                || McpContext::new(cx.clone(), request_id),
+                |state| McpContext::with_state(cx.clone(), request_id, state.clone()),
+            )
+            .with_budget_ceiling(budget);
+        let session_state = session_state.unwrap_or_default();
 
         match request.method.as_str() {
             "initialize" => {
@@ -13089,7 +13216,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_tools_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_tools_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -13101,7 +13228,11 @@ to skip auth for local requests.</p>
                 {
                     // Keep alias normalization tool-specific so one cluster cannot
                     // silently rewrite another tool's documented parameters.
-                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    if tool_name == "reply_message" {
+                        mcp_agent_mail_tools::normalize_reply_message_arguments(arguments)?;
+                    } else {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
                 }
 
                 // Extract format param before dispatch (TOON support)
@@ -13194,7 +13325,7 @@ to skip auth for local requests.</p>
                 let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ));
@@ -13336,7 +13467,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resources_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13346,7 +13477,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resource_templates_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13358,7 +13489,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -13378,7 +13509,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_prompts_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
@@ -13386,7 +13517,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -16663,6 +16794,31 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
     }
 }
 
+/// The mailbox verdict cannot see the write-back latch (#122), which refuses
+/// every send with `DURABILITY_DEGRADED` until the failed write-backs are
+/// verified in the archive. Without this, `/health/durability` said "healthy",
+/// `allows_writes: true` on a mailbox that had refused all sends for hours (mac
+/// studio, 2026-10-14 after ENOSPC).
+fn apply_wbq_write_gate(
+    body: &mut serde_json::Value,
+    latched: Option<mcp_agent_mail_storage::WbqStats>,
+) {
+    let Some(stats) = latched else {
+        return;
+    };
+    body["durability_state"] =
+        serde_json::json!(mcp_agent_mail_db::DurabilityState::DegradedReadOnly.to_string());
+    body["allows_writes"] = serde_json::json!(false);
+    body["write_gate"] = serde_json::json!({
+        "error_code": "DURABILITY_DEGRADED",
+        "wbq_unrecoverable_errors_total": stats.unrecoverable_errors,
+        "wbq_last_unrecoverable_error_us": stats.last_unrecoverable_error_us,
+        "recovery": "automatic once the archive reconciler re-archives the failed messages and \
+                     disk pressure is below critical; otherwise a supervised restart, or \
+                     `am doctor repair` after draining the server",
+    });
+}
+
 /// Fast-path mailbox-verdict probe used by `/health/durability` (#94). Returns
 /// `None` for :memory: DBs — those have no on-disk state the verdict engine can
 /// meaningfully inspect, so the readiness check is the only health signal. Any
@@ -18684,6 +18840,24 @@ mod tests {
         }
     }
 
+    struct SessionStateProbeTool;
+
+    impl fastmcp::ToolHandler for SessionStateProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "session_state_probe".to_string(),
+                description: Some("test-only session-state presence probe".to_string()),
+                ..fastmcp::ToolHandler::definition(&NoopTool)
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: serde_json::json!({"has_session_state": ctx.has_session_state()}).to_string(),
+            }])
+        }
+    }
+
     /// Test tool that always fails with a legacy-coded tool error (br-315wc).
     struct FailingTool {
         code: &'static str,
@@ -19133,6 +19307,7 @@ mod tests {
             archive_wbq_p99_us: 2_000,
             archive_commit_queue_p99_us: 16_778_000,
             git_commit_p99_us: 450_000,
+            archive_fence_wait_us: 0,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -19142,16 +19317,64 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics);
+        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
         assert!(text.contains("archive_commit_queue_p99_ms=16778"));
         assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("archive_fence_wait_ms=0; archive_fence_holder=none;"));
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
+    }
+
+    /// br-9bwnb: a reservation that timed out behind the archive publication
+    /// fence names the fence, its live wait and its holder, and the text no
+    /// longer claims that archive work cannot cause a tool timeout.
+    #[test]
+    fn dispatch_timeout_text_names_a_live_archive_fence_wait_and_its_holder() {
+        let diagnostics = mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+            client_deadline_us: 30_000_000,
+            stage: mcp_agent_mail_core::metrics::TimeoutStage::ArchiveFence,
+            stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
+            pool_acquire_p99_us: 3_000,
+            database_write_p99_us: 6_000,
+            archive_wbq_p99_us: 0,
+            archive_commit_queue_p99_us: 1_650_000,
+            git_commit_p99_us: 630_000,
+            archive_fence_wait_us: 29_400_000,
+            blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
+                timeouts_total: 13,
+            },
+        };
+        let holder = mcp_agent_mail_storage::ArchiveFenceHolder {
+            thread: "wbq-drain (ThreadId(7))".to_string(),
+            site: "crates/mcp-agent-mail-storage/src/lib.rs:9316:20".to_string(),
+            held_for: Duration::from_millis(29_500),
+        };
+
+        let text =
+            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        assert!(text.contains("stage=archive_publication_fence"), "{text}");
+        assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
+        assert!(
+            text.contains(
+                "archive_fence_holder=wbq-drain (ThreadId(7)) at \
+                 crates/mcp-agent-mail-storage/src/lib.rs:9316:20 for 29500 ms;"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("archive lag cannot cause a tool timeout"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -19884,11 +20107,19 @@ mod tests {
     }
 
     fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        // Only the isolated child that run_prepared_http_test_in_child spawns
+        // calls this; its private DATABASE_URL and STORAGE_ROOT reach Config
+        // through the ordinary env parsing rather than a raw re-read (GH#340).
+        // Outside that child the env is not private: refuse instead of
+        // resolving the operator's default mailbox.
+        assert!(
+            std::env::var_os("AM_PREPARED_HTTP_STARTUP_TEST_CHILD").is_some(),
+            "prepared_http_test_config runs only inside the isolated child"
+        );
+        let isolated = mcp_agent_mail_core::Config::from_env();
         let config = mcp_agent_mail_core::Config {
-            database_url: std::env::var("DATABASE_URL").expect("isolated child database"),
-            storage_root: std::env::var_os("STORAGE_ROOT")
-                .expect("isolated child archive")
-                .into(),
+            database_url: isolated.database_url,
+            storage_root: isolated.storage_root,
             http_host: "127.0.0.1".to_string(),
             http_port: 0,
             http_bearer_token: None,
@@ -21653,7 +21884,7 @@ first body
         }
     }
 
-    fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
+    fn with_serialized_tool_dispatch_env<F, T>(overrides: &[(&str, &str)], f: F) -> T
     where
         F: FnOnce(String) -> T,
     {
@@ -21677,13 +21908,14 @@ first body
             .expect("tool dispatch project root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            || f(project_key),
-        )
+        let mut env_overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        env_overrides.extend_from_slice(overrides);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env_overrides, || {
+            f(project_key)
+        })
     }
 
     fn with_serialized_dispatch_permits<F, T>(f: F) -> T
@@ -24470,7 +24702,7 @@ first body
 
     #[test]
     fn dispatch_request_contact_preserves_contact_parameter_names() {
-        with_serialized_tool_dispatch_env(|project_key| {
+        with_serialized_tool_dispatch_env(&[], |project_key| {
             let config = mcp_agent_mail_core::Config::from_env();
             let state = build_state(config);
 
@@ -24573,6 +24805,174 @@ first body
                 .and_then(serde_json::Value::as_array)
                 .is_some(),
             "expected tools list result"
+        );
+    }
+
+    /// GH#279: with `MESSAGING_SESSION_IDENTITY` on, `initialize` mints an
+    /// `Mcp-Session-Id`; requests that send it back share the session's agent
+    /// identity (verified without a token, even fail-closed), cannot change
+    /// another agent's contact policy, and keep the policy intact on refusal.
+    /// Stateless requests do not share bindings, and `DELETE` ends the session.
+    #[test]
+    fn opt_in_http_sessions_carry_identity_across_requests() {
+        with_serialized_tool_dispatch_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+                // The project lives in a `.tmpXXXXXX` tempdir, which the
+                // ephemeral-root guard refuses by default (GH#349).
+                ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+            ],
+            |project_key| {
+                // Sessions, not HTTP auth, are under test (GH#349): without
+                // these the first tools/call got RBAC's 403 (no loopback peer),
+                // or initialize got 401 from a host's user-level config.env
+                // bearer token, and the session code never ran.
+                let mut state = build_state(mcp_agent_mail_core::Config {
+                    http_rbac_enabled: false,
+                    http_bearer_token: None,
+                    http_jwt_enabled: false,
+                    ..mcp_agent_mail_core::Config::from_env()
+                });
+                Arc::get_mut(&mut state.router)
+                    .expect("test owns the router")
+                    .add_tool(SessionStateProbeTool)
+                    .expect("admit the state probe");
+                let post =
+                    |method: &str, params: serde_json::Value, id: i64, session: Option<&str>| {
+                        let headers: Vec<(&str, &str)> = session
+                            .map(|session| vec![("Mcp-Session-Id", session)])
+                            .unwrap_or_default();
+                        let mut req = make_request(Http1Method::Post, "/api", &headers);
+                        req.body =
+                            serde_json::to_vec(&JsonRpcRequest::new(method, Some(params), id))
+                                .expect("serialize json-rpc");
+                        block_on(state.handle(req))
+                    };
+                let tool =
+                    |name: &str, arguments: serde_json::Value, id: i64, session: Option<&str>| {
+                        let resp = post(
+                            "tools/call",
+                            serde_json::json!({"name": name, "arguments": arguments}),
+                            id,
+                            session,
+                        );
+                        assert_eq!(resp.status, 200, "{name}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&resp.body).expect("json-rpc body");
+                        let result = body["result"].clone();
+                        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+                        let failed = body.get("error").is_some()
+                            || result["isError"].as_bool().unwrap_or(false);
+                        // A JSON-RPC error has no tool text; keep the whole body
+                        // so a failed assertion shows why.
+                        let payload = serde_json::from_str::<serde_json::Value>(text)
+                            .unwrap_or_else(|_| body.clone());
+                        (failed, payload)
+                    };
+
+                let init = post(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "session-test", "version": "1"},
+                    }),
+                    1,
+                    None,
+                );
+                assert_eq!(init.status, 200);
+                let session = response_header(&init, "mcp-session-id")
+                    .expect("initialize mints a session id")
+                    .to_string();
+
+                for (header, expected) in [
+                    (Some(session.as_str()), true),
+                    (None, false),
+                    (Some("unknown-session"), false),
+                ] {
+                    let (failed, presence) =
+                        tool("session_state_probe", serde_json::json!({}), 10, header);
+                    assert!(!failed, "{presence}");
+                    assert_eq!(presence["has_session_state"], expected);
+                }
+
+                let (failed, project) = tool(
+                    "ensure_project",
+                    serde_json::json!({"human_key": project_key}),
+                    2,
+                    Some(&session),
+                );
+                assert!(!failed, "{project}");
+                let identity = serde_json::json!({
+                    "project_key": project_key,
+                    "program": "codex-cli",
+                    "model": "gpt-5",
+                    "return_registration_token": false,
+                });
+                let (failed, alice) =
+                    tool("create_agent_identity", identity.clone(), 3, Some(&session));
+                assert!(!failed, "{alice}");
+                let alice = alice["name"].as_str().expect("alice").to_string();
+                let (failed, bob) = tool("create_agent_identity", identity, 4, None);
+                assert!(!failed, "{bob}");
+                let bob = bob["name"].as_str().expect("bob").to_string();
+                let (failed, policy) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
+                    5,
+                    None,
+                );
+                assert!(!failed, "{policy}");
+
+                let (failed, refusal) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "block_all"}),
+                    6,
+                    Some(&session),
+                );
+                assert!(
+                    failed,
+                    "a bound session cannot change another agent's policy"
+                );
+                assert_eq!(refusal["error"]["type"], "SESSION_IDENTITY_MISMATCH");
+
+                let send_args = serde_json::json!({
+                    "project_key": project_key,
+                    "sender_name": alice,
+                    "to": [bob],
+                    "subject": "hello",
+                    "body_md": "sent from a session",
+                });
+                let (failed, receipt) = tool("send_message", send_args.clone(), 7, Some(&session));
+                assert!(
+                    !failed,
+                    "refused block_all must leave Bob reachable: {receipt}"
+                );
+                assert_eq!(receipt["verified_sender"], true);
+                assert_eq!(receipt["sender_verification"], "session");
+
+                let (failed, _) = tool("send_message", send_args.clone(), 8, None);
+                assert!(failed, "a stateless request has no session identity");
+
+                let mut end = make_request(
+                    Http1Method::Delete,
+                    "/api",
+                    &[("Mcp-Session-Id", session.as_str())],
+                );
+                end.body = Vec::new();
+                assert_eq!(block_on(state.handle(end)).status, 204);
+                let (failed, _) = tool("send_message", send_args, 9, Some(&session));
+                assert!(failed, "an ended session has no identity");
+                let (failed, presence) = tool(
+                    "session_state_probe",
+                    serde_json::json!({}),
+                    11,
+                    Some(&session),
+                );
+                assert!(!failed, "{presence}");
+                assert_eq!(presence["has_session_state"], false);
+            },
         );
     }
 
@@ -29947,6 +30347,42 @@ first body
     }
 
     #[test]
+    fn health_durability_reports_the_wbq_write_latch() {
+        let healthy = || {
+            serde_json::json!({
+                "durability_state": "healthy",
+                "allows_reads": true,
+                "allows_writes": true,
+            })
+        };
+        let mut unlatched = healthy();
+        apply_wbq_write_gate(&mut unlatched, None);
+        assert_eq!(unlatched, healthy());
+
+        let mut latched = healthy();
+        apply_wbq_write_gate(
+            &mut latched,
+            Some(mcp_agent_mail_storage::WbqStats {
+                enqueued: 1188,
+                drained: 1188,
+                errors: 1,
+                fallbacks: 0,
+                unrecoverable_errors: 1,
+                last_unrecoverable_error_us: 1_792_012_964_761_918,
+            }),
+        );
+        assert_eq!(latched["durability_state"], "degraded_read_only");
+        assert_eq!(latched["allows_reads"], true);
+        assert_eq!(latched["allows_writes"], false);
+        assert_eq!(latched["write_gate"]["error_code"], "DURABILITY_DEGRADED");
+        assert_eq!(latched["write_gate"]["wbq_unrecoverable_errors_total"], 1);
+        assert_eq!(
+            latched["write_gate"]["wbq_last_unrecoverable_error_us"],
+            1_792_012_964_761_918_u64
+        );
+    }
+
+    #[test]
     fn health_durability_rejects_post_with_405() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
@@ -30777,6 +31213,142 @@ first body
             })
             .unwrap_or_default();
         assert_eq!(configured, i64::from(INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS));
+    }
+
+    /// br-r6psd: child side of a cross-process lock probe. `F_GETLK` reports
+    /// only a conflicting lock owned by ANOTHER process and never takes one,
+    /// so the probe cannot perturb the parent. Run it only in the re-executed
+    /// child: opening and closing the probed inode in the parent would itself
+    /// release the parent's classic `fcntl` locks on Linux.
+    #[cfg(target_os = "linux")]
+    fn fd_close_lock_probe_reports_foreign_conflict(
+        path: &Path,
+        start: nix::libc::off_t,
+        len: nix::libc::off_t,
+    ) -> bool {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("child opens the probed inode");
+        let short = |value: nix::libc::c_int| {
+            nix::libc::c_short::try_from(value).expect("fcntl lock constant fits c_short")
+        };
+        let mut query = nix::libc::flock {
+            l_type: short(nix::libc::F_WRLCK),
+            l_whence: short(nix::libc::SEEK_SET),
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETLK(&mut query))
+            .expect("non-mutating F_GETLK probe");
+        query.l_type != short(nix::libc::F_UNLCK)
+    }
+
+    /// br-r6psd regression (Linux): the raw TUI/metrics/observability open
+    /// guard runs inside the server process, beside live FrankenSQLite pool
+    /// connections. With nonclean durable breaker authority on disk it must
+    /// compare fingerprints without opening the live main inode. The raw
+    /// `recovery_breaker::fingerprint_db` it used to call opens, hashes and closes it, which
+    /// releases every classic `fcntl` lock this process holds there, so a
+    /// separate process stops seeing the parent's RESERVED/SHARED locks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_live_open_guard_preserves_same_process_franken_main_inode_locks() {
+        const CHILD_PATH_ENV: &str = "AM_TEST_RAW_GUARD_LOCK_PROBE_PATH";
+        const CHILD_TEST_NAME: &str =
+            "tests::raw_live_open_guard_preserves_same_process_franken_main_inode_locks";
+        const CHILD_WITNESS: &str = "raw-guard-lock-probe conflict=";
+        // SQLite's lock-byte page: PENDING (0x4000_0000), RESERVED (+1) and
+        // the 510-byte SHARED range (+2 .. +512).
+        const LOCK_PAGE_START: nix::libc::off_t = 0x4000_0000;
+        const LOCK_PAGE_LEN: nix::libc::off_t = 512;
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            let conflict = fd_close_lock_probe_reports_foreign_conflict(
+                Path::new(&path),
+                LOCK_PAGE_START,
+                LOCK_PAGE_LEN,
+            );
+            println!("{CHILD_WITNESS}{conflict}");
+            return;
+        }
+
+        fn child_observes_parent_main_lock(db_path: &Path) -> bool {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", CHILD_TEST_NAME, "--nocapture"])
+                .env(CHILD_PATH_ENV, db_path)
+                .output()
+                .expect("run main-inode child lock probe");
+            assert!(
+                output.status.success(),
+                "child lock probe failed: {output:?}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let verdict = stdout
+                .lines()
+                // libtest prints `test <name> ... ` ahead of the child's output on the same line.
+                .find_map(|line| line.split_once(CHILD_WITNESS).map(|(_, rest)| rest))
+                .unwrap_or_else(|| panic!("child filter ran no causal lock probe: {stdout}"));
+            verdict.split_whitespace().next() == Some("true")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("raw-guard-lock.sqlite3");
+        let writer = DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open FrankenSQLite writer");
+        writer
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("use main-inode rollback locking");
+        writer
+            .execute_raw("CREATE TABLE guard_lock_fixture (value INTEGER NOT NULL);")
+            .expect("create guard fixture table");
+        writer
+            .execute_raw("INSERT INTO guard_lock_fixture (value) VALUES (7);")
+            .expect("seed guard fixture row");
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let mut sidecar = db_path.clone().into_os_string();
+            sidecar.push(suffix);
+            assert!(
+                Path::new(&sidecar).is_file(),
+                "precondition: FrankenSQLite namespace sidecar {suffix} marks a Franken-managed family"
+            );
+        }
+
+        // Nonclean durable authority recorded for a different (lock-neutral
+        // format) generation: the guard must consult it, and it must not apply.
+        let other_generation = mcp_agent_mail_db::recovery_breaker::RecoveryBreakerState {
+            schema: 1,
+            db_fingerprint: format!("4096:fdc10ce1{}", "0".repeat(56)),
+            consecutive_failures: 1,
+            last_failure_unix: 1,
+            last_failure_reason: "br-r6psd fd-close regression fixture".to_string(),
+            tripped: false,
+            attempt_in_progress: false,
+        };
+        mcp_agent_mail_db::recovery_breaker::store(&db_path, &other_generation)
+            .expect("persist nonclean breaker authority");
+
+        writer
+            .execute_raw("BEGIN IMMEDIATE;")
+            .expect("acquire parent RESERVED writer lock");
+        assert!(
+            child_observes_parent_main_lock(&db_path),
+            "precondition: a separate process must observe the parent's live main-inode lock"
+        );
+
+        guard_raw_live_sqlite_engine_open(&db_path, "br-r6psd fd-close regression")
+            .expect("breaker history for another generation must not refuse a healthy family");
+
+        assert!(
+            child_observes_parent_main_lock(&db_path),
+            "the raw-open guard must not release this process's live FrankenSQLite main-inode locks"
+        );
+        writer
+            .execute_raw("ROLLBACK;")
+            .expect("end the parent writer transaction");
+        drop(writer);
     }
 
     #[test]

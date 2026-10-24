@@ -247,6 +247,41 @@ fn build_materialized_views_with_conn(
     } else {
         format!("'{UNKNOWN_SENDER_DISPLAY}' AS sender_name")
     };
+    // A sender registered in another project (a cross-project `Name@project`
+    // send) is shown as `Name@slug`, with its project for the viewer's
+    // sender badge. A same-project sender leaves these NULL and displays as
+    // `sender_name`. The viewer reads every column below (br-kp1in.42).
+    let (sender_origin_cols, sender_origin_join) = if has_sender_id {
+        (
+            format!(
+                "CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id \
+                      AND COALESCE(sp.slug, '') != '' AND NULLIF(TRIM(sa.name), '') IS NOT NULL \
+                      THEN TRIM(sa.name) || '@' || sp.slug \
+                      ELSE COALESCE(NULLIF(TRIM(sa.name), ''), '{UNKNOWN_SENDER_DISPLAY}') \
+                 END AS sender_display, \
+                 CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.id END \
+                     AS sender_project_id, \
+                 CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.slug END \
+                     AS sender_project_slug, \
+                 CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id THEN sp.human_key END \
+                     AS sender_project_name, \
+                 CASE WHEN sp.id IS NOT NULL AND sp.id != m.project_id \
+                      AND COALESCE(sp.slug, '') != '' AND NULLIF(TRIM(sa.name), '') IS NOT NULL \
+                      THEN 'project:' || sp.slug || '#' || TRIM(sa.name) \
+                 END AS sender_address"
+            ),
+            "LEFT JOIN agents sa ON sa.id = m.sender_id \
+             LEFT JOIN projects sp ON sp.id = sa.project_id",
+        )
+    } else {
+        (
+            format!(
+                "'{UNKNOWN_SENDER_DISPLAY}' AS sender_display, NULL AS sender_project_id, \
+                 NULL AS sender_project_slug, NULL AS sender_project_name, NULL AS sender_address"
+            ),
+            "",
+        )
+    };
     let recipients_join = format!(
         "LEFT JOIN ( \
              SELECT ordered_recipients.message_id, \
@@ -286,6 +321,11 @@ fn build_materialized_views_with_conn(
              ack_required INTEGER, \
              created_ts INTEGER, \
              sender_name TEXT, \
+             sender_display TEXT, \
+             sender_project_id INTEGER, \
+             sender_project_slug TEXT, \
+             sender_project_name TEXT, \
+             sender_address TEXT, \
              body_length INTEGER, \
              attachment_count INTEGER, \
              latest_snippet TEXT, \
@@ -307,11 +347,13 @@ fn build_materialized_views_with_conn(
              m.ack_required, \
              m.created_ts, \
              {sender_expr}, \
+             {sender_origin_cols}, \
              LENGTH(m.body_md) AS body_length, \
              {attachments_expr}, \
              SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet, \
              {recipients_expr} \
          FROM messages m \
+         {sender_origin_join} \
          {recipients_join} \
          ORDER BY m.created_ts DESC"
     );
@@ -2036,6 +2078,88 @@ mod tests {
             .unwrap();
         let fts_name: String = fts_rows[0].get_named("sender_name").unwrap();
         assert_eq!(fts_name, UNKNOWN_SENDER_DISPLAY);
+    }
+
+    /// br-kp1in.42: the share viewer shows a sender registered in another
+    /// project as `Name@slug` and reads its project from the overview; a
+    /// same-project or orphaned sender keeps its plain display name.
+    #[test]
+    fn materialized_views_mark_cross_project_senders_for_the_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (2, 'proj-beta', '/data/beta', '')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (3, 2, 'BetaRemote', 'codex-cli', 'gpt-5', '', '', '', \
+             'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES (3, 1, 3, 'TKT-2', 'From beta', 'cross-project', \
+             'normal', 0, '2025-01-01T12:00:00Z', '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES (4, 1, 99, 'TKT-3', 'Orphan', 'gone sender', \
+             'normal', 0, '2025-01-01T13:00:00Z', '[]')",
+        )
+        .unwrap();
+        drop(conn);
+
+        build_materialized_views(&db, false).unwrap();
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT id, sender_display, \
+                        COALESCE(sender_project_id, -1) AS project_id, \
+                        COALESCE(sender_project_slug, '<null>') AS slug, \
+                        COALESCE(sender_project_name, '<null>') AS name, \
+                        COALESCE(sender_address, '<null>') AS address \
+                 FROM message_overview_mv ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        let view: Vec<(i64, String, i64, String, String, String)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_named("id").unwrap(),
+                    row.get_named("sender_display").unwrap(),
+                    row.get_named("project_id").unwrap(),
+                    row.get_named("slug").unwrap(),
+                    row.get_named("name").unwrap(),
+                    row.get_named("address").unwrap(),
+                )
+            })
+            .collect();
+        let plain = |id: i64, display: &str| {
+            (
+                id,
+                display.to_string(),
+                -1,
+                "<null>".to_string(),
+                "<null>".to_string(),
+                "<null>".to_string(),
+            )
+        };
+        assert_eq!(
+            view,
+            vec![
+                plain(1, "AlphaAgent"),
+                plain(2, "AlphaAgent"),
+                (
+                    3,
+                    "BetaRemote@proj-beta".to_string(),
+                    2,
+                    "proj-beta".to_string(),
+                    "/data/beta".to_string(),
+                    "project:proj-beta#BetaRemote".to_string(),
+                ),
+                plain(4, UNKNOWN_SENDER_DISPLAY),
+            ]
+        );
     }
 
     #[test]

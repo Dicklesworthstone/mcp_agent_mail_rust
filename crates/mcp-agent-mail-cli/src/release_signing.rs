@@ -190,13 +190,13 @@ impl MinisignSignature {
 /// `trusted_keys`, selected by the key id the signature names.
 ///
 /// Both the file signature and the global signature (which binds the trusted
-/// comment) must verify, exactly as `minisign -V` requires. Returns the hex
-/// id of the key that verified the manifest.
-pub(crate) fn verify_manifest_signature(
+/// comment) must verify, exactly as `minisign -V` requires. The returned
+/// comment is authenticated, but the caller must still bind it to a release.
+fn verify_manifest_signature(
     manifest: &[u8],
     minisig: &[u8],
     trusted_keys: &[MinisignPublicKey],
-) -> Result<String, String> {
+) -> Result<MinisignSignature, String> {
     if trusted_keys.is_empty() {
         return Err("no trusted release signing keys are configured".to_string());
     }
@@ -241,7 +241,47 @@ pub(crate) fn verify_manifest_signature(
             )
         })?;
 
-    Ok(signer_id)
+    Ok(sig)
+}
+
+/// Authenticate the manifest and its exact requested release identity before
+/// using any checksum. Asset names and signing keys are reused across releases,
+/// so a valid signature for another version is insufficient.
+///
+/// `version` is the normalized version without the leading `v`, selected by
+/// the updater, never supplied by the downloaded manifest.
+pub(crate) fn verify_release_manifest_signature(
+    manifest: &[u8],
+    minisig: &[u8],
+    trusted_keys: &[MinisignPublicKey],
+    version: &str,
+) -> Result<String, String> {
+    let sig = verify_manifest_signature(manifest, minisig, trusted_keys)?;
+    if !release_comment_identifies_version(&sig.trusted_comment, version) {
+        return Err(format!(
+            "signed checksum manifest does not identify the requested release v{version}; \
+             expected authenticated product and tag mcp_agent_mail_rust v{version}"
+        ));
+    }
+    Ok(format_key_id(&sig.key_id))
+}
+
+fn release_comment_identifies_version(comment: &[u8], version: &str) -> bool {
+    let prefix = format!("mcp_agent_mail_rust v{version} ");
+    let Some(suffix) = comment.strip_prefix(prefix.as_bytes()) else {
+        return false;
+    };
+    if suffix == b"SHA256SUMS" {
+        return true;
+    }
+    // Published v0.3.34/.35 include "source <commit> SHA256SUMS", and
+    // v0.3.36 includes just the source commit. Keep those authenticated
+    // formats while requiring an exact tag boundary and a full commit ID.
+    let commit = suffix
+        .strip_prefix(b"source ")
+        .and_then(|value| value.strip_suffix(b" SHA256SUMS"))
+        .unwrap_or(suffix);
+    commit.len() == 40 && commit.iter().all(u8::is_ascii_hexdigit)
 }
 
 /// Parse a list of minisign public keys separated by whitespace or commas.
@@ -396,9 +436,13 @@ mod tests {
 
     #[test]
     fn real_v0_3_32_manifest_verifies_with_embedded_key() {
-        let key_id =
-            verify_manifest_signature(V0_3_32_SHA256SUMS, V0_3_32_MINISIG, &embedded_keys())
-                .expect("published manifest verifies");
+        let key_id = verify_release_manifest_signature(
+            V0_3_32_SHA256SUMS,
+            V0_3_32_MINISIG,
+            &embedded_keys(),
+            "0.3.32",
+        )
+        .expect("published manifest verifies for its own release");
         assert_eq!(key_id, "1BBD79B28BF718D0");
         let hash = manifest_sha256_for(
             std::str::from_utf8(V0_3_32_SHA256SUMS).unwrap(),
@@ -409,6 +453,91 @@ mod tests {
             hash,
             "72628ba5c7e7d1feba9a8b8c1663937bd69da09a9ac6d90211aa537c9943a573"
         );
+    }
+
+    #[test]
+    fn real_signed_manifest_cannot_be_replayed_as_another_release() {
+        for version in ["0.3.31", "0.3.33", "0.3.32-rc.1", "0.3.320"] {
+            let err = verify_release_manifest_signature(
+                V0_3_32_SHA256SUMS,
+                V0_3_32_MINISIG,
+                &embedded_keys(),
+                version,
+            )
+            .expect_err("a genuine signature for another release must fail");
+            assert!(err.contains("requested release"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn release_identity_accepts_published_provenance_formats_for_the_exact_tag() {
+        let key = TestKey::new(12);
+        let manifest = b"manifest";
+        let commit = "071e1c85d06b6247bbddab11cc8139b38cc885bf";
+        for version in ["0.3.36", "1.2.3-rc.1"] {
+            for suffix in [
+                "SHA256SUMS".to_string(),
+                commit.to_string(),
+                format!("source {commit} SHA256SUMS"),
+            ] {
+                let comment = format!("mcp_agent_mail_rust v{version} {suffix}");
+                let signed = key.sign(manifest, &comment, true);
+                let keys = [key.public()];
+                assert!(
+                    verify_release_manifest_signature(manifest, &signed, &keys, version).is_ok(),
+                    "published format {comment:?} must be accepted"
+                );
+                let replay =
+                    verify_release_manifest_signature(manifest, &signed, &keys, "1.2.3-rc.2")
+                        .expect_err("source provenance must not allow another requested version");
+                assert!(replay.contains("requested release"));
+            }
+        }
+    }
+
+    #[test]
+    fn release_identity_rejects_ambiguous_labels_and_unauthenticated_relabeling() {
+        let key = TestKey::new(13);
+        let manifest = b"manifest";
+        let version = "1.2.3-rc.1";
+        for comment in [
+            "mcp_agent_mail_rust v1.2.3 SHA256SUMS",
+            "mcp_agent_mail_rust v1.2.3-rc.10 SHA256SUMS",
+            "another_product v1.2.3-rc.1 SHA256SUMS",
+            "mcp_agent_mail_rust v1.2.3-rc.1 another_manifest",
+            "mcp_agent_mail_rust 1.2.3-rc.1 SHA256SUMS",
+            "mcp_agent_mail_rust v1.2.3-rc.1 SHA256SUMS ",
+            "mcp_agent_mail_rust v1.2.3-rc.1 source 01234567890123456789012345678901234567890 SHA256SUMS",
+            "mcp_agent_mail_rust v1.2.3-rc.1 source 012345678901234567890123456789012345678901 SHA256SUMS",
+            "mcp_agent_mail_rust v1.2.3-rc.1 01234567890123456789012345678901234567890",
+            "mcp_agent_mail_rust v1.2.3-rc.1 012345678901234567890123456789012345678901",
+            "mcp_agent_mail_rust v1.2.3-rc.1 source 0123456789012345678901234567890123456789 SHA256SUMS extra",
+            "mcp_agent_mail_rust v1.2.3-rc.1 0123456789012345678901234567890123456789 extra",
+            "timestamp:1700000000 file:SHA256SUMS",
+            "",
+        ] {
+            let signed = key.sign(manifest, comment, true);
+            let err =
+                verify_release_manifest_signature(manifest, &signed, &[key.public()], version)
+                    .expect_err("valid cryptography does not replace exact release identity");
+            assert!(
+                err.contains("requested release"),
+                "comment {comment:?}: {err}"
+            );
+        }
+
+        let old = key.sign(manifest, "mcp_agent_mail_rust v1.2.2 SHA256SUMS", true);
+        let relabeled = String::from_utf8(old)
+            .unwrap()
+            .replace("v1.2.2", "v1.2.3-rc.1");
+        let err = verify_release_manifest_signature(
+            manifest,
+            relabeled.as_bytes(),
+            &[key.public()],
+            version,
+        )
+        .expect_err("an unauthenticated release label must fail");
+        assert!(err.contains("global signature"), "unexpected error: {err}");
     }
 
     #[test]
@@ -455,7 +584,7 @@ mod tests {
             let sig = key.sign(manifest, "test manifest", prehashed);
             let id = verify_manifest_signature(manifest, &sig, &[key.public()])
                 .expect("test signature verifies");
-            assert_eq!(id, key.public().key_id_hex());
+            assert_eq!(format_key_id(&id.key_id), key.public().key_id_hex());
         }
         // Everything after "trusted comment: " is the comment, including
         // leading whitespace and an empty comment.
@@ -503,12 +632,20 @@ mod tests {
         let trusted = vec![old.public(), new.public()];
         let by_new = new.sign(manifest, "new", true);
         assert_eq!(
-            verify_manifest_signature(manifest, &by_new, &trusted).unwrap(),
+            format_key_id(
+                &verify_manifest_signature(manifest, &by_new, &trusted)
+                    .unwrap()
+                    .key_id
+            ),
             new.public().key_id_hex()
         );
         let by_old = old.sign(manifest, "old", true);
         assert_eq!(
-            verify_manifest_signature(manifest, &by_old, &trusted).unwrap(),
+            format_key_id(
+                &verify_manifest_signature(manifest, &by_old, &trusted)
+                    .unwrap()
+                    .key_id
+            ),
             old.public().key_id_hex()
         );
         // Dropping the old key from the trusted set revokes it.

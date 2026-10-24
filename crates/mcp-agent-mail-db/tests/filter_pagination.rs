@@ -532,6 +532,235 @@ fn ack_required_filter() {
     assert_eq!(resp.results[0].id, id_ack);
 }
 
+/// A filter-only search (here: ack required, no text) has nothing to rank by
+/// relevance; it must page newest first, not list the oldest matches first.
+#[test]
+fn filter_only_relevance_pages_newest_first() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "sql-relevance");
+    let aid = seed_agent(&pool, pid, "AmberOx");
+    let mut ids = Vec::new();
+    for day in 0..7 {
+        let id = create_msg(
+            &pool,
+            pid,
+            aid,
+            "sqlrel needs ack",
+            "sqlrel body",
+            "normal",
+            None,
+            true,
+        );
+        set_message_ts(&pool, id, BASE_TS + day * MICROS_PER_DAY);
+        ids.push(id);
+    }
+    let no_ack = create_msg(&pool, pid, aid, "sqlrel", "sqlrel", "normal", None, false);
+    set_message_ts(&pool, no_ack, BASE_TS + 9 * MICROS_PER_DAY);
+
+    let mut query = SearchQuery::messages("", pid);
+    query.ack_required = Some(true);
+    query.limit = Some(3);
+    assert_eq!(query.ranking, RankingMode::Relevance);
+    let mut collected = Vec::new();
+    for _ in 0..=7 {
+        let response = search(&pool, &query);
+        collected.extend(result_ids(&response));
+        query.cursor = response.next_cursor;
+        if query.cursor.is_none() {
+            break;
+        }
+    }
+    ids.reverse();
+    assert_eq!(collected, ids, "newest first, every match once");
+}
+
+/// Newest/Oldest order runs on the SQL plan; its text match must honour the
+/// Query Help syntax rather than flatten it into required words.
+#[test]
+fn time_ordered_search_honours_query_syntax() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "like-syntax");
+    let aid = seed_agent(&pool, pid, "TealOtter");
+    let msg = |subject: &str, body: &str| {
+        create_msg(&pool, pid, aid, subject, body, "normal", None, false)
+    };
+    let error_only = msg("deploy error", "rollback started");
+    let _error_timeout = msg("deploy error", "the job hit a timeout");
+    let auth_subject = msg("authentication rework", "notes");
+    let _auth_body = msg("weekly notes", "authentication came up");
+    let phrase = msg("keys", "rotate the API key today");
+    let _split = msg("keys", "the API rotated; one key left");
+
+    let ids = |text: &str| {
+        let mut query = SearchQuery::messages(text, pid);
+        query.ranking = RankingMode::Recency;
+        let mut ids = result_ids(&search(&pool, &query));
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(ids("error NOT timeout"), vec![error_only]);
+    assert_eq!(ids("error -timeout"), vec![error_only]);
+    assert_eq!(ids("subject:authentication"), vec![auth_subject]);
+    assert_eq!(ids("body:\"API key\""), vec![phrase]);
+    assert_eq!(ids("\"API key\""), vec![phrase]);
+}
+
+/// `from:`, `thread:`, `importance:` and `after:`/`before:` hints in the text
+/// filter like the facets they name, and only applied hints are reported.
+#[test]
+fn query_hints_filter_like_their_facets() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "query-hints");
+    let amber = seed_agent(&pool, pid, "AmberOx");
+    let coral = seed_agent(&pool, pid, "CoralFinch");
+    let amber_plan = create_msg(
+        &pool,
+        pid,
+        amber,
+        "hintq plan",
+        "b",
+        "high",
+        Some("br-9"),
+        false,
+    );
+    set_message_ts(&pool, amber_plan, BASE_TS + 2 * MICROS_PER_DAY);
+    let coral_plan = create_msg(
+        &pool,
+        pid,
+        coral,
+        "hintq plan",
+        "b",
+        "normal",
+        Some("br-7"),
+        false,
+    );
+    set_message_ts(&pool, coral_plan, BASE_TS);
+
+    let run = |text: &str| {
+        let response = search(&pool, &SearchQuery::messages(text, pid));
+        let mut ids = result_ids(&response);
+        ids.sort_unstable();
+        let applied: Vec<String> = response
+            .assistance
+            .map(|a| {
+                a.applied_filter_hints
+                    .into_iter()
+                    .map(|h| h.field)
+                    .collect()
+            })
+            .unwrap_or_default();
+        (ids, applied)
+    };
+    assert_eq!(run("hintq"), (vec![amber_plan, coral_plan], vec![]));
+    assert_eq!(
+        run("from:AmberOx hintq"),
+        (vec![amber_plan], vec!["from".to_string()])
+    );
+    assert_eq!(
+        run("thread:br-7 hintq"),
+        (vec![coral_plan], vec!["thread".to_string()])
+    );
+    assert_eq!(
+        run("importance:high hintq"),
+        (vec![amber_plan], vec!["importance".to_string()])
+    );
+    assert_eq!(
+        run("after:2026-01-16 hintq"),
+        (vec![amber_plan], vec!["after".to_string()])
+    );
+    // An unknown project is not applied, and not reported as applied.
+    assert_eq!(run("project:no-such-project hintq").1, Vec::<String>::new());
+}
+
+/// Time-ordered (SQL plan) results carry their recipients like relevance
+/// (index) results do.
+#[test]
+fn time_ordered_results_carry_recipients() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "plan-recipients");
+    let sender = seed_agent(&pool, pid, "AmberOx");
+    let to = seed_agent(&pool, pid, "TealOtter");
+    let cc = seed_agent(&pool, pid, "CoralFinch");
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                pid,
+                sender,
+                "hydrate me",
+                "hydrate body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(to, "to"), (cc, "cc")],
+            )
+            .await
+            {
+                Outcome::Ok(_) => {}
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            }
+        }
+    });
+
+    let mut query = SearchQuery::messages("hydrate", pid);
+    query.ranking = RankingMode::Recency;
+    let response = search(&pool, &query);
+    let result = response.results.first().expect("one result");
+    assert_eq!(result.to.as_deref(), Some(&["TealOtter".to_string()][..]));
+    assert_eq!(result.cc.as_deref(), Some(&["CoralFinch".to_string()][..]));
+}
+
+/// A numeric thread id names its root message, which has no `thread_id` of
+/// its own: the filter must return it with its replies, as the thread view does.
+#[test]
+fn numeric_thread_filter_includes_the_root_message() {
+    let (pool, _dir) = make_pool();
+    let pid = seed_project(&pool, "thread-root");
+    let aid = seed_agent(&pool, pid, "CoralFinch");
+    let root = create_msg(
+        &pool,
+        pid,
+        aid,
+        "rootthr plan",
+        "rootthr body",
+        "normal",
+        None,
+        false,
+    );
+    let root_thread = root.to_string();
+    let reply = create_msg(
+        &pool,
+        pid,
+        aid,
+        "rootthr reply",
+        "rootthr body",
+        "normal",
+        Some(&root_thread),
+        false,
+    );
+    let _other = create_msg(
+        &pool,
+        pid,
+        aid,
+        "rootthr other",
+        "rootthr body",
+        "normal",
+        None,
+        false,
+    );
+
+    for text in ["rootthr", ""] {
+        let mut query = SearchQuery::messages(text, pid);
+        query.thread_id = Some(root_thread.clone());
+        let mut ids = result_ids(&search(&pool, &query));
+        ids.sort_unstable();
+        assert_eq!(ids, vec![root, reply], "text={text:?}");
+    }
+}
+
 /// Test: project isolation — messages in other projects are not returned.
 #[test]
 fn project_isolation() {
@@ -697,10 +926,13 @@ fn pagination_exhausts_beyond_candidate_prefix_with_date_and_recency() {
         ids.push(id);
     }
 
+    // Oldest must start at the oldest match, not reverse the newest page.
     for (ranking, date_filtered) in [
         (RankingMode::Relevance, false),
         (RankingMode::Relevance, true),
         (RankingMode::Recency, true),
+        (RankingMode::Oldest, false),
+        (RankingMode::Oldest, true),
     ] {
         let mut query = SearchQuery::messages("deepcursor", pid);
         query.limit = Some(3);

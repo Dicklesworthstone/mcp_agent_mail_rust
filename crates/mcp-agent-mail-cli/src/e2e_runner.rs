@@ -3189,8 +3189,11 @@ test "$(tail -n 1 build_modes)" = 0
         let root = TempDir::new().unwrap().keep();
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
+        // The pid is published atomically: a plain `>` truncates first, and a
+        // fixture killed between truncation and write left an empty file
+        // (GH#340: `ParseIntError { kind: Empty }` under load).
         fs::write(bin.join("cargo"), r#"#!/bin/sh
-printf '%s\n' "$$" > "$CARGO_FIXTURE_PID"
+printf '%s\n' "$$" > "$CARGO_FIXTURE_PID.tmp" && /bin/mv -f "$CARGO_FIXTURE_PID.tmp" "$CARGO_FIXTURE_PID"
 case "$CARGO_FIXTURE_MODE" in
   timeout)
     trap 'echo "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; exit 0' TERM
@@ -3214,12 +3217,16 @@ esac
         }
         for mode in ["timeout", "stdout", "stderr"] {
             let pid_path = root.join(format!("{mode}.pid"));
+            let mut reap_checks = 0_usize;
             let runner = Runner::new(
                 &root,
                 RunConfig {
                     project_root: root.clone(),
                     max_output_bytes: 1024,
-                    timeout: Some(Duration::from_millis(500)),
+                    // Long enough for a loaded host to start the fixture shell
+                    // and install its TERM trap; still well inside the 5 s
+                    // per-suite bound asserted below.
+                    timeout: Some(Duration::from_secs(2)),
                     env: HashMap::from([
                         ("PATH".to_string(), bin.to_string_lossy().into_owned()),
                         ("CARGO_FIXTURE_MODE".to_string(), mode.to_string()),
@@ -3240,13 +3247,13 @@ esac
                 "tui_a11y",
                 "tui_interaction",
             ] {
+                // A pid left by the previous suite must not stand in for this one.
+                let _ = fs::remove_file(&pid_path);
                 let started = Instant::now();
                 let result = runner.run_suite(runner.registry.get(suite).unwrap());
-                let pid: i32 = fs::read_to_string(&pid_path)
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap();
+                let pid: Option<i32> = fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok());
                 assert!(!result.passed, "{suite}/{mode}: {}", result.stdout);
                 assert_eq!(
                     result.exit_code,
@@ -3256,11 +3263,16 @@ esac
                 );
                 assert!(started.elapsed() < Duration::from_secs(5), "{suite}/{mode}");
                 assert!(result.stdout.len() < 1200 && result.stderr.len() < 1400);
-                assert_eq!(
-                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-                    Err(nix::errno::Errno::ESRCH),
-                    "unreaped cargo peer: {suite}/{mode}"
-                );
+                // A fixture stopped before it published its pid cannot be
+                // looked up, but it was still bounded by the checks above.
+                if let Some(pid) = pid {
+                    reap_checks += 1;
+                    assert_eq!(
+                        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                        Err(nix::errno::Errno::ESRCH),
+                        "unreaped cargo peer: {suite}/{mode}"
+                    );
+                }
                 if mode == "timeout" {
                     // A valid-looking summary emitted by the TERM handler
                     // does not turn a timed-out operation into success.
@@ -3270,6 +3282,11 @@ esac
                     assert!(result.stderr.contains("capture limit"));
                 }
             }
+            // The reap check must actually run, not pass vacuously.
+            assert!(
+                reap_checks > 0,
+                "{mode}: no suite published a fixture pid; reaping was never checked"
+            );
         }
     }
 

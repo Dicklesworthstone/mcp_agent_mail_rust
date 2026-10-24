@@ -1,4 +1,5 @@
-//! Recipient resolution across projects, through the real tool entry points.
+//! Tool behaviour through the real tool entry points: recipient resolution
+//! across projects, and what the session macros and summaries do to an agent.
 //!
 //! GH#301: a `send_message` to an unregistered same-project recipient
 //! auto-registers a placeholder agent (when `MESSAGING_AUTO_REGISTER_RECIPIENTS`
@@ -1368,5 +1369,221 @@ fn qualified_send_consent_cannot_be_forged_by_the_sender() {
             .expect_err("block_all recipient");
         assert_eq!(code(&err).as_deref(), Some("CONTACT_BLOCKED"), "{err:?}");
         assert_eq!(delivery_counts(&cx).await, before, "nothing may be written");
+    });
+}
+
+/// A welcome with a body but no subject is not sent, and the handshake says why
+/// instead of returning a bare `welcome_message: null`.
+#[test]
+fn handshake_reports_a_half_written_welcome() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-welcome-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        let handshake: Value = serde_json::from_str(
+            &macro_contact_handshake(
+                &ctx,
+                project.clone(),
+                Some("GreenCastle".to_string()),
+                Some("BlueLake".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                Some("hi".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("handshake"),
+        )
+        .expect("handshake JSON");
+        assert!(handshake["welcome_message"].is_null(), "{handshake}");
+        assert!(
+            handshake["welcome_skipped_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("welcome_incomplete")),
+            "{handshake}"
+        );
+    });
+}
+
+/// A single-thread summary covers the whole thread; `per_thread_limit` (a
+/// multi-thread knob, default 50) cuts it only when given.
+#[test]
+fn single_thread_summary_counts_the_whole_thread() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-summary-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        for _ in 0..55 {
+            send_in_plan_thread(&ctx, &project, "GreenCastle", "BlueLake", None)
+                .await
+                .expect("send");
+        }
+        let total = |limit: Option<i32>| {
+            let ctx = &ctx;
+            let project = project.clone();
+            async move {
+                let raw = mcp_agent_mail_tools::summarize_thread(
+                    ctx,
+                    project,
+                    "th-plan".to_string(),
+                    None,
+                    Some(false),
+                    None,
+                    limit,
+                )
+                .await
+                .expect("summarize_thread");
+                let summary: Value = serde_json::from_str(&raw).expect("summary JSON");
+                summary["summary"]["total_messages"].as_i64()
+            }
+        };
+        assert_eq!(total(None).await, Some(55));
+        assert_eq!(total(Some(10)).await, Some(10), "an explicit limit applies");
+    });
+}
+
+/// Send from `from` to `to` in thread th-plan, optionally verified.
+async fn send_in_plan_thread(
+    ctx: &McpContext,
+    project: &str,
+    from: &str,
+    to: &str,
+    token: Option<String>,
+) -> Result<String, fastmcp::McpError> {
+    send_message(
+        ctx,
+        project.to_string(),
+        from.to_string(),
+        vec![to.to_string()],
+        "plan".to_string(),
+        "body".to_string(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("th-plan".to_string()),
+        None,
+        None,
+        None,
+        token,
+        None,
+    )
+    .await
+}
+
+/// Register `name` in `project`; returns its registration token.
+async fn register_for_token(ctx: &McpContext, project: &str, name: &str) -> String {
+    let raw = register_agent(
+        ctx,
+        project.to_string(),
+        "codex-cli".to_string(),
+        "gpt-5".to_string(),
+        Some(name.to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register_agent");
+    let agent: Value = serde_json::from_str(&raw).expect("agent JSON");
+    agent["registration_token"]
+        .as_str()
+        .expect("token")
+        .to_string()
+}
+
+/// `macro_prepare_thread` registers only as a convenience: it must not rotate a
+/// running agent's token (its verified sends would start failing).
+/// `register_agent` itself still rotates.
+#[test]
+fn macro_prepare_thread_keeps_the_running_agents_token() {
+    run_with_storage(|cx, _storage_root| async move {
+        let ctx = McpContext::new(cx, 1);
+        let project = format!("/tmp/auto-register-prepare-{}", unique_suffix());
+        ensure_project(&ctx, project.clone(), None)
+            .await
+            .expect("ensure_project");
+        let token = register_for_token(&ctx, &project, "BlueLake").await;
+        register_for_token(&ctx, &project, "GreenCastle").await;
+        send_in_plan_thread(&ctx, &project, "GreenCastle", "BlueLake", None)
+            .await
+            .expect("send to BlueLake");
+
+        let prepared: Value = serde_json::from_str(
+            &mcp_agent_mail_tools::macro_prepare_thread(
+                &ctx,
+                project.clone(),
+                "th-plan".to_string(),
+                "codex-cli".to_string(),
+                "gpt-5".to_string(),
+                Some("BlueLake".to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("macro_prepare_thread"),
+        )
+        .expect("prepare JSON");
+        // Present (the Python response always carried it) but null: the kept
+        // token is never echoed.
+        assert_eq!(
+            prepared["agent"].get("registration_token"),
+            Some(&serde_json::Value::Null),
+            "{prepared}"
+        );
+        assert!(
+            prepared["inbox"]
+                .as_array()
+                .is_some_and(|inbox| inbox.iter().any(|msg| msg["thread_id"] == "th-plan")),
+            "{prepared}"
+        );
+
+        send_in_plan_thread(
+            &ctx,
+            &project,
+            "BlueLake",
+            "GreenCastle",
+            Some(token.clone()),
+        )
+        .await
+        .expect("BlueLake's original token still verifies");
+
+        register_for_token(&ctx, &project, "BlueLake").await;
+        let err = send_in_plan_thread(&ctx, &project, "BlueLake", "GreenCastle", Some(token))
+            .await
+            .expect_err("register_agent rotated the token");
+        assert_eq!(
+            mcp_agent_mail_tools::tool_util::tool_error_code(&err),
+            Some("SENDER_TOKEN_MISMATCH")
+        );
     });
 }

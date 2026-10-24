@@ -4,8 +4,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Every script, style and data file is served from the bundle itself
+       (vendor/ with SRI). The Tailwind runtime and Alpine evaluate at runtime,
+       so 'unsafe-eval'/'unsafe-inline' remain; connect-src 'self' keeps a
+       script that slips past the sanitizer from sending mail elsewhere. -->
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src *; object-src 'none'; base-uri 'self';" />
+    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self';" />
   <title>Agent Mail Viewer</title>
   <!-- Static Viewer: compatibility marker for legacy tests -->
 
@@ -157,7 +161,7 @@
     crossorigin="anonymous"></script>
 
   <!-- DOMPurify for HTML sanitization -->
-  <script src="./vendor/dompurify.min.js" integrity="sha256-0kaYYq3qitkkVZpP/6uKTJwfTpqFNM6OHDbsaYzw9Uw="
+  <script src="./vendor/dompurify.min.js" integrity="sha256-LJCptG1kY/JgOKKbaG6CvJHeAf2snVIp58/js2ATTqI="
     crossorigin="anonymous"></script>
 
   <style>
@@ -707,25 +711,25 @@
               class="absolute right-0 mt-1 w-40 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 py-1 z-20"
               style="display: none;">
               <button @click="sortBy = 'newest'; filterMessages(); sortOpen = false"
-                :class="sortBy === 'newest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300" : 'text-slate-700 dark:text-slate-300'"
+                :class="sortBy === 'newest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
                 class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
                 <i data-lucide="arrow-down" class="w-4 h-4"></i>
                 Newest First
               </button>
               <button @click="sortBy = 'oldest'; filterMessages(); sortOpen = false"
-                :class="sortBy === 'oldest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300" : 'text-slate-700 dark:text-slate-300'"
+                :class="sortBy === 'oldest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
                 class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
                 <i data-lucide="arrow-up" class="w-4 h-4"></i>
                 Oldest First
               </button>
               <button @click="sortBy = 'sender'; filterMessages(); sortOpen = false"
-                :class="sortBy === 'sender' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300" : 'text-slate-700 dark:text-slate-300'"
+                :class="sortBy === 'sender' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
                 class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
                 <i data-lucide="user" class="w-4 h-4"></i>
                 By Sender
               </button>
               <button @click="sortBy = 'longest'; filterMessages(); sortOpen = false"
-                :class="sortBy === 'longest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300" : 'text-slate-700 dark:text-slate-300'"
+                :class="sortBy === 'longest' ? 'bg-primary-50 dark:bg-primary-900/20 text-primary-700 dark:text-primary-300' : 'text-slate-700 dark:text-slate-300'"
                 class="w-full px-3 py-2 text-left text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors flex items-center gap-2">
                 <i data-lucide="file-text" class="w-4 h-4"></i>
                 Longest First
@@ -1269,7 +1273,9 @@
 
   <!-- Scripts -->
   <script type="module" src="./preview-reload.js"></script>
-  <!-- Load Alpine AFTER the inline controllers above so controllers exist before Alpine scans -->
+  <!-- The viewer controller (window.viewerController) must exist before Alpine scans -->
+  <script src="./viewer.js" integrity="sha256-9D0K1U8gJXa5Ra+bz0wJin+Q5sp7Ll1qiG9u8Gq0n9Q="></script>
+  <!-- Load Alpine AFTER the controllers so they exist before Alpine scans -->
   <script src="./vendor/alpine.min.js" integrity="sha256-NY2a+7GrW++i9IBhowd25bzXcH9BCmBrqYX5i8OxwDQ=" defer></script>
 
   <script>

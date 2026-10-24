@@ -360,7 +360,26 @@ jobs:
         shell: bash
         env:
           AM_E2E_KEEP_TMP: "1"
-        run: bash tests/installer/test_install_artifact_fallback.sh
+        run: |
+          if ! command -v minisign >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y minisign
+          fi
+          bash tests/installer/test_install_artifact_fallback.sh
+          bash tests/installer/test_install_transaction_history_prune.sh
+
+      - name: Install pinned Minisign for Windows installer verification
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
+          Invoke-WebRequest -Uri 'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip' -OutFile $archive -UserAgent 'mcp_agent_mail_rust-ci (+https://github.com/Dicklesworthstone/mcp_agent_mail_rust)'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne '37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479') {
+            throw 'Pinned Minisign archive checksum mismatch'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP 'minisign-0.12'
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          Join-Path $destination 'minisign-win64/x86_64' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Run PowerShell installer transaction suite
         if: runner.os == 'Windows'
@@ -368,6 +387,7 @@ jobs:
         env:
           AM_E2E_KEEP_TMP: "1"
           AM_E2E_INSTALL_PS1_REQUIRE_PWSH: "1"
+          AM_E2E_INSTALL_PS1_REQUIRE_MINISIGN: "1"
         run: target/debug/am e2e run --keep-tmp --project . install_ps1
 
       - name: Upload native matrix artifacts

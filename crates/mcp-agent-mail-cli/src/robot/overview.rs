@@ -1,4 +1,4 @@
-//! Bounded cold overview collection without SQL joins (GH#274).
+//! Bounded cold overview collection (GH#274).
 //!
 //! Keyset pages bound the Rust row buffers independently of mailbox size.
 //! Separate unread recipients from overdue acknowledgement candidates when
@@ -6,6 +6,9 @@
 //! for the current active-reservation page.
 //! Inventory seeks past already-discovered project groups through a suitable
 //! index, rather than returning every historical message and agent row.
+//! Shared-mailbox counts use a capped viewer population and sparse corrections,
+//! with the canonical visibility query as the dense/schema fallback. No
+//! recipient rows or read receipts are created by this observation.
 //! The returned project list necessarily remains proportional to projects.
 
 use std::collections::{HashMap, HashSet};
@@ -17,6 +20,7 @@ use serde::Serialize;
 use sqlmodel_core::{Row, Value};
 
 mod counts_reservations;
+mod shared_mailboxes;
 mod sparse_recipients;
 
 const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
@@ -166,6 +170,7 @@ struct ScanWork {
     recipient_sample_rows: usize,
     ack_message_rows: usize,
     ack_count_rows: usize,
+    project_mailbox_message_rows: usize,
     peak_query_rows: usize,
     peak_message_keys: usize,
     peak_release_keys: usize,
@@ -569,6 +574,7 @@ fn collect_at(
     if !sparse_recipients::try_collect(conn, now_us, &mut projects, &mut work)? {
         collect_recipients_scan(conn, now_us, &mut projects, &mut work)?;
     }
+    collect_project_mailboxes(conn, now_us, &mut projects, &mut work)?;
 
     if counts_only {
         counts_reservations::collect(conn, now_us, &mut projects, &mut work)?;
@@ -581,6 +587,88 @@ fn collect_at(
         left.slug.cmp(&right.slug).then(left_id.cmp(right_id))
     });
     Ok((projects.into_iter().map(|(_, row)| row).collect(), work))
+}
+
+fn collect_project_mailboxes(
+    conn: &DbConn,
+    now_us: i64,
+    projects: &mut HashMap<i64, OverviewProject>,
+    work: &mut ScanWork,
+) -> Result<(), CliError> {
+    // Only a wholly absent pre-v32 schema means there are no shared deliveries.
+    // A missing half must fail even when the remaining delivery table is empty.
+    let has_deliveries = has_column(conn, "PRAGMA table_info(project_mailbox_deliveries)", None)?;
+    let has_receipts = has_column(conn, "PRAGMA table_info(project_mailbox_receipts)", None)?;
+    match (has_deliveries, has_receipts) {
+        (false, false) => return Ok(()),
+        (true, true) => {}
+        _ => {
+            return Err(CliError::Other(
+                "overview has an incomplete project mailbox schema".to_string(),
+            ));
+        }
+    }
+    let mut population = shared_mailboxes::Collector::default();
+    let threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
+    let mut after = None;
+    loop {
+        // Page stored deliveries first: a fully settled or invisible page
+        // must not end the scan, and the aggregation must not join unbounded
+        // history again for every returned page.
+        let (predicate, params) = after.map_or_else(
+            || (String::new(), Vec::new()),
+            |id| ("WHERE message_id > ?".to_string(), vec![Value::BigInt(id)]),
+        );
+        let rows = bounded_query(
+            conn,
+            &format!(
+                "SELECT message_id AS id, project_id FROM project_mailbox_deliveries \
+                 {predicate} ORDER BY message_id ASC LIMIT {OVERVIEW_PAGE_ROWS}"
+            ),
+            &params,
+            work,
+        )?;
+        work.project_mailbox_message_rows += rows.len();
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id = integer(row, "id")?;
+            if after.is_some_and(|previous| id <= previous) {
+                return Err(CliError::Other(
+                    "overview project mailbox cursor did not advance".to_string(),
+                ));
+            }
+            after = Some(id);
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if !population.try_page(conn, &rows, threshold, projects, work)? {
+            let (sql, params) =
+                mcp_agent_mail_db::project_mailbox::overview_counts_query(&ids, threshold)
+                    .map_err(|error| {
+                        CliError::Other(format!("overview mailbox lookup failed: {error}"))
+                    })?;
+            for row in &bounded_query(conn, &sql, &params, work)? {
+                let counts = project(projects, integer(row, "project_id")?);
+                for (column, total) in [
+                    ("unread", &mut counts.unread),
+                    ("urgent", &mut counts.urgent),
+                    ("ack_overdue", &mut counts.ack_overdue),
+                ] {
+                    let count = usize::try_from(integer(row, column)?).map_err(|_| {
+                        CliError::Other(format!("overview {column} count is out of range"))
+                    })?;
+                    *total = total.checked_add(count).ok_or_else(|| {
+                        CliError::Other(format!("overview {column} count overflowed"))
+                    })?;
+                }
+            }
+        }
+        if rows.len() < OVERVIEW_PAGE_ROWS {
+            return Ok(());
+        }
+    }
 }
 
 fn collect_reservations(
@@ -713,7 +801,6 @@ mod inventory_tests {
         }
         (dir, conn)
     }
-
     fn seed(conn: &DbConn, groups: &[(i64, usize)]) {
         let mut values = Vec::new();
         let mut id = 0;

@@ -2101,6 +2101,95 @@ fn set_contact_policy_contacts_only() {
     );
 }
 
+/// GH#333 follow-up: request-path reads share one live query-only pool, but a
+/// write refreshes cached agent rows only in the writing pool's cache scope.
+/// An agent read through the live lane, then updated, must read back updated
+/// through the live lane (by name and by id), not from the earlier cached row.
+#[test]
+fn live_read_lane_sees_agent_updates_after_a_cached_read() {
+    let (pool, dir) = make_pool();
+    let pid = setup_project(&pool);
+    let agent_id = setup_agent(&pool, pid, "GoldFox");
+    let live_config = live_read_lane_config(&pool, &dir);
+    let read_through_live_lane = |config: DbPoolConfig| {
+        block_on(|cx| async move {
+            let live = mcp_agent_mail_db::get_or_create_live_query_only_pool(&config)
+                .expect("live read pool");
+            let by_name = match queries::get_agent(&cx, &live, pid, "GoldFox").await {
+                Outcome::Ok(agent) => agent.contact_policy,
+                other => panic!("live get_agent failed: {other:?}"),
+            };
+            let by_id = match queries::get_agent_by_id(&cx, &live, agent_id).await {
+                Outcome::Ok(agent) => agent.contact_policy,
+                other => panic!("live get_agent_by_id failed: {other:?}"),
+            };
+            (by_name, by_id)
+        })
+    };
+
+    let (before, before_by_id) = read_through_live_lane(live_config.clone());
+    assert_eq!(before, before_by_id);
+    let updated_policy = if before == "block_all" {
+        "contacts_only"
+    } else {
+        "block_all"
+    };
+
+    let writer = pool.clone();
+    let written = block_on(|cx| async move {
+        queries::set_agent_contact_policy(&cx, &writer, agent_id, updated_policy).await
+    });
+    match written {
+        Outcome::Ok(agent) => assert_eq!(agent.contact_policy, updated_policy),
+        other => panic!("set_agent_contact_policy failed: {other:?}"),
+    }
+
+    let (after, after_by_id) = read_through_live_lane(live_config);
+    assert_eq!(
+        after, updated_policy,
+        "the live read lane served the contact policy cached before the update"
+    );
+    assert_eq!(after_by_id, updated_policy);
+}
+
+/// GH#333: each live read-lane wrapper has its own read-cache scope, but all of
+/// them name the one shared engine pool, so memos of facts about the database
+/// file (the search generation probe) are computed once per engine pool, not
+/// by opening a fresh connection on every read.
+#[test]
+fn live_read_lane_wrappers_share_engine_identity_not_cache_scope() {
+    let (pool, dir) = make_pool();
+    let live_config = live_read_lane_config(&pool, &dir);
+    let first = mcp_agent_mail_db::get_or_create_live_query_only_pool(&live_config)
+        .expect("first live read pool");
+    let second = mcp_agent_mail_db::get_or_create_live_query_only_pool(&live_config)
+        .expect("second live read pool");
+    assert_ne!(
+        first.sqlite_identity_key(),
+        second.sqlite_identity_key(),
+        "live read-lane wrappers must not share a read-cache scope"
+    );
+    assert_eq!(
+        first.engine_identity_key(),
+        second.engine_identity_key(),
+        "live read-lane wrappers share one engine pool identity"
+    );
+    assert_eq!(pool.engine_identity_key(), pool.sqlite_identity_key());
+}
+
+/// Live read-lane configuration for the mailbox behind a `make_pool` pool.
+fn live_read_lane_config(pool: &DbPool, dir: &tempfile::TempDir) -> DbPoolConfig {
+    DbPoolConfig {
+        database_url: format!("sqlite:///{}", pool.sqlite_path()),
+        storage_root: Some(dir.path().join("storage")),
+        min_connections: 0,
+        max_connections: 2,
+        run_migrations: false,
+        warmup_connections: 0,
+        ..Default::default()
+    }
+}
+
 // =============================================================================
 // Search V3 scope enforcement integration tests (br-2tnl.6.4)
 //

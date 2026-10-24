@@ -17,7 +17,8 @@ use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
 use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
-    claim_fresh_auto_named_agent, ensure_project, register_agent, tool_util::get_db_pool,
+    claim_fresh_auto_named_agent, create_agent_identity, ensure_project, register_agent,
+    tool_util::get_db_pool,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -325,5 +326,79 @@ fn register_agent_without_name_never_reuses_existing_row() {
         assert_eq!(existing.id, Some(core_id));
         assert_eq!(existing.program, "wsl2-trial-core");
         assert_eq!(existing.task_description, "core work");
+    });
+}
+
+/// GH#213 for `create_agent_identity`: without a hint it drew one random name
+/// and failed with "already exists ... omit the name" when that draw hit an
+/// agent of the project. A quarter of the name space is taken here, so one
+/// unretried draw fails about one creation in four (30 creations all
+/// succeeding that way: ~2e-4); with redraws every creation succeeds.
+#[test]
+fn create_agent_identity_without_hint_redraws_past_taken_names() {
+    run_serial_async(|cx| async move {
+        let project_key = format!("/tmp/crowded-identities-{}", unique_suffix());
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = parse_json(
+            &ensure_project(&ctx, project_key.clone(), None)
+                .await
+                .expect("ensure_project"),
+        );
+        let project_id = project["id"].as_i64().expect("project id");
+
+        let taken: Vec<String> = mcp_agent_mail_core::models::VALID_ADJECTIVES
+            .iter()
+            .flat_map(|adjective| {
+                mcp_agent_mail_core::models::VALID_NOUNS
+                    .iter()
+                    .map(move |noun| format!("{adjective}{noun}"))
+            })
+            .filter_map(|raw| mcp_agent_mail_core::models::normalize_agent_name(&raw))
+            .step_by(4)
+            .collect();
+        let pool = get_db_pool().expect("db pool");
+        let conn = pool.acquire(&cx).await.into_result().expect("checkout");
+        conn.execute_raw("BEGIN IMMEDIATE").expect("begin seed");
+        for chunk in taken.chunks(200) {
+            let values = chunk
+                .iter()
+                .map(|name| format!("({project_id}, '{name}', 'seed', 'seed', '', 1, 1)"))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute_raw(&format!(
+                "INSERT INTO agents (project_id, name, program, model, task_description, \
+                 inception_ts, last_active_ts) VALUES {values}"
+            ))
+            .expect("seed taken names");
+        }
+        conn.execute_raw("COMMIT").expect("commit seed");
+        drop(conn);
+        let taken: std::collections::HashSet<String> =
+            taken.iter().map(|name| name.to_ascii_lowercase()).collect();
+
+        let mut created = std::collections::HashSet::new();
+        for _ in 0..30 {
+            let identity = parse_json(
+                &create_agent_identity(
+                    &ctx,
+                    project_key.clone(),
+                    "crowded-fleet".to_string(),
+                    "opus-4.5".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("a random draw that hits a taken name must be redrawn, not fail"),
+            );
+            let name = identity["name"].as_str().expect("agent name").to_string();
+            let lower = name.to_ascii_lowercase();
+            assert!(!taken.contains(&lower), "{name} was already taken");
+            assert!(created.insert(lower), "{name} was handed out twice");
+        }
     });
 }

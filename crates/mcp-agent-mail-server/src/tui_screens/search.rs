@@ -28,11 +28,12 @@ use std::time::Instant;
 use asupersync::Outcome;
 use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_db::search_planner::{
-    DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, ZeroResultGuidance,
+    DocKind, Importance, RankingMode, RecoverySuggestion, SearchQuery, TextFieldScope,
+    ZeroResultGuidance,
 };
 use mcp_agent_mail_db::search_recipes::{
-    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, insert_history, insert_recipe,
-    list_recent_history, list_recipes, prune_history, touch_recipe,
+    MAX_RECIPES, QueryHistoryEntry, ScopeMode, SearchRecipe, delete_recipe, insert_history,
+    insert_recipe, list_recent_history, list_recipes, prune_history, touch_recipe, update_recipe,
 };
 use mcp_agent_mail_db::search_service::{SEMANTIC_TIER_COMPILED, SearchOptions};
 use mcp_agent_mail_db::sqlmodel::Value;
@@ -378,16 +379,13 @@ impl FieldScope {
         }
     }
 
-    /// Apply field scope to a query string for parser-recognized field filtering.
-    /// Returns the query wrapped with column prefix for SubjectOnly/BodyOnly.
-    fn apply_to_query(self, query: &str) -> String {
-        if query.is_empty() {
-            return query.to_string();
-        }
+    /// The search service's field scope: every word, on the lexical and the
+    /// SQL path alike, must match these fields.
+    const fn text_fields(self) -> TextFieldScope {
         match self {
-            Self::SubjectAndBody => query.to_string(),
-            Self::SubjectOnly => format!("subject:{query}"),
-            Self::BodyOnly => format!("body_md:{query}"),
+            Self::SubjectAndBody => TextFieldScope::SubjectAndBody,
+            Self::SubjectOnly => TextFieldScope::Subject,
+            Self::BodyOnly => TextFieldScope::Body,
         }
     }
 
@@ -438,6 +436,16 @@ impl SortDirection {
             "oldest" => Self::OldestFirst,
             "relevance" => Self::Relevance,
             _ => Self::NewestFirst,
+        }
+    }
+
+    /// The search backend's ordering, so Oldest fetches the oldest matches
+    /// rather than reversing the newest page.
+    const fn ranking(self) -> RankingMode {
+        match self {
+            Self::NewestFirst => RankingMode::Recency,
+            Self::OldestFirst => RankingMode::Oldest,
+            Self::Relevance => RankingMode::Relevance,
         }
     }
 }
@@ -1140,6 +1148,23 @@ impl SavePresetField {
     }
 }
 
+/// A row of the Load dialog: a preset saved on this screen, or a mailbox
+/// recipe (the web UI's saved search) that has no preset of the same name.
+#[derive(Debug, Clone)]
+enum LoadDialogEntry {
+    Preset(String),
+    Recipe(SearchRecipe),
+}
+
+impl LoadDialogEntry {
+    fn label(&self) -> String {
+        match self {
+            Self::Preset(name) => name.clone(),
+            Self::Recipe(recipe) => format!("{} (saved search)", recipe.name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DockDragState {
     Idle,
@@ -1199,6 +1224,11 @@ pub struct SearchCockpitScreen {
 
     // Facet state
     scope_mode: ScopeMode,
+    /// The project a Project or Product scope is pinned to: the selected
+    /// result's project when the Scope facet last changed.
+    scope_project: Option<i64>,
+    /// Project slug or product name the last search scoped to, for labels.
+    scope_label: Option<String>,
     doc_kind_filter: DocKindFilter,
     importance_filter: ImportanceFilter,
     ack_filter: AckFilter,
@@ -1326,6 +1356,8 @@ impl SearchCockpitScreen {
                 .with_placeholder("Search across messages, agents, projects... (/ to focus)")
                 .with_focused(false),
             scope_mode: ScopeMode::Global,
+            scope_project: None,
+            scope_label: None,
             doc_kind_filter: DocKindFilter::Messages,
             importance_filter: ImportanceFilter::Any,
             ack_filter: AckFilter::Any,
@@ -1532,6 +1564,22 @@ impl SearchCockpitScreen {
         self.filter_presets.list_names(SEARCH_PRESET_SCREEN_ID)
     }
 
+    fn load_dialog_entries(&self) -> Vec<LoadDialogEntry> {
+        let presets = self.preset_names();
+        let recipes = self
+            .saved_recipes
+            .iter()
+            .filter(|recipe| !presets.contains(&recipe.name))
+            .cloned()
+            .map(LoadDialogEntry::Recipe)
+            .collect::<Vec<_>>();
+        presets
+            .into_iter()
+            .map(LoadDialogEntry::Preset)
+            .chain(recipes)
+            .collect()
+    }
+
     fn persist_filter_presets(&self) {
         if let Err(err) =
             save_screen_filter_presets(&self.filter_presets_path, &self.filter_presets)
@@ -1550,6 +1598,9 @@ impl SearchCockpitScreen {
             "scope_mode".to_string(),
             self.scope_mode.as_str().to_string(),
         );
+        if let Some(project) = self.pinned_scope_project() {
+            values.insert("scope_project".to_string(), project.to_string());
+        }
         values.insert(
             "doc_kind_filter".to_string(),
             self.doc_kind_filter.route_value().to_string(),
@@ -1608,13 +1659,17 @@ impl SearchCockpitScreen {
         if name.is_empty() {
             return false;
         }
+        let description = description.filter(|d| !d.trim().is_empty());
         self.filter_presets.upsert(
             SEARCH_PRESET_SCREEN_ID.to_string(),
             name.to_string(),
-            description.filter(|d| !d.trim().is_empty()),
+            description.clone(),
             self.current_preset_values(),
         );
         self.persist_filter_presets();
+        // The mailbox's recipes are the web UI's saved searches: mirror the
+        // preset there so it is one click away in the browser too.
+        self.save_current_as_recipe(name, description.as_deref().unwrap_or_default());
         true
     }
 
@@ -1625,6 +1680,10 @@ impl SearchCockpitScreen {
         if let Some(scope) = values.get("scope_mode") {
             self.scope_mode = ScopeMode::from_str_lossy(scope);
         }
+        if let Some(project) = values.get("scope_project").and_then(|p| p.parse().ok()) {
+            self.scope_project = Some(project);
+        }
+        self.scope_label = None;
         if let Some(doc) = values.get("doc_kind_filter") {
             self.doc_kind_filter = DocKindFilter::from_route_value(doc);
         }
@@ -1675,7 +1734,33 @@ impl SearchCockpitScreen {
         if removed {
             self.persist_filter_presets();
         }
-        removed
+        let recipe_removed = self.remove_recipe_named(name);
+        removed || recipe_removed
+    }
+
+    /// Delete the mailbox recipe of that name (the web UI's saved search).
+    fn remove_recipe_named(&mut self, name: &str) -> bool {
+        let Some(pos) = self.saved_recipes.iter().position(|r| r.name == name) else {
+            return false;
+        };
+        let Some(id) = self.saved_recipes[pos].id else {
+            return false;
+        };
+        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+        let deleted = self
+            .open_live_metadata_operation_db_connection()
+            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen delete recipe"))
+            .and_then(|conn| delete_recipe(&conn, id));
+        match deleted {
+            Ok(()) => {
+                self.saved_recipes.remove(pos);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "search screen failed deleting recipe {name:?}");
+                false
+            }
+        }
     }
 
     fn open_save_preset_dialog(&mut self) {
@@ -1689,12 +1774,13 @@ impl SearchCockpitScreen {
 
     fn open_load_preset_dialog(&mut self) {
         self.preset_dialog_mode = PresetDialogMode::Load;
-        let names = self.preset_names();
-        if names.is_empty() {
-            self.load_preset_cursor = 0;
-        } else {
-            self.load_preset_cursor = self.load_preset_cursor.min(names.len().saturating_sub(1));
+        // Pick up saved searches stored since the screen last read them.
+        if !self.metadata_database_url.is_empty() {
+            self.recipes_loaded = false;
+            self.ensure_recipes_loaded();
         }
+        let entries = self.load_dialog_entries();
+        self.load_preset_cursor = self.load_preset_cursor.min(entries.len().saturating_sub(1));
     }
 
     fn handle_save_dialog_key(&mut self, key: &ftui::KeyEvent) {
@@ -1725,35 +1811,44 @@ impl SearchCockpitScreen {
     }
 
     fn handle_load_dialog_key(&mut self, key: &ftui::KeyEvent) {
-        let names = self.preset_names();
+        let entries = self.load_dialog_entries();
         match key.code {
             KeyCode::Escape => self.preset_dialog_mode = PresetDialogMode::None,
-            KeyCode::Char('j') | KeyCode::Down if !names.is_empty() => {
-                self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down if !entries.is_empty() => {
+                self.load_preset_cursor = (self.load_preset_cursor + 1).min(entries.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
             }
             KeyCode::Delete => {
-                if let Some(name) = names.get(self.load_preset_cursor) {
-                    let _ = self.remove_named_preset(name);
+                match entries.get(self.load_preset_cursor) {
+                    Some(LoadDialogEntry::Preset(name)) => {
+                        let _ = self.remove_named_preset(name);
+                    }
+                    Some(LoadDialogEntry::Recipe(recipe)) => {
+                        let _ = self.remove_recipe_named(&recipe.name);
+                    }
+                    None => {}
                 }
-                let refreshed = self.preset_names();
-                if refreshed.is_empty() {
+                let remaining = self.load_dialog_entries().len();
+                if remaining == 0 {
                     self.load_preset_cursor = 0;
                     self.preset_dialog_mode = PresetDialogMode::None;
                 } else {
-                    self.load_preset_cursor = self
-                        .load_preset_cursor
-                        .min(refreshed.len().saturating_sub(1));
+                    self.load_preset_cursor = self.load_preset_cursor.min(remaining - 1);
                 }
             }
-            KeyCode::Enter => {
-                if let Some(name) = names.get(self.load_preset_cursor) {
+            KeyCode::Enter => match entries.get(self.load_preset_cursor) {
+                Some(LoadDialogEntry::Preset(name)) => {
                     let _ = self.apply_named_preset(name);
                     self.preset_dialog_mode = PresetDialogMode::None;
                 }
-            }
+                Some(LoadDialogEntry::Recipe(recipe)) => {
+                    self.load_recipe(recipe);
+                    self.preset_dialog_mode = PresetDialogMode::None;
+                }
+                None => {}
+            },
             _ => {}
         }
     }
@@ -1924,10 +2019,7 @@ impl SearchCockpitScreen {
         };
 
         // Apply ranking mode
-        query.ranking = match self.sort_direction {
-            SortDirection::Relevance => RankingMode::Relevance,
-            SortDirection::NewestFirst | SortDirection::OldestFirst => RankingMode::Recency,
-        };
+        query.ranking = self.sort_direction.ranking();
 
         // Apply importance facet
         if let Some(imp) = self.importance_filter.importance() {
@@ -2240,23 +2332,21 @@ impl SearchCockpitScreen {
         raw: &str,
         cfg: &crate::tui_bridge::ConfigSnapshot,
     ) -> Result<Vec<ResultEntry>, String> {
+        let (project_id, product_id) = self.resolve_scope(conn)?;
         if raw.is_empty() {
-            return self.search_messages_recent(conn);
+            return self.search_messages_recent(conn, project_id, product_id);
         }
 
-        // Apply field scope to constrain search to subject/body/both
-        let scoped_query = self.field_scope.apply_to_query(raw);
-
         let mut query = SearchQuery {
-            text: scoped_query,
+            text: raw.to_string(),
+            text_fields: self.field_scope.text_fields(),
             doc_kind: DocKind::Message,
+            project_id,
+            product_id,
             limit: Some(MAX_RESULTS),
             explain: self.explain_toggle.is_on(),
+            ranking: self.sort_direction.ranking(),
             ..Default::default()
-        };
-        query.ranking = match self.sort_direction {
-            SortDirection::Relevance => RankingMode::Relevance,
-            SortDirection::NewestFirst | SortDirection::OldestFirst => RankingMode::Recency,
         };
 
         if let Some(imp) = self.importance_filter.importance() {
@@ -2285,10 +2375,26 @@ impl SearchCockpitScreen {
     }
 
     /// Recent messages view (empty query).
-    fn search_messages_recent(&mut self, conn: &DbConn) -> Result<Vec<ResultEntry>, String> {
+    fn search_messages_recent(
+        &mut self,
+        conn: &DbConn,
+        project_id: Option<i64>,
+        product_id: Option<i64>,
+    ) -> Result<Vec<ResultEntry>, String> {
         self.last_diagnostics = derive_tui_degraded_diagnostics(None, self.search_mode);
         let mut where_clauses: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
+
+        if let Some(project) = project_id {
+            where_clauses.push("m.project_id = ?");
+            params.push(Value::BigInt(project));
+        }
+        if let Some(product) = product_id {
+            where_clauses.push(
+                "m.project_id IN (SELECT project_id FROM product_project_links WHERE product_id = ?)",
+            );
+            params.push(Value::BigInt(product));
+        }
 
         if let Some(ref imp) = self.importance_filter.filter_string() {
             where_clauses.push("m.importance = ?");
@@ -2393,7 +2499,7 @@ impl SearchCockpitScreen {
     #[allow(clippy::missing_const_for_fn)] // mutates self through .next() chains
     fn toggle_active_facet(&mut self) {
         match self.active_facet {
-            FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
+            FacetSlot::Scope => self.cycle_scope(),
             FacetSlot::DocKind => self.doc_kind_filter = self.doc_kind_filter.next(),
             FacetSlot::Importance => self.importance_filter = self.importance_filter.next(),
             FacetSlot::AckStatus => self.ack_filter = self.ack_filter.next(),
@@ -2406,9 +2512,83 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
     }
 
+    /// Global → Project → Product → Global. The scope pins to the selected
+    /// result's project, and keeps its pin when nothing is selected.
+    fn cycle_scope(&mut self) {
+        if let Some(project) = self.results.get(self.cursor).and_then(|r| r.project_id) {
+            self.scope_project = Some(project);
+        }
+        self.scope_mode = self.scope_mode.next();
+        self.scope_label = None;
+    }
+
+    /// Project/Product scope as `(project_id, product_id)` for a message
+    /// search, resolved from the pinned project; refreshes the facet label.
+    fn resolve_scope(&mut self, conn: &DbConn) -> Result<(Option<i64>, Option<i64>), String> {
+        self.scope_label = None;
+        if self.scope_mode == ScopeMode::Global {
+            return Ok((None, None));
+        }
+        let project = self.scope_project.ok_or_else(|| {
+            format!(
+                "{} scope needs a project: select a result, then set Scope again",
+                self.scope_mode.label()
+            )
+        })?;
+        let slug = conn
+            .query_sync(
+                "SELECT slug FROM projects WHERE id = ?",
+                &[Value::BigInt(project)],
+            )
+            .map_err(|e| format!("Scope lookup failed: {e}"))?
+            .first()
+            .and_then(|row| row.get_named::<String>("slug").ok())
+            .ok_or_else(|| format!("Scope project #{project} no longer exists"))?;
+        if self.scope_mode == ScopeMode::Project {
+            self.scope_label = Some(slug);
+            return Ok((Some(project), None));
+        }
+        let rows = conn
+            .query_sync(
+                "SELECT p.id AS id, p.name AS name FROM product_project_links l \
+                 JOIN products p ON p.id = l.product_id \
+                 WHERE l.project_id = ? ORDER BY p.id LIMIT 1",
+                &[Value::BigInt(project)],
+            )
+            .map_err(|e| format!("Scope lookup failed: {e}"))?;
+        let product = rows
+            .first()
+            .and_then(|row| {
+                Some((
+                    row.get_named::<i64>("id").ok()?,
+                    row.get_named::<String>("name").ok()?,
+                ))
+            })
+            .ok_or_else(|| format!("Project {slug} belongs to no product"))?;
+        self.scope_label = Some(product.1);
+        Ok((None, Some(product.0)))
+    }
+
+    /// The pinned project while a Project or Product scope is on.
+    fn pinned_scope_project(&self) -> Option<i64> {
+        self.scope_project
+            .filter(|_| self.scope_mode != ScopeMode::Global)
+    }
+
+    /// The Scope facet's value, naming what it narrows to once resolved.
+    fn scope_value_label(&self) -> String {
+        match &self.scope_label {
+            Some(target) if self.scope_mode != ScopeMode::Global => {
+                format!("{}: {target}", self.scope_mode.label())
+            }
+            _ => self.scope_mode.label().to_string(),
+        }
+    }
+
     /// Clear all facets to defaults.
     fn reset_facets(&mut self) {
         self.scope_mode = ScopeMode::Global;
+        self.scope_label = None;
         self.doc_kind_filter = DocKindFilter::Messages;
         self.importance_filter = ImportanceFilter::Any;
         self.ack_filter = AckFilter::Any;
@@ -2636,7 +2816,7 @@ impl SearchCockpitScreen {
             query_text: text,
             doc_kind: self.doc_kind_filter.route_value().to_string(),
             scope_mode: self.scope_mode,
-            scope_id: None,
+            scope_id: self.pinned_scope_project(),
             result_count: i64::try_from(self.results.len()).unwrap_or(0),
             executed_ts: now_micros(),
             ..Default::default()
@@ -2656,14 +2836,16 @@ impl SearchCockpitScreen {
         self.history_cursor = None;
     }
 
-    /// Save current search state as a named recipe.
-    #[allow(dead_code)] // In-progress: called once recipe save UI is wired up.
-    fn save_current_as_recipe(&mut self, name: String) {
-        let recipe = SearchRecipe {
-            name,
+    /// Save the current search state as the mailbox recipe of that name,
+    /// replacing an existing one (keeping its pin and use count).
+    fn save_current_as_recipe(&mut self, name: &str, description: &str) {
+        let mut recipe = SearchRecipe {
+            name: name.to_string(),
+            description: description.to_string(),
             query_text: self.query_input.value().trim().to_string(),
             doc_kind: self.doc_kind_filter.route_value().to_string(),
             scope_mode: self.scope_mode,
+            scope_id: self.pinned_scope_project(),
             importance_filter: self.importance_filter.filter_string().unwrap_or_default(),
             ack_filter: match self.ack_filter {
                 AckFilter::Any => "any".to_string(),
@@ -2674,15 +2856,41 @@ impl SearchCockpitScreen {
             thread_filter: self.thread_filter.clone(),
             ..Default::default()
         };
+        // Decide update-or-insert against the mailbox, not a stale list (the
+        // web UI or another TUI may have changed it since it was read).
+        if !self.metadata_database_url.is_empty() {
+            self.recipes_loaded = false;
+            self.ensure_recipes_loaded();
+        }
+        let existing = self
+            .saved_recipes
+            .iter()
+            .position(|r| r.name == name)
+            .and_then(|pos| self.saved_recipes[pos].id.map(|id| (pos, id)));
         let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        if let Ok(conn) = self
+        let Ok(conn) = self
             .open_live_metadata_operation_db_connection()
-            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen insert recipe"))
-            && let Ok(id) = insert_recipe(&conn, &recipe)
-        {
-            let mut saved = recipe;
-            saved.id = Some(id);
-            self.saved_recipes.insert(0, saved);
+            .map(|conn| mcp_agent_mail_db::guard_db_conn(conn, "search screen save recipe"))
+        else {
+            return;
+        };
+        if let Some((pos, id)) = existing {
+            let current = &self.saved_recipes[pos];
+            recipe.id = Some(id);
+            recipe.pinned = current.pinned;
+            recipe.use_count = current.use_count;
+            recipe.created_ts = current.created_ts;
+            match update_recipe(&conn, &recipe) {
+                Ok(()) => self.saved_recipes[pos] = recipe,
+                Err(error) => {
+                    tracing::warn!(error = %error, "search screen failed updating recipe {name:?}");
+                }
+            }
+            return;
+        }
+        if let Ok(id) = insert_recipe(&conn, &recipe) {
+            recipe.id = Some(id);
+            self.saved_recipes.insert(0, recipe);
             // Evict oldest non-pinned recipes when over the cap.
             while self.saved_recipes.len() > MAX_RECIPES {
                 if let Some(pos) = self.saved_recipes.iter().rposition(|r| !r.pinned) {
@@ -2695,10 +2903,14 @@ impl SearchCockpitScreen {
     }
 
     /// Load a recipe into the current search state.
-    #[allow(dead_code)] // In-progress: called once recipe load UI is wired up.
     fn load_recipe(&mut self, recipe: &SearchRecipe) {
         self.query_input.set_value(&recipe.query_text);
         self.scope_mode = recipe.scope_mode;
+        if recipe.scope_id.is_some() {
+            self.scope_project = recipe.scope_id;
+        }
+        self.scope_label = None;
+        self.importance_filter = ImportanceFilter::from_persist(&recipe.importance_filter);
         self.doc_kind_filter = match recipe.doc_kind.as_str() {
             "agents" => DocKindFilter::Agents,
             "projects" => DocKindFilter::Projects,
@@ -2762,8 +2974,10 @@ impl SearchCockpitScreen {
             "off"
         };
         format!(
-            "scope={};type={};imp={};ack={};sort={};field={};mode={};explain={};thread={thread}",
+            "scope={}{};type={};imp={};ack={};sort={};field={};mode={};explain={};thread={thread}",
             self.scope_mode.as_str(),
+            self.pinned_scope_project()
+                .map_or_else(String::new, |project| format!("@{project}")),
             self.doc_kind_filter.route_value(),
             importance,
             ack,
@@ -2847,6 +3061,9 @@ impl SearchCockpitScreen {
         }
         if self.scope_mode != ScopeMode::Global {
             params.push(("scope", self.scope_mode.as_str().to_string()));
+            if let Some(project) = self.pinned_scope_project() {
+                params.push(("scope_id", project.to_string()));
+            }
         }
         if self.doc_kind_filter != DocKindFilter::Messages {
             params.push(("type", self.doc_kind_filter.route_value().to_string()));
@@ -3226,7 +3443,7 @@ impl MailScreen for SearchCockpitScreen {
                     }
                     KeyCode::Left => {
                         match self.active_facet {
-                            FacetSlot::Scope => self.scope_mode = self.scope_mode.next(),
+                            FacetSlot::Scope => self.cycle_scope(),
                             FacetSlot::DocKind => {
                                 self.doc_kind_filter = self.doc_kind_filter.prev();
                             }
@@ -3365,7 +3582,8 @@ impl MailScreen for SearchCockpitScreen {
                         KeyCode::Char('L') => {
                             self.query_lab_visible = !self.query_lab_visible;
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear all (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.query_input.clear();
                             self.reset_facets();
                             self.results.clear();
@@ -3689,7 +3907,11 @@ impl MailScreen for SearchCockpitScreen {
                 self.save_preset_field,
             ),
             PresetDialogMode::Load => {
-                let names = self.preset_names();
+                let names: Vec<String> = self
+                    .load_dialog_entries()
+                    .iter()
+                    .map(LoadDialogEntry::label)
+                    .collect();
                 render_load_preset_dialog(frame, area, &names, self.load_preset_cursor);
             }
             PresetDialogMode::None => {}
@@ -3755,7 +3977,7 @@ impl MailScreen for SearchCockpitScreen {
                 action: "Timeline at time",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear all",
             },
             HelpEntry {
@@ -4686,7 +4908,7 @@ fn render_query_bar(
             "{}  state:{}  scope:{}  type:{}  sort:{}  terms:{}  sql:{}  latency:{}",
             meter,
             state_label,
-            screen.scope_mode.label(),
+            screen.scope_value_label(),
             screen.doc_kind_filter.label(),
             screen.sort_direction.label(),
             screen.highlight_terms.len(),
@@ -4772,7 +4994,7 @@ fn render_query_help_popup(frame: &mut Frame<'_>, area: Rect, query_area: Rect) 
 Quotes: \"build failed\"\n\
 Prefix: deploy*\n\
 NOT: error NOT test\n\
-Column: subject:deploy\n\
+Subject or body only: Field facet (f)\n\
 Esc/any key: close";
 
     Paragraph::new(text)
@@ -4802,9 +5024,10 @@ fn render_facet_rail(
     let in_rail = screen.focus == Focus::FacetRail;
     let w = inner.width as usize;
     let search_mode = screen.search_mode.shown_label(screen.semantic_enabled);
+    let scope = screen.scope_value_label();
 
     let facets: &[(FacetSlot, &str, &str)] = &[
-        (FacetSlot::Scope, "Scope", screen.scope_mode.label()),
+        (FacetSlot::Scope, "Scope", &*scope),
         (
             FacetSlot::DocKind,
             "Doc Type",
@@ -6191,7 +6414,7 @@ mod tests {
             "query history should load from the live configured db"
         );
 
-        screen.save_current_as_recipe("New Recipe".to_string());
+        screen.save_current_as_recipe("New Recipe", "");
         let existing_recipe = screen
             .saved_recipes
             .iter()
@@ -6221,6 +6444,42 @@ mod tests {
                 .any(|entry| entry.query_text == "archive-search-token"),
             "query history writes should persist into the live configured db"
         );
+        drop(live_conn);
+
+        // Re-saving under the same name replaces that saved search (the web
+        // UI lists each recipe as a link) instead of adding a duplicate.
+        screen.query_input.set_value("revised query");
+        screen.save_current_as_recipe("New Recipe", "revised");
+        let named = |name: &str| {
+            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+            list_recipes(&conn)
+                .expect("list recipes")
+                .into_iter()
+                .filter(|recipe| recipe.name == name)
+                .collect::<Vec<_>>()
+        };
+        let saved = named("New Recipe");
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(saved[0].query_text, "revised query");
+        assert_eq!(saved[0].description, "revised");
+
+        // The Load dialog offers it (no preset of that name exists), Enter
+        // applies it, and Del removes the saved search from the mailbox.
+        screen.query_input.set_value("something else");
+        screen.preset_dialog_mode = PresetDialogMode::Load;
+        let entries = screen.load_dialog_entries();
+        let row = entries
+            .iter()
+            .position(|entry| entry.label() == "New Recipe (saved search)")
+            .expect("saved search row");
+        screen.load_preset_cursor = row;
+        screen.handle_load_dialog_key(&ftui::KeyEvent::new(KeyCode::Enter));
+        assert_eq!(screen.query_input.value(), "revised query");
+        screen.preset_dialog_mode = PresetDialogMode::Load;
+        screen.load_preset_cursor = row;
+        screen.handle_load_dialog_key(&ftui::KeyEvent::new(KeyCode::Delete));
+        let ids: Vec<Option<i64>> = named("New Recipe").iter().map(|r| r.id).collect();
+        assert_eq!(ids, [] as [Option<i64>; 0]);
     }
 
     #[test]
@@ -6441,7 +6700,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_clears_query_and_refreshes_results_immediately() {
+    fn capital_x_clears_query_and_refreshes_results_immediately() {
         let config = mcp_agent_mail_core::Config::default();
         let state = crate::tui_bridge::TuiSharedState::new(&config);
         let mut screen = SearchCockpitScreen::new();
@@ -6468,11 +6727,8 @@ mod tests {
         });
         screen.search_dirty = true;
 
-        let clear = Event::Key(ftui::KeyEvent {
-            code: KeyCode::Char('c'),
-            kind: KeyEventKind::Press,
-            modifiers: Modifiers::CTRL,
-        });
+        // X, not Ctrl+C: the shell owns Ctrl+C, so it never reaches a screen.
+        let clear = Event::Key(ftui::KeyEvent::new(KeyCode::Char('X')));
         let _ = screen.update(&clear, &state);
 
         assert_eq!(screen.query_input.value(), "");
@@ -6506,6 +6762,19 @@ mod tests {
         assert!(screen.consumes_text_input());
         screen.focus = Focus::FacetRail;
         assert!(!screen.consumes_text_input());
+    }
+
+    #[test]
+    fn capital_x_clears_query_and_facets_from_the_result_list() {
+        let mut screen = SearchCockpitScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        screen.query_input.set_value("deploy");
+        screen.search_mode = SearchModeFilter::Hybrid;
+        assert_eq!(screen.focus, Focus::ResultList);
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.query_input.value(), "");
+        assert_eq!(screen.search_mode, SearchModeFilter::default());
     }
 
     #[test]
@@ -6581,6 +6850,19 @@ mod tests {
         assert_eq!(q.importance, vec![Importance::High]);
         assert_eq!(q.ack_required, Some(true));
         assert_eq!(q.thread_id.as_deref(), Some("t-1"));
+    }
+
+    #[test]
+    fn each_sort_asks_the_backend_for_its_own_order() {
+        let mut screen = SearchCockpitScreen::new();
+        for (sort, ranking) in [
+            (SortDirection::NewestFirst, RankingMode::Recency),
+            (SortDirection::OldestFirst, RankingMode::Oldest),
+            (SortDirection::Relevance, RankingMode::Relevance),
+        ] {
+            screen.sort_direction = sort;
+            assert_eq!(screen.build_query().ranking, ranking, "{sort:?}");
+        }
     }
 
     #[test]
@@ -6810,31 +7092,16 @@ mod tests {
     }
 
     #[test]
-    fn field_scope_subject_only_produces_fts5_column_filter() {
-        let scope = FieldScope::SubjectOnly;
-        let query = scope.apply_to_query("test query");
-        assert_eq!(query, "subject:test query");
-    }
-
-    #[test]
-    fn field_scope_body_only_produces_fts5_column_filter() {
-        let scope = FieldScope::BodyOnly;
-        let query = scope.apply_to_query("test query");
-        assert_eq!(query, "body_md:test query");
-    }
-
-    #[test]
-    fn field_scope_subject_and_body_preserves_query() {
-        let scope = FieldScope::SubjectAndBody;
-        let query = scope.apply_to_query("test query");
-        assert_eq!(query, "test query");
-    }
-
-    #[test]
-    fn field_scope_empty_query_returns_empty() {
-        assert_eq!(FieldScope::SubjectOnly.apply_to_query(""), "");
-        assert_eq!(FieldScope::BodyOnly.apply_to_query(""), "");
-        assert_eq!(FieldScope::SubjectAndBody.apply_to_query(""), "");
+    fn field_scope_is_a_search_parameter_not_a_query_prefix() {
+        assert_eq!(
+            FieldScope::SubjectAndBody.text_fields(),
+            TextFieldScope::SubjectAndBody
+        );
+        assert_eq!(
+            FieldScope::SubjectOnly.text_fields(),
+            TextFieldScope::Subject
+        );
+        assert_eq!(FieldScope::BodyOnly.text_fields(), TextFieldScope::Body);
     }
 
     #[test]
@@ -7069,10 +7336,13 @@ mod tests {
             text.contains("Query Syntax Help"),
             "expected popup title, got:\n{text}"
         );
+        // Field scoping is the Field facet, not a subject: prefix (which
+        // the default Newest sort never honoured).
         assert!(
-            text.contains("subject:deploy"),
-            "expected column example, got:\n{text}"
+            text.contains("Subject or body only: Field facet (f)"),
+            "expected field-scope hint, got:\n{text}"
         );
+        assert!(!text.contains("subject:deploy"), "{text}");
     }
 
     #[test]
@@ -8347,13 +8617,82 @@ mod tests {
 
         let mut screen = SearchCockpitScreen::new();
         let results = screen
-            .search_messages_recent(&conn)
+            .search_messages_recent(&conn, None, None)
             .expect("recent search succeeds");
 
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].from_agent.as_deref(),
             Some(UNKNOWN_SENDER_DISPLAY)
+        );
+    }
+
+    #[test]
+    fn scope_facet_narrows_messages_to_the_pinned_project_or_its_product() {
+        let conn = DbConn::open_memory().expect("open in-memory sqlite");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE product_project_links (product_id INTEGER, project_id INTEGER);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL,
+                 subject TEXT NOT NULL, importance TEXT NOT NULL,
+                 ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL,
+                 thread_id TEXT, body_md TEXT NOT NULL, project_id INTEGER NOT NULL
+             );
+             INSERT INTO projects VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+             INSERT INTO products VALUES (10, 'suite');
+             INSERT INTO product_project_links VALUES (10, 1), (10, 2);
+             INSERT INTO messages VALUES
+                 (1, 0, 'a', 'normal', 0, 1, 't', 'b', 1),
+                 (2, 0, 'b', 'normal', 0, 2, 't', 'b', 2),
+                 (3, 0, 'c', 'normal', 0, 3, 't', 'b', 3);",
+        )
+        .expect("seed scope schema");
+        let mut screen = SearchCockpitScreen::new();
+        let search = |screen: &mut SearchCockpitScreen| -> Result<Vec<i64>, String> {
+            let (project, product) = screen.resolve_scope(&conn)?;
+            let mut ids: Vec<i64> = screen
+                .search_messages_recent(&conn, project, product)?
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            ids.sort_unstable();
+            Ok(ids)
+        };
+
+        // Nothing selected yet: Project scope cannot guess a project.
+        screen.cycle_scope();
+        assert_eq!(screen.scope_mode, ScopeMode::Project);
+        assert!(search(&mut screen).unwrap_err().contains("needs a project"));
+        screen.cycle_scope();
+        screen.cycle_scope();
+        assert_eq!(screen.scope_mode, ScopeMode::Global);
+        assert_eq!(search(&mut screen), Ok(vec![1, 2, 3]));
+
+        // Select alpha's message: Project pins alpha, Product its product.
+        screen.results = screen
+            .search_messages_recent(&conn, None, None)
+            .expect("global results");
+        screen.cursor = screen.results.iter().position(|r| r.id == 1).unwrap();
+        screen.cycle_scope();
+        assert_eq!(search(&mut screen), Ok(vec![1]));
+        assert_eq!(screen.scope_value_label(), "Project: alpha");
+        screen.cycle_scope();
+        assert_eq!(search(&mut screen), Ok(vec![1, 2]));
+        assert_eq!(screen.scope_value_label(), "Product: suite");
+
+        // gamma is in no product, and the scope says so instead of widening.
+        screen.cycle_scope();
+        screen.cursor = screen.results.iter().position(|r| r.id == 3).unwrap();
+        screen.cycle_scope();
+        assert_eq!(search(&mut screen), Ok(vec![3]));
+        screen.cycle_scope();
+        assert!(
+            search(&mut screen)
+                .unwrap_err()
+                .contains("gamma belongs to no product")
         );
     }
 

@@ -22,6 +22,9 @@ pub mod threads;
 pub mod timeline;
 pub mod tool_metrics;
 
+use asupersync::Cx;
+use fastmcp::prelude::McpContext;
+use fastmcp_core::block_on;
 use ftui::layout::Rect;
 use ftui_runtime::program::Cmd;
 use std::collections::HashSet;
@@ -75,6 +78,129 @@ pub fn contains_ci(text: &str, query_lower: &str) -> bool {
     } else {
         text.to_lowercase().contains(&query_lower.to_lowercase())
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Operator actions — action-menu writes run as in-process tool calls
+// ──────────────────────────────────────────────────────────────────────
+
+/// A tool context for the operator console acting on an agent's behalf.
+///
+/// Borrows the runtime-backed ambient `Cx` installed by `Runtime::block_on`,
+/// as the compose and reservation-create forms do, and marks the call as the
+/// operator's so the agent is not recorded as active
+/// (`tool_util::operator_context`). A tool call made with it blocks the UI
+/// loop for its duration, like those forms.
+pub(crate) fn operator_tool_context() -> McpContext {
+    let cx = block_on(async {
+        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    });
+    mcp_agent_mail_tools::tool_util::operator_context(cx)
+}
+
+/// Hand the outcome of an action-menu write to the app, which shows it as a
+/// toast and clears the operation's in-flight marker.
+pub(crate) fn operator_result(
+    operation: &str,
+    result: Result<String, String>,
+) -> Cmd<MailScreenMsg> {
+    let (status, text) = match result {
+        Ok(summary) => ("ok", summary),
+        Err(error) => ("error", error),
+    };
+    Cmd::msg(MailScreenMsg::ActionExecute(
+        format!("operator_result:{status}:{operation}"),
+        text,
+    ))
+}
+
+/// Run `f` against a fresh file-backed mailbox in a tempdir, with the tool
+/// layer's `DATABASE_URL` and `STORAGE_ROOT` pointing at it. `f` receives the
+/// absolute key of a project directory inside that tempdir.
+#[cfg(test)]
+pub(crate) fn with_operator_test_mailbox<T>(f: impl FnOnce(&str) -> T) -> T {
+    let temp = tempfile::tempdir().expect("operator test tempdir");
+    let storage_root = temp.path().join("storage-root");
+    let project_root = temp.path().join("project-root");
+    std::fs::create_dir_all(&storage_root).expect("operator test storage root");
+    std::fs::create_dir_all(&project_root).expect("operator test project root");
+    let database_url = format!("sqlite://{}", temp.path().join("storage.sqlite3").display());
+    let storage_root = storage_root.to_string_lossy().to_string();
+    let project_key = project_root.to_string_lossy().to_string();
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+            // The project root is a `.tmpXXXXXX` tempdir inside this isolated
+            // mailbox, which the ephemeral-root guard otherwise refuses.
+            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
+        ],
+        || f(&project_key),
+    )
+}
+
+/// Create the project at `project_key` and register `agents` with an open
+/// contact policy, through the tools. Returns the project's slug.
+#[cfg(test)]
+pub(crate) fn seed_operator_test_project(project_key: &str, agents: &[&str]) -> String {
+    let ctx = operator_tool_context();
+    let project: serde_json::Value = serde_json::from_str(
+        &block_on(mcp_agent_mail_tools::ensure_project(
+            &ctx,
+            project_key.to_string(),
+            None,
+        ))
+        .expect("ensure_project"),
+    )
+    .expect("ensure_project JSON");
+    for name in agents {
+        block_on(mcp_agent_mail_tools::register_agent(
+            &ctx,
+            project_key.to_string(),
+            "codex-cli".to_string(),
+            "gpt-5".to_string(),
+            Some((*name).to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect("register_agent");
+        block_on(mcp_agent_mail_tools::set_contact_policy(
+            &ctx,
+            project_key.to_string(),
+            (*name).to_string(),
+            "open".to_string(),
+        ))
+        .expect("set_contact_policy");
+    }
+    project["slug"].as_str().expect("project slug").to_string()
+}
+
+/// Run `f` on a connection to the mailbox the tools are using.
+#[cfg(test)]
+pub(crate) fn with_operator_test_conn<T>(f: impl FnOnce(&mcp_agent_mail_db::DbConn) -> T) -> T {
+    block_on(async {
+        let cx = Cx::current().expect("Runtime::block_on installs an ambient Cx");
+        let pool = mcp_agent_mail_tools::tool_util::get_db_pool().expect("DB pool");
+        let conn = pool.acquire(&cx).await.into_result().expect("DB checkout");
+        f(&conn)
+    })
+}
+
+/// The `(status, operation, text)` of an [`operator_result`] command.
+#[cfg(test)]
+pub(crate) fn expect_operator_result(cmd: Cmd<MailScreenMsg>) -> (String, String, String) {
+    let Cmd::Msg(MailScreenMsg::ActionExecute(op, text)) = cmd else {
+        panic!("expected an operator_result message");
+    };
+    let rest = op
+        .strip_prefix("operator_result:")
+        .unwrap_or_else(|| panic!("expected operator_result, got {op}"));
+    let (status, operation) = rest.split_once(':').expect("status:operation");
+    (status.to_string(), operation.to_string(), text)
 }
 
 // ──────────────────────────────────────────────────────────────────────

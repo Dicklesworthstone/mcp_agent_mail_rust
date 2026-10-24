@@ -513,6 +513,18 @@ impl EmbeddingQueue {
         state.queue.len() + state.retry_queue.len()
     }
 
+    /// Discard work belonging to a retired source generation.
+    /// The source refresh hook calls this between embedding batches.
+    pub(crate) fn clear(&self) {
+        let mut state = mutex_lock_or_recover("semantic.embedding_queue.pending", &self.pending);
+        state.queue.clear();
+        state.retry_queue.clear();
+        state.dedup.clear();
+        state.next_retry_due_at = None;
+        state.stats.pending_count = 0;
+        state.stats.retry_count = 0;
+    }
+
     /// Get queue statistics.
     #[must_use]
     pub fn stats(&self) -> QueueStats {
@@ -738,8 +750,8 @@ impl EmbeddingJobRunner {
         let mut index = rwlock_write_or_recover("semantic.embedding_index", &self.index);
         let mut embeddings_iter = embeddings.into_iter();
 
-        for req in &batch {
-            let Some(embedding) = embeddings_iter.next() else {
+        for (req, text) in batch.iter().zip(&texts) {
+            let Some(mut embedding) = embeddings_iter.next() else {
                 self.push_retry_or_failure(
                     req,
                     "embedder returned fewer vectors than requested".to_owned(),
@@ -747,6 +759,10 @@ impl EmbeddingJobRunner {
                 );
                 continue;
             };
+
+            // The provenance witness must describe the exact canonical input
+            // passed to the model, independently of an embedder's bookkeeping.
+            embedding.content_hash = crate::search_canonical::content_hash(text);
 
             match self.process_single(&mut index, req, embedding) {
                 Ok(job_result) => Self::record_job_result(&mut result, job_result),
@@ -917,6 +933,8 @@ impl Default for RefreshWorkerConfig {
     }
 }
 
+type SourceRefillHook = dyn Fn(&AtomicBool) -> bool + Send + Sync;
+
 /// Background worker that drives embedding refresh.
 ///
 /// This is intentionally synchronous — it runs on a dedicated OS thread
@@ -925,8 +943,10 @@ pub struct IndexRefreshWorker {
     config: RefreshWorkerConfig,
     runner: Arc<EmbeddingJobRunner>,
     rebuild_lifecycle: Option<Arc<dyn IndexLifecycle>>,
+    source_refill: Option<Arc<SourceRefillHook>>,
     shutdown: Arc<AtomicBool>,
     last_refresh: Mutex<Option<Instant>>,
+    cycle: Mutex<()>,
 }
 
 impl IndexRefreshWorker {
@@ -937,8 +957,10 @@ impl IndexRefreshWorker {
             config,
             runner,
             rebuild_lifecycle: None,
+            source_refill: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             last_refresh: Mutex::new(None),
+            cycle: Mutex::new(()),
         }
     }
 
@@ -946,6 +968,19 @@ impl IndexRefreshWorker {
     #[must_use]
     pub fn with_rebuild_lifecycle(mut self, lifecycle: Arc<dyn IndexLifecycle>) -> Self {
         self.rebuild_lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Refill a bounded page from the canonical source before each cycle.
+    /// Returning false defers processing until the source is readable again.
+    /// The hook and all batches in a cycle are serialized, so a source reset
+    /// cannot be followed by publication from a previously drained batch.
+    #[must_use]
+    pub(crate) fn with_source_refill(
+        mut self,
+        refill: impl Fn(&AtomicBool) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.source_refill = Some(Arc::new(refill));
         self
     }
 
@@ -1008,9 +1043,21 @@ impl IndexRefreshWorker {
     /// Returns the number of documents processed this cycle.
     #[must_use]
     pub fn run_cycle(&self) -> usize {
+        let _cycle = mutex_lock_or_recover("semantic.refresh_cycle", &self.cycle);
+        if self.shutdown.load(Ordering::Acquire)
+            || self
+                .source_refill
+                .as_ref()
+                .is_some_and(|refill| !refill(&self.shutdown))
+        {
+            return 0;
+        }
         let max_docs = self.config.max_docs_per_cycle.max(1);
         let mut processed = 0usize;
-        while self.runner.has_ready_work() && processed < max_docs {
+        while !self.shutdown.load(Ordering::Acquire)
+            && self.runner.has_ready_work()
+            && processed < max_docs
+        {
             let remaining = max_docs.saturating_sub(processed).max(1);
             match self.runner.process_batch_limit(remaining) {
                 Ok(result) => {
@@ -1602,6 +1649,9 @@ mod tests {
         let processed = worker.run_cycle();
         assert_eq!(processed, 3);
         assert_eq!(queue.len(), 2);
+        worker.shutdown();
+        assert_eq!(worker.run_cycle(), 0);
+        assert_eq!(queue.len(), 2, "shutdown must not drain another batch");
     }
 
     #[test]

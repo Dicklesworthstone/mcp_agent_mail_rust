@@ -1,0 +1,289 @@
+{
+ "schema": "inbox-stats-increment-ab-v2",
+ "beads": [
+  "br-v0ucm",
+  "br-qbhs0"
+ ],
+ "author": "CopperGoose (Claude Opus 5.5)",
+ "rule": "inbox_stats increment lever, second test (br-v0ucm residual decline). Written 2026-10-18 ~16:05Z, before any run of\nthis binary.\n\nChange (unchanged from 10-12): create_message_with_recipients_tx counts each newly inserted recipient row into that\nagent's existing inbox_stats row (PK SELECT + one UPDATE) instead of DELETE + full COUNT JOIN recount + INSERT per\nrecipient under MESSAGE_WRITE_SERIALIZER; exact recount fallback when no row exists or an insert was a no-op.\nPatch = inbox_stats_incr_v2.patch (sha256 12332fba...), re-applied cleanly to main ac8307df.\n\nPrior result that STANDS: 2026-10-12 (dcef3743) LOSS on its primary, sequential heavy-inbox send p50 1.11x base.\nIts non-deciding line said 3-sender seeding ran 2x faster. This is a NEW claim on a different metric, chosen because\nbr-v0ucm's own probe (decay_probe, defined before this lever existed) shows concurrent throughput falling as one\nrecipient's inbox grows (main 0.66x storms 2-4 -> 10-12 on 2026-10-18). The sequential regime that lost stays a guard.\n\nArms: base = build34/main_ac0dcbcd (am 1b0ff39d; code identical to ac8307df), incr = build35/incr_ac8307df\n(am c7998b94). Both portable release builds. Host lock; nothing else of mine on the host.\n\nRuns:\n  D. decay_probe_v0ucm.py, 12 storms (16 concurrent x 6 sends, A -> B), fresh mailbox each, order base incr incr base.\n  H. heavy_inbox.py --seed 3000 --timed 400 (the 10-12 scenario), fresh mailbox each, order base incr incr base.\n\nDecision:\n  H1 (primary). Pooled mean acked/s over first-process storms 10..12 (1-indexed): incr >= 1.15 x base, AND each incr\n     run's storms-10..12 mean exceeds each base run's.\n  G1 (small inbox). Pooled mean acked/s over storms 2..4: incr >= 0.95 x base.\n  G2 (errors). Every incr storm acks 96/96 with 0 errors; H errors incr <= base.\n  G3 (the regime that lost). Pooled H timed-send p50: incr <= 1.05 x base.\n  C  (correctness, separate lane). db test create_message_counts_itself_into_inbox_stats_exactly_like_a_recount passes\n     on the patched tree.\nWIN, so it lands, only if H1, G1, G2, G3 and C all hold. Otherwise LOSS, reported in one line, not landed.\nReported, not deciding: H seed_s (concurrent seeding time), D after-restart storms, per-storm curves.\n",
+ "builds": {
+  "base": {
+   "source": "main ac0dcbcd (code identical to ac8307df), portable release",
+   "am_sha256": "1b0ff39d52ff041dd8f115c9021ad18398593edf3e6e468a9ac88322661442de"
+  },
+  "incr": {
+   "source": "ac8307df + inbox_stats_incr_v2.patch, portable release",
+   "patch_sha256": "12332fba5ae6e5df25cba17a4c9a7b8960392b04f8d5c89f141b00efb69b164b",
+   "am_sha256": "c7998b94000424db53e74713634a161df0ee29a2b287e7057eda1470f9351495"
+  }
+ },
+ "host": "thinkstation1 (64 cores), host lock held",
+ "decay_D": [
+  {
+   "run": "D1-base",
+   "arm": "base",
+   "first_process_acked_per_s": [
+    34.0,
+    45.8,
+    46.8,
+    37.4,
+    41.3,
+    34.6,
+    31.6,
+    31.1,
+    31.9,
+    28.3,
+    30.8,
+    28.6
+   ],
+   "after_restart_acked_per_s": [
+    28.9,
+    26.0,
+    29.2
+   ],
+   "all_storms_96_acked_0_errors": true,
+   "p50_s": [
+    0.34,
+    0.278,
+    0.319,
+    0.36,
+    0.307,
+    0.416,
+    0.481,
+    0.474,
+    0.486,
+    0.503,
+    0.472,
+    0.451,
+    0.485,
+    0.588,
+    0.438
+   ],
+   "max_wal_bytes": 13072792
+  },
+  {
+   "run": "D2-incr",
+   "arm": "incr",
+   "first_process_acked_per_s": [
+    41.9,
+    51.8,
+    53.7,
+    57.8,
+    60.9,
+    49.6,
+    43.1,
+    40.2,
+    43.0,
+    42.2,
+    49.8,
+    45.6
+   ],
+   "after_restart_acked_per_s": [
+    41.8,
+    46.0,
+    45.2
+   ],
+   "all_storms_96_acked_0_errors": true,
+   "p50_s": [
+    0.243,
+    0.223,
+    0.257,
+    0.231,
+    0.213,
+    0.281,
+    0.332,
+    0.377,
+    0.36,
+    0.33,
+    0.291,
+    0.309,
+    0.34,
+    0.266,
+    0.291
+   ],
+   "max_wal_bytes": 13287032
+  },
+  {
+   "run": "D3-incr",
+   "arm": "incr",
+   "first_process_acked_per_s": [
+    38.3,
+    58.6,
+    44.9,
+    67.4,
+    52.8,
+    47.0,
+    47.0,
+    45.4,
+    41.4,
+    42.8,
+    40.2,
+    40.0
+   ],
+   "after_restart_acked_per_s": [
+    54.6,
+    38.9,
+    45.9
+   ],
+   "all_storms_96_acked_0_errors": true,
+   "p50_s": [
+    0.257,
+    0.233,
+    0.323,
+    0.207,
+    0.292,
+    0.302,
+    0.297,
+    0.313,
+    0.341,
+    0.284,
+    0.353,
+    0.39,
+    0.228,
+    0.405,
+    0.317
+   ],
+   "max_wal_bytes": 13620752
+  },
+  {
+   "run": "D4-base",
+   "arm": "base",
+   "first_process_acked_per_s": [
+    53.0,
+    50.1,
+    46.1,
+    48.7,
+    42.4,
+    36.0,
+    30.9,
+    32.0,
+    35.4,
+    28.2,
+    28.5,
+    30.0
+   ],
+   "after_restart_acked_per_s": [
+    29.4,
+    26.5,
+    30.2
+   ],
+   "all_storms_96_acked_0_errors": true,
+   "p50_s": [
+    0.169,
+    0.228,
+    0.306,
+    0.321,
+    0.316,
+    0.385,
+    0.453,
+    0.442,
+    0.4,
+    0.448,
+    0.483,
+    0.442,
+    0.48,
+    0.599,
+    0.416
+   ],
+   "max_wal_bytes": 13200512
+  }
+ ],
+ "heavy_inbox_H": [
+  {
+   "run": "H1-base",
+   "arm": "base",
+   "seed": 3000,
+   "seed_s": 112.3,
+   "timed": 400,
+   "errors": {
+    "seed": 0,
+    "timed": 0
+   },
+   "send": {
+    "p50": 0.0767,
+    "p90": 0.1004,
+    "p99": 0.1397,
+    "max": 0.1625,
+    "mean": 0.0737
+   }
+  },
+  {
+   "run": "H2-incr",
+   "arm": "incr",
+   "seed": 3000,
+   "seed_s": 67.4,
+   "timed": 400,
+   "errors": {
+    "seed": 0,
+    "timed": 0
+   },
+   "send": {
+    "p50": 0.074,
+    "p90": 0.0866,
+    "p99": 0.1225,
+    "max": 0.1528,
+    "mean": 0.0617
+   }
+  },
+  {
+   "run": "H3-incr",
+   "arm": "incr",
+   "seed": 3000,
+   "seed_s": 66.9,
+   "timed": 400,
+   "errors": {
+    "seed": 0,
+    "timed": 0
+   },
+   "send": {
+    "p50": 0.0758,
+    "p90": 0.0867,
+    "p99": 0.1229,
+    "max": 0.1316,
+    "mean": 0.0627
+   }
+  },
+  {
+   "run": "H4-base",
+   "arm": "base",
+   "seed": 3000,
+   "seed_s": 113.5,
+   "timed": 400,
+   "errors": {
+    "seed": 0,
+    "timed": 0
+   },
+   "send": {
+    "p50": 0.0765,
+    "p90": 0.0996,
+    "p99": 0.1427,
+    "max": 0.1786,
+    "mean": 0.075
+   }
+  }
+ ],
+ "pooled": {
+  "late_storms_mean_acked_per_s": {
+   "base": 29.07,
+   "incr": 43.43
+  },
+  "early_storms_mean_acked_per_s": {
+   "base": 45.82,
+   "incr": 55.7
+  },
+  "heavy_timed_p50_s": {
+   "base": 0.0765,
+   "incr": 0.0746
+  }
+ },
+ "checks": {
+  "H1_late_storms_incr_over_base": 1.494,
+  "H1_every_incr_run_above_every_base_run": true,
+  "G1_early_storms_incr_over_base": 1.216,
+  "G2_incr_all_storms_96_0_and_H_errors": true,
+  "G3_heavy_sequential_p50_incr_over_base": 0.975,
+  "C_db_test": "PASS"
+ },
+ "verdict": "WIN",
+ "note": "The 2026-10-12 loss of this lever on sequential heavy-inbox p50 (dcef3743) did not reproduce on current main (G3 0.975x). The decay probe still fails br-v0ucm's FLAT bar with the lever (min/max over storms 2..12 below 0.80), so br-v0ucm stays open."
+}

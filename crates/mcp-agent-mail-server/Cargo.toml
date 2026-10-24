@@ -96,10 +96,12 @@ browser-dashboard = []
 # the capability-security gate intact. See mcp-agent-mail-db/Cargo.toml.
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion.workspace = true
+git2.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 ftui-harness.workspace = true
 mcp-agent-mail-test-helpers.workspace = true
+mcp-agent-mail-guard.workspace = true
 
 [[bench]]
 name = "widget_bench"

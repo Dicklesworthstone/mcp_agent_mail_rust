@@ -117,6 +117,15 @@ accessible via `?`. Common patterns:
 - `Enter` — Inspect/open selected item (screen-dependent deep links)
 - `.` — Open contextual action menu on focused row
 
+Action-menu writes run the same tools agents call, on the agent's behalf, and
+toast what they did or why the tool refused. They never count as the agent's
+own activity, so clearing a dead agent's lock does not make it look alive.
+Reservations: Renew (+30 min) and Release act for the holder; Force-release
+acts as `HumanOverseer`, keeps the tool's staleness check (an active holder is
+refused), and tells the holder. Contacts: Approve, Deny and Block answer for
+the recipient (Deny leaves the requester blocked). Messages: Acknowledge and
+Mark read apply for every recipient.
+
 ### 3.1 Command Palette Usage
 
 Use the palette (`Ctrl+P` or `:`) for fast, low-friction control:
@@ -140,12 +149,13 @@ Enter toast focus mode with `Ctrl+Y` when multiple notifications are active.
 
 ### 3.3 High-Signal Screen Keys
 
-- Messages: `g` toggles Local/Global inbox mode; `c` opens compose; `Ctrl+M` marks read; `Ctrl+V` drops to thread.
-- Threads: `e/c` expands/collapses all message cards; `Left/Right` collapses/expands selected branch.
+- Messages / Threads: `Ctrl+X` cuts the selected message and `Ctrl+V` pastes it into the selected thread (Esc cancels); `X` clears the search/filter. Messages: `g` toggles Local/Global inbox mode; `c` opens compose.
+- Threads: `e/c` expands/collapses all message cards; `Left/Right` collapses/expands selected branch. `.` → Summarize lists the thread's bullet points and checkbox action items above the conversation (`summarize_thread`, no LLM).
+- Agents: `.` opens profile, inbox, reservations, and compose for the selected agent.
 - Timeline: `V` cycles Events/Commits/Combined/Log; lowercase `v` toggles visual selection mode.
-- Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets.
-- Contacts: `n` toggles Table/Graph; `g` toggles Mermaid panel.
-- Reservations: `n` opens create-reservation form.
+- Search: `f` focuses facet rail; use `j/k` + `Enter` to cycle scope/sort/field facets. Scope Project narrows messages to the selected result's project and Product to every project in that project's product; the facet names the target.
+- Contacts: `n` cycles Table/Graph/Matrix (sender × recipient heatmap of recent message flow); `g` toggles Mermaid panel.
+- Reservations: `n` opens create-reservation form. "View reservations" on an agent narrows the table to that agent; `X` shows every agent again.
 - ATC: `d` opens decision detail; `r` opens the retention report.
 
 ## 4. Screens Reference
@@ -268,8 +278,18 @@ is used in hot paths.
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `AM_READ_CACHE_ENTRIES_PER_CATEGORY` | profile-derived `16384` | Per-category read-cache entry cap, clamped to 1,024..1,048,576 |
-| `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run `PRAGMA quick_check` at boot |
-| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity check    |
+| `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run the boot-time `PRAGMA quick_check`; `false` skips only this probe, leaving the background guard enabled |
+| `INTEGRITY_GUARD_ENABLED`      | `true`                | Enable periodic integrity checks, automatic backups and database maintenance; `false` stops that worker |
+| `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `300`       | Background quick-check cadence and delay before the first cycle when startup checking is skipped (minimum 1 second) |
+| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity-check cadence (`0` disables scheduled full checks, leaving quick checks enabled) |
+| `DB_MAINTENANCE_ENABLED`       | `true`                | Enable checkpoint/ANALYZE/VACUUM/journal-size maintenance inside the guard; `false` leaves checks and backups enabled |
+
+Skipping startup checking leaves the critical integrity verdict yellow until a
+full background check succeeds. Health names `INTEGRITY_CHECK_ON_STARTUP=false`
+and the first cycle's scheduled time, or reports that no running worker has
+published a schedule. Failed checks remain red. Changes to these settings
+require restarting the server; `INTEGRITY_GUARD_ENABLED=false` also disables
+automatic backup refresh and K4 maintenance, even if maintenance is enabled.
 
 ### HTTP Server
 
@@ -617,12 +637,15 @@ jq '{verdict, summary, remote_checks: [.stages.remote.checks[] | {id, severity, 
 Cloudflare Pages deployment path (native artifacts + verification):
 
 ```bash
-# Generate deployment tooling files, including Cloudflare workflow + wrangler template
-am share deploy tooling /tmp/agent-mail-bundle
+# Generate deployment tooling files, including Cloudflare workflow + wrangler template.
+# They land at the root of the git repo that contains the bundle (else the
+# nearest project-marker root, else the bundle's parent directory), so keep
+# the bundle inside the site repository you deploy from.
+am share deploy tooling ~/site-repo/agent-mail-bundle
 
-# Expected Cloudflare artifacts
-ls /tmp/agent-mail-bundle/.github/workflows/deploy-cf-pages.yml
-ls /tmp/agent-mail-bundle/wrangler.toml.template
+# Expected Cloudflare artifacts (repo root, beside the bundle)
+ls ~/site-repo/.github/workflows/deploy-cf-pages.yml
+ls ~/site-repo/wrangler.toml.template
 
 # Verify a Cloudflare Pages host against the same bundle
 am share deploy verify-live https://<project>.pages.dev \

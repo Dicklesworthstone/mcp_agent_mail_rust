@@ -1,0 +1,182 @@
+{
+ "schema": "br-9ott5 rg19 v1",
+ "rule": "rg19: lag-aware message-reconciler grace (RG) vs main. Bead br-9ott5 (and br-kp1in.13). Written 2026-10-21 ~00:20Z, before the\nRG build finished and before any rg19 run. The file's birth time is its timestamp.\n\nDISCLOSED CONTEXT. Everything below was seen before this rule.\n- ab18 runs 1 and 2 (main 2b5d14d7 + br-tsqvm fix; base vs SP+L2+L3), P2:\n  - file_reservation_paths errors: base 2,417/2,633 (91.8%); cand 787/2,633;\n  - every contended fence wait of 2 s or more was held by recovery/message_reconcile/database.rs:598: base 6, cand 61;\n  - reconciler per run: ~5k scans, 0 repaired, 418-1,036 unchanged, 3.7-4.6k deferred;\n  - completion: base 619.6 s, cand 634.5 s.\n- Any ab18 runs that finish before rg19 starts will also have been seen. They measure a different candidate, and none of their\n  numbers set a threshold below.\n\nTHE LEVER (rgrace_v1.patch b5b43bf5, worktree rc1020g = 2b5d14d7 + tsqvm_v1.patch + RG, crates diff b0af7e9bc610):\n- reconcile_message_batch_inner computes its cutoff as now - (30 s + min(archive_lag_snapshot().oldest_unmaterialized_us, 10 min)),\n  and still applies max(settled_before_us), so rows from before the process started skip the grace.\n- Failed WBQ writes still reach the reconciler through durability::seed_retries.\n- Unit test in_flight_cutoff_extends_the_grace_by_the_archive_lag. Its negative case: a fixed-grace cutoff fails the 120 s\n  assertion.\n\nARMS (portable release, same host, host lock):\n- base = build36/ab18b_base/am, sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254. This is the same binary\n  as ab18's base. It is re-run live in rg19; no ab18 number is reused.\n- cand = build36/rgrace_cand2/am, sha256 recorded at freeze. (Note 2026-10-21 03:35Z, no data involved: the first build,\n  rgrace_cand, lost its worker after 3 h, with completion unconfirmed on vmi1227854. It was rebuilt from the same tree as\n  rgrace_cand2, excluding that worker.) The build log must show diff=b0af7e9bc610, and the binary must\n  differ from base.\n\nRUNS: as ab18 (load gate < 8, foreign-CPU validity, re-queue up to 6 h).\n- P2: base cand cand base base cand.\n- P6: cand base base cand.\n- Release smoke in both orders (cand_vs_base, base_vs_cand).\n- The same server env as ab18.\n\nPRIMARY. Both must hold.\n- R1: over pooled valid P2 runs, the cand file_reservation_paths error rate is at most 25% of base's.\n- R2: across all valid cand P2 and P6 server logs, there are 0 \"archive publication fence contended\" waits of 2 s or more whose\n  holder site is recovery/message_reconcile/database.rs.\n\nGUARDS (any failure = LOSS):\n- G1 throughput: P2 completion median cand <= 1.05x base; smoke swarm acked sends cand >= 0.95x base in each order.\n- G2 failures:\n  - non-reservation paced tool errors cand <= base + 5 (pooled P2, and pooled P6);\n  - smoke tool errors (swarm + soak) cand <= base + 5 in each order;\n  - cand crash phase PASS in each order;\n  - integrity_check ok;\n  - no \"canonical message id ... already exists\" error in any cand server log.\n- G3: P6 send p99 and last-60 s send p90 cand <= 1.2x base; every P6 completion <= 330 s.\n- G4 convergence, because the reconciler exists to repair:\n  - post-swarm un-archived cand <= base + 2% of cand's acked swarm sends, in each order;\n  - the smoke soak check \"archive converges after load stops\" must not pass for base and fail for cand in either order.\n- C:\n  - storage message_reconcile tests and storage clippy -D warnings on rc1020g (lane vrg1);\n  - if R1, R2 and G1-G4 hold: storage lib nextest (only br-3ukrb's test may fail, and only identically on base), tools it and\n    conformance on the landing tree.\n\nREPORTED, not gated:\n- the bead probe: cand reservation error rate <= 1% and R2;\n- reconciler scans, unchanged, deferred and repaired per run;\n- fence-contended waits by holder site;\n- WBQ depth and lag at end of run;\n- reservation p50/p99;\n- send p50/p90, with the closed-loop caveat.\n\nDECISION:\n- WIN only if R1, R2, G1-G4 and C hold.\n- The reconciler is recovery code owned by its maintainer. A WIN is posted on br-9ott5 with the evidence for the owner to land.\n  It is not landed unilaterally.\n- br-9ott5 closes only when its own probe passes on a landed build.\n- LOSS: one line on br-9ott5; nothing lands.\n\nFROZEN 2026-10-21T05:09Z, before any rg19 run (no rg19 directory exists).\n- cand am sha256 963aa0f9e2051410a86447f429ccf9c2544f1204f172a892b8157f2236ffeca8 (build36/rgrace_cand2; log diff=b0af7e9bc610;\n  differs from base; SP marker absent, as expected for RG alone).\n- base am sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254.\n- Additional context seen since this rule was written: ab18 final, a LOSS.\n  - P2 grant refusals: base 928.7, cand 295.5 per 1,000. P6: base 766.4, cand 2.3.\n  - P2 completion: cand 1.12x base.\n  - Smoke: cand soak convergence failed in both orders while base passed. Acked sends 0.77x and 0.84x of base.\n  - In every ab18 server log the 2 s+ fence waits were held by the message reconciler.\n  None of it changes a threshold here.\n- Timestamp correction (appended later): the FROZEN block above was written at 2026-10-21T05:08:48.8Z (file mtime), before P1 started at 05:08:49Z per rg19/run.log. The \"05:09Z\" in its heading was rounded up. This note sets this file's mtime; the order is shown by the two timestamps above.\n\nSTOPPED 2026-10-21T05:33:04Z after 2 valid paced runs (P1 base, P2 cand). Run P3 was killed mid-run and is not used. Smoke was not run.\nVERDICT: LOSS, determined by R2. Valid cand run 2 had 27 contended fence waits of 2 s or more held by\nrecovery/message_reconcile/database.rs, and R2 requires 0 in every valid cand run.\n- R1 on the runs so far: base 2,452/2,633 and cand 2,489/2,633 reservation errors, where cand must be <= 25% of base.\n- Reconciler: base scanned 4,926 and deferred 4,522; cand scanned 4,713 and deferred 4,470.\nMechanism refuted: the grace only delays WHEN each new message is verified. The tail lane still verifies every new message once\nunder the global fence (git open + committed-tree checks in reconcile_message_bundle_inner), so the fence load does not change.\n",
+ "binaries": {
+  "base": {
+   "am_sha256": "3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/ab18b_base/am"
+  },
+  "cand": {
+   "am_sha256": "963aa0f9e2051410a86447f429ccf9c2544f1204f172a892b8157f2236ffeca8",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/rgrace_cand2/am"
+  }
+ },
+ "provenance": {
+  "base": "start 2026-10-20T20:17:24Z wt=/data/projects/mcp_agent_mail_rust-rc1020f head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=af51a3426ded features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1227854,vmi1293453,hz1,hz2,hz3 jobs=2",
+  "cand": "start 2026-10-21T03:33:18Z wt=/data/projects/mcp_agent_mail_rust-rc1020g head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=b0af7e9bc610 features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1293453,hz1 jobs=2"
+ },
+ "run_log": "P1 p2 base start 2026-10-21T05:08:49Z load=3.07 3.36 3.47\nP1 p2 base exit=0 end 2026-10-21T05:19:25Z foreign_samples=0\nP2 p2 cand start 2026-10-21T05:19:26Z load=7.68 8.37 6.21\nP2 p2 cand exit=0 end 2026-10-21T05:30:11Z foreign_samples=0\nP3 p2 cand start 2026-10-21T05:30:11Z load=6.77 8.38 7.40\n",
+ "paced_runs": [
+  {
+   "run": "1-p2-base",
+   "completion_s": 596.5,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2452
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2452,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4926,
+    "unchanged": 404,
+    "repaired": 0,
+    "deferred": 4522,
+    "passes": 220
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0451,
+     "p90": 0.3981,
+     "p99": 1.2189
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1552,
+     "p90": 0.739,
+     "p99": 1.6995
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2433,
+     "p90": 0.9469,
+     "p99": 2.0308
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 3.274,
+     "p90": 4.7933,
+     "p99": 11.064
+    }
+   }
+  },
+  {
+   "run": "2-p2-cand",
+   "completion_s": 605.7,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2489,
+    "fetch_inbox": 2
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2489,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {
+    "recovery/message_reconcile/database.rs": 27
+   },
+   "reconciler_held_fence_waits_2s": 27,
+   "reconciler": {
+    "scanned": 4713,
+    "unchanged": 243,
+    "repaired": 0,
+    "deferred": 4470,
+    "passes": 218
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0466,
+     "p90": 0.4262,
+     "p99": 1.1386
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1511,
+     "p90": 0.7499,
+     "p99": 1.5922
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2521,
+     "p90": 0.9646,
+     "p99": 1.8044
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 3.3273,
+     "p90": 5.1318,
+     "p99": 9.0306
+    }
+   }
+  }
+ ],
+ "paced_pooled": {
+  "p2-base": {
+   "runs": 1,
+   "completion_median_s": 596.4512,
+   "completion_s": [
+    596.5
+   ],
+   "send_p50": 3.274,
+   "send_p99": 11.064,
+   "late60_send_p90": 5.1405,
+   "resv_calls": 2633,
+   "resv_errors": 2452,
+   "resv_errors_per_1000": 931.3,
+   "other_errors": 0,
+   "reserve_p50": 0.1552,
+   "reserve_p99": 1.6995,
+   "release_p99": 2.0308,
+   "reconciler_held_fence_waits_2s": 0
+  },
+  "p2-cand": {
+   "runs": 1,
+   "completion_median_s": 605.6558,
+   "completion_s": [
+    605.7
+   ],
+   "send_p50": 3.3273,
+   "send_p99": 9.0306,
+   "late60_send_p90": 6.0323,
+   "resv_calls": 2633,
+   "resv_errors": 2489,
+   "resv_errors_per_1000": 945.3,
+   "other_errors": 2,
+   "reserve_p50": 0.1511,
+   "reserve_p99": 1.5922,
+   "release_p99": 1.8044,
+   "reconciler_held_fence_waits_2s": 27
+  }
+ },
+ "smoke": [
+  {
+   "run": "cand_vs_base",
+   "missing": true
+  },
+  {
+   "run": "base_vs_cand",
+   "missing": true
+  }
+ ],
+ "smoke_note": "smoke not run: the verdict was determined by the paced primaries before the smoke phase",
+ "p6_note": "P6 not run for both arms: its checks are not evaluated",
+ "checks": {
+  "R1 P2 cand reservation error rate <= 25% of base's": false,
+  "R2 0 reconciler-held fence waits >= 2 s in valid cand paced logs": false,
+  "G1 P2 completion median cand <= 1.05x base": true,
+  "G1 swarm acked sends cand >= 0.95x base each order": null,
+  "G2 non-reservation paced errors cand <= base + 5 (P2 and P6 pooled)": null,
+  "G2 smoke errors (swarm + soak) cand <= base + 5 each order": null,
+  "G2 cand crash PASS and integrity_check ok, each order": null,
+  "G3 every P6 completion <= 330 s": null,
+  "G3 P6 send p99 and late-60s p90 cand <= 1.2x base": null,
+  "G4 post-swarm unarchived cand <= base + 2% of cand acked, each order": null,
+  "G4 soak convergence not (base pass and cand fail), each order": null,
+  "G2 no canonical-id collision errors in any cand log (paced logs only; smoke not run)": true
+ },
+ "reported": {
+  "bead probe (cand P2 and P6 resv errors <= 10/1000, no reconciler-held waits)": false
+ },
+ "measured_verdict": "LOSS (see failed checks; null = not evaluated)"
+}

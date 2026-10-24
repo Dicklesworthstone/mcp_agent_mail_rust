@@ -703,3 +703,195 @@ fn am_doctor_fix_only_exits_two_on_partial_fix() {
     assert_eq!(envelope["actions_taken"], 1);
     assert!(envelope["summary"]["total_findings"].as_u64().unwrap_or(0) >= 1);
 }
+
+/// Every `detail` of a `check: "mcp_config"` result, wherever it is nested.
+fn mcp_config_details(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("check").and_then(serde_json::Value::as_str) == Some("mcp_config")
+                && let Some(detail) = map.get("detail").and_then(serde_json::Value::as_str)
+            {
+                out.push(detail.to_string());
+            }
+            for nested in map.values() {
+                mcp_config_details(nested, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                mcp_config_details(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+const STALE_MCP_ENTRY: &str =
+    r#"{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:9999/stale/"}}}"#;
+
+/// A private HOME, project and storage root for a hermetic legacy
+/// `am doctor fix --dry-run` (br-u2vt2).
+struct LegacyFixSandbox {
+    _td: tempfile::TempDir,
+    home: PathBuf,
+    project: PathBuf,
+    storage: PathBuf,
+}
+
+impl LegacyFixSandbox {
+    fn new() -> Self {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        // Detection reports the project through current_dir(), which resolves
+        // symlinks; canonicalize so planned paths compare exactly.
+        let root = std::fs::canonicalize(td.path()).expect("canonical tempdir");
+        let sandbox = Self {
+            home: root.join("home"),
+            project: root.join("project"),
+            storage: root.join("storage"),
+            _td: td,
+        };
+        for dir in [&sandbox.home, &sandbox.project, &sandbox.storage] {
+            std::fs::create_dir_all(dir).expect("fixture dir");
+        }
+        sandbox
+    }
+
+    /// Writes a stale Agent Mail entry at every path.
+    fn seed(paths: &[&PathBuf]) {
+        for path in paths {
+            std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+            std::fs::write(path, STALE_MCP_ENTRY).expect("seed stale entry");
+        }
+    }
+
+    /// The `mcp_config` repair details the legacy fixer plans, with `extra_env`
+    /// layered on the private environment.
+    fn planned_repairs(&self, extra_env: &[(&str, &str)]) -> Vec<String> {
+        let mut command = Command::new(am_bin());
+        command
+            .args(["doctor", "fix", "--dry-run", "--json"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("XDG_CACHE_HOME", self.home.join(".cache"))
+            .env("XDG_STATE_HOME", self.home.join(".local/state"))
+            .env("STORAGE_ROOT", &self.storage)
+            .env(
+                "DATABASE_URL",
+                format!("sqlite:///{}/storage.sqlite3", self.storage.display()),
+            )
+            .env("AM_INTERFACE_MODE", "cli")
+            .env("HTTP_HOST", "127.0.0.1")
+            .env("HTTP_PORT", "8765")
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&self.project);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let out = command.output().expect("invoke am");
+        assert!(
+            out.status.success(),
+            "dry-run must succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("am doctor fix --dry-run --json emits JSON");
+        let mut details = Vec::new();
+        mcp_config_details(&report, &mut details);
+        details
+    }
+}
+
+fn is_planned(details: &[String], path: &std::path::Path) -> bool {
+    let needle = format!(" in {} to ", path.display());
+    details.iter().any(|detail| detail.contains(&needle))
+}
+
+fn assert_unchanged(paths: &[&PathBuf]) {
+    for path in paths {
+        assert_eq!(
+            std::fs::read_to_string(path).expect("fixture survives"),
+            STALE_MCP_ENTRY,
+            "dry-run rewrote {}",
+            path.display()
+        );
+    }
+}
+
+/// br-u2vt2: the legacy `am doctor fix` (no `--only`) plans MCP config repairs
+/// only for files Agent Mail may write. OMP reads its compatibility fallbacks
+/// but never writes them, so a stale entry there must be left alone; the
+/// active and project OMP primaries are still repaired. Dry-run keeps this
+/// hermetic: HOME is private and nothing is rewritten.
+#[test]
+fn legacy_doctor_fix_never_targets_omp_read_only_compat_files() {
+    let sandbox = LegacyFixSandbox::new();
+    let writable = [
+        sandbox.home.join(".omp/agent/mcp.json"),
+        sandbox.project.join(".omp/mcp.json"),
+    ];
+    let read_only = [
+        sandbox.home.join(".omp/agent/.mcp.json"),
+        sandbox.project.join(".omp/.mcp.json"),
+        sandbox.project.join("mcp.json"),
+        sandbox.project.join(".mcp.json"),
+    ];
+    let all: Vec<&PathBuf> = writable.iter().chain(read_only.iter()).collect();
+    LegacyFixSandbox::seed(&all);
+
+    let details = sandbox.planned_repairs(&[]);
+    for path in &writable {
+        assert!(
+            is_planned(&details, path),
+            "{} must be repaired: {details:#?}",
+            path.display()
+        );
+    }
+    for path in &read_only {
+        assert!(
+            !is_planned(&details, path),
+            "{} is OMP read-only and must not be targeted: {details:#?}",
+            path.display()
+        );
+    }
+    assert_unchanged(&all);
+}
+
+/// br-u2vt2: a named-profile session repairs only its own OMP profile, never
+/// the default or another named profile, and an invalid profile name leaves
+/// every OMP file alone instead of falling back to the default profile. The
+/// Cursor config is the control that proves the MCP fix pass ran.
+#[test]
+fn legacy_doctor_fix_targets_only_the_active_omp_profile() {
+    let sandbox = LegacyFixSandbox::new();
+    let active = sandbox.home.join(".omp/profiles/work/agent/mcp.json");
+    let default_profile = sandbox.home.join(".omp/agent/mcp.json");
+    let other_profile = sandbox.home.join(".omp/profiles/other/agent/mcp.json");
+    let cursor = sandbox.home.join(".cursor/mcp.json");
+    let all = [&active, &default_profile, &other_profile, &cursor];
+    LegacyFixSandbox::seed(&all);
+
+    let details = sandbox.planned_repairs(&[("OMP_PROFILE", "work")]);
+    assert!(is_planned(&details, &cursor), "control: {details:#?}");
+    assert!(is_planned(&details, &active), "active: {details:#?}");
+    for inactive in [&default_profile, &other_profile] {
+        assert!(
+            !is_planned(&details, inactive),
+            "inactive profile {} must not be targeted: {details:#?}",
+            inactive.display()
+        );
+    }
+
+    let details = sandbox.planned_repairs(&[("OMP_PROFILE", "Work")]);
+    assert!(is_planned(&details, &cursor), "control: {details:#?}");
+    for omp in [&active, &default_profile, &other_profile] {
+        assert!(
+            !is_planned(&details, omp),
+            "an invalid profile must not target {}: {details:#?}",
+            omp.display()
+        );
+    }
+    assert_unchanged(&all);
+}

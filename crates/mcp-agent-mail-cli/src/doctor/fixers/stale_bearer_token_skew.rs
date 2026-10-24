@@ -43,10 +43,11 @@
 //!
 //! ## Fix (`Op::WriteFile`)
 //!
-//! Re-parse JSON, rewrite the token field at the recorded JSON
-//! pointer, serialize back with `serde_json::to_string_pretty`,
-//! call `mutate(... Op::WriteFile { content, mode: 0o600 })`.
-//! Same shape as pass-13's wrong_mcp_url_json fixer.
+//! `transform_config_file` reads and renders the current JSON under the
+//! canonical mutation locks. Only the detected token field changes;
+//! removed fields and newer operator values are not overwritten.
+//! Backup, hash verification, owner-only publication, and undo records
+//! remain in the mutation chokepoint.
 //!
 //! ## Reversibility
 //!
@@ -56,7 +57,7 @@
 #![forbid(unsafe_code)]
 
 use super::{FindingRemediation, FixOutcome};
-use crate::doctor::mutate::{Op, mutate};
+use crate::doctor::mutate::transform_config_file;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -68,12 +69,11 @@ const FM_SUBSYSTEM: &str = "mcp_config_files";
 /// MCP-servers container key variants (clients differ).
 const SERVERS_CONTAINER_KEYS: &[&str] = &["mcpServers", "mcp_servers"];
 
-/// Token-bearing field names. The Authorization header has both
-/// canonical-case (`Authorization`) and lower-case (`authorization`)
-/// variants depending on client JSON style. The `bearer` and
-/// `token` standalone fields are non-RFC but common in client
-/// configs that opt out of full HTTP-header verbiage.
-const TOKEN_FIELDS: &[&str] = &["Authorization", "authorization", "bearer", "token"];
+/// JSON token aliases retain their spelling; Authorization header names
+/// are matched case-insensitively and their actual key is preserved.
+fn is_token_field(field: &str) -> bool {
+    field.eq_ignore_ascii_case("authorization") || matches!(field, "bearer" | "token")
+}
 
 /// Structured pointer to the token field. Keep this separate from
 /// `display_pointer()` so server names containing `.` remain addressable.
@@ -170,10 +170,10 @@ impl StaleBearerTokenSkewFinding {
 }
 
 /// Token redactor: first 4 + last 4 chars, with length in the
-/// middle. Sufficient for diff/triage; never exposes the full
-/// secret in JSON logs.
+/// middle. Short values are completely masked, including multibyte
+/// values whose byte length is greater than their character count.
 fn redact(s: &str) -> String {
-    if s.len() <= 12 {
+    if s.chars().take(13).count() <= 12 {
         return format!("<redacted len={}>", s.len());
     }
     let head: String = s.chars().take(4).collect();
@@ -273,40 +273,40 @@ fn scan_value_containers(
             let Some(server_obj) = server_val.as_object() else {
                 continue;
             };
-            // Walk `headers.*` and direct top-level token fields.
-            for token_field in TOKEN_FIELDS {
-                // Direct field on the server object.
-                if let Some(val) = server_obj.get(*token_field).and_then(|x| x.as_str())
-                    && strip_bearer_prefix(val) != canonical_token
-                {
+            // Iterate actual keys rather than two hard-coded header
+            // spellings so mixed/upper-case Authorization is repaired too.
+            for (inside_headers, fields) in [
+                (false, Some(server_obj)),
+                (
+                    true,
+                    server_obj
+                        .get("headers")
+                        .and_then(serde_json::Value::as_object),
+                ),
+            ] {
+                let Some(fields) = fields else {
+                    continue;
+                };
+                for (field, value) in fields {
+                    if !is_token_field(field) {
+                        continue;
+                    }
+                    let Some(token) = value.as_str() else {
+                        continue;
+                    };
+                    if strip_bearer_prefix(token) == canonical_token {
+                        continue;
+                    }
                     out.push(StaleBearerTokenSkewFinding {
                         config_path: path.to_path_buf(),
                         location: TokenLocation {
                             project_path: project_path.map(str::to_string),
                             container_key: (*container_key).to_string(),
                             server_name: server_name.clone(),
-                            inside_headers: false,
-                            field: (*token_field).to_string(),
+                            inside_headers,
+                            field: field.clone(),
                         },
-                        current_token: val.to_string(),
-                        canonical_token: canonical_token.to_string(),
-                    });
-                }
-                // Inside `headers.<field>`.
-                if let Some(headers) = server_obj.get("headers").and_then(|x| x.as_object())
-                    && let Some(val) = headers.get(*token_field).and_then(|x| x.as_str())
-                    && strip_bearer_prefix(val) != canonical_token
-                {
-                    out.push(StaleBearerTokenSkewFinding {
-                        config_path: path.to_path_buf(),
-                        location: TokenLocation {
-                            project_path: project_path.map(str::to_string),
-                            container_key: (*container_key).to_string(),
-                            server_name: server_name.clone(),
-                            inside_headers: true,
-                            field: (*token_field).to_string(),
-                        },
-                        current_token: val.to_string(),
+                        current_token: token.to_string(),
                         canonical_token: canonical_token.to_string(),
                     });
                 }
@@ -320,136 +320,85 @@ fn is_agent_mail_server_name(name: &str) -> bool {
     lower.contains("agent") && lower.contains("mail")
 }
 
-/// Fixer. Routes through `mutate()` with `Op::WriteFile`.
-///
-/// Preserves the `"Bearer "` prefix iff the original value had
-/// one. Re-parses the file before writing (defensive against
-/// concurrent writers). Refuses if the current value no longer
-/// matches what the detector recorded.
+/// Rotate the detected field in the current, locked snapshot. Preserve the
+/// Bearer prefix when present, but never recreate a removed credential or
+/// overwrite a value changed since detection.
 pub fn fix(
     ctx: &crate::doctor::mutate::MutateContext,
     finding: &StaleBearerTokenSkewFinding,
 ) -> Result<FixOutcome, crate::doctor::mutate::MutateError> {
-    if !finding.config_path.exists() {
+    if finding.canonical_token.is_empty() {
         return Ok(FixOutcome {
             actions_taken: 0,
             actions_skipped: 1,
             quarantined_paths: Vec::new(),
         });
     }
-
-    let body =
-        fs::read_to_string(&finding.config_path).map_err(crate::doctor::mutate::MutateError::Io)?;
-    let mut v: serde_json::Value =
-        serde_json::from_str(&body).map_err(crate::doctor::mutate::MutateError::Serde)?;
-
-    // Walk the structured location directly; dotted display strings
-    // are ambiguous for server names such as "agent-mail.prod".
-    let loc = &finding.location;
-    let Some(root) = v.as_object_mut() else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    // For project-scoped entries, descend into
-    // `projects.<project_path>` before resolving the container.
-    let obj = match &loc.project_path {
-        None => root,
-        Some(project_path) => {
-            let Some(scoped) = root
-                .get_mut("projects")
-                .and_then(|x| x.as_object_mut())
-                .and_then(|projects| projects.get_mut(project_path))
-                .and_then(|x| x.as_object_mut())
-            else {
-                return Ok(FixOutcome {
-                    actions_taken: 0,
-                    actions_skipped: 1,
-                    quarantined_paths: Vec::new(),
-                });
-            };
-            scoped
+    let result = transform_config_file(ctx, &finding.config_path, 0o600, true, |source| {
+        let mut value: serde_json::Value = serde_json::from_slice(source)?;
+        let loc = &finding.location;
+        if !SERVERS_CONTAINER_KEYS.contains(&loc.container_key.as_str())
+            || !is_agent_mail_server_name(&loc.server_name)
+            || !is_token_field(&loc.field)
+        {
+            return Ok(None);
         }
-    };
-    let Some(servers) = obj
-        .get_mut(&loc.container_key)
-        .and_then(|x| x.as_object_mut())
-    else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-    let Some(server_obj) = servers
-        .get_mut(&loc.server_name)
-        .and_then(|x| x.as_object_mut())
-    else {
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    };
-
-    let (target_obj, field): (&mut serde_json::Map<String, serde_json::Value>, &str) =
-        if loc.inside_headers {
-            let Some(headers) = server_obj
-                .get_mut("headers")
-                .and_then(|x| x.as_object_mut())
-            else {
-                return Ok(FixOutcome {
-                    actions_taken: 0,
-                    actions_skipped: 1,
-                    quarantined_paths: Vec::new(),
-                });
-            };
-            (headers, loc.field.as_str())
-        } else {
-            (server_obj, loc.field.as_str())
+        // Structured locations preserve literal dots/slashes in both
+        // project keys and server names; never parse the display string.
+        let parent = match &loc.project_path {
+            None => &mut value,
+            Some(project) => {
+                let Some(scoped) = value
+                    .get_mut("projects")
+                    .and_then(|projects| projects.get_mut(project.as_str()))
+                else {
+                    return Ok(None);
+                };
+                scoped
+            }
         };
-
-    let cur = target_obj.get(field).and_then(|x| x.as_str()).unwrap_or("");
-    if cur != finding.current_token {
-        // Concurrent writer changed it; refuse to clobber.
-        return Ok(FixOutcome {
-            actions_taken: 0,
-            actions_skipped: 1,
-            quarantined_paths: Vec::new(),
-        });
-    }
-    // Preserve `Bearer ` prefix iff the original had one.
-    // Use `get(..7)` to avoid panicking on non-ASCII UTF-8 boundaries.
-    let had_bearer_prefix = cur
-        .get(..7)
-        .is_some_and(|h| h.eq_ignore_ascii_case("bearer "));
-    let new_value = if had_bearer_prefix {
-        format!("Bearer {}", finding.canonical_token)
-    } else {
-        finding.canonical_token.clone()
-    };
-    target_obj.insert(field.to_string(), serde_json::Value::String(new_value));
-
-    let new_body =
-        serde_json::to_string_pretty(&v).map_err(crate::doctor::mutate::MutateError::Serde)?;
-    let mut new_bytes = new_body.into_bytes();
-    if !new_bytes.ends_with(b"\n") {
-        new_bytes.push(b'\n');
-    }
-    mutate(
-        ctx,
-        &finding.config_path,
-        Op::WriteFile {
-            content: new_bytes,
-            mode: 0o600, // bearer tokens — owner-only
-        },
-    )?;
-
+        let Some(server) = parent
+            .get_mut(loc.container_key.as_str())
+            .and_then(|servers| servers.get_mut(loc.server_name.as_str()))
+        else {
+            return Ok(None);
+        };
+        let fields = if loc.inside_headers {
+            let Some(headers) = server.get_mut("headers") else {
+                return Ok(None);
+            };
+            headers
+        } else {
+            server
+        };
+        let Some(slot) = fields.get_mut(loc.field.as_str()) else {
+            return Ok(None);
+        };
+        let Some(current) = slot.as_str() else {
+            return Ok(None);
+        };
+        if current != finding.current_token
+            || strip_bearer_prefix(current) == finding.canonical_token
+        {
+            return Ok(None);
+        }
+        let had_bearer_prefix = current
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("bearer "));
+        let replacement = if had_bearer_prefix {
+            format!("Bearer {}", finding.canonical_token)
+        } else {
+            finding.canonical_token.clone()
+        };
+        *slot = serde_json::Value::String(replacement);
+        let mut bytes = serde_json::to_vec_pretty(&value)?;
+        bytes.push(b'\n');
+        Ok(Some(bytes))
+    })?;
+    let (actions_taken, actions_skipped) = if result.is_some() { (1, 0) } else { (0, 1) };
     Ok(FixOutcome {
-        actions_taken: 1,
-        actions_skipped: 0,
+        actions_taken,
+        actions_skipped,
         quarantined_paths: Vec::new(),
     })
 }
@@ -657,10 +606,7 @@ mod tests {
 
         let ctx = ctx_for(&td, "2026-05-14T03-00-00Z__token_dotted_server");
         let outcome = fix(&ctx, &findings[0]).expect("fix");
-        assert_eq!(
-            outcome.actions_taken, 1,
-            "structured TokenLocation must fix tokens for dotted server names"
-        );
+        assert_eq!(outcome.actions_taken, 1);
         let body = fs::read_to_string(&p).unwrap();
         assert!(body.contains(r#""bearer": "canonical-xyz""#));
     }
@@ -813,5 +759,90 @@ mod tests {
             !s.contains("super-canonical-token-xyz789"),
             "evidence must NOT include the raw canonical: {s}"
         );
+    }
+
+    #[test]
+    fn fixer_locks_before_parsing_token_configuration() {
+        use fs2::FileExt;
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"agent-mail":{"token":"old"}}}"#).unwrap();
+        let findings = detect("new", std::slice::from_ref(&path));
+        let ctx = ctx_for(&td, "2026-10-14T00-02-00Z__token_lock");
+        let writer = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(td.path().join(".mcp.json.doctor-lock"))
+            .unwrap();
+        writer.try_lock_exclusive().unwrap();
+        fs::write(&path, b"{in-progress operator edit").unwrap();
+        let error = fix(&ctx, &findings[0]).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::doctor::mutate::MutateError::LockHeld(_)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"{in-progress operator edit");
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fixer_never_recreates_a_removed_empty_token_field() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"agent-mail":{"token":""}}}"#).unwrap();
+        let findings = detect("new-secret", std::slice::from_ref(&path));
+        assert_eq!(findings.len(), 1);
+        let edited = br#"{"mcpServers":{"agent-mail":{"url":"http://keep/"}}}"#;
+        fs::write(&path, edited).unwrap();
+        let ctx = ctx_for(&td, "2026-10-14T00-02-01Z__token_removed");
+        let result = fix(&ctx, &findings[0]).unwrap();
+        assert_eq!(result.actions_taken, 0);
+        assert_eq!(result.actions_skipped, 1);
+        assert_eq!(fs::read(&path).unwrap(), edited);
+        assert!(
+            fs::read(ctx.run_dir.join("actions.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn detector_and_fixer_preserve_arbitrary_authorization_header_case() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("mcp.json");
+        for (index, field) in ["AUTHORIZATION", "AuThOrIzAtIoN"].iter().enumerate() {
+            let mut headers = serde_json::Map::new();
+            headers.insert((*field).to_string(), serde_json::json!("Bearer old"));
+            headers.insert("X-Keep".to_string(), serde_json::json!("unchanged"));
+            let config = serde_json::json!({
+                "mcp_servers": { "agent-mail.prod": { "headers": headers } }
+            });
+            fs::write(&path, config.to_string()).unwrap();
+            let findings = detect("new", std::slice::from_ref(&path));
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].location.field, *field);
+            let ctx = ctx_for(&td, &format!("2026-10-14T00-02-02Z__case_{index}"));
+            assert_eq!(fix(&ctx, &findings[0]).unwrap().actions_taken, 1);
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let headers = &repaired["mcp_servers"]["agent-mail.prod"]["headers"];
+            assert_eq!(headers[*field], "Bearer new");
+            assert_eq!(headers["X-Keep"], "unchanged");
+            assert_eq!(fix(&ctx, &findings[0]).unwrap().actions_skipped, 1);
+        }
+    }
+
+    #[test]
+    fn short_multibyte_tokens_are_completely_redacted() {
+        for token in ["🔐🔒🔑🗝", "ééééééé", "漢字秘密"] {
+            assert!(redact(token).starts_with("<redacted len="));
+            assert!(!redact(token).contains(token));
+        }
     }
 }

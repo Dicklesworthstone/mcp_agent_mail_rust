@@ -7,15 +7,17 @@
 
 use std::collections::HashSet;
 
-use asupersync::Cx;
+use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
-use mcp_agent_mail_db::DbPool;
 use mcp_agent_mail_db::sqlmodel_core::{Row, Value as SqlValue};
+use mcp_agent_mail_db::{DbConn, DbPool};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::super::MAX_RECIPIENTS;
-use super::{MAX_DB_PAYLOAD_BYTES, PreparedMessage, outcome, source_error};
+#[cfg(test)]
+use super::outcome;
+use super::{MAX_DB_PAYLOAD_BYTES, PreparedMessage, ReconcileFailure, source_error};
 
 const MAX_RECIPIENT_NAME_BYTES: i64 = 1024;
 
@@ -63,17 +65,71 @@ fn decode_archive_metadata(
 // that the recovery worker is allowed to discard.
 const SOURCE_SQL: &str = mcp_agent_mail_db::queries::MESSAGE_ARCHIVE_SOURCE_SQL;
 
+#[cfg(test)]
 pub(super) fn prepare_message(cx: &Cx, pool: &DbPool, id: i64) -> Result<PreparedMessage, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    read_source(id, |sql, params| {
-        conn.query_sync(sql, params).map_err(source_error)
+    prepare_message_classified(cx, pool, id).map_err(|error| error.detail)
+}
+
+pub(super) fn prepare_message_classified(
+    cx: &Cx,
+    pool: &DbPool,
+    id: i64,
+) -> Result<PreparedMessage, ReconcileFailure> {
+    with_source_connection(cx, pool, |conn| {
+        read_source(id, |sql, params| {
+            conn.query_sync(sql, params)
+                .map_err(ReconcileFailure::source_unavailable)
+        })
     })
+}
+
+/// A retry must not reacquire the reader whose SQL operation just failed.
+/// The maintenance pool has one connection: returning an obsolete pager to it
+/// can turn the bounded retry lane into repeated reads of the same bad handle.
+/// Retire only failed source reads, not valid reads that expose conflicting
+/// durable metadata. Neither path mutates mailbox rows or relaxes validation.
+fn with_source_connection<T>(
+    cx: &Cx,
+    pool: &DbPool,
+    read: impl FnOnce(&DbConn) -> Result<T, ReconcileFailure>,
+) -> Result<T, ReconcileFailure> {
+    let conn = match block_on(pool.acquire(cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Err(ReconcileFailure::source_unavailable(error)),
+        Outcome::Cancelled(_) => {
+            return Err(ReconcileFailure::source_unavailable(
+                "source read cancelled",
+            ));
+        }
+        Outcome::Panicked(_) => {
+            return Err(ReconcileFailure::source_unavailable("source read panicked"));
+        }
+    };
+    // The synchronous driver/decoder may unwind instead of returning an SQL
+    // error. Keep that failure inside the read-only observation: the caller's
+    // bounded retry lane must retain the message ID, and the uncertain pager
+    // must never return to this one-slot pool. No archive publication or SQL
+    // mutation is included in this boundary. Do not copy the panic payload
+    // into the returned error; it may contain private source data.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&conn)))
+        .unwrap_or_else(|_| {
+            Err(ReconcileFailure::source_unavailable(
+                "message archive source read panicked",
+            ))
+        });
+    if result.as_ref().is_err_and(|error| error.transient) {
+        // Detach updates pool accounting and prevents Drop from returning this
+        // handle to the idle slot. Use the driver's normal explicit close path;
+        // do not clear shared pools, change generations, or repair the database.
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed message archive source read");
+    }
+    result
 }
 
 fn read_source(
     id: i64,
-    query: impl FnOnce(&str, &[SqlValue]) -> Result<Vec<Row>, String>,
-) -> Result<PreparedMessage, String> {
+    query: impl FnOnce(&str, &[SqlValue]) -> Result<Vec<Row>, ReconcileFailure>,
+) -> Result<PreparedMessage, ReconcileFailure> {
     // The pinned runtime's compound-select executor applies LIMIT without
     // bindings. Only the fixed internal row budget is rendered as SQL; message
     // IDs and payload bounds remain bound, with explicit indices across arms.
@@ -87,7 +143,7 @@ fn read_source(
             MAX_RECIPIENT_NAME_BYTES.into(),
         ],
     )?;
-    prepare_source_rows(id, &rows)
+    prepare_source_rows(id, &rows).map_err(ReconcileFailure::from)
 }
 
 /// Retention verifies the exact projection captured by the database, then the
@@ -201,8 +257,11 @@ fn select_routing(cached: Value, durable: &Value) -> Result<Value, String> {
     Ok(cached)
 }
 
+/// The agent inboxes a routing delivers to. A project shared-mailbox address
+/// (GH#282) is routing but never an inbox, so it is counted, not returned.
 fn routing_names(routing: &Value) -> Result<Vec<String>, String> {
     let mut recipients = Vec::new();
+    let mut addressed = 0usize;
     for kind in ["to", "cc", "bcc"] {
         for name in routing
             .get(kind)
@@ -214,13 +273,20 @@ fn routing_names(routing: &Value) -> Result<Vec<String>, String> {
                 .ok_or_else(|| "non-string message recipient".to_string())?;
             crate::validate_archive_component("recipient", name)
                 .map_err(|error| error.to_string())?;
-            recipients.push(name.to_string());
-            if recipients.len() > MAX_RECIPIENTS {
+            addressed += 1;
+            if addressed > MAX_RECIPIENTS {
                 return Err("message recipient budget exceeded".to_string());
             }
+            if mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name).is_some() {
+                if kind == "bcc" {
+                    return Err("a project mailbox cannot be a bcc recipient".to_string());
+                }
+                continue;
+            }
+            recipients.push(name.to_string());
         }
     }
-    if recipients.is_empty() {
+    if addressed == 0 {
         return Err("message has no authoritative recipients".to_string());
     }
     recipients.sort_unstable();
@@ -237,8 +303,36 @@ fn routing_from_rows(rows: &[Row], id: i64, project_id: i64) -> Result<Value, St
     let mut names = HashSet::new();
     for row in rows {
         let integer = |key| row.get_named::<i64>(key).map_err(source_error);
-        if integer("row_kind")? != 1 || integer("id")? != id {
+        let row_kind = integer("row_kind")?;
+        if !matches!(row_kind, 1 | 2) || integer("id")? != id {
             return Err("recipient projection has a mismatched message identity".to_string());
+        }
+        if row_kind == 2 {
+            // GH#282: the project shared-mailbox delivery, named by address.
+            if integer("recipient_project_id")? != project_id {
+                return Err(
+                    "project mailbox delivery belongs to a different project; archive repair refused"
+                        .to_string(),
+                );
+            }
+            let address = row
+                .get_named::<Option<String>>("recipient_name")
+                .map_err(source_error)?
+                .filter(|name| {
+                    mcp_agent_mail_db::project_mailbox::parse_project_mailbox_address(name)
+                        .is_some_and(|ident| !ident.is_empty())
+                })
+                .ok_or_else(|| "project mailbox delivery has no valid address".to_string())?;
+            let kind = row
+                .get_named::<Option<String>>("recipient_kind")
+                .map_err(source_error)?
+                .filter(|kind| matches!(kind.as_str(), "to" | "cc"))
+                .ok_or_else(|| "project mailbox delivery has an invalid kind".to_string())?;
+            routing[&kind]
+                .as_array_mut()
+                .ok_or_else(|| "recipient routing is not an array".to_string())?
+                .push(Value::String(address));
+            continue;
         }
         let agent_id = integer("recipient_id")?;
         if agent_id <= 0 || !ids.insert(agent_id) {
@@ -383,6 +477,7 @@ mod tests {
                         true,
                         "[]",
                         &[(102, "to"), (103, "bcc"), (104, "cc")],
+                        None,
                     ),
                 ))
                 .unwrap();
@@ -391,7 +486,9 @@ mod tests {
                 // the writer's pooled connection, returned row or archive queue.
                 let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
                 let original = read_source(id, |sql, params| {
-                    reopened.query_sync(sql, params).map_err(source_error)
+                    reopened
+                        .query_sync(sql, params)
+                        .map_err(ReconcileFailure::source_unavailable)
                 })
                 .unwrap();
                 drop(reopened);
@@ -472,12 +569,15 @@ mod tests {
                     true,
                     &attachments.to_string(),
                     &[(102, "to"), (103, "bcc"), (104, "cc")],
+                    None,
                 ),
             ))
             .unwrap();
             let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
             let prepared = read_source(created.id.unwrap(), |sql, params| {
-                reopened.query_sync(sql, params).map_err(source_error)
+                reopened
+                    .query_sync(sql, params)
+                    .map_err(ReconcileFailure::source_unavailable)
             })
             .unwrap();
             drop(reopened);
@@ -524,6 +624,7 @@ mod tests {
                         false,
                         "[]",
                         &[(102, "to")],
+                        None,
                         mcp_agent_mail_db::IdempotencyClaim {
                             project_id: 101,
                             tool: "reply_message",
@@ -598,6 +699,7 @@ mod tests {
                         false,
                         "[]",
                         &[(102, "to")],
+                        None,
                     ),
                 ))
                 .unwrap_err();
@@ -624,6 +726,7 @@ mod tests {
                     false,
                     "[]",
                     &[(102, "to")],
+                    None,
                 ),
             ))
             .unwrap();
@@ -1041,6 +1144,212 @@ mod tests {
             drop(conn);
             let error = prepare_message(cx, pool, 901).err().unwrap();
             assert!(error.contains("exceeds its bound"), "{error}");
+        });
+    }
+
+    fn query_only(conn: &DbConn) -> i64 {
+        conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
+    }
+
+    #[test]
+    fn source_read_panics_retire_the_reader_and_leave_repairable_mail() {
+        for after_projection in [false, true] {
+            fixture(|cx, pool, config| {
+                let failed = with_source_connection(cx, pool, |conn| -> Result<PreparedMessage, ReconcileFailure> {
+                    conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                    assert_eq!(query_only(conn), 1);
+                    if after_projection {
+                        let prepared = read_source(901, |sql, params| {
+                            conn.query_sync(sql, params)
+                                .map_err(ReconcileFailure::source_unavailable)
+                        })?;
+                        assert_eq!(prepared.body, "Keep this body.");
+                    }
+                    panic!("private-source-panic-payload");
+                });
+                let failure = failed.err().expect("a panic must not publish a source projection");
+                assert!(failure.transient, "the bounded retry lane must retain this ID");
+                assert!(failure.detail.contains("panicked"));
+                assert!(!failure.detail.contains("private-source-panic-payload"));
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(query_only(&conn), 0, "panicked reader must not be reused");
+                drop(conn);
+                let report = reconcile_message_batch(
+                    cx,
+                    pool,
+                    config,
+                    &mut ReconcileCursor::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(report.repaired, 1);
+                assert_eq!(report.files_created, 5);
+                assert_eq!(report.deferred, 0);
+                let original = prepare_message(cx, pool, 901).unwrap();
+                assert_eq!(original.body, "Keep this body.");
+                assert_eq!(original.message["bcc"], json!(["RedFox"]));
+                assert_eq!(
+                    reconcile_prepared(config, &original).unwrap(),
+                    ReconcileResult::default()
+                );
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+                let receipts = conn.query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901 AND agent_id = 102",
+                    &[],
+                ).unwrap();
+                assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 7);
+                assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 11);
+            });
+        }
+    }
+
+    #[test]
+    fn failed_source_query_retires_reader_and_next_pass_repairs_without_redelivery() {
+        fixture(|cx, pool, config| {
+            let failure = with_source_connection(cx, pool, |conn| {
+                // A connection-local witness distinguishes a replacement from
+                // the same failed connection returned to this one-slot pool.
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                assert_eq!(query_only(conn), 1);
+                conn.query_sync("SELECT * FROM missing_archive_source_probe", &[])
+                    .map_err(ReconcileFailure::source_unavailable)
+            })
+            .unwrap_err();
+            assert!(failure.transient);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(query_only(&conn), 0, "failed reader must not be reused");
+            drop(conn);
+            let report = reconcile_message_batch(
+                cx,
+                pool,
+                config,
+                &mut ReconcileCursor::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(report.repaired, 1);
+            assert_eq!(report.files_created, 5);
+            assert_eq!(report.deferred, 0);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(original.body, "Keep this body.");
+            assert_eq!(original.message["bcc"], json!(["RedFox"]));
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap(),
+                ReconcileResult::default()
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS n FROM messages", &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 1);
+            let receipts = conn.query_sync(
+                "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901 AND agent_id = 102",
+                &[],
+            ).unwrap();
+            assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 7);
+            assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 11);
+        });
+    }
+
+    #[test]
+    fn successful_source_read_keeps_healthy_pool_connection() {
+        fixture(|cx, pool, _| {
+            let original = with_source_connection(cx, pool, |conn| {
+                conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                read_source(901, |sql, params| {
+                    conn.query_sync(sql, params)
+                        .map_err(ReconcileFailure::source_unavailable)
+                })
+            })
+            .unwrap();
+            assert_eq!(original.body, "Keep this body.");
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                query_only(&conn),
+                1,
+                "successful reads must retain the connection"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+        });
+    }
+
+    #[test]
+    fn conflicting_source_metadata_does_not_retire_reader_or_weaken_refusal() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET recipients_json = '{\"to\":[\"GreenStone\"]}' WHERE id = 901",
+            )
+            .unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let failure = prepare_message_classified(cx, pool, 901).err().unwrap();
+            assert!(
+                !failure.transient,
+                "conflicting evidence is not a failed reader"
+            );
+            assert!(failure.detail.contains("lacks cc array"));
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                query_only(&conn),
+                1,
+                "metadata refusal must not churn the pool"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            drop(conn);
+            let report = reconcile_message_batch(
+                cx,
+                pool,
+                config,
+                &mut ReconcileCursor::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(report.deferred_conflict, 1);
+            assert_eq!(report.repaired, 0);
+            assert_eq!(report.retry_len, 0);
+            assert!(
+                !config
+                    .storage_root
+                    .join("projects/project/messages")
+                    .exists()
+            );
+        });
+    }
+
+    /// The reconciler renders the shared envelope key for key, in order; a
+    /// reply appends `reply_to`. Tool-side writers are pinned to the same
+    /// constant, so a repaired copy matches a queued write byte for byte.
+    #[test]
+    fn prepared_envelope_uses_the_shared_archive_key_order() {
+        fixture(|cx, pool, _config| {
+            let keys = |message: &Value| -> Vec<String> {
+                message
+                    .as_object()
+                    .expect("envelope object")
+                    .keys()
+                    .cloned()
+                    .collect()
+            };
+            let plain = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(keys(&plain.message), crate::MESSAGE_ARCHIVE_ENVELOPE_KEYS);
+
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET thread_id = 'root', archive_metadata_json = '{\"reply_to\":7}' WHERE id = 901",
+            )
+            .unwrap();
+            drop(conn);
+            let reply = prepare_message(cx, pool, 901).unwrap();
+            let mut expected: Vec<&str> = crate::MESSAGE_ARCHIVE_ENVELOPE_KEYS.to_vec();
+            expected.push("reply_to");
+            assert_eq!(keys(&reply.message), expected);
         });
     }
 }

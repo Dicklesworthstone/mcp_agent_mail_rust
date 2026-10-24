@@ -26,6 +26,132 @@
 
 mod archive_read;
 
+#[cfg(test)]
+mod issue353_bootstrap_tests {
+    use super::tool_util::{
+        DB_POOL_BOOTSTRAP_GATE, DB_POOL_BOOTSTRAP_PROMOTIONS, get_db_pool_for_config,
+    };
+    use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_db::DbPoolConfig;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::{Duration, Instant};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn mailbox() -> (tempfile::TempDir, DbPoolConfig) {
+        let scratch = tempfile::tempdir().unwrap();
+        let storage_root = scratch.path().join("archive");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let config = Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &scratch.path().join("mail.sqlite3"),
+            ),
+            storage_root,
+            ..Default::default()
+        };
+        let pool = DbPoolConfig {
+            database_url: config.database_url,
+            storage_root: Some(config.storage_root),
+            min_connections: 1,
+            max_connections: 4,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        (scratch, pool)
+    }
+
+    #[test]
+    fn gh353_cold_loser_returns_retryable_busy_before_promotion() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let (_scratch, config) = mailbox();
+        let initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        // `WriteDbPool` is not `Debug`, so `unwrap_err()` does not compile.
+        let Err(error) = get_db_pool_for_config(&config) else {
+            panic!("a losing cold initializer must be refused, not handed a pool");
+        };
+        let after = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        drop(initializer);
+        assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+        assert_eq!(before, after, "losing initializer attempted promotion");
+    }
+
+    #[test]
+    fn gh353_hot_requests_bypass_initializer_gate() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let (_scratch, config) = mailbox();
+        let first = get_db_pool_for_config(&config).unwrap();
+        let engine = first.engine_identity_key();
+        drop(first);
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let _initializer = DB_POOL_BOOTSTRAP_GATE.lock().unwrap();
+        for _ in 0..64 {
+            let request = get_db_pool_for_config(&config).unwrap();
+            assert_eq!(request.engine_identity_key(), engine);
+        }
+        assert_eq!(DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn gh353_concurrent_cold_callers_converge_on_one_engine() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        let (_scratch, config) = mailbox();
+        let start = Arc::new(Barrier::new(8));
+        let before = DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed);
+        let identities = std::thread::scope(|scope| {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let start = Arc::clone(&start);
+                let config = config.clone();
+                tasks.push(scope.spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    start.wait();
+                    loop {
+                        match get_db_pool_for_config(&config) {
+                            Ok(pool) => return pool.engine_identity_key(),
+                            Err(error) => {
+                                assert_eq!(crate::tool_error_code(&error), Some("RESOURCE_BUSY"));
+                                assert!(Instant::now() < deadline, "initializer never completed");
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                        }
+                    }
+                }));
+            }
+            tasks
+                .into_iter()
+                .map(std::thread::ScopedJoinHandle::join)
+                .collect::<Vec<_>>()
+        });
+        let identities = identities
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            DB_POOL_BOOTSTRAP_PROMOTIONS.load(Ordering::Relaxed) - before,
+            1
+        );
+    }
+
+    #[test]
+    fn gh353_factory_admission_contention_stays_retryable() {
+        // A maintenance worker cold-building the same mailbox makes the shared
+        // pool factory refuse with ResourceBusy after this caller already won
+        // the gate. Clients must see retryable contention, as for the gate.
+        let busy =
+            super::tool_util::pool_bootstrap_error(mcp_agent_mail_db::DbError::ResourceBusy(
+                "runtime pool initialization for this mailbox is in progress".into(),
+            ));
+        assert_eq!(crate::tool_error_code(&busy), Some("RESOURCE_BUSY"));
+        let failed = super::tool_util::pool_bootstrap_error(mcp_agent_mail_db::DbError::Sqlite(
+            "disk I/O error".into(),
+        ));
+        assert_eq!(failed.code, fastmcp::McpErrorCode::InternalError);
+    }
+}
+
 pub mod build_slots;
 pub mod contacts;
 pub mod degraded_intents;
@@ -42,6 +168,7 @@ pub mod reservation_parity;
 pub mod reservations;
 pub mod resources;
 pub mod search;
+pub mod session_identity;
 
 // Re-export tool handlers for server registration
 pub use build_slots::*;
@@ -822,11 +949,54 @@ pub mod tool_util {
         }
     }
 
-    fn bootstrap_db_pool_with_barrier_handoff(
+    // Only one genuinely cold caller may enter pool initialization. A loser
+    // must not queue another recovery-style promotion behind the winner: that
+    // was the GH#353 path that repeatedly closed maintenance write admission.
+    // Hot callers never touch this gate because get_db_pool_for_config returns
+    // from the cache before entering this helper.
+    pub(super) static DB_POOL_BOOTSTRAP_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(test)]
+    pub(super) static DB_POOL_BOOTSTRAP_PROMOTIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// A maintenance worker cold-building the same mailbox makes the pool
+    /// factory refuse with `ResourceBusy`. That is the same retryable
+    /// contention as losing the initializer gate, not an internal failure.
+    pub(super) fn pool_bootstrap_error(error: DbError) -> McpError {
+        match error {
+            DbError::ResourceBusy(_) => db_error_to_mcp_error(error),
+            error => McpError::internal_error(error.to_string()),
+        }
+    }
+
+    pub(super) fn bootstrap_db_pool_with_barrier_handoff(
         cfg: &DbPoolConfig,
         storage_root: &Path,
         sqlite_path: Option<&Path>,
     ) -> McpResult<(DbPool, crate::archive_read::WriteGuard)> {
+        let _initializer = match DB_POOL_BOOTSTRAP_GATE.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(db_error_to_mcp_error(DbError::ResourceBusy(
+                    "database pool initialization is already in progress; retry the operation"
+                        .into(),
+                )));
+            }
+        };
+
+        // Another caller may have published a pool after our initial cache
+        // miss but before we acquired initializer ownership. Recheck while
+        // counted as an ordinary writer; if it is now hot, return it without
+        // ever closing admission behind the recovery-promotion barrier.
+        let guard = crate::archive_read::WriteGuard::begin(storage_root, sqlite_path);
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
+            return Ok((pool, guard));
+        }
+        drop(guard);
+
+        #[cfg(test)]
+        DB_POOL_BOOTSTRAP_PROMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (barrier, outcome) =
             mcp_agent_mail_db::write_barrier::acquire_promotion_barrier_draining(
                 mcp_agent_mail_db::write_barrier::writer_drain_timeout(),
@@ -839,8 +1009,7 @@ pub mod tool_util {
                 "database pool bootstrap deferred because {remaining_writers} writer(s) did not drain before the recovery barrier timeout"
             )));
         }
-        let pool =
-            get_or_create_pool(cfg).map_err(|error| McpError::internal_error(error.to_string()))?;
+        let pool = get_or_create_pool(cfg).map_err(pool_bootstrap_error)?;
         // Atomic handoff: register the caller as a writer while the promotion
         // barrier is still closed, then release the barrier. No promotion can
         // enter between cold bootstrap/recovery and the operation using this
@@ -851,7 +1020,10 @@ pub mod tool_util {
     }
 
     pub fn get_db_pool() -> McpResult<WriteDbPool> {
-        let cfg = DbPoolConfig::from_env();
+        get_db_pool_for_config(&DbPoolConfig::from_env())
+    }
+
+    pub(crate) fn get_db_pool_for_config(cfg: &DbPoolConfig) -> McpResult<WriteDbPool> {
         let sqlite_path =
             if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&cfg.database_url) {
                 None
@@ -870,7 +1042,7 @@ pub mod tool_util {
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
         );
-        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(&cfg) {
+        if let Some(pool) = mcp_agent_mail_db::get_cached_pool(cfg) {
             return Ok(WriteDbPool {
                 pool,
                 _guard: guard,
@@ -881,7 +1053,7 @@ pub mod tool_util {
         // explicit barrier-to-writer handoff in the helper.
         drop(guard);
         let (pool, guard) = bootstrap_db_pool_with_barrier_handoff(
-            &cfg,
+            cfg,
             &storage_root,
             sqlite_path.as_deref().map(Path::new),
         )?;
@@ -891,8 +1063,33 @@ pub mod tool_util {
         })
     }
 
+    /// Session-state key that marks a context made by [`operator_context`].
+    /// Only in-process callers can set session state; an MCP client cannot.
+    const OPERATOR_ON_BEHALF_STATE_KEY: &str = "mcp_agent_mail.operator_on_behalf";
+
+    /// A context for the operator console to run a tool on an agent's behalf,
+    /// such as releasing its reservation or acknowledging its mail.
+    ///
+    /// The tool behaves as usual except that the agent is not marked active.
+    /// GH#334's `last_active_ts` records what the agent itself did; an
+    /// operator clearing a dead agent's lock must not make it look alive,
+    /// which would also make `force_release_file_reservation` refuse its
+    /// other locks.
+    #[must_use]
+    pub fn operator_context(cx: Cx) -> McpContext {
+        let state = fastmcp_core::SessionState::new();
+        state.set(OPERATOR_ON_BEHALF_STATE_KEY, true);
+        McpContext::with_state(cx, 1, state)
+    }
+
+    fn acts_for_operator(ctx: &McpContext) -> bool {
+        ctx.get_state::<bool>(OPERATOR_ON_BEHALF_STATE_KEY)
+            .unwrap_or(false)
+    }
+
     /// GH#334: record that the acting agent (the caller, never a recipient)
-    /// was active, on the write `pool` the tool already holds.
+    /// was active, on the write `pool` the tool already holds. A call made
+    /// through [`operator_context`] is the operator's, not the agent's.
     ///
     /// Best-effort: `queries::touch_agent` writes at most once a minute per
     /// agent, and a failed touch is logged, never surfaced to the caller.
@@ -900,6 +1097,9 @@ pub mod tool_util {
         let Some(agent_id) = agent_id.filter(|id| *id > 0) else {
             return;
         };
+        if acts_for_operator(ctx) {
+            return;
+        }
         match mcp_agent_mail_db::queries::touch_agent(ctx.cx(), pool, agent_id).await {
             asupersync::Outcome::Ok(_) => {}
             asupersync::Outcome::Err(error) => {
@@ -922,7 +1122,9 @@ pub mod tool_util {
         let Some(agent_id) = agent_id.filter(|id| *id > 0) else {
             return;
         };
-        if !mcp_agent_mail_db::queries::agent_touch_due(read_pool, agent_id) {
+        if acts_for_operator(ctx)
+            || !mcp_agent_mail_db::queries::agent_touch_due(read_pool, agent_id)
+        {
             return;
         }
         match get_db_pool() {
@@ -943,7 +1145,10 @@ pub mod tool_util {
         }
         cfg.run_migrations = false;
         cfg.warmup_connections = 0;
-        mcp_agent_mail_db::create_query_only_pool(&cfg)
+        // Shared, not per call: a per-call pool opened and closed one engine
+        // connection per read, leaking a descriptor wherever the engine
+        // cannot reuse it (GH#333, br-8r6dl).
+        mcp_agent_mail_db::get_or_create_live_query_only_pool(&cfg)
             .map_err(|error| McpError::internal_error(error.to_string()))
     }
 

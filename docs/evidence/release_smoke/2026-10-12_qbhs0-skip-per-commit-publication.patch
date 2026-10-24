@@ -1,0 +1,140 @@
+diff --git a/crates/mcp-agent-mail-db/src/queries.rs b/crates/mcp-agent-mail-db/src/queries.rs
+index 540f2d53..7dac5bb5 100644
+--- a/crates/mcp-agent-mail-db/src/queries.rs
++++ b/crates/mcp-agent-mail-db/src/queries.rs
+@@ -1800,6 +1800,25 @@ const WAL_RESET_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_
+ 
+ /// Whether `wal_frames` WAL frames exceed this connection's
+ /// `journal_size_limit`. A negative limit (unbounded WAL) never does.
++/// Whether this connection's `-wal` file is larger than `journal_size_limit`
++/// (never below [`WAL_RESET_MIN_BYTES`]). A missing or unreadable WAL is not.
++fn wal_file_over_journal_size_limit(conn: &crate::DbConn) -> bool {
++    let Ok(metadata) = std::fs::metadata(format!("{}-wal", conn.path())) else {
++        return false;
++    };
++    let Some(limit) = conn
++        .query_sync("PRAGMA journal_size_limit;", &[])
++        .ok()
++        .and_then(|rows| {
++            rows.first()
++                .and_then(|row| row.get(0).and_then(value_as_i64))
++        })
++    else {
++        return false;
++    };
++    limit >= 0 && i64::try_from(metadata.len()).unwrap_or(i64::MAX) > limit.max(WAL_RESET_MIN_BYTES)
++}
++
+ fn wal_exceeds_journal_size_limit(conn: &crate::DbConn, wal_frames: i64) -> bool {
+     if wal_frames <= 0 {
+         return false;
+@@ -1875,7 +1894,11 @@ fn reset_over_limit_wal(cx: &Cx, conn: &crate::DbConn, gate: &crate::pool::WalRe
+ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
+     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
+         Outcome::Ok(_) => {
+-            if tracked.inner.path() != ":memory:" {
++            // EXPERIMENT (nopub_rule.txt): the engine publishes each commit
++            // through the shared WAL-index (frankensqlite#411), so only an
++            // over-limit WAL is checkpointed here.
++            if tracked.inner.path() != ":memory:" && wal_file_over_journal_size_limit(tracked.inner)
++            {
+                 let mut retire = false;
+                 match tracked.inner.execute_raw("PRAGMA busy_timeout = 0;") {
+                     Ok(()) => match tracked
+@@ -24475,6 +24498,96 @@ mod tests {
+         );
+     }
+ 
++    /// nopub experiment (C3): a commit is visible to a fresh FrankenSQLite
++    /// connection and to a canonical SQLite reader through the shared
++    /// WAL-index, with no checkpoint backfilling it into the main file; an
++    /// uncommitted write on another connection is visible to neither.
++    #[test]
++    fn commits_are_visible_to_fresh_and_canonical_readers_without_a_checkpoint() {
++        const COMMITTED: &str = "/workspace/visible-without-checkpoint";
++        const UNCOMMITTED: &str = "/workspace/never-committed";
++        let dir = tempfile::tempdir().expect("tempdir");
++        let db_path = dir.path().join("visibility.db");
++        let pool = crate::create_pool(&crate::pool::DbPoolConfig {
++            database_url: format!("sqlite:///{}", db_path.display()),
++            min_connections: 1,
++            max_connections: 2,
++            run_migrations: true,
++            warmup_connections: 0,
++            ..Default::default()
++        })
++        .expect("create pool");
++        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
++            .build()
++            .expect("build runtime");
++        let cx = asupersync::Cx::for_testing();
++        runtime
++            .block_on(ensure_project(&cx, &pool, COMMITTED))
++            .into_result()
++            .expect("commit a project");
++
++        let count_sql =
++            |key: &str| format!("SELECT COUNT(*) AS n FROM projects WHERE human_key = '{key}'");
++        let count = |rows: Vec<SqlRow>| rows.first().and_then(|row| row.get_named::<i64>("n").ok());
++
++        // The main file alone (no WAL) must not hold the row yet: nothing
++        // backfilled it, so any reader that sees it read the WAL.
++        let main_only = dir.path().join("main-only.db");
++        std::fs::copy(&db_path, &main_only).expect("copy the main file alone");
++        let backfilled = crate::CanonicalDbConn::open_file(main_only.display().to_string())
++            .expect("open the main file alone");
++        assert_eq!(
++            count(
++                backfilled
++                    .query_sync(&count_sql(COMMITTED), &[])
++                    .expect("query main file")
++            ),
++            Some(0),
++            "the commit was checkpointed into the main file"
++        );
++
++        let writer = crate::DbConn::open_file(db_path.display().to_string())
++            .expect("open uncommitted writer");
++        writer
++            .execute_raw("BEGIN IMMEDIATE;")
++            .expect("begin uncommitted write");
++        writer
++            .execute_raw(&format!(
++                "INSERT INTO projects (slug, human_key, created_at) \
++                 VALUES ('never-committed', '{UNCOMMITTED}', 0)"
++            ))
++            .expect("uncommitted insert");
++
++        let fresh =
++            crate::DbConn::open_file(db_path.display().to_string()).expect("fresh FrankenSQLite");
++        let canonical = crate::CanonicalDbConn::open_file(db_path.display().to_string())
++            .expect("canonical reader");
++        for (reader, rows_committed, rows_uncommitted) in [
++            (
++                "fresh FrankenSQLite",
++                fresh.query_sync(&count_sql(COMMITTED), &[]),
++                fresh.query_sync(&count_sql(UNCOMMITTED), &[]),
++            ),
++            (
++                "canonical SQLite",
++                canonical.query_sync(&count_sql(COMMITTED), &[]),
++                canonical.query_sync(&count_sql(UNCOMMITTED), &[]),
++            ),
++        ] {
++            assert_eq!(
++                count(rows_committed.expect("query committed")),
++                Some(1),
++                "{reader} must see the committed row"
++            );
++            assert_eq!(
++                count(rows_uncommitted.expect("query uncommitted")),
++                Some(0),
++                "{reader} must not see an uncommitted row"
++            );
++        }
++        writer.execute_raw("ROLLBACK;").expect("roll back");
++    }
++
+     #[cfg(target_os = "linux")]
+     #[test]
+     fn commit_tx_does_not_wait_for_external_reader_checkpoint() {

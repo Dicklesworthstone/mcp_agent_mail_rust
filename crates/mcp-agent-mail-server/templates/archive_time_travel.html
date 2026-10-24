@@ -103,6 +103,14 @@
             </template>
           </div>
         </template>
+        <!-- Without a commit there is no snapshot: say why instead of
+             showing an empty inbox. -->
+        <template x-if="!snapshot.commit_sha && (snapshot.error || snapshot.note)">
+          <div class="bg-white/10 backdrop-blur-sm rounded-xl p-4 flex items-start gap-2 text-yellow-200 text-sm">
+            <i data-lucide="alert-triangle" class="w-4 h-4 flex-shrink-0 mt-0.5"></i>
+            <span x-text="snapshot.error || snapshot.note"></span>
+          </div>
+        </template>
       </div>
 
       <div class="p-6 space-y-3">
@@ -129,7 +137,7 @@
           </div>
         </template>
 
-        <template x-if="snapshot.messages.length === 0">
+        <template x-if="snapshot.commit_sha && snapshot.messages.length === 0">
           <div class="flex flex-col items-center justify-center py-12 text-slate-500 dark:text-slate-400">
             <i data-lucide="inbox" class="w-16 h-16 mb-4"></i>
             <p class="text-base mb-2">Inbox was empty at this time</p>
@@ -200,10 +208,12 @@ function timeTravelManager() {
 
     async timeTravel() {
       try {
+        // The picker gives local time with no zone; the server reads a zoneless
+        // timestamp as UTC, so send the instant itself.
         const params = new URLSearchParams({
           project: this.selectedProject,
           agent: this.selectedAgent,
-          timestamp: this.selectedTime
+          timestamp: new Date(this.selectedTime).toISOString()
         });
 
         const response = await fetch(`/mail/archive/time-travel/snapshot?${params}`);

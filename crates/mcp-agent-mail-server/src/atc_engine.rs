@@ -4663,6 +4663,15 @@ impl AtcEngine {
     }
 
     fn resolve_pending_feedback_on_activity(&mut self, agent: &str, timestamp_micros: i64) {
+        // Arrival time is not event time. An observation at or before the
+        // intervention cannot be evidence about that intervention's outcome.
+        if self
+            .pending_liveness_feedback
+            .get(agent)
+            .is_none_or(|pending| timestamp_micros <= pending.issued_at_micros)
+        {
+            return;
+        }
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
@@ -4842,13 +4851,15 @@ impl AtcEngine {
     }
 
     fn compact_liveness_schedule_if_needed(&mut self) {
-        let live_scheduled = self.scheduled_agent_count();
-        let max_heap_entries = live_scheduled.saturating_mul(4).max(64);
+        // This check runs for every activity and hydration reschedule while the
+        // engine mutex is held. Use tracked population as an O(1) upper bound
+        // instead of scanning the whole roster just to decide whether to rebuild.
+        let max_heap_entries = self.agents.len().saturating_mul(4).max(64);
         if self.liveness_schedule.len() <= max_heap_entries {
             return;
         }
 
-        let mut rebuilt = BinaryHeap::new();
+        let mut rebuilt = Vec::with_capacity(self.agents.len());
         for entry in self.agents.values() {
             if entry.next_review_micros == i64::MAX {
                 continue;
@@ -4859,7 +4870,8 @@ impl AtcEngine {
                 agent: entry.name.clone(),
             }));
         }
-        self.liveness_schedule = rebuilt;
+        // Heapify once instead of performing one logarithmic push per live entry.
+        self.liveness_schedule = BinaryHeap::from(rebuilt);
     }
 
     fn effective_threshold(base_k: f64, adaptive_k: Option<f64>, fallback_active: bool) -> f64 {
@@ -5113,7 +5125,16 @@ impl AtcEngine {
         project_key: Option<&str>,
         timestamp_micros: i64,
     ) {
-        if agent == ATC_AGENT_NAME {
+        if agent == ATC_AGENT_NAME || timestamp_micros <= 0 {
+            return;
+        }
+        let Some(entry) = self.agents.get(agent) else {
+            return;
+        };
+        // AgentRhythm keeps its timestamp monotonic, but stale observations
+        // previously still consumed feedback, changed project attribution,
+        // resurrected dead agents, and churned the scheduler.
+        if timestamp_micros <= entry.rhythm.last_activity_ts {
             return;
         }
         self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
@@ -6624,6 +6645,70 @@ mod engine_tests {
             "sprt_log_lr should be cleared, got {}",
             entry.sprt_log_lr
         );
+    }
+
+    #[test]
+    fn stale_activity_is_a_complete_noop_for_liveness_state() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Phoenix", "claude-code", Some("/current"));
+        engine.observe_activity("Phoenix", Some("/current"), 5_000_000);
+        {
+            let entry = engine.agents.get_mut("Phoenix").unwrap();
+            entry.state = LivenessState::Dead;
+            entry.suspect_since = 6_000_000;
+            entry.probe_sent_at = 7_000_000;
+            entry.sprt_log_lr = 5.0;
+        }
+        engine.schedule_entry_for_push("Phoenix", i64::MAX);
+        engine.record_pending_liveness_feedback("Phoenix", LivenessAction::Suspect, 2.0, 8_000_000);
+        let before = engine.agents["Phoenix"].clone();
+        let heap = engine.liveness_schedule.clone().into_sorted_vec();
+
+        for timestamp in [i64::MIN, -1, 0, 4_000_000, 5_000_000] {
+            engine.observe_activity("Phoenix", Some("/stale"), timestamp);
+        }
+
+        let after = &engine.agents["Phoenix"];
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.project_key, before.project_key);
+        assert_eq!(
+            after.rhythm.last_activity_ts,
+            before.rhythm.last_activity_ts
+        );
+        assert_eq!(after.schedule_version, before.schedule_version);
+        assert_eq!(engine.liveness_schedule.clone().into_sorted_vec(), heap);
+        assert!(engine.pending_liveness_feedback.contains_key("Phoenix"));
+        assert_eq!(engine.resolved_experience_count, 0);
+    }
+
+    #[test]
+    fn pre_intervention_activity_does_not_consume_future_feedback() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("FeedbackAgent", "codex-cli", None);
+        engine.observe_activity("FeedbackAgent", None, 1_000_000);
+        engine.record_pending_liveness_feedback(
+            "FeedbackAgent",
+            LivenessAction::Suspect,
+            2.0,
+            4_000_000,
+        );
+
+        engine.observe_activity("FeedbackAgent", None, 3_000_000);
+        engine.observe_activity("FeedbackAgent", None, 4_000_000);
+        assert!(
+            engine
+                .pending_liveness_feedback
+                .contains_key("FeedbackAgent")
+        );
+        assert_eq!(engine.resolved_experience_count, 0);
+
+        engine.observe_activity("FeedbackAgent", None, 4_000_001);
+        assert!(
+            !engine
+                .pending_liveness_feedback
+                .contains_key("FeedbackAgent")
+        );
+        assert_eq!(engine.resolved_experience_count, 1);
     }
 
     #[test]
@@ -10363,12 +10448,12 @@ pub fn atc_record_outcome(
         adaptive.record_outcome(correct);
     }
 
-    // Feed liveness tuner (regret → PID → loss matrix feedback loop)
+    // Match tick/activity feedback's ENGINE -> TUNER lock order.
+    // Never wait for ENGINE while holding TUNER: that deadlocks with ticks.
     if subsystem == AtcSubsystem::Liveness
+        && let Some(engine_lock) = ATC_ENGINE.get()
         && let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
-        && let Ok(mut tuner) = tuner_lock.lock()
     {
-        let regret = (predicted_loss - actual_loss).abs();
         let action = if correct {
             LivenessAction::DeclareAlive
         } else {
@@ -10379,13 +10464,17 @@ pub fn atc_record_outcome(
         } else {
             LivenessState::Dead
         };
-        tuner.record_outcome(action, state, regret);
-
-        if let Some(engine_lock) = ATC_ENGINE.get()
-            && let Ok(mut engine) = engine_lock.lock()
-            && tuner.maybe_update(&mut engine.liveness_core)
+        if let Ok(mut engine) = engine_lock.lock()
+            && engine.enabled()
         {
-            engine.propagate_liveness_policy();
+            let changed = tuner_lock.lock().is_ok_and(|mut tuner| {
+                tuner.record_outcome(action, state, (predicted_loss - actual_loss).abs());
+                tuner.maybe_update(&mut engine.liveness_core)
+            });
+            // Do not hold the tuner lock during policy fan-out.
+            if changed {
+                engine.propagate_liveness_policy();
+            }
         }
     }
 
@@ -12037,6 +12126,39 @@ mod alien_enhancement_tests {
             "compaction should keep only the latest schedule entry per agent"
         );
         assert_eq!(engine.scheduled_agent_count(), 1);
+    }
+
+    #[test]
+    fn schedule_compaction_keeps_large_population_bounded_without_roster_scans() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("HeapAgent{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            engine.schedule_entry_for_push(&agent, 1_000_000);
+        }
+
+        let bound = POPULATION * 4;
+        for generation in 1_i64..=8 {
+            for index in 0..POPULATION {
+                let agent = format!("HeapAgent{index:04}");
+                engine.schedule_entry_for_push(&agent, 1_000_000 + generation);
+                assert!(engine.liveness_schedule.len() <= bound);
+            }
+        }
+
+        // Force one final rebuild and verify exactly one current entry survives
+        // for each live scheduled agent.
+        while engine.liveness_schedule.len() <= bound {
+            engine.liveness_schedule.push(Reverse(ScheduledAgentReview {
+                review_at_micros: 1,
+                schedule_version: 0,
+                agent: "obsolete".to_string(),
+            }));
+        }
+        engine.compact_liveness_schedule_if_needed();
+        assert_eq!(engine.liveness_schedule.len(), POPULATION);
+        assert_eq!(engine.scheduled_agent_count(), POPULATION);
     }
 
     #[test]

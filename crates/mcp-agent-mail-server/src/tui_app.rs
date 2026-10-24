@@ -104,6 +104,10 @@ const TOAST_ENTRANCE_TICKS: u8 = 3;
 const TOAST_EXIT_TICKS: u8 = 2;
 const REMOTE_EVENTS_PER_TICK: usize = 256;
 const HOUSEKEEPING_EVENTS_PER_TICK: usize = 192;
+/// Message toasts closer together than this coalesce into one summary, so a
+/// busy swarm neither floods the stack nor keeps toast animations (and with
+/// them the fast tick) running continuously (GH#338).
+const MESSAGE_TOAST_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const RESERVATION_EXPIRY_SCAN_TICK_DIVISOR: u64 = 10;
 const MAX_DEFERRED_ACTIONS_PER_TICK: usize = 64;
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
@@ -533,6 +537,42 @@ enum TransitionKind {
 enum TransitionDirection {
     Forward,
     Backward,
+}
+
+/// Coalesces per-message toasts: one shows, those within
+/// [`MESSAGE_TOAST_MIN_INTERVAL`] of it are counted, and the count surfaces as
+/// one summary once the interval has passed.
+#[derive(Debug, Default)]
+struct MessageToastWindow {
+    last_shown: Option<Instant>,
+    suppressed: u32,
+}
+
+impl MessageToastWindow {
+    fn quiet_since_last(&self, now: Instant) -> bool {
+        self.last_shown
+            .is_none_or(|shown| now.saturating_duration_since(shown) >= MESSAGE_TOAST_MIN_INTERVAL)
+    }
+
+    /// Whether a message toast at `now` shows; otherwise it is counted.
+    fn admit(&mut self, now: Instant) -> bool {
+        if self.quiet_since_last(now) {
+            self.last_shown = Some(now);
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    /// The number of counted toasts to summarize, once the interval allows.
+    fn take_summary(&mut self, now: Instant) -> Option<u32> {
+        if self.suppressed == 0 || !self.quiet_since_last(now) {
+            return None;
+        }
+        self.last_shown = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1516,6 +1556,8 @@ pub struct MailAppModel {
     git_segfault_toast_enabled: bool,
     /// Session state for git segfault retry toast suppression/escalation.
     git_segfault_retry_toasts: GitSegfaultRetryToastState,
+    /// Rate limit for per-message toasts under load.
+    message_toasts: MessageToastWindow,
     /// Per-severity auto-dismiss durations (seconds).
     toast_info_dismiss_secs: u64,
     toast_warn_dismiss_secs: u64,
@@ -1674,6 +1716,7 @@ impl MailAppModel {
             toast_muted: false,
             git_segfault_toast_enabled: true,
             git_segfault_retry_toasts: GitSegfaultRetryToastState::default(),
+            message_toasts: MessageToastWindow::default(),
             toast_info_dismiss_secs: 5,
             toast_warn_dismiss_secs: 8,
             toast_error_dismiss_secs: 15,
@@ -2492,6 +2535,22 @@ impl MailAppModel {
                 self.notify_reservation_create_result(arg, context);
                 Cmd::none()
             }
+            "operator_result" => {
+                let (status, operation) = arg.split_once(':').unwrap_or((arg, ""));
+                let operation = operation.to_string();
+                self.record_action_outcome(if status == "ok" {
+                    ActionOutcome::Success {
+                        operation,
+                        summary: context.to_string(),
+                    }
+                } else {
+                    ActionOutcome::Failure {
+                        operation,
+                        error: context.to_string(),
+                    }
+                });
+                Cmd::none()
+            }
             "rethread_message" => {
                 if let Some((message_id, target_thread_id)) = parse_rethread_operation_arg(arg) {
                     self.execute_rethread_message(message_id, &target_thread_id);
@@ -2506,11 +2565,12 @@ impl MailAppModel {
             }
 
             // ── Server-dispatched operations ──────────────────────
-            // These produce an in-flight toast; actual execution is
-            // delegated to the screen's update handler via ActionExecute.
+            // These produce an in-flight toast; the screen that owns the rows
+            // runs the tool in its `handle_action` and answers with an
+            // `operator_result`.
             "acknowledge" | "mark_read" | "renew" | "release" | "force_release" | "summarize"
             | "approve_contact" | "deny_contact" | "block_contact" | "batch_acknowledge"
-            | "batch_mark_read" | "batch_mark_unread" => {
+            | "batch_mark_read" => {
                 let op = operation.to_string();
                 let ctx = context.to_string();
                 self.action_outcomes.push_back(ActionOutcome::InFlight {
@@ -3911,12 +3971,14 @@ impl MailAppModel {
         }
 
         // ── Dynamic sources ───────────────────────────────────────
-        if id.starts_with(palette_action_ids::AGENT_PREFIX) {
-            self.activate_screen(MailScreenId::Agents);
+        if let Some(name) = id.strip_prefix(palette_action_ids::AGENT_PREFIX) {
+            let target = DeepLinkTarget::AgentByName(name.to_string());
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
-        if id.starts_with(palette_action_ids::THREAD_PREFIX) {
-            self.activate_screen(MailScreenId::Threads);
+        if let Some(thread_id) = id.strip_prefix(palette_action_ids::THREAD_PREFIX) {
+            let target = DeepLinkTarget::ThreadById(thread_id.to_string());
+            self.apply_deep_link_with_transition(&target);
             return Cmd::none();
         }
         if let Some(id_str) = id.strip_prefix(palette_action_ids::MESSAGE_PREFIX) {
@@ -4012,16 +4074,6 @@ impl MailAppModel {
     /// Dispatch a macro action by its suffix (after `macro:` prefix).
     fn dispatch_macro_action(&mut self, rest: &str) -> Cmd<MailMsg> {
         // Thread macros
-        if let Some(thread_id) = rest.strip_prefix("summarize_thread:") {
-            self.notifications.notify(
-                Toast::new(format!("Summarizing thread {thread_id}..."))
-                    .icon(ToastIcon::Info)
-                    .duration(Duration::from_secs(4)),
-            );
-            let target = DeepLinkTarget::ThreadById(thread_id.to_string());
-            self.apply_deep_link_with_transition(&target);
-            return Cmd::none();
-        }
         if let Some(thread_id) = rest.strip_prefix("view_thread:") {
             let target = DeepLinkTarget::ThreadById(thread_id.to_string());
             self.apply_deep_link_with_transition(&target);
@@ -4294,6 +4346,23 @@ impl MailAppModel {
         let new_events = self
             .state
             .events_since_limited(self.last_toast_seq, HOUSEKEEPING_EVENTS_PER_TICK);
+        // Surface message toasts held back by the last burst before this
+        // batch's own, so notifications stay in order.
+        let toast_now = Instant::now();
+        if let Some(held) = self.message_toasts.take_summary(toast_now)
+            && !self.toast_muted
+        {
+            let noun = if held == 1 {
+                "notification"
+            } else {
+                "notifications"
+            };
+            let summary = Toast::new(format!("+{held} more message {noun}"))
+                .icon(ToastIcon::Info)
+                .style(Style::default().fg(toast_color_info()))
+                .duration(Duration::from_secs(4));
+            self.notifications.notify(self.apply_toast_policy(summary));
+        }
         let mut reservation_tracker_changed = false;
         for event in &new_events {
             self.last_toast_seq = event.seq().max(self.last_toast_seq);
@@ -4348,7 +4417,13 @@ impl MailAppModel {
             if !self.toast_muted
                 && let Some(toast) = safe_toast_for_event(event, self.toast_severity)
             {
-                self.notifications.notify(self.apply_toast_policy(toast));
+                let is_message = matches!(
+                    event,
+                    MailEvent::MessageSent { .. } | MailEvent::MessageReceived { .. }
+                );
+                if !is_message || self.message_toasts.admit(toast_now) {
+                    self.notifications.notify(self.apply_toast_policy(toast));
+                }
             }
         }
 
@@ -4859,6 +4934,12 @@ impl Model for MailAppModel {
                     if is_ctrl_d {
                         return self.detach_tui_headless();
                     }
+                    // A pending keyboard move (Ctrl+X) is app-wide state, so
+                    // Esc cancels it from any screen before it arms quit.
+                    if is_escape && !text_mode && self.state.keyboard_move_snapshot().is_some() {
+                        self.state.clear_keyboard_move_snapshot();
+                        return Cmd::none();
+                    }
                     if is_escape && !text_mode {
                         return self.handle_quit_confirmation_input(QuitConfirmSource::Escape);
                     }
@@ -5000,7 +5081,6 @@ impl Model for MailAppModel {
                         | "block_contact"
                         | "batch_acknowledge"
                         | "batch_mark_read"
-                        | "batch_mark_unread"
                 ) {
                     self.notifications.notify(
                         Toast::new(format!("Action not supported on this screen: {cmd_name}"))
@@ -9091,6 +9171,58 @@ mod tests {
     }
 
     #[test]
+    fn message_toast_window_shows_sparse_messages_and_summarizes_bursts() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut window = MessageToastWindow::default();
+        // Messages further apart than the interval each show.
+        assert!(window.admit(at(0)));
+        assert_eq!(window.take_summary(at(2_500)), None, "nothing held back");
+        assert!(window.admit(at(2_500)));
+        // A burst inside the interval is counted, then summarized once.
+        for ms in [2_600, 3_000, 4_000] {
+            assert!(!window.admit(at(ms)));
+        }
+        assert_eq!(window.take_summary(at(4_400)), None, "interval not over");
+        assert_eq!(window.take_summary(at(4_500)), Some(3));
+        assert_eq!(window.take_summary(at(9_000)), None);
+        // The summary restarts the interval like a shown toast does.
+        assert!(!window.admit(at(5_000)));
+        assert!(window.admit(at(9_000)));
+    }
+
+    #[test]
+    fn a_burst_of_message_events_raises_one_message_toast() {
+        let config = Config::default();
+        let state = TuiSharedState::with_event_capacity(&config, 64);
+        let mut model = MailAppModel::new(Arc::clone(&state));
+        for id in 0..10 {
+            assert!(state.push_event(MailEvent::message_sent(
+                id,
+                "RedFox",
+                vec!["BlueLake".to_string()],
+                "Subject",
+                "thread-1",
+                "proj",
+                "",
+            )));
+        }
+        // Non-message toasts in the same batch are not rate limited.
+        assert!(state.push_event(MailEvent::agent_registered(
+            "GoldFox",
+            "codex-cli",
+            "gpt-5-codex",
+            "proj",
+        )));
+
+        let _ = model.update(MailMsg::Terminal(Event::Tick));
+
+        let toasts = model.notifications.pending_count() + model.notifications.visible_count();
+        assert_eq!(toasts, 2, "one message toast plus the registration toast");
+        assert_eq!(model.message_toasts.suppressed, 9);
+    }
+
+    #[test]
     fn housekeeping_event_processing_is_bounded_per_tick() {
         let config = Config::default();
         let total_events = HOUSEKEEPING_EVENTS_PER_TICK + 17;
@@ -9602,6 +9734,33 @@ mod tests {
         let second = model.update(MailMsg::Terminal(esc));
         assert!(model.state.is_shutdown_requested());
         assert!(matches!(second, Cmd::Quit));
+    }
+
+    #[test]
+    fn escape_cancels_a_pending_keyboard_move_before_arming_quit() {
+        let mut model = test_model();
+        // Agents does not claim Esc, so this is the shell's own handling.
+        model.update(MailMsg::SwitchScreen(MailScreenId::Agents));
+        model
+            .state
+            .set_keyboard_move_snapshot(Some(crate::tui_bridge::KeyboardMoveSnapshot {
+                message_id: 7,
+                subject: "Subj".to_string(),
+                source_thread_id: "t1".to_string(),
+                source_project_slug: "project".to_string(),
+            }));
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+
+        // The first Esc only cancels the move ...
+        let first = model.update(MailMsg::Terminal(esc.clone()));
+        assert!(matches!(first, Cmd::None));
+        assert!(model.state.keyboard_move_snapshot().is_none());
+        // ... so quitting still takes the usual two presses after it.
+        let second = model.update(MailMsg::Terminal(esc.clone()));
+        assert!(matches!(second, Cmd::None));
+        assert!(!model.state.is_shutdown_requested());
+        let third = model.update(MailMsg::Terminal(esc));
+        assert!(matches!(third, Cmd::Quit));
     }
 
     #[test]
@@ -11121,13 +11280,6 @@ first body
     }
 
     // ── Macro dispatch tests ─────────────────────────────────────
-
-    #[test]
-    fn dispatch_macro_summarize_thread_goes_to_threads() {
-        let mut model = test_model();
-        model.dispatch_palette_action("macro:summarize_thread:br-3vwi");
-        assert_eq!(model.active_screen(), MailScreenId::Threads);
-    }
 
     #[test]
     fn dispatch_macro_view_thread_goes_to_threads() {
@@ -12920,6 +13072,55 @@ first body
         }
     }
 
+    struct DeepLinkRecordingScreen {
+        received: Rc<RefCell<Vec<DeepLinkTarget>>>,
+    }
+
+    impl MailScreen for DeepLinkRecordingScreen {
+        fn update(&mut self, _event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+            Cmd::none()
+        }
+
+        fn view(&self, _frame: &mut ftui::Frame<'_>, _area: Rect, _state: &TuiSharedState) {}
+
+        fn tick(&mut self, _tick_count: u64, _state: &TuiSharedState) {}
+
+        fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
+            self.received.borrow_mut().push(target.clone());
+            true
+        }
+
+        fn title(&self) -> &'static str {
+            "DeepLinkRecording"
+        }
+    }
+
+    #[test]
+    fn palette_agent_and_thread_entries_open_the_named_target() {
+        let mut model = test_model();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        for id in [MailScreenId::Agents, MailScreenId::Threads] {
+            let screen = DeepLinkRecordingScreen {
+                received: Rc::clone(&received),
+            };
+            model.set_screen(id, Box::new(screen));
+        }
+
+        model.dispatch_palette_action("agent:GoldFox");
+        assert_eq!(model.active_screen(), MailScreenId::Agents);
+        model.dispatch_palette_action("thread:br-10wc");
+        assert_eq!(model.active_screen(), MailScreenId::Threads);
+
+        // Switching screens alone would leave the user hunting for the row.
+        assert_eq!(
+            *received.borrow(),
+            [
+                DeepLinkTarget::AgentByName("GoldFox".to_string()),
+                DeepLinkTarget::ThreadById("br-10wc".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn error_boundary_view_catches_panic() {
         let mut model = test_model();
@@ -14270,6 +14471,41 @@ first body
     }
 
     // ── ActionOutcome tests ─────────────────────────────────────
+
+    #[test]
+    fn operator_result_settles_the_in_flight_action() {
+        let mut model = test_model();
+        let _ = model.dispatch_execute_operation("release:7", "key");
+        assert!(
+            model.action_outcomes.iter().any(
+                |o| matches!(o, ActionOutcome::InFlight { operation } if operation == "release")
+            )
+        );
+
+        let _ = model.dispatch_execute_operation("operator_result:ok:release", "released 1");
+        assert!(
+            !model
+                .action_outcomes
+                .iter()
+                .any(|o| matches!(o, ActionOutcome::InFlight { .. })),
+            "the result clears the in-flight marker"
+        );
+        assert!(matches!(
+            model.action_outcomes.back(),
+            Some(ActionOutcome::Success { operation, summary })
+                if operation == "release" && summary == "released 1"
+        ));
+
+        let _ = model.dispatch_execute_operation(
+            "operator_result:error:force_release",
+            "Reservation still shows recent activity",
+        );
+        assert!(matches!(
+            model.action_outcomes.back(),
+            Some(ActionOutcome::Failure { operation, error })
+                if operation == "force_release" && error.contains("recent activity")
+        ));
+    }
 
     #[test]
     fn action_outcome_success_shows_toast() {

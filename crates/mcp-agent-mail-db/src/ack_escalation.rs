@@ -5,6 +5,16 @@
 //! conflicts in the same immediate transaction as the grant. An ACK committed
 //! before admission makes the proposal a no-op. A later ACK does not
 //! retroactively revoke a valid grant.
+//!
+//! Direct deliveries take precedence over project-mailbox visibility, including
+//! a direct delivery already acknowledged by this viewer. Shared obligations
+//! use the inbox's visibility predicate and the viewer's own lazy receipt; a
+//! grant never materializes per-agent deliveries or marks a message read.
+//! A new grant is read back before commit: an ignored or altered insert must
+//! never authorize an archive artifact for a reservation that was not stored.
+//! Both the recipient and chosen holder must still be active. Retired or
+//! permanently deregistered identities keep their history, not authority for
+//! the background worker to create another reservation on their behalf.
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
@@ -45,20 +55,38 @@ pub enum AckEscalationOutcome {
     NoLongerOverdue,
 }
 
-const AUTHORIZED_SQL: &str = "\
+// Lifecycle checks belong in the same transaction as delivery authorization,
+// before even returning AlreadyCovered. A retained direct recipient is not a
+// live identity, and an explicitly chosen inactive holder must not be replaced.
+// Bind the system-owned legacy prefix rather than duplicating its spelling or
+// trying to parse a possibly malformed tombstone as permission to reactivate.
+const AUTHORIZED_SQL: &str = concat!(
+    "\
 SELECT 1 AS authorized \
-FROM messages m JOIN message_recipients mr ON mr.message_id = m.id \
-JOIN agents recipient ON recipient.id = mr.agent_id \
+FROM messages m JOIN agents viewer ON viewer.id = ?4 \
 JOIN projects p ON p.id = m.project_id \
 JOIN agents holder ON holder.id = ?5 \
 WHERE m.id = ?1 AND m.project_id = ?2 AND m.created_ts = ?3 \
   AND m.created_ts <= ?11 \
-  AND m.ack_required = 1 AND mr.agent_id = ?4 AND mr.ack_ts IS NULL \
-  AND recipient.project_id = ?2 AND recipient.name = ?6 COLLATE BINARY \
+  AND m.ack_required = 1 \
+  AND viewer.project_id = ?2 AND viewer.name = ?6 COLLATE BINARY \
   AND holder.project_id = ?2 AND holder.name = ?7 COLLATE BINARY \
+  AND viewer.retired_at IS NULL AND holder.retired_at IS NULL \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = viewer.id) \
+  AND NOT EXISTS (SELECT 1 FROM agent_deregistrations life WHERE life.agent_id = holder.id) \
+  AND substr(viewer.task_description, 1, length(?12)) <> ?12 COLLATE BINARY \
+  AND substr(holder.task_description, 1, length(?12)) <> ?12 COLLATE BINARY \
   AND p.slug = ?8 COLLATE BINARY AND p.human_key = ?9 COLLATE BINARY \
   AND (SELECT generation_id FROM db_identity WHERE singleton = 0) IS ?10 \
-LIMIT 1";
+  AND (EXISTS (SELECT 1 FROM message_recipients mr \
+               WHERE mr.message_id = m.id AND mr.agent_id = viewer.id AND mr.ack_ts IS NULL) \
+       OR EXISTS (SELECT 1 FROM project_mailbox_deliveries d \
+                  LEFT JOIN project_mailbox_receipts pr \
+                    ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+                  WHERE d.message_id = m.id AND pr.ack_ts IS NULL AND ",
+    crate::project_mailbox::visible_to_viewer_sql!(),
+    ")) LIMIT 1"
+);
 
 const INSERT_SQL: &str = "\
 INSERT INTO file_reservations \
@@ -158,6 +186,7 @@ async fn apply_claim(
                     .generation_id
                     .map_or(Value::Null, |value| Value::Text(value.to_string())),
                 request.overdue_before_ts.into(),
+                crate::models::DEREGISTERED_TASK_PREFIX.into(),
             ],
         )
         .await
@@ -267,7 +296,11 @@ async fn apply_claim(
     let started = crate::tracking::query_timer();
     let inserted = tx.execute(cx, INSERT_SQL, &params).await;
     crate::tracking::record_query(INSERT_SQL, crate::tracking::elapsed_us(started));
-    take_sql!(inserted);
+    if take_sql!(inserted) != 1 {
+        return Outcome::Err(DbError::Internal(
+            "ACK grant insert did not create exactly one reservation".into(),
+        ));
+    }
     let rows = take_sql!(query(tx, cx, "SELECT last_insert_rowid() AS id", &[]).await);
     let id = match rows.first().and_then(|row| row.get_named::<i64>("id").ok()) {
         Some(id) if id > 0 => id,
@@ -277,6 +310,32 @@ async fn apply_claim(
             ));
         }
     };
+    // A positive last_insert_rowid is connection history, not proof that this
+    // INSERT stored our grant. Counts alone also miss AFTER-trigger changes.
+    // Verify the exact proposed fields and canonical release-ledger state in
+    // this transaction before allowing Granted to authorize archive publication.
+    // This is a primary-key lookup, not another scan of the active population.
+    let verify_sql = format!(
+        "SELECT id FROM file_reservations \
+         WHERE project_id = ?1 AND agent_id = ?2 \
+           AND path_pattern = ?3 COLLATE BINARY AND \"exclusive\" = ?4 \
+           AND reason = ?5 COLLATE BINARY AND created_ts = ?6 \
+           AND expires_ts = ?7 AND id = ?8 AND released_ts IS NULL \
+           AND ({ACTIVE_RESERVATION_PREDICATE})"
+    );
+    let mut verify_params = params.to_vec();
+    verify_params.push(id.into());
+    let verified = take_sql!(query(tx, cx, &verify_sql, &verify_params).await);
+    if verified.len() != 1
+        || verified
+            .first()
+            .and_then(|row| row.get_named::<i64>("id").ok())
+            != Some(id)
+    {
+        return Outcome::Err(DbError::Internal(
+            "ACK grant did not persist the requested active reservation".into(),
+        ));
+    }
     reservation.id = Some(id);
     Outcome::Ok(AckEscalationOutcome::Granted(reservation))
 }
@@ -372,6 +431,296 @@ pub async fn grant_ack_escalation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn use_shared_delivery(pool: &DbPool, cx: &Cx) {
+        execute(
+            pool,
+            cx,
+            "DELETE FROM message_recipients WHERE message_id = 901",
+        );
+        execute(
+            pool,
+            cx,
+            "INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) VALUES(901, 101, 'to', 1000000)",
+        );
+    }
+
+    #[test]
+    fn shared_grant_preserves_lazy_receipts_and_does_not_renew_coverage() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            let request = request(generation, observed);
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(first.path_pattern, "agents/BlueBear/inbox/1970/01/*.md");
+            assert_eq!(first.agent_id, observed.agent_id);
+            assert_eq!(first.project_id, observed.project_id);
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::AlreadyCovered)
+            ));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"),
+                0
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_deliveries"),
+                1
+            );
+
+            // Reading alone is not an ACK. A subsequent real ACK is terminal
+            // for this proposal even though its earlier reservation still exists.
+            execute(
+                pool,
+                cx,
+                "INSERT INTO project_mailbox_receipts VALUES(901, 102, 77, NULL)",
+            );
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Ok(AckEscalationOutcome::AlreadyCovered)
+            ));
+            run(crate::queries::acknowledge_message(cx, pool, 102, 901))
+                .into_result()
+                .unwrap();
+            let ack = scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts");
+            assert!(ack > 0);
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(
+                scalar(pool, cx, "SELECT read_ts FROM project_mailbox_receipts"),
+                77
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"),
+                ack
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn shared_visibility_and_identity_changes_refuse_the_observed_grant() {
+        for sql in [
+            "UPDATE agents SET retired_at = 2 WHERE id = 102",
+            "UPDATE agents SET contact_policy = 'BLOCK_ALL' WHERE id = 102",
+            "UPDATE agents SET inception_ts = 1000001 WHERE id = 102",
+            "UPDATE agents SET project_id = 201 WHERE id = 102",
+            "UPDATE agents SET name = 'bluebear' WHERE id = 102",
+            "UPDATE messages SET sender_id = 102 WHERE id = 901",
+            "UPDATE messages SET created_ts = 999999 WHERE id = 901",
+            "UPDATE messages SET project_id = 201 WHERE id = 901",
+            "UPDATE messages SET ack_required = 0 WHERE id = 901",
+            "UPDATE project_mailbox_deliveries SET project_id = 201 WHERE message_id = 901",
+            "DELETE FROM project_mailbox_deliveries WHERE message_id = 901",
+            "UPDATE db_identity SET generation_id = 'replacement' WHERE singleton = 0",
+            "UPDATE projects SET human_key = '/changed' WHERE id = 101",
+        ] {
+            fixture(|pool, cx, generation, observed| {
+                use_shared_delivery(pool, cx);
+                execute(pool, cx, sql);
+                stale(run(grant_ack_escalation(
+                    cx,
+                    pool,
+                    &request(generation, observed),
+                )));
+                assert_eq!(
+                    scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                    0,
+                    "{sql}"
+                );
+                assert_eq!(
+                    scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                    0
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn shared_ack_before_admission_prevents_a_first_grant() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            run(crate::queries::acknowledge_message(cx, pool, 102, 901))
+                .into_result()
+                .unwrap();
+            let ack = scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts");
+            assert!(ack > 0);
+            stale(run(grant_ack_escalation(
+                cx,
+                pool,
+                &request(generation, observed),
+            )));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                0
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT ack_ts FROM project_mailbox_receipts"),
+                ack
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM message_recipients"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn direct_ack_state_wins_over_the_shared_receipt_in_both_directions() {
+        fixture(|pool, cx, generation, observed| {
+            execute(
+                pool,
+                cx,
+                "INSERT INTO project_mailbox_deliveries VALUES(901, 101, 'to', 1000000)",
+            );
+            execute(
+                pool,
+                cx,
+                "INSERT INTO project_mailbox_receipts VALUES(901, 102, 41, 42)",
+            );
+            // Existing direct mail is not made ineligible by a shared opt-out
+            // or a stale shared receipt. Only its own ACK settles it.
+            execute(
+                pool,
+                cx,
+                "UPDATE agents SET contact_policy = 'block_all' WHERE id = 102",
+            );
+            let request = request(generation, observed);
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            execute(
+                pool,
+                cx,
+                "UPDATE agents SET contact_policy = 'auto' WHERE id = 102",
+            );
+            execute(
+                pool,
+                cx,
+                "UPDATE message_recipients SET ack_ts = 43 WHERE message_id = 901",
+            );
+            execute(
+                pool,
+                cx,
+                "UPDATE project_mailbox_receipts SET ack_ts = NULL WHERE message_id = 901",
+            );
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT ack_ts FROM message_recipients"),
+                43
+            );
+        });
+    }
+
+    #[test]
+    fn shared_cutoff_holder_and_conflicts_remain_transactional() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            let mut request = request(generation, observed);
+            request.overdue_before_ts = observed.created_ts - 1;
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            request.overdue_before_ts = observed.created_ts;
+            request.holder_id = 101;
+            request.holder_name = "WrongName";
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            request.holder_id = 102;
+            request.holder_name = "BlueBear";
+            let competing = run(crate::queries::create_file_reservations(
+                cx,
+                pool,
+                101,
+                101,
+                &["agents/BlueBear/inbox/**"],
+                3600,
+                true,
+                "other work",
+            ))
+            .into_result()
+            .unwrap();
+            assert_eq!(competing.len(), 1);
+            assert!(matches!(
+                run(grant_ack_escalation(cx, pool, &request)),
+                Outcome::Err(DbError::ResourceBusy(_))
+            ));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                competing[0].expires_ts
+            );
+            run(crate::queries::release_reservations(
+                cx,
+                pool,
+                101,
+                101,
+                None,
+                Some(&[competing[0].id.unwrap()]),
+            ))
+            .into_result()
+            .unwrap();
+            granted(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                2
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn unavailable_shared_receipts_fail_instead_of_certifying_no_obligation() {
+        fixture(|pool, cx, generation, observed| {
+            use_shared_delivery(pool, cx);
+            execute(
+                pool,
+                cx,
+                "ALTER TABLE project_mailbox_receipts RENAME TO unavailable_receipts",
+            );
+            assert!(matches!(
+                run(grant_ack_escalation(
+                    cx,
+                    pool,
+                    &request(generation, observed)
+                )),
+                Outcome::Err(_)
+            ));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                0
+            );
+            let conn = run(pool.acquire(cx)).expect("checkout after failed admission");
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("ROLLBACK").unwrap();
+        });
+    }
 
     fn run<T>(future: impl std::future::Future<Output = T>) -> T {
         asupersync::runtime::RuntimeBuilder::current_thread()
@@ -773,5 +1122,360 @@ mod tests {
             request.overdue_before_ts = i64::MAX;
             granted(run(grant_ack_escalation(cx, pool, &request)));
         });
+    }
+
+    fn connection_scalar(conn: &DbConn, sql: &str) -> i64 {
+        conn.query_sync(sql, &[]).unwrap()[0]
+            .get_as::<i64>(0)
+            .unwrap()
+    }
+
+    fn assert_failed_grant_rolled_back(conn: &DbConn) {
+        assert_eq!(
+            connection_scalar(conn, "SELECT COUNT(*) FROM file_reservations"),
+            0
+        );
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        conn.execute_raw("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn ignored_insert_cannot_publish_a_previous_connection_rowid_as_a_grant() {
+        fixture(|pool, cx, generation, observed| {
+            let conn = run(pool.acquire(cx)).expect("checkout");
+            conn.execute_raw("CREATE TABLE ack_grant_audit (id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute_raw("INSERT INTO ack_grant_audit VALUES (700)")
+                .unwrap();
+            assert_eq!(connection_scalar(&conn, "SELECT last_insert_rowid()"), 700);
+            conn.execute_raw(
+                "CREATE TRIGGER ignore_ack_grant BEFORE INSERT ON file_reservations \
+                 BEGIN SELECT RAISE(IGNORE); END",
+            )
+            .unwrap();
+            let request = request(generation, observed);
+            let pattern = claim_pattern(&request).unwrap();
+            let result = run(grant_on_connection(cx, &conn, &request, &pattern));
+            assert!(
+                matches!(&result, Outcome::Err(DbError::Internal(detail))
+                    if detail == "ACK grant insert did not create exactly one reservation"),
+                "{result:?}"
+            );
+            assert_failed_grant_rolled_back(&conn);
+            assert_eq!(
+                connection_scalar(&conn, "SELECT id FROM ack_grant_audit"),
+                700
+            );
+            conn.execute_raw("DROP TRIGGER ignore_ack_grant").unwrap();
+            let committed = granted(run(grant_on_connection(cx, &conn, &request, &pattern)));
+            assert_eq!(
+                Some(connection_scalar(&conn, "SELECT id FROM file_reservations")),
+                committed.id
+            );
+        });
+    }
+
+    #[test]
+    fn altered_inserted_grant_fields_refuse_publication_and_roll_back() {
+        for assignment in [
+            "id = NEW.id + 1000",
+            "project_id = 201",
+            "agent_id = 101",
+            "path_pattern = 'agents/bluebear/inbox/1970/01/*.md'",
+            "\"exclusive\" = 0",
+            "reason = 'ACK-OVERDUE'",
+            "created_ts = NEW.created_ts + 1",
+            "expires_ts = NEW.expires_ts - 1",
+            "released_ts = 0",
+            "released_ts = NEW.created_ts",
+        ] {
+            fixture(|pool, cx, generation, observed| {
+                let conn = run(pool.acquire(cx)).expect("checkout");
+                conn.execute_raw(&format!(
+                    "CREATE TRIGGER alter_ack_grant AFTER INSERT ON file_reservations \
+                     BEGIN UPDATE file_reservations SET {assignment} WHERE id = NEW.id; END"
+                ))
+                .unwrap();
+                let request = request(generation, observed);
+                let result = run(grant_on_connection(
+                    cx,
+                    &conn,
+                    &request,
+                    &claim_pattern(&request).unwrap(),
+                ));
+                assert!(
+                    matches!(&result, Outcome::Err(DbError::Internal(detail))
+                        if detail == "ACK grant did not persist the requested active reservation"),
+                    "assignment={assignment}: {result:?}"
+                );
+                assert_failed_grant_rolled_back(&conn);
+            });
+        }
+    }
+
+    #[test]
+    fn release_ledger_written_during_insert_cannot_certify_an_active_grant() {
+        fixture(|pool, cx, generation, observed| {
+            let conn = run(pool.acquire(cx)).expect("checkout");
+            conn.execute_raw(
+                "CREATE TRIGGER release_ack_grant AFTER INSERT ON file_reservations \
+                 BEGIN INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+                       VALUES (NEW.id, NEW.created_ts); END",
+            )
+            .unwrap();
+            let request = request(generation, observed);
+            let result = run(grant_on_connection(
+                cx,
+                &conn,
+                &request,
+                &claim_pattern(&request).unwrap(),
+            ));
+            assert!(
+                matches!(&result, Outcome::Err(DbError::Internal(detail))
+                    if detail == "ACK grant did not persist the requested active reservation"),
+                "{result:?}"
+            );
+            assert_failed_grant_rolled_back(&conn);
+            assert_eq!(
+                connection_scalar(&conn, "SELECT COUNT(*) FROM file_reservation_releases"),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn harmless_insert_trigger_preserves_the_exact_committed_grant() {
+        fixture(|pool, cx, generation, observed| {
+            let conn = run(pool.acquire(cx)).expect("checkout");
+            conn.execute_raw(
+                "CREATE TABLE ack_grant_audit (id INTEGER PRIMARY KEY, reservation_id INTEGER)",
+            )
+            .unwrap();
+            conn.execute_raw(
+                "CREATE TRIGGER audit_ack_grant AFTER INSERT ON file_reservations \
+                 BEGIN INSERT INTO ack_grant_audit VALUES (700, NEW.id); END",
+            )
+            .unwrap();
+            let request = request(generation, observed);
+            let committed = granted(run(grant_on_connection(
+                cx,
+                &conn,
+                &request,
+                &claim_pattern(&request).unwrap(),
+            )));
+            let stored = conn
+                .query_sync("SELECT * FROM file_reservations", &[])
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            let stored = &stored[0];
+            assert_eq!(
+                stored.get_named::<i64>("id").unwrap(),
+                committed.id.unwrap()
+            );
+            assert_eq!(
+                stored.get_named::<i64>("project_id").unwrap(),
+                committed.project_id
+            );
+            assert_eq!(
+                stored.get_named::<i64>("agent_id").unwrap(),
+                committed.agent_id
+            );
+            assert_eq!(
+                stored.get_named::<String>("path_pattern").unwrap(),
+                committed.path_pattern
+            );
+            assert_eq!(
+                stored.get_named::<i64>("exclusive").unwrap(),
+                committed.exclusive
+            );
+            assert_eq!(
+                stored.get_named::<String>("reason").unwrap(),
+                committed.reason
+            );
+            assert_eq!(
+                stored.get_named::<i64>("created_ts").unwrap(),
+                committed.created_ts
+            );
+            assert_eq!(
+                stored.get_named::<i64>("expires_ts").unwrap(),
+                committed.expires_ts
+            );
+            assert_eq!(
+                stored.get_named::<Option<i64>>("released_ts").unwrap(),
+                None
+            );
+            assert_eq!(
+                Some(connection_scalar(
+                    &conn,
+                    "SELECT reservation_id FROM ack_grant_audit"
+                )),
+                committed.id
+            );
+            assert_eq!(
+                connection_scalar(&conn, "SELECT id FROM ack_grant_audit"),
+                700
+            );
+        });
+    }
+
+    #[test]
+    fn inactive_recipient_or_holder_cannot_receive_a_direct_or_shared_automatic_grant() {
+        for shared in [false, true] {
+            for actor in [101, 102] {
+                for mutation in [
+                    format!("UPDATE agents SET retired_at = 0 WHERE id = {actor}"),
+                    format!("UPDATE agents SET retired_at = 42 WHERE id = {actor}"),
+                    format!(
+                        "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES ({actor}, 0)"
+                    ),
+                    format!(
+                        "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES ({actor}, 42)"
+                    ),
+                    format!(
+                        "UPDATE agents SET task_description = '[DEREGISTERED 2026-01-01T00:00:00Z] old' WHERE id = {actor}"
+                    ),
+                    format!(
+                        "UPDATE agents SET task_description = '[DEREGISTERED at 2026-01-01 00:00:00] old' WHERE id = {actor}"
+                    ),
+                    format!(
+                        "UPDATE agents SET task_description = '[DEREGISTERED malformed] old' WHERE id = {actor}"
+                    ),
+                ] {
+                    fixture(|pool, cx, generation, observed| {
+                        if shared {
+                            use_shared_delivery(pool, cx);
+                        }
+                        let mut request = request(generation, observed);
+                        request.holder_id = 101;
+                        request.holder_name = "RedFox";
+                        // This transition occurs after the worker's observation.
+                        // Both names and project IDs still match that proposal.
+                        execute(pool, cx, &mutation);
+                        stale(run(grant_ack_escalation(cx, pool, &request)));
+                        assert_eq!(
+                            scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                            0,
+                            "shared={shared}, mutation={mutation}"
+                        );
+                        assert_eq!(scalar(pool, cx, "SELECT COUNT(*) FROM messages"), 1);
+                        assert_eq!(
+                            scalar(pool, cx, "SELECT COUNT(*) FROM project_mailbox_receipts"),
+                            0
+                        );
+                        assert_eq!(
+                            scalar(
+                                pool,
+                                cx,
+                                "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NULL"
+                            ),
+                            i64::from(!shared)
+                        );
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unretirement_restores_eligibility_but_cannot_clear_permanent_deregistration() {
+        fixture(|pool, cx, generation, observed| {
+            let request = request(generation, observed);
+            execute(pool, cx, "UPDATE agents SET retired_at = 42 WHERE id = 102");
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            execute(
+                pool,
+                cx,
+                "UPDATE agents SET retired_at = NULL WHERE id = 102",
+            );
+            let first = granted(run(grant_ack_escalation(cx, pool, &request)));
+            execute(
+                pool,
+                cx,
+                "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (102, 42)",
+            );
+            // Even existing coverage cannot bypass the lifecycle check. This
+            // does not mutate a prior lease or delete historical obligations.
+            stale(run(grant_ack_escalation(cx, pool, &request)));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                1
+            );
+            assert_eq!(
+                scalar(pool, cx, "SELECT expires_ts FROM file_reservations"),
+                first.expires_ts
+            );
+            assert_eq!(
+                scalar(
+                    pool,
+                    cx,
+                    "SELECT deregistered_at FROM agent_deregistrations"
+                ),
+                42
+            );
+        });
+    }
+
+    #[test]
+    fn missing_deregistration_authority_is_an_error_not_an_active_identity() {
+        fixture(|pool, cx, generation, observed| {
+            execute(
+                pool,
+                cx,
+                "ALTER TABLE agent_deregistrations RENAME TO unavailable_deregistrations",
+            );
+            assert!(matches!(
+                run(grant_ack_escalation(
+                    cx,
+                    pool,
+                    &request(generation, observed)
+                )),
+                Outcome::Err(_)
+            ));
+            assert_eq!(
+                scalar(pool, cx, "SELECT COUNT(*) FROM file_reservations"),
+                0
+            );
+            let conn = run(pool.acquire(cx)).expect("checkout after lifecycle failure");
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            conn.execute_raw("ROLLBACK").unwrap();
+            drop(conn);
+            execute(
+                pool,
+                cx,
+                "ALTER TABLE unavailable_deregistrations RENAME TO agent_deregistrations",
+            );
+            granted(run(grant_ack_escalation(
+                cx,
+                pool,
+                &request(generation, observed),
+            )));
+        });
+    }
+
+    #[test]
+    fn ordinary_task_text_does_not_become_a_deregistration_marker() {
+        for task in [
+            "",
+            "normal task",
+            "mentions [DEREGISTERED old] without using the reserved prefix",
+            "[deregistered lowercase-is-not-the-system-marker]",
+        ] {
+            assert!(!crate::models::task_description_uses_reserved_deregistered_prefix(task));
+            fixture(|pool, cx, generation, observed| {
+                let conn = run(pool.acquire(cx)).expect("checkout");
+                conn.execute_sync(
+                    "UPDATE agents SET task_description = ? WHERE id IN (101, 102)",
+                    &[Value::Text(task.to_string())],
+                )
+                .unwrap();
+                drop(conn);
+                let mut request = request(generation, observed);
+                request.holder_id = 101;
+                request.holder_name = "RedFox";
+                let granted = granted(run(grant_ack_escalation(cx, pool, &request)));
+                assert_eq!(granted.agent_id, 101);
+                assert_eq!(granted.path_pattern, "agents/BlueBear/inbox/1970/01/*.md");
+            });
+        }
     }
 }

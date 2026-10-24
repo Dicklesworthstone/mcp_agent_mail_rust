@@ -254,20 +254,32 @@ mod tests {
             integrity_check_on_startup: true,
             ..mcp_agent_mail_core::Config::default()
         };
-        let disabled = mcp_agent_mail_core::Config {
+        let skipped_startup = mcp_agent_mail_core::Config {
             integrity_check_on_startup: false,
+            ..enabled.clone()
+        };
+        let disabled = mcp_agent_mail_core::Config {
+            integrity_guard_enabled: false,
             ..enabled.clone()
         };
         let in_memory = mcp_agent_mail_core::Config {
             database_url: "sqlite:///:memory:".to_string(),
             ..enabled.clone()
         };
-        for (config, expected) in [(enabled, true), (disabled, false), (in_memory, false)] {
+        for (config, expected) in [
+            (enabled, true),
+            (skipped_startup, true),
+            (disabled, false),
+            (in_memory, false),
+        ] {
             let payload = poll_payload(&TuiSharedState::new(&config), None);
             assert_eq!(
-                payload["config"]["integrity_guard_enabled"], expected,
-                "{} on_startup={}",
-                config.database_url, config.integrity_check_on_startup
+                payload["config"]["integrity_guard_enabled"],
+                expected,
+                "{} on_startup={} guard_enabled={}",
+                config.database_url,
+                config.integrity_check_on_startup,
+                config.integrity_guard_enabled
             );
         }
     }

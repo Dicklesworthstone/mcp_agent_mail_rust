@@ -49,7 +49,7 @@ pub use prompt::{WizardConfig, WizardOutcome, format_json_output, run_interactiv
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
 pub use snapshot::{
-    SnapshotContext, create_private_canonical_snapshot_context,
+    SnapshotContext, SnapshotPurpose, create_private_canonical_snapshot_context,
     create_private_canonical_sqlite_snapshot, create_snapshot_context, create_sqlite_snapshot,
 };
 pub use static_render::{

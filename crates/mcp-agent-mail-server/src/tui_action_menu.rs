@@ -556,13 +556,13 @@ pub fn messages_actions(
             ActionKind::Execute(format!("acknowledge:{message_id}")),
         )
         .with_keybinding("a")
-        .with_description("Mark as acknowledged"),
+        .with_description("Acknowledge for every recipient, as the operator"),
         ActionEntry::new(
             "Mark read",
             ActionKind::Execute(format!("mark_read:{message_id}")),
         )
         .with_keybinding("r")
-        .with_description("Mark as read"),
+        .with_description("Mark read for every recipient, as the operator"),
     ];
 
     if let Some(tid) = thread_id {
@@ -598,19 +598,13 @@ pub fn messages_batch_actions(selected_count: usize) -> Vec<ActionEntry> {
             ActionKind::Execute("batch_acknowledge".into()),
         )
         .with_keybinding("a")
-        .with_description("Acknowledge all selected messages"),
+        .with_description("Acknowledge the selected messages for every recipient"),
         ActionEntry::new(
             format!("Mark read selected ({count})"),
             ActionKind::Execute("batch_mark_read".into()),
         )
         .with_keybinding("r")
-        .with_description("Mark all selected messages as read"),
-        ActionEntry::new(
-            format!("Mark unread selected ({count})"),
-            ActionKind::Execute("batch_mark_unread".into()),
-        )
-        .with_keybinding("u")
-        .with_description("Mark all selected messages as unread"),
+        .with_description("Mark the selected messages read for every recipient"),
     ]
 }
 
@@ -808,15 +802,12 @@ pub fn agents_actions(agent_name: &str) -> Vec<ActionEntry> {
 #[must_use]
 pub fn threads_actions(thread_id: &str) -> Vec<ActionEntry> {
     vec![
-        ActionEntry::new("View messages", ActionKind::Execute("view_messages".into()))
-            .with_keybinding("v")
-            .with_description("Show all messages in thread"),
         ActionEntry::new(
             "Summarize",
             ActionKind::Execute(format!("summarize:{thread_id}")),
         )
         .with_keybinding("s")
-        .with_description("Generate thread summary"),
+        .with_description("Key points and action items above the conversation"),
         ActionEntry::new(
             "Search in thread",
             ActionKind::Execute(format!("search_in:{thread_id}")),
@@ -904,11 +895,13 @@ pub fn contacts_actions(from_agent: &str, to_agent: &str, status: &str) -> Vec<A
                 ActionKind::Execute(format!("deny_contact:{from_agent}:{to_agent}")),
             )
             .with_keybinding("d")
-            .with_description("Deny contact request"),
+            .with_description("Deny the request; the requester stays blocked"),
         );
     }
 
-    if status != "blocked" {
+    // Denying a pending request already blocks it, so Block is offered only
+    // for a link that is in effect.
+    if status != "blocked" && status != "pending" {
         actions.push(
             ActionEntry::new(
                 "Block",
@@ -1028,6 +1021,10 @@ mod tests {
         let actions = contacts_actions("AgentA", "AgentB", "pending");
         assert!(actions.iter().any(|a| a.label == "Approve"));
         assert!(actions.iter().any(|a| a.label == "Deny"));
+        assert!(
+            !actions.iter().any(|a| a.label == "Block"),
+            "Deny already blocks a pending request"
+        );
     }
 
     #[test]
@@ -1124,8 +1121,8 @@ mod tests {
         assert!(agents.iter().any(|a| a.label == "Send message"));
 
         let threads = threads_actions("th-1");
-        assert!(threads.iter().any(|a| a.label == "View messages"));
         assert!(threads.iter().any(|a| a.label == "Summarize"));
+        assert!(threads.iter().any(|a| a.label == "Search in thread"));
 
         let timeline = timeline_actions("tool_call_end", "http");
         assert!(timeline.iter().any(|a| a.label == "View details"));
@@ -1297,7 +1294,7 @@ mod tests {
     #[test]
     fn messages_batch_actions_include_expected_operations() {
         let actions = messages_batch_actions(3);
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 2);
 
         let ops: Vec<String> = actions
             .iter()
@@ -1309,7 +1306,10 @@ mod tests {
 
         assert!(ops.iter().any(|op| op == "batch_acknowledge"));
         assert!(ops.iter().any(|op| op == "batch_mark_read"));
-        assert!(ops.iter().any(|op| op == "batch_mark_unread"));
+        assert!(
+            !ops.iter().any(|op| op.contains("unread")),
+            "no operation can mark mail unread, so the menu must not offer it"
+        );
     }
 
     #[test]

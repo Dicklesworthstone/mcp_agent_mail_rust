@@ -19,21 +19,36 @@
 //! br-8j6cb adds non-destructive message archive healing on this same worker.
 //! File-backed mailboxes enable it by default; set
 //! `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED=false` to disable it. Bounded recent
-//! catch-up and rotating history passes run once per minute in steady state;
-//! while a pass exhausts its repair budget the next pass follows after one
-//! second until the backlog clears. Neither accelerates the configured
-//! reporting/pruning cadence. Repair never sends
+//! catch-up and rotating history passes run once per minute in steady state.
+//! Successful, uncontended catch-up batches run in finite bursts before the
+//! one-second backlog pause; each batch retains its original limits and
+//! checkpoint. Neither accelerates the configured reporting/pruning cadence.
+//! Each repair lane keeps its own deadline: a retry or backlog in one lane
+//! must not turn healthy peer lanes into once-per-second database scans.
+//! Repair never sends
 //! another message or changes read/ack state. Its per-pass result is not a
 //! whole-mailbox or attachment-durability certificate.
 //!
 //! Terminal reservation releases also converge without another client read.
 //! Set `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED=false` to disable this separate
 //! default-on pass. It preserves foreign-generation and conflicting artifacts.
+//! Reservation retry debt also requests the short follow-up, independently of
+//! message repair. Successful release batches run in bounded turns; contention
+//! yields immediately without bypassing per-ID cooldown or publication locks.
 //!
 //! The worker runs on a dedicated OS thread with `std::thread::sleep` between
 //! iterations, matching the pattern in `cleanup.rs` and `ack_ttl.rs`.
+//! Unwinding runs restart on that same owned thread after bounded backoff.
+//! Pools and recovery cursors are recreated; only the original process-start
+//! anchor and reporting/pruning cadence survive the failed run.
 
 #![forbid(unsafe_code)]
+
+mod agent_catch_up;
+mod catch_up;
+mod reservation_catch_up;
+mod schedule;
+mod supervisor;
 
 use asupersync::Cx;
 use fastmcp_core::block_on;
@@ -41,7 +56,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{
     DbPool, DbPoolConfig, create_pool, now_micros, queries::count_prunable_messages,
 };
-use mcp_agent_mail_storage::recovery::agent_reconcile::{self, AgentReconcileCursor};
+use mcp_agent_mail_storage::recovery::agent_reconcile::AgentReconcileCursor;
 use mcp_agent_mail_storage::recovery::message_reconcile::database::{
     self as message_archive_reconcile, ArchivePruneCursor, ArchivePruneReport, ReconcileCursor,
 };
@@ -99,7 +114,7 @@ fn report_is_due(elapsed: Option<Duration>, interval: Duration) -> bool {
 /// queued when the process was killed).
 const REPAIR_CATCH_UP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Sleep before the next worker pass. A pass that exhausted its repair budget
+/// Delay before this lane's next pass. A pass that exhausted its repair budget
 /// left known work behind, so the next one follows after
 /// [`REPAIR_CATCH_UP_POLL_INTERVAL`] instead of the steady-state poll: at 4
 /// repairs per pass, a once-per-minute cadence healed ~20 messages in five
@@ -147,7 +162,16 @@ pub fn start(config: &Config) {
             .name("retention-quota".into())
             .stack_size(mcp_agent_mail_core::worker_stack_size())
             .spawn(move || {
-                retention_loop(&config, settled_before_us);
+                supervisor::run(
+                    &SHUTDOWN,
+                    |last_report| retention_loop(&config, settled_before_us, last_report),
+                    sleep_with_shutdown,
+                    |restart| {
+                        warn!(target: "maintenance", event = "archive_maintenance_restarted",
+                            panicked = restart.panicked, retry_in_secs = restart.delay.as_secs(),
+                            "archive maintenance exited unexpectedly; restarting from authoritative storage");
+                    },
+                );
             }) {
             Ok(handle) => {
                 *worker = Some(handle);
@@ -197,12 +221,32 @@ fn retention_pool_config(config: &Config) -> DbPoolConfig {
     pool_config
 }
 
-fn retention_loop(config: &Config, settled_before_us: i64) {
+/// Pool construction can create SQLite sidecars before a repair lane reaches
+/// its own disk-pressure check. Refuse that first write boundary as well.
+/// `None` is a resource pause, not a failed source or an empty successful scan.
+/// Existing pools remain owned by the worker; each repair lane still checks
+/// pressure immediately before its checkpointed batch.
+fn create_retention_pool_if_admitted(
+    config: &Config,
+    pressure: u64,
+) -> Option<mcp_agent_mail_db::DbResult<DbPool>> {
+    if pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
+        return None;
+    }
+    Some(create_pool(&retention_pool_config(config)))
+}
+
+fn retention_loop(config: &Config, settled_before_us: i64, last_report: &mut Option<Instant>) {
     let interval = Duration::from_secs(config.retention_report_interval_seconds.max(60));
     let message_repair_enabled = message_archive_reconcile::enabled(config);
     let reservation_repair_enabled = reservation_reconcile::enabled(config);
     let repair_enabled = message_repair_enabled || reservation_repair_enabled;
     let poll_interval = maintenance_poll_interval(interval, repair_enabled);
+    let mut repair_schedule = schedule::RepairSchedule::new(
+        poll_interval,
+        message_repair_enabled,
+        reservation_repair_enabled,
+    );
     let startup_delay = poll_interval.min(Duration::from_secs(10));
     let needs_db = message_retention_needs_db(config) || repair_enabled;
     let mut pool: Option<DbPool> = None;
@@ -212,7 +256,6 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
     let mut reservation_last_repair_us: Option<i64> = None;
     let mut reservation_progress_warned = false;
     let mut prune_cursor = ArchivePruneCursor::default();
-    let mut last_report: Option<Instant> = None;
 
     info!(
         interval_secs = interval.as_secs(),
@@ -244,8 +287,19 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
 
         // Retry admission on a later tick instead of permanently disabling
         // healing after a transient startup failure or a retired pool.
-        if needs_db && pool.is_none() {
-            match create_pool(&retention_pool_config(config)) {
+        // Resource pressure is checked before opening the source, not only
+        // inside a repair batch after SQLite has already created sidecars.
+        if needs_db
+            && pool.is_none()
+            && let Some(result) = create_retention_pool_if_admitted(
+                config,
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+            )
+        {
+            match result {
                 Ok(created) => pool = Some(created),
                 Err(error) => {
                     warn!(
@@ -256,20 +310,24 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             }
         }
 
-        let mut message_repair_backlog = false;
-        if message_repair_enabled {
-            let mut retire_pool = false;
-            if let Some(live_pool) = pool.as_ref() {
+        // A busy lane wakes this thread, not every other lane. Check its
+        // deadline before borrowing the pool, creating a Cx or reading SQL.
+        // Missing pools and errors get the normal retry delay, without a
+        // fabricated successful storage report or a discarded repair cursor.
+        if let Some(Err(error)) =
+            repair_schedule.run_if_due(schedule::Lane::Messages, Instant::now, || {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return None;
+                }
+                let live_pool = pool.as_ref()?;
                 let cx = worker_cx();
-                match message_archive_reconcile::reconcile_message_batch(
+                Some(catch_up::run(
                     &cx,
                     live_pool,
                     config,
                     &mut cursor,
                     &SHUTDOWN,
-                ) {
-                    Ok(report) => {
-                        message_repair_backlog = report.budget_exhausted;
+                    |report| {
                         if report.scanned > 0 || report.interrupted {
                             info!(
                                 target: "maintenance",
@@ -279,34 +337,44 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                                 repaired = report.repaired,
                                 files_created = report.files_created,
                                 deferred = report.deferred,
+                                deferred_transient = report.deferred_transient,
+                                deferred_conflict = report.deferred_conflict,
+                                retry_len = report.retry_len,
                                 payload_bytes = report.payload_bytes,
                                 interrupted = report.interrupted,
                                 budget_exhausted = report.budget_exhausted,
                                 "bounded message archive reconciliation pass completed"
                             );
                         }
-                    }
-                    Err(error) => {
-                        warn!(
-                            target: "maintenance",
-                            event = "message_archive_reconcile_source_unavailable",
-                            error = %error,
-                            "message archive reconciliation refused; preserving source and retrying next cycle"
-                        );
-                        retire_pool = true;
-                    }
+                    },
+                ))
+            })
+        {
+            warn!(
+                target: "maintenance",
+                event = "message_archive_reconcile_source_unavailable",
+                error = %error,
+                "message archive reconciliation refused; preserving source and retrying next cycle"
+            );
+            // A verified recovery may have replaced the live generation.
+            // Reacquire through ordinary pool admission on the next tick.
+            pool = None;
+        }
+
+        if let Some(Err(error)) =
+            repair_schedule.run_if_due(schedule::Lane::Agents, Instant::now, || {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return None;
                 }
-            }
-            if !retire_pool && let Some(live_pool) = pool.as_ref() {
+                let live_pool = pool.as_ref()?;
                 let cx = worker_cx();
-                match agent_reconcile::reconcile_agent_batch(
+                Some(agent_catch_up::run(
                     &cx,
                     live_pool,
                     config,
                     &mut agent_cursor,
                     &SHUTDOWN,
-                ) {
-                    Ok(report) => {
+                    |report| {
                         if report.scanned > 0 || report.interrupted {
                             info!(
                                 target: "maintenance",
@@ -320,74 +388,75 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
                                 "bounded agent profile reconciliation pass completed"
                             );
                         }
-                    }
-                    Err(error) => {
-                        warn!(
-                            target: "maintenance",
-                            event = "agent_archive_reconcile_source_unavailable",
-                            error = %error,
-                            "agent profile reconciliation refused; retrying next cycle"
-                        );
-                        retire_pool = true;
-                    }
-                }
-            }
-            if retire_pool {
-                // A verified recovery may have replaced the live generation.
-                // Reacquire through ordinary pool admission on the next tick.
-                pool = None;
-            }
+                    },
+                ))
+            })
+        {
+            warn!(
+                target: "maintenance",
+                event = "agent_archive_reconcile_source_unavailable",
+                error = %error,
+                "agent profile reconciliation refused; retrying next cycle"
+            );
+            pool = None;
         }
 
-        if reservation_repair_enabled && let Some(live_pool) = pool.as_ref() {
-            let cx = worker_cx();
-            match reservation_reconcile::reconcile_reservation_releases(
-                &cx,
-                live_pool,
-                config,
-                &mut reservation_cursor,
-                &SHUTDOWN,
-            ) {
-                Ok(report) => {
-                    if report.scanned > 0 || report.interrupted {
-                        info!(target: "maintenance", event = "reservation_release_archive_reconcile",
-                            scanned = report.scanned, unchanged = report.unchanged,
-                            attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
-                            interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
-                            "bounded terminal reservation release reconciliation pass completed");
-                    }
-                    // `am doctor health` reads this to tell drift that is
-                    // converging from a reconciler that stopped repairing it.
-                    if !report.interrupted {
-                        let pass_us = now_micros();
-                        if report.repaired > 0 {
-                            reservation_last_repair_us = Some(pass_us);
+        if let Some(Err(error)) = repair_schedule.run_if_due(
+            schedule::Lane::Reservations,
+            Instant::now,
+            || {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return None;
+                }
+                let live_pool = pool.as_ref()?;
+                let cx = worker_cx();
+                Some(reservation_catch_up::run(
+                    &cx,
+                    live_pool,
+                    config,
+                    &mut reservation_cursor,
+                    &SHUTDOWN,
+                    |report| {
+                        if report.scanned > 0 || report.interrupted || report.retry_len > 0 {
+                            info!(target: "maintenance", event = "reservation_release_archive_reconcile",
+                                scanned = report.scanned, unchanged = report.unchanged,
+                                attempted = report.attempted, repaired = report.repaired, deferred = report.deferred,
+                                deferred_transient = report.deferred_transient, retry_len = report.retry_len,
+                                interrupted = report.interrupted, budget_exhausted = report.budget_exhausted,
+                                "bounded terminal reservation release reconciliation pass completed");
                         }
-                        let progress = reservation_reconcile::ReservationReconcileProgress {
-                            pid: std::process::id(),
-                            pass_us,
-                            last_repair_us: reservation_last_repair_us,
-                        };
-                        match reservation_reconcile::record_progress(
-                            &config.storage_root,
-                            &progress,
-                        ) {
-                            Ok(()) => reservation_progress_warned = false,
-                            Err(error) if !reservation_progress_warned => {
-                                reservation_progress_warned = true;
-                                warn!(target: "maintenance", event = "reservation_reconcile_progress_unrecorded",
-                                    error = %error, "could not record reservation reconciliation progress for doctor health");
+                        // `am doctor health` reads this to tell drift that is
+                        // converging from a reconciler that stopped repairing it.
+                        if !report.interrupted {
+                            let pass_us = now_micros();
+                            if report.repaired > 0 {
+                                reservation_last_repair_us = Some(pass_us);
                             }
-                            Err(_) => {}
+                            let progress = reservation_reconcile::ReservationReconcileProgress {
+                                pid: std::process::id(),
+                                pass_us,
+                                last_repair_us: reservation_last_repair_us,
+                            };
+                            match reservation_reconcile::record_progress(
+                                &config.storage_root,
+                                &progress,
+                            ) {
+                                Ok(()) => reservation_progress_warned = false,
+                                Err(error) if !reservation_progress_warned => {
+                                    reservation_progress_warned = true;
+                                    warn!(target: "maintenance", event = "reservation_reconcile_progress_unrecorded",
+                                        error = %error, "could not record reservation reconciliation progress for doctor health");
+                                }
+                                Err(_) => {}
+                            }
                         }
-                    }
-                }
-                Err(error) => {
-                    warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
-                        error = %error, "reservation release reconciliation refused; retrying next cycle");
-                    pool = None;
-                }
-            }
+                    },
+                ))
+            },
+        ) {
+            warn!(target: "maintenance", event = "reservation_release_reconcile_source_unavailable",
+                error = %error, "reservation release reconciliation refused; retrying next cycle");
+            pool = None;
         }
 
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -396,7 +465,11 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
 
         // Archive catch-up does not turn a long-interval filesystem inventory
         // or destructive retention sweep into a once-per-minute operation.
-        if report_is_due(last_report.map(|last| last.elapsed()), interval) {
+        if report_is_due(last_report.as_ref().map(Instant::elapsed), interval) {
+            // The clock belongs to the supervisor, not this run. Record the
+            // sweep's completion on both normal exit and unwind; restarting
+            // archive repair must not accelerate opted-in destructive retention.
+            let _report_attempt = supervisor::ReportAttempt::begin(last_report);
             if config.retention_report_enabled || config.quota_enabled {
                 match run_retention_cycle(config) {
                     Ok(report) => {
@@ -421,10 +494,9 @@ fn retention_loop(config: &Config, settled_before_us: i64) {
             if let Some(pool) = pool.as_ref() {
                 run_message_retention_phase(config, pool, &mut prune_cursor);
             }
-            last_report = Some(Instant::now());
         }
 
-        if sleep_with_shutdown(next_poll_interval(poll_interval, message_repair_backlog)) {
+        if sleep_with_shutdown(repair_schedule.next_delay(Instant::now())) {
             return;
         }
     }
@@ -2034,5 +2106,97 @@ mod tests {
         assert_eq!(report.largest_roots.len(), 1);
         assert_eq!(report.largest_roots[0].name, "refactor_artifacts");
         assert_eq!(report.largest_roots[0].bytes, 9);
+    }
+}
+
+#[cfg(test)]
+mod source_admission_tests {
+    use super::*;
+
+    fn config(root: &Path) -> Config {
+        Config {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &root.join("mail.sqlite3"),
+            ),
+            storage_root: root.join("archive"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn critical_pressure_never_opens_the_maintenance_source() {
+        let scratch = tempfile::tempdir().expect("isolated source");
+        let config = config(scratch.path());
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        for pressure in [critical, critical.saturating_add(1), u64::MAX] {
+            for _ in 0..3 {
+                assert!(create_retention_pool_if_admitted(&config, pressure).is_none());
+                assert_eq!(
+                    std::fs::read_dir(scratch.path())
+                        .expect("source directory")
+                        .count(),
+                    0,
+                    "a pressure pause must not create a database, sidecar, or archive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_source_admission_resumes_after_pressure_clears() {
+        let scratch = tempfile::tempdir().expect("isolated source");
+        let config = config(scratch.path());
+        let critical = mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64();
+        assert!(critical > 0);
+        // Production initializes the schema before starting maintenance.
+        // Exercise real checkout and SQL, not only a lazy pool constructor.
+        let startup_config = DbPoolConfig {
+            database_url: config.database_url.clone(),
+            storage_root: Some(config.storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            run_migrations: true,
+            ..Default::default()
+        };
+        let startup = create_pool(&startup_config).expect("runtime source");
+        let cx = Cx::for_testing();
+        let initialized = block_on(startup.acquire(&cx))
+            .into_result()
+            .expect("initialize runtime source");
+        initialized
+            .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+            .expect("startup migrations completed");
+        drop(initialized);
+
+        assert!(create_retention_pool_if_admitted(&config, critical).is_none());
+        for pressure in [critical - 1, 0] {
+            let admitted = create_retention_pool_if_admitted(&config, pressure)
+                .expect("noncritical pressure admits a source attempt")
+                .expect("ordinary maintenance source opens after recovery");
+            let connection = block_on(admitted.acquire(&cx))
+                .into_result()
+                .expect("maintenance checkout after pressure clears");
+            let rows = connection
+                .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+                .expect("maintenance reads initialized source");
+            assert_eq!(rows[0].get_named::<i64>("c").unwrap(), 0);
+            assert!(scratch.path().join("mail.sqlite3").is_file());
+        }
+    }
+
+    #[test]
+    fn admitted_source_errors_are_not_reported_as_resource_pauses() {
+        let scratch = tempfile::tempdir().expect("isolated source");
+        let obstruction = scratch.path().join("not-a-directory");
+        std::fs::write(&obstruction, b"preserve this file").expect("source obstruction");
+        let config = config(&obstruction);
+        let result = create_retention_pool_if_admitted(&config, 0)
+            .expect("noncritical pressure must attempt ordinary source admission");
+        assert!(
+            result.is_err(),
+            "an invalid source must remain a real error"
+        );
+        assert_eq!(std::fs::read(&obstruction).unwrap(), b"preserve this file");
     }
 }

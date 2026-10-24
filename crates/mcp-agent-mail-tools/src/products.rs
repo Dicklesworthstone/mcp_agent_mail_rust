@@ -22,7 +22,8 @@ use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_project,
+    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists,
+    resolve_existing_project,
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -356,15 +357,28 @@ pub async fn ensure_product(
         display_name = uid.clone();
     }
 
-    let row = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::ensure_product(
-            ctx.cx(),
-            &pool,
-            Some(uid.as_str()),
-            Some(display_name.as_str()),
-        )
-        .await,
-    )?;
+    // A key that is neither the product's uid nor its name (e.g. key
+    // "core-suite", name "Core Suite") misses the lookup above; without this
+    // a repeat call would collide with the UNIQUE name instead of returning
+    // the product it created.
+    let existing_by_name = if display_name == key_raw {
+        None
+    } else {
+        get_product_by_key(ctx.cx(), &pool, &display_name).await?
+    };
+    let row = if let Some(existing) = existing_by_name {
+        existing
+    } else {
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::ensure_product(
+                ctx.cx(),
+                &pool,
+                Some(uid.as_str()),
+                Some(display_name.as_str()),
+            )
+            .await,
+        )?
+    };
 
     let response = ProductResponse {
         id: row.id.unwrap_or(0),
@@ -426,7 +440,8 @@ pub async fn products_link(
             )
         })?;
 
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Link an existing project; a typo'd key must not create and link a new one.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let product_id = product.id.unwrap_or(0);
     let project_id = project.id.unwrap_or(0);
 
@@ -517,6 +532,10 @@ pub struct ProductThreadSummaryResponse {
     pub diagnostics: Option<crate::search::SearchDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partial_failures: Vec<ProductPartialFailure>,
+    /// True when the summary was refined with the conformance fixture's
+    /// canned text instead of a model (test harness only; br-kp1in.21).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_stub: bool,
 }
 
 /// Search across all projects linked to a product.
@@ -636,16 +655,35 @@ pub async fn search_messages_product(
         &[("date_from", date_from), ("after", after), ("since", since)],
         &[("date_to", date_to), ("before", before), ("until", until)],
     )?;
-    let scoped_project_id = if let Some(project_selector) = project_filter {
-        let project = resolve_project(ctx, &pool, &project_selector).await?;
-        project.id
+    // The project filter narrows within the product; it must not create a
+    // project from a typo'd key.
+    let scoped_project = if let Some(project_selector) = project_filter {
+        Some(resolve_existing_project(ctx, &pool, &project_selector).await?)
     } else {
         None
     };
+    let scoped_project_id = scoped_project.as_ref().and_then(|project| project.id);
     phase.mark("argument_filter_resolution");
     let product_projects = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
     )?;
+    // The planner applies a project filter instead of the product join, so a
+    // project outside the product would leak its messages into the results.
+    if let Some(project) = &scoped_project
+        && !product_projects
+            .iter()
+            .any(|linked| linked.id == project.id)
+    {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Project '{}' is not linked to this product; link it with products_link or drop the project filter.",
+                project.slug
+            ),
+            true,
+            serde_json::json!({ "field": "project", "project": project.slug }),
+        ));
+    }
     let partial_failures = product_partial_failures_for_projects(&product_projects);
     phase.mark("product_project_scope_resolution");
 
@@ -788,29 +826,31 @@ pub async fn fetch_inbox_product(
     validate_product_inbox_agent_name(&agent_name)?;
     phase.mark("argument_validation");
 
-    let rows = db_outcome_to_mcp_result(if with_bodies {
-        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent(
+    // Resolve canonical viewers once, before returning any project data.
+    // Pin the fan-in to those exact IDs so concurrent link/registration
+    // changes cannot introduce an identity that was never authorized.
+    let viewers = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::product_inbox_agents(ctx.cx(), &pool, product_id, &agent_name)
+            .await,
+    )?;
+    for viewer in &viewers {
+        crate::session_identity::authorize_actor(ctx, viewer, false, "read the product inbox")?;
+    }
+    let viewer_ids: Vec<i64> = viewers.iter().filter_map(|viewer| viewer.id).collect();
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::product_inbox::fetch_inbox_for_product_agent_scoped(
             ctx.cx(),
             &pool,
             product_id,
             &agent_name,
+            &viewer_ids,
             urgent,
             since_micros,
             max_messages,
+            with_bodies,
         )
-        .await
-    } else {
-        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent_metadata(
-            ctx.cx(),
-            &pool,
-            product_id,
-            &agent_name,
-            urgent,
-            since_micros,
-            max_messages,
-        )
-        .await
-    })?;
+        .await,
+    )?;
     phase.mark("sqlite_query");
 
     let out: Vec<InboxMessage> = rows
@@ -836,6 +876,7 @@ pub async fn fetch_inbox_product(
                 created_ts: Some(micros_to_iso(created_ts)),
                 read_ts: row.read_ts.map(micros_to_iso),
                 ack_ts: row.ack_ts.map(micros_to_iso),
+                via: crate::messaging::inbox_via(&row.kind),
                 kind: row.kind,
                 attachments: parse_attachment_metadata_json(&msg.attachments),
                 body_md: if with_bodies { Some(msg.body_md) } else { None },
@@ -929,6 +970,7 @@ pub async fn summarize_thread_product(
     let mut summary = crate::search::summarize_messages(&rows);
 
     // Optional LLM refinement (legacy parity: same merge semantics as summarize_thread).
+    let mut llm_stub = false;
     if use_llm && config.llm_enabled {
         let start_idx = rows.len().saturating_sub(llm::MAX_MESSAGES_FOR_LLM);
         let msg_tuples: Vec<(i64, String, String, String)> = rows[start_idx..]
@@ -944,6 +986,7 @@ pub async fn summarize_thread_product(
             Ok(output) => {
                 if let Some(parsed) = llm::parse_json_safely(&output.content) {
                     summary = llm::merge_single_thread_summary(&summary, &parsed);
+                    llm_stub = output.is_conformance_fixture();
                 } else {
                     tracing::debug!(
                         "summarize_thread_product.llm_skipped: could not parse LLM response"
@@ -981,6 +1024,7 @@ pub async fn summarize_thread_product(
         examples,
         diagnostics,
         partial_failures,
+        llm_stub,
     };
 
     serde_json::to_string(&response)
@@ -1002,6 +1046,107 @@ mod tests {
     /// `resources::resource_shape_tests::seed_pool`).
     fn seed_pool() -> mcp_agent_mail_db::DbPool {
         get_db_pool().expect("db pool").clone()
+    }
+
+    #[test]
+    fn product_inbox_tool_uses_indexed_readers_and_preserves_delivery_contract() {
+        use mcp_agent_mail_db::{queries, tracking};
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("indexed-product-tool.sqlite3");
+        let archive = temp.path().join("archive");
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", database.display())),
+                ("STORAGE_ROOT", &archive.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+                ("MESSAGING_SESSION_IDENTITY", "0"),
+            ],
+            || {
+                Config::reset_cached();
+                RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                    let cx = Cx::current().expect("runtime product context");
+                    let pool = seed_pool();
+                    let mut projects = Vec::new();
+                    for path in ["/indexed-product-first", "/indexed-product-second", "/indexed-product-foreign"] {
+                        projects.push(queries::ensure_project(&cx, &pool, path).await.into_result().unwrap().id.unwrap());
+                    }
+                    let product = queries::ensure_product(&cx, &pool, None, Some("indexed-product-tool"))
+                        .await.into_result().unwrap();
+                    queries::link_product_to_projects(&cx, &pool, product.id.unwrap(), &projects[..2])
+                        .await.into_result().unwrap();
+                    let conn = pool.acquire(&cx).await.into_result().unwrap();
+                    conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                    for (offset, project) in projects.iter().enumerate() {
+                        let sender = 10 + i64::try_from(offset).unwrap() * 10;
+                        let viewer = sender + 1;
+                        conn.execute_raw(&format!(
+                            "INSERT INTO agents(id,project_id,name,program,model,inception_ts,last_active_ts) VALUES \
+                             ({sender},{project},'RedFox','test','test',0,7),({viewer},{project},'BlueLake','test','test',0,7)"
+                        )).unwrap();
+                        let id = 100 + i64::try_from(offset).unwrap() * 10;
+                        conn.execute_raw(&format!(
+                            "INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts,importance,ack_required,recipients_json) VALUES \
+                             ({id},{project},{sender},'direct','direct body',{id},'high',1,'{{\"to\":[\"BlueLake\"],\"bcc\":[\"PrivateViewer\"]}}'), \
+                             ({},{project},{sender},'shared','shared body',{},'normal',0,'{{\"to\":[\"project:shared\"]}}'); \
+                             INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) VALUES({id},{viewer},'bcc',8,9); \
+                             INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES \
+                             ({id},{project},'to',1),({},{project},'to',1); \
+                             INSERT INTO project_mailbox_receipts(message_id,agent_id,read_ts,ack_ts) VALUES \
+                             ({id},{viewer},88,99),({},{viewer},NULL,NULL)",
+                            id+1,id+1,id+1,id+1
+                        )).unwrap();
+                    }
+                    conn.execute_raw("COMMIT").unwrap();
+                    drop(conn);
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let invoke = |bodies, urgent, since, limit| {
+                        fetch_inbox_product(&ctx, "indexed-product-tool".into(), "bluelake".into(),
+                            Some(limit), Some(urgent), Some(bodies), since)
+                    };
+                    // Warm normal read admission before observing the tool's actual query route.
+                    invoke(false, false, None, 4).await.unwrap();
+                    let tracker = Arc::new(tracking::QueryTracker::new());
+                    tracker.enable(None);
+                    let _tracking = tracking::set_active_tracker(Arc::clone(&tracker));
+                    for bodies in [false, true] {
+                        tracker.reset();
+                        let response = invoke(bodies, false, None, 3).await.unwrap();
+                        let rows: Vec<serde_json::Value> = serde_json::from_str(&response).unwrap();
+                        assert_eq!(rows.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![111,110,101]);
+                        assert!(rows.iter().all(|row| row.get("body_md").is_some() == bodies));
+                        assert_eq!(rows[0]["via"], "project");
+                        assert_eq!(rows[1]["kind"], "bcc");
+                        assert_eq!(rows[1]["read_ts"], micros_to_iso(8));
+                        assert_eq!(rows[1]["ack_ts"], micros_to_iso(9));
+                        assert!(rows.iter().all(|row|row.get("bcc").is_none_or(|bcc|bcc.as_array().is_some_and(Vec::is_empty))));
+                        assert!(!response.contains("PrivateViewer"));
+                        if bodies {
+                            assert_eq!(rows[0]["body_md"], "shared body");
+                            assert_eq!(rows[1]["body_md"], "direct body");
+                        }
+                        let observations = tracker.snapshot();
+                        assert!(observations.per_table.get("message_recipients").copied().unwrap_or(0)>0,
+                            "the public tool must run the indexed recipient reader, not the old product join: {observations:?}");
+                        assert!(observations.per_table.get("messages").copied().unwrap_or(0)>0,
+                            "message hydration must use the indexed reader: {observations:?}");
+                    }
+                    let urgent: Vec<serde_json::Value> = serde_json::from_str(&invoke(true,true,None,10).await.unwrap()).unwrap();
+                    assert_eq!(urgent.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(),vec![110,100]);
+                    let since: Vec<serde_json::Value> = serde_json::from_str(&invoke(false,false,Some(micros_to_iso(110)),10).await.unwrap()).unwrap();
+                    assert_eq!(since.iter().map(|row|row["id"].as_i64().unwrap()).collect::<Vec<_>>(),vec![111]);
+                    let conn=pool.acquire(&cx).await.into_result().unwrap();
+                    let activity=conn.query_sync("SELECT last_active_ts FROM agents WHERE name='BlueLake'",&[]).unwrap();
+                    assert!(activity.iter().all(|row|row.get_named::<i64>("last_active_ts").unwrap()==7));
+                    let receipts=conn.query_sync("SELECT read_ts,ack_ts FROM project_mailbox_receipts WHERE message_id=111 AND agent_id=21",&[]).unwrap();
+                    assert!(receipts[0].get_named::<Option<i64>>("read_ts").unwrap().is_none());
+                    assert!(receipts[0].get_named::<Option<i64>>("ack_ts").unwrap().is_none());
+                    drop(conn);
+                });
+                Config::reset_cached();
+            },
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1631,6 +1776,116 @@ mod tests {
                 });
             },
         );
+    }
+
+    #[test]
+    fn ensure_product_repeats_cleanly_and_product_search_stays_in_the_product() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-scope.sqlite3");
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::current().expect("runtime installs product context");
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    // The key is neither a uid nor the stored name.
+                    let ensure = || {
+                        ensure_product(
+                            &ctx,
+                            Some("core-suite".to_string()),
+                            Some("Core Suite".to_string()),
+                        )
+                    };
+                    let first: ProductResponse =
+                        serde_json::from_str(&ensure().await.expect("first ensure"))
+                            .expect("product JSON");
+                    let again: ProductResponse =
+                        serde_json::from_str(&ensure().await.expect("repeat ensure"))
+                            .expect("product JSON");
+                    assert_eq!(again.id, first.id, "a repeat call returns the product");
+
+                    let pool = seed_pool();
+                    let project = |key: &'static str| {
+                        let pool = pool.clone();
+                        let cx = cx.clone();
+                        async move {
+                            match mcp_agent_mail_db::queries::ensure_project(&cx, &pool, key).await
+                            {
+                                Outcome::Ok(project) => project,
+                                other => panic!("ensure {key} failed: {other:?}"),
+                            }
+                        }
+                    };
+                    let inside = project("/product-scope-inside").await;
+                    let outside = project("/product-scope-outside").await;
+                    if let Outcome::Err(error) =
+                        mcp_agent_mail_db::queries::link_product_to_projects(
+                            &cx,
+                            &pool,
+                            first.id,
+                            &[inside.id.unwrap_or(0)],
+                        )
+                        .await
+                    {
+                        panic!("link failed: {error}");
+                    }
+                    let err = search_product_within(&ctx, &first.product_uid, &outside.slug)
+                        .await
+                        .expect_err("a project outside the product is refused");
+                    assert_eq!(
+                        crate::tool_util::tool_error_code(&err),
+                        Some("INVALID_ARGUMENT")
+                    );
+                    search_product_within(&ctx, &first.product_uid, &inside.slug)
+                        .await
+                        .expect("a linked project narrows the search");
+                });
+            },
+        );
+    }
+
+    /// `search_messages_product` for "deploy", narrowed to project `slug`.
+    async fn search_product_within(
+        ctx: &McpContext,
+        product_uid: &str,
+        slug: &str,
+    ) -> McpResult<String> {
+        search_messages_product(
+            ctx,
+            product_uid.to_string(),
+            "deploy".to_string(),
+            None,
+            None,
+            Some(slug.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     #[test]

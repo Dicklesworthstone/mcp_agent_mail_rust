@@ -81,6 +81,78 @@ which overrides the working-directory `.env`.
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.
 
+For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
+only that startup probe. The background guard remains enabled and starts its
+first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,
+minimum 1). The integrity verdict stays yellow with the configured skip and
+scheduled time until a full check passes; a failed check stays red. The full
+check cadence remains `INTEGRITY_CHECK_INTERVAL_HOURS` (default 1; `0` disables
+scheduled full checks).
+
+Keep `INTEGRITY_GUARD_ENABLED=true` to retain periodic checks and automatic
+backups. Setting it to `false` disables the entire worker, including database
+maintenance. To disable only checkpoint/ANALYZE/VACUUM/journal-size maintenance,
+use `DB_MAINTENANCE_ENABLED=false`; checks and backups still run. These settings
+take effect when the server starts. Existing service overrides remain an
+operator decision; inspect them before changing a deployment.
+
+### Verify a mailbox before upgrading [read-only]
+
+Use the installed binary and the same `STORAGE_ROOT` and `DATABASE_URL` as
+the service. Stop the service gracefully through its supervisor and prevent
+automatic restarts while inspecting or copying the mailbox. Then run:
+
+```bash
+am doctor locks --json
+am doctor drain --json
+am doctor check --json
+am doctor archive-verify --json
+am doctor backups --json
+```
+
+Inspect `safe_to_mutate` in the drain report; its exit code alone does not
+prove the owner has stopped. Resolve findings before upgrading. Preserve an
+offline copy of the entire storage directory and, if the database lives
+elsewhere, its complete database family, including WAL, SHM, engine sidecars,
+and recovery artifacts. Keep the old binary and the diagnostic output. Copy
+only while all mailbox writers remain stopped; copying the main SQLite file
+alone can omit committed WAL data.
+
+There is no required standalone forced-checkpoint command in this procedure.
+Do not delete WAL, SHM, certificate, or namespace files to make an upgrade
+start. `am doctor check` is verification, not a promise to checkpoint or
+migrate. Start the new binary with the same configuration, then repeat the
+checks and review startup logs. Preserve the offline copy until verification
+passes. A support bundle can retain sanitized diagnostic evidence:
+
+```bash
+am doctor support-bundle --output-dir /abs/path/upgrade-evidence --json
+```
+
+For GH#357, startup may reconcile archive-ahead state before normal pool
+migrations. Bounded replay now prepares its required additive message columns
+transactionally through canonical SQLite before querying them; the ordinary
+migration runner subsequently records the migrations and performs dependent
+work. When columns are added, canonical record materialization preserves
+legacy row values before runtime reads resume. Replay rechecks missing IDs in
+its write transaction and leaves already present messages untouched. If
+post-apply inventories still disagree, the reconcile fails without
+reconstructing; a primary that passed its health check keeps serving, with the
+drift left pending for the periodic retry. The startup warning says to run
+`am doctor health`, then `am doctor reconstruct --yes` to retry under
+supervision.
+A replay/schema error rolls back and stops reconciliation without
+reconstructing a healthy primary. Existing corruption recovery still has its
+separate health checks and recovery admission controls.
+
+Archive-ahead means inventory drift, not confirmed corruption. A successful
+reconciliation message does not establish damage. The reported 984-versus-982
+upgrade discrepancy has not been reproduced here; stale WAL certification is
+an unverified hypothesis. Keep the complete pre-upgrade database family and
+logs if inventories disagree. Do not infer missing committed rows from an
+`immutable=1` read of a main file when a populated WAL exists: that mode ignores
+the WAL.
+
 ## 3. Register a named operator agent [stateful]
 
 **Goal:** Create or refresh an explicit agent identity for a project.
@@ -165,7 +237,7 @@ print((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec='sec
 PY
 )"
 
-am robot timeline --project "$PROJECT" --agent "$AGENT" --since "$SINCE" --format toon
+am robot timeline --project "$PROJECT" --source "$AGENT" --since "$SINCE" --format toon
 am robot analytics --project "$PROJECT" --agent "$AGENT" --format toon
 ```
 
@@ -295,7 +367,7 @@ archive.
 
 ```bash
 PROJECT=/abs/path/project
-OUT=~/mailbox-share.zip
+OUT=~/mailbox-share
 AGE_RECIPIENT=age1example...
 
 am share export --output "$OUT" --project "$PROJECT" --dry-run
@@ -303,9 +375,15 @@ am share export --output "$OUT" --project "$PROJECT" --zip --age-recipient "$AGE
 am share verify "$OUT"
 ```
 
-**Expected output:** The dry run summarizes what would be exported, the real
-export writes the bundle to `OUT`, and verify confirms the resulting archive is
-well-formed.
+**Expected output:** The dry run summarizes what would be exported. The real
+export writes the bundle directory to `OUT` and the encrypted archive beside it
+(`$OUT.zip.age`; `$OUT.zip` without `--age-recipient`). `am share verify` checks
+a bundle directory, not an archive: to check what you will ship, run
+`am share decrypt "$OUT.zip.age"` (it writes `$OUT.zip`), unzip that, and verify
+the unpacked directory. It hashes every file the export wrote against the
+manifest (`Files valid`), so with a signature the whole bundle is covered; the
+hosting config the deploy wizard rewrites per provider (`_headers`,
+`_redirects`, `.nojekyll`) is left out.
 
 **Troubleshooting:** If you need a different scrub profile or chunking behavior,
 add the relevant `am share export` flags explicitly. Use a real Age recipient
@@ -362,6 +440,157 @@ If that reconciler is not running or has stopped making progress, health exits
 **Troubleshooting:** If the mailbox lock is busy, wait for the current archive
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
+
+### Automatic backup retention and actual disk reclamation
+
+Successful automatic publication runs retention immediately, including during
+long-running server operation. On supported Unix systems the default policy
+physically removes superseded periodic backup generations when verification
+and filesystem checks establish that doing so preserves recovery. Rotation of
+incident evidence into `doctor/reclaimable/` remains a move: those bytes still
+occupy the filesystem.
+
+`AM_BACKUP_KEEP_COUNT` requests the newest three generations per backup kind by
+default, with a minimum of one. The current `.bak` publication slot and the
+exact verified recovery generation remain protected, even when an older verified
+generation falls outside that window. Automatic deletion accepts only strict
+timestamped periodic names, requires a fully verified newer restore point and
+a valid standalone candidate, and proves common mailbox scope through a
+matching nonempty database lineage or an exact byte-for-byte match to the
+verified restore point. These checks apply to resident and historical files.
+Companion recovery state, changed files, unsafe paths, or observed active
+readers cause refusal. On Linux this includes memory mappings whose file
+descriptors have already closed. A bad backup cannot become disposable merely
+because its filename looks old.
+
+Retention inventories both resident backups and material already accumulated
+under `doctor/reclaimable/`. Native historical rotation files are eligible only
+inside generated `rotation-YYYYMMDDTHHMMSSZ[-N]` directories, with the same
+verification and scope proof as resident candidates. A recreated mailbox's
+older lineage remains protected unless it is an exact duplicate. Recorded recovery
+runs, including the offline script's `rotated-backups-*` and
+`proactive-staging-*` directories, retain their complete manifest, action logs,
+and payloads for inspection, resume, or restore. Successful move receipts do
+not authorize deletion. Unrecognized material and failed or interrupted backup
+stages remain recovery evidence.
+
+Empty native rotation directories are also removed, including directories
+emptied by the current reclamation pass. This releases directory inodes as well
+as backup-file storage. Cleanup inspects only immediate, strictly named native
+rotation directories and uses an empty-directory removal through retained
+directory handles. Unknown directories, nested trees, manifests, and active
+directory readers or staging operations remain protected. A bounded empty-only
+sweep runs before the full backup inventory, so an old installation with more
+than 16,384 empty rotation directories can drain over successive passes instead
+of remaining permanently blocked by the inventory limit. Each rotation removes
+at most 128 empty directories across its pre-inventory and post-reclamation
+sweeps. Explicit `AM_BACKUP_ROTATION_DELETE=false` also disables this cleanup.
+
+Automatic exporters also have admission limits so refused reclamation cannot
+silently produce unlimited new copies. The periodic count limit is
+`keep_count + 3`, including retained historical periodic files. The projected
+logical byte limit is the larger of 512 MiB and
+`(keep_count + 3) × (current database bytes + WAL bytes)`. Existing periodic
+images and the full observed `doctor/reclaimable/` footprint count toward that
+byte limit; a proposed publication also reserves one current database-plus-WAL
+estimate. Separate staging admission and disk-headroom checks still apply.
+Metadata inspection now uses the same bounded staging namespace as backup
+exports. Legacy `.snapshot-inspect-*.sqlite3` files left beside the database
+by older interrupted inspections also spend the parent-wide staging count
+and byte budget. They remain uncertain recovery evidence; automatic retention
+does not delete them. A failed inspection preserves its new staging directory
+and reports that path, while successful metadata publication removes it.
+The resident retention window can shorten to restore count or byte capacity,
+while preserving the publication slot and verified recovery generation. Only
+confirmed removals reduce that calculation; a refused candidate cannot prevent
+cleanup from considering another safely superseded generation in the window.
+These are bounds on cooperating automatic producers, not a filesystem quota
+on operator exports or other programs.
+
+An old oversized backlog with missing or stale verification metadata may need
+a fresh verified publication before any safe deletion can proceed. The
+per-mailbox automatic-backup journal durably reserves **one** such repair export
+after live verification and exclusive snapshot admission, immediately before
+the first backup mutation. An ordinary export also passes its disk-headroom
+check first; preserving stale companion recovery files can spend the allowance
+before that later check. A reader or a failed live check can therefore defer
+without spending the allowance. Once export begins, a crash, failed backup
+validation, or failed metadata publication does not replenish that allowance.
+Further over-budget exports remain refused
+until an ordinary admission check observes sufficient retained count and byte
+capacity after cleanup. Existing failed-stage admission is checked first. A
+refused export still permits independently admitted, bounded reclamation of
+superseded backups, including when interrupted staging or an unavailable
+journal prevents publication, or when the producer refuses disk headroom or
+fails verification before publishing. This leaves the preserved operation evidence
+and export retry state intact. Do not remove the journal or authority lock to
+bypass a refusal: inspect the preserved evidence and resolve the underlying
+retention, permission, or verification finding.
+
+Setting `AM_BACKUP_ROTATION_DELETE=false` explicitly preserves move-only
+retention and disables the extra repair export; automatic publication stops at
+the same admission limits when staging cannot release space. Leaving the
+variable unset enables the verified periodic reclamation policy. Setting it
+to `true` also allows incident-backup reclamation. On Unix, this requires an
+older, standalone SQLite image with a fully verified successor, matching
+mailbox lineage or exact duplicate bytes, and the same pin, reader, hardlink,
+and namespace checks used for periodic generations. Corrupt or insufficiently
+verified incident evidence stays available even with explicit deletion enabled.
+Platforms without the verified descriptor-bound deletion boundary preserve
+incident evidence. Explicit opt-in never falls back to unchecked pathname deletion.
+
+Retention also holds the existing database recovery election from selection
+through reclamation. A live recovery, an occupied legacy `.recovery.lock`, or
+an unresolved recovery receipt ending in `.pending` prevents cleanup. The
+verified survivor's inode, links, timestamps, and companion state are checked
+again before each destructive operation. Explicit CLI restore holds the same
+election before copying its backup, so retention cannot remove its source
+during staging. Resolve pending recovery operations through recovery tooling;
+removing their markers does not establish that their evidence is disposable.
+
+Startup and publication logs report `bytes_staged`, `bytes_deleted`,
+`bytes_reclaimed`, and `bytes_retained`; scheduled retention also reports
+`empty_directories_deleted` separately from backup payload counts and bytes.
+Staged and retained values are logical file lengths still occupying storage.
+Deleted bytes are the logical lengths of confirmed removals; reclaimed bytes
+count the allocated blocks associated with verified backup unlinks. The latter
+is not a measurement of the
+filesystem's free-space delta: filesystem snapshots and shared storage can
+retain blocks independently. Refused operations retain their byte accounting.
+An incomplete inventory refuses backup-file mutations and marks totals as lower
+bounds; the separately admitted empty-directory sweep can still make progress.
+Uncertain moves or unlinks have separate counters rather than being reported
+as successful reclamation. Each cleanup pass attempts at most 128 periodic
+candidates, with a candidate-byte budget of the larger of 512 MiB and the
+current database's size. One oversized candidate can still be attempted so a
+large mailbox can make progress. Verifying the pinned restore point adds I/O
+beyond that candidate budget. A shared progress cursor keeps refused older
+files from repeatedly preventing examination of the remaining backlog.
+Explicit incident reclamation has a separate 128-candidate allowance and the
+same candidate-byte limit, so incident verification cannot spend the periodic
+queue's entire cleanup allowance.
+Bounded cleanup passes can leave more work for a later attempt; the publication
+limit remains in force while that work is pending.
+
+`am doctor health` prints a `backup_retention:` line for this state. It reads
+`storage.sqlite3.bak.meta.json` the way a verified backup would and computes
+the producer's count and byte footprint with the same rule as admission. An
+unversioned sidecar written by v0.3.13 through v0.3.30 is a warning: the next
+verified backup keeps it as a `.legacy-<sha256>.json` sibling and replaces it.
+Health fails (exit 1) when verified backups cannot replace the sidecar
+(malformed, foreign, from a newer format, or not a regular file), because
+verified backups then keep failing and rotation keeps every backup generation.
+It also fails when the footprint is at the publication limit, because
+automatic backups are then paused. For an unrecognized sidecar, move it aside
+and keep it as evidence; the next verified backup records fresh metadata.
+While automatic backups are paused, retention can delete superseded
+generations only after a verified backup has recorded current metadata, and
+the server makes at most one verified repair backup while over the limit. If
+health still does not show `snapshot_metadata=current` after the next backup
+attempt, stop the server and remove old `storage.sqlite3.bak.<timestamp>`
+files by hand, keeping `storage.sqlite3.bak` and the newest few. Generations
+that retention cannot tie to this mailbox also stay where they are; if
+`backup_images` stops falling, remove them the same way.
 
 ## 14. Plan archive pack maintenance [read-only]
 

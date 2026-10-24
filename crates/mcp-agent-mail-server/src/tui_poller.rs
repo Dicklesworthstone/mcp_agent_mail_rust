@@ -7,7 +7,7 @@
 //! on data changes plus periodic heartbeat intervals.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -102,7 +102,7 @@ struct AgentReservationStats {
     active: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AgentContactStats {
     respected_count: u64,
     violation_count: u64,
@@ -402,9 +402,8 @@ struct PollerConnectionState {
     _snapshot_dir: Option<crate::SnapshotDirGuard>,
     last_data_version: Option<i64>,
     last_reservation_snapshot_gap_refresh_micros: i64,
-    /// Tracks last full snapshot time for the fallback path when
-    /// `PRAGMA data_version` is unavailable.  Prevents running expensive
-    /// aggregate queries on every 2-second poll cycle.
+    /// Completion time of the last full projection, including detail fallback.
+    /// Bounds unknown-version polling and repeated unchanged detail gaps.
     last_full_snapshot_micros: i64,
 }
 
@@ -796,7 +795,26 @@ fn fetch_db_stats_with_connection(
     state: &mut PollerConnectionState,
     previous: &DbStatSnapshot,
 ) -> Option<DbPollSnapshotUpdate> {
-    let now = now_micros();
+    fetch_db_stats_with_clock(state, previous, now_micros)
+}
+
+/// An unresolved detail gap is not evidence of a new database revision. For
+/// example, the aggregate agent count includes retired identities whereas the
+/// visible agent list deliberately excludes them. Retry the full projection at
+/// the fallback cadence, not on every poll forever (GH#354). A backward clock
+/// jump permits one refresh; its completion establishes the new clock anchor.
+const fn full_snapshot_retry_due(now: i64, last_completed: i64) -> bool {
+    last_completed <= 0
+        || now < last_completed
+        || now.saturating_sub(last_completed) >= NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS
+}
+
+fn fetch_db_stats_with_clock(
+    state: &mut PollerConnectionState,
+    previous: &DbStatSnapshot,
+    mut clock: impl FnMut() -> i64,
+) -> Option<DbPollSnapshotUpdate> {
+    let now = clock();
     let data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
     let must_refresh_for_expiry = reservation_expiry_requires_time_refresh(previous, now);
     let must_refresh_for_snapshot_gap = reservation_snapshot_gap_requires_refresh(
@@ -804,17 +822,20 @@ fn fetch_db_stats_with_connection(
         now,
         state.last_reservation_snapshot_gap_refresh_micros,
     );
-    let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous);
-    // When `PRAGMA data_version` is available, use it to skip full snapshots
-    // when nothing has changed.
+    let full_retry_due = full_snapshot_retry_due(now, state.last_full_snapshot_micros);
+    let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous) && full_retry_due;
+    // A changed or newly available version still refreshes immediately. Only
+    // repeated attempts against unchanged/unknown revisions use the retry gate.
     let version_unchanged = match (data_version, state.last_data_version) {
         (Some(current), Some(prev)) => current == prev,
         _ => false,
     };
     if version_unchanged && previous.timestamp_micros > 0 {
         let update = if must_refresh_for_detail_gap {
-            DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
-                .fetch_snapshot(Some(previous))
+            let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
+                .fetch_snapshot(Some(previous));
+            state.last_full_snapshot_micros = clock();
+            snapshot
         } else if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
             refresh_reservation_time_sensitive_snapshot(state, previous, now)
         } else {
@@ -836,21 +857,23 @@ fn fetch_db_stats_with_connection(
         );
         return Some(DbPollSnapshotUpdate::Snapshot(update));
     }
-    // When data_version is unavailable (e.g. FrankenSQLite), throttle
-    // expensive full snapshots to once every 30 seconds to avoid burning
-    // CPU on repeated no-op poll cycles.
+    // Unknown versions use the same completion-based budget. A detail gap
+    // cannot override it, but reservation expiry and gap recovery retain their
+    // independent time-sensitive refresh behavior.
     if data_version.is_none()
         && previous.timestamp_micros > 0
         && !must_refresh_for_detail_gap
         && !must_refresh_for_expiry
         && !must_refresh_for_snapshot_gap
-        && (now - state.last_full_snapshot_micros) < NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS
+        && !full_retry_due
     {
         return Some(DbPollSnapshotUpdate::TimestampOnly(now));
     }
     let snapshot = DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
         .fetch_snapshot(Some(previous));
-    state.last_full_snapshot_micros = now;
+    // Include query and fallback-connection work in the attempt. Slow work
+    // must not consume its own pause and immediately schedule another scan.
+    state.last_full_snapshot_micros = clock();
     if snapshot_is_empty(&snapshot)
         && required_mail_schema_state(&state.conn) != RequiredMailSchemaState::Present
     {
@@ -2006,6 +2029,14 @@ fn fetch_agent_reservation_stats(
         .unwrap_or_default()
 }
 
+/// Per-recipient contact-policy outcomes over the health window.
+///
+/// The approved links are read once and the recipient rows are grouped by
+/// (recipient, sender, policy) with no subqueries; the respected/violation
+/// classification runs in Rust. Expressing the link check as a correlated
+/// `EXISTS` over a CTE made the engine re-run the CTE for every recipient row
+/// in the 30-day window, which pegged the poller thread at a full core once
+/// the window held enough mail (br-bdo5g).
 fn fetch_agent_contact_stats(
     conn: &DbConn,
     agent_ids_sql: &str,
@@ -2015,71 +2046,106 @@ fn fetch_agent_contact_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
-    let message_created_expr = timestamp_sort_expr("m.created_ts");
+    let Some(approved_links) = fetch_approved_contact_links(conn, now) else {
+        return HashMap::new();
+    };
+    conn.query_sync(&contact_policy_rows_sql(agent_ids_sql, window_start), &[])
+        .ok()
+        .map(|rows| {
+            let mut stats: HashMap<i64, AgentContactStats> = HashMap::new();
+            for row in rows {
+                let Some(recipient_id) = parse_raw_i64(&row, "agent_id") else {
+                    continue;
+                };
+                let sender_id = parse_raw_i64(&row, "sender_id");
+                let policy = row.get_named::<String>("contact_policy").ok();
+                let row_count =
+                    nonnegative_i64_to_u64(parse_raw_i64(&row, "row_count").unwrap_or(0));
+                let (respected, violation) = classify_contact_policy_rows(
+                    policy.as_deref(),
+                    sender_id,
+                    recipient_id,
+                    &approved_links,
+                );
+                let entry = stats.entry(recipient_id).or_default();
+                if respected {
+                    entry.respected_count += row_count;
+                }
+                if violation {
+                    entry.violation_count += row_count;
+                }
+            }
+            stats
+        })
+        .unwrap_or_default()
+}
+
+/// Directed (sender, recipient) pairs allowed by an approved, unexpired link.
+/// A link permits messages in both directions. `None` when the query fails.
+fn fetch_approved_contact_links(conn: &DbConn, now: i64) -> Option<HashSet<(i64, i64)>> {
     let link_expires_expr = timestamp_sort_expr("al.expires_ts");
-    let sql = format!(
-        "WITH approved_links AS ( \
-            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
-            FROM agent_links al \
-            WHERE status IN ('approved', 'accepted') \
-              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
-            UNION \
-            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
-            FROM agent_links al \
-            WHERE status IN ('approved', 'accepted') \
-              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
-         ) \
-         SELECT \
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT a_agent_id AS a_agent_id, b_agent_id AS b_agent_id \
+                 FROM agent_links al \
+                 WHERE status IN ('approved', 'accepted') \
+                   AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now})"
+            ),
+            &[],
+        )
+        .ok()?;
+    let mut pairs = HashSet::with_capacity(rows.len() * 2);
+    for row in rows {
+        if let (Some(a), Some(b)) = (
+            parse_raw_i64(&row, "a_agent_id"),
+            parse_raw_i64(&row, "b_agent_id"),
+        ) {
+            pairs.insert((a, b));
+            pairs.insert((b, a));
+        }
+    }
+    Some(pairs)
+}
+
+fn contact_policy_rows_sql(agent_ids_sql: &str, window_start: i64) -> String {
+    let message_created_expr = timestamp_sort_expr("m.created_ts");
+    format!(
+        "SELECT \
             mr.agent_id AS agent_id, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
-                    WHEN m.sender_id = mr.agent_id THEN 1 \
-                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
-                    ELSE 0 END) AS respected_count, \
-            SUM(CASE \
-                    WHEN recipient.contact_policy = 'contacts_only' \
-                     AND m.sender_id != mr.agent_id \
-                     AND NOT EXISTS ( \
-                        SELECT 1 FROM approved_links link \
-                        WHERE link.sender_id = m.sender_id \
-                          AND link.recipient_id = mr.agent_id \
-                    ) THEN 1 \
-                    WHEN recipient.contact_policy = 'block_all' \
-                     AND m.sender_id != mr.agent_id \
-                    THEN 1 \
-                    ELSE 0 END) AS violation_count \
+            m.sender_id AS sender_id, \
+            recipient.contact_policy AS contact_policy, \
+            COUNT(*) AS row_count \
          FROM message_recipients mr \
          JOIN messages m ON m.id = mr.message_id \
          JOIN agents recipient ON recipient.id = mr.agent_id \
          WHERE mr.agent_id IN ({agent_ids_sql}) \
            AND {message_created_expr} >= {window_start} \
-         GROUP BY mr.agent_id"
-    );
-    conn.query_sync(&sql, &[])
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let agent_id = parse_raw_i64(&row, "agent_id")?;
-                    Some((
-                        agent_id,
-                        AgentContactStats {
-                            respected_count: nonnegative_i64_to_u64(
-                                parse_raw_i64(&row, "respected_count").unwrap_or(0),
-                            ),
-                            violation_count: nonnegative_i64_to_u64(
-                                parse_raw_i64(&row, "violation_count").unwrap_or(0),
-                            ),
-                        },
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+         GROUP BY mr.agent_id, m.sender_id, recipient.contact_policy"
+    )
+}
+
+/// `(respected, violation)` for messages from `sender_id` to `recipient_id`
+/// under the recipient's contact policy. Mirrors SQL comparison semantics: a
+/// NULL sender matches neither the self-send nor the link rules.
+fn classify_contact_policy_rows(
+    policy: Option<&str>,
+    sender_id: Option<i64>,
+    recipient_id: i64,
+    approved_links: &HashSet<(i64, i64)>,
+) -> (bool, bool) {
+    let self_send = sender_id == Some(recipient_id);
+    let linked = sender_id.is_some_and(|sender| approved_links.contains(&(sender, recipient_id)));
+    let foreign_sender = sender_id.is_some_and(|sender| sender != recipient_id);
+    let respected = matches!(policy, Some("open" | "auto"))
+        || self_send
+        || (policy == Some("contacts_only") && linked);
+    let violation = match policy {
+        Some("contacts_only") => foreign_sender && !linked,
+        Some("block_all") => foreign_sender,
+        _ => false,
+    };
+    (respected, violation)
 }
 
 fn fetch_agent_decision_counts(agents: &[AgentListRow], window_start: i64) -> HashMap<String, u64> {
@@ -3913,7 +3979,13 @@ mod tests {
     #[test]
     fn open_sync_connection_with_path_uses_shared_server_resolver() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let absolute_db = dir.path().join("poller_fallback.sqlite3");
+        // The resolver reports canonical paths; macOS temp dirs sit behind the
+        // /var -> /private/var symlink.
+        let absolute_db = dir
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("poller_fallback.sqlite3");
         let conn = DbConn::open_file(absolute_db.to_string_lossy().as_ref()).expect("open");
         create_empty_mail_schema(&conn);
         drop(conn);
@@ -6727,5 +6799,481 @@ first body
         assert_eq!(input.reservation_active_count, 0);
         assert_eq!(input.contact_policy_respected_count, None);
         assert!(input.last_active_age_micros.is_some());
+    }
+
+    /// The pre-br-bdo5g query (correlated `EXISTS` over a CTE), kept as the
+    /// oracle the subquery-free implementation must agree with.
+    fn legacy_contact_stats(
+        conn: &DbConn,
+        agent_ids_sql: &str,
+        window_start: i64,
+        now: i64,
+    ) -> HashMap<i64, AgentContactStats> {
+        let message_created_expr = timestamp_sort_expr("m.created_ts");
+        let link_expires_expr = timestamp_sort_expr("al.expires_ts");
+        let sql = format!(
+            "WITH approved_links AS ( \
+                SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
+                FROM agent_links al \
+                WHERE status IN ('approved', 'accepted') \
+                  AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+                UNION \
+                SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
+                FROM agent_links al \
+                WHERE status IN ('approved', 'accepted') \
+                  AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+             ) \
+             SELECT \
+                mr.agent_id AS agent_id, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                        WHEN m.sender_id = mr.agent_id THEN 1 \
+                        WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
+                            SELECT 1 FROM approved_links link \
+                            WHERE link.sender_id = m.sender_id \
+                              AND link.recipient_id = mr.agent_id \
+                        ) THEN 1 \
+                        ELSE 0 END) AS respected_count, \
+                SUM(CASE \
+                        WHEN recipient.contact_policy = 'contacts_only' \
+                         AND m.sender_id != mr.agent_id \
+                         AND NOT EXISTS ( \
+                            SELECT 1 FROM approved_links link \
+                            WHERE link.sender_id = m.sender_id \
+                              AND link.recipient_id = mr.agent_id \
+                        ) THEN 1 \
+                        WHEN recipient.contact_policy = 'block_all' \
+                         AND m.sender_id != mr.agent_id \
+                        THEN 1 \
+                        ELSE 0 END) AS violation_count \
+             FROM message_recipients mr \
+             JOIN messages m ON m.id = mr.message_id \
+             JOIN agents recipient ON recipient.id = mr.agent_id \
+             WHERE mr.agent_id IN ({agent_ids_sql}) \
+               AND {message_created_expr} >= {window_start} \
+             GROUP BY mr.agent_id"
+        );
+        conn.query_sync(&sql, &[])
+            .expect("legacy contact stats query")
+            .into_iter()
+            .map(|row| {
+                (
+                    parse_raw_i64(&row, "agent_id").expect("agent_id"),
+                    AgentContactStats {
+                        respected_count: nonnegative_i64_to_u64(
+                            parse_raw_i64(&row, "respected_count").unwrap_or(0),
+                        ),
+                        violation_count: nonnegative_i64_to_u64(
+                            parse_raw_i64(&row, "violation_count").unwrap_or(0),
+                        ),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn contact_stats(respected_count: u64, violation_count: u64) -> AgentContactStats {
+        AgentContactStats {
+            respected_count,
+            violation_count,
+        }
+    }
+
+    #[test]
+    fn fetch_agent_contact_stats_matches_legacy_correlated_query() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, contact_policy TEXT)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER, created_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create recipients");
+        conn.execute_sync(
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_agent_id INTEGER, b_agent_id INTEGER, status TEXT, expires_ts INTEGER)",
+            &[],
+        )
+        .expect("create agent_links");
+
+        let now = now_micros();
+        let window_start = now.saturating_sub(86_400_000_000);
+        let inside = now.saturating_sub(3_600_000_000);
+        let outside = now.saturating_sub(2 * 86_400_000_000);
+
+        // Recipients 1-8 cover every policy branch; 10-12 are plain senders.
+        conn.execute_sync(
+            "INSERT INTO agents (id, contact_policy) VALUES \
+             (1, 'auto'), (2, 'open'), (3, 'contacts_only'), (4, 'block_all'), \
+             (5, 'contacts_only'), (6, 'contacts_only'), (7, 'contacts_only'), (8, NULL), \
+             (10, 'auto'), (11, 'auto'), (12, 'auto')",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES (?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(10),
+                Value::BigInt(3),
+                Value::Text("approved".into()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert never-expiring link 10<->3");
+        conn.execute_sync(
+            "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES (?, ?, ?, ?, NULL)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(5),
+                Value::BigInt(11),
+                Value::Text("accepted".into()),
+            ],
+        )
+        .expect("insert reverse-direction link 5<->11");
+        for (id, a, b, status, expires) in [
+            (3, 10, 6, "pending", 0),
+            (4, 11, 6, "approved", now.saturating_sub(1_000)),
+            (5, 12, 6, "approved", now.saturating_add(1_000_000_000)),
+            (6, 10, 7, "rejected", 0),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO agent_links (id, a_agent_id, b_agent_id, status, expires_ts) VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(a),
+                    Value::BigInt(b),
+                    Value::Text(status.into()),
+                    Value::BigInt(expires),
+                ],
+            )
+            .expect("insert link");
+        }
+        for (id, sender, created) in [
+            (1, 10, inside),
+            (2, 11, inside),
+            (3, 12, inside),
+            (4, 3, inside),
+            (5, 4, inside),
+            (6, 10, outside),
+            (7, 11, inside),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO messages (id, sender_id, created_ts) VALUES (?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(sender),
+                    Value::BigInt(created),
+                ],
+            )
+            .expect("insert message");
+        }
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id) VALUES \
+             (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (1, 7), (1, 8), \
+             (2, 3), (2, 5), (2, 6), \
+             (3, 6), (3, 4), \
+             (4, 3), (5, 4), (6, 3), (7, 1)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let ids = "1,2,3,4,5,6,7,8";
+        let current = fetch_agent_contact_stats(&conn, ids, window_start, now);
+        let legacy = legacy_contact_stats(&conn, ids, window_start, now);
+        assert_eq!(
+            current, legacy,
+            "subquery-free stats diverged from the legacy query"
+        );
+
+        let expected: HashMap<i64, AgentContactStats> = [
+            (1, contact_stats(2, 0)), // auto: everything respected
+            (2, contact_stats(1, 0)), // open
+            (3, contact_stats(2, 1)), // linked 10, self-send; unlinked 11; out-of-window 10 ignored
+            (4, contact_stats(1, 2)), // block_all: self-send respected, others violate
+            (5, contact_stats(1, 1)), // link stored as (5, 11) admits 11 -> 5; 10 unlinked
+            (6, contact_stats(1, 2)), // pending and expired links do not count; future expiry does
+            (7, contact_stats(0, 1)), // rejected link does not count
+            (8, contact_stats(0, 0)), // NULL policy: neither respected nor violated
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(current, expected);
+    }
+
+    #[test]
+    fn classify_contact_policy_rows_treats_null_sender_like_sql() {
+        let links: HashSet<(i64, i64)> = [(10, 3), (3, 10)].into_iter().collect();
+        assert_eq!(
+            classify_contact_policy_rows(Some("auto"), None, 3, &links),
+            (true, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("contacts_only"), None, 3, &links),
+            (false, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("block_all"), None, 3, &links),
+            (false, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("contacts_only"), Some(10), 3, &links),
+            (true, false)
+        );
+        assert_eq!(
+            classify_contact_policy_rows(Some("Contacts_Only"), Some(11), 3, &links),
+            (false, false),
+            "policy comparison is exact, like SQLite's BINARY collation"
+        );
+    }
+
+    #[test]
+    fn contact_policy_rows_sql_has_no_subquery() {
+        let sql = contact_policy_rows_sql("1,2", 0);
+        assert!(!sql.contains("EXISTS"), "{sql}");
+        assert_eq!(sql.matches("SELECT").count(), 1, "{sql}");
+    }
+
+    // GH#354: the clock is injected, but database/version probes and the
+    // lifecycle-filtered projections use the actual file-backed engine.
+    fn retired_poller_fixture() -> (tempfile::TempDir, PollerConnectionState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("retired-poller.sqlite3");
+        let sqlite_path = path.to_string_lossy().into_owned();
+        let conn = DbConn::open_file(&sqlite_path).expect("open database");
+        create_empty_mail_schema(&conn);
+        conn.execute_sync("ALTER TABLE agents ADD COLUMN retired_at INTEGER", &[])
+            .expect("add retirement column");
+        conn.execute_sync(
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create lifecycle ledger");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'quiet', '/quiet', 1)",
+            &[],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts, retired_at) VALUES (1, 1, 'BlueLake', 'test', 1, 2), (2, 1, 'GreenStone', 'test', 1, NULL)",
+            &[],
+        )
+        .expect("insert retired and deregistered agents");
+        conn.execute_sync(
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (2, 2)",
+            &[],
+        )
+        .expect("deregister second agent");
+        (
+            dir,
+            PollerConnectionState {
+                conn,
+                sqlite_path,
+                _snapshot_dir: None,
+                last_data_version: None,
+                last_reservation_snapshot_gap_refresh_micros: 0,
+                last_full_snapshot_micros: 0,
+            },
+        )
+    }
+
+    fn require_full_update(update: Option<DbPollSnapshotUpdate>) -> DbStatSnapshot {
+        match update {
+            Some(DbPollSnapshotUpdate::Snapshot(snapshot)) => snapshot,
+            _ => panic!("expected a real full snapshot"),
+        }
+    }
+
+    #[test]
+    fn gh354_retired_only_mailbox_does_not_repeat_full_projection_each_poll() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let start = now_micros();
+        let mut previous = DbStatSnapshot::default();
+        let mut full_refreshes = Vec::new();
+        for second in 0_i64..=120 {
+            let now = start + second * 1_000_000;
+            match fetch_db_stats_with_clock(&mut state, &previous, || now) {
+                Some(DbPollSnapshotUpdate::Snapshot(snapshot)) => {
+                    full_refreshes.push(second);
+                    assert_eq!(snapshot.agents, 2, "do not hide historical identities");
+                    assert!(
+                        snapshot.agents_list.is_empty(),
+                        "do not resurrect retired identities"
+                    );
+                    assert_eq!(snapshot.projects, 1);
+                    previous = snapshot;
+                }
+                Some(DbPollSnapshotUpdate::TimestampOnly(timestamp)) => {
+                    assert_eq!(timestamp, now);
+                    previous.timestamp_micros = timestamp;
+                }
+                None => panic!("healthy mailbox lost its observable state"),
+            }
+        }
+        assert_eq!(full_refreshes, [0, 30, 60, 90, 120]);
+        let rows = state
+            .conn
+            .query_sync("SELECT COUNT(*) AS n FROM agents", &[])
+            .unwrap();
+        assert_eq!(rows[0].get_named::<i64>("n").unwrap(), 2);
+    }
+
+    #[test]
+    fn gh354_slow_detail_projection_keeps_a_completion_based_pause() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let start = now_micros();
+        let completed = start + 120_000_000;
+        let mut ticks = [start, completed].into_iter();
+        let previous = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || ticks.next().expect("unexpected clock read"),
+        ));
+        assert!(ticks.next().is_none());
+        assert_eq!(state.last_full_snapshot_micros, completed);
+        for now in [completed, completed + 1, completed + 29_999_999] {
+            assert!(matches!(
+                fetch_db_stats_with_clock(&mut state, &previous, || now),
+                Some(DbPollSnapshotUpdate::TimestampOnly(_)),
+            ));
+        }
+        let next = completed + 30_000_000;
+        let refreshed =
+            require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || next));
+        assert_eq!(refreshed.agents, 2);
+        assert_eq!(refreshed.agents_list.len(), 0);
+    }
+
+    #[test]
+    fn gh354_first_snapshot_and_recovered_version_bypass_detail_retry_pause() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let now = now_micros();
+        state.last_full_snapshot_micros = now;
+        let previous = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || now,
+        ));
+        assert_eq!(previous.agents, 2);
+        // Simulate loss of the prior version observation, not the next probe.
+        // The actual engine still owns its version-availability behavior.
+        let available_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+        state.last_data_version = None;
+        let update = fetch_db_stats_with_clock(&mut state, &previous, || now + 1);
+        if available_version.is_some() {
+            assert!(matches!(update, Some(DbPollSnapshotUpdate::Snapshot(_))));
+        } else {
+            assert!(matches!(
+                update,
+                Some(DbPollSnapshotUpdate::TimestampOnly(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn gh354_new_agent_becomes_visible_without_waiting_for_an_unrelated_gap_retry() {
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
+            let (_dir, mut state) = retired_poller_fixture();
+            let now = now_micros();
+            let previous = require_full_update(fetch_db_stats_with_clock(
+                &mut state,
+                &DbStatSnapshot::default(),
+                || now,
+            ));
+            let before_version = state.last_data_version;
+            let writer = DbConn::open_file(&state.sqlite_path).expect("open independent writer");
+            writer.execute_sync(
+                "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES (3, 1, 'RedFox', 'test', 3)",
+                &[],
+            )
+            .expect("register visible agent");
+            let after_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+            let changed_version = matches!(
+                (before_version, after_version),
+                (Some(a), Some(b)) if a != b
+            );
+            // Without an engine change notification the existing 30s fallback
+            // remains the freshness contract; do not claim event-driven reads.
+            let observed_at = if changed_version {
+                now + 1
+            } else {
+                now + 30_000_000
+            };
+            let refreshed =
+                require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || {
+                    observed_at
+                }));
+            assert_eq!(refreshed.agents, 3);
+            assert_eq!(refreshed.agents_list.len(), 1);
+            assert_eq!(refreshed.agents_list[0].name, "RedFox");
+            assert!(matches!(
+                fetch_db_stats_with_clock(&mut state, &refreshed, || observed_at + 1),
+                Some(DbPollSnapshotUpdate::TimestampOnly(_)),
+            ));
+        });
+    }
+
+    #[test]
+    fn gh354_detail_gap_cooldown_does_not_block_reservation_expiry() {
+        let (_dir, mut state) = retired_poller_fixture();
+        let now = now_micros();
+        let mut previous = require_full_update(fetch_db_stats_with_clock(
+            &mut state,
+            &DbStatSnapshot::default(),
+            || now,
+        ));
+        state.conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, \"exclusive\", created_ts, expires_ts) VALUES (1, 1, 1, 'src/**', 1, 1, 2)",
+            &[],
+        )
+        .unwrap();
+        state.last_data_version = query_data_version(&state.conn, Some(&state.sqlite_path));
+        previous.file_reservations = 1;
+        previous.projects_list[0].reservation_count = 1;
+        previous.reservation_snapshots = vec![ReservationSnapshot {
+            id: 1,
+            project_slug: "quiet".into(),
+            agent_name: "BlueLake".into(),
+            path_pattern: "src/**".into(),
+            exclusive: true,
+            granted_ts: 1,
+            expires_ts: 2,
+            released_ts: None,
+        }];
+        let refreshed =
+            require_full_update(fetch_db_stats_with_clock(&mut state, &previous, || now + 1));
+        assert_eq!(refreshed.file_reservations, 0);
+        assert_eq!(refreshed.projects_list[0].reservation_count, 0);
+        assert_eq!(refreshed.reservation_snapshots.len(), 0);
+        assert_eq!(refreshed.agents, 2);
+        assert_eq!(refreshed.agents_list.len(), 0);
+        let rows = state
+            .conn
+            .query_sync("SELECT id FROM file_reservations", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "observability must not delete the expired lease"
+        );
+    }
+
+    #[test]
+    fn gh354_full_snapshot_retry_clock_boundaries_are_safe() {
+        let start = 1_000_000;
+        assert!(full_snapshot_retry_due(start, 0));
+        assert!(!full_snapshot_retry_due(start, start));
+        assert!(!full_snapshot_retry_due(start + 29_999_999, start));
+        assert!(full_snapshot_retry_due(start + 30_000_000, start));
+        assert!(full_snapshot_retry_due(start - 1, start));
+        assert!(full_snapshot_retry_due(i64::MAX, 1));
+        assert!(full_snapshot_retry_due(i64::MIN, i64::MAX));
     }
 }

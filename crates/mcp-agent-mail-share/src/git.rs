@@ -1,6 +1,12 @@
 use std::path::{Path, PathBuf};
 
-/// Try to extract the git remote URL for the directory.
+/// Try to extract the git remote URL for the directory, without credentials.
+///
+/// The URL feeds hosting signals that are written into the bundle's
+/// `manifest.json` and `HOW_TO_DEPLOY.md`, which are published; a remote such
+/// as `https://user:ghp_token@github.com/o/r.git` must not carry its token
+/// there, whatever the scrub preset. Query strings and fragments are omitted
+/// too: credentials need not be in userinfo or use a recognizable key name.
 ///
 /// br-8ujfs.4.1 (D1): routes through `GitCmd` for per-repo locking.
 #[must_use]
@@ -12,10 +18,32 @@ pub fn git_remote_url(dir: &Path) -> Option<String> {
     if output.status.success() {
         let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !url.is_empty() {
-            return Some(url);
+            return Some(strip_url_credentials(&url));
         }
     }
     None
+}
+
+/// Return a publishable repository URL, not a URL for authenticated transport.
+///
+/// Drop userinfo, query strings, and fragments from `scheme://` URLs. A query
+/// may contain a signed credential with an unknown or percent-encoded key, so
+/// a secret-name denylist cannot safely decide which parameters to preserve.
+/// The scheme, host, port, and path suffice for hosting detection. Other forms
+/// (such as scp-style `git@host:owner/repo`) pass unchanged.
+#[must_use]
+pub fn strip_url_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let public_end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let public = &rest[..public_end];
+    let authority_end = public.find('/').unwrap_or(public.len());
+    let (authority, path) = public.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_credentials, host)| host);
+    format!("{scheme}://{host}{path}")
 }
 
 /// Walk ancestor directories looking for a specific file/dir.
@@ -108,6 +136,119 @@ fn isolated_test_tempdir_from(preferred: &Path) -> tempfile::TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_urls_lose_their_credentials() {
+        assert_eq!(
+            strip_url_credentials("https://alice:ghp_secret@github.com/alice/site.git"),
+            "https://github.com/alice/site.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://x-access-token:abc@github.com/o/r"),
+            "https://github.com/o/r"
+        );
+        // A user name alone is dropped too; an '@' after the host is not
+        // credentials.
+        assert_eq!(
+            strip_url_credentials("ssh://git@example.com/o/r@v2.git"),
+            "ssh://example.com/o/r@v2.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn published_remote_urls_drop_query_and_fragment_secrets() {
+        for suffix in [
+            "?access_token=secret",
+            "?ACCESS%5fTOKEN=secret&ref=main",
+            "?X-Amz-Signature=secret&X-Amz-Credential=identity",
+            "?custom_auth=secret",
+            "#access_token=secret",
+            "?ref=main#secret",
+            "#secret?ref=main",
+        ] {
+            let remote = format!("https://github.com/o/r.git{suffix}");
+            assert_eq!(strip_url_credentials(&remote), "https://github.com/o/r.git");
+        }
+        assert_eq!(
+            strip_url_credentials("https://user:secret@host:8443/r.git?token=secret#secret"),
+            "https://host:8443/r.git"
+        );
+        assert_eq!(
+            strip_url_credentials("https://user:secret@[::1]:8443?token=secret"),
+            "https://[::1]:8443"
+        );
+    }
+
+    #[test]
+    fn remote_url_scrubbing_preserves_paths_and_is_idempotent() {
+        for (remote, public) in [
+            (
+                "https://host/o/r@v2.git?token=secret",
+                "https://host/o/r@v2.git",
+            ),
+            (
+                "https://host/équipe/郵便.git#secret",
+                "https://host/équipe/郵便.git",
+            ),
+            (
+                "https://host/r%3Fpart%23name.git?secret",
+                "https://host/r%3Fpart%23name.git",
+            ),
+            ("ssh://git@host:2222/o/r.git", "ssh://host:2222/o/r.git"),
+            ("git@host:o/r.git", "git@host:o/r.git"),
+            ("../local-repo", "../local-repo"),
+            ("", ""),
+        ] {
+            assert_eq!(strip_url_credentials(remote), public);
+            assert_eq!(strip_url_credentials(public), public);
+        }
+    }
+
+    #[test]
+    fn remote_url_discovery_scrubs_public_metadata_without_changing_git_config() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let secret_remote = "https://alice:secret@github.com/o/r.git?access_token=secret#secret";
+        assert!(
+            Command::new("git")
+                .args(["remote", "add", "origin", secret_remote])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            git_remote_url(dir.path()).as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        let configured = Command::new("git")
+            .args(["config", "--get", "remote.origin.url"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(configured.status.success());
+        assert_eq!(
+            String::from_utf8(configured.stdout).unwrap().trim(),
+            secret_remote
+        );
+    }
 
     #[test]
     fn isolated_test_tempdir_escapes_checkout_tmpdir() {

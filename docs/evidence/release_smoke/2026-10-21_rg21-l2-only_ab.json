@@ -1,0 +1,590 @@
+{
+ "schema": "br-9ott5 rg21 v1",
+ "rule": "rg21: bounded direct fence admission alone (L2) vs main. Beads br-9ott5 and br-kp1in.19. Written 2026-10-21 ~05:45Z,\nbefore the L2-only build finished and before any rg21 run. It gets a FROZEN line with the cand sha before its first run.\n\nDISCLOSED CONTEXT. Everything below was seen before this rule.\n- ab18 (cand = SP + L2 + L3; base = main 2b5d14d7 + br-tsqvm fix, the same base binary as here), LOSS:\n  - grant refusals per 1,000: P2 base 928.7 / cand 295.5; P6 base 766.4 / cand 2.3;\n  - P2 completion 1.12x base;\n  - P6 send p99 1.21x base;\n  - smoke acked sends 0.77x and 0.84x of base;\n  - cand soak convergence failed in both orders, while base passed.\n  So the thresholds below were chosen with the SP+L2+L3 numbers in view. L2 alone has not been measured.\n- rg19 (RG alone): LOSS, after 2 valid runs. The message reconciler's per-message verification under the fence is the long\n  holder (br-9ott5).\n\nLEVER: rc1020i = 2b5d14d7 + tsqvm_v1.patch + clippy rename + L2.\n- L2 = admit_direct_publication: retry try_begin_repair with a doubling pause of at most 10 ms, for up to 500 ms, checking\n  cancellation on every attempt. Plus its 3 unit tests, which pass on rc1020h (vrgl2 l2 6/6).\n- Tree diff 8c8518bb7967 (l2only_tree_v1.patch). The reconciler file is untouched.\n\nARMS (portable release, same host, host lock):\n- base = build36/ab18b_base/am, sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254, re-run live;\n- cand = build36/l2only_cand/am. The build log must show diff=8c8518bb7967. The sha256 is recorded at freeze.\n\nRUNS: as rg19 (P2: base cand cand base base cand; P6: cand base base cand; smoke in both orders; same env and validity rules).\n\nPRIMARY. Both must hold.\n- M1 (reservations usable below saturation): pooled valid P6 cand file_reservation_paths errors <= 10 per 1,000 calls.\n- M2 (partial relief at saturation): pooled valid P2 cand reservation error rate <= 50% of base's.\n\nGUARDS (any failure = LOSS):\n- G1: P2 completion median cand <= 1.05x base; smoke swarm acked sends cand >= 0.95x base in each order. This is not loosened\n  for unequal work.\n- G2:\n  - non-reservation paced tool errors cand <= base + 5 (P2 and P6 pooled);\n  - smoke tool errors cand <= base + 5 in each order;\n  - cand crash phase PASS in each order;\n  - integrity_check ok;\n  - no canonical-id collision errors in any cand log;\n  - smoke dispatch zombies for cand == 0 or <= base's, in each order (GH#351's symptom: L2 waits on request threads).\n- G3: P6 send p99 and last-60 s send p90 cand <= 1.2x base; P6 file_reservation_paths p99 and release p99 cand <= base + 0.5 s;\n  every P6 completion <= 330 s.\n- G4: post-swarm un-archived cand <= base + 2% of cand's acked swarm sends, in each order. The smoke soak \"archive converges after\n  load stops\" must not pass for base and fail for cand.\n- C: on current main + L2, all of these:\n  - storage lib nextest --no-fail-fast (br-3ukrb's and br-u5biy's tests may fail, and only identically on base);\n  - storage + tools clippy;\n  - workspace prodcheck;\n  - tools it;\n  - conformance.\n\nREPORTED, not gated:\n- the br-9ott5 probe at P2;\n- fence-contended waits by holder;\n- reconciler counters;\n- release-artifact refusals;\n- reservation p50/p99;\n- send p50/p90, with the closed-loop caveat.\n\nDECISION:\n- WIN only if M1, M2, G1-G4 and C hold. A WIN lands L2 (storage lib.rs direct-write admission) with this rule and the\n  evidence cited.\n- br-9ott5 stays open unless its own probe (P2 included) passes.\n- LOSS: one line on br-9ott5 and br-kp1in.19; nothing lands.\n\nFROZEN 2026-10-21T07:23:45.1Z, before any rg21 run (no rg21 directory exists).\n- cand am sha256 4678cd6d02c065e0e06afbf6e358bd0adafa7d761667ac3b9d4f5a19a8894221 (build36/l2only_cand; log diff=8c8518bb7967, head 2b5d14d7;\n  differs from base; SP marker string count 0, as for base; ab18b_cand has 1).\n- base am sha256 3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254.\n- No additional data seen since this rule was written.\n\nDETERMINED 2026-10-21T08:17:34Z: M2 FAILS after all 6 P2 runs, all valid (foreign_samples=0).\n- file_reservation_paths errors pooled over P2: base 7376/7899 (P1 2462, P4 2456, P5 2458); cand 5560/7899 (P2 1919, P3 1785, P6 1856).\n- cand/base rate 0.754; M2 requires <= 0.5. VERDICT: LOSS. Nothing lands.\n- The P6 runs (P7-P10) continue, because M1 is reported for the owner. The smoke runs will be stopped before they start, as they only feed guards that cannot change a LOSS.\nSTOPPED 2026-10-21T08:38:09Z: after P10 (all 10 paced runs valid, foreign_samples=0). The smoke cand_vs_base had started at 08:37:44Z and was killed seconds in, with no receipt; base_vs_cand never ran. Smoke is recorded as not run, not as failed.\n",
+ "binaries": {
+  "base": {
+   "am_sha256": "3d35263d06e664f345572b9175c7102d445ba6e87b0ccf11a1ca491f5401e254",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/ab18b_base/am"
+  },
+  "cand": {
+   "am_sha256": "4678cd6d02c065e0e06afbf6e358bd0adafa7d761667ac3b9d4f5a19a8894221",
+   "path": "/data/tmp/claude-1000/-data-projects-mcp-agent-mail-rust/202ec80d-ec9d-4f09-83c4-91d6bf371b56/scratchpad/build36/l2only_cand/am"
+  }
+ },
+ "provenance": {
+  "base": "start 2026-10-20T20:17:24Z wt=/data/projects/mcp_agent_mail_rust-rc1020f head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=af51a3426ded features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1227854,vmi1293453,hz1,hz2,hz3 jobs=2",
+  "cand": "start 2026-10-21T05:34:26Z wt=/data/projects/mcp_agent_mail_rust-rc1020i head=2b5d14d7cc11073148e225e38ad57033ba6d7574 diff=8c8518bb7967 features=portable workers=vmi1149989,vmi1152480,vmi1153651,vmi1156319,vmi1167313,vmi1293453,hz1 jobs=2"
+ },
+ "run_log": "P1 p2 base start 2026-10-21T07:23:48Z load=3.00 2.81 2.72\nP1 p2 base exit=0 end 2026-10-21T07:33:07Z foreign_samples=0\nP2 p2 cand start 2026-10-21T07:33:07Z load=7.92 8.13 5.60\nP2 p2 cand exit=0 end 2026-10-21T07:40:57Z foreign_samples=0\nP3 p2 cand start 2026-10-21T07:40:57Z load=7.42 9.48 7.43\nP3 p2 cand exit=0 end 2026-10-21T07:50:19Z foreign_samples=0\nP4 p2 base start 2026-10-21T07:50:39Z load=7.08 9.38 8.46\nP4 p2 base exit=0 end 2026-10-21T08:00:11Z foreign_samples=0\nP5 p2 base start 2026-10-21T08:00:11Z load=7.89 9.07 8.69\nP5 p2 base exit=0 end 2026-10-21T08:08:53Z foreign_samples=0\nP6 p2 cand start 2026-10-21T08:09:33Z load=6.92 9.96 9.34\nP6 p2 cand exit=0 end 2026-10-21T08:17:08Z foreign_samples=0\nP7 p6 cand start 2026-10-21T08:17:08Z load=7.25 9.66 9.49\nP7 p6 cand exit=0 end 2026-10-21T08:22:17Z foreign_samples=0\nP8 p6 base start 2026-10-21T08:22:17Z load=6.31 7.56 8.61\nP8 p6 base exit=0 end 2026-10-21T08:27:26Z foreign_samples=0\nP9 p6 base start 2026-10-21T08:27:26Z load=6.50 7.05 8.10\nP9 p6 base exit=0 end 2026-10-21T08:32:35Z foreign_samples=0\nP10 p6 cand start 2026-10-21T08:32:35Z load=6.51 6.65 7.60\nP10 p6 cand exit=0 end 2026-10-21T08:37:44Z foreign_samples=0\nR cand_vs_base start 2026-10-21T08:37:44Z load=4.07 5.29 6.77\n",
+ "paced_runs": [
+  {
+   "run": "1-p2-base",
+   "completion_s": 517.1,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2462
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2462,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4518,
+    "unchanged": 312,
+    "repaired": 0,
+    "deferred": 4206,
+    "passes": 201
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0415,
+     "p90": 0.3347,
+     "p99": 1.0094
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1411,
+     "p90": 0.6382,
+     "p99": 1.3667
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.221,
+     "p90": 0.8772,
+     "p99": 1.6948
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.6987,
+     "p90": 4.4402,
+     "p99": 9.7054
+    }
+   }
+  },
+  {
+   "run": "2-p2-cand",
+   "completion_s": 428.4,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 1919,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 2633,
+   "resv_errors": 1919,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3839,
+    "unchanged": 26,
+    "repaired": 0,
+    "deferred": 3813,
+    "passes": 176
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0378,
+     "p90": 0.2316,
+     "p99": 0.7899
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 1.1836,
+     "p90": 1.8437,
+     "p99": 2.6219
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 1.3176,
+     "p90": 2.0335,
+     "p99": 3.0813
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 1.6498,
+     "p90": 2.6945,
+     "p99": 8.4214
+    }
+   }
+  },
+  {
+   "run": "3-p2-cand",
+   "completion_s": 521.6,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 1785
+   },
+   "resv_calls": 2633,
+   "resv_errors": 1785,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4897,
+    "unchanged": 61,
+    "repaired": 0,
+    "deferred": 4836,
+    "passes": 240
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0423,
+     "p90": 0.3719,
+     "p99": 1.1492
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 1.2294,
+     "p90": 1.9842,
+     "p99": 3.0386
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 1.4306,
+     "p90": 2.3683,
+     "p99": 3.4694
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.1261,
+     "p90": 3.5978,
+     "p99": 7.76
+    }
+   }
+  },
+  {
+   "run": "4-p2-base",
+   "completion_s": 531.4,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2456
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2456,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4679,
+    "unchanged": 359,
+    "repaired": 0,
+    "deferred": 4320,
+    "passes": 207
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0406,
+     "p90": 0.3372,
+     "p99": 1.1332
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.1342,
+     "p90": 0.6656,
+     "p99": 1.5918
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2092,
+     "p90": 0.8204,
+     "p99": 1.7785
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.9022,
+     "p90": 4.6614,
+     "p99": 8.8567
+    }
+   }
+  },
+  {
+   "run": "5-p2-base",
+   "completion_s": 483.2,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 2458,
+    "fetch_inbox": 2
+   },
+   "resv_calls": 2633,
+   "resv_errors": 2458,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4365,
+    "unchanged": 244,
+    "repaired": 0,
+    "deferred": 4121,
+    "passes": 195
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0396,
+     "p90": 0.2819,
+     "p99": 1.0332
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 0.138,
+     "p90": 0.5857,
+     "p99": 1.4097
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 0.2088,
+     "p90": 0.7864,
+     "p99": 1.664
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 2.6185,
+     "p90": 3.9348,
+     "p99": 8.9835
+    }
+   }
+  },
+  {
+   "run": "6-p2-cand",
+   "completion_s": 414.8,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 1856,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 2633,
+   "resv_errors": 1856,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {
+    "lib.rs": 1
+   },
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3748,
+    "unchanged": 24,
+    "repaired": 0,
+    "deferred": 3724,
+    "passes": 170
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 9000,
+     "p50": 0.0374,
+     "p90": 0.2267,
+     "p99": 0.7458
+    },
+    "file_reservation_paths": {
+     "n": 2633,
+     "p50": 1.1918,
+     "p90": 1.7931,
+     "p99": 2.4722
+    },
+    "release_file_reservations": {
+     "n": 2633,
+     "p50": 1.2812,
+     "p90": 1.9958,
+     "p99": 2.8334
+    },
+    "send_message": {
+     "n": 9000,
+     "p50": 1.5728,
+     "p90": 2.5684,
+     "p99": 8.1759
+    }
+   }
+  },
+  {
+   "run": "7-p6-cand",
+   "completion_s": 300.2,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 294
+   },
+   "resv_calls": 886,
+   "resv_errors": 294,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3646,
+    "unchanged": 295,
+    "repaired": 0,
+    "deferred": 3351,
+    "passes": 147
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0255,
+     "p90": 0.0822,
+     "p99": 0.2741
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.4828,
+     "p90": 1.1313,
+     "p99": 1.7166
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.4616,
+     "p90": 1.2384,
+     "p99": 1.8536
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1197,
+     "p90": 0.2747,
+     "p99": 2.432
+    }
+   }
+  },
+  {
+   "run": "8-p6-base",
+   "completion_s": 300.0,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 708,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 886,
+   "resv_errors": 708,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 4020,
+    "unchanged": 837,
+    "repaired": 0,
+    "deferred": 3183,
+    "passes": 136
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0262,
+     "p90": 0.0838,
+     "p99": 0.3169
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0868,
+     "p90": 0.1848,
+     "p99": 0.6978
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1147,
+     "p90": 0.2627,
+     "p99": 0.5888
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1163,
+     "p90": 0.3311,
+     "p99": 6.0004
+    }
+   }
+  },
+  {
+   "run": "9-p6-base",
+   "completion_s": 300.2,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 691,
+    "fetch_inbox": 1
+   },
+   "resv_calls": 886,
+   "resv_errors": 691,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3930,
+    "unchanged": 813,
+    "repaired": 0,
+    "deferred": 3117,
+    "passes": 132
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0256,
+     "p90": 0.0838,
+     "p99": 0.2742
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.0877,
+     "p90": 0.1855,
+     "p99": 0.5679
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.1132,
+     "p90": 0.2501,
+     "p99": 0.6132
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1152,
+     "p90": 0.2628,
+     "p99": 1.2307
+    }
+   }
+  },
+  {
+   "run": "10-p6-cand",
+   "completion_s": 300.1,
+   "tool_errors_by_tool": {
+    "file_reservation_paths": 309
+   },
+   "resv_calls": 886,
+   "resv_errors": 309,
+   "collision_errors": 0,
+   "fence_waits_2s_by_holder": {},
+   "reconciler_held_fence_waits_2s": 0,
+   "reconciler": {
+    "scanned": 3433,
+    "unchanged": 105,
+    "repaired": 0,
+    "deferred": 3328,
+    "passes": 145
+   },
+   "tools": {
+    "fetch_inbox": {
+     "n": 3000,
+     "p50": 0.0262,
+     "p90": 0.0825,
+     "p99": 0.2702
+    },
+    "file_reservation_paths": {
+     "n": 886,
+     "p50": 0.5497,
+     "p90": 1.1443,
+     "p99": 1.71
+    },
+    "release_file_reservations": {
+     "n": 886,
+     "p50": 0.543,
+     "p90": 1.1914,
+     "p99": 1.796
+    },
+    "send_message": {
+     "n": 3000,
+     "p50": 0.1216,
+     "p90": 0.2669,
+     "p99": 0.9515
+    }
+   }
+  }
+ ],
+ "paced_pooled": {
+  "p2-base": {
+   "runs": 3,
+   "completion_median_s": 517.1395,
+   "completion_s": [
+    517.1,
+    531.4,
+    483.2
+   ],
+   "send_p50": 2.7201,
+   "send_p99": 9.1694,
+   "late60_send_p90": 3.1959,
+   "resv_calls": 7899,
+   "resv_errors": 7376,
+   "resv_errors_per_1000": 933.8,
+   "other_errors": 2,
+   "reserve_p50": 0.1379,
+   "reserve_p99": 1.4637,
+   "release_p99": 1.7276,
+   "reconciler_held_fence_waits_2s": 0
+  },
+  "p2-cand": {
+   "runs": 3,
+   "completion_median_s": 428.3611,
+   "completion_s": [
+    428.4,
+    521.6,
+    414.8
+   ],
+   "send_p50": 1.7807,
+   "send_p99": 8.0735,
+   "late60_send_p90": 2.8878,
+   "resv_calls": 7899,
+   "resv_errors": 5560,
+   "resv_errors_per_1000": 703.9,
+   "other_errors": 2,
+   "reserve_p50": 1.1958,
+   "reserve_p99": 2.7156,
+   "release_p99": 3.128,
+   "reconciler_held_fence_waits_2s": 0
+  },
+  "p6-cand": {
+   "runs": 2,
+   "completion_median_s": 300.16859999999997,
+   "completion_s": [
+    300.2,
+    300.1
+   ],
+   "send_p50": 0.1208,
+   "send_p99": 1.9603,
+   "late60_send_p90": 0.1681,
+   "resv_calls": 1772,
+   "resv_errors": 603,
+   "resv_errors_per_1000": 340.3,
+   "other_errors": 0,
+   "reserve_p50": 0.5323,
+   "reserve_p99": 1.71,
+   "release_p99": 1.8518,
+   "reconciler_held_fence_waits_2s": 0
+  },
+  "p6-base": {
+   "runs": 2,
+   "completion_median_s": 300.1748,
+   "completion_s": [
+    300.0,
+    300.2
+   ],
+   "send_p50": 0.1158,
+   "send_p99": 5.5829,
+   "late60_send_p90": 0.1698,
+   "resv_calls": 1772,
+   "resv_errors": 1399,
+   "resv_errors_per_1000": 789.5,
+   "other_errors": 2,
+   "reserve_p50": 0.0872,
+   "reserve_p99": 0.6193,
+   "release_p99": 0.6089,
+   "reconciler_held_fence_waits_2s": 0
+  }
+ },
+ "smoke": [
+  {
+   "run": "cand_vs_base",
+   "missing": true
+  },
+  {
+   "run": "base_vs_cand",
+   "missing": true
+  }
+ ],
+ "smoke_note": "smoke not run: the verdict was determined by the paced primaries before the smoke phase",
+ "p6_note": null,
+ "checks": {
+  "M1 P6 cand reservation errors <= 10 per 1000": false,
+  "M2 P2 cand reservation error rate <= 50% of base's": false,
+  "G1 P2 completion median cand <= 1.05x base": true,
+  "G1 swarm acked sends cand >= 0.95x base each order": null,
+  "G2 non-reservation paced errors cand <= base + 5 (P2 and P6 pooled)": true,
+  "G2 smoke errors (swarm + soak) cand <= base + 5 each order": null,
+  "G2 cand crash PASS and integrity_check ok, each order": null,
+  "G2 dispatch zombies cand == 0 or <= base, each order": null,
+  "G3 every P6 completion <= 330 s": true,
+  "G3 P6 send p99 and late-60s p90 cand <= 1.2x base": true,
+  "G3 P6 reserve p99 and release p99 cand <= base + 0.5 s": false,
+  "G4 post-swarm unarchived cand <= base + 2% of cand acked, each order": null,
+  "G4 soak convergence not (base pass and cand fail), each order": null,
+  "G2 no canonical-id collision errors in any cand log (paced logs only; smoke not run)": true
+ },
+ "reported": {
+  "bead probe (cand P2 and P6 resv errors <= 10/1000, no reconciler-held waits)": false
+ },
+ "measured_verdict": "LOSS (see failed checks; null = not evaluated)"
+}

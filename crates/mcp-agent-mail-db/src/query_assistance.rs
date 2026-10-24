@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 #[cfg(feature = "tantivy-engine")]
+use crate::search_planner::TextFieldScope;
+#[cfg(feature = "tantivy-engine")]
 use crate::tantivy_schema::{BODY_BOOST, SUBJECT_BOOST};
 
 // ── Query sanitization (engine-independent) ─────────────────────────────────
@@ -536,6 +538,7 @@ pub struct LexicalParser {
     config: LexicalParserConfig,
     subject_field: Field,
     body_field: Field,
+    text_fields: TextFieldScope,
 }
 
 /// Escape regex-special characters in a prefix string for `RegexQuery`.
@@ -563,6 +566,23 @@ impl LexicalParser {
             config,
             subject_field,
             body_field,
+            text_fields: TextFieldScope::SubjectAndBody,
+        }
+    }
+
+    /// Restrict every word, phrase, prefix and fallback term to `scope`.
+    #[must_use]
+    pub const fn with_text_fields(mut self, scope: TextFieldScope) -> Self {
+        self.text_fields = scope;
+        self
+    }
+
+    /// The fields an unqualified term searches.
+    fn default_fields(&self) -> Vec<Field> {
+        match self.text_fields {
+            TextFieldScope::SubjectAndBody => vec![self.subject_field, self.body_field],
+            TextFieldScope::Subject => vec![self.subject_field],
+            TextFieldScope::Body => vec![self.body_field],
         }
     }
 
@@ -595,7 +615,7 @@ impl LexicalParser {
             return ParseOutcome::Parsed(self.apply_boost(q));
         }
 
-        let mut parser = QueryParser::for_index(index, vec![self.subject_field, self.body_field]);
+        let mut parser = QueryParser::for_index(index, self.default_fields());
 
         if self.config.conjunction_by_default {
             parser.set_conjunction_by_default();
@@ -628,10 +648,9 @@ impl LexicalParser {
         let escaped = regex_escape_prefix(&prefix);
         let pattern = format!("{escaped}.*");
 
-        let fields = [self.subject_field, self.body_field];
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-        for &field in &fields {
+        for field in self.default_fields() {
             if let Ok(rq) = RegexQuery::from_pattern(&pattern, field) {
                 clauses.push((Occur::Should, Box::new(rq) as Box<dyn Query>));
             }
@@ -675,7 +694,7 @@ impl LexicalParser {
 
         // Try each term individually as a simple query
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        let parser = QueryParser::for_index(index, vec![self.subject_field, self.body_field]);
+        let parser = QueryParser::for_index(index, self.default_fields());
 
         for term in &terms {
             if let Ok(q) = parser.parse_query(term) {

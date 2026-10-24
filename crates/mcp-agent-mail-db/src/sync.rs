@@ -5,9 +5,12 @@
 
 use crate::DbConn;
 use crate::error::DbError;
+#[cfg(test)]
 use crate::models::MessageRow;
 use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 use sqlmodel_core::Value;
+
+pub(crate) mod inbox;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
 
@@ -63,6 +66,9 @@ pub struct MessageDeliveryReceipt {
     pub project_id: i64,
     pub persisted_ts: i64,
     pub recipients: Vec<MessageDeliveryRecipientReceipt>,
+    /// The project shared-mailbox delivery (GH#282) and each visible agent's
+    /// read/ack state, when the message was addressed to the project.
+    pub project_mailbox: Option<crate::project_mailbox::ProjectMailboxDeliveryReceipt>,
 }
 
 /// A cursor condition is explicit so monitor clients never confuse retention
@@ -214,11 +220,15 @@ pub fn message_delivery_receipt_from_conn(
         }
     }
 
+    let project_mailbox =
+        crate::project_mailbox::project_mailbox_delivery_from_conn(conn, message_id)?;
+
     Ok(MessageDeliveryReceipt {
         message_id,
         project_id,
         persisted_ts,
         recipients,
+        project_mailbox,
     })
 }
 
@@ -414,6 +424,27 @@ fn fetch_inbox_rows_from_conn_impl(
     options: InboxFetchOptions<'_>,
 ) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
+    inbox::with_snapshot(conn, || {
+        let direct = inbox::fetch_direct(conn, project_id, agent_id, since_ts, limit, options)?;
+        let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+            conn, project_id, agent_id, since_ts, limit, options,
+        )?;
+        Ok(crate::project_mailbox::merge_inbox_rows(
+            direct, shared, limit,
+        ))
+    })
+}
+
+#[cfg(test)]
+fn reference_inbox_rows_from_conn_impl(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: InboxFetchOptions<'_>,
+) -> Result<Vec<InboxRow>, DbError> {
+    let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
     let body_select = match options.body_policy {
         InboxBodyPolicy::Full => "m.body_md",
         InboxBodyPolicy::MetadataOnly => "'' AS body_md",
@@ -534,7 +565,12 @@ fn fetch_inbox_rows_from_conn_impl(
         });
     }
 
-    Ok(out)
+    // GH#282: the agent's view of its project's shared mailbox, under the same
+    // filters, merged into one newest-first window.
+    let shared = crate::project_mailbox::fetch_project_mailbox_rows_from_conn(
+        conn, project_id, agent_id, since_ts, limit, options,
+    )?;
+    Ok(crate::project_mailbox::merge_inbox_rows(out, shared, limit))
 }
 
 /// Read an append-only, recipient-scoped inbox delivery page.
@@ -544,6 +580,26 @@ fn fetch_inbox_rows_from_conn_impl(
 /// Rows are ordered oldest-first so a consumer can safely persist
 /// `next_cursor` after processing each page.
 pub fn inbox_delivery_events_from_conn(
+    conn: &impl crate::pool::SyncQuery,
+    project_id: i64,
+    agent_id: i64,
+    after: Option<i64>,
+    limit: usize,
+) -> Result<InboxDeliveryEventPage, InboxDeliveryEventError> {
+    // Range, direct events and shared visibility are one observation. A
+    // peer commit between those queries must not advance next_cursor past
+    // our advertised tail, remove retained events, or mix membership eras.
+    // The inner result preserves typed cursor errors; the outer result
+    // admits/cleans up only our nested read scope, including on error.
+    inbox::with_snapshot(conn, || {
+        Ok(inbox_delivery_events_in_snapshot(
+            conn, project_id, agent_id, after, limit,
+        ))
+    })
+    .map_err(InboxDeliveryEventError::Database)?
+}
+
+fn inbox_delivery_events_in_snapshot(
     conn: &impl crate::pool::SyncQuery,
     project_id: i64,
     agent_id: i64,
@@ -571,9 +627,12 @@ pub fn inbox_delivery_events_from_conn(
 
     let range_rows = conn
         .query_sync(
+            // GH#282: the project's shared-mailbox cursor events (no agent)
+            // share this recipient's cursor space.
             "SELECT MIN(seq) AS oldest_cursor, MAX(seq) AS tail_cursor, \
                     (SELECT MIN(seq) FROM inbox_delivery_events) AS global_oldest \
-             FROM inbox_delivery_events WHERE project_id = ? AND agent_id = ?",
+             FROM inbox_delivery_events WHERE project_id = ? \
+               AND (agent_id = ? OR (agent_id IS NULL AND kind = 'project'))",
             &[Value::BigInt(project_id), Value::BigInt(agent_id)],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
@@ -631,7 +690,7 @@ pub fn inbox_delivery_events_from_conn(
     }
 
     let cursor = after.unwrap_or(0);
-    let rows = conn
+    let mut rows = conn
         .query_sync(
             "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
                     COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
@@ -649,6 +708,35 @@ pub fn inbox_delivery_events_from_conn(
             ],
         )
         .map_err(|error| InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string())))?;
+    // GH#282: this agent's view of the project's shared-mailbox deliveries.
+    match conn.query_sync(
+        &crate::project_mailbox::visible_events_sql(),
+        &[
+            Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+            Value::BigInt(agent_id),
+            Value::BigInt(project_id),
+            Value::BigInt(cursor),
+            Value::BigInt(limit_i64),
+        ],
+    ) {
+        Ok(shared) => rows.extend(shared),
+        Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            // Use the same global schema authority as snapshot inboxes and
+            // receipt writers. A partial page must never let a monitor advance
+            // its cursor past shared delivery history whose tables are gone.
+            crate::project_mailbox::allow_absent_shared_schema(conn, &error.to_string())
+                .map_err(InboxDeliveryEventError::Database)?;
+        }
+        Err(error) => {
+            return Err(InboxDeliveryEventError::Database(DbError::Sqlite(
+                error.to_string(),
+            )));
+        }
+    }
 
     let mut events = Vec::with_capacity(rows.len().min(limit));
     for row in rows {
@@ -679,6 +767,8 @@ pub fn inbox_delivery_events_from_conn(
             })? != 0,
         });
     }
+    events.sort_by_key(|event| event.seq);
+    events.truncate(limit_with_probe);
     let has_more = events.len() > limit;
     if has_more {
         events.pop();
@@ -862,6 +952,56 @@ pub struct MarkMessagesReadBatch {
     pub message_ids: Vec<i64>,
 }
 
+type SyncReadReceipts = std::collections::BTreeMap<i64, (Option<i64>, Option<i64>)>;
+
+/// Receipt timestamps are authority, not best-effort display fields.
+fn sync_receipt_timestamp(row: &sqlmodel_core::Row, field: &str) -> Result<Option<i64>, DbError> {
+    match row.get_by_name(field) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::BigInt(value)) => Ok(Some(*value)),
+        Some(Value::Int(value)) => Ok(Some(i64::from(*value))),
+        _ => Err(DbError::Sqlite(format!(
+            "direct receipt {field} is missing or not an integer"
+        ))),
+    }
+}
+
+fn direct_read_receipts(
+    conn: &DbConn,
+    agent_id: i64,
+    sorted_ids: &[i64],
+) -> Result<SyncReadReceipts, DbError> {
+    let mut receipts = SyncReadReceipts::new();
+    for chunk in sorted_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
+        let sql = format!(
+            "SELECT message_id, read_ts, ack_ts FROM message_recipients \
+             WHERE agent_id = ? AND message_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let mut params = Vec::with_capacity(chunk.len() + 1);
+        params.push(Value::BigInt(agent_id));
+        params.extend(chunk.iter().copied().map(Value::BigInt));
+        for row in conn
+            .query_sync(&sql, &params)
+            .map_err(|e| DbError::Sqlite(e.to_string()))?
+        {
+            let id = row
+                .get_named::<i64>("message_id")
+                .map_err(|e| DbError::Sqlite(e.to_string()))?;
+            let state = (
+                sync_receipt_timestamp(&row, "read_ts")?,
+                sync_receipt_timestamp(&row, "ack_ts")?,
+            );
+            if chunk.binary_search(&id).is_err() || receipts.insert(id, state).is_some() {
+                return Err(DbError::Sqlite(
+                    "direct receipt query returned a duplicate or unrequested message".into(),
+                ));
+            }
+        }
+    }
+    Ok(receipts)
+}
+
 fn mark_messages_read_batch_sync_conn(
     conn: &DbConn,
     agent_id: i64,
@@ -876,31 +1016,19 @@ fn mark_messages_read_batch_sync_conn(
     unique_message_ids.dedup();
     let read_ts = crate::now_micros();
 
-    begin_sync_write_tx(conn)?;
+    let transaction = SyncWriteTransaction::begin(conn)?;
 
     let result = (|| -> Result<Vec<i64>, DbError> {
+        // Observe the entire request before any chunk can change receipts.
+        let mut expected = direct_read_receipts(conn, agent_id, &unique_message_ids)?;
         let mut updated_message_ids = Vec::new();
-        for chunk in unique_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
-            let select_sql = format!(
-                "SELECT DISTINCT message_id FROM message_recipients \
-                 WHERE agent_id = ? AND read_ts IS NULL AND message_id IN ({})",
-                placeholders(chunk.len())
-            );
-            let mut select_params = Vec::with_capacity(1 + chunk.len());
-            select_params.push(Value::BigInt(agent_id));
-            for &message_id in chunk {
-                select_params.push(Value::BigInt(message_id));
+        for (&id, (existing_read, _)) in &mut expected {
+            if existing_read.is_none() {
+                *existing_read = Some(read_ts);
+                updated_message_ids.push(id);
             }
-            for row in conn
-                .query_sync(&select_sql, &select_params)
-                .map_err(|e| DbError::Sqlite(e.to_string()))?
-            {
-                let message_id = row
-                    .get_named::<i64>("message_id")
-                    .map_err(|e| DbError::Sqlite(e.to_string()))?;
-                updated_message_ids.push(message_id);
-            }
-
+        }
+        for chunk in updated_message_ids.chunks(MAX_SYNC_IN_CLAUSE_ITEMS) {
             let sql = format!(
                 "UPDATE message_recipients \
                  SET read_ts = ? \
@@ -917,27 +1045,29 @@ fn mark_messages_read_batch_sync_conn(
                 .map_err(|e| DbError::Sqlite(e.to_string()))?;
         }
 
-        rebuild_agent_inbox_stats_sync(conn, agent_id)?;
-        updated_message_ids.sort_unstable();
-        updated_message_ids.dedup();
+        // Counts change only when a receipt flipped; a no-op batch must not
+        // pay the recount inside the write transaction.
+        if !updated_message_ids.is_empty() {
+            rebuild_agent_inbox_stats_sync(conn, agent_id)?;
+        }
+        // Successful SQL execution is not proof of a receipt. Verify after
+        // ALL chunks and stats writes: a late trigger must not undo earlier
+        // reads, alter ACK state, or change an already-read requested row.
+        if direct_read_receipts(conn, agent_id, &unique_message_ids)? != expected {
+            return Err(DbError::Sqlite(
+                "direct read receipts did not match the requested state".into(),
+            ));
+        }
         Ok(updated_message_ids)
     })();
 
-    match result {
-        Ok(updated_message_ids) => {
-            commit_sync_write_tx(conn)?;
-            Ok(
-                (!updated_message_ids.is_empty()).then_some(MarkMessagesReadBatch {
-                    read_ts,
-                    message_ids: updated_message_ids,
-                }),
-            )
-        }
-        Err(err) => {
-            rollback_sync_write_tx(conn);
-            Err(err)
-        }
-    }
+    let updated_message_ids = transaction.finish(result)?;
+    Ok(
+        (!updated_message_ids.is_empty()).then_some(MarkMessagesReadBatch {
+            read_ts,
+            message_ids: updated_message_ids,
+        }),
+    )
 }
 
 /// Synchronously batch-mark multiple messages as read for a single agent.
@@ -960,20 +1090,56 @@ pub fn mark_messages_read_batch_sync(
     result
 }
 
-fn begin_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
-    conn.execute_sync("BEGIN IMMEDIATE", &[])
-        .map(|_| ())
-        .map_err(|e| DbError::Sqlite(e.to_string()))
+/// Own only a transaction successfully begun here. COMMIT failure and
+/// unwinding must release it too. A refused nested BEGIN never gives us
+/// ownership of the caller's transaction.
+struct SyncWriteTransaction<'a> {
+    conn: &'a DbConn,
+    active: bool,
 }
 
-fn commit_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
-    conn.execute_sync("COMMIT", &[])
-        .map(|_| ())
-        .map_err(|e| DbError::Sqlite(e.to_string()))
+impl<'a> SyncWriteTransaction<'a> {
+    fn begin(conn: &'a DbConn) -> Result<Self, DbError> {
+        conn.execute_sync("BEGIN IMMEDIATE", &[])
+            .map_err(|e| DbError::Sqlite(e.to_string()))?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn finish<T>(mut self, result: Result<T, DbError>) -> Result<T, DbError> {
+        let result = result.and_then(|value| {
+            self.conn
+                .execute_sync("COMMIT", &[])
+                .map(|_| value)
+                .map_err(|e| DbError::Sqlite(e.to_string()))
+        });
+        match result {
+            Ok(value) => {
+                self.active = false;
+                Ok(value)
+            }
+            Err(error) => match self.conn.execute_sync("ROLLBACK", &[]) {
+                Ok(_) => {
+                    self.active = false;
+                    Err(error)
+                }
+                Err(rollback) => {
+                    // Drop makes one last attempt; report both failures,
+                    // never a guarantee that this session is reusable.
+                    Err(DbError::Sqlite(format!(
+                        "synchronous write failed ({error}); rollback failed ({rollback})"
+                    )))
+                }
+            },
+        }
+    }
 }
 
-fn rollback_sync_write_tx(conn: &DbConn) {
-    let _ = conn.execute_sync("ROLLBACK", &[]);
+impl Drop for SyncWriteTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_sync("ROLLBACK", &[]);
+        }
+    }
 }
 
 fn is_agent_name_unique_violation(message: &str) -> bool {
@@ -1207,7 +1373,7 @@ pub fn dispatch_root_message(
     use crate::timestamps::now_micros;
 
     let project_id = resolve_root_project_id(conn)?;
-    begin_sync_write_tx(conn)?;
+    let transaction = SyncWriteTransaction::begin(conn)?;
 
     let dispatch_result = (|| -> Result<i64, DbError> {
         let now = now_micros();
@@ -1224,24 +1390,16 @@ pub fn dispatch_root_message(
         Ok(msg_id)
     })();
 
-    match dispatch_result {
-        Ok(msg_id) => {
-            commit_sync_write_tx(conn)?;
-            // GH#227: every delivery path must invalidate the process-wide
-            // search cache once the message row is committed. This sync path
-            // is the TUI compose dispatch, which runs inside the server
-            // process — without this, cached pre-delivery result sets keep
-            // serving false-negatives for the full cache TTL.
-            crate::search_service::invalidate_search_cache(
-                crate::search_cache::InvalidationTrigger::IndexUpdate,
-            );
-            Ok(msg_id)
-        }
-        Err(err) => {
-            rollback_sync_write_tx(conn);
-            Err(err)
-        }
-    }
+    let msg_id = transaction.finish(dispatch_result)?;
+    // GH#227: every delivery path must invalidate the process-wide
+    // search cache once the message row is committed. This sync path
+    // is the TUI compose dispatch, which runs inside the server
+    // process — without this, cached pre-delivery result sets keep
+    // serving false-negatives for the full cache TTL.
+    crate::search_service::invalidate_search_cache(
+        crate::search_cache::InvalidationTrigger::IndexUpdate,
+    );
+    Ok(msg_id)
 }
 
 #[cfg(test)]
@@ -1262,7 +1420,7 @@ mod tests {
     }
 
     /// Helper: open an in-memory DB with the full schema applied.
-    fn test_conn() -> DbConn {
+    pub(super) fn test_conn() -> DbConn {
         let conn = DbConn::open_memory().expect("open in-memory db");
         conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
             .expect("apply PRAGMAs");
@@ -1379,6 +1537,408 @@ mod tests {
             metadata_rows[0].message.body_md.is_empty(),
             "metadata-only inbox reads should not materialize message bodies"
         );
+    }
+
+    fn event_snapshot_fixture(test: impl FnOnce(&DbConn, &DbConn, i64, i64)) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("delivery-event-snapshot.sqlite3");
+        let reader = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "event reader",
+        );
+        reader.execute_raw(schema::PRAGMA_DB_INIT_SQL).unwrap();
+        block_on({
+            let conn = &*reader;
+            move |cx| async move {
+                schema::migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap();
+            }
+        });
+        let project = insert_project(&reader);
+        let sender = insert_agent(&reader, project, "Sender");
+        let viewer = insert_agent(&reader, project, "Viewer");
+        let direct = insert_message(&reader, project, sender, "direct");
+        let shared = insert_message(&reader, project, sender, "shared");
+        reader
+            .execute_sync(
+                "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                &[Value::BigInt(direct), Value::BigInt(viewer)],
+            )
+            .unwrap();
+        reader.execute_sync("INSERT INTO project_mailbox_deliveries(message_id,project_id,kind,delivered_ts) VALUES(?,?,'to',1000000)",
+            &[Value::BigInt(shared),Value::BigInt(project)]).unwrap();
+        reader
+            .execute_sync(
+                crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                &[
+                    Value::BigInt(project),
+                    Value::BigInt(shared),
+                    Value::BigInt(1_000_000),
+                ],
+            )
+            .unwrap();
+        let writer = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "event peer writer",
+        );
+        test(&reader, &writer, project, viewer);
+    }
+
+    #[test]
+    fn delivery_event_snapshot_preserves_query_only_caller_transactions_and_cursor_errors() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader.execute_raw("PRAGMA query_only=ON").unwrap();
+            let page = inbox_delivery_events_from_conn(reader, project, viewer, None, 1).unwrap();
+            assert!(page.has_more);
+            assert_eq!(page.events.len(), 1);
+            assert!(matches!(
+                inbox_delivery_events_from_conn(
+                    reader,
+                    project,
+                    viewer,
+                    Some(page.tail_cursor + 1),
+                    1
+                ),
+                Err(InboxDeliveryEventError::CursorAhead { .. })
+            ));
+            assert!(inbox_delivery_events_from_conn(reader, project, viewer, None, 0).is_err());
+            assert!(
+                inbox_delivery_events_from_conn(reader, project, viewer, None, usize::MAX).is_err()
+            );
+            assert_eq!(
+                reader.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1
+            );
+            reader.execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; UPDATE messages SET subject='caller pending'").unwrap();
+            let pending =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert!(
+                pending
+                    .events
+                    .iter()
+                    .all(|event| event.subject == "caller pending")
+            );
+            reader
+                .execute_raw("DELETE FROM inbox_delivery_events WHERE seq=1")
+                .unwrap();
+            assert!(matches!(
+                inbox_delivery_events_from_conn(reader, project, viewer, Some(0), 1),
+                Err(InboxDeliveryEventError::CursorExpired { .. })
+            ));
+            reader.execute_raw("ROLLBACK").unwrap();
+            let restored =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert_eq!(restored.events.len(), 2);
+            assert!(
+                restored
+                    .events
+                    .iter()
+                    .all(|event| event.subject == "test subject")
+            );
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_cleans_up_failed_queries_admission_release_and_unwinding() {
+        struct Failed<'a> {
+            conn: &'a DbConn,
+            mode: u8,
+            fired: std::cell::Cell<bool>,
+            releases: std::cell::Cell<usize>,
+        }
+        impl crate::pool::SyncQuery for Failed<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if (self.mode == 0 || self.mode == 1)
+                    && sql.contains("e.agent_id = ?")
+                    && !self.fired.replace(true)
+                {
+                    assert_ne!(self.mode, 1, "injected event reader unwind");
+                    return self
+                        .conn
+                        .query_sync("SELECT * FROM missing_event_source", &[]);
+                }
+                self.conn.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                if sql == "RELEASE SAVEPOINT am_inbox_read" {
+                    self.releases.set(self.releases.get() + 1);
+                }
+                if ((self.mode == 2 && sql == "RELEASE SAVEPOINT am_inbox_read")
+                    || (self.mode == 3 && sql == "SAVEPOINT am_inbox_read"))
+                    && !self.fired.replace(true)
+                {
+                    return self
+                        .conn
+                        .query_sync("SELECT * FROM missing_event_control", &[])
+                        .map(|_| ());
+                }
+                self.conn.execute_raw(sql)
+            }
+        }
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            for mode in 0..4 {
+                reader
+                    .execute_raw("BEGIN IMMEDIATE; UPDATE messages SET subject='caller pending'")
+                    .unwrap();
+                let failed = Failed {
+                    conn: reader,
+                    mode,
+                    fired: std::cell::Cell::new(false),
+                    releases: std::cell::Cell::new(0),
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inbox_delivery_events_from_conn(&failed, project, viewer, None, 10)
+                }));
+                if mode == 1 {
+                    assert!(result.is_err());
+                } else {
+                    assert!(result.unwrap().is_err());
+                }
+                assert!(failed.fired.get());
+                assert_eq!(
+                    failed.releases.get(),
+                    match mode {
+                        2 => 2,
+                        3 => 0,
+                        _ => 1,
+                    }
+                );
+                assert_eq!(
+                    reader
+                        .query_sync("SELECT subject FROM messages WHERE id=1", &[])
+                        .unwrap()[0]
+                        .get_named::<String>("subject")
+                        .unwrap(),
+                    "caller pending"
+                );
+                reader.execute_raw("ROLLBACK").unwrap();
+                reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+                assert_eq!(
+                    inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                        .unwrap()
+                        .events
+                        .len(),
+                    2
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_legacy_absence_requires_no_shared_ledger_evidence() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader
+                .execute_raw(
+                    "ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries; \
+                ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+                )
+                .unwrap();
+            assert!(
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incomplete project mailbox schema")
+            );
+            // A genuine pre-upgrade database contains only direct ledger events.
+            reader
+                .execute_raw(
+                    "DELETE FROM inbox_delivery_events WHERE kind='project'; PRAGMA query_only=ON",
+                )
+                .unwrap();
+            let legacy =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert_eq!(legacy.events.len(), 1);
+            assert_eq!(legacy.events[0].kind, "to");
+            assert_eq!(legacy.tail_cursor, legacy.next_cursor);
+            reader
+                .execute_raw("PRAGMA query_only=OFF; BEGIN IMMEDIATE; ROLLBACK")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_catalog_failure_cannot_become_empty_shared_mail() {
+        struct Broken<'a>(&'a DbConn);
+        impl crate::pool::SyncQuery for Broken<'_> {
+            fn query_sync(
+                &self,
+                sql: &str,
+                params: &[Value],
+            ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                if sql.contains("FROM sqlite_master") {
+                    return self
+                        .0
+                        .query_sync("SELECT * FROM missing_event_catalog", &[]);
+                }
+                self.0.query_sync(sql, params)
+            }
+            fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                self.0.execute_raw(sql)
+            }
+        }
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader
+                .execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+                .unwrap();
+            let error = inbox_delivery_events_from_conn(&Broken(reader), project, viewer, None, 10)
+                .unwrap_err();
+            assert!(error.to_string().contains("missing_event_catalog"));
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_refuses_incomplete_shared_schema() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            reader
+                .execute_raw("ALTER TABLE project_mailbox_deliveries RENAME TO retained_deliveries")
+                .unwrap();
+            let error=inbox_delivery_events_from_conn(reader,project,viewer,None,10)
+                .expect_err("missing shared delivery authority must not return a partial direct-only success");
+            assert!(
+                error
+                    .to_string()
+                    .contains("incomplete project mailbox schema")
+            );
+            reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            reader
+                .execute_raw("ALTER TABLE retained_deliveries RENAME TO project_mailbox_deliveries")
+                .unwrap();
+            assert_eq!(
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10)
+                    .unwrap()
+                    .events
+                    .len(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn delivery_event_snapshot_preserves_tail_and_rows_across_peer_commit() {
+        for prune in [false, true] {
+            event_snapshot_fixture(|reader, writer, project, viewer| {
+                let before =
+                    inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+                assert_eq!(before.events.len(), 2);
+                struct Race<'a> {
+                    reader: &'a DbConn,
+                    writer: &'a DbConn,
+                    project: i64,
+                    viewer: i64,
+                    prune: bool,
+                    fired: std::cell::Cell<bool>,
+                }
+                impl crate::pool::SyncQuery for Race<'_> {
+                    fn query_sync(
+                        &self,
+                        sql: &str,
+                        params: &[Value],
+                    ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                        let rows = self.reader.query_sync(sql, params)?;
+                        if sql.contains("AS tail_cursor") && !self.fired.replace(true) {
+                            self.writer.execute_raw("BEGIN IMMEDIATE")?;
+                            self.writer
+                                .execute_raw("UPDATE messages SET subject='peer changed'")?;
+                            if self.prune {
+                                self.writer
+                                    .execute_raw("DELETE FROM inbox_delivery_events")?;
+                            }
+                            let id = insert_message(self.writer, self.project, 1, "peer arrival");
+                            self.writer.execute_sync("INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                                &[Value::BigInt(id),Value::BigInt(self.viewer)])?;
+                            self.writer.execute_raw("COMMIT")?;
+                        }
+                        Ok(rows)
+                    }
+                    fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                        self.reader.execute_raw(sql)
+                    }
+                }
+                let race = Race {
+                    reader,
+                    writer,
+                    project,
+                    viewer,
+                    prune,
+                    fired: std::cell::Cell::new(false),
+                };
+                let observed =
+                    inbox_delivery_events_from_conn(&race, project, viewer, None, 10).unwrap();
+                assert!(race.fired.get());
+                assert_eq!(
+                    observed, before,
+                    "a page and its cursor range must describe one snapshot"
+                );
+                assert!(
+                    observed
+                        .events
+                        .iter()
+                        .all(|event| event.seq <= observed.tail_cursor)
+                );
+                let after =
+                    inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+                assert_eq!(after.events.len(), if prune { 1 } else { 3 });
+                assert!(after.tail_cursor > before.tail_cursor);
+                reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn delivery_event_snapshot_keeps_direct_and_shared_membership_consistent() {
+        event_snapshot_fixture(|reader, writer, project, viewer| {
+            let before =
+                inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            struct Race<'a> {
+                reader: &'a DbConn,
+                writer: &'a DbConn,
+                viewer: i64,
+                fired: std::cell::Cell<bool>,
+            }
+            impl crate::pool::SyncQuery for Race<'_> {
+                fn query_sync(
+                    &self,
+                    sql: &str,
+                    params: &[Value],
+                ) -> Result<Vec<sqlmodel_core::Row>, sqlmodel_core::Error> {
+                    let rows = self.reader.query_sync(sql, params)?;
+                    if sql.contains("e.agent_id = ?") && !self.fired.replace(true) {
+                        self.writer.execute_sync(
+                            "UPDATE agents SET retired_at=7 WHERE id=?",
+                            &[Value::BigInt(self.viewer)],
+                        )?;
+                    }
+                    Ok(rows)
+                }
+                fn execute_raw(&self, sql: &str) -> Result<(), sqlmodel_core::Error> {
+                    self.reader.execute_raw(sql)
+                }
+            }
+            let race = Race {
+                reader,
+                writer,
+                viewer,
+                fired: std::cell::Cell::new(false),
+            };
+            assert_eq!(
+                inbox_delivery_events_from_conn(&race, project, viewer, None, 10).unwrap(),
+                before
+            );
+            assert!(race.fired.get());
+            let after = inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            assert_eq!(after.events.len(), 1);
+            assert_eq!(after.events[0].kind, "to");
+        });
     }
 
     #[test]
@@ -2417,11 +2977,40 @@ mod tests {
             ],
         )
         .expect("insert already-read recipient row");
+        // Deliberately not what a recount would produce: a no-op batch must
+        // leave the counters alone instead of recounting under the write lock.
+        conn.execute_sync(
+            "INSERT OR REPLACE INTO inbox_stats \
+             (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+             VALUES (?1, 7, 7, 7, 7)",
+            &[Value::BigInt(recipient_id)],
+        )
+        .expect("insert sentinel inbox stats");
 
         let read_ts = mark_messages_read_batch_sync_conn(&conn, recipient_id, &[message_id])
             .expect("already-read rows should remain a successful no-op");
 
         assert_eq!(read_ts, None);
+        let stats = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count, last_message_ts \
+                 FROM inbox_stats WHERE agent_id = ?1",
+                &[Value::BigInt(recipient_id)],
+            )
+            .expect("read inbox stats");
+        let stats = stats.first().expect("sentinel inbox stats row");
+        for column in [
+            "total_count",
+            "unread_count",
+            "ack_pending_count",
+            "last_message_ts",
+        ] {
+            assert_eq!(
+                stats.get_named::<i64>(column).unwrap(),
+                7,
+                "{column} was recounted by a batch that changed nothing"
+            );
+        }
         let stored_read_ts = conn
             .query_sync(
                 "SELECT read_ts FROM message_recipients WHERE message_id = ?1 AND agent_id = ?2",
@@ -2477,6 +3066,336 @@ mod tests {
         .expect("one row should be updated");
 
         assert_eq!(batch.message_ids, vec![updated_message_id]);
+    }
+
+    #[test]
+    fn sync_read_write_failure_refuses_ignored_updates() {
+        write_failure_fixture(|conn, _, recipient, first, second| {
+            conn.execute_raw(&format!(
+                "CREATE TRIGGER ignore_second_read BEFORE UPDATE ON message_recipients \
+                 WHEN NEW.message_id={second} BEGIN SELECT RAISE(IGNORE); END"
+            ))
+            .unwrap();
+            let result = mark_messages_read_batch_sync_conn(conn, recipient, &[first, second]);
+            assert!(
+                result.is_err(),
+                "ignored writes cannot count as recorded reads: {result:?}"
+            );
+            assert_no_fixture_reads(conn, recipient);
+        });
+    }
+
+    #[test]
+    fn sync_read_write_failure_releases_failed_commit() {
+        write_failure_fixture(|conn, _, recipient, first, second| {
+            add_deferred_write_failure(conn, "UPDATE", "message_recipients");
+            assert!(mark_messages_read_batch_sync_conn(conn, recipient, &[first, second]).is_err());
+            assert_no_fixture_reads(conn, recipient);
+            assert!(
+                conn.query_sync("SELECT 1 FROM deferred_write_check", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn sync_dispatch_write_failure_releases_failed_commit() {
+        write_failure_fixture(|conn, _, _, _, _| {
+            add_deferred_write_failure(conn, "INSERT", "messages");
+            assert!(
+                dispatch_root_message(
+                    conn,
+                    "Sender",
+                    "must roll back",
+                    "body",
+                    "normal",
+                    None,
+                    &[("Recipient".into(), "to".into())]
+                )
+                .is_err()
+            );
+            let rows = conn
+                .query_sync(
+                    "SELECT id FROM messages WHERE subject='must roll back'",
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                rows.is_empty(),
+                "failed send commit must not remain pending on the connection"
+            );
+            assert!(
+                conn.query_sync("SELECT 1 FROM deferred_write_check", &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK")
+                .expect("failed send releases writer");
+        });
+    }
+
+    #[test]
+    fn sync_read_write_failure_preserves_existing_receipts_and_peer_state() {
+        write_failure_fixture(|conn, project, recipient, first, second| {
+            let peer = insert_agent(conn, project, "Peer");
+            conn.execute_raw(&format!(
+                "UPDATE message_recipients SET ack_ts=77 WHERE message_id={first}; \
+                UPDATE message_recipients SET read_ts=55,ack_ts=66 WHERE message_id={second}; \
+                INSERT INTO message_recipients(message_id,agent_id,kind,read_ts,ack_ts) \
+                VALUES({first},{peer},'cc',11,22)"
+            ))
+            .unwrap();
+            let batch =
+                mark_messages_read_batch_sync_conn(conn, recipient, &[second, first, first, 999])
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(batch.message_ids, vec![first]);
+            assert_eq!(
+                direct_read_receipts(conn, recipient, &[first, second]).unwrap(),
+                std::collections::BTreeMap::from([
+                    (first, (Some(batch.read_ts), Some(77))),
+                    (second, (Some(55), Some(66)))
+                ])
+            );
+            assert_eq!(
+                direct_read_receipts(conn, peer, &[first]).unwrap(),
+                std::collections::BTreeMap::from([(first, (Some(11), Some(22)))])
+            );
+            assert!(
+                mark_messages_read_batch_sync_conn(conn, recipient, &[first, second])
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn sync_read_write_failure_refuses_ack_changes_and_stats_side_effects() {
+        for mutate_stats in [false, true] {
+            write_failure_fixture(|conn, _, recipient, first, second| {
+                rebuild_agent_inbox_stats_sync(conn, recipient).unwrap();
+                let before = conn
+                    .query_sync(
+                        "SELECT * FROM inbox_stats WHERE agent_id=?",
+                        &[Value::BigInt(recipient)],
+                    )
+                    .unwrap();
+                let sql = if mutate_stats {
+                    format!(
+                        "CREATE TRIGGER undo_read_from_stats AFTER INSERT ON inbox_stats \
+                        BEGIN UPDATE message_recipients SET read_ts=NULL WHERE message_id={first}; END"
+                    )
+                } else {
+                    "CREATE TRIGGER alter_ack_from_read AFTER UPDATE OF read_ts ON message_recipients \
+                        BEGIN UPDATE message_recipients SET ack_ts=77 WHERE message_id=NEW.message_id AND agent_id=NEW.agent_id; END".into()
+                };
+                conn.execute_raw(&sql).unwrap();
+                let error = mark_messages_read_batch_sync_conn(conn, recipient, &[first, second])
+                    .unwrap_err();
+                assert!(error.to_string().contains("did not match"));
+                assert_no_fixture_reads(conn, recipient);
+                let after = conn
+                    .query_sync(
+                        "SELECT * FROM inbox_stats WHERE agent_id=?",
+                        &[Value::BigInt(recipient)],
+                    )
+                    .unwrap();
+                assert_eq!(before.len(), after.len());
+                for field in [
+                    "total_count",
+                    "unread_count",
+                    "ack_pending_count",
+                    "last_message_ts",
+                ] {
+                    assert_eq!(
+                        before[0].get_named::<Option<i64>>(field).unwrap(),
+                        after[0].get_named::<Option<i64>>(field).unwrap()
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn sync_read_write_failure_refuses_malformed_receipt_authority() {
+        for field in ["read_ts", "ack_ts"] {
+            write_failure_fixture(|conn, _, recipient, first, second| {
+                conn.execute_raw(&format!(
+                    "UPDATE message_recipients SET {field}=X'0102' WHERE message_id={first}"
+                ))
+                .unwrap();
+                let error = mark_messages_read_batch_sync_conn(conn, recipient, &[first, second])
+                    .unwrap_err();
+                assert!(error.to_string().contains("not an integer"));
+                assert_eq!(conn.query_sync(&format!("SELECT typeof({field}) AS kind FROM message_recipients WHERE message_id={first}"),&[]).unwrap()[0]
+                    .get_named::<String>("kind").unwrap(),"blob");
+                assert_eq!(
+                    conn.query_sync(
+                        &format!(
+                            "SELECT read_ts FROM message_recipients WHERE message_id={second}"
+                        ),
+                        &[]
+                    )
+                    .unwrap()[0]
+                        .get_named::<Option<i64>>("read_ts")
+                        .unwrap(),
+                    None
+                );
+                conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn sync_read_write_failure_checks_the_whole_batch_after_the_last_chunk() {
+        for ignore_last in [false, true] {
+            write_failure_fixture(|conn, project, recipient, first, second| {
+                let sender = lookup_agent_id_by_name(conn, project, "Sender")
+                    .unwrap()
+                    .unwrap();
+                conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+                let mut ids = vec![first, second];
+                for id in 1000..1500 {
+                    conn.execute_raw(&format!("INSERT INTO messages(id,project_id,sender_id,subject,body_md,created_ts) \
+                        VALUES({id},{project},{sender},'chunk','body',1000); \
+                        INSERT INTO message_recipients(message_id,agent_id,kind) VALUES({id},{recipient},'to')")).unwrap();
+                    ids.push(id);
+                }
+                conn.execute_raw("COMMIT").unwrap();
+                let body = if ignore_last {
+                    "SELECT RAISE(IGNORE);".into()
+                } else {
+                    format!(
+                        "UPDATE message_recipients SET read_ts=NULL WHERE message_id={first} AND agent_id={recipient};"
+                    )
+                };
+                let timing = if ignore_last { "BEFORE" } else { "AFTER" };
+                conn.execute_raw(&format!(
+                    "CREATE TRIGGER break_last_chunk {timing} UPDATE ON message_recipients \
+                    WHEN NEW.message_id=1499 BEGIN {body} END"
+                ))
+                .unwrap();
+                assert!(mark_messages_read_batch_sync_conn(conn, recipient, &ids).is_err());
+                let rows = direct_read_receipts(conn, recipient, &ids).unwrap();
+                assert_eq!(rows.len(), 502);
+                assert!(rows.values().all(|state| *state == (None, None)));
+                conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn sync_read_write_failure_preserves_caller_transactions_and_cleans_up_unwinding() {
+        write_failure_fixture(|conn, _, recipient, first, second| {
+            conn.execute_raw(&format!(
+                "BEGIN IMMEDIATE; UPDATE message_recipients SET read_ts=55 WHERE message_id={first}"
+            ))
+            .unwrap();
+            assert!(mark_messages_read_batch_sync_conn(conn, recipient, &[second]).is_err());
+            assert!(
+                dispatch_root_message(
+                    conn,
+                    "Sender",
+                    "nested",
+                    "body",
+                    "normal",
+                    None,
+                    &[("Recipient".into(), "to".into())]
+                )
+                .is_err()
+            );
+            assert_eq!(
+                direct_read_receipts(conn, recipient, &[first]).unwrap()[&first].0,
+                Some(55)
+            );
+            conn.execute_raw("ROLLBACK").unwrap();
+            assert_no_fixture_reads(conn, recipient);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _transaction = SyncWriteTransaction::begin(conn).unwrap();
+                conn.execute_raw(&format!(
+                    "UPDATE message_recipients SET read_ts=88 WHERE message_id={first}"
+                ))
+                .unwrap();
+                panic!("injected synchronous transaction unwind");
+            }));
+            assert!(unwound.is_err());
+            assert_no_fixture_reads(conn, recipient);
+        });
+    }
+
+    fn add_deferred_write_failure(conn: &DbConn, operation: &str, table: &str) {
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA foreign_keys", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        conn.execute_raw("CREATE TABLE deferred_write_parent(id INTEGER PRIMARY KEY); \
+            CREATE TABLE deferred_write_check(id INTEGER REFERENCES deferred_write_parent(id) DEFERRABLE INITIALLY DEFERRED)").unwrap();
+        // Prove the fixture reaches COMMIT: the statement itself succeeds.
+        conn.execute_raw("BEGIN IMMEDIATE; INSERT INTO deferred_write_check VALUES(999)")
+            .unwrap();
+        assert!(conn.execute_raw("COMMIT").is_err());
+        conn.execute_raw("ROLLBACK").unwrap();
+        conn.execute_raw(&format!(
+            "CREATE TRIGGER fail_write_commit AFTER {operation} ON {table} \
+            BEGIN INSERT INTO deferred_write_check VALUES(999); END"
+        ))
+        .unwrap();
+    }
+
+    fn assert_no_fixture_reads(conn: &DbConn, recipient: i64) {
+        let rows = conn
+            .query_sync(
+                "SELECT read_ts,ack_ts FROM message_recipients WHERE agent_id=?",
+                &[Value::BigInt(recipient)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                row.get_named::<Option<i64>>("read_ts").unwrap(),
+                None,
+                "failed batch cannot publish any read"
+            );
+            assert_eq!(row.get_named::<Option<i64>>("ack_ts").unwrap(), None);
+        }
+        conn.execute_raw("BEGIN IMMEDIATE; ROLLBACK")
+            .expect("writer must be reusable after failed batch");
+    }
+
+    fn write_failure_fixture(test: impl FnOnce(&DbConn, i64, i64, i64, i64)) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sync-write-failure.sqlite3");
+        let conn = crate::guard_db_conn(
+            DbConn::open_file(path.to_str().unwrap()).unwrap(),
+            "sync write failure fixture",
+        );
+        conn.execute_raw(schema::PRAGMA_DB_INIT_SQL).unwrap();
+        block_on({
+            let conn = &*conn;
+            move |cx| async move {
+                schema::migrate_to_latest_base(&cx, conn)
+                    .await
+                    .into_result()
+                    .unwrap();
+            }
+        });
+        let project = insert_project(&conn);
+        let sender = insert_agent(&conn, project, "Sender");
+        let recipient = insert_agent(&conn, project, "Recipient");
+        let first = insert_message(&conn, project, sender, "first");
+        let second = insert_message(&conn, project, sender, "second");
+        for id in [first, second] {
+            conn.execute_sync(
+                "INSERT INTO message_recipients(message_id,agent_id,kind) VALUES(?,?,'to')",
+                &[Value::BigInt(id), Value::BigInt(recipient)],
+            )
+            .unwrap();
+        }
+        test(&conn, project, recipient, first, second);
     }
 
     #[test]

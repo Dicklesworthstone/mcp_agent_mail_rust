@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 use crate::search::{AggregateSummary, MentionCount, ThreadEntry, ThreadSummary, TopMention};
 use mcp_agent_mail_core::{LockLevel, OrderedMutex, config::dotenv_value};
 
+mod protocol;
+
 // ---------------------------------------------------------------------------
 // Provider env bridge
 // ---------------------------------------------------------------------------
@@ -219,6 +221,20 @@ pub struct LlmOutput {
     pub estimated_cost_usd: Option<f64>,
 }
 
+/// [`LlmOutput::provider`] of the conformance fixture completion (see the
+/// block comment near EOF): canned text, never model output.
+const CONFORMANCE_FIXTURE_PROVIDER: &str = "conformance-fixture";
+
+impl LlmOutput {
+    /// Whether this is the conformance fixture's canned text rather than a
+    /// model result. Tool responses refined with it carry `llm_stub: true`
+    /// (br-kp1in.21).
+    #[must_use]
+    pub fn is_conformance_fixture(&self) -> bool {
+        self.provider.as_deref() == Some(CONFORMANCE_FIXTURE_PROVIDER)
+    }
+}
+
 /// LLM completion error.
 #[derive(Debug)]
 pub enum LlmError {
@@ -255,125 +271,11 @@ impl std::error::Error for LlmError {}
 // ---------------------------------------------------------------------------
 
 /// Determine the API base URL and auth header for a given model.
-#[allow(clippy::too_many_lines)]
 fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmError> {
-    // Provider-qualified: "provider/model" or "provider:model"
-    let provider = if model.contains('/') {
-        model.split('/').next().unwrap_or("")
-    } else if model.contains(':') {
-        model.split(':').next().unwrap_or("")
-    } else {
-        // Guess provider from model name prefix
-        if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
-            "openai"
-        } else if model.starts_with("claude") {
-            "anthropic"
-        } else if model.starts_with("gemini") {
-            "google"
-        } else {
-            "openai" // default
-        }
-    };
-
-    let provider_lower = provider.to_ascii_lowercase();
-    match provider_lower.as_str() {
-        "openai" | "gpt" => {
-            let key = get_env_var("OPENAI_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = strip_provider_prefix(model, &["openai", "gpt"]);
-            Ok((
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "anthropic" | "claude" => {
-            let key = get_env_var("ANTHROPIC_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = strip_provider_prefix(model, &["anthropic", "claude"]);
-            Ok((
-                "https://api.anthropic.com/v1/messages".to_string(),
-                key, // Raw key for x-api-key header
-                api_model.to_string(),
-            ))
-        }
-        "google" | "gemini" => {
-            let key = get_env_var("GOOGLE_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = strip_provider_prefix(model, &["google", "gemini"]);
-            Ok((
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-                    .to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "groq" => {
-            let key =
-                get_env_var("GROQ_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            // Strip provider prefix for the API
-            let api_model = model
-                .strip_prefix("groq/")
-                .or_else(|| model.strip_prefix("groq:"))
-                .unwrap_or(model);
-            Ok((
-                "https://api.groq.com/openai/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "deepseek" => {
-            let key = get_env_var("DEEPSEEK_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model
-                .strip_prefix("deepseek/")
-                .or_else(|| model.strip_prefix("deepseek:"))
-                .unwrap_or(model);
-            Ok((
-                "https://api.deepseek.com/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "xai" => {
-            let key =
-                get_env_var("XAI_API_KEY").ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model
-                .strip_prefix("xai/")
-                .or_else(|| model.strip_prefix("xai:"))
-                .unwrap_or(model);
-            Ok((
-                "https://api.x.ai/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        "openrouter" => {
-            let key = get_env_var("OPENROUTER_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            let api_model = model
-                .strip_prefix("openrouter/")
-                .or_else(|| model.strip_prefix("openrouter:"))
-                .unwrap_or(model);
-            Ok((
-                "https://openrouter.ai/api/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                api_model.to_string(),
-            ))
-        }
-        _ => {
-            // Try OpenAI-compatible endpoint
-            let key = get_env_var("OPENAI_API_KEY")
-                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
-            Ok((
-                "https://api.openai.com/v1/chat/completions".to_string(),
-                format!("Bearer {key}"),
-                model.to_string(),
-            ))
-        }
-    }
+    protocol::resolve_api_endpoint(model, get_env_var)
 }
 
+#[cfg(test)]
 fn strip_provider_prefix<'a>(model: &'a str, providers: &[&str]) -> &'a str {
     let lower_model = model.to_ascii_lowercase();
     for provider in providers {
@@ -430,7 +332,7 @@ pub async fn complete_system_user(
         return Ok(LlmOutput {
             content: conformance_fixture_completion(system, user),
             model: resolved,
-            provider: Some("conformance-fixture".to_string()),
+            provider: Some(CONFORMANCE_FIXTURE_PROVIDER.to_string()),
             estimated_cost_usd: Some(0.0),
         });
     }
@@ -464,27 +366,7 @@ async fn complete_single(
 
     let is_anthropic = url.contains("api.anthropic.com");
 
-    let payload = if is_anthropic {
-        serde_json::json!({
-            "model": api_model,
-            "system": system,
-            "messages": [
-                {"role": "user", "content": user}
-            ],
-            "temperature": temp,
-            "max_tokens": max_tok
-        })
-    } else {
-        serde_json::json!({
-            "model": api_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ],
-            "temperature": temp,
-            "max_tokens": max_tok
-        })
-    };
+    let payload = protocol::request_payload(&url, &api_model, system, user, temp, max_tok);
 
     let body_bytes =
         serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
@@ -520,24 +402,7 @@ async fn complete_single(
     let resp_json: Value = serde_json::from_slice(&response.body)
         .map_err(|e| LlmError::ParseError(format!("response JSON: {e}")))?;
 
-    let content = if is_anthropic {
-        resp_json
-            .get("content")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    } else {
-        resp_json
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
+    let content = protocol::response_content(&resp_json, is_anthropic)?;
 
     let resp_model = resp_json
         .get("model")
@@ -1040,19 +905,43 @@ pub fn multi_thread_user_prompt(
 //   2. Offline E2E tests that exercise the JSON-extraction pipeline
 //      (brace-slice fallback, code-fence extraction) without network.
 //
-// Activation: requires `MCP_AGENT_MAIL_LLM_STUB=1` environment variable.
-// This variable is NEVER set in production, only in conformance.rs and
-// test_llm.sh. If you see it set outside those two files, that is a bug.
+// Activation: requires `MCP_AGENT_MAIL_LLM_STUB=1` AND `AM_TEST_MODE=1`
+// (the process-wide "this is a test harness" signal), as set by
+// conformance.rs and test_llm.sh. The second gate is what keeps a stray
+// MCP_AGENT_MAIL_LLM_STUB (copied shell, service unit) from silently replacing
+// model output in a real deployment (br-kp1in.21). The fixture text stays
+// byte-identical to the Python reference; a tool response refined with it
+// carries an additive `llm_stub: true` (legacy fixtures are compared as
+// contracts, so the extra field does not break parity).
 // ---------------------------------------------------------------------------
 
 fn conformance_fixture_mode_enabled() -> bool {
-    let Ok(v) = std::env::var("MCP_AGENT_MAIL_LLM_STUB") else {
-        return false;
+    conformance_fixture_mode_from(|key| std::env::var(key).ok())
+}
+
+fn conformance_fixture_mode_from(env: impl Fn(&str) -> Option<String>) -> bool {
+    let truthy = |key| {
+        env(key).is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
     };
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    if !truthy("MCP_AGENT_MAIL_LLM_STUB") {
+        return false;
+    }
+    if truthy("AM_TEST_MODE") {
+        return true;
+    }
+    static REFUSED_WARNED: OnceLock<()> = OnceLock::new();
+    REFUSED_WARNED.get_or_init(|| {
+        tracing::warn!(
+            "MCP_AGENT_MAIL_LLM_STUB is set without AM_TEST_MODE: ignoring it and calling the \
+             configured LLM. The conformance fixture switch only works inside a test harness."
+        );
+    });
+    false
 }
 
 fn conformance_fixture_completion(system: &str, user: &str) -> String {
@@ -1108,6 +997,29 @@ mod tests {
 
     // Note: env var tests are inherently sequential and may interfere.
     // We use unique prefixes or accept test isolation limitations.
+
+    #[test]
+    fn llm_fixture_switch_needs_the_test_harness_signal_too() {
+        let mode = |pairs: &[(&str, &str)]| {
+            let env: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            conformance_fixture_mode_from(|key| env.get(key).cloned())
+        };
+        // A stray switch alone (copied shell, service unit) is refused.
+        assert!(!mode(&[("MCP_AGENT_MAIL_LLM_STUB", "1")]));
+        assert!(!mode(&[("AM_TEST_MODE", "1")]));
+        assert!(!mode(&[
+            ("MCP_AGENT_MAIL_LLM_STUB", "0"),
+            ("AM_TEST_MODE", "1")
+        ]));
+        // Conformance and test_llm.sh set both.
+        assert!(mode(&[
+            ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+            ("AM_TEST_MODE", "true")
+        ]));
+    }
 
     #[test]
     fn parse_json_clean() {

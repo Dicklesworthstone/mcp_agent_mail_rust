@@ -32,11 +32,15 @@ use mcp_agent_mail_db::sqlmodel::{Row, Value};
 use mcp_agent_mail_db::timestamps::micros_to_iso;
 use serde::Deserialize;
 
+use crate::tui_action_menu::{ActionEntry, threads_actions};
 use crate::tui_bridge::{
     KeyboardMoveSnapshot, MessageDragSnapshot, ScreenDiagnosticSnapshot, TuiSharedState,
 };
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, operator_result, operator_tool_context,
+};
 use crate::tui_widgets::{MermaidThreadMessage, generate_thread_flow_mermaid};
+use fastmcp_core::block_on;
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -292,6 +296,14 @@ struct RawThreadSummaryRow {
     has_escalation: bool,
 }
 
+/// Key points and action items `summarize_thread` extracted from one thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ThreadDigest {
+    thread_id: String,
+    key_points: Vec<String>,
+    action_items: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct LatestThreadMeta {
     subject: String,
@@ -518,6 +530,8 @@ struct ThreadDropVisual<'a> {
 pub struct ThreadExplorerScreen {
     /// All threads sorted by last activity.
     threads: Vec<ThreadSummary>,
+    /// The last "Summarize" result, shown while its thread is selected.
+    digest: Option<ThreadDigest>,
     /// Cursor position in the thread list.
     cursor: usize,
     /// Messages in the currently selected thread.
@@ -609,6 +623,7 @@ impl ThreadExplorerScreen {
     pub fn new() -> Self {
         Self {
             threads: Vec::new(),
+            digest: None,
             cursor: 0,
             detail_messages: Vec::new(),
             detail_scroll: 0,
@@ -1487,6 +1502,50 @@ impl Default for ThreadExplorerScreen {
     }
 }
 
+impl ThreadExplorerScreen {
+    /// The "Summarize" result for the selected thread, if it has one.
+    fn selected_digest(&self) -> Option<&ThreadDigest> {
+        let thread = self.threads.get(self.cursor)?;
+        self.digest
+            .as_ref()
+            .filter(|digest| digest.thread_id == thread.thread_id)
+    }
+
+    /// Summarize a listed thread with the `summarize_thread` tool and keep the
+    /// result for the detail pane. No LLM: the UI loop waits on the call.
+    fn summarize(&mut self, thread_id: &str) -> Result<String, String> {
+        let project = self
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == thread_id)
+            .map(|thread| thread.project_slug.clone())
+            .ok_or_else(|| format!("thread {thread_id} is no longer listed"))?;
+        let raw = block_on(mcp_agent_mail_tools::summarize_thread(
+            &operator_tool_context(),
+            project,
+            thread_id.to_string(),
+            Some(false),
+            Some(false),
+            None,
+            None,
+        ))
+        .map_err(|err| err.to_string())?;
+        let response: mcp_agent_mail_tools::SingleThreadResponse =
+            serde_json::from_str(&raw).map_err(|err| format!("unexpected summary: {err}"))?;
+        let summary = format!(
+            "{} key point(s), {} action item(s)",
+            response.summary.key_points.len(),
+            response.summary.action_items.len()
+        );
+        self.digest = Some(ThreadDigest {
+            thread_id: thread_id.to_string(),
+            key_points: response.summary.key_points,
+            action_items: response.summary.action_items,
+        });
+        Ok(summary)
+    }
+}
+
 impl MailScreen for ThreadExplorerScreen {
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
@@ -1533,7 +1592,9 @@ impl MailScreen for ThreadExplorerScreen {
                 state.clear_keyboard_move_snapshot();
                 return Cmd::None;
             }
-            if key.code == KeyCode::Char('m') && key.modifiers.contains(Modifiers::CTRL) {
+            // Ctrl+X cuts (marks) and Ctrl+V pastes (moves). Not Ctrl+M:
+            // terminals send it as the same byte as Enter.
+            if key.code == KeyCode::Char('x') && key.modifiers.contains(Modifiers::CTRL) {
                 self.mark_selected_message_for_keyboard_move(state);
                 return Cmd::None;
             }
@@ -1631,8 +1692,8 @@ impl MailScreen for ThreadExplorerScreen {
                         KeyCode::Char('v') => {
                             self.view_lens = self.view_lens.next();
                         }
-                        // Clear filter
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear filter (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.filter_text.clear();
                             self.list_dirty = true;
                         }
@@ -1975,6 +2036,7 @@ impl MailScreen for ThreadExplorerScreen {
                     &self.detail_messages,
                     Some(&cached_rows),
                     self.threads.get(self.cursor),
+                    self.selected_digest(),
                     self.detail_scroll,
                     self.detail_cursor,
                     &self.expanded_message_ids,
@@ -2064,6 +2126,7 @@ impl MailScreen for ThreadExplorerScreen {
                     &self.detail_messages,
                     Some(&cached_rows),
                     self.threads.get(self.cursor),
+                    self.selected_digest(),
                     self.detail_scroll,
                     self.detail_cursor,
                     &self.expanded_message_ids,
@@ -2133,6 +2196,7 @@ impl MailScreen for ThreadExplorerScreen {
                             &self.detail_messages,
                             Some(&cached_rows),
                             self.threads.get(self.cursor),
+                            self.selected_digest(),
                             self.detail_scroll,
                             self.detail_cursor,
                             &self.expanded_message_ids,
@@ -2189,8 +2253,8 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Drag message to thread row",
             },
             HelpEntry {
-                key: "Ctrl+M / Ctrl+V",
-                action: "Mark message / drop to selected thread",
+                key: "Ctrl+X / Ctrl+V",
+                action: "Cut message / paste into selected thread",
             },
             HelpEntry {
                 key: "Left/Right",
@@ -2225,7 +2289,7 @@ impl MailScreen for ThreadExplorerScreen {
                 action: "Filter threads",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear filter",
             },
             HelpEntry {
@@ -2269,6 +2333,26 @@ impl MailScreen for ThreadExplorerScreen {
     fn copyable_content(&self) -> Option<String> {
         let thread = self.threads.get(self.cursor)?;
         Some(format!("[{}] {}", thread.thread_id, thread.last_subject))
+    }
+
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let thread = self.threads.get(self.cursor)?;
+        // Anchor row is the selected row + header offset, as in Contacts.
+        let anchor_row = u16::try_from(self.cursor)
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        Some((
+            threads_actions(&thread.thread_id),
+            anchor_row,
+            thread.thread_id.clone(),
+        ))
+    }
+
+    fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
+        let Some(thread_id) = operation.strip_prefix("summarize:") else {
+            return Cmd::None;
+        };
+        operator_result("summarize", self.summarize(thread_id))
     }
 
     fn title(&self) -> &'static str {
@@ -2438,6 +2522,7 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
     let sender_name_map = agent_names_by_id(conn, &agent_ids);
     let project_slug_map = project_slugs_by_id(conn, &project_ids);
     let participant_names_map = participant_names_by_thread(conn, &thread_ids, &sender_name_map);
+    let unread_map = unread_counts_by_thread(conn, &thread_ids);
 
     rows.into_iter()
         .map(|row| {
@@ -2495,10 +2580,39 @@ fn build_thread_summaries(conn: &DbConn, rows: Vec<RawThreadSummaryRow>) -> Vec<
                 velocity_msg_per_hr: velocity,
                 participant_names,
                 first_timestamp_iso: micros_to_iso(row.first_timestamp_micros),
-                unread_count: 0,
+                unread_count: unread_map.get(&row.thread_id).copied().unwrap_or(0),
             }
         })
         .collect()
+}
+
+/// Messages in each thread that at least one recipient has not read yet.
+fn unread_counts_by_thread(conn: &DbConn, thread_ids: &[String]) -> HashMap<String, usize> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = vec!["?"; thread_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT m.thread_id AS thread_id, COUNT(DISTINCT m.id) AS unread \
+         FROM messages m \
+         JOIN message_recipients r ON r.message_id = m.id \
+         WHERE m.thread_id IN ({placeholders}) AND r.read_ts IS NULL \
+         GROUP BY m.thread_id"
+    );
+    let params: Vec<Value> = thread_ids.iter().cloned().map(Value::Text).collect();
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let thread_id = row.get_named::<String>("thread_id").ok()?;
+                    let unread = row.get_named::<i64>("unread").ok()?;
+                    Some((thread_id, usize::try_from(unread).unwrap_or(0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn latest_thread_meta_by_thread(
@@ -3381,6 +3495,7 @@ fn render_thread_detail(
     messages: &[ThreadMessage],
     prebuilt_tree_rows: Option<&[ThreadTreeRow]>,
     thread: Option<&ThreadSummary>,
+    digest: Option<&ThreadDigest>,
     scroll: usize,
     selected_idx: usize,
     expanded_message_ids: &HashSet<i64>,
@@ -3523,6 +3638,35 @@ fn render_thread_detail(
                     truncate_display_width(
                         &t.participant_names,
                         content_inner.width.saturating_sub(8) as usize,
+                    ),
+                    Style::default().fg(tp.text_secondary),
+                ),
+            ]));
+        }
+    }
+    if let Some(digest) = digest {
+        if digest.key_points.is_empty() && digest.action_items.is_empty() {
+            header_lines.push(Line::from_spans([
+                Span::styled("Summary: ", crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    "no bullet points or checkbox items in this thread",
+                    crate::tui_theme::text_hint(&tp),
+                ),
+            ]));
+        }
+        for (label, items) in [
+            ("Key points: ", &digest.key_points),
+            ("Actions: ", &digest.action_items),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            header_lines.push(Line::from_spans([
+                Span::styled(label, crate::tui_theme::text_meta(&tp)),
+                Span::styled(
+                    truncate_display_width(
+                        &items.join(" · "),
+                        usize::from(content_inner.width).saturating_sub(label.len()),
                     ),
                     Style::default().fg(tp.text_secondary),
                 ),
@@ -4791,14 +4935,33 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_marks_selected_detail_message_for_keyboard_move() {
+    fn capital_x_clears_the_filter_from_the_list_but_types_while_editing() {
+        let mut screen = ThreadExplorerScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let key = |c| Event::Key(ftui::KeyEvent::new(KeyCode::Char(c)));
+        // While the filter is being edited, X is text.
+        for c in ['/', 'a', 'X'] {
+            let _ = screen.update(&key(c), &state);
+        }
+        assert_eq!(screen.filter_text, "aX");
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Enter)), &state);
+        assert!(!screen.filter_editing);
+        // From the list X clears it (Ctrl+C never reaches a screen).
+        screen.list_dirty = false;
+        let _ = screen.update(&key('X'), &state);
+        assert_eq!(screen.filter_text, "");
+        assert!(screen.list_dirty);
+    }
+
+    #[test]
+    fn ctrl_x_marks_selected_detail_message_for_keyboard_move() {
         let mut screen = ThreadExplorerScreen::new();
         screen.threads.push(make_thread("t1", 3, 2));
         screen.detail_messages.push(make_message(77));
         screen.focus = Focus::DetailPanel;
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
-        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         assert!(matches!(cmd, Cmd::None));
         let marker = state
             .keyboard_move_snapshot()
@@ -5479,6 +5642,7 @@ mod tests {
             &messages,
             None,
             Some(&thread),
+            None,
             0,
             0,
             &expanded,
@@ -5507,6 +5671,106 @@ mod tests {
     }
 
     #[test]
+    fn summarize_action_shows_key_points_and_actions_for_the_selected_thread() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug = seed_operator_test_project(project_key, &["GreenCastle", "BlueLake"]);
+            for body in ["- ship the parser first", "- [ ] write the migration"] {
+                block_on(mcp_agent_mail_tools::send_message(
+                    &operator_tool_context(),
+                    project_key.to_string(),
+                    "GreenCastle".to_string(),
+                    vec!["BlueLake".to_string()],
+                    "plan".to_string(),
+                    body.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("th-plan".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .expect("send_message");
+            }
+            let mut screen = ThreadExplorerScreen::new();
+            let mut plan = make_thread("th-plan", 2, 2);
+            plan.project_slug = slug;
+            screen.threads.push(plan.clone());
+            screen.threads.push(make_thread("th-other", 1, 1));
+
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action("summarize:th-plan", ""));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "summarize"),
+                "{text}"
+            );
+            let digest = screen
+                .selected_digest()
+                .expect("digest for the selected thread");
+            assert!(
+                digest
+                    .key_points
+                    .iter()
+                    .any(|p| p.contains("ship the parser")),
+                "{digest:?}"
+            );
+            assert!(
+                digest
+                    .action_items
+                    .iter()
+                    .any(|a| a.contains("write the migration")),
+                "{digest:?}"
+            );
+
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = ftui::Frame::new(120, 24, &mut pool);
+            render_thread_detail(
+                &mut frame,
+                Rect::new(0, 0, 120, 24),
+                &[make_message(1)],
+                None,
+                Some(&plan),
+                Some(digest),
+                0,
+                0,
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+                0,
+                2,
+                2,
+                false,
+                true,
+                thread_tree_guides(None),
+                &std::cell::Cell::new(0usize),
+            );
+            let text = buffer_to_text(&frame.buffer);
+            assert!(text.contains("Key points: "), "{text}");
+            assert!(
+                text.contains("Actions: - [ ] write the migration"),
+                "{text}"
+            );
+
+            screen.cursor = 1;
+            assert!(
+                screen.selected_digest().is_none(),
+                "another thread does not show this summary"
+            );
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action("summarize:th-gone", ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("no longer listed"), "{text}");
+        });
+    }
+
+    #[test]
     fn selected_tree_row_updates_preview_subject() {
         let mut root = make_message(1);
         root.subject = "Root subject".to_string();
@@ -5525,6 +5789,7 @@ mod tests {
             &mut frame,
             Rect::new(0, 0, 120, 24),
             &messages,
+            None,
             None,
             None,
             0,
@@ -5871,6 +6136,37 @@ mod tests {
         }
 
         conn
+    }
+
+    #[test]
+    fn unread_counts_count_messages_some_recipient_has_not_read() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE messages (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL)")
+            .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+               message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, read_ts INTEGER\
+             )",
+        )
+        .expect("create recipients");
+        // t1: message 1 unread by two of three recipients, message 2 read by
+        // all; t2: everything read; t3 is not asked for.
+        conn.execute_raw(
+            "INSERT INTO messages (id, thread_id) VALUES (1, 't1'), (2, 't1'), (3, 't2'), (4, 't3');
+             INSERT INTO message_recipients (message_id, agent_id, read_ts) VALUES
+                (1, 2, NULL), (1, 3, 100), (1, 4, NULL), (2, 2, 100), (3, 2, 100), (4, 2, NULL);",
+        )
+        .expect("seed rows");
+
+        let counts = unread_counts_by_thread(&conn, &["t1".to_string(), "t2".to_string()]);
+        assert_eq!(
+            counts.get("t1"),
+            Some(&1),
+            "two unread copies of one message count once"
+        );
+        assert_eq!(counts.get("t2"), None);
+        assert_eq!(counts.get("t3"), None, "only the requested threads");
+        assert!(unread_counts_by_thread(&conn, &[]).is_empty());
     }
 
     #[test]
@@ -6658,6 +6954,7 @@ mod tests {
             &mut frame,
             Rect::new(0, 0, 120, 24),
             &messages,
+            None,
             None,
             None,
             0,

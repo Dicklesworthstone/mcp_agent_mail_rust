@@ -45,7 +45,10 @@ use crate::tui_persist::{
     ScreenFilterPresetStore, configured_console_persist_path,
     load_screen_filter_presets_or_default, save_screen_filter_presets, screen_filter_presets_path,
 };
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState};
+use crate::tui_screens::{
+    DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg, SelectionState, operator_result,
+    operator_tool_context,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Constants
@@ -150,6 +153,51 @@ fn render_splitter_handle(frame: &mut Frame<'_>, area: Rect, vertical: bool, act
 // Query presets — reusable filter shortcuts
 // ──────────────────────────────────────────────────────────────────────
 
+/// Structured filter a preset applies on top of the typed query.
+///
+/// Importance and acknowledgement are message columns, not words: a text
+/// search for "urgent" finds messages that mention the word, not urgent ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MessageFilter {
+    /// Only messages of exactly this importance.
+    importance: Option<&'static str>,
+    /// Only messages that require acknowledgement.
+    ack_required: bool,
+}
+
+impl MessageFilter {
+    const NONE: Self = Self {
+        importance: None,
+        ack_required: false,
+    };
+
+    const fn is_active(self) -> bool {
+        self.importance.is_some() || self.ack_required
+    }
+
+    /// Live-event entries carry no importance or ack flag (they read as
+    /// normal / not required), so an active filter never admits them.
+    fn matches(self, entry: &MessageEntry) -> bool {
+        self.importance
+            .is_none_or(|level| entry.importance.eq_ignore_ascii_case(level))
+            && (!self.ack_required || entry.ack_required)
+    }
+
+    /// SQL predicates over the `messages` table, ANDed by the caller.
+    fn sql_predicates(self) -> (Vec<&'static str>, Vec<Value>) {
+        let mut predicates = Vec::new();
+        let mut params = Vec::new();
+        if let Some(level) = self.importance {
+            predicates.push("importance = ?");
+            params.push(Value::Text(level.to_string()));
+        }
+        if self.ack_required {
+            predicates.push("ack_required = 1");
+        }
+        (predicates, params)
+    }
+}
+
 /// A named query preset for quick search access.
 #[derive(Debug, Clone)]
 struct QueryPreset {
@@ -157,6 +205,8 @@ struct QueryPreset {
     label: &'static str,
     /// The query string to inject into the search bar.
     query: &'static str,
+    /// Structured filter applied with whatever the search bar holds.
+    filter: MessageFilter,
     /// Short description for help overlay (shown in preset picker).
     #[allow(dead_code)]
     description: &'static str,
@@ -167,31 +217,46 @@ const QUERY_PRESETS: &[QueryPreset] = &[
     QueryPreset {
         label: "All",
         query: "",
+        filter: MessageFilter::NONE,
         description: "Show all recent messages",
     },
     QueryPreset {
         label: "Urgent",
-        query: "urgent",
+        query: "",
+        filter: MessageFilter {
+            importance: Some("urgent"),
+            ack_required: false,
+        },
         description: "Urgent importance messages",
     },
     QueryPreset {
         label: "High",
-        query: "high",
+        query: "",
+        filter: MessageFilter {
+            importance: Some("high"),
+            ack_required: false,
+        },
         description: "High importance messages",
     },
     QueryPreset {
         label: "Ack",
-        query: "ack",
+        query: "",
+        filter: MessageFilter {
+            importance: None,
+            ack_required: true,
+        },
         description: "Messages requiring acknowledgement",
     },
     QueryPreset {
         label: "Error",
         query: "error",
+        filter: MessageFilter::NONE,
         description: "Messages containing error",
     },
     QueryPreset {
         label: "Plan",
         query: "plan",
+        filter: MessageFilter::NONE,
         description: "Planning and coordination messages",
     },
 ];
@@ -1077,6 +1142,8 @@ pub struct MessageBrowserScreen {
     selected_message_ids: SelectionState<i64>,
     /// Last search term that was actually executed.
     last_search: String,
+    /// Preset filter the current `results` were fetched under.
+    last_filter: MessageFilter,
     /// Ticks remaining before executing a search after input changes.
     debounce_remaining: u8,
     /// Whether we need to re-query.
@@ -1179,6 +1246,7 @@ impl MessageBrowserScreen {
             list_state: RefCell::new(VirtualizedListState::default()),
             selected_message_ids: SelectionState::new(),
             last_search: String::new(),
+            last_filter: MessageFilter::NONE,
             debounce_remaining: 0,
             search_dirty: true, // Initial load
             db_conn: None,
@@ -1702,6 +1770,70 @@ impl MessageBrowserScreen {
                 ))
             }
         }
+    }
+
+    /// Acknowledge (or mark read) each listed message for every one of its
+    /// recipients, as the operator.
+    fn receipt_for_recipients(&mut self, ids: &[i64], acknowledge: bool) -> Result<String, String> {
+        if ids.is_empty() {
+            return Err("no message selected".to_string());
+        }
+        let ctx = operator_tool_context();
+        let mut receipts = 0_usize;
+        for &id in ids {
+            let entry = self
+                .results
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| format!("message #{id} is no longer listed"))?;
+            let project = entry.project_slug.clone();
+            let recipients: Vec<String> = entry
+                .to_agents
+                .split(", ")
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
+            if project.is_empty() || recipients.is_empty() {
+                return Err(format!(
+                    "message #{id} has no recorded project or recipients"
+                ));
+            }
+            for agent in recipients {
+                let result = if acknowledge {
+                    block_on(mcp_agent_mail_tools::messaging::acknowledge_message(
+                        &ctx,
+                        project.clone(),
+                        agent.clone(),
+                        id,
+                        None,
+                    ))
+                } else {
+                    block_on(mcp_agent_mail_tools::messaging::mark_message_read(
+                        &ctx,
+                        project.clone(),
+                        agent.clone(),
+                        id,
+                    ))
+                };
+                result.map_err(|err| format!("#{id} for {agent}: {err}"))?;
+                receipts += 1;
+            }
+        }
+        // Re-query so the list shows the new read and ack state.
+        self.search_dirty = true;
+        self.debounce_remaining = 0;
+        let verb = if acknowledge {
+            "acknowledged"
+        } else {
+            "marked read"
+        };
+        Ok(match ids {
+            [id] => format!("#{id} {verb} for {receipts} recipient(s)"),
+            _ => format!(
+                "{} messages {verb} ({receipts} recipient receipts)",
+                ids.len()
+            ),
+        })
     }
 
     fn submit_quick_reply_form(&mut self, state: Option<&TuiSharedState>) -> Cmd<MailScreenMsg> {
@@ -2775,6 +2907,7 @@ impl MessageBrowserScreen {
     fn execute_search(&mut self, state: &TuiSharedState) {
         self.ensure_db_conn(state);
         let query = self.search_input.value().trim().to_string();
+        let filter = self.active_preset().filter;
         self.last_refresh = Some(Instant::now());
 
         // Determine if we should show project column (Global mode)
@@ -2789,11 +2922,12 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             let previous_results = self.results.clone();
             let previous_total = self.total_results;
-            let preserve_previous = self.can_preserve_previous_results_for_live_fallback(
-                &query,
-                show_project,
-                project_filter,
-            );
+            let preserve_previous = self.last_filter == filter
+                && self.can_preserve_previous_results_for_live_fallback(
+                    &query,
+                    show_project,
+                    project_filter,
+                );
             let mut results = Self::search_live_events(state, &query, show_project);
             if let Some(slug) = project_filter {
                 results.retain(|entry| entry.project_slug == slug);
@@ -2804,6 +2938,8 @@ impl MessageBrowserScreen {
             } else {
                 results.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp_micros));
             }
+            results.retain(|entry| filter.matches(entry));
+            self.last_filter = filter;
 
             // Apply system-message filter on the live-only fallback path too.
             let mut hidden = 0usize;
@@ -2851,24 +2987,35 @@ impl MessageBrowserScreen {
 
         let (mut results, total, method) = if query.is_empty() {
             self.last_search.clear();
-            let (r, t) = fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project);
+            let (r, t) =
+                fetch_recent_messages(conn, PAGE_SIZE, project_filter, show_project, filter);
             (r, t, SearchMethod::Recent)
         } else {
             self.last_search.clone_from(&query);
-            let (r, t, m) =
-                search_messages_unified(conn, &query, MAX_RESULTS, project_filter, show_project);
+            let (r, t, m) = search_messages_unified(
+                conn,
+                &query,
+                MAX_RESULTS,
+                project_filter,
+                show_project,
+                filter,
+            );
             (r, t, m)
         };
         self.search_method = method;
+        self.last_filter = filter;
 
         // Self-heal: if the DB query returned nothing but the poller knows
         // messages exist, the connection is likely stale or broken.  Drop it
         // so the next tick re-opens a fresh one (with schema guarantee).
         // Setting search_method=Live activates the tick handler's 5-second
         // retry loop which resets db_conn_attempted and search_dirty.
+        // A preset filter may legitimately match nothing, so it never
+        // counts as evidence of a broken connection.
         if results.is_empty()
             && total == 0
             && query.is_empty()
+            && !filter.is_active()
             && state
                 .db_stats_snapshot()
                 .is_some_and(|stats| stats.messages > 0)
@@ -2895,6 +3042,9 @@ impl MessageBrowserScreen {
                 if let Some(slug) = project_filter
                     && entry.project_slug != slug
                 {
+                    continue;
+                }
+                if !filter.matches(&entry) {
                     continue;
                 }
                 results.push(entry);
@@ -3346,8 +3496,9 @@ impl MailScreen for MessageBrowserScreen {
                             }
                             return Cmd::None;
                         }
-                        // Mark selected message for keyboard move.
-                        KeyCode::Char('m') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Mark (cut) selected message for keyboard move. Not
+                        // Ctrl+M: terminals send it as the same byte as Enter.
+                        KeyCode::Char('x') if key.modifiers.contains(Modifiers::CTRL) => {
                             self.mark_selected_result_for_keyboard_move(state);
                             return Cmd::None;
                         }
@@ -3355,8 +3506,8 @@ impl MailScreen for MessageBrowserScreen {
                         KeyCode::Char('v') if key.modifiers.contains(Modifiers::CTRL) => {
                             return self.execute_keyboard_move_to_selected_context(state);
                         }
-                        // Clear search
-                        KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
+                        // Clear search (not Ctrl+C: the shell always takes it)
+                        KeyCode::Char('X') => {
                             self.search_input.clear();
                             self.search_dirty = true;
                             self.debounce_remaining = 0;
@@ -3411,45 +3562,18 @@ impl MailScreen for MessageBrowserScreen {
     }
 
     fn handle_action(&mut self, operation: &str, _context: &str) -> Cmd<MailScreenMsg> {
-        match operation {
-            "batch_acknowledge" => {
+        let (name, id) = operation.split_once(':').unwrap_or((operation, ""));
+        let ids = match name {
+            "acknowledge" | "mark_read" => id.parse::<i64>().ok().into_iter().collect(),
+            "batch_acknowledge" | "batch_mark_read" => {
                 let ids = self.selected_message_ids_sorted();
                 self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "acknowledge".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
+                ids
             }
-            "batch_mark_read" => {
-                let ids = self.selected_message_ids_sorted();
-                self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "mark_read".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
-            }
-            "batch_mark_unread" => {
-                let ids = self.selected_message_ids_sorted();
-                self.clear_message_selection();
-                let mut batch = Vec::new();
-                for id in ids {
-                    batch.push(Cmd::msg(MailScreenMsg::ActionExecute(
-                        "mark_unread".to_string(),
-                        format!("msg:{id}"),
-                    )));
-                }
-                Cmd::batch(batch)
-            }
-            _ => Cmd::None,
-        }
+            _ => return Cmd::None,
+        };
+        let result = self.receipt_for_recipients(&ids, name.ends_with("acknowledge"));
+        operator_result(name, result)
     }
 
     fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
@@ -3799,12 +3923,12 @@ impl MailScreen for MessageBrowserScreen {
                 action: "Exit search / cancel move",
             },
             HelpEntry {
-                key: "Ctrl+C",
+                key: "X",
                 action: "Clear search",
             },
             HelpEntry {
-                key: "Ctrl+M / Ctrl+V",
-                action: "Mark message / drop to current thread",
+                key: "Ctrl+X / Ctrl+V",
+                action: "Cut message / paste into current thread",
             },
             HelpEntry {
                 key: "p/P",
@@ -3946,42 +4070,48 @@ impl MailScreen for MessageBrowserScreen {
 ///
 /// If `project_filter` is Some, only fetch messages from that project (Local mode).
 /// Otherwise, fetch from all projects (Global mode).
+/// `WHERE` clause (empty when unfiltered) and parameters for a project scope
+/// plus a preset filter. `None` when the project slug does not resolve.
+fn message_scope_where(
+    conn: &DbConn,
+    project_filter: Option<&str>,
+    filter: MessageFilter,
+) -> Option<(String, Vec<Value>)> {
+    let (mut predicates, mut params) = (Vec::new(), Vec::new());
+    if let Some(slug) = project_filter {
+        predicates.push("project_id = ?");
+        params.push(Value::BigInt(project_id_for_slug(conn, slug)?));
+    }
+    let (filter_predicates, filter_params) = filter.sql_predicates();
+    predicates.extend(filter_predicates);
+    params.extend(filter_params);
+    let clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", predicates.join(" AND "))
+    };
+    Some((clause, params))
+}
+
 fn fetch_recent_messages(
     conn: &DbConn,
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
+    filter: MessageFilter,
 ) -> (Vec<MessageEntry>, usize) {
-    let (sql, params, total) = match project_filter {
-        Some(slug) => {
-            let Some(project_id) = project_id_for_slug(conn, slug) else {
-                return (Vec::new(), 0);
-            };
-            (
-                format!(
-                    "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
-                     created_ts, sender_id, project_id, recipients_json \
-                     FROM messages \
-                     WHERE project_id = ? \
-                     ORDER BY created_ts DESC \
-                     LIMIT {limit}"
-                ),
-                vec![Value::BigInt(project_id)],
-                count_messages(conn, project_filter),
-            )
-        }
-        None => (
-            format!(
-                "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
-                 created_ts, sender_id, project_id, recipients_json \
-                 FROM messages \
-                 ORDER BY created_ts DESC \
-                 LIMIT {limit}"
-            ),
-            Vec::new(),
-            count_messages(conn, None),
-        ),
+    let Some((where_clause, params)) = message_scope_where(conn, project_filter, filter) else {
+        return (Vec::new(), 0);
     };
+    let sql = format!(
+        "SELECT id, subject, topic, body_md, thread_id, importance, ack_required, \
+         created_ts, sender_id, project_id, recipients_json \
+         FROM messages \
+         {where_clause}\
+         ORDER BY created_ts DESC \
+         LIMIT {limit}"
+    );
+    let total = count_messages(conn, project_filter, filter);
 
     let rows = query_raw_message_rows(conn, &sql, &params);
     let results = message_entries_from_rows(conn, rows, show_project);
@@ -3998,6 +4128,7 @@ fn search_messages_unified(
     limit: usize,
     project_filter: Option<&str>,
     show_project: bool,
+    filter: MessageFilter,
 ) -> (Vec<MessageEntry>, usize, SearchMethod) {
     let project_id = project_filter.and_then(|slug| project_id_for_slug(conn, slug));
     let mut search_query = mcp_agent_mail_db::search_planner::SearchQuery {
@@ -4005,6 +4136,12 @@ fn search_messages_unified(
         doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
         project_id,
         limit: Some(limit),
+        importance: filter
+            .importance
+            .and_then(mcp_agent_mail_db::search_planner::Importance::parse)
+            .into_iter()
+            .collect(),
+        ack_required: filter.ack_required.then_some(true),
         ..Default::default()
     };
     // Messages screen expects newest-first ordering when scanning inbox content.
@@ -4381,21 +4518,13 @@ fn recipient_names_from_json(raw: &str) -> String {
 }
 
 /// Count total messages, optionally filtered by project.
-fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
-    let (sql, params) = match project_filter {
-        Some(slug) => {
-            let Some(project_id) = project_id_for_slug(conn, slug) else {
-                return 0;
-            };
-            (
-                "SELECT COUNT(*) AS c FROM messages WHERE project_id = ?",
-                vec![Value::BigInt(project_id)],
-            )
-        }
-        None => ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
+fn count_messages(conn: &DbConn, project_filter: Option<&str>, filter: MessageFilter) -> usize {
+    let Some((where_clause, params)) = message_scope_where(conn, project_filter, filter) else {
+        return 0;
     };
+    let sql = format!("SELECT COUNT(*) AS c FROM messages {where_clause}");
 
-    match conn.query_sync(sql, &params) {
+    match conn.query_sync(&sql, &params) {
         Ok(rows) => rows
             .into_iter()
             .next()
@@ -7189,14 +7318,27 @@ first body
     }
 
     #[test]
-    fn ctrl_m_marks_selected_message_for_keyboard_move() {
+    fn capital_x_clears_the_search_from_the_result_list() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.search_input.set_value("deploy");
+        screen.focus = Focus::ResultList;
+        screen.search_dirty = false;
+        // Ctrl+C never reaches a screen (the shell owns it), so X clears.
+        let _ = screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('X'))), &state);
+        assert_eq!(screen.search_input.value(), "");
+        assert!(screen.search_dirty);
+    }
+
+    #[test]
+    fn ctrl_x_marks_selected_message_for_keyboard_move() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
         screen.results = vec![test_message_entry(10, "thread-a", "Subject A")];
         screen.cursor = 0;
 
-        let cmd = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let cmd = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         assert!(matches!(cmd, Cmd::None));
         let marker = state
             .keyboard_move_snapshot()
@@ -7206,7 +7348,7 @@ first body
     }
 
     #[test]
-    fn ctrl_m_replaces_existing_keyboard_move_marker() {
+    fn ctrl_x_replaces_existing_keyboard_move_marker() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.search_dirty = false;
@@ -7215,9 +7357,9 @@ first body
             test_message_entry(11, "thread-b", "Subject B"),
         ];
 
-        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let _ = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
         screen.cursor = 1;
-        let _ = screen.update(&ctrl_key(KeyCode::Char('m')), &state);
+        let _ = screen.update(&ctrl_key(KeyCode::Char('x')), &state);
 
         let marker = state
             .keyboard_move_snapshot()
@@ -8102,8 +8244,13 @@ first body
         )
         .expect("seed message");
 
-        let (entries, total) =
-            fetch_recent_messages(&conn, PAGE_SIZE, Some("[unknown-project-77]"), true);
+        let (entries, total) = fetch_recent_messages(
+            &conn,
+            PAGE_SIZE,
+            Some("[unknown-project-77]"),
+            true,
+            MessageFilter::NONE,
+        );
 
         assert_eq!(total, 1);
         assert_eq!(entries.len(), 1);
@@ -8251,11 +8398,88 @@ first body
     #[test]
     fn apply_preset_sets_query() {
         let mut screen = MessageBrowserScreen::new();
-        screen.apply_preset(1); // "Urgent"
-        assert_eq!(screen.preset_index, 1);
-        assert_eq!(screen.search_input.value(), "urgent");
+        screen.apply_preset(4); // "Error" is a text preset
+        assert_eq!(screen.preset_index, 4);
+        assert_eq!(screen.search_input.value(), "error");
         assert!(screen.search_dirty);
         assert_eq!(screen.debounce_remaining, 0);
+    }
+
+    #[test]
+    fn importance_and_ack_presets_filter_columns_not_words() {
+        let mut screen = MessageBrowserScreen::new();
+        screen.apply_preset(1); // "Urgent"
+        assert_eq!(screen.search_input.value(), "", "no word is injected");
+        let urgent = screen.active_preset().filter;
+        assert_eq!(urgent.importance, Some("urgent"));
+
+        let mut flagged = test_message_entry(1, "t", "deploy");
+        flagged.importance = "urgent".to_string();
+        // The old text preset matched this one and missed the one above.
+        let mentions_word = test_message_entry(2, "t", "urgent: please read");
+        let mut live = test_message_entry(-1, "t", "urgent");
+        live.importance = "normal".to_string();
+        assert!(urgent.matches(&flagged));
+        assert!(!urgent.matches(&mentions_word));
+        assert!(!urgent.matches(&live), "live entries carry no importance");
+
+        screen.apply_preset(3); // "Ack"
+        let ack = screen.active_preset().filter;
+        let mut needs_ack = test_message_entry(3, "t", "s");
+        needs_ack.ack_required = true;
+        assert!(ack.matches(&needs_ack));
+        assert!(!ack.matches(&flagged));
+
+        assert!(!MessageFilter::NONE.is_active());
+        assert!(MessageFilter::NONE.matches(&mentions_word));
+    }
+
+    #[test]
+    fn fetch_recent_messages_applies_the_preset_filter_to_rows_and_total() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
+        conn.execute_raw("INSERT INTO projects (id, slug) VALUES (7, 'proj')")
+            .expect("seed project");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY, subject TEXT, topic TEXT, body_md TEXT,
+                thread_id TEXT, importance TEXT, ack_required INTEGER, created_ts INTEGER,
+                sender_id INTEGER, project_id INTEGER, recipients_json TEXT
+            )",
+        )
+        .expect("create messages");
+        // Message 2 only mentions the word; message 4 is in another project.
+        for (id, subject, importance, ack, project) in [
+            (1, "deploy", "urgent", 0, 7),
+            (2, "urgent: please read", "normal", 0, 7),
+            (3, "review", "high", 1, 7),
+            (4, "elsewhere", "urgent", 1, 8),
+        ] {
+            conn.execute_raw(&format!(
+                "INSERT INTO messages (id, subject, body_md, thread_id, importance, \
+                 ack_required, created_ts, sender_id, project_id, recipients_json) \
+                 VALUES ({id}, '{subject}', 'b', 't', '{importance}', {ack}, {id}, 1, \
+                 {project}, '{{\"to\":[],\"cc\":[],\"bcc\":[]}}')"
+            ))
+            .expect("seed message");
+        }
+        let ids = |project: Option<&str>, filter: MessageFilter| {
+            let (entries, total) = fetch_recent_messages(&conn, PAGE_SIZE, project, true, filter);
+            let mut ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+            ids.sort_unstable();
+            (ids, total)
+        };
+        let urgent = QUERY_PRESETS[1].filter;
+        let ack = QUERY_PRESETS[3].filter;
+
+        assert_eq!(ids(None, MessageFilter::NONE), (vec![1, 2, 3, 4], 4));
+        assert_eq!(ids(None, urgent), (vec![1, 4], 2));
+        assert_eq!(ids(Some("proj"), urgent), (vec![1], 1));
+        assert_eq!(ids(None, ack), (vec![3, 4], 2));
+        assert_eq!(ids(Some("proj"), ack), (vec![3], 1));
     }
 
     #[test]
@@ -8275,7 +8499,8 @@ first body
         let p = Event::Key(ftui::KeyEvent::new(KeyCode::Char('p')));
         screen.update(&p, &state);
         assert_eq!(screen.preset_index, 1);
-        assert_eq!(screen.search_input.value(), "urgent");
+        assert_eq!(screen.active_preset().label, "Urgent");
+        assert_eq!(screen.active_preset().filter.importance, Some("urgent"));
     }
 
     #[test]
@@ -8290,18 +8515,15 @@ first body
     }
 
     #[test]
-    fn ctrl_c_resets_preset() {
+    fn capital_x_resets_preset() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
         screen.apply_preset(2);
         assert_eq!(screen.preset_index, 2);
 
-        let ctrl_c = Event::Key(ftui::KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: Modifiers::CTRL,
-            kind: KeyEventKind::Press,
-        });
-        screen.update(&ctrl_c, &state);
+        // X, not Ctrl+C: the shell owns Ctrl+C, so it never reaches a screen.
+        let clear = Event::Key(ftui::KeyEvent::new(KeyCode::Char('X')));
+        screen.update(&clear, &state);
         assert_eq!(screen.preset_index, 0);
         assert_eq!(screen.search_input.value(), "");
     }
@@ -9194,90 +9416,141 @@ first body
 
     // ── Batch operation tests (br-2bbt.10) ──────────────────────────
 
-    #[test]
-    fn batch_acknowledge_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(10, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(20, "thread-b", "Two"));
-        screen
-            .results
-            .push(test_message_entry(30, "thread-c", "Three"));
-        screen.selected_message_ids.select(10);
-        screen.selected_message_ids.select(30);
+    /// GreenCastle → BlueLake, cc RedFox, ack required; returns the message id.
+    fn send_to_bluelake_cc_redfox(project_key: &str, subject: &str) -> i64 {
+        let sent: serde_json::Value = serde_json::from_str(
+            &block_on(mcp_agent_mail_tools::messaging::send_message(
+                &operator_tool_context(),
+                project_key.to_string(),
+                "GreenCastle".to_string(),
+                vec!["BlueLake".to_string()],
+                subject.to_string(),
+                "body".to_string(),
+                Some(vec!["RedFox".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .expect("send_message"),
+        )
+        .expect("send_message JSON");
+        sent["deliveries"][0]["payload"]["id"]
+            .as_i64()
+            .expect("message id")
+    }
 
-        let cmd = screen.handle_action("batch_acknowledge", "batch:10,30");
-        // Should clear selection
-        assert!(screen.selected_message_ids.is_empty());
-        // Should return a batch of individual acknowledge commands
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2, "should dispatch 2 acknowledge actions");
-            }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+    /// `(agent, read, acked)` for each recipient of one message, from the mailbox.
+    fn recipient_receipts(id: i64) -> Vec<(String, bool, bool)> {
+        crate::tui_screens::with_operator_test_conn(|conn| {
+            let rows = conn
+                .query_sync(
+                    "SELECT a.name AS name, r.read_ts IS NOT NULL AS read, \
+                     r.ack_ts IS NOT NULL AS acked \
+                     FROM message_recipients r JOIN agents a ON a.id = r.agent_id \
+                     WHERE r.message_id = ? ORDER BY a.name",
+                    &[Value::BigInt(id)],
+                )
+                .expect("receipts");
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get_named::<String>("name").expect("name"),
+                        row.get_named::<i64>("read").expect("read") == 1,
+                        row.get_named::<i64>("acked").expect("acked") == 1,
+                    )
+                })
+                .collect()
+        })
     }
 
     #[test]
-    fn batch_mark_read_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(5, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(6, "thread-b", "Two"));
-        screen.selected_message_ids.select(5);
-        screen.selected_message_ids.select(6);
-
-        let cmd = screen.handle_action("batch_mark_read", "batch:5,6");
-        assert!(screen.selected_message_ids.is_empty());
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 2, "should dispatch 2 mark_read actions");
+    fn action_menu_message_receipts_reach_the_mailbox() {
+        use crate::tui_screens::{expect_operator_result, seed_operator_test_project};
+        crate::tui_screens::with_operator_test_mailbox(|project_key| {
+            let slug =
+                seed_operator_test_project(project_key, &["GreenCastle", "BlueLake", "RedFox"]);
+            let send = |subject: &str| send_to_bluelake_cc_redfox(project_key, subject);
+            let receipts = recipient_receipts;
+            let first = send("first");
+            let second = send("second");
+            let untouched = send("untouched");
+            let mut screen = MessageBrowserScreen::new();
+            for (id, subject) in [
+                (first, "first"),
+                (second, "second"),
+                (untouched, "untouched"),
+            ] {
+                screen.results.push(MessageEntry {
+                    to_agents: "BlueLake, RedFox".to_string(),
+                    project_slug: slug.clone(),
+                    ..test_message_entry(id, "thread", subject)
+                });
             }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
+
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action(&format!("acknowledge:{first}"), ""));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "acknowledge"),
+                "{text}"
+            );
+            assert!(text.contains("2 recipient"), "{text}");
+            let acked: Vec<bool> = receipts(first).iter().map(|r| r.2).collect();
+            assert_eq!(acked, [true, true], "both recipients acknowledged");
+
+            screen.selected_message_ids.select(first);
+            screen.selected_message_ids.select(second);
+            let (status, op, text) =
+                expect_operator_result(screen.handle_action("batch_mark_read", "batch:"));
+            assert_eq!(
+                (status.as_str(), op.as_str()),
+                ("ok", "batch_mark_read"),
+                "{text}"
+            );
+            assert!(screen.selected_message_ids.is_empty());
+            for id in [first, second] {
+                let read: Vec<bool> = receipts(id).iter().map(|r| r.1).collect();
+                assert_eq!(read, [true, true], "#{id} read for both recipients");
+            }
+            assert_eq!(
+                receipts(second).iter().map(|r| r.2).collect::<Vec<_>>(),
+                [false, false],
+                "marking read does not acknowledge"
+            );
+            assert_eq!(
+                receipts(untouched),
+                [
+                    ("BlueLake".to_string(), false, false),
+                    ("RedFox".to_string(), false, false)
+                ],
+                "an unselected message is left alone"
+            );
+
+            let (status, _, text) =
+                expect_operator_result(screen.handle_action("mark_read:999999", ""));
+            assert_eq!(status, "error");
+            assert!(text.contains("no longer listed"), "{text}");
+        });
     }
 
     #[test]
-    fn batch_mark_unread_dispatches_individual_actions() {
-        let mut screen = MessageBrowserScreen::new();
-        screen
-            .results
-            .push(test_message_entry(7, "thread-a", "One"));
-        screen
-            .results
-            .push(test_message_entry(8, "thread-b", "Two"));
-        screen
-            .results
-            .push(test_message_entry(9, "thread-c", "Three"));
-        screen.selected_message_ids.select(7);
-        screen.selected_message_ids.select(8);
-        screen.selected_message_ids.select(9);
-
-        let cmd = screen.handle_action("batch_mark_unread", "batch:7,8,9");
-        assert!(screen.selected_message_ids.is_empty());
-        match cmd {
-            Cmd::Batch(cmds) => {
-                assert_eq!(cmds.len(), 3, "should dispatch 3 mark_unread actions");
-            }
-            other => panic!("expected Cmd::Batch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn batch_acknowledge_with_empty_selection_returns_noop() {
+    fn batch_acknowledge_with_empty_selection_reports_it() {
         let mut screen = MessageBrowserScreen::new();
         let cmd = screen.handle_action("batch_acknowledge", "batch:");
-        // Cmd::batch with empty vec collapses to Cmd::None
-        assert!(
-            matches!(cmd, Cmd::None | Cmd::Batch(_)),
-            "empty selection should produce noop or empty batch"
+        let (status, op, text) = crate::tui_screens::expect_operator_result(cmd);
+        assert_eq!(
+            (status.as_str(), op.as_str()),
+            ("error", "batch_acknowledge")
         );
+        assert_eq!(text, "no message selected");
     }
 
     #[test]

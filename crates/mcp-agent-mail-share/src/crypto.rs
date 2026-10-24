@@ -177,6 +177,8 @@ pub fn verify_bundle(
                     key_source: None,
                     database_checked: false,
                     database_verified: false,
+                    files_checked: false,
+                    files_verified: false,
                     error: Some(format!(
                         "SRI entry for {relative_path} has non-string value"
                     )),
@@ -194,6 +196,8 @@ pub fn verify_bundle(
                         key_source: None,
                         database_checked: false,
                         database_verified: false,
+                        files_checked: false,
+                        files_verified: false,
                         error: Some(traversal_err),
                     });
                 }
@@ -220,6 +224,8 @@ pub fn verify_bundle(
                         key_source: None,
                         database_checked: false,
                         database_verified: false,
+                        files_checked: false,
+                        files_verified: false,
                         error: Some(format!(
                             "SRI mismatch for {relative_path}: file content does not match manifest hash"
                         )),
@@ -236,6 +242,8 @@ pub fn verify_bundle(
                     key_source: None,
                     database_checked: false,
                     database_verified: false,
+                    files_checked: false,
+                    files_verified: false,
                     error: Some(format!("SRI-referenced file missing: {relative_path}")),
                 });
             }
@@ -262,6 +270,8 @@ pub fn verify_bundle(
                     key_source: None,
                     database_checked: false,
                     database_verified: false,
+                    files_checked: false,
+                    files_verified: false,
                     error: Some("signature file must not be a symlink".to_string()),
                 });
             }
@@ -275,6 +285,8 @@ pub fn verify_bundle(
                     key_source: None,
                     database_checked: false,
                     database_verified: false,
+                    files_checked: false,
+                    files_verified: false,
                     error: Some("signature file must be a regular file".to_string()),
                 });
             }
@@ -333,6 +345,15 @@ pub fn verify_bundle(
             Some(Err(message)) => (true, false, Some(message)),
             None => (false, false, None),
         };
+    // The same for every other file the export wrote: viewer code, rendered
+    // pages and attachments are served to readers, so a signature that left
+    // them out would bless a bundle whose viewer had been swapped.
+    let (files_checked, files_verified, files_error) =
+        match verify_listed_files(bundle_root, &manifest)? {
+            Some(Ok(())) => (true, true, None),
+            Some(Err(message)) => (true, false, Some(message)),
+            None => (false, false, None),
+        };
 
     Ok(VerifyResult {
         bundle: bundle_root.display().to_string(),
@@ -343,8 +364,68 @@ pub fn verify_bundle(
         key_source,
         database_checked,
         database_verified,
-        error: database_error,
+        files_checked,
+        files_verified,
+        error: database_error.or(files_error),
     })
+}
+
+/// Check every file in the manifest's `files` map against its recorded
+/// SHA-256. `Ok(None)` when the manifest has no map (exported before it
+/// existed); otherwise `Ok(Some(Err(_)))` names the first listed file that is
+/// missing, not a regular file inside the bundle, or altered. Files the map
+/// does not list (hosting config, deploy history, an operator's `CNAME`) are
+/// not judged.
+fn verify_listed_files(
+    bundle_root: &Path,
+    manifest: &serde_json::Value,
+) -> ShareResult<Option<Result<(), String>>> {
+    let Some(files) = manifest.get(crate::bundle::MANIFEST_FILES_KEY) else {
+        return Ok(None);
+    };
+    let Some(files) = files.as_object() else {
+        return Ok(Some(Err(
+            "manifest `files` must map bundle paths to SHA-256 hashes".to_string(),
+        )));
+    };
+    for (relative_path, expected) in files {
+        let Some(expected) = expected.as_str() else {
+            return Ok(Some(Err(format!(
+                "manifest hash for {relative_path} is not a string"
+            ))));
+        };
+        if !Path::new(relative_path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Ok(Some(Err(format!(
+                "path traversal blocked: '{relative_path}' is not a plain bundle-relative path"
+            ))));
+        }
+        let path = match validate_sri_resolved_path(
+            bundle_root,
+            bundle_root.join(relative_path),
+            relative_path,
+        ) {
+            Ok(path) => path,
+            Err(err) => return Ok(Some(Err(err))),
+        };
+        if !crate::is_real_file(&path) {
+            return Ok(Some(Err(format!(
+                "bundle file listed in the manifest is missing: {relative_path}"
+            ))));
+        }
+        let mut hasher = Sha256::new();
+        if let Err(err) = hash_file_into(&path, &mut hasher) {
+            return Ok(Some(Err(format!("failed to read {relative_path}: {err}"))));
+        }
+        if !hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected) {
+            return Ok(Some(Err(format!(
+                "{relative_path} does not match its hash in the manifest"
+            ))));
+        }
+    }
+    Ok(Some(Ok(())))
 }
 
 /// Verify the bundle's database payload against the manifest's signed
@@ -504,12 +585,12 @@ fn validate_sri_resolved_path(
 
     if metadata.file_type().is_symlink() {
         return Err(format!(
-            "SRI-referenced path must not be a symlink: '{relative_path}'"
+            "bundle path must not be a symlink: '{relative_path}'"
         ));
     }
     if !metadata.file_type().is_file() {
         return Err(format!(
-            "SRI-referenced path must be a regular file: '{relative_path}'"
+            "bundle path must be a regular file: '{relative_path}'"
         ));
     }
 
@@ -544,6 +625,14 @@ pub struct VerifyResult {
     /// Whether the database payload matched the manifest's signed `database.sha256`.
     /// Only meaningful as authenticity when `signature_verified` is also true.
     pub database_verified: bool,
+    /// Whether the manifest's per-file hash map (`files`) was checked. Bundles
+    /// exported before the map existed carry none, and this stays false.
+    #[serde(default)]
+    pub files_checked: bool,
+    /// Whether every file in that map matched its hash. As with the database,
+    /// authenticity also needs `signature_verified`.
+    #[serde(default)]
+    pub files_verified: bool,
     pub error: Option<String>,
 }
 
@@ -1290,6 +1379,54 @@ mod tests {
             "a tampered chunk must fail verification"
         );
         assert!(swapped_chunk.error.is_some());
+    }
+
+    #[test]
+    fn verify_checks_every_file_the_manifest_lists_and_ignores_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("viewer")).unwrap();
+        std::fs::write(root.join("viewer/app.js"), b"render()").unwrap();
+        // Unlisted, like an operator's CNAME or the deploy history.
+        std::fs::write(root.join("CNAME"), b"mail.example.org").unwrap();
+        let write_manifest = |files: serde_json::Value| {
+            let manifest = serde_json::json!({ "files": files });
+            std::fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();
+        };
+
+        write_manifest(serde_json::json!({ "viewer/app.js": hex_sha256(b"render()") }));
+        let intact = verify_bundle(root, None).unwrap();
+        assert!(intact.files_checked && intact.files_verified, "{intact:?}");
+        assert!(intact.error.is_none());
+
+        std::fs::write(root.join("viewer/app.js"), b"exfiltrate()").unwrap();
+        let altered = verify_bundle(root, None).unwrap();
+        assert!(altered.files_checked && !altered.files_verified);
+        assert!(altered.error.unwrap_or_default().contains("viewer/app.js"));
+
+        for (files, expected) in [
+            (
+                serde_json::json!({ "viewer/gone.js": hex_sha256(b"x") }),
+                "missing",
+            ),
+            (
+                serde_json::json!({ "../outside.js": hex_sha256(b"x") }),
+                "path traversal",
+            ),
+            (serde_json::json!({ "viewer/app.js": 7 }), "not a string"),
+            (serde_json::json!(["viewer/app.js"]), "must map"),
+        ] {
+            write_manifest(files);
+            let result = verify_bundle(root, None).unwrap();
+            assert!(!result.files_verified);
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        // A manifest exported before the map existed has nothing to check.
+        std::fs::write(root.join("manifest.json"), "{}").unwrap();
+        let legacy = verify_bundle(root, None).unwrap();
+        assert!(!legacy.files_checked && legacy.error.is_none());
     }
 
     #[test]

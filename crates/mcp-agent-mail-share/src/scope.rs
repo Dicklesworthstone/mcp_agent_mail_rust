@@ -15,6 +15,8 @@ use crate::ShareError;
 
 type Conn = DbConn;
 
+mod prune;
+
 /// A project record from the `projects` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
@@ -52,13 +54,15 @@ pub struct RemainingCounts {
 /// Apply project scoping to a snapshot database.
 ///
 /// If `identifiers` is empty, all projects are kept and no deletions occur.
-/// Otherwise, only projects matching the given slugs or `human_keys` (case-insensitive,
-/// trimmed) are retained; all other project data is deleted.
+/// Otherwise, every identifier must be nonblank and match exactly one project
+/// by slug or `human_key` (case-insensitive, trimmed). All other project data is
+/// deleted. Ambiguous aliases never select a project by inventory order.
 ///
 /// # Errors
 ///
 /// - [`ShareError::ScopeNoProjects`] if the database has no discoverable project identities.
-/// - [`ShareError::ScopeIdentifierNotFound`] if any identifier doesn't match.
+/// - [`ShareError::ScopeIdentifierNotFound`] if any identifier is blank or doesn't match.
+/// - [`ShareError::Validation`] if an identifier matches multiple project identities.
 /// - [`ShareError::Sqlite`] on any SQLite error.
 pub fn apply_project_scope(
     snapshot_path: &Path,
@@ -81,7 +85,8 @@ pub fn apply_project_scope(
         return Err(ShareError::ScopeNoProjects);
     }
 
-    // If no identifiers, keep everything
+    // Only an absent scope authorizes exporting every project. An explicitly
+    // supplied but empty selector must never widen the requested disclosure.
     if identifiers.is_empty() {
         let remaining = count_remaining(&conn)?;
         return Ok(ProjectScopeResult {
@@ -92,29 +97,46 @@ pub fn apply_project_scope(
         });
     }
 
-    // Build lookup: slug.lower() -> record, human_key.lower() -> record
-    let mut lookup: HashMap<String, &ProjectRecord> = HashMap::new();
-    for p in &all_projects {
-        lookup.insert(p.slug.to_ascii_lowercase(), p);
-        lookup.insert(p.human_key.to_ascii_lowercase(), p);
+    // Slugs and human keys share a case-insensitive namespace. Preserve an
+    // ambiguity witness rather than letting the last inventory row win.
+    // Two aliases belonging to the same project are not ambiguous.
+    let mut lookup: HashMap<String, Option<&ProjectRecord>> = HashMap::new();
+    for project in &all_projects {
+        for alias in [&project.slug, &project.human_key] {
+            lookup
+                .entry(alias.to_ascii_lowercase())
+                .and_modify(|known| {
+                    if known.as_ref().is_some_and(|known| known.id != project.id) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(project));
+        }
     }
 
-    // Match identifiers (case-insensitive, trimmed)
+    // Resolve the entire request before beginning any deletion transaction.
     let mut matched: Vec<ProjectRecord> = Vec::new();
-    let mut matched_ids: Vec<i64> = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
     for ident in identifiers {
         let key = ident.trim().to_ascii_lowercase();
         if key.is_empty() {
-            continue;
+            return Err(ShareError::ScopeIdentifierNotFound {
+                identifier: ident.clone(),
+            });
         }
         match lookup.get(&key) {
-            Some(p) => {
-                if seen_ids.insert(p.id) {
-                    matched.push((*p).clone());
-                    matched_ids.push(p.id);
+            Some(Some(project)) => {
+                if seen_ids.insert(project.id) {
+                    matched.push((*project).clone());
                 }
+            }
+            Some(None) => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "ambiguous project scope identifier {ident:?}; use an unambiguous slug or human_key"
+                    ),
+                });
             }
             None => {
                 return Err(ShareError::ScopeIdentifierNotFound {
@@ -122,17 +144,6 @@ pub fn apply_project_scope(
                 });
             }
         }
-    }
-
-    // If all provided identifiers were empty/whitespace, treat as no-op scope.
-    if matched_ids.is_empty() {
-        let remaining = count_remaining(&conn)?;
-        return Ok(ProjectScopeResult {
-            identifiers: identifiers.to_vec(),
-            projects: all_projects,
-            removed_count: 0,
-            remaining,
-        });
     }
 
     // Compute disallowed IDs
@@ -157,135 +168,16 @@ pub fn apply_project_scope(
 
     let derived_artifacts = crate::scrub::detect_derived_export_artifacts(&conn)?;
 
-    // Build SQL placeholders for allowed IDs
-    let placeholders = build_placeholders(matched_ids.len());
-    let id_values: Vec<Value> = matched_ids.iter().map(|&id| Value::BigInt(id)).collect();
-
     conn.execute_sync("BEGIN IMMEDIATE", &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("BEGIN transaction failed: {e}"),
         })?;
 
     let result = (|| {
-        // Delete order — use NOT IN (allowed_ids) for safety
-        // 1. agent_links (cross-project)
-        if table_exists(&conn, "agent_links")? {
-            let sql = format!(
-                "DELETE FROM agent_links WHERE a_project_id NOT IN ({placeholders}) OR b_project_id NOT IN ({placeholders})"
-            );
-            let mut params = id_values.clone();
-            params.extend(id_values.iter().cloned());
-            exec(&conn, &sql, &params)?;
-        }
+        // One transaction owns every phase and project chunk. Never collect
+        // all excluded message IDs into a single parameter list.
+        prune::apply(&conn, &disallowed)?;
 
-        // 2. project_sibling_suggestions
-        if table_exists(&conn, "project_sibling_suggestions")? {
-            let sql = format!(
-                "DELETE FROM project_sibling_suggestions WHERE project_a_id NOT IN ({placeholders}) OR project_b_id NOT IN ({placeholders})"
-            );
-            let mut params = id_values.clone();
-            params.extend(id_values.iter().cloned());
-            exec(&conn, &sql, &params)?;
-        }
-
-        // 3. Collect message IDs for non-allowed projects
-        let msg_sql = format!(
-            "SELECT id FROM messages WHERE project_id NOT IN ({placeholders}) ORDER BY id ASC"
-        );
-        let msg_rows = conn
-            .query_sync(&msg_sql, &id_values)
-            .map_err(|e| ShareError::Sqlite {
-                message: format!("SELECT messages failed: {e}"),
-            })?;
-        let msg_ids: Vec<i64> = msg_rows
-            .iter()
-            .filter_map(|r| r.get_named::<i64>("id").ok())
-            .collect();
-
-        // 4. Delete message_recipients for collected message IDs
-        if !msg_ids.is_empty() {
-            let msg_placeholders = build_placeholders(msg_ids.len());
-            let msg_values: Vec<Value> = msg_ids.iter().map(|&id| Value::BigInt(id)).collect();
-            exec(
-                &conn,
-                &format!("DELETE FROM message_recipients WHERE message_id IN ({msg_placeholders})"),
-                &msg_values,
-            )?;
-        }
-
-        // 5. Delete messages
-        exec(
-            &conn,
-            &format!("DELETE FROM messages WHERE project_id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
-
-        // 6. Delete file_reservations
-        exec(
-            &conn,
-            &format!("DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
-        if table_exists(&conn, "file_reservation_releases")? {
-            exec(
-                &conn,
-                "DELETE FROM file_reservation_releases \
-                 WHERE reservation_id NOT IN (SELECT id FROM file_reservations)",
-                &[],
-            )?;
-        }
-
-        // 7. Delete product links scoped to filtered-out projects and then
-        // remove any products that are no longer referenced by the kept scope.
-        if table_exists(&conn, "product_project_links")? {
-            exec(
-                &conn,
-                &format!(
-                    "DELETE FROM product_project_links WHERE project_id NOT IN ({placeholders})"
-                ),
-                &id_values,
-            )?;
-            if table_exists(&conn, "products")? {
-                exec(
-                    &conn,
-                    "DELETE FROM products \
-                     WHERE id NOT IN (SELECT DISTINCT product_id FROM product_project_links)",
-                    &[],
-                )?;
-            }
-        }
-
-        // 8. Remove lifecycle ledger rows for agents outside the selected
-        // project scope before removing their parent rows. Older snapshots do
-        // not have this table, so keep the operation schema-tolerant.
-        if table_exists(&conn, "agent_deregistrations")? {
-            exec(
-                &conn,
-                &format!(
-                    "DELETE FROM agent_deregistrations \
-                     WHERE agent_id IN (\
-                         SELECT id FROM agents WHERE project_id NOT IN ({placeholders})\
-                     )"
-                ),
-                &id_values,
-            )?;
-        }
-
-        // 9. Delete agents
-        exec(
-            &conn,
-            &format!("DELETE FROM agents WHERE project_id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
-
-        // 10. Delete recipient links that now point at filtered-out agents, then
-        // repair the denormalized recipients envelope for kept messages.
-        exec(
-            &conn,
-            "DELETE FROM message_recipients \
-             WHERE agent_id NOT IN (SELECT id FROM agents)",
-            &[],
-        )?;
         if column_exists(&conn, "messages", "recipients_json")? {
             sync_scope_recipients_json(&conn)?;
         }
@@ -297,12 +189,12 @@ pub fn apply_project_scope(
             rebuild_scope_inbox_stats(&conn)?;
         }
 
-        // 12. Delete projects
-        exec(
-            &conn,
-            &format!("DELETE FROM projects WHERE id NOT IN ({placeholders})"),
-            &id_values,
-        )?;
+        // Global tool telemetry is not keyed by project, so it cannot be scoped:
+        // it covers every project's calls and goes whenever scoping applies,
+        // whatever the scrub preset (the archive preset otherwise keeps it).
+        if table_exists(&conn, "tool_metrics_snapshots")? {
+            exec(&conn, "DELETE FROM tool_metrics_snapshots", &[])?;
+        }
 
         let remaining = count_remaining(&conn)?;
 
@@ -331,6 +223,30 @@ pub fn apply_project_scope(
             Err(err)
         }
     }
+}
+
+/// Every project's `(slug, human_key)` in the snapshot, read before scoping
+/// deletes the unselected ones, so their paths can still be redacted from
+/// the rows that remain.
+///
+/// # Errors
+///
+/// - [`ShareError::Sqlite`] on any SQLite error.
+pub fn project_paths_before_scope(
+    snapshot_path: &Path,
+) -> Result<Vec<(String, String)>, ShareError> {
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let path_str = snapshot_path.display().to_string();
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
+    })?;
+    if !table_exists(&conn, "projects")? {
+        return Ok(Vec::new());
+    }
+    Ok(load_scope_projects(&conn)?
+        .into_iter()
+        .map(|project| (project.slug, project.human_key))
+        .collect())
 }
 
 fn load_scope_projects(conn: &Conn) -> Result<Vec<ProjectRecord>, ShareError> {
@@ -465,42 +381,59 @@ fn build_placeholders(n: usize) -> String {
     s
 }
 
-/// Check if a table exists in the database.
-/// Uses a direct SELECT probe because `FrankenConnection` does not
-/// support `sqlite_master` queries.
+/// Only catalog-proven absence is a legacy case. A broken view or a failed
+/// read must not skip scoping or leave global/private payloads in an export.
 fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
-    let probe = format!("SELECT 1 FROM \"{name}\" LIMIT 0");
-    match conn.query_sync(&probe, &[]) {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+    let rows = conn
+        .query_sync(
+            "SELECT type FROM sqlite_master WHERE name = ? COLLATE NOCASE AND type IN ('table', 'view')",
+            &[Value::Text(name.to_string())],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("inspect scope table {name}: {e}"),
+        })?;
+    if rows.is_empty() {
+        return Ok(false);
     }
+    if rows.len() != 1
+        || rows[0]
+            .get_named::<String>("type")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode scope table {name}: {e}"),
+            })?
+            != "table"
+    {
+        return Err(ShareError::Validation {
+            message: format!("scope object {name} must be a real table"),
+        });
+    }
+    Ok(true)
 }
 
 fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareError> {
-    // `SELECT "col" FROM t LIMIT 0` false-positives on fsqlite 0.3.8+: an
-    // unresolved double-quoted identifier degrades to a string literal (the
-    // SQLite double-quoted-string misfeature) and the probe succeeds. Use
-    // PRAGMA table_info first; keep the SELECT probe only as a fallback for
-    // engines whose table_info yields no rows.
+    // Never fall back to a quoted SELECT: SQLite may accept a missing quoted
+    // identifier as a string literal, while other failures hide real columns.
     let rows = conn
         .query_sync(&format!("PRAGMA table_info({table})"), &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("PRAGMA table_info({table}) failed: {e}"),
         })?;
-    if !rows.is_empty() {
-        for row in &rows {
-            let name: String = row.get_named("name").unwrap_or_default();
-            if name == column {
-                return Ok(true);
-            }
+    if rows.is_empty() {
+        return Err(ShareError::Validation {
+            message: format!("cannot inspect columns for scope table {table}"),
+        });
+    }
+    for row in &rows {
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode scope column in {table}: {e}"),
+            })?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
         }
-        return Ok(false);
     }
-    let probe = format!("SELECT \"{column}\" FROM \"{table}\" LIMIT 0");
-    match conn.query_sync(&probe, &[]) {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    Ok(false)
 }
 
 /// Execute a statement with parameters, mapping errors to [`ShareError`].
@@ -512,6 +445,14 @@ fn exec(conn: &Conn, sql: &str, params: &[Value]) -> Result<u64, ShareError> {
 }
 
 fn sync_scope_recipients_json(conn: &Conn) -> Result<(), ShareError> {
+    // Inspect once per scope, not once per message. A partially upgraded
+    // shared schema cannot be interpreted as a legacy direct-only mailbox.
+    let shared = table_exists(conn, "project_mailbox_deliveries")?;
+    if shared != table_exists(conn, "project_mailbox_receipts")? {
+        return Err(ShareError::Validation {
+            message: "incomplete project mailbox schema; recipient scoping refused".to_string(),
+        });
+    }
     let message_rows = conn
         .query_sync("SELECT id FROM messages ORDER BY id ASC", &[])
         .map_err(|e| ShareError::Sqlite {
@@ -522,13 +463,17 @@ fn sync_scope_recipients_json(conn: &Conn) -> Result<(), ShareError> {
         let message_id = row.get_named::<i64>("id").map_err(|e| ShareError::Sqlite {
             message: format!("scope recipients_json message id decode failed: {e}"),
         })?;
-        sync_scope_message_recipients_json(conn, message_id)?;
+        sync_scope_message_recipients_json(conn, message_id, shared)?;
     }
 
     Ok(())
 }
 
-fn sync_scope_message_recipients_json(conn: &Conn, message_id: i64) -> Result<(), ShareError> {
+fn sync_scope_message_recipients_json(
+    conn: &Conn,
+    message_id: i64,
+    shared: bool,
+) -> Result<(), ShareError> {
     let rows = conn
         .query_sync(
             "SELECT COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') AS name, \
@@ -570,6 +515,9 @@ fn sync_scope_message_recipients_json(conn: &Conn, message_id: i64) -> Result<()
         }
     }
 
+    if shared {
+        append_scope_project_recipient(conn, message_id, &mut to_names, &mut cc_names)?;
+    }
     let recipients_json = json!({
         "to": to_names,
         "cc": cc_names,
@@ -585,6 +533,85 @@ fn sync_scope_message_recipients_json(conn: &Conn, message_id: i64) -> Result<()
         message: format!("scope recipients_json update failed for message {message_id}: {e}"),
     })?;
 
+    Ok(())
+}
+
+/// Rebuild the shared address from surviving delivery authority, never from
+/// the pre-scope cache or the project roster. This preserves TO versus CC
+/// without fan-out, receipt writes, or resurrecting excluded destinations.
+fn append_scope_project_recipient(
+    conn: &Conn,
+    message_id: i64,
+    to: &mut Vec<String>,
+    cc: &mut Vec<String>,
+) -> Result<(), ShareError> {
+    use mcp_agent_mail_db::project_mailbox::{
+        parse_project_mailbox_address, project_mailbox_address,
+    };
+
+    let rows = conn
+        .query_sync(
+            "SELECT d.kind AS kind, d.project_id AS delivery_project_id, \
+                    m.project_id AS message_project_id, p.slug AS slug \
+             FROM project_mailbox_deliveries d \
+             LEFT JOIN messages m ON m.id = d.message_id \
+             LEFT JOIN projects p ON p.id = d.project_id \
+             WHERE d.message_id = ? LIMIT 2",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("scope shared routing query failed for message {message_id}: {e}"),
+        })?;
+    if rows.len() > 1 {
+        return Err(ShareError::Validation {
+            message: format!("ambiguous shared delivery for message {message_id}; scope refused"),
+        });
+    }
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let delivery_project =
+        row.get_named::<i64>("delivery_project_id")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode shared delivery project for message {message_id}: {e}"),
+            })?;
+    let message_project =
+        row.get_named::<i64>("message_project_id")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("decode shared message project for message {message_id}: {e}"),
+            })?;
+    let slug = row
+        .get_named::<String>("slug")
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("decode shared project slug for message {message_id}: {e}"),
+        })?;
+    let kind = row
+        .get_named::<String>("kind")
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("decode shared delivery kind for message {message_id}: {e}"),
+        })?;
+    let address = project_mailbox_address(&slug);
+    if delivery_project != message_project
+        || slug.is_empty()
+        || parse_project_mailbox_address(&address) != Some(slug.as_str())
+    {
+        return Err(ShareError::Validation {
+            message: format!(
+                "invalid shared delivery identity for message {message_id}; scope refused"
+            ),
+        });
+    }
+    match kind.as_str() {
+        "to" => to.push(address),
+        "cc" => cc.push(address),
+        _ => {
+            return Err(ShareError::Validation {
+                message: format!(
+                    "invalid shared delivery kind for message {message_id}; scope refused"
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -845,6 +872,38 @@ mod tests {
     }
 
     #[test]
+    fn scoping_drops_global_tool_telemetry() {
+        let seed = |db: &std::path::Path| {
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "CREATE TABLE tool_metrics_snapshots (id INTEGER PRIMARY KEY, payload TEXT)",
+            )
+            .unwrap();
+            conn.execute_raw("INSERT INTO tool_metrics_snapshots VALUES (1, 'every project')")
+                .unwrap();
+        };
+        let telemetry_rows = |db: &std::path::Path| -> i64 {
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.query_sync("SELECT COUNT(*) AS n FROM tool_metrics_snapshots", &[])
+                .unwrap()[0]
+                .get_named("n")
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let scoped = create_test_db(dir.path());
+        seed(&scoped);
+        apply_project_scope(&scoped, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(telemetry_rows(&scoped), 0, "covers other projects' calls");
+
+        let other = tempfile::tempdir().unwrap();
+        let unscoped = create_test_db(other.path());
+        seed(&unscoped);
+        apply_project_scope(&unscoped, &[]).unwrap();
+        assert_eq!(telemetry_rows(&unscoped), 1, "no scope, nothing to hide");
+    }
+
+    #[test]
     fn scope_empty_identifiers_keeps_all() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
@@ -882,28 +941,248 @@ mod tests {
     }
 
     #[test]
-    fn scope_ignores_empty_identifiers() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = create_test_db(dir.path());
-        let result = apply_project_scope(
-            &db,
-            &[String::new(), "   ".to_string(), "proj-alpha".to_string()],
-        )
-        .unwrap();
-        assert_eq!(result.removed_count, 1);
-        assert_eq!(result.projects.len(), 1);
-        assert_eq!(result.projects[0].slug, "proj-alpha");
+    fn scope_rejects_blank_identifiers_without_mutation() {
+        for identifiers in [
+            vec![String::new()],
+            vec!["   \t\n".to_string()],
+            vec!["\u{2003}".to_string()],
+            vec!["proj-alpha".to_string(), String::new()],
+            vec![String::new(), "proj-alpha".to_string()],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_test_db(dir.path());
+            let error = apply_project_scope(&db, &identifiers).unwrap_err();
+            assert!(matches!(error, ShareError::ScopeIdentifierNotFound { .. }));
+            let unchanged = apply_project_scope(&db, &[]).unwrap();
+            assert_eq!(unchanged.remaining.projects, 2);
+            assert_eq!(unchanged.remaining.messages, 3);
+            assert_eq!(unchanged.remaining.recipients, 3);
+        }
     }
 
     #[test]
-    fn scope_only_empty_identifiers_keeps_all() {
+    fn scope_rejects_ambiguous_aliases_before_any_deletion() {
+        for (sql, identifier) in [
+            (
+                "UPDATE projects SET slug = 'PROJ-ALPHA' WHERE id = 2",
+                "proj-alpha",
+            ),
+            (
+                "UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 2",
+                "proj-alpha",
+            ),
+            (
+                "UPDATE projects SET human_key = '/DATA/PROJECTS/ALPHA' WHERE id = 2",
+                "/data/projects/alpha",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_test_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(sql).unwrap();
+            drop(conn);
+            // An earlier valid selection must not permit a partial scope.
+            let error =
+                apply_project_scope(&db, &["proj-beta".to_string(), identifier.to_string()]);
+            // The slug-collision case changes proj-beta, so use its unique
+            // human key to reach the ambiguous selection in that case.
+            let error = if matches!(error, Err(ShareError::ScopeIdentifierNotFound { .. })) {
+                apply_project_scope(
+                    &db,
+                    &["/data/projects/beta".to_string(), identifier.to_string()],
+                )
+            } else {
+                error
+            }
+            .unwrap_err();
+            assert!(matches!(error, ShareError::Validation { .. }));
+            assert!(error.to_string().contains("ambiguous project scope"));
+            let unchanged = apply_project_scope(&db, &[]).unwrap();
+            assert_eq!(unchanged.remaining.projects, 2);
+            assert_eq!(unchanged.remaining.messages, 3);
+        }
+    }
+
+    #[test]
+    fn scope_can_use_unique_alias_despite_an_unrelated_collision() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
-        let result = apply_project_scope(&db, &[String::new(), "   ".to_string()]).unwrap();
-        assert_eq!(result.removed_count, 0);
-        assert_eq!(result.projects.len(), 2);
-        assert_eq!(result.remaining.projects, 2);
-        assert_eq!(result.remaining.messages, 3);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE projects SET slug = 'PROJ-ALPHA' WHERE id = 2")
+            .unwrap();
+        drop(conn);
+        let result = apply_project_scope(&db, &[" /data/projects/alpha ".to_string()]).unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].id, 1);
+        assert_eq!(result.remaining.messages, 2);
+    }
+
+    #[test]
+    fn scope_identical_aliases_of_one_project_are_not_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE projects SET human_key = 'PROJ-ALPHA' WHERE id = 1")
+            .unwrap();
+        drop(conn);
+        let result =
+            apply_project_scope(&db, &["proj-alpha".to_string(), "PROJ-ALPHA".to_string()])
+                .unwrap();
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].id, 1);
+        assert_eq!(result.remaining.messages, 2);
+    }
+
+    fn add_shared_scope_state(db: &Path, kind: &str) {
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        for sql in [
+            "CREATE TABLE project_mailbox_deliveries(message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
+            "CREATE TABLE project_mailbox_receipts(message_id INTEGER NOT NULL REFERENCES messages(id), agent_id INTEGER NOT NULL REFERENCES agents(id), read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id,agent_id))",
+            "INSERT INTO project_mailbox_deliveries VALUES(3,2,'to',200)",
+            "INSERT INTO project_mailbox_receipts VALUES(1,1,17,19), (3,2,23,29)",
+            "UPDATE messages SET recipients_json = '{\"to\":[\"PurpleBear\"],\"cc\":[],\"bcc\":[]}' WHERE id=1",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+        conn.execute_sync(
+            "INSERT INTO project_mailbox_deliveries VALUES(1,1,?,100)",
+            &[Value::Text(kind.to_string())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scope_preserves_shared_roles_without_fanout_or_receipt_mutation() {
+        for kind in ["to", "cc"] {
+            for direct in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_test_db(dir.path());
+                add_shared_scope_state(&db, kind);
+                if !direct {
+                    let conn = Conn::open_file(db.display().to_string()).unwrap();
+                    conn.execute_raw("DELETE FROM message_recipients WHERE message_id=1")
+                        .unwrap();
+                }
+                apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT recipients_json FROM messages WHERE id=1", &[])
+                    .unwrap();
+                let routing: serde_json::Value =
+                    serde_json::from_str(&rows[0].get_named::<String>("recipients_json").unwrap())
+                        .unwrap();
+                let mut expected = json!({"to": [], "cc": [], "bcc": []});
+                if direct {
+                    expected["to"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("GreenCastle"));
+                }
+                expected[kind]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("project:proj-alpha"));
+                assert_eq!(routing, expected);
+                assert_eq!(
+                    count_table(&conn, "message_recipients").unwrap(),
+                    1 + i64::from(direct)
+                );
+                let deliveries = conn
+                    .query_sync(
+                        "SELECT message_id, kind FROM project_mailbox_deliveries",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(deliveries.len(), 1);
+                assert_eq!(deliveries[0].get_named::<i64>("message_id").unwrap(), 1);
+                assert_eq!(deliveries[0].get_named::<String>("kind").unwrap(), kind);
+                let receipts = conn
+                    .query_sync("SELECT message_id, agent_id, read_ts, ack_ts FROM project_mailbox_receipts", &[])
+                    .unwrap();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].get_named::<i64>("message_id").unwrap(), 1);
+                assert_eq!(receipts[0].get_named::<i64>("agent_id").unwrap(), 1);
+                assert_eq!(receipts[0].get_named::<i64>("read_ts").unwrap(), 17);
+                assert_eq!(receipts[0].get_named::<i64>("ack_ts").unwrap(), 19);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_shared_evidence_rolls_back_the_complete_scope() {
+        for sql in [
+            "UPDATE project_mailbox_deliveries SET kind='bcc' WHERE message_id=1",
+            "UPDATE projects SET slug='' WHERE id=1",
+            "UPDATE projects SET slug='proj-alpha#GreenCastle' WHERE id=1",
+            "ALTER TABLE project_mailbox_deliveries RENAME COLUMN kind TO broken_kind",
+            "ALTER TABLE project_mailbox_receipts RENAME TO retained_receipts",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_test_db(dir.path());
+            add_shared_scope_state(&db, "to");
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(sql).unwrap();
+            drop(conn);
+            assert!(apply_project_scope(&db, &["/data/projects/alpha".to_string()]).is_err());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            assert_eq!(count_table(&conn, "projects").unwrap(), 2);
+            assert_eq!(count_table(&conn, "messages").unwrap(), 3);
+            assert_eq!(count_table(&conn, "message_recipients").unwrap(), 3);
+            assert_eq!(count_table(&conn, "agent_links").unwrap(), 1);
+            let rows = conn
+                .query_sync("SELECT recipients_json FROM messages WHERE id=1", &[])
+                .unwrap();
+            assert!(
+                rows[0]
+                    .get_named::<String>("recipients_json")
+                    .unwrap()
+                    .contains("PurpleBear")
+            );
+        }
+    }
+
+    #[test]
+    fn shared_delivery_cannot_be_readdressed_between_selected_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        add_shared_scope_state(&db, "to");
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects(id,slug,human_key) VALUES(3,'keep-other','/keep-other')",
+        )
+        .unwrap();
+        conn.execute_raw("UPDATE project_mailbox_deliveries SET project_id=3 WHERE message_id=1")
+            .unwrap();
+        drop(conn);
+        let error = apply_project_scope(&db, &["proj-alpha".to_string(), "keep-other".to_string()])
+            .unwrap_err();
+        assert!(matches!(error, ShareError::Validation { .. }));
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(count_table(&conn, "projects").unwrap(), 3);
+        assert_eq!(count_table(&conn, "messages").unwrap(), 3);
+    }
+
+    #[test]
+    fn broken_telemetry_view_is_not_absence_and_rolls_back_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE VIEW tool_metrics_snapshots AS SELECT secret FROM missing_private_source",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(apply_project_scope(&db, &["proj-alpha".to_string()]).is_err());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(count_table(&conn, "projects").unwrap(), 2);
+        assert_eq!(count_table(&conn, "messages").unwrap(), 3);
+        assert_eq!(count_table(&conn, "agent_links").unwrap(), 1);
+        assert!(matches!(
+            table_exists(&conn, "tool_metrics_snapshots"),
+            Err(ShareError::Validation { .. })
+        ));
+        assert!(!table_exists(&conn, "genuinely_absent_table").unwrap());
+        assert!(table_exists(&conn, "PROJECTS").unwrap());
     }
 
     #[test]

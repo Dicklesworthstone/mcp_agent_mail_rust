@@ -88,6 +88,20 @@ impl Default for BundleExportConfig {
     }
 }
 
+/// An attachment path as a published bundle may record it: relative archive
+/// paths as they are, an absolute host path as its file name only.
+fn publishable_attachment_path(path: &str) -> String {
+    let as_path = Path::new(path);
+    if as_path.is_absolute() {
+        as_path.file_name().map_or_else(
+            || "attachment".to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    } else {
+        path.to_string()
+    }
+}
+
 fn rewrite_original_path(obj: &mut serde_json::Map<String, Value>, original_path: &Option<String>) {
     match original_path {
         Some(path) => {
@@ -217,6 +231,11 @@ pub fn bundle_attachments(
                 let Some(orig_path_str) = &original_path else {
                     continue;
                 };
+                // What the published bundle records: an absolute source path
+                // (allowed with ALLOW_ABSOLUTE_ATTACHMENT_PATHS) would publish
+                // the host's directory layout, so only its file name is kept.
+                // `orig_path_str` still locates the file.
+                let published_path = original_path.as_deref().map(publishable_attachment_path);
 
                 let media_type = obj
                     .get("media_type")
@@ -255,7 +274,7 @@ pub fn bundle_attachments(
                             base64::engine::general_purpose::STANDARD.encode(&content)
                         );
                         remove_attachment_keys(obj, &["path", "note"]);
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("inline".to_string()));
                         obj.insert("data_uri".to_string(), Value::String(data_uri));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
@@ -270,7 +289,7 @@ pub fn bundle_attachments(
                             sha256: Some(sha),
                             media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: None,
                         });
                         updated = true;
@@ -278,7 +297,7 @@ pub fn bundle_attachments(
                         // External — too large to bundle
                         let sha = sha256_file(source)?;
                         remove_attachment_keys(obj, &["path", "data_uri"]);
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("external".to_string()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
                         obj.insert(
@@ -298,7 +317,7 @@ pub fn bundle_attachments(
                             sha256: Some(sha),
                             media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: None,
                         });
                         updated = true;
@@ -319,7 +338,7 @@ pub fn bundle_attachments(
                         };
 
                         remove_attachment_keys(obj, &["data_uri", "note"]);
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("file".to_string()));
                         obj.insert("path".to_string(), Value::String(bundle_rel.clone()));
                         obj.insert("sha256".to_string(), Value::String(sha.clone()));
@@ -334,7 +353,7 @@ pub fn bundle_attachments(
                             sha256: Some(sha),
                             media_type: Some(media_type.clone()),
                             bytes: Some(file_size as u64),
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: Some(bundle_rel),
                         });
                         updated = true;
@@ -353,7 +372,7 @@ pub fn bundle_attachments(
                             obj,
                             &["path", "data_uri", "sha256", "bytes", "note"],
                         );
-                        rewrite_original_path(obj, &original_path);
+                        rewrite_original_path(obj, &published_path);
                         obj.insert("type".to_string(), Value::String("missing".to_string()));
                         stats.missing += 1;
                         items.push(AttachmentItem {
@@ -362,7 +381,7 @@ pub fn bundle_attachments(
                             sha256: None,
                             media_type: Some(media_type),
                             bytes: None,
-                            original_path: original_path.clone(),
+                            original_path: published_path.clone(),
                             bundle_path: None,
                         });
                         updated = true;
@@ -496,26 +515,6 @@ pub fn write_bundle_scaffolding(
     viewer_data: Option<&ViewerDataManifest>,
     viewer_sri: &HashMap<String, String>,
 ) -> ShareResult<()> {
-    // manifest.json (sorted keys for determinism — matches Python `sort_keys=True`)
-    let manifest = build_manifest(
-        scope,
-        scrub_summary,
-        attachment_manifest,
-        chunk_manifest,
-        chunk_threshold,
-        chunk_size,
-        hosting_hints,
-        fts_enabled,
-        db_path_relative,
-        db_sha256,
-        db_size_bytes,
-        viewer_data,
-        viewer_sri,
-    );
-    let sorted = sort_json_keys(&manifest);
-    let manifest_json = crate::encode_json_pretty(&sorted, "bundle manifest serialization failed")?;
-    write_output_bytes(output_dir, "manifest.json", manifest_json.as_bytes())?;
-
     // README.md
     let readme = generate_readme(scope, scrub_summary);
     write_output_bytes(output_dir, "README.md", readme.as_bytes())?;
@@ -559,7 +558,60 @@ pub fn write_bundle_scaffolding(
     let headers = hosting::generate_headers_file();
     write_output_bytes(output_dir, "_headers", headers.as_bytes())?;
 
+    // manifest.json last (sorted keys for determinism — matches Python
+    // `sort_keys=True`): it records the hash of every file written before it.
+    let mut manifest = build_manifest(
+        scope,
+        scrub_summary,
+        attachment_manifest,
+        chunk_manifest,
+        chunk_threshold,
+        chunk_size,
+        hosting_hints,
+        fts_enabled,
+        db_path_relative,
+        db_sha256,
+        db_size_bytes,
+        viewer_data,
+        viewer_sri,
+    );
+    manifest[MANIFEST_FILES_KEY] = Value::Object(hash_bundle_files(output_dir)?);
+    let sorted = sort_json_keys(&manifest);
+    let manifest_json = crate::encode_json_pretty(&sorted, "bundle manifest serialization failed")?;
+    write_output_bytes(output_dir, "manifest.json", manifest_json.as_bytes())?;
+
     Ok(())
+}
+
+/// Manifest key mapping every bundle-relative path the export wrote to its
+/// SHA-256 (hex), so a manifest signature covers the whole bundle: viewer
+/// code, rendered pages, data and attachments, not just the database and the
+/// vendored scripts in `viewer.sri`.
+pub(crate) const MANIFEST_FILES_KEY: &str = "files";
+
+/// Export outputs left out of [`MANIFEST_FILES_KEY`]: the manifest and its
+/// signature, and the hosting config the deploy wizard rewrites per provider
+/// after the bundle is signed.
+const UNHASHED_BUNDLE_FILES: [&str; 5] = [
+    "manifest.json",
+    "manifest.sig.json",
+    "_headers",
+    "_redirects",
+    ".nojekyll",
+];
+
+fn hash_bundle_files(output_dir: &Path) -> ShareResult<serde_json::Map<String, Value>> {
+    let mut entries = Vec::new();
+    collect_entries_ctx(output_dir, output_dir, &mut entries, "bundle")?;
+    let mut files = serde_json::Map::new();
+    for relative in entries {
+        if UNHASHED_BUNDLE_FILES.contains(&relative.as_str()) {
+            continue;
+        }
+        let digest = sha256_file(&output_dir.join(&relative))?;
+        files.insert(relative, Value::String(digest));
+    }
+    Ok(files)
 }
 
 /// Result of the canonical bundle export assembly path.
@@ -2256,6 +2308,58 @@ mod tests {
     }
 
     #[test]
+    fn bundled_absolute_attachment_paths_publish_only_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let outside = dir.path().join("home-alice-clients-acme");
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("merger-notes.txt");
+        std::fs::write(&source, b"Hello!").unwrap();
+
+        let att_json = serde_json::json!([{
+            "type": "file",
+            "path": source.display().to_string(),
+            "media_type": "text/plain",
+        }])
+        .to_string();
+        let db = create_bundle_test_db(dir.path(), &[att_json.as_str()]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let result = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            result.items[0].original_path.as_deref(),
+            Some("merger-notes.txt")
+        );
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            !att.contains("home-alice-clients-acme"),
+            "the host directory must not be published: {att}"
+        );
+        assert!(att.contains("merger-notes.txt"), "{att}");
+
+        // Relative archive paths are recorded as they are.
+        assert_eq!(
+            publishable_attachment_path("attachments/ab/x.webp"),
+            "attachments/ab/x.webp"
+        );
+    }
+
+    #[test]
     fn bundle_refreshes_attachment_materialized_view_after_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().join("storage");
@@ -3101,6 +3205,66 @@ mod tests {
         let copied1 = copy_viewer_assets_from(&source, &out1).unwrap();
         let copied2 = copy_viewer_assets_from(&source, &out2).unwrap();
         assert_eq!(copied1, copied2, "copy order should be deterministic");
+    }
+
+    #[test]
+    fn embedded_viewer_scripts_load_with_the_sri_of_their_shipped_bytes() {
+        // br-kp1in.42: the page's Alpine root is `window.viewerController()`,
+        // which only viewer.js defines; a missing or stale script tag leaves
+        // the exported viewer dead. Every local script must carry the SRI of
+        // the bytes the bundle ships, or the browser refuses to run it.
+        use base64::Engine;
+
+        let index = std::str::from_utf8(
+            BUILTIN_VIEWER_ASSETS
+                .get_file("index.html")
+                .expect("embedded index.html")
+                .contents(),
+        )
+        .expect("index.html is UTF-8");
+        let attr = |tag: &str, name: &str| -> Option<String> {
+            let start = tag.find(&format!("{name}=\""))? + name.len() + 2;
+            Some(tag[start..].split('"').next()?.to_string())
+        };
+        let mut checked = Vec::new();
+        for chunk in index.split("<script").skip(1) {
+            let tag = chunk.split('>').next().unwrap_or_default();
+            let Some(src) =
+                attr(tag, "src").and_then(|src| src.strip_prefix("./").map(String::from))
+            else {
+                continue;
+            };
+            if tag.contains("type=\"module\"") {
+                continue; // preview-reload.js only runs under `am share preview`
+            }
+            let bytes = BUILTIN_VIEWER_ASSETS
+                .get_file(&src)
+                .unwrap_or_else(|| panic!("index.html loads {src}, which the viewer does not ship"))
+                .contents();
+            let expected = format!(
+                "sha256-{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
+            );
+            assert_eq!(
+                attr(tag, "integrity").as_deref(),
+                Some(expected.as_str()),
+                "{src} must load with the SRI of its shipped bytes"
+            );
+            checked.push(src);
+        }
+        assert!(
+            checked.iter().any(|src| src == "viewer.js"),
+            "index.html must load the viewer controller: {checked:?}"
+        );
+        assert!(checked.iter().any(|src| src == "vendor/dompurify.min.js"));
+        let controller = std::str::from_utf8(
+            BUILTIN_VIEWER_ASSETS
+                .get_file("viewer.js")
+                .expect("embedded viewer.js")
+                .contents(),
+        )
+        .expect("viewer.js is UTF-8");
+        assert!(controller.contains("window.viewerController = viewerController"));
     }
 
     #[test]

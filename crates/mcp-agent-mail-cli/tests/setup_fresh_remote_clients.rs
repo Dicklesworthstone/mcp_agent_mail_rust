@@ -267,6 +267,94 @@ fn no_clients_or_nonexecutable_names_do_not_create_credentials() {
     }
 }
 
+/// Status of one `POST /mcp/` `tools/list`, or `None` when nothing answered.
+fn mcp_status(port: u16, authorization: Option<&str>) -> Option<u16> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .ok()?;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let auth =
+        authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+    write!(
+        stream,
+        "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nConnection: close\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut head = [0_u8; 64];
+    let read = stream.read(&mut head).ok()?;
+    std::str::from_utf8(&head[..read])
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+struct ServerGuard(std::process::Child);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// br-49eak: the credential `am setup run` persists is the one a fresh server
+/// process enforces. The server gets no token in its environment (the sandbox
+/// clears it), so it can only have read the canonical `config.env` that setup
+/// wrote; a writer/reader split on that path would reject the persisted token.
+#[test]
+fn setup_token_is_the_one_a_fresh_server_enforces() {
+    let sandbox = Sandbox::new("config");
+    require_success(&sandbox.setup(), "setup");
+    let token = sandbox.assert_credentials();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("free loopback port")
+        .port();
+    let mut server = ServerGuard(
+        sandbox
+            .command(env!("CARGO_BIN_EXE_am"))
+            .args(["serve-http", "--no-tui"])
+            .env("HTTP_PORT", port.to_string())
+            .env("TUI_ENABLED", "false")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn am serve-http"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while mcp_status(port, None).is_none() {
+        assert!(
+            server.0.try_wait().expect("poll server").is_none(),
+            "server exited before listening on {port}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server never answered on {port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    assert_eq!(mcp_status(port, None), Some(401), "no credential");
+    assert_eq!(
+        mcp_status(port, Some("Bearer not-the-persisted-token")),
+        Some(401),
+        "wrong credential"
+    );
+    assert_eq!(
+        mcp_status(port, Some(&format!("Bearer {token}"))),
+        Some(200),
+        "the persisted setup token must authenticate"
+    );
+}
+
 #[test]
 fn symlinked_token_authority_fails_before_any_client_write() {
     let sandbox = Sandbox::new("path");

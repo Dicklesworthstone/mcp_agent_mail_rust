@@ -347,6 +347,11 @@ pub struct Config {
     pub read_cache_entries_per_category: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
+    /// Run periodic integrity checks, automatic backups and database maintenance.
+    /// Independent of the boot-time probe (default: true).
+    pub integrity_guard_enabled: bool,
+    /// Seconds between background quick-check cycles (default: 300, minimum: 1).
+    pub integrity_quick_check_interval_seconds: u64,
     /// Hours between periodic full `PRAGMA integrity_check` runs
     /// (default: 1, 0 = disabled).
     ///
@@ -525,6 +530,18 @@ pub struct Config {
     /// a receipt that omits message payload fields. This remains opt-in so the
     /// default MCP/Python-parity send contract is unchanged.
     pub messaging_fail_closed_send_profile: bool,
+    /// Opt-in MCP session-bound agent identity (GH#279,
+    /// `MESSAGING_SESSION_IDENTITY`).
+    ///
+    /// When enabled, an MCP session (one stdio process, or one Streamable
+    /// HTTP session identified by `Mcp-Session-Id`) remembers the agent
+    /// identities it established (`create_agent_identity`, or a
+    /// `register_agent` that created the agent). A bound agent is a verified
+    /// sender in that session without a `sender_token` in the transcript, and
+    /// a session that holds an identity in a project cannot act as another
+    /// agent of that project by naming it. Off by default: the trusted-local,
+    /// stateless contract is unchanged.
+    pub messaging_session_identity: bool,
 
     // Message size limits (bytes). 0 = unlimited.
     pub max_message_body_bytes: usize,
@@ -1300,9 +1317,47 @@ fn current_exe_is_cargo_test_artifact() -> bool {
     std::env::current_exe()
         .ok()
         .as_deref()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "deps")
+        .is_some_and(path_has_cargo_test_artifact_layout)
+}
+
+/// Cargo test/bench artifact locations, from the executable path alone:
+///
+/// * `<target>/<profile>/deps/<name>-<hash>` (the classic layout), and
+/// * `<target>/<profile>/build/<package>/<hash>/out/<name>-<hash>` (the
+///   build-dir layout of the pinned nightly, also where RCH-relocated test
+///   binaries run from; GH#340). There no binary lives under `deps/`, so a
+///   `deps`-only check left every integration-test binary outside this crate
+///   undetected under plain `cargo test`.
+///
+/// Shipped binaries (`<target>/<profile>/am`, `~/.local/bin/am`) match neither.
+fn path_has_cargo_test_artifact_layout(exe: &Path) -> bool {
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    if parent.file_name().is_some_and(|name| name == "deps") {
+        return true;
+    }
+    let in_build_out_dir = parent.file_name().is_some_and(|name| name == "out")
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "build");
+    in_build_out_dir
+        && exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(has_cargo_metadata_hash_suffix)
+}
+
+/// `<name>-<16 hex digits>` (optionally `.exe`): the hash Cargo appends to
+/// test and bench artifacts. Build-script outputs in `out/` carry no such tag.
+fn has_cargo_metadata_hash_suffix(file_name: &str) -> bool {
+    let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    stem.rsplit_once('-').is_some_and(|(name, hash)| {
+        !name.is_empty() && hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+    })
 }
 
 /// When this process is running under a test harness and `storage_root`
@@ -1586,6 +1641,8 @@ impl Default for Config {
             read_cache_entries_per_category: CacheProfile::Balanced
                 .read_cache_entries_per_category(),
             integrity_check_on_startup: true,
+            integrity_guard_enabled: true,
+            integrity_quick_check_interval_seconds: 300,
             integrity_check_interval_hours: 1,
 
             fsqlite_concurrent_mode: false,
@@ -1731,6 +1788,7 @@ impl Default for Config {
             messaging_auto_register_recipients: true,
             messaging_auto_handshake_on_block: true,
             messaging_fail_closed_send_profile: false,
+            messaging_session_identity: false,
 
             // Message size limits
             max_message_body_bytes: 1_048_576,   // 1 MiB
@@ -2136,6 +2194,13 @@ impl Config {
             "INTEGRITY_CHECK_INTERVAL_HOURS",
             config.integrity_check_interval_hours,
         );
+        config.integrity_guard_enabled =
+            env_bool("INTEGRITY_GUARD_ENABLED", config.integrity_guard_enabled);
+        config.integrity_quick_check_interval_seconds = env_u64(
+            "INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS",
+            config.integrity_quick_check_interval_seconds,
+        )
+        .max(1);
 
         // Periodic SQLite maintenance knobs (bead K4). Each interval is in
         // seconds; 0 disables that op (and `DB_MAINTENANCE_ENABLED=false`
@@ -2484,6 +2549,10 @@ impl Config {
         config.messaging_fail_closed_send_profile = env_bool(
             "MESSAGING_FAIL_CLOSED_SEND_PROFILE",
             config.messaging_fail_closed_send_profile,
+        );
+        config.messaging_session_identity = env_bool(
+            "MESSAGING_SESSION_IDENTITY",
+            config.messaging_session_identity,
         );
 
         // Message size limits
@@ -6071,6 +6140,11 @@ mod tests {
             "Python-DB discovery needs the raw URL; Config substitutes the Rust default when unset",
         ),
         (
+            "STORAGE_ROOT",
+            "mcp-agent-mail-guard/src/lib.rs",
+            "explicit-vs-default provenance: the installed hook bakes in only an explicitly configured root and computes the default itself at commit time",
+        ),
+        (
             "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
             "mcp-agent-mail-guard/src/lib.rs",
             "git hook contract: the guard gates on the committing process env, like the hook script",
@@ -7317,6 +7391,40 @@ mod tests {
     }
 
     #[test]
+    fn integrity_guard_and_startup_flags_resolve_independently() {
+        assert!(Config::default().integrity_guard_enabled);
+        assert_eq!(
+            Config::default().integrity_quick_check_interval_seconds,
+            300
+        );
+        for (startup, guard, maintenance) in [
+            ("false", "true", "true"),
+            ("true", "false", "true"),
+            ("false", "true", "false"),
+        ] {
+            with_isolated_default_storage_root_and_env_overrides_for_test(
+                &[
+                    ("INTEGRITY_CHECK_ON_STARTUP", startup),
+                    ("INTEGRITY_GUARD_ENABLED", guard),
+                    ("DB_MAINTENANCE_ENABLED", maintenance),
+                    ("INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS", "0"),
+                ],
+                |_| {
+                    let config = Config::from_env();
+                    assert_eq!(config.integrity_check_on_startup, startup == "true");
+                    assert_eq!(config.integrity_guard_enabled, guard == "true");
+                    assert_eq!(config.db_maintenance_enabled, maintenance == "true");
+                    assert_eq!(config.integrity_quick_check_interval_seconds, 1);
+                    let flag = crate::flags::find_flag("INTEGRITY_GUARD_ENABLED").unwrap();
+                    let snapshot = crate::flags::flag_snapshot(&config, flag);
+                    assert_eq!(snapshot.current_value, guard);
+                    assert_eq!(snapshot.source, "env");
+                },
+            );
+        }
+    }
+
+    #[test]
     fn isolated_default_storage_root_helper_redirects_default_root_into_tempdir() {
         // br-99aih: the helper must hand tests a default storage root that is
         // (a) the default root by every definition the guard uses, (b) not
@@ -7412,6 +7520,40 @@ mod tests {
                 guard_against_default_storage_root_in_test_mode(&explicit);
             },
         );
+    }
+
+    #[test]
+    fn cargo_test_artifacts_are_recognised_in_both_layouts() {
+        // GH#340: the pinned nightly (and RCH-relocated binaries) run tests from
+        // `build/<package>/<hash>/out/`, where a `deps`-only check missed them.
+        for test_binary in [
+            "/w/target/debug/deps/it-0123456789abcdef",
+            "/w/target/debug/build/mcp-agent-mail-storage/62e7a103e31a8cdc/out/it-0123456789abcdef",
+            "/w/target/debug/build/mcp-agent-mail-db/fffffffffffffff0/out/mcp_agent_mail_db-a1b2c3d4e5f60718",
+            "/w/target/debug/build/mcp-agent-mail-cli/0123456789abcdef/out/it-0123456789abcdef.exe",
+        ] {
+            assert!(
+                path_has_cargo_test_artifact_layout(Path::new(test_binary)),
+                "{test_binary} is a cargo test artifact"
+            );
+        }
+        // Shipped binaries, build-script outputs and look-alikes must never be
+        // mistaken for a test harness (the guard would then refuse real use).
+        for not_a_test in [
+            "/home/u/.local/bin/am",
+            "/w/target/release/am",
+            "/w/target/debug/mcp-agent-mail",
+            "/w/target/debug/build/zstd-sys/0123456789abcdef/out/libzstd.a",
+            "/w/target/debug/build/pkg/0123456789abcdef/out/gen-notahexhash12",
+            "/w/target/debug/build/pkg/out/it-0123456789abcdef",
+            "/srv/out/it-0123456789abcdef",
+            "am",
+        ] {
+            assert!(
+                !path_has_cargo_test_artifact_layout(Path::new(not_a_test)),
+                "{not_a_test} is not a cargo test artifact"
+            );
+        }
     }
 
     #[test]

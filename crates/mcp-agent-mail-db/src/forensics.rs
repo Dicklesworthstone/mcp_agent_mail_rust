@@ -749,6 +749,91 @@ fn recovery_receipts_dir(_storage_root: &Path, db_path: &Path) -> Result<PathBuf
         .join(forensic_bundle_dir_component(&authority_path)))
 }
 
+/// A crashed promotion can release its process lock while its durable intent
+/// still references recovery generations. Retention must preserve those bytes
+/// until recovery resolves the intent; verifying the entire receipt chain or
+/// opening the live database is unnecessary for this admission check.
+#[cfg(unix)]
+pub(crate) fn ensure_no_pending_recovery_receipts(db_path: &Path) -> std::io::Result<()> {
+    let directory = recovery_receipts_dir(Path::new(""), db_path).map_err(std::io::Error::other)?;
+    ensure_no_pending_recovery_receipts_in(&directory, 16_384)
+}
+
+#[cfg(unix)]
+fn ensure_no_pending_recovery_receipts_in(path: &Path, entry_limit: usize) -> std::io::Result<()> {
+    use rustix::fs::{Dir, Mode, OFlags};
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !path.is_absolute() {
+        return Err(std::io::Error::other(
+            "recovery receipt authority must be absolute",
+        ));
+    }
+    let open_directory = || -> std::io::Result<Option<std::fs::File>> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut directory = std::fs::File::from(rustix::fs::open("/", flags, Mode::empty())?);
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::Normal(name) => {
+                    match rustix::fs::openat(&directory, name, flags, Mode::empty()) {
+                        Ok(next) => directory = std::fs::File::from(next),
+                        Err(rustix::io::Errno::NOENT) => return Ok(None),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                _ => {
+                    return Err(std::io::Error::other(
+                        "invalid recovery receipt authority path",
+                    ));
+                }
+            }
+        }
+        Ok(Some(directory))
+    };
+    let Some(directory) = open_directory()? else {
+        return Ok(());
+    };
+    let before = directory.metadata()?;
+    let mut observed = 0;
+    for entry in Dir::read_from(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        observed += 1;
+        if observed > entry_limit {
+            return Err(std::io::Error::other(
+                "recovery receipt inventory is incomplete; preserving recovery evidence",
+            ));
+        }
+        // Inspect names, not targets: malformed records, directories, and even
+        // dangling symlinks ending in .pending are all unresolved authority.
+        if name.ends_with(b".pending") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "unfinalized recovery intent remains; preserving recovery evidence",
+            ));
+        }
+    }
+    let current = open_directory()?
+        .ok_or_else(|| std::io::Error::other("recovery receipt authority disappeared"))?
+        .metadata()?;
+    if current.dev() != before.dev()
+        || current.ino() != before.ino()
+        || current.mtime() != before.mtime()
+        || current.mtime_nsec() != before.mtime_nsec()
+        || current.ctime() != before.ctime()
+        || current.ctime_nsec() != before.ctime_nsec()
+    {
+        return Err(std::io::Error::other(
+            "recovery receipt authority changed during retention",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_recovery_directory(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
@@ -4557,6 +4642,54 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(all(unix, not(target_os = "macos")))]
     use std::os::unix::ffi::OsStringExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_pending_scan_preserves_malformed_and_dangling_intents() {
+        for shape in ["malformed", "directory", "dangling"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let primary = root.join("storage.sqlite3");
+            let receipts = super::recovery_receipts_dir(&root, &primary).unwrap();
+            std::fs::create_dir_all(&receipts).unwrap();
+            let pending = receipts.join("recovery-admission.receipt.pending");
+            match shape {
+                "malformed" => std::fs::write(&pending, b"truncated intent").unwrap(),
+                "directory" => std::fs::create_dir(&pending).unwrap(),
+                _ => std::os::unix::fs::symlink(root.join("missing"), &pending).unwrap(),
+            }
+            assert!(
+                super::ensure_no_pending_recovery_receipts(&primary).is_err(),
+                "{shape}"
+            );
+            assert!(std::fs::symlink_metadata(&pending).is_ok(), "{shape}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_pending_scan_is_bounded_and_refuses_symlinked_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let receipts = super::recovery_receipts_dir(&root, &primary).unwrap();
+        super::ensure_no_pending_recovery_receipts(&primary).unwrap();
+        assert!(
+            !receipts.exists(),
+            "admission must not construct a receipt directory"
+        );
+        std::fs::create_dir_all(&receipts).unwrap();
+        for index in 0..3 {
+            std::fs::write(receipts.join(format!("{index}.receipt.json")), b"evidence").unwrap();
+        }
+        assert!(super::ensure_no_pending_recovery_receipts_in(&receipts, 2).is_err());
+        super::ensure_no_pending_recovery_receipts_in(&receipts, 3).unwrap();
+        let preserved = root.join("preserved-receipts");
+        std::fs::rename(&receipts, &preserved).unwrap();
+        std::os::unix::fs::symlink(&preserved, &receipts).unwrap();
+        assert!(super::ensure_no_pending_recovery_receipts(&primary).is_err());
+        assert_eq!(std::fs::read_dir(&preserved).unwrap().count(), 3);
+    }
 
     /// br-r6awv: reduced multiplicity of a SURVIVING identity is
     /// deduplication of replayed rows and must not count as identity loss —

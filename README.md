@@ -26,6 +26,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 ```
 
 <p><em>Works on Linux and macOS (x86_64 and aarch64). Auto-detects your platform, downloads the right binary, and configures detected coding agents for HTTP MCP.</em></p>
+<p><em>Needs <code>minisign</code> on <code>PATH</code> to verify the release (and <code>xz</code> on minimal Linux images); see <a href="#one-liner-recommended">One-Liner</a>.</em></p>
 </div>
 
 ---
@@ -98,7 +99,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 ### Quick Example
 
 ```bash
-# Install and start (auto-detects all installed coding agents)
+# Start the server (the installer already configured your detected coding agents;
+# `am setup run` re-runs that setup at any time)
 am
 
 # That's it. Server starts on 127.0.0.1:8765 with the interactive TUI.
@@ -295,6 +297,8 @@ The stress tests live in `crates/mcp-agent-mail-storage/tests/stress_pipeline.rs
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
 ```
 
+**Prerequisites:** the installer verifies the release with `minisign` and refuses to install without it, and minimal Linux images also lack `xz`. macOS: `brew install minisign`. Debian 12+ and Ubuntu 24.04+: `apt install minisign xz-utils`. Ubuntu 22.04 and Debian 10 have no `minisign` package: use the static binary from the [minisign releases](https://github.com/jedisct1/minisign/releases).
+
 Downloads the right binary for your platform, installs to `~/.local/bin`, optionally updates your `PATH`, and auto-configures detected Codex CLI configs for HTTP MCP URL mode. Downloaded release archives are verified **before extraction by default**. The requested version is normalized to the release tag `vX.Y.Z` (or `vX.Y.Z-prerelease`), and the trust model depends on the release generation:
 
 - **Releases v0.3.31 and later** (the current model): releases are built and published by the maintainer's own release infrastructure rather than GitHub Actions, and every release ships a `SHA256SUMS` manifest plus a detached **minisign** signature (`SHA256SUMS.minisig`) made with the maintainer-held release key (id `1BBD79B28BF718D0`; the public key is pinned inside the installer). The installer verifies the signature over the exact manifest bytes with `minisign`, then verifies the archive's SHA-256 against the authenticated manifest. A missing `minisign` executable, manifest, signature, or checksum entry aborts the install; `cosign` is not required or consulted for these releases. This replaced the earlier keyless GitHub-Actions Sigstore requirement, which had become unsatisfiable once releases stopped being built by Actions — the trust anchor is now a key the maintainer controls (the same model as the maintainer's other released tools), and verification remains fail-closed. `am self-update` applies the same model with a built-in minisign verifier (the release public key is embedded in the binary; no `minisign` executable is needed) and refuses unsigned or tampered manifests. See [SECURITY.md](SECURITY.md#release-trust-model).
@@ -314,6 +318,19 @@ iwr -useb "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_ru
 
 PowerShell enforces the same per-release trust contract before `Expand-Archive`: for releases v0.3.31 and later it verifies the minisign-signed `SHA256SUMS` manifest with the same pinned maintainer key (a `minisign` executable on `PATH` is required; `cosign` is not consulted), and for older releases it requires the same stable `cosign` v3.1.3-or-newer-in-v3 verifier, forces modern-bundle parsing, and isolates verification from the three custom Sigstore trust environment variables named above. The ZIP must contain exactly flat `am.exe` and `mcp-agent-mail.exe`, and their staged and post-install version lines must exactly match the requested release. Both executables are replaced under one per-destination installer mutex and rollback domain; backups remain until byte-for-byte installed-digest and version checks pass. Options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`, `-Verify` (explicitly request the already-default cryptographic checks), and `-NoVerify` (the **unsafe** escape that skips only those checksum and signature checks). Archive-member and exact-version checks still run with `-NoVerify`, which means unauthenticated downloaded executables run during version probes and may execute arbitrary code as the installer user.
 
+### Container (Docker or Podman)
+
+Each release also publishes a `linux/amd64` + `linux/arm64` image to GHCR, tagged `vX.Y.Z`, `X.Y.Z`, `0.3` and `latest`:
+
+```bash
+docker run -d --name agent-mail -p 127.0.0.1:8765:8765 \
+  -e HTTP_BEARER_TOKEN="$(openssl rand -hex 32)" \
+  -v agent-mail-data:/data/mailbox \
+  ghcr.io/dicklesworthstone/mcp_agent_mail_rust:latest
+```
+
+The image runs `mcp-agent-mail serve --no-tui` as the non-root `appuser`, serving MCP on port 8765 at `/mcp/`, with the whole mailbox (Git archive and SQLite) under `/data/mailbox`. Mount a volume there so mail survives replacing the container. Every request needs the token (`Authorization: Bearer <token>`); clients connect to `http://127.0.0.1:8765/mcp/` with it. Keep the published port on loopback unless remote agents should reach it. Docker's healthcheck polls `/health/liveness`. The image packages the release's Linux glibc binaries unchanged ([`Dockerfile.release`](Dockerfile.release)).
+
 ### From Source
 
 ```bash
@@ -328,18 +345,14 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294`, recorded in `Cargo.toml` and `Cargo.lock` and aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This revision shares FastMCP's rustix 1.1.5 requirement; the enabled search features retain local Model2Vec and native reranking without FastEmbed or Tokio. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses FrankenSQLite 0.4.4 through SQLModel 0.5.0 on Asupersync 0.5.0, with an immutable engine revision retaining SQL binding and schema-prefix fixes omitted from the release. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.6.0` retains its separate, patched FrankenSQLite 0.3.18 dependency, with default features disabled.
-
-The current engine pin also includes NOCASE consistency, `INSERT ... SELECT`
-UPSERT parameter binding, and Linux retained-descriptor fixes. See
-[`UPGRADE_LOG.md`](UPGRADE_LOG.md) for qualification results and remaining
-release gates; these changes are not part of the published v0.3.36 binaries.
+Requires Rust nightly (see `rust-toolchain.toml`). On current `main`, Cargo fetches [FrankenSearch](https://github.com/Dicklesworthstone/frankensearch) 0.6.1 at revision `616c9a7a6bdada97d81f760808996911ba3be294`, recorded in `Cargo.toml` and `Cargo.lock` and aligned with `FRANKENSEARCH_COMMIT` in `.github/workflows/dist.yml`. This revision shares FastMCP's rustix 1.1.5 requirement; the enabled search features retain local Model2Vec and native reranking without FastEmbed or Tokio. A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source. The mailbox uses registry FrankenSQLite `=0.4.10` through SQLModel 0.5.0 on Asupersync 0.5.0. FastMCP 0.10.0 remains pinned to an immutable revision preserving protocol negotiation. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results.
 
 ### Platforms
 
 | Platform | Architecture | Binary |
 |----------|-------------|--------|
-| Linux | x86_64 | `mcp-agent-mail-x86_64-unknown-linux-gnu` |
+| Linux | x86_64 (static; the installer's default) | `mcp-agent-mail-x86_64-unknown-linux-musl` |
+| Linux | x86_64 (glibc 2.28+) | `mcp-agent-mail-x86_64-unknown-linux-gnu` |
 | Linux | aarch64 | `mcp-agent-mail-aarch64-unknown-linux-gnu` |
 | macOS | x86_64 | `mcp-agent-mail-x86_64-apple-darwin` |
 | macOS | Apple Silicon | `mcp-agent-mail-aarch64-apple-darwin` |
@@ -355,7 +368,7 @@ release gates; these changes are not part of the published v0.3.36 binaries.
 am
 ```
 
-Auto-detects all installed coding agents (Claude Code, Codex CLI, Gemini CLI, OMP, etc.), refreshes their MCP connections as needed, and starts the HTTP server on `127.0.0.1:8765` with the interactive TUI.
+Starts the HTTP server on `127.0.0.1:8765` with the interactive TUI. It leaves existing MCP client configuration untouched: the curl installer configures detected coding agents (Claude Code, Codex CLI, Gemini CLI, OMP, etc.), and `am setup run` (or `am serve-http --setup`) configures them explicitly afterwards.
 
 ### 2. Agents register and coordinate
 
@@ -552,6 +565,8 @@ Agent Mail supports both stdio and HTTP transports:
 
 - **stdio**: Run `mcp-agent-mail` as a subprocess (the default for most MCP clients)
 - **HTTP**: Connect to `http://127.0.0.1:8765/mcp/` when the server is running via `am` or `mcp-agent-mail serve`
+
+One server process owns a mailbox at a time. While `am` (or `mcp-agent-mail serve`) is serving a storage root, a stdio `mcp-agent-mail` started for the same root refuses to start ("another Agent Mail server is already serving this storage root") instead of contending for it, so configure clients with the HTTP URL whenever `am` runs; the installer and `am setup run` write HTTP URL entries.
 - **Examples**: Token-free client templates live under `docs/examples/mcp/`
 
 ---
@@ -594,6 +609,52 @@ This controls CLI token selection; it does not establish MCP session ownership
 or isolate hostile processes sharing the same OS account. Server-side verified
 send enforcement remains `MESSAGING_FAIL_CLOSED_SEND_PROFILE=true`.
 
+#### Session-bound agent identity (opt-in)
+
+Available since v0.3.39 (see [CHANGELOG.md](CHANGELOG.md)).
+Set `MESSAGING_SESSION_IDENTITY=true` on the server to let an MCP session act as
+the identities it established without a registration token in the model-visible
+transcript:
+
+- **The session.** Over stdio, the session is the client's server process. Over
+  Streamable HTTP, a successful `initialize` returns an `Mcp-Session-Id` header;
+  requests that send it back (over any connection) share the session, and
+  `DELETE` on the MCP endpoint with the header ends it. A session is tied to the
+  `Authorization` it was created under: another credential, an unknown id or an
+  expired id (24 h idle) gets a stateless request. Sessions live in memory, so a
+  restart ends them. Bearer/JWT authorization is still checked on every request:
+  this is identity context inside an authorized connection, not authentication.
+- **Binding.** `create_agent_identity` (use `return_registration_token: false`
+  to keep the token out of the transcript) binds the new agent, and so does a
+  `register_agent` that creates its agent. Naming an existing agent never binds
+  it.
+- **Acting as a bound agent.** `send_message` / `reply_message` from the session
+  as a bound agent are verified without `sender_token` (`"verified_sender": true,
+  "sender_verification": "session"`), including under
+  `MESSAGING_FAIL_CLOSED_SEND_PROFILE`.
+- **No borrowed names.** A session that holds an identity in a project cannot,
+  in that project, send/reply, read an inbox (`fetch_inbox`,
+  `fetch_inbox_events`, or that project's view in `fetch_inbox_product`), mark
+  read or acknowledge, reserve/renew/release files, manage build slots, request
+  a forced reservation release, or re-register (rewriting the profile and
+  rotating the token) as any other
+  agent: those calls fail with `SESSION_IDENTITY_MISMATCH` (a send or reply that
+  carries the other agent's own `sender_token` is still accepted). A session
+  holding no identity in the project keeps the trusted-local behavior.
+- **Database outages.** ACKs and reservation releases can be queued durably
+  after the acting identity is authorized. If an outage prevents that check
+  and the session holds a potentially relevant binding, the call returns the
+  database error without queuing an intent, even for its own supplied name.
+  Retry after database access recovers. Already authorized intents remain
+  replayable when another session triggers recovery.
+- **Lifecycle.** `retire_agent` / `deregister_agent` drop the identity from the
+  calling session; lifecycle authorization itself is unchanged (registration
+  token, or a bound tmux pane over stdio).
+
+This does not authenticate the model, provider or OS process, and it cannot
+isolate hostile clients that share one bearer credential and can read each
+other's session ids.
+
 When an interactive `am` finds a healthy Agent Mail service already serving the
 configured endpoint, it attaches a read-only terminal view to that service's
 `/mail/ws-state` snapshot. It does not stop or restart the service, acquire a
@@ -631,7 +692,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Project and product routing | `projects ...`, `products ...`, `list-projects`, `beads ...` | Manage project identity, cross-project product groupings, and task-tracker views |
 | Platform and setup | `setup run|status`, `config set-port|show-port`, `amctl env`, `tooling ...`, `docs insert-blurbs` | Bootstrap connectors, inspect runtime config, introspect tool schemas/metrics/locks, and stamp docs |
 | Migration and lifecycle | `legacy detect|import|status`, `upgrade`, `migrate`, `self-update`, `am-run`, `guard ...` | Migrate Python installs, perform DB-format upgrades, run slot-aware build commands, and manage guard hooks |
-| Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. Use sparingly. |
+| Break-glass admin | `clear-and-reset-everything` | Fully reset local state after optional archival. A running server holding the mailbox is stopped for the wipe: a systemd user service or LaunchAgent through its manager (and started again afterwards), any other Agent Mail process with SIGTERM, then SIGKILL after a grace period. Use sparingly. |
 
 ### Setup Drift Reports
 
@@ -664,7 +725,7 @@ token values.
 | `projects` | `mark-identity`, `discovery-init`, `adopt` |
 | `mail` | `status`, `send`, `reply`, `inbox`, `read`, `ack`, `search`, `summarize-thread`, `replay-queued`, `discard-queued` |
 | `products` | `ensure`, `link`, `status`, `search`, `inbox`, `summarize-thread` |
-| `doctor` (28 verbs) | `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `ls`, `explain`, `fixers`, `capabilities`, `robot-docs`, `artifacts`, `reclaim`, `selftest`, `mcp-selftest`, `write-selftest`, `support-bundle`, `repair`, `reconstruct`, `backups`, `restore`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix-orphan-refs`, `pack-archive`, `vacuum` (`vacuum` is on `main` and unreleased as of 2026-09-01) |
+| `doctor` (28 verbs) | `check`, `health`, `triage`, `locks`, `drain`, `fix`, `undo`, `ls`, `explain`, `fixers`, `capabilities`, `robot-docs`, `artifacts`, `reclaim`, `selftest`, `mcp-selftest`, `write-selftest`, `support-bundle`, `repair`, `reconstruct`, `backups`, `restore`, `archive-scan`, `archive-verify`, `archive-normalize`, `fix-orphan-refs`, `pack-archive`, `vacuum` |
 | `agents` | `register`, `create`, `list`, `show`, `detect`, `reap`, `resolve-pane` |
 | `tooling` | `directory`, `schemas`, `metrics`, `metrics-core`, `diagnostics`, `locks`, `decommission-fts` |
 | `macros` | `start-session`, `prepare-thread`, `file-reservation-cycle`, `contact-handshake` |
@@ -695,7 +756,10 @@ am inbox-events --project /abs/path --agent BlueLake --after 42 --limit 100 --fo
 
 Each page includes `events`, `next_cursor`, `has_more`,
 `oldest_available_cursor`, and `tail_cursor`. A cursor below retained history
-returns `CURSOR_EXPIRED`; a cursor beyond the tail returns `CURSOR_AHEAD`.
+fails with code `cursor_expired` (the `fetch_inbox_events` tool reports
+`CURSOR_EXPIRED`); a cursor beyond the tail fails with `cursor_ahead`
+(`CURSOR_AHEAD`). Restart from the error's `oldest_available_cursor` or
+`tail_cursor`.
 
 ---
 
@@ -787,7 +851,7 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 **Global keys:** `?` help, `Ctrl+P`/`:` command palette, `/` the screen's own filter (global search focus on screens without one), `.` contextual action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast-focus mode, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API transport, `q` quit.
 **ATC keys:** `d` decision detail, `r` retention report, `i` toggle detail pane, `Tab` switch agents/decisions.
 
-**Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined/Log and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` for Table/Graph mode; batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
+**Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined/Log and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` to cycle Table/Graph/Matrix (sender × recipient heatmap); batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
 
 **Command palette:** Press `Ctrl+P` (or `:` outside text-entry) to open a searchable action launcher that includes screen navigation, transport/layout controls, and dynamic entities (agents/projects/threads/tools/reservations).
 
@@ -810,20 +874,20 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 |---------|---------|-----------|
 | `am robot status` | Dashboard synthesis | `--format`, `--project`, `--agent` |
 | `am robot inbox` | Actionable inbox with urgency/ack synthesis | `--urgent`, `--ack-overdue`, `--unread`, `--all`, `--limit`, `--include-bodies` |
-| `am robot timeline` | Event stream since last check | `--since`, `--kind`, `--source` |
+| `am robot timeline` | Project event stream (last 24h unless `--since`) | `--since`, `--kind`, `--source` |
 | `am robot overview` | Cross-project summary | `--format`, `--counts` |
 | `am robot thread <id>` | Full thread rendering | `--limit`, `--since`, `--format` |
 | `am robot search <query>` | Full-text search with facets/relevance | `--kind`, `--importance`, `--since`, `--format` |
-| `am robot message <id>` | Single-message deep view | `--format`, `--project`, `--agent` |
+| `am robot message <id>` | Single-message deep view | `--format`, `--project` |
 | `am robot navigate <resource://...>` | Resolve resources into robot-formatted output | `--format`, `--project`, `--agent` |
 | `am robot reservations` | Reservation view with conflict/expiry awareness; JSON entries carry absolute `granted_ts`/`expires_ts` (RFC 3339 UTC) and integer `remaining_seconds`/`granted_age_seconds` next to the humanized `remaining` | `--all`, `--conflicts`, `--expiring`, `--agent` |
-| `am robot metrics` | Tool call rates, failures, latency percentiles | `--format`, `--project`, `--agent` |
-| `am robot health` | Runtime/system diagnostics | `--format`, `--project`, `--agent`, `--include-host` |
+| `am robot metrics` | Tool call rates, failures, latency percentiles (server-wide) | `--format` |
+| `am robot health` | Runtime/system diagnostics (server-wide) | `--format`, `--include-host` |
 | `am robot analytics` | Anomaly and remediation summary | `--format`, `--project`, `--agent` |
 | `am robot agents` | Agent roster and activity overview | `--active`, `--sort` |
-| `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
-| `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
-| `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
+| `am robot contacts` | Contact graph (incoming cross-project requests included) and policy surface | `--format`, `--project`, `--agent` (links on either side) |
+| `am robot projects` | Per-project aggregate stats (every project) | `--format` |
+| `am robot attachments` | Attachment inventory | `--format`, `--project` |
 | `am robot atc` | Live ATC snapshot with local DB fallback when the server is unavailable | `--since`, `--stratum`, `--summary-only`, `--limit` |
 | `am robot handoff` | Read-only stale bead ownership and handoff dashboard | `--stale-minutes`, `--active-minutes`, `--fresh-comment-minutes`, `--include-fresh`, `--dry-run` |
 | `am robot tui-dump` | TUI freeze escape hatch (alias of `am tui-dump`): the situational snapshot the TUI renders, fetched live or from local SQLite | `--format` |
@@ -962,6 +1026,21 @@ sequenceDiagram
 2. **Reserve files before editing:** `file_reservation_paths(project_key, agent_name, paths=["src/**"], ttl_seconds=3600, exclusive=true)`
 3. **Communicate with threads:** `send_message(..., thread_id="FEAT-123")`, check with `fetch_inbox`, acknowledge with `acknowledge_message`
 4. **Quick reads:** `resource://inbox/{Agent}?project=<abs-path>&limit=20`
+5. **Tell the whole project once:** address the project's shared mailbox as `project:<slug>` (or `project:<human_key>`). Available since v0.3.39 (see [CHANGELOG.md](CHANGELOG.md)):
+
+   ```
+   send_message(project_key="/abs/path", sender_name="GreenCastle",
+                to=["project:abs-path"], subject="Schema freeze until 18:00",
+                body_md="Do not touch migrations/ until the release is cut.", ack_required=true)
+   ```
+
+   - The message is stored **once**, with one project delivery: no per-agent copies, rows, signals or archive inbox files. This is not `broadcast` (which stays rejected).
+   - Every other non-retired agent of the project that was registered when the message was sent sees it in `fetch_inbox` (and `resource://inbox/...`, `am robot inbox`) with `"via": "project"`. An agent that joins later is not handed the backlog; project history stays readable through threads, `fetch_topic` and search. An agent whose `contact_policy` is `block_all` opts out, and a direct to/cc/bcc delivery to the same agent takes precedence so nothing appears twice.
+   - Read and acknowledgement state is per agent and recorded lazily: `fetch_inbox` read receipts, `mark_message_read`, `acknowledge_message` and `mark_all_read` record only the calling agent's state. `get_message_delivery_receipt` reports the delivery under `project_mailbox` with each visible agent's read/ack state.
+   - It can be combined with named recipients in `to`/`cc`, cannot be `bcc`, and can only name the sender's own project. Replies may address it too.
+   - Retention treats a project message as settled only after every agent that can see it has read it (and acknowledged it when required). Archive reconstruction restores the delivery from the canonical message's `to`/`cc` envelope, and salvage restores the per-agent receipts.
+   - Restart-safe monitors see it too: a project delivery appends one event to the durable `fetch_inbox_events` / `am inbox-events` cursor ledger, and each visible agent's page includes it (`"kind": "project"`) under the same single cursor.
+   - `am robot overview` and `am robot overview --counts` include each visible agent's unread, urgent-unread, and overdue acknowledgement obligations. One shared message can therefore count for several agents, while a named recipient is counted only once; generating the overview never creates receipts or marks mail read.
 
 ### Across Different Repos
 
@@ -1078,7 +1157,7 @@ Overseer messages:
 - Bypass normal contact policies so you can always reach any agent
 - Include a preamble instructing agents to pause current work, handle the request, then resume
 
-Agents see overseer messages in their normal inbox via `fetch_inbox` or `resource://inbox/{name}?project=<abs-path>`. They can reply in-thread like any other message. Everything is stored identically to agent-to-agent messages (Git + SQLite), fully auditable.
+Agents see overseer messages in their normal inbox via `fetch_inbox` or `resource://inbox/{name}?project=<abs-path>`. They can reply in-thread like any other message. The send writes the message to SQLite; the background DB-to-archive reconciler then writes its Git archive copy, in the same envelope as agent-to-agent mail, so it is auditable once reconciled.
 
 ---
 
@@ -1136,10 +1215,13 @@ All configuration via environment variables. The server reads them at startup vi
 | `AM_TUI_AMBIENT` | `subtle` | Ambient mode (`off`/`subtle`/`full`) |
 | `AM_TUI_FULL_REDRAW_MAX_SECS` | `30` | Wall-clock bound (seconds) for a guaranteed full TUI redraw that repairs terminal desync (e.g. after a mux pane swap). Each forced redraw resends the whole screen, so lower values cost terminal output; `<= 0` disables the bound |
 | `AM_IDEMPOTENCY_RETENTION_SECS` | `86400` | Retention window in seconds for `file_reservation_paths` idempotency keys; invalid or non-positive values fall back to 24 hours |
-| `WORKTREES_ENABLED` | `false` | Build slots feature flag |
-| `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run `PRAGMA integrity_check` during startup self-heal (set `false` to fast-unblock a degraded boot) |
+| `WORKTREES_ENABLED` | `false` | Enables build slots and the product bus (`ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product`); while off, those tools return `FEATURE_DISABLED`. `GIT_IDENTITY_ENABLED=true` also enables them |
+| `INTEGRITY_CHECK_ON_STARTUP` | `true` | Run the boot-time `PRAGMA quick_check`; `false` skips only this probe and leaves the background guard enabled |
+| `INTEGRITY_GUARD_ENABLED` | `true` | Enable periodic integrity checks, automatic backups and database maintenance; `false` stops that worker |
+| `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` | `300` | Background quick-check cadence and initial delay when startup checking is skipped (minimum 1 second) |
+| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1` | Periodic full integrity-check cadence (`0` disables scheduled full checks; quick checks remain enabled) |
 | `STARTUP_READINESS_BIND_TIMEOUT_SECS` | `20` | Max seconds to wait for DB readiness before binding the listener anyway (`/healthz` stays up while the DB warms) |
-| `DB_MAINTENANCE_ENABLED` | `true` | Enable the off-hot-path periodic SQLite maintenance worker (checkpoint/ANALYZE/VACUUM/journal-size cap) |
+| `DB_MAINTENANCE_ENABLED` | `true` | Enable checkpoint/ANALYZE/VACUUM/journal-size maintenance within the integrity guard; `false` leaves checks and backups enabled |
 | `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
 | `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
 | `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
@@ -1227,9 +1309,20 @@ are persisted in the database, so replay protection survives server restarts.
 | `AM_REGISTRATION_PROOF_CLOCK_SKEW_SECONDS` | `60` | Clock-skew tolerance for the validity window. |
 | `AM_REGISTRATION_PROOF_REQUIRE_NONCE` | `true` | Require and consume a single-use nonce per proof (replay protection). |
 
-The canonical signing bytes are explicit (domain-separation tag +
-newline-delimited `field=value` lines; capabilities sorted and de-duplicated),
-so issuers can be written in any language. Verification is expressed through a
+The canonical signing bytes (v2) are explicit, so issuers can be written in any
+language. They are LF-terminated lines:
+
+1. `agent-mail-registration-proof:v2`.
+2. `identity`, `project_key`, `program` and `model`, in that order. Each is
+   `label=N:value`, where N is the value's UTF-8 byte length; values are neither
+   escaped nor trimmed.
+3. `capabilities=N` with the count, then one `capability=N:value` line per
+   capability (trimmed, non-empty, sorted by bytes, de-duplicated).
+4. `issued_at=N` and `expires_at=N` as decimal i64.
+5. `nonce=N:value`.
+
+v1 proofs (`field=value` lines without length prefixes) are rejected; reissue
+them. Verification is expressed through a
 pluggable `ProofVerifier` trait (`crates/mcp-agent-mail-tools/src/proof_gate.rs`);
 the shipped implementation is the Ed25519 trust-anchor verifier, and external
 verifier backends can be added without touching registration call sites.
@@ -1494,7 +1587,7 @@ If the live layer gets sick, the durable ledger can rebuild it.
 | File reservation / advisory locks | Glob patterns, TTL, exclusive/shared, pre-commit guard | Lockfiles (no TTL, no glob) | Build yourself | None |
 | Audit trail | Full Git history of all communication | File timestamps | Depends | Chat logs (if saved) |
 | Cross-repo coordination | Product bus, contact system | Manual | Build yourself | Manual |
-| Search | Search V3 (lexical + semantic + hybrid) | `grep` | Build yourself | Limited |
+| Search | Search V3 (lexical in release binaries; semantic + hybrid in default-feature source builds) | `grep` | Build yourself | Limited |
 | Operational visibility | 16-screen TUI, robot CLI, metrics | None | None | None |
 | Token efficiency | Messages stored externally, not in context | Files in context | Varies | All in context |
 
@@ -1781,14 +1874,14 @@ What `check` inspects:
 | TUI appears **frozen** (render/input stuck, but the process is still serving MCP/API) | Do **not** kill the process. Run the non-interactive freeze escape hatch `am tui-dump --format json`: it returns the same situational snapshot the TUI renders, fetched live from `/mail/ws-state` (including a per-loop liveness verdict that names the stalled loop) and falling back to a local SQLite read if the whole process is wedged. Always exits 0. `am robot health --format json` also classifies the stall and points at the same read-out. If the freeze persists, restart headless: `mcp-agent-mail serve --no-tui`. |
 | TUI shows **garbled / stale cells** (render corruption that clears on resize) | A guaranteed full redraw is bounded by wall clock: `AM_TUI_FULL_REDRAW_MAX_SECS` (default `30`s). Lower it (e.g. `2`) to repair desync faster at the cost of resending the whole screen that often, or set `<= 0` to disable the bound. Ensure you are on the latest build — confirm with `am --version` and reinstall via `./install-local.sh` if stale, since render fixes ship in the binary, not the running session. |
 | TUI becomes **mostly blank after running for a while** | Upgrade to `v0.3.21` or later and confirm with `am --version`. Older builds could mistake a healthy 100 ms frame for a missed 16.6 ms budget and then replace most content with an `EssentialOnly` frame. Current builds keep the console at full visual fidelity under load; `am e2e run --project . tui_full_traversal` verifies this against an emulated terminal screen. |
-| `Resource is temporarily busy` | The message includes the activity-lock owner PID, age, mode, subject, and executable when metadata is available. Run the read-only `am doctor locks --json`; do not remove lock files. Stale advisory metadata is reaped only after an exclusive-lock probe proves no kernel holder and records PID/executable liveness evidence. |
+| `Resource is temporarily busy` | The message includes the activity-lock owner PID, age, mode, subject, and executable when metadata is available. Run the read-only `am doctor locks --json`; do not remove lock files. Stale advisory metadata is reaped only after an exclusive-lock probe proves no kernel holder and records PID/executable liveness evidence. `am clear-and-reset-everything` and `am archive restore` do not stop here: they stop the running server themselves and start its service again afterwards. |
 | Interactive `am` while a service is running | It attaches a read-only TUI snapshot and leaves the service running. Restart coordination uses a single mailbox mutex with bounded jittered backoff, so concurrent starts wait for a live peer instead of restart-fighting. Use `--takeover` only for an intentional replacement. |
 | `CURSOR_EXPIRED` from `am inbox-events` | The saved delivery cursor fell below retained history. Start from `--position-now` for a new tail position, or choose a recovery policy using `oldest_available_cursor`; do not substitute a message ID. |
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
 | Tools time out / "Database corruption detected" under heavy load | Inspect the timeout response or `health_check` timeout diagnostics: they report `contended_path`, whether that stage exceeded the client deadline, p99 pool-acquire/database-write/archive queue/archive-commit latency, and blocking-dispatch occupancy. An unattributed dispatch timeout is reported as such, not blamed on SQLite. Also run `am robot health --include-host --format json`; if `host_pressure_likely` is true (low disk/inodes, high load-per-CPU, low free memory) or the data dir is not writable, relieve host pressure before reconstructing. |
-| `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor check --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. Fast unblock: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. |
+| `am serve-http` shows systemd `active (running)` but port 8765 is **not reachable** (high memory, single thread) | A degraded/corrupt DB is making the startup recovery slow. The server binds the listener within `STARTUP_READINESS_BIND_TIMEOUT_SECS` (default 20s) regardless, so `/healthz` returns 200 while the DB recovers in the background and `/health` reports `warming_up`/`unavailable`. If it persists: stop the service and run `am doctor check --json`; or quarantine `storage.sqlite3*` (move, don't delete) and restart to rebuild from the Git archive. To skip only the boot-time integrity probe: `INTEGRITY_CHECK_ON_STARTUP=false am serve-http --no-tui`. Periodic checks, backups and maintenance remain enabled, with the first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300s). Integrity health reports the configured skip and scheduled time, staying yellow until a full check passes; a failed check stays red. `INTEGRITY_GUARD_ENABLED=false` disables the entire worker and its backups/maintenance; `DB_MAINTENANCE_ENABLED=false` disables only maintenance. |
 | Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
 | `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all` (a dry run unless `--apply`). |
 
@@ -1822,6 +1915,7 @@ need to do anything.
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
+- **Slow file reservations at swarm scale.** The release smoke's 60-agent swarm phase runs 3 projects of mixed sends, reads, acks and reservations, with a server kill midway. In it, `file_reservation_paths` and `release_file_reservations` miss the 5 s p99 budget. On v0.3.38 they take about 13 s at the median and about 25 s at p99. v0.3.39 stages each reservation's archive file outside the process-wide archive lock, which brings the median to about 4.7 s; the p99 is still about 15 s, because the archive batch drain holds that lock through its fsyncs ([#344](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/344), [#345](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/345)). In the same runs no acknowledged message was lost across the kill, and integrity checks passed. Receipts: [`docs/evidence/release_smoke/`](docs/evidence/release_smoke/).
 
 ---
 

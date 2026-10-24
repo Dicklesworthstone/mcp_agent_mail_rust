@@ -5,11 +5,18 @@
 //! verifying their complete archive and rechecking the live source. Both paths
 //! require the server's writable pool for the same configured mailbox/root.
 
+#[cfg(test)]
+mod admission_tests;
+mod checkpoint;
+pub(crate) mod durability;
+#[cfg(test)]
+mod pressure_tests;
 mod source;
 mod staged;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
@@ -24,8 +31,10 @@ use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 
+#[cfg(test)]
 use self::source::prepare_message;
-use super::{ReconcileResult, read_surviving_message, reconcile_message_bundle};
+use self::source::prepare_message_classified;
+use super::{ReconcileResult, RepairControl, read_surviving_message, reconcile_message_bundle};
 use crate::{MessageBundleBatchEntry, ProjectArchive};
 
 const IDS_PER_LANE: i64 = 16;
@@ -33,10 +42,74 @@ const MAX_REPAIRS_PER_BATCH: usize = 4;
 const MAX_DB_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const NORMAL_ARCHIVE_GRACE_US: i64 = 30 * 1_000_000;
+const MAX_ARCHIVE_LAG_GRACE_US: u64 = 10 * 60 * 1_000_000;
+const MAX_RETRY_IDS: usize = 1024;
+const MAX_RETRIES_PER_PASS: usize = 16;
+const MAX_IDS_PER_PASS: usize = 32;
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct DeferredRetry {
+    id: i64,
+    attempts: u32,
+    ready_at: Instant,
+}
+
+#[derive(Debug)]
+struct ReconcileFailure {
+    detail: String,
+    transient: bool,
+}
+
+impl ReconcileFailure {
+    fn source_unavailable(error: impl std::fmt::Display) -> Self {
+        // A failed source read is not conflicting evidence. Keep its ID for
+        // retry; the corruption observer still stops all repair when needed.
+        Self {
+            detail: source_error(error),
+            transient: true,
+        }
+    }
+}
+
+impl From<String> for ReconcileFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+        }
+    }
+}
+
+impl From<crate::StorageError> for ReconcileFailure {
+    fn from(error: crate::StorageError) -> Self {
+        use std::io::ErrorKind;
+
+        // Resource pressure cannot contradict message identity. Keep its ID
+        // in the ordinary bounded retry lane instead of discarding retry debt
+        // behind the history cursor. Do not infer retryability from error text
+        // or broaden cancellation, permission, path, or opaque Git failures.
+        let transient = matches!(
+            error,
+            crate::StorageError::LockContention { .. }
+                | crate::StorageError::LockTimeout(_)
+                | crate::StorageError::GitIndexLock { .. }
+        ) || matches!(&error, crate::StorageError::Io(error)
+            if matches!(error.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ResourceBusy
+                    | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory));
+        Self {
+            detail: error.to_string(),
+            transient,
+        }
+    }
+}
 
 /// Separate new-message and rotating backfill cursors prevent old broken
 /// records from pinning catch-up and continuous new mail from starving history.
 /// Cursors are only hints: restarting or wrapping always safely checks again.
+/// The startup-aware worker cursor checkpoints its hints; `Default` remains
+/// in-memory for independent one-shot scans and callers without a startup anchor.
 #[derive(Debug, Default)]
 pub struct ReconcileCursor {
     source_identity: String,
@@ -45,10 +118,26 @@ pub struct ReconcileCursor {
     // A byte budget can admit only one message. Resume with the opposite lane
     // after the last consumed item, not unconditionally with new-mail catch-up.
     next_lane_is_history: bool,
+    // Retry payloads share the same byte budget as new/history work. Preserve
+    // the opposite lane's turn even when one admitted item fills a whole pass.
+    next_lane_is_retry: bool,
     // Rows created before this instant (µs) predate the reconciling process's
     // own write-behind queue, so they cannot still be in flight there and need
     // no grace period. 0 = always apply the grace.
     settled_before_us: i64,
+    // Finish the current descending history round at catch-up cadence after
+    // worker startup, even when its first pages are already archived. This is
+    // process-local: checkpoint restore keeps its scan position and retry debt,
+    // but cannot claim that this worker has already completed that round.
+    startup_backfill_complete: bool,
+    // Only IDs are retained. Every retry rereads the current live source and
+    // repeats the ordinary authority/no-clobber checks before publication.
+    retries: VecDeque<DeferredRetry>,
+    conflict_backoff: VecDeque<(i64, Instant)>,
+    persist_progress: bool,
+    // A failed checkpoint must not replace newer in-memory retry debt with
+    // an older disk snapshot on the next pass. A successful save clears this.
+    checkpoint_dirty: bool,
 }
 
 impl ReconcileCursor {
@@ -56,10 +145,17 @@ impl ReconcileCursor {
     /// `settled_before_us`. After a crash, the mail that the dead process
     /// committed but never archived is then eligible on the first pass instead
     /// of waiting behind a 16-ids-per-pass walk of healthy recent mail.
+    ///
+    /// Scan positions and retry debt are checkpointed together beside the live
+    /// database. Restoring them never restores the old process's grace anchor
+    /// or grants authority to repair a message without rereading its source.
+    /// Until the current history round reaches its end, consumed pages request
+    /// the worker's bounded catch-up cadence, not its once-per-minute idle poll.
     #[must_use]
     pub fn settled_before(settled_before_us: i64) -> Self {
         Self {
             settled_before_us,
+            persist_progress: true,
             ..Self::default()
         }
     }
@@ -72,6 +168,42 @@ impl ReconcileCursor {
         }
         self.next_lane_is_history = tail;
     }
+
+    fn forget_retry(&mut self, id: i64) {
+        self.retries.retain(|retry| retry.id != id);
+    }
+
+    fn defer_transient(&mut self, id: i64, now: Instant) {
+        let previous = self
+            .retries
+            .iter()
+            .position(|retry| retry.id == id)
+            .and_then(|index| self.retries.remove(index));
+        let attempts = previous.map_or(0, |retry| retry.attempts.saturating_add(1));
+        // The first deferral is eligible in the very next pass. Repeated
+        // contention backs off without exceeding the normal worker cadence.
+        let backoff = if attempts == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1_u64 << attempts.saturating_sub(1).min(6)).min(MAX_RETRY_BACKOFF)
+        };
+        self.retries.push_back(DeferredRetry {
+            id,
+            attempts,
+            ready_at: now + backoff,
+        });
+    }
+
+    fn defer_conflict(&mut self, id: i64, now: Instant) {
+        self.forget_retry(id);
+        self.conflict_backoff
+            .retain(|(known, until)| *known != id && *until > now);
+        if self.conflict_backoff.len() == MAX_RETRY_IDS {
+            self.conflict_backoff.pop_front();
+        }
+        self.conflict_backoff
+            .push_back((id, now + MAX_RETRY_BACKOFF));
+    }
 }
 
 /// Counts describe this bounded pass, not whole-mailbox durability.
@@ -82,11 +214,46 @@ pub struct ReconcileReport {
     pub repaired: usize,
     pub files_created: usize,
     pub deferred: usize,
+    pub deferred_transient: usize,
+    pub deferred_conflict: usize,
+    pub retry_len: usize,
     /// Serialized payload bytes admitted to archive work, excluding rejected
     /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
     pub interrupted: bool,
+    /// More bounded work should follow at catch-up cadence: an execution limit
+    /// was reached, or a consumed startup history page has not yet proved the
+    /// end of its round. This is not a count of missing archive messages.
     pub budget_exhausted: bool,
+    /// Scheduling hints were restored, not archive authority or read/ack state.
+    pub checkpoint_restored: bool,
+    /// `None` for an in-memory or pre-cancelled pass; false means progress is
+    /// currently memory-only and a restart may replay an older bounded pass.
+    pub checkpoint_saved: Option<bool>,
+}
+
+/// Record only a completed failure after cancellation and capacity admission.
+/// Resource retries retain IDs, never the failed payload or archive authority.
+fn record_failure(
+    id: i64,
+    error: ReconcileFailure,
+    cursor: &mut ReconcileCursor,
+    report: &mut ReconcileReport,
+    now: Instant,
+) {
+    report.deferred += 1;
+    if error.transient {
+        report.deferred_transient += 1;
+        cursor.defer_transient(id, now);
+    } else {
+        report.deferred_conflict += 1;
+        cursor.defer_conflict(id, now);
+    }
+    tracing::warn!(
+        target: "maintenance", event = "message_archive_reconcile_deferred",
+        message_id = id, reason = %error.detail, transient = error.transient,
+        "message archive repair deferred; source and conflicting evidence retained"
+    );
 }
 
 /// A finite retention round revisits unavailable archive evidence without
@@ -203,6 +370,23 @@ fn interleave_ids(tail: &[i64], history: &[i64], history_first: bool) -> Vec<(i6
     selected
 }
 
+fn normal_archive_cutoff(now_us: i64, settled_before_us: i64, archive_lag_us: u64) -> i64 {
+    // A fixed grace mistakes still-queued mail for lost mail when WBQ falls
+    // behind. Its repair then competes for the publication fence with the
+    // very drain and reservation writers that need to make progress (br-9ott5).
+    // Lag is a process-wide scheduling hint, never proof that a particular
+    // message is queued. Bound its effect so unrelated or stalled archive
+    // work cannot hide a genuinely lost message indefinitely.
+    let lag_grace_us =
+        i64::try_from(archive_lag_us.min(MAX_ARCHIVE_LAG_GRACE_US)).unwrap_or(i64::MAX);
+    now_us
+        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
+        .saturating_sub(lag_grace_us)
+        // A restarted worker cannot own the prior process's queued mail.
+        // Known failures also bypass this cutoff through the retry lane.
+        .max(settled_before_us)
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -214,6 +398,7 @@ fn select_ids(
         *cursor = ReconcileCursor {
             source_identity: identity,
             settled_before_us: cursor.settled_before_us,
+            persist_progress: cursor.persist_progress,
             ..Default::default()
         };
     }
@@ -241,6 +426,7 @@ fn select_ids(
         cursor.tail_after = None;
         cursor.backfill_ceiling = None;
         cursor.next_lane_is_history = false;
+        cursor.startup_backfill_complete = false;
     }
     let mut tail = if let Some(after) = cursor.tail_after {
         conn.query_sync(
@@ -273,6 +459,9 @@ fn select_ids(
         .collect::<Result<Vec<_>, _>>()?;
     if history.is_empty() {
         cursor.backfill_ceiling = None;
+        // The descending round is finite even while new IDs keep arriving.
+        // Keep its next ordinary wrap, but stop startup-only acceleration.
+        cursor.startup_backfill_complete = true;
     }
     // Interleave within a pass AND retain lane priority across budget-limited
     // passes. Fixed tail-first ordering starves history at one payload per pass.
@@ -407,25 +596,44 @@ fn merge_surviving_metadata(
     Ok(())
 }
 
+#[cfg(test)]
 fn reconcile_prepared(
     config: &Config,
     prepared: &PreparedMessage,
 ) -> Result<ReconcileResult, String> {
-    let archive =
-        crate::ensure_archive(config, &prepared.project_slug).map_err(|error| error.to_string())?;
+    reconcile_prepared_inner(config, prepared, None, false).map_err(|error| error.detail)
+}
+
+fn reconcile_prepared_inner(
+    config: &Config,
+    prepared: &PreparedMessage,
+    control: Option<RepairControl<'_>>,
+    require_guarded_proof: bool,
+) -> Result<ReconcileResult, ReconcileFailure> {
+    if !require_guarded_proof && verify_prepared_without_mutation(config, prepared, control)? {
+        return Ok(ReconcileResult::default());
+    }
+    // Admit before ensure_archive: even creating a missing archive must not
+    // wait behind an unrelated publisher while retaining the DB source lease.
+    // Keep mutable metadata collection in one native mutation window. Bundle
+    // repair revalidates the captured bytes before publishing, so release this
+    // window before its immutable Git-history proof: scanning old messages must
+    // not exclude unrelated live archive writers.
+    let metadata_mutation = control
+        .map(|control| control.begin_at(&config.storage_root))
+        .transpose()?;
+    let archive = crate::ensure_archive(config, &prepared.project_slug)?;
     let paths = crate::message_paths_for_bundle(
         &archive,
         &prepared.message,
         &prepared.sender,
         &prepared.recipients,
-    )
-    .map_err(|error| error.to_string())?
+    )?
     .0;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
-        if let Some((message, body)) =
-            read_surviving_message(path).map_err(|error| error.to_string())?
-        {
+        super::checkpoint(control)?;
+        if let Some((message, body)) = read_surviving_message(path)? {
             validate_surviving_message(prepared, &message, &body)?;
             merge_surviving_metadata(
                 &mut surviving,
@@ -443,6 +651,7 @@ fn reconcile_prepared(
     };
     if let Some(committed) = &committed {
         for path in [&paths.canonical, &paths.outbox] {
+            super::checkpoint(control)?;
             if let Some((message, body)) = committed.read(&archive, path)? {
                 validate_surviving_message(prepared, &message, &body)?;
                 merge_surviving_metadata(
@@ -458,9 +667,8 @@ fn reconcile_prepared(
     // extension fields; BCC comes exclusively from the authoritative DB row.
     if surviving.is_none() {
         for path in &paths.inbox {
-            if let Some((message, body)) =
-                read_surviving_message(path).map_err(|error| error.to_string())?
-            {
+            super::checkpoint(control)?;
+            if let Some((message, body)) = read_surviving_message(path)? {
                 let message = restore_inbox_metadata(prepared, message, &body)?;
                 merge_surviving_metadata(
                     &mut surviving,
@@ -477,6 +685,7 @@ fn reconcile_prepared(
         && let Some(committed) = &committed
     {
         for path in &paths.inbox {
+            super::checkpoint(control)?;
             if let Some((message, body)) = committed.read(&archive, path)? {
                 let message = restore_inbox_metadata(prepared, message, &body)?;
                 merge_surviving_metadata(
@@ -494,6 +703,7 @@ fn reconcile_prepared(
     if surviving.is_none()
         && let Some(committed) = &committed
     {
+        super::checkpoint(control)?;
         surviving = staged::read_metadata(
             &committed.repo,
             &archive,
@@ -511,27 +721,114 @@ fn reconcile_prepared(
         None => {
             // Legacy SQLite rows store only the thread. A fabricated parent
             // can collide with a delayed original WBQ write.
-            return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string());
+            return Err("threaded message has no surviving authoritative bundle; reply metadata cannot be inferred".to_string().into());
         }
     };
-    reconcile_message_bundle(
+    super::checkpoint(control)?;
+    let entry = MessageBundleBatchEntry {
+        message: &message,
+        body_md: &prepared.body,
+        sender: &prepared.sender,
+        recipients: &prepared.recipients,
+        extra_paths: &[],
+    };
+    drop(metadata_mutation);
+    match control {
+        Some(control) => super::reconcile_message_bundle_cancellable(
+            control.cx,
+            &archive,
+            config,
+            entry,
+            control.stop,
+        ),
+        None => reconcile_message_bundle(&archive, config, entry),
+    }
+    .map_err(ReconcileFailure::from)
+}
+
+/// Observe an already complete, committed bundle without taking the global
+/// publication fence. This can only report unchanged: every missing, damaged,
+/// uncommitted, or otherwise unproven bundle still uses guarded repair.
+///
+/// Equal stamps detect local mutation windows and observed remote epoch/HEAD
+/// changes. A remote mutation window can span both samples, so this is not a
+/// publication or deletion authorization. A stale unchanged observation merely
+/// leaves repair for a later sweep, as can a write immediately after a fenced
+/// observation. Keep all reads pinned to one HEAD and retain source revalidation.
+fn verify_prepared_without_mutation(
+    config: &Config,
+    prepared: &PreparedMessage,
+    control: Option<RepairControl<'_>>,
+) -> Result<bool, ReconcileFailure> {
+    super::checkpoint(control)?;
+    let Some(archive) = crate::open_archive(config, &prepared.project_slug)? else {
+        return Ok(false);
+    };
+    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)? else {
+        return Ok(false);
+    };
+    let changed = || crate::StorageError::LockContention {
+        message: "archive changed during read-only message verification; retry required".into(),
+    };
+    let committed = CommittedMessages::open(&archive)?;
+    if before.generation.head != committed.head_id {
+        return Err(changed().into());
+    }
+    if !matches!(
+        verify_retention_archive_at(&archive, prepared, &mut 0, &committed, control),
+        Ok(Some(_))
+    ) {
+        super::checkpoint(control)?;
+        return Ok(false);
+    }
+    // A staged canonical collision remains conflicting evidence even when
+    // every expected disk/HEAD copy is intact. Reuse the same bounded identity
+    // gate as publication, bracketed by the pinned HEAD checks because its
+    // own preflight opens HEAD independently.
+    if !committed.same_head(&archive)? {
+        return Err(changed().into());
+    }
+    let paths = crate::message_paths_for_bundle(
         &archive,
-        config,
-        MessageBundleBatchEntry {
-            message: &message,
-            body_md: &prepared.body,
-            sender: &prepared.sender,
-            recipients: &prepared.recipients,
-            extra_paths: &[],
-        },
-    )
-    .map_err(|error| error.to_string())
+        &prepared.message,
+        &prepared.sender,
+        &prepared.recipients,
+    )?
+    .0;
+    let canonical = crate::rel_path_cached(&archive.canonical_repo_root, &paths.canonical)?;
+    let expected = committed.file_identity(&archive, &paths.canonical)?.0;
+    let mut budget = super::CanonicalScanBudget {
+        control,
+        ..Default::default()
+    };
+    if !super::identity::preflight(
+        &committed.repo,
+        &archive,
+        prepared.message["id"]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| super::invalid("message has no positive archive identity"))?,
+        &canonical,
+        expected,
+        false,
+        &mut budget,
+    )? {
+        return Ok(false);
+    }
+    super::checkpoint(control)?;
+    if !committed.same_head(&archive)?
+        || crate::archive_epoch_read_stamp(&archive.repo_root)?.as_ref() != Some(&before)
+    {
+        return Err(changed().into());
+    }
+    Ok(true)
 }
 
 /// Immutable Git observation for all surviving copies of one message.
 /// Holding the tree identity avoids mixing metadata from separate HEADs.
 struct CommittedMessages {
     repo: git2::Repository,
+    head_id: Option<git2::Oid>,
     tree_id: Option<git2::Oid>,
 }
 
@@ -541,19 +838,31 @@ impl CommittedMessages {
             crate::archive_repo_root_checked(archive).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let tree_id = match repo.head() {
-            Ok(head) => Some(head.peel_to_tree().map_err(|error| error.to_string())?.id()),
+        let (head_id, tree_id) = match repo.head() {
+            Ok(head) => {
+                let commit = head.peel_to_commit().map_err(|error| error.to_string())?;
+                (Some(commit.id()), Some(commit.tree_id()))
+            }
             Err(error)
                 if matches!(
                     error.code(),
                     git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound
                 ) =>
             {
-                None
+                (None, None)
             }
             Err(error) => return Err(error.to_string()),
         };
-        Ok(Self { repo, tree_id })
+        Ok(Self {
+            repo,
+            head_id,
+            tree_id,
+        })
+    }
+
+    fn same_head(&self, archive: &ProjectArchive) -> Result<bool, String> {
+        let current = Self::open(archive)?;
+        Ok(self.head_id == current.head_id && self.tree_id == current.tree_id)
     }
 
     fn file_identity(
@@ -652,15 +961,45 @@ impl CommittedMessages {
 /// archive work per pass. SQL projections are separately bounded before JSON
 /// serialization; an expanded payload that cannot fit any batch is deferred
 /// without pinning the cursor. These are work bounds, not deadlines on SQL,
-/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace.
-/// No row, receipt, delivery, notification or thread digest is mutated. Failed
-/// messages are reported and revisited by backfill, not retried in a tight loop.
+/// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace
+/// plus observed archive lag, capped at ten additional minutes. Pre-startup
+/// rows and known failed-write retries remain eligible during that grace.
+/// No row, receipt, delivery, notification or thread digest is mutated. Transient
+/// archive refusals retain a bounded FIFO retry lane; conflicts stay on backfill
+/// with a cooldown. Retries never bypass source or archive authority checks.
+/// Database-promotion contention defers before consuming a candidate. A busy
+/// global archive fence or project lock defers that message within the finite
+/// scan; other messages can progress and the next pass revisits it. Shutdown
+/// reaches the archive admission path as well as the outer loop. Blocking I/O and Git
+/// operations still have no hard deadline.
+///
+/// Startup-aware cursors atomically checkpoint scan positions and retry debt.
+/// A checkpoint is source-generation scoped scheduling metadata, never archive
+/// authority. Unavailable checkpoint storage leaves repair enabled in memory.
+/// The first descending history round requests catch-up after each consumed
+/// page, including already-archived pages. It resumes the checkpoint's position
+/// rather than restarting at the newest ID. Once that round reaches its end,
+/// subsequent healthy history rounds return to the ordinary polling cadence.
 ///
 /// # Errors
 ///
 /// Refuses mismatched/readonly sources, source acquisition/query errors, or an
 /// open corruption breaker. Ambiguous/conflicting/oversized artifacts defer.
 pub fn reconcile_message_batch(
+    cx: &Cx,
+    pool: &DbPool,
+    config: &Config,
+    cursor: &mut ReconcileCursor,
+    stop: &AtomicBool,
+) -> Result<ReconcileReport, String> {
+    if cursor.persist_progress {
+        checkpoint::run(cx, pool, config, cursor, stop)
+    } else {
+        reconcile_message_batch_inner(cx, pool, config, cursor, stop)
+    }
+}
+
+fn reconcile_message_batch_inner(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
@@ -677,13 +1016,47 @@ pub fn reconcile_message_batch(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
-    validate_pool_binding(pool, config)?;
-    let cutoff = mcp_agent_mail_db::now_micros()
-        .saturating_sub(NORMAL_ARCHIVE_GRACE_US)
-        .max(cursor.settled_before_us);
-    let selected = select_ids(cx, pool, cursor, cutoff)?;
+    let cutoff = normal_archive_cutoff(
+        mcp_agent_mail_db::now_micros(),
+        cursor.settled_before_us,
+        crate::archive_lag_snapshot().oldest_unmaterialized_us,
+    );
+    let selected = {
+        // The selection itself must not enter a pool while promotion owns
+        // admission. Refusal leaves both scan positions untouched.
+        let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
+        validate_pool_binding(pool, config)?;
+        let selected = select_ids(cx, pool, cursor, cutoff)?;
+        // Selection already bound and validated the writable source. Inject
+        // known failed IDs into the ordinary bounded retry lane, not a second
+        // worker or a larger publication batch.
+        durability::seed_retries(config, cursor);
+        selected
+    };
+    let selected_identity = cursor.source_identity.clone();
+    let now = Instant::now();
+    let mut retries = cursor
+        .retries
+        .iter()
+        .filter(|retry| retry.ready_at <= now)
+        .take(MAX_RETRIES_PER_PASS)
+        .map(|retry| (retry.id, None))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut selected = selected.into_iter().map(|(id, tail)| (id, Some(tail)));
     let mut seen = HashSet::new();
-    for (id, tail) in selected {
+    loop {
+        // At saturation only a retained item can free capacity. Do not let
+        // normal-lane priority pin a full queue before any due retry runs.
+        let next = if cursor.next_lane_is_retry || cursor.retries.len() >= MAX_RETRY_IDS {
+            retries.next().or_else(|| selected.next())
+        } else {
+            selected.next().or_else(|| retries.next())
+        };
+        let Some((id, tail)) = next else {
+            break;
+        };
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             report.interrupted = true;
             break;
@@ -691,18 +1064,49 @@ pub fn reconcile_message_batch(
         if corruption_circuit_breaker().is_tripped() {
             return Err("message reconciliation stopped: source corruption observed".to_string());
         }
-        if report.repaired >= MAX_REPAIRS_PER_BATCH {
+        if report.repaired >= MAX_REPAIRS_PER_BATCH || report.scanned >= MAX_IDS_PER_PASS {
             report.budget_exhausted = true;
             break;
         }
-        if !seen.insert(id) {
-            cursor.advance(id, tail);
+        // A scan-lane duplicate cannot bypass a retry's cooldown or cause a
+        // second publication attempt during the same bounded pass.
+        let cooling_down = cursor
+            .retries
+            .iter()
+            .any(|retry| retry.id == id && retry.ready_at > now)
+            || cursor
+                .conflict_backoff
+                .iter()
+                .any(|(known, until)| *known == id && *until > now);
+        // A retained ID belongs to the retry lane. Consuming its scan-lane
+        // duplicate must not steal the normal lane's turn or byte allowance.
+        let retained_scan = tail.is_some() && cursor.retries.iter().any(|retry| retry.id == id);
+        if seen.contains(&id) || cooling_down || retained_scan {
+            if let Some(tail) = tail {
+                cursor.advance(id, tail);
+            }
             continue;
         }
+        // At saturation, leave the unconsumed scan position intact. Evicting
+        // a transiently deferred ID would recreate the days-long wrap delay.
+        if cursor.retries.len() >= MAX_RETRY_IDS
+            && !cursor.retries.iter().any(|retry| retry.id == id)
+        {
+            break;
+        }
         // Freeze recovery promotion through source observation and archive
-        // publication. Drop each SQL connection before filesystem/Git work.
-        let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
-        let result = match prepare_message(cx, pool, id) {
+        // publication, but never wait for closed admission on this worker.
+        // A replacement between selection and this item invalidates the page;
+        // the next pass rebinds its cursors before reading new-generation IDs.
+        let write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+            .ok_or("message reconciliation deferred: recovery promotion or admission contention")?;
+        if pool.sqlite_identity_key() != selected_identity {
+            return Err(
+                "message reconciliation source changed after selection; rescan required".into(),
+            );
+        }
+        seen.insert(id);
+        let result = match prepare_message_classified(cx, pool, id) {
             Ok(prepared) => match payload_admission(report.payload_bytes, prepared.payload_bytes) {
                 PayloadAdmission::Oversized => {
                     // SQL's raw-text bound does not bound JSON escaping. This
@@ -711,7 +1115,7 @@ pub fn reconcile_message_batch(
                     Err(format!(
                         "serialized message payload exceeds per-batch limit ({} > {} bytes); source preserved",
                         prepared.payload_bytes, MAX_BATCH_PAYLOAD_BYTES,
-                    ))
+                    ).into())
                 }
                 PayloadAdmission::NextBatch => {
                     // This item CAN fit a fresh batch. Do not consume its
@@ -725,29 +1129,70 @@ pub fn reconcile_message_batch(
                         report.interrupted = true;
                         break;
                     }
-                    reconcile_prepared(config, &prepared)
+                    let ticket = durability::ticket_for(config, &prepared);
+                    let result = reconcile_prepared_inner(
+                        config,
+                        &prepared,
+                        Some(RepairControl { cx, stop }),
+                        // Clearing a failed-write refusal consumes an archive
+                        // proof, so even unchanged failed mail must retain the
+                        // original guarded verification. The optimistic path
+                        // is only an observation for ordinary maintenance.
+                        ticket.is_some(),
+                    );
+                    if result.is_ok() {
+                        durability::confirm_repaired(
+                            cx,
+                            pool,
+                            config,
+                            &selected_identity,
+                            stop,
+                            ticket.as_ref(),
+                        );
+                    }
+                    result
                 }
             },
             Err(error) => Err(error),
         };
+        // Archive guards and SQL connections have already been dropped. Slow
+        // logging must not prolong this message's database-promotion exclusion.
+        drop(write_activity);
+        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            report.interrupted = true;
+            break;
+        }
         report.scanned += 1;
+        cursor.next_lane_is_retry = tail.is_some();
         match result {
             Ok(result) if result.files_created > 0 || result.git_commit_needed => {
                 report.repaired += 1;
                 report.files_created += result.files_created;
+                cursor.forget_retry(id);
             }
-            Ok(_) => report.unchanged += 1,
-            Err(error) => {
-                report.deferred += 1;
-                tracing::warn!(
-                    target: "maintenance", event = "message_archive_reconcile_deferred",
-                    message_id = id, reason = %error,
-                    "message archive repair deferred; source and conflicting evidence retained"
-                );
+            Ok(_) => {
+                report.unchanged += 1;
+                cursor.forget_retry(id);
             }
+            Err(error) => record_failure(id, error, cursor, &mut report, now),
         }
-        cursor.advance(id, tail);
+        if let Some(tail) = tail {
+            cursor.advance(id, tail);
+        }
     }
+    // Finding no missing files on the newest page does not establish that a
+    // crash left no older orphans. Continue this finite startup history round
+    // using the worker's existing one-second catch-up poll. No loop, SQL page,
+    // repair count, payload bound, retry cooldown, or publication guard changes.
+    // A cancelled or wholly blocked pass does not request extra polling here.
+    if cursor.persist_progress
+        && !cursor.startup_backfill_complete
+        && report.scanned > 0
+        && !report.interrupted
+    {
+        report.budget_exhausted = true;
+    }
+    report.retry_len = cursor.retries.len();
     Ok(report)
 }
 
@@ -760,6 +1205,18 @@ fn verify_retention_archive(
     prepared: &PreparedMessage,
     admitted_bytes: &mut usize,
 ) -> Result<Option<usize>, String> {
+    let committed = CommittedMessages::open(archive)?;
+    verify_retention_archive_at(archive, prepared, admitted_bytes, &committed, None)
+}
+
+fn verify_retention_archive_at(
+    archive: &ProjectArchive,
+    prepared: &PreparedMessage,
+    admitted_bytes: &mut usize,
+    committed: &CommittedMessages,
+    control: Option<RepairControl<'_>>,
+) -> Result<Option<usize>, String> {
+    super::checkpoint(control).map_err(|error| error.to_string())?;
     let paths = crate::message_paths_for_bundle(
         archive,
         &prepared.message,
@@ -770,7 +1227,6 @@ fn verify_retention_archive(
     .0;
     let attachments = super::attachments::required_paths(archive, &prepared.message)
         .map_err(|error| error.to_string())?;
-    let committed = CommittedMessages::open(archive)?;
     let mut expected = Vec::new();
     let mut bundle_bytes = 0_usize;
     let mut message_bytes = 0_usize;
@@ -779,6 +1235,7 @@ fn verify_retention_archive(
         .chain(paths.inbox.iter().map(|path| (path, true)))
         .chain(attachments.iter().map(|path| (path, false)))
     {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (oid, size) = committed.file_identity(archive, path)?;
         if message && size > super::MAX_MESSAGE_ARTIFACT_BYTES {
             return Err("retention message exceeds the archive artifact byte bound".into());
@@ -800,6 +1257,7 @@ fn verify_retention_archive(
     *admitted_bytes += bundle_bytes;
     let mut surviving = None;
     for path in [&paths.canonical, &paths.outbox] {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (message, body) = committed
             .read(archive, path)?
             .ok_or("retention requires committed canonical and outbox copies")?;
@@ -811,6 +1269,7 @@ fn verify_retention_archive(
         )?;
     }
     for path in &paths.inbox {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (message, body) = committed
             .read(archive, path)?
             .ok_or("retention requires every committed recipient inbox copy")?;
@@ -824,6 +1283,7 @@ fn verify_retention_archive(
     // Reuse attachment path, size and content-digest validation. The preceding
     // inventory requires committed blobs even when repair could use a proven
     // uncommitted original. This verifier never creates or commits files.
+    super::checkpoint(control).map_err(|error| error.to_string())?;
     let files = super::attachments::prepare(
         &committed.repo,
         archive,
@@ -832,6 +1292,7 @@ fn verify_retention_archive(
     )
     .map_err(|error| error.to_string())?;
     for (path, bytes) in files {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         let (oid, _) = committed.file_identity(archive, &path)?;
         if git2::Oid::hash_object_ext(git2::ObjectType::Blob, &bytes, oid.object_format())
             .map_err(|error| error.to_string())?
@@ -842,6 +1303,7 @@ fn verify_retention_archive(
     }
     let current = CommittedMessages::open(archive)?;
     for (path, oid) in expected {
+        super::checkpoint(control).map_err(|error| error.to_string())?;
         if current.file_identity(archive, path)?.0 != oid {
             return Err("retention archive changed during verification".into());
         }
@@ -888,34 +1350,43 @@ fn prune_retention_candidate(
     // Match archive writers' lock order: publication fence, then project lock.
     // Keep both through the DB commit so cooperating archive writes cannot
     // invalidate the evidence between verification and destructive retention.
-    let _mutation = crate::ArchiveMutationGuard::begin_at(&config.storage_root);
+    // Replayable maintenance must not retain promotion admission indefinitely
+    // behind a busy publisher. Use the native recovery fence and lock budget.
+    let control = RepairControl { cx, stop };
+    let _mutation = control
+        .begin_at(&config.storage_root)
+        .map_err(|error| error.to_string())?;
     let archive = crate::open_archive(config, &prepared.project_slug)
         .map_err(|error| error.to_string())?
         .ok_or("retention requires an existing authoritative project archive")?;
-    crate::with_project_lock(&archive, || {
-        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-            return Ok(PruneAttempt::Interrupted);
-        }
-        if verify_retention_archive(&archive, &prepared, &mut report.archive_bytes)
-            .map_err(super::invalid)?
-            .is_none()
-        {
-            return Ok(PruneAttempt::NextBatch);
-        }
-        if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-            return Ok(PruneAttempt::Interrupted);
-        }
-        let pruned = outcome(block_on(prune_verified_settled_messages(
-            cx,
-            pool,
-            older_than_us,
-            1,
-            std::slice::from_ref(&candidate),
-        )))
-        .map_err(super::invalid)?;
-        Ok(PruneAttempt::Pruned(pruned))
-    })
-    .map_err(|error| error.to_string())
+    archive
+        .with_repair_lock(
+            || control.cancelled(),
+            || {
+                if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                    return Ok(PruneAttempt::Interrupted);
+                }
+                if verify_retention_archive(&archive, &prepared, &mut report.archive_bytes)
+                    .map_err(super::invalid)?
+                    .is_none()
+                {
+                    return Ok(PruneAttempt::NextBatch);
+                }
+                if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+                    return Ok(PruneAttempt::Interrupted);
+                }
+                let pruned = outcome(block_on(prune_verified_settled_messages(
+                    cx,
+                    pool,
+                    older_than_us,
+                    1,
+                    std::slice::from_ref(&candidate),
+                )))
+                .map_err(super::invalid)?;
+                Ok(PruneAttempt::Pruned(pruned))
+            },
+        )
+        .map_err(|error| error.to_string())
 }
 
 /// Prune only settled messages whose complete archive has been verified.
@@ -923,13 +1394,15 @@ fn prune_retention_candidate(
 /// Each pass inspects at most 32 IDs and admits 16 MiB of prepared DB payload
 /// plus 64 MiB of unique archive bundle content. Raw SQL projections have a
 /// separate per-candidate bound; invalid projections still count toward the ID
-/// limit. Some objects are read repeatedly for Git and disk validation.
-/// Missing, conflicting or oversized evidence leaves the
+/// limit. Missing, conflicting or oversized evidence leaves the
 /// DB row intact for the repair worker. The deletion transaction rechecks the
 /// exact source projection and settlement observed before archive I/O.
 /// Connections are released during archive reads. One write-activity lease
 /// excludes recovery promotion from source selection through deletion; each
 /// candidate also retains the archive publication fence and project lock.
+/// Promotion and publication contention defer without waiting indefinitely;
+/// project-lock admission shares recovery's bounded, cancellation-aware budget.
+/// Deferred evidence is always reverified before a later deletion attempt.
 pub fn prune_archived_message_batch(
     cx: &Cx,
     pool: &DbPool,
@@ -946,7 +1419,8 @@ pub fn prune_archived_message_batch(
     if corruption_circuit_breaker().is_tripped() {
         return Err("archive-verified retention refused: source corruption breaker is open".into());
     }
-    let _write_activity = mcp_agent_mail_db::write_barrier::begin_write_activity();
+    let _write_activity = mcp_agent_mail_db::write_barrier::try_begin_write_activity()
+        .ok_or("archive-verified retention deferred: recovery promotion or admission contention")?;
     validate_pool_binding(pool, config)?;
     {
         let conn = outcome(block_on(pool.acquire(cx)))?;
@@ -1002,6 +1476,13 @@ pub fn prune_archived_message_batch(
                 if pruned.deleted_messages == 0 {
                     report.deferred += 1;
                 }
+            }
+            Err(_) if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() => {
+                // A cancelled lock wait did not inspect or delete this source.
+                // Preserve its position rather than consuming it as a conflict.
+                report.interrupted = true;
+                completed_page = false;
+                break;
             }
             Err(reason) => {
                 report.deferred += 1;
@@ -1279,6 +1760,129 @@ mod tests {
         let original = prepared();
         let archive = crate::ensure_archive(&config, &original.project_slug).unwrap();
         (temp, config, original, archive)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prepared_repair_releases_metadata_fence_and_rechecks_surviving_reply() {
+        use super::super::cancellable_tests::{ObserveScan, isolated};
+        use std::fs;
+        use std::sync::atomic::Ordering;
+
+        if isolated() {
+            return;
+        }
+        for replace_survivor in [false, true] {
+            let (_temp, config, original, archive) = git_fixture();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &original.message,
+                &original.sender,
+                &original.recipients,
+            )
+            .unwrap()
+            .0;
+            let mut full = original.message.clone();
+            full["reply_to"] = json!(7);
+            full["future_metadata"] = json!({"opaque": ["keep", 42]});
+            let redacted = crate::redact_message_bcc_for_inbox(&full);
+            let survivor_bytes =
+                crate::render_message_bundle_content(&redacted, &original.body).unwrap();
+            crate::ensure_parent_dir(&paths.inbox[0]).unwrap();
+            fs::write(&paths.inbox[0], survivor_bytes.as_bytes()).unwrap();
+            let history = archive.root.join("messages/2025/01/other.md");
+            commit_survivors(&archive, &[(&history, &json!({"id": 99}))], "history");
+            let other = crate::ensure_archive(&config, "reservation-peer").unwrap();
+            let op = crate::WriteOp::FileReservation {
+                project_slug: other.slug.clone(),
+                config: config.clone(),
+                reservations: vec![json!({
+                    "id": 1, "agent": "GreenCastle", "path_pattern": "src/**",
+                    "exclusive": true, "reason": "unrelated reservation",
+                    "created_ts": "2026-10-01T00:00:00Z", "expires_ts": "2030-10-01T00:00:00Z",
+                })],
+            };
+            let mut replacement = redacted.clone();
+            replacement["reply_to"] = json!(8);
+            replacement["future_metadata"] = json!({"concurrent": "preserve"});
+            let replacement_bytes =
+                crate::render_message_bundle_content(&replacement, &original.body).unwrap();
+            let replacement_for_hook = replacement_bytes.clone();
+            let survivor = paths.inbox[0].clone();
+            let visited = std::sync::Arc::new(AtomicBool::new(false));
+            let hook_visited = visited.clone();
+            let observer = ObserveScan::new(move |stage| {
+                if stage != "git blob" || hook_visited.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let op = op.clone();
+                let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
+                    .join()
+                    .unwrap();
+                assert!(
+                    matches!(result, crate::DirectArchiveWrite::Written),
+                    "{result:?}"
+                );
+                crate::flush_async_commits();
+                if replace_survivor {
+                    fs::write(&survivor, replacement_for_hook.as_bytes()).unwrap();
+                }
+            });
+            let cx = Cx::for_testing();
+            let stop = AtomicBool::new(false);
+            let result = reconcile_prepared_inner(
+                &config,
+                &original,
+                Some(RepairControl {
+                    cx: &cx,
+                    stop: &stop,
+                }),
+                true,
+            );
+            drop(observer);
+            assert!(visited.load(Ordering::Acquire));
+            let reservation: Value = serde_json::from_slice(
+                &fs::read(other.root.join("file_reservations/id-1.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reservation["agent"], "GreenCastle");
+            assert_eq!(reservation["path_pattern"], "src/**");
+            if replace_survivor {
+                let error = result.unwrap_err();
+                assert!(error.detail.contains("conflict"), "{}", error.detail);
+                assert!(!paths.canonical.exists());
+                assert!(!paths.outbox.exists());
+                assert!(!paths.inbox[1].exists());
+                assert_eq!(
+                    fs::read(&paths.inbox[0]).unwrap(),
+                    replacement_bytes.as_bytes()
+                );
+            } else {
+                let repaired = result.unwrap();
+                assert_eq!(repaired.files_created, 3);
+                assert!(repaired.git_commit_needed);
+                for path in [&paths.canonical, &paths.outbox] {
+                    let (message, body) = read_surviving_message(path).unwrap().unwrap();
+                    assert_eq!(message, full);
+                    assert_eq!(body, original.body);
+                }
+                for path in &paths.inbox {
+                    assert_eq!(fs::read(path).unwrap(), survivor_bytes.as_bytes());
+                }
+                let repo = git2::Repository::open(&archive.repo_root).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(paths.inbox.iter())
+                {
+                    let relative =
+                        crate::rel_path_cached(&archive.canonical_repo_root, path).unwrap();
+                    let entry = tree.get_path(std::path::Path::new(&relative)).unwrap();
+                    let blob = repo.find_blob(entry.id()).unwrap();
+                    assert_eq!(blob.content(), fs::read(path).unwrap().as_slice());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1585,6 +2189,9 @@ mod tests {
 
     #[test]
     fn oversized_projection_does_not_pin_later_mail_and_preserves_source() {
+        if admission_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join("mail.sqlite3");
@@ -1660,7 +2267,12 @@ mod tests {
         });
     }
 
-    fn retention_fixture(count: i64, test: impl FnOnce(&Cx, &DbPool, &Config)) {
+    pub(super) fn retention_fixture(count: i64, test: impl FnOnce(&Cx, &DbPool, &Config)) {
+        // Recovery now refuses unrelated process-global lock contention.
+        // Keep the existing exact expectations isolated from parallel tests.
+        if admission_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let storage_root = temp.path().join("archive");
@@ -1994,6 +2606,9 @@ mod tests {
 
     #[test]
     fn real_file_backed_projection_repairs_without_modifying_mailbox_rows() {
+        if admission_tests::isolated() {
+            return;
+        }
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
             let temp = tempfile::tempdir().unwrap();
             let db_path = temp.path().join("mail.sqlite3");
@@ -2093,6 +2708,141 @@ mod tests {
                 std::fs::read(&other).unwrap(),
                 b"preserve other database bytes"
             );
+        });
+    }
+
+    fn archive_fixture_range(cx: &Cx, pool: &DbPool, config: &Config, ids: std::ops::Range<i64>) {
+        for id in ids {
+            let prepared = prepare_message(cx, pool, id).unwrap();
+            reconcile_prepared(config, &prepared).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_backfill_reaches_old_orphan_behind_healthy_pages_then_returns_to_idle() {
+        retention_fixture(40, |cx, pool, config| {
+            // The newest pages are completely healthy, but the oldest accepted
+            // message never reached Git. No retry record knows about it yet.
+            archive_fixture_range(cx, pool, config, 902..941);
+            let stop = AtomicBool::new(false);
+            let mut ordinary = ReconcileCursor::default();
+            let ordinary_page =
+                reconcile_message_batch(cx, pool, config, &mut ordinary, &stop).unwrap();
+            assert_eq!(ordinary_page.unchanged, 16);
+            assert!(!ordinary_page.budget_exhausted);
+
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            for pass in 0..2 {
+                let report = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                assert_eq!(report.unchanged, 16, "pass {pass}: {report:?}");
+                assert_eq!(report.repaired, 0);
+                assert_eq!(report.deferred, 0);
+                assert!(
+                    report.budget_exhausted,
+                    "healthy pages must not hide an older orphan"
+                );
+                assert_eq!(report.checkpoint_saved, Some(true));
+            }
+            let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(repaired.scanned, 8);
+            assert_eq!(repaired.repaired, 1);
+            assert_eq!(repaired.files_created, 4);
+            assert_eq!(repaired.deferred, 0);
+            assert!(repaired.scanned <= MAX_IDS_PER_PASS);
+            assert!(repaired.repaired <= MAX_REPAIRS_PER_BATCH);
+            assert!(repaired.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap(),
+                ReconcileResult::default()
+            );
+            assert!(
+                verify_retention_archive(
+                    &crate::open_archive(config, "project").unwrap().unwrap(),
+                    &original,
+                    &mut 0
+                )
+                .unwrap()
+                .is_some()
+            );
+
+            let end = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(end.scanned, 0);
+            assert!(!end.budget_exhausted);
+            assert!(cursor.startup_backfill_complete);
+            // Ordinary rotating history continues, but does not keep the
+            // worker on the fast startup cadence forever.
+            let wrapped = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(wrapped.unchanged, 16);
+            assert!(!wrapped.budget_exhausted);
+            assert!(cursor.startup_backfill_complete);
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..941).collect::<Vec<_>>()
+            );
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let receipts = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 901",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(receipts.len(), 2);
+            for receipt in receipts {
+                assert_eq!(receipt.get_named::<i64>("read_ts").unwrap(), 2_000_000);
+                assert_eq!(receipt.get_named::<i64>("ack_ts").unwrap(), 2_500_000);
+            }
+        });
+    }
+
+    #[test]
+    fn startup_backfill_resumes_persisted_position_instead_of_restarting_recent_pages() {
+        retention_fixture(40, |cx, pool, config| {
+            archive_fixture_range(cx, pool, config, 902..941);
+            let stop = AtomicBool::new(false);
+            let mut before_restart =
+                ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let first =
+                reconcile_message_batch(cx, pool, config, &mut before_restart, &stop).unwrap();
+            assert_eq!(first.unchanged, 16);
+            assert_eq!(before_restart.backfill_ceiling, Some(924));
+            assert_eq!(first.checkpoint_saved, Some(true));
+
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let resumed = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(resumed.checkpoint_restored);
+            assert_eq!(resumed.unchanged, 16);
+            assert_eq!(restarted.backfill_ceiling, Some(908));
+            assert!(resumed.budget_exhausted);
+            assert!(!restarted.startup_backfill_complete);
+            let next = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert_eq!(next.repaired, 1);
+            assert_eq!(next.scanned, 8);
+            assert_eq!(next.deferred, 0);
+            let end = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(!end.budget_exhausted);
+            assert!(restarted.startup_backfill_complete);
+        });
+    }
+
+    #[test]
+    fn empty_and_stopped_startup_backfill_do_not_request_busy_polling() {
+        retention_fixture(0, |cx, pool, config| {
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let stopped =
+                reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(true))
+                    .unwrap();
+            assert!(stopped.interrupted);
+            assert!(!stopped.budget_exhausted);
+            assert!(!cursor.startup_backfill_complete);
+            for _ in 0..3 {
+                let empty =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(empty.scanned, 0);
+                assert!(!empty.budget_exhausted);
+                assert!(cursor.startup_backfill_complete);
+            }
         });
     }
 }

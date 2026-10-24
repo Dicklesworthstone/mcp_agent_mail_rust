@@ -443,27 +443,114 @@ e2e_assert_eq "no Python alias in zshrc" "0" "$(echo "$PYTHON_ALIAS" | tr -d ' '
 # ===========================================================================
 e2e_case_banner "Bearer token generation produces valid output"
 
-set +e
-if command -v openssl >/dev/null 2>&1; then
-  TOKEN="$(openssl rand -hex 32)"
-  TOKEN_LEN="${#TOKEN}"
-  e2e_assert_eq "token length is 64 hex chars" "64" "$TOKEN_LEN"
-  # Verify it's all hex
-  TOKEN_HEX="$(echo "$TOKEN" | command grep -cE '^[0-9a-f]+$' 2>/dev/null || echo 0)"
-  e2e_assert_eq "token is valid hex" "1" "$TOKEN_HEX"
-elif [ -r /dev/urandom ]; then
-  TOKEN="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  TOKEN_LEN="${#TOKEN}"
-  # urandom+od output may vary in length
-  if [ "$TOKEN_LEN" -ge 32 ]; then
-    e2e_assert_eq "urandom token >= 32 chars" "yes" "yes"
-  else
-    e2e_assert_eq "urandom token >= 32 chars" "yes" "no (got $TOKEN_LEN)"
-  fi
+# Exercise the installer's own generator (br-lgorb), never a copy of its
+# pipeline: a weak fallback or a fixed placeholder token must fail here.
+TOKEN_DIR="${FAKE_HOME}/token-generator"
+mkdir -p "${TOKEN_DIR}/openssl-fails" "${TOKEN_DIR}/openssl-placeholder" \
+  "${TOKEN_DIR}/urandom-only" "${TOKEN_DIR}/no-generator"
+TOKEN_LIBRARY="${TOKEN_DIR}/generate-bearer-token-function.sh"
+sed -n '/^generate_bearer_token() {/,/^normalize_mcp_http_path() {/p' "${INSTALL_SH}" \
+  | sed '$d' > "${TOKEN_LIBRARY}"
+TOKEN_SETUP_LIBRARY="${TOKEN_DIR}/setup-mcp-configs-function.sh"
+sed -n '/^path_resolves_within_directory() {/,/^update_mcp_configs() {/p' "${INSTALL_SH}" \
+  | sed '$d' > "${TOKEN_SETUP_LIBRARY}"
+printf '#!/bin/sh\nexit 1\n' > "${TOKEN_DIR}/openssl-fails/openssl"
+printf '#!/bin/sh\nprintf placeholder-token-replace-me\n' > "${TOKEN_DIR}/openssl-placeholder/openssl"
+chmod +x "${TOKEN_DIR}/openssl-fails/openssl" "${TOKEN_DIR}/openssl-placeholder/openssl"
+for tool in head od tr; do
+  ln -s "$(command -v "$tool")" "${TOKEN_DIR}/urandom-only/${tool}"
+done
+ln -s "$(command -v head)" "${TOKEN_DIR}/no-generator/head"
+ln -s "$(command -v tr)" "${TOKEN_DIR}/no-generator/tr"
+
+# Runs the extracted generator with PATH set to $1 (empty keeps the host
+# PATH); prints "<exit code>|<stdout>".
+run_token_generator() {
+  (
+    # shellcheck disable=SC2329
+    warn() { :; }
+    # shellcheck disable=SC1090
+    source "${TOKEN_LIBRARY}"
+    if [ -n "$1" ]; then
+      PATH="$1"
+    fi
+    set +e
+    token="$(generate_bearer_token)"
+    rc=$?
+    printf '%s|%s' "$rc" "$token"
+  )
+}
+
+if [ ! -s "${TOKEN_LIBRARY}" ] || [ ! -s "${TOKEN_SETUP_LIBRARY}" ]; then
+  e2e_fail "extract installer bearer-token generator" "function bodies" "missing"
 else
-  e2e_assert_eq "token generation available" "skipped" "skipped"
+  TOKEN_A="$(run_token_generator "")"
+  TOKEN_B="$(run_token_generator "")"
+  if [[ "$TOKEN_A" =~ ^0\|[0-9a-f]{64}$ ]]; then
+    e2e_pass "host generator yields 64 lowercase hex chars"
+  else
+    e2e_fail "host generator yields 64 lowercase hex chars" "0|<64 hex>" "$TOKEN_A"
+  fi
+  if [ "$TOKEN_A" != "$TOKEN_B" ]; then
+    e2e_pass "two generated tokens differ"
+  else
+    e2e_fail "two generated tokens differ" "distinct tokens" "$TOKEN_A twice"
+  fi
+  TOKEN_URANDOM="$(run_token_generator "${TOKEN_DIR}/urandom-only")"
+  if [[ "$TOKEN_URANDOM" =~ ^0\|[0-9a-f]{64}$ ]]; then
+    e2e_pass "/dev/urandom fallback yields 64 hex chars without openssl"
+  else
+    e2e_fail "/dev/urandom fallback yields 64 hex chars without openssl" \
+      "0|<64 hex>" "$TOKEN_URANDOM"
+  fi
+  e2e_assert_eq "a failing openssl refuses instead of falling back" \
+    "1|" "$(run_token_generator "${TOKEN_DIR}/openssl-fails")"
+  e2e_assert_eq "a non-hex token is refused" \
+    "1|" "$(run_token_generator "${TOKEN_DIR}/openssl-placeholder")"
+  e2e_assert_eq "no secure generator refuses instead of a date/PID token" \
+    "1|" "$(run_token_generator "${TOKEN_DIR}/no-generator")"
+
+  # With no existing token and a failing generator, setup must refuse before
+  # any client writer runs, leaving credential-bearing configs untouched.
+  TOKEN_CLIENT_CONFIG="${TOKEN_DIR}/client-mcp.json"
+  printf '%s\n' '{"mcpServers":{"other":{"url":"http://example.invalid/"}}}' \
+    > "${TOKEN_CLIENT_CONFIG}"
+  TOKEN_CLIENT_BEFORE="$(sha256sum "${TOKEN_CLIENT_CONFIG}")"
+  TOKEN_REFUSAL="$(
+    # shellcheck disable=SC2329
+    detect_mcp_configs() { printf 'cursor\t%s\t1\n' "${TOKEN_CLIENT_CONFIG}"; }
+    # shellcheck disable=SC2329
+    resolve_setup_http_bearer_token() { :; }
+    TOKEN_WRITER_CALLS=0
+    # shellcheck disable=SC2329
+    setup_claude_code_mcp_via_cli() { TOKEN_WRITER_CALLS=$((TOKEN_WRITER_CALLS + 1)); }
+    # shellcheck disable=SC2329
+    setup_single_mcp_config() { TOKEN_WRITER_CALLS=$((TOKEN_WRITER_CALLS + 1)); }
+    # shellcheck disable=SC2329
+    ok() { :; }
+    # shellcheck disable=SC2329
+    info() { :; }
+    # shellcheck disable=SC2329
+    warn() { :; }
+    # shellcheck disable=SC2329
+    verbose() { :; }
+    # shellcheck disable=SC1090
+    source "${TOKEN_LIBRARY}"
+    # shellcheck disable=SC1090
+    source "${TOKEN_SETUP_LIBRARY}"
+    unset HTTP_BEARER_TOKEN
+    PATH="${TOKEN_DIR}/openssl-fails:${PATH}"
+    set +e
+    setup_mcp_configs "/unused/mcp-agent-mail"
+    rc=$?
+    printf 'rc=%s writers=%s token=%s' "$rc" "$TOKEN_WRITER_CALLS" "${HTTP_BEARER_TOKEN:-<unset>}"
+  )"
+  e2e_save_artifact "case_14_token_refusal.txt" "$TOKEN_REFUSAL"
+  e2e_assert_eq "setup refuses without a secure token and runs no client writer" \
+    "rc=1 writers=0 token=<unset>" "$TOKEN_REFUSAL"
+  e2e_assert_eq "client config bytes unchanged after the refusal" \
+    "$TOKEN_CLIENT_BEFORE" "$(sha256sum "${TOKEN_CLIENT_CONFIG}")"
 fi
-set -e
 
 # ===========================================================================
 # Case 15: Installer migration remains robust with binary PATH entries + MCP mode env
@@ -771,6 +858,77 @@ PY
     set -e
     e2e_assert_exit_code "OMP installer writer is byte-and-mode idempotent" \
       "1" "${OMP_WRITER_THIRD_RC}"
+
+    # br-q8k82: stale OAuth authority is stripped while the operator's own
+    # tuning fields on the entry survive, and a malformed server allow/deny
+    # list is refused with the file untouched rather than rewritten.
+    OMP_TUNING_CONFIG="${OMP_INSTALLER_DIR}/tuning-mcp.json"
+    printf '%s\n' '{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:9999/stale/","timeout":45000,"description":"operator note","autoApprove":["send_message"],"auth":{"type":"oauth","credentialId":"stale"},"headers":{"Authorization":"Bearer stale-token","X-Trace":"keep"}}}}' \
+      > "${OMP_TUNING_CONFIG}"
+    set +e
+    (
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
+      # shellcheck disable=SC1090
+      source "${OMP_WRITER_LIBRARY}"
+      setup_single_standard_http_json_config omp "${OMP_TUNING_CONFIG}"
+    )
+    OMP_TUNING_RC=$?
+    set -e
+    e2e_assert_exit_code "OMP installer writer refreshes an entry carrying tuning fields" \
+      "0" "${OMP_TUNING_RC}"
+    OMP_TUNING_ASSERTIONS="$(python3 - "${OMP_TUNING_CONFIG}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    entry = json.load(handle)["mcpServers"]["mcp-agent-mail"]
+assert entry["url"] == "http://127.0.0.1:8765/mcp/", entry
+assert entry["timeout"] == 45000, entry
+assert entry["description"] == "operator note", entry
+assert entry["autoApprove"] == ["send_message"], entry
+assert "auth" not in entry and "oauth" not in entry, entry
+assert entry["headers"] == {"X-Trace": "keep", "Authorization": "Bearer fresh-token"}, entry
+print("valid")
+PY
+    )" || true  # a failed assert must report FAIL below, not abort the suite under set -e
+    e2e_assert_eq "OMP installer writer keeps tuning fields and drops stale OAuth" \
+      "valid" "${OMP_TUNING_ASSERTIONS}"
+
+    OMP_MALFORMED_INDEX=0
+    for OMP_MALFORMED_LISTS in \
+      '"disabledServers":"mcp-agent-mail"' \
+      '"disabledServers":["sibling",3]' \
+      '"enabledServers":{"mcp-agent-mail":true}' \
+      '"enabledServers":[null]'; do
+      OMP_MALFORMED_INDEX=$((OMP_MALFORMED_INDEX + 1))
+      OMP_MALFORMED_CONFIG="${OMP_INSTALLER_DIR}/malformed-${OMP_MALFORMED_INDEX}-mcp.json"
+      printf '{"mcpServers":{"mcp-agent-mail":{"type":"http","url":"http://127.0.0.1:9999/stale/","auth":{"type":"oauth"}}},%s}\n' \
+        "${OMP_MALFORMED_LISTS}" > "${OMP_MALFORMED_CONFIG}"
+      OMP_MALFORMED_BEFORE="$(sha256sum "${OMP_MALFORMED_CONFIG}")"
+      set +e
+      (
+        # shellcheck disable=SC2329
+        verbose() { :; }
+        # shellcheck disable=SC2329
+        desired_mcp_http_url() { printf '%s' 'http://127.0.0.1:8765/mcp/'; }
+        # shellcheck disable=SC2329
+        resolve_setup_http_bearer_token() { printf '%s' 'fresh-token'; }
+        # shellcheck disable=SC1090
+        source "${OMP_WRITER_LIBRARY}"
+        setup_single_standard_http_json_config omp "${OMP_MALFORMED_CONFIG}"
+      )
+      OMP_MALFORMED_RC=$?
+      set -e
+      e2e_assert_exit_code "OMP installer writer refuses malformed lists (${OMP_MALFORMED_LISTS})" \
+        "2" "${OMP_MALFORMED_RC}"
+      e2e_assert_eq "malformed-list refusal leaves the config byte-preserved (${OMP_MALFORMED_LISTS})" \
+        "${OMP_MALFORMED_BEFORE}" "$(sha256sum "${OMP_MALFORMED_CONFIG}")"
+    done
 
     OMP_SYMLINK_TARGET="${OMP_INSTALLER_DIR}/symlink-target.json"
     OMP_SYMLINK_CONFIG="${OMP_INSTALLER_DIR}/symlinked-mcp.json"
@@ -1670,6 +1828,84 @@ EOF
     )"
     e2e_assert_eq "installer persists the exact mode-600 token before any fallback writer" \
       "valid" "${OMP_DURABILITY_ORDER_CONTRACT}"
+
+    # The deferral asserts above run with native setup failing, which skips the
+    # shell writers altogether, so they would pass with the containment check
+    # deleted (br-x5a8y, br-vzh8o). Here native setup succeeds and the writers
+    # run: an outside client must receive the durable token while every
+    # project-local candidate (canonical OMP, relative OMP override, Cursor
+    # relative and absolute, Codex) keeps its bytes.
+    OMP_NATIVE_OK_ENV="${OMP_INSTALLER_DIR}/native-ok-xdg/mcp-agent-mail/config.env"
+    OMP_NATIVE_OK_OUTSIDE_CONFIG="${OMP_INSTALLER_DIR}/native-ok-outside-mcp.json"
+    printf '%s\n' '{"mcpServers":{"outside-sibling":{"command":"node"}}}' \
+      > "${OMP_NATIVE_OK_OUTSIDE_CONFIG}"
+    OMP_NATIVE_OK_CONTRACT="$(
+      # shellcheck disable=SC2329
+      detect_mcp_configs() {
+        printf 'omp\t%s\t1\nomp\t%s\t1\ncursor\t%s\t1\ncursor\t%s\t1\ncodex\t%s\t1\nopencode\t%s\t1\n' \
+          "${OMP_PROJECT_CONFIG}" '.omp/agent/mcp.json' 'cursor.mcp.json' \
+          "${OMP_PROJECT_CURSOR_CONFIG}" 'codex.mcp.json' "${OMP_NATIVE_OK_OUTSIDE_CONFIG}"
+      }
+      # shellcheck disable=SC2329
+      resolve_setup_http_bearer_token() { printf '%s' 'native-ok-secret'; }
+      # shellcheck disable=SC2329
+      generate_bearer_token() { printf '%s' 'wrong-generated-token'; }
+      # shellcheck disable=SC2329
+      rust_config_env_path() { printf '%s' "${OMP_NATIVE_OK_ENV}"; }
+      # shellcheck disable=SC2329
+      token_env_targets_outside_git_worktrees() { return 0; }
+      # shellcheck disable=SC2329
+      read_env_assignment_value() {
+        sed -n "s/^${2}=//p" "$1" 2>/dev/null | tail -1
+      }
+      OMP_NATIVE_OK_WRITES=""
+      # shellcheck disable=SC2329
+      setup_claude_code_mcp_via_cli() {
+        OMP_NATIVE_OK_WRITES="${OMP_NATIVE_OK_WRITES} claude"
+        return 0
+      }
+      # shellcheck disable=SC2329
+      setup_single_mcp_config() {
+        OMP_NATIVE_OK_WRITES="${OMP_NATIVE_OK_WRITES} $1"
+        printf '%s' "${HTTP_BEARER_TOKEN:-}" > "$2"
+        return 0
+      }
+      # shellcheck disable=SC2329
+      warn() { :; }
+      # shellcheck disable=SC2329
+      verbose() { :; }
+      # shellcheck disable=SC2329
+      ok() { :; }
+      # shellcheck disable=SC2329
+      info() { :; }
+      # shellcheck disable=SC1090
+      source "${OMP_SETUP_LIBRARY}"
+      # shellcheck disable=SC1090
+      source "${OMP_UPDATE_LIBRARY}"
+      cd "${OMP_PROJECT_DIR}"
+      export HOME="${OMP_PROJECT_DIR}"
+      export OMP_DURABILITY_MODE=exact
+      export OMP_DURABILITY_ENV="${OMP_NATIVE_OK_ENV}"
+      set +e
+      configure_mcp_clients "/unused/mcp-agent-mail" "${OMP_DURABILITY_FAKE_CLI}"
+      printf 'rc=%s writes=%s' "$?" "${OMP_NATIVE_OK_WRITES# }"
+    )"
+    e2e_save_artifact "case_16_native_ok_project_defer.txt" "${OMP_NATIVE_OK_CONTRACT}"
+    e2e_assert_eq "with native setup succeeding, only the outside client is shell-written" \
+      "rc=0 writes=opencode" "${OMP_NATIVE_OK_CONTRACT}"
+    e2e_assert_eq "outside client receives the durable bearer" \
+      "native-ok-secret" "$(cat "${OMP_NATIVE_OK_OUTSIDE_CONFIG}")"
+    e2e_assert_eq "native success leaves project OMP config byte-preserved" \
+      '{"mcpServers":{"sibling":{"command":"node"}}}' "$(cat "${OMP_PROJECT_CONFIG}")"
+    e2e_assert_eq "native success leaves relative OMP override byte-preserved" \
+      '{"mcpServers":{"override-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_OVERRIDE_CONFIG}")"
+    e2e_assert_eq "native success leaves project-local Cursor config byte-preserved" \
+      '{"mcpServers":{"cursor-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_CURSOR_CONFIG}")"
+    e2e_assert_eq "native success leaves project-local Codex config byte-preserved" \
+      '{"mcpServers":{"codex-sibling":{"command":"node"}}}' \
+      "$(cat "${OMP_PROJECT_CODEX_CONFIG}")"
   fi
 fi
 
@@ -1754,11 +1990,64 @@ EOF
     fi
     LEGACY_PROJECT_SIDE_EFFECTS="$(
       find "${LEGACY_PROJECT_CONFIG_DIR}" -maxdepth 1 -type f \
-        \( -name '*.bak.mcp-agent-mail-*' -o -name '*.tmp.*' \) -print \
+        \( -name '*.bak.mcp-agent-mail*' -o -name '*.tmp.*' \) -print \
         | wc -l | tr -d ' '
     )"
     e2e_assert_eq "legacy env refusal creates no backup or temporary files" \
       "0" "${LEGACY_PROJECT_SIDE_EFFECTS}"
+
+    # A HOME outside the checkout that is a symlink into it, and a HOME whose
+    # Git metadata cannot be resolved, must both refuse before any write.
+    LEGACY_LINKED_HOME="${LEGACY_ENV_CONTRACT_DIR}/linked-home"
+    ln -s "${LEGACY_PROJECT_DIR}" "${LEGACY_LINKED_HOME}"
+    LEGACY_BROKEN_HOME="${LEGACY_ENV_CONTRACT_DIR}/broken-git-home"
+    mkdir -p "${LEGACY_BROKEN_HOME}"
+    printf 'gitdir: %s\n' "${LEGACY_ENV_CONTRACT_DIR}/missing-gitdir" > "${LEGACY_BROKEN_HOME}/.git"
+    LEGACY_REFUSAL_MARKER="${LEGACY_ENV_CONTRACT_DIR}/refusal-start"
+    : > "${LEGACY_REFUSAL_MARKER}"
+    for LEGACY_REFUSAL_HOME in "${LEGACY_LINKED_HOME}" "${LEGACY_BROKEN_HOME}"; do
+      set +e
+      (
+        # shellcheck disable=SC2329
+        warn() { :; }
+        # shellcheck disable=SC2329
+        info() { :; }
+        # shellcheck disable=SC2329
+        ok() { :; }
+        # shellcheck disable=SC1090
+        source "${LEGACY_ENV_LIBRARY}"
+        cd "${LEGACY_OUTSIDE_HOME}"
+        export HOME="${LEGACY_REFUSAL_HOME}"
+        unset XDG_CONFIG_HOME
+        export PYTHON_CLONE_FOUND=0
+        export PYTHON_CLONE_PATH=""
+        export RUST_STORAGE_ROOT="${LEGACY_OUTSIDE_HOME}/mailbox"
+        export RUST_DB_PATH="${LEGACY_OUTSIDE_HOME}/mailbox/storage.sqlite3"
+        export MIGRATED_BEARER_TOKEN="refused-home-secret"
+        migrate_env_config
+      ) >/dev/null 2>&1
+      LEGACY_REFUSAL_RC=$?
+      set -e
+      e2e_assert_exit_code "legacy env migration refuses HOME ${LEGACY_REFUSAL_HOME##*/}" \
+        "1" "${LEGACY_REFUSAL_RC}"
+      LEGACY_REFUSAL_LEAKS="$(
+        { grep -rl 'refused-home-secret' "${LEGACY_PROJECT_DIR}" "${LEGACY_BROKEN_HOME}" 2>/dev/null || true; } \
+          | wc -l | tr -d ' '
+      )"
+      e2e_assert_eq "HOME ${LEGACY_REFUSAL_HOME##*/} receives no bearer bytes" \
+        "0" "${LEGACY_REFUSAL_LEAKS}"
+    done
+    e2e_assert_eq "project env still byte-preserved after the linked-HOME refusal" \
+      $'# tracked project sentinel\nHTTP_BEARER_TOKEN=old-project-secret\nKEEP_ME=byte-preserved' \
+      "$(cat "${LEGACY_PROJECT_CONFIG}")"
+    LEGACY_REFUSAL_SIDE_EFFECTS="$(
+      find "${LEGACY_PROJECT_CONFIG_DIR}" "${LEGACY_BROKEN_HOME}" -type f \
+        \( -name '*.bak.mcp-agent-mail*' -o -name '*.tmp.*' -o -name 'config.env' -o -name '.env' \) \
+        -newer "${LEGACY_REFUSAL_MARKER}" -print \
+        | wc -l | tr -d ' '
+    )"
+    e2e_assert_eq "linked and unresolved HOME refusals create no env, backup or temp files" \
+      "0" "${LEGACY_REFUSAL_SIDE_EFFECTS}"
 
     git init -q -b main "${LEGACY_OTHER_PROJECT_DIR}"
     cat > "${LEGACY_OTHER_CONFIG}" <<'EOF'
@@ -1805,7 +2094,7 @@ EOF
     fi
     LEGACY_OTHER_SIDE_EFFECTS="$(
       find "${LEGACY_OTHER_CONFIG_DIR}" -maxdepth 1 -type f \
-        \( -name '*.bak.mcp-agent-mail-*' -o -name '*.tmp.*' \) -print \
+        \( -name '*.bak.mcp-agent-mail*' -o -name '*.tmp.*' \) -print \
         | wc -l | tr -d ' '
     )"
     e2e_assert_eq "unrelated worktree refusal creates no backup or temporary files" \

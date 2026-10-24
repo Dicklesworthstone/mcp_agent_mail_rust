@@ -73,6 +73,16 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
             .unwrap_or_else(|_| unreachable!()),
         // GitLab tokens
         Regex::new(r"glpat-[A-Za-z0-9\-_]{20,}").unwrap_or_else(|_| unreachable!()),
+        // Secret assignments: `HTTP_BEARER_TOKEN=...`, `sender_token: ...`,
+        // `"api_key": "..."` (a pasted .env line, an agent's own sender token).
+        // The name must end in a secret word, so `token_count=...` is not one;
+        // the value needs 16+ characters, so prose like "token: required"
+        // survives; and `[` is excluded so an earlier `[REDACTED]` is final.
+        // Kept last: specific patterns above redact first.
+        Regex::new(
+            r#"(?i)\b[a-z0-9_\-]*(?:secret|token|password|passwd|api[_\-]?key|private[_\-]?key|access[_\-]?key)["']?\s*[:=]\s*["']?[^\s"',;\[\]]{16,}"#,
+        )
+        .unwrap_or_else(|_| unreachable!()),
     ]
 });
 
@@ -192,12 +202,121 @@ impl DerivedExportArtifacts {
 ///
 /// Operates in-place on the provided snapshot file.
 ///
+/// Null every agent's registration token in a snapshot.
+///
+/// Share exports run this whatever the scrub preset: the tokens are sender
+/// credentials and a published bundle is public, while the `archive` preset
+/// otherwise keeps them so a private `archive save` restores losslessly.
+/// Returns the number of tokens removed.
+///
+/// # Errors
+///
+/// - [`ShareError::Sqlite`] on any SQLite error.
+pub fn clear_registration_tokens(snapshot_path: &Path) -> Result<i64, ShareError> {
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let path_str = snapshot_path.display().to_string();
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot open snapshot {path_str}: {e}"),
+    })?;
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .map_err(|_| ShareError::Sqlite {
+            message: "cannot begin registration-token cleanup".to_string(),
+        })?;
+    let result = clear_registration_tokens_from_conn(&conn).and_then(|cleared| {
+        conn.execute_raw("COMMIT")
+            .map_err(|_| ShareError::Sqlite {
+                message: "cannot commit registration-token cleanup".to_string(),
+            })?;
+        Ok(cleared)
+    });
+    if result.is_err() {
+        let _ = conn.execute_raw("ROLLBACK");
+    }
+    result
+}
+
+/// The caller owns the transaction, including catalog inspection and readback.
+/// Identifier case is not credential absence. Nor does an affected-row count
+/// prove that a trigger or driver actually removed every token.
+fn clear_registration_tokens_from_conn(conn: &Conn) -> Result<i64, ShareError> {
+    if !private_export_table_exists(conn, "agents")? {
+        return Ok(0);
+    }
+    let columns = conn
+        .query_sync("PRAGMA table_info(agents)", &[])
+        .map_err(|_| ShareError::Sqlite {
+            message: "cannot inspect registration-token columns".to_string(),
+        })?;
+    if columns.is_empty() {
+        return Err(ShareError::Validation {
+            message: "cannot establish registration-token column authority".to_string(),
+        });
+    }
+    let mut token_columns = 0;
+    for column in columns {
+        let name = column
+            .get_named::<String>("name")
+            .map_err(|_| ShareError::Validation {
+                message: "invalid registration-token column metadata".to_string(),
+            })?;
+        if name.eq_ignore_ascii_case("registration_token") {
+            token_columns += 1;
+        }
+    }
+    if token_columns == 0 {
+        return Ok(0);
+    }
+    if token_columns != 1 {
+        return Err(ShareError::Validation {
+            message: "ambiguous registration-token column authority".to_string(),
+        });
+    }
+    let cleared = exec_count(
+        conn,
+        "UPDATE agents SET registration_token = NULL WHERE registration_token IS NOT NULL",
+        &[],
+    )
+    .map_err(|_| ShareError::Sqlite {
+        message: "registration-token cleanup failed".to_string(),
+    })?;
+    let remaining = conn
+        .query_sync(
+            "SELECT 1 FROM agents WHERE registration_token IS NOT NULL LIMIT 1",
+            &[],
+        )
+        .map_err(|_| ShareError::Sqlite {
+            message: "cannot verify registration-token cleanup".to_string(),
+        })?;
+    if !remaining.is_empty() {
+        return Err(ShareError::Validation {
+            message: "registration tokens were not cleared; export refused".to_string(),
+        });
+    }
+    Ok(cleared)
+}
+
 /// # Errors
 ///
 /// - [`ShareError::Sqlite`] on any SQLite error.
 pub fn scrub_snapshot(
     snapshot_path: &Path,
     preset: ScrubPreset,
+) -> Result<ScrubSummary, ShareError> {
+    scrub_snapshot_redacting(snapshot_path, preset, &[])
+}
+
+/// [`scrub_snapshot`], also redacting the paths of `scoped_out_projects`
+/// (`(slug, human_key)` pairs). Project scoping deletes the other projects
+/// before the scrub runs, so their paths would otherwise drop off the
+/// redaction list while kept messages can still mention them.
+///
+/// # Errors
+///
+/// - [`ShareError::Sqlite`] on any SQLite error.
+pub fn scrub_snapshot_redacting(
+    snapshot_path: &Path,
+    preset: ScrubPreset,
+    scoped_out_projects: &[(String, String)],
 ) -> Result<ScrubSummary, ShareError> {
     let cfg = preset_config(preset);
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
@@ -248,6 +367,12 @@ pub fn scrub_snapshot(
             }
             removed
         } else if cfg.clear_recipient_state {
+            if table_exists(&conn, "inbox_stats")? {
+                // Per-agent unread and ack-pending counts are that same
+                // read/ack state in aggregate (and project scoping rebuilt
+                // them from the unscrubbed rows), so they go with it.
+                exec_count(&conn, "DELETE FROM inbox_stats", &[])?;
+            }
             exec_count(
                 &conn,
                 "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL",
@@ -287,7 +412,16 @@ pub fn scrub_snapshot(
         }
 
         let project_path_redactions = if cfg.redact_project_paths {
-            redact_project_paths(&conn)?
+            let mut redactions = redact_project_paths(&conn)?;
+            for (slug, human_key) in scoped_out_projects {
+                if let Some(redaction) = project_path_redaction_for(slug, human_key)
+                    && !redactions.iter().any(|r| r.original == redaction.original)
+                {
+                    redactions.push(redaction);
+                }
+            }
+            redactions.sort_by_key(|redaction| std::cmp::Reverse(redaction.original.len()));
+            redactions
         } else {
             Vec::new()
         };
@@ -306,17 +440,55 @@ pub fn scrub_snapshot(
 
         // Iterate messages and scrub in chunks to avoid OOM
         let mut secrets_replaced: i64 = 0;
-        let mut attachments_sanitized: i64 = 0;
-        let mut bodies_redacted: i64 = 0;
-        let mut attachments_cleared: i64 = 0;
-
-        let mut last_id = 0i64;
-        loop {
-            let message_rows = conn
+        // Strict means no attachment metadata, including malformed JSON, SQL
+        // NULL/BLOB values, or a JSON value with the wrong shape. Parsing first
+        // used to classify all of these as an empty array and leave the raw
+        // value in the downloadable database. Clear the column independently
+        // of decoding, inside the same transaction as the other redactions.
+        let attachments_cleared = if cfg.drop_attachments {
+            let count = count_scalar(
+                &conn,
+                "SELECT COUNT(*) AS cnt FROM messages \
+                 WHERE attachments IS NULL OR attachments != '[]'",
+            )?;
+            exec_count(&conn, "UPDATE messages SET attachments = '[]'", &[])?;
+            if !conn
                 .query_sync(
-                    "SELECT id, subject, body_md, attachments FROM messages WHERE id > ? ORDER BY id ASC LIMIT 500",
-                    &[SqlValue::BigInt(last_id)],
+                    "SELECT 1 FROM messages WHERE attachments IS NULL OR attachments != '[]' LIMIT 1",
+                    &[],
                 )
+                .map_err(|error| ShareError::Sqlite {
+                    message: format!("verify strict attachment redaction: {error}"),
+                })?
+                .is_empty()
+            {
+                return Err(ShareError::Validation {
+                    message: "strict attachment redaction did not clear every message".to_string(),
+                });
+            }
+            count
+        } else {
+            0
+        };
+        let mut attachments_sanitized: i64 = attachments_cleared;
+        let mut bodies_redacted: i64 = 0;
+
+        // Legacy imports can contain zero or negative IDs. The first page has
+        // no lower bound, rather than silently skipping their private content.
+        let mut last_id: Option<i64> = None;
+        while scrub_mutates_export_artifacts(&cfg) {
+            let (sql, params) = match last_id {
+                Some(id) => (
+                    "SELECT id, subject, body_md, attachments, typeof(subject) AS subject_type, typeof(body_md) AS body_md_type, typeof(attachments) AS attachments_type FROM messages WHERE id > ? ORDER BY id ASC LIMIT 500",
+                    vec![SqlValue::BigInt(id)],
+                ),
+                None => (
+                    "SELECT id, subject, body_md, attachments, typeof(subject) AS subject_type, typeof(body_md) AS body_md_type, typeof(attachments) AS attachments_type FROM messages ORDER BY id ASC LIMIT 500",
+                    Vec::new(),
+                ),
+            };
+            let message_rows = conn
+                .query_sync(sql, &params)
                 .map_err(|e| ShareError::Sqlite {
                     message: format!("SELECT messages failed: {e}"),
                 })?;
@@ -329,16 +501,40 @@ pub fn scrub_snapshot(
             let messages: Vec<(i64, String, String, String)> = message_rows
                 .iter()
                 .map(|row| {
-                    let id: i64 = row.get_named("id").unwrap_or(0);
-                    let subject: String = row.get_named("subject").unwrap_or_default();
-                    let body_md: String = row.get_named("body_md").unwrap_or_default();
-                    let attachments: String = row.get_named("attachments").unwrap_or_default();
-                    (id, subject, body_md, attachments)
+                    let id = row
+                        .get_named::<i64>("id")
+                        .map_err(|_| ShareError::Validation {
+                            message: "message export requires an integer identity".to_string(),
+                        })?;
+                    let text = |column: &str| {
+                        let storage_type = row
+                            .get_named::<String>(&format!("{column}_type"))
+                            .map_err(|_| ShareError::Validation {
+                                message: format!(
+                                    "cannot inspect message {id} export column {column}"
+                                ),
+                            })?;
+                        if !matches!(storage_type.as_str(), "text" | "null") {
+                            return Err(ShareError::Validation {
+                                message: format!(
+                                    "message {id} has non-text export column {column}"
+                                ),
+                            });
+                        }
+                        row.get_named::<Option<String>>(column)
+                            .map(Option::unwrap_or_default)
+                            .map_err(|_| ShareError::Validation {
+                                message: format!(
+                                    "message {id} has non-text export column {column}"
+                                ),
+                            })
+                    };
+                    Ok((id, text("subject")?, text("body_md")?, text("attachments")?))
                 })
-                .collect();
+                .collect::<Result<_, ShareError>>()?;
 
             for (msg_id, subject_original, body_original, attachments_value) in &messages {
-                last_id = *msg_id;
+                last_id = Some(*msg_id);
                 let mut subject = subject_original.clone();
                 let mut body = body_original.clone();
                 let mut subj_replacements: i64 = 0;
@@ -359,16 +555,15 @@ pub fn scrub_snapshot(
                 secrets_replaced += subj_replacements + body_replacements;
 
                 // Parse attachments JSON
-                let mut attachments_data: Vec<Value> = parse_attachments_json(attachments_value);
+                let mut attachments_data = parse_attachments_json(attachments_value).map_err(|()| {
+                    ShareError::Validation {
+                        // Do not put the raw metadata or parse error in logs:
+                        // either can contain the very secret being scrubbed.
+                        message: format!("message {msg_id} has invalid attachment metadata; sharing export refused"),
+                    }
+                })?;
                 let mut attachments_updated = false;
                 let mut attachment_replacements: i64 = 0;
-
-                // Drop attachments if preset requires it
-                if cfg.drop_attachments && !attachments_data.is_empty() {
-                    attachments_data = Vec::new();
-                    attachments_cleared += 1;
-                    attachments_updated = true;
-                }
 
                 // Scrub secrets in attachment structure
                 if cfg.scrub_secrets && !attachments_data.is_empty() {
@@ -399,12 +594,18 @@ pub fn scrub_snapshot(
                     }
                 }
 
-                // Write back attachment changes
-                if attachments_updated {
-                    let sanitized_json = crate::encode_json(
-                        &attachments_data,
-                        "scrubbed attachments serialization failed",
-                    )?;
+                // Publish the representation actually inspected, even when no
+                // decoded value changed. JSON object parsing discards shadowed
+                // duplicate keys: leaving the original bytes would retain their
+                // uninspected private values. This also normalizes the supported
+                // legacy string-encoded array instead of retaining a second
+                // representation that downstream readers may interpret differently.
+                let sanitized_json = crate::encode_json(
+                    &attachments_data,
+                    "scrubbed attachments serialization failed",
+                )?;
+                if sanitized_json != *attachments_value {
+                    attachments_updated = true;
                     exec_count(
                         &conn,
                         "UPDATE messages SET attachments = ? WHERE id = ?",
@@ -461,18 +662,17 @@ pub fn scrub_snapshot(
                 scrub_secrets_in_text_column(&conn, RedactTextColumn::AgentTaskDescription)?;
             secrets_replaced +=
                 scrub_secrets_in_text_column(&conn, RedactTextColumn::SiblingSuggestionRationale)?;
-            if column_exists(&conn, "agents", "registration_token")? {
-                // Registration tokens are credentials by definition. Sharing
-                // presets must remove them even when their encoding does not
-                // match a generic secret detector; the full-fidelity archive
-                // preset keeps them so disaster recovery remains lossless.
-                secrets_replaced += exec_count(
-                    &conn,
-                    "UPDATE agents SET registration_token = NULL \
-                     WHERE registration_token IS NOT NULL",
-                    &[],
-                )?;
-            }
+            // Sharing presets clear credentials regardless of their spelling or
+            // encoding. Verify within this transaction so a refused cleanup also
+            // rolls back bodies, recipients, paths, and other scrub mutations.
+            // The private Archive preset never enters this secret-scrub branch.
+            secrets_replaced += clear_registration_tokens_from_conn(&conn)?;
+            // The replay cache and recovery envelope retain pre-scrub copies
+            // of bodies, recipients, attachments and credentials. They are not
+            // viewer data. Full bundle rebuilding already omits these fields;
+            // the public scrub API must also remove them when handed a raw
+            // snapshot directly. Remove them in this same transaction.
+            clear_private_runtime_state(&conn, cfg.drop_recipient_metadata)?;
         }
 
         // Generate a stable salt for pseudonymization reproducibility (matches Python).
@@ -510,6 +710,124 @@ pub fn scrub_snapshot(
     }
 }
 
+/// Remove operational payloads when directly scrubbing a raw sharing snapshot.
+/// The caller owns the transaction. Archive scrubbing preserves these values;
+/// this does not change the separate bundle rebuild's known-table projection.
+fn clear_private_runtime_state(
+    conn: &Conn,
+    drop_recipient_metadata: bool,
+) -> Result<(), ShareError> {
+    // Shared receipts are created lazily on reader activity. Even a receipt
+    // whose timestamps are NULL discloses which agent accessed the mailbox,
+    // so sharing presets must remove the rows, not merely clear read/ack times.
+    // Standard retains the shared TO/CC address; strict removes that authority
+    // too. Keep events and receipts before delivery parents for FK safety.
+    for table in [
+        "idempotency_keys",
+        "proof_gate_consumed_nonces",
+        "inbox_delivery_events",
+        // This ledger also identifies recipients and retains observation times
+        // and route/path fingerprints after ordinary receipts are scrubbed.
+        "message_delivery_signal_receipts",
+        "project_mailbox_receipts",
+        "project_mailbox_deliveries",
+    ] {
+        if table == "project_mailbox_deliveries" && !drop_recipient_metadata {
+            continue;
+        }
+        if !private_export_table_exists(conn, table)? {
+            continue;
+        }
+        exec_count(conn, &format!("DELETE FROM \"{table}\""), &[])?;
+        // Do not use affected-row counts as proof: the runtime engine can
+        // report zero for a successful mutation. Read back the actual table.
+        let remaining = conn
+            .query_sync(&format!("SELECT 1 FROM \"{table}\" LIMIT 1"), &[])
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("verify private export table {table}: {error}"),
+            })?;
+        if !remaining.is_empty() {
+            return Err(ShareError::Validation {
+                message: format!("private export table {table} was not cleared"),
+            });
+        }
+    }
+
+    // Recovery metadata is deliberately opaque and may include fields added
+    // by a newer server. Do not attempt to sanitize a partial field allowlist:
+    // the normal message columns already supply the static viewer's content.
+    let columns = conn
+        .query_sync("PRAGMA table_info(messages)", &[])
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("inspect message recovery metadata for export: {error}"),
+        })?;
+    if columns.is_empty() {
+        return Err(ShareError::Validation {
+            message: "cannot inspect message columns for private export cleanup".to_string(),
+        });
+    }
+    let mut has_metadata = false;
+    for column in columns {
+        let name = column
+            .get_named::<String>("name")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("read export message column name: {error}"),
+            })?;
+        has_metadata |= name.eq_ignore_ascii_case("archive_metadata_json");
+    }
+    if has_metadata {
+        exec_count(
+            conn,
+            "UPDATE messages SET archive_metadata_json = NULL \
+             WHERE archive_metadata_json IS NOT NULL",
+            &[],
+        )?;
+        let remaining = conn
+            .query_sync(
+                "SELECT 1 FROM messages WHERE archive_metadata_json IS NOT NULL LIMIT 1",
+                &[],
+            )
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("verify cleared export recovery metadata: {error}"),
+            })?;
+        if !remaining.is_empty() {
+            return Err(ShareError::Validation {
+                message: "message recovery metadata was not cleared for export".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Missing legacy tables are allowed; failed inspection is not proof of absence.
+/// Reject a view masquerading as runtime state instead of silently skipping it.
+fn private_export_table_exists(conn: &Conn, table: &str) -> Result<bool, ShareError> {
+    let rows = conn
+        .query_sync(
+            "SELECT type FROM sqlite_master WHERE name = ? COLLATE NOCASE",
+            &[SqlValue::Text(table.to_string())],
+        )
+        .map_err(|error| ShareError::Sqlite {
+            message: format!("inspect private export table {table}: {error}"),
+        })?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    if rows.len() != 1
+        || rows[0]
+            .get_named::<String>("type")
+            .map_err(|error| ShareError::Sqlite {
+                message: format!("read private export table type for {table}: {error}"),
+            })?
+            != "table"
+    {
+        return Err(ShareError::Validation {
+            message: format!("private export object {table} must be a table"),
+        });
+    }
+    Ok(true)
+}
+
 /// Scan text for secret patterns and replace with `[REDACTED]`.
 ///
 /// Returns `(scrubbed_text, replacement_count)`.
@@ -539,17 +857,17 @@ fn scrub_text(input: &str) -> (String, i64) {
 }
 
 /// Parse attachments field as JSON array, handling string-encoded JSON.
-fn parse_attachments_json(value: &str) -> Vec<Value> {
-    if value.is_empty() {
-        return Vec::new();
+fn parse_attachments_json(value: &str) -> Result<Vec<Value>, ()> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
     }
     match serde_json::from_str::<Value>(value) {
-        Ok(Value::Array(arr)) => arr,
+        Ok(Value::Array(arr)) => Ok(arr),
         Ok(Value::String(inner)) => match serde_json::from_str::<Value>(&inner) {
-            Ok(Value::Array(arr)) => arr,
-            _ => Vec::new(),
+            Ok(Value::Array(arr)) => Ok(arr),
+            _ => Err(()),
         },
-        _ => Vec::new(),
+        _ => Err(()),
     }
 }
 
@@ -1012,11 +1330,944 @@ fn redact_project_paths(conn: &Conn) -> Result<Vec<ProjectPathRedaction>, ShareE
 mod tests {
     use super::*;
 
+    const PRIVATE_ATTACHMENT: &str = "ATTACHMENT_PRIVATE_SENTINEL_7e5d";
+
+    fn message_text(conn: &Conn, column: &str) -> String {
+        conn.query_sync(
+            &format!("SELECT {column} AS value FROM messages WHERE id = 1"),
+            &[],
+        )
+        .unwrap()[0]
+            .get_named("value")
+            .unwrap()
+    }
+
+    fn set_attachment_text(db: &Path, text: &str) {
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET attachments = ?, ack_required = 1 WHERE id = 1",
+            &[SqlValue::Text(text.to_string())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn strict_clears_malformed_and_non_array_attachment_metadata() {
+        let cases = [
+            format!("{{\"private\":\"{PRIVATE_ATTACHMENT}\""),
+            format!("{{\"private\":\"{PRIVATE_ATTACHMENT}\"}}"),
+            serde_json::to_string(PRIVATE_ATTACHMENT).unwrap(),
+            serde_json::to_string(&format!("{{\"private\":\"{PRIVATE_ATTACHMENT}\"}}")).unwrap(),
+            "null".to_string(),
+            "false".to_string(),
+            "42".to_string(),
+            String::new(),
+            format!(
+                "{}\"{PRIVATE_ATTACHMENT}\"{}",
+                "[".repeat(300),
+                "]".repeat(300)
+            ),
+        ];
+        for raw in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, &raw);
+            scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            assert_eq!(message_text(&conn, "attachments"), "[]");
+            assert_eq!(message_text(&conn, "body_md"), "[Message body redacted]");
+        }
+    }
+
+    #[test]
+    fn standard_refuses_undecodable_attachments_and_rolls_back_redactions() {
+        for raw in [
+            format!("[{{\"private\":\"{PRIVATE_ATTACHMENT}\""),
+            format!("{{\"private\":\"{PRIVATE_ATTACHMENT}\"}}"),
+            serde_json::to_string(PRIVATE_ATTACHMENT).unwrap(),
+            "null".to_string(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, &raw);
+            let error = scrub_snapshot(&db, ScrubPreset::Standard).unwrap_err();
+            assert!(error.to_string().contains("invalid attachment metadata"));
+            assert!(!error.to_string().contains(PRIVATE_ATTACHMENT));
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            assert_eq!(message_text(&conn, "attachments"), raw);
+            let rows = conn
+                .query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<i64>("ack_required").unwrap(), 1);
+            let rows = conn
+                .query_sync("SELECT human_key FROM projects WHERE id = 1", &[])
+                .unwrap();
+            assert_eq!(rows[0].get_named::<String>("human_key").unwrap(), "/test");
+        }
+    }
+
+    #[test]
+    fn attachment_sql_types_do_not_bypass_sharing_policy() {
+        for (preset, succeeds) in [
+            (ScrubPreset::Standard, false),
+            (ScrubPreset::Strict, true),
+            (ScrubPreset::Archive, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_sync(
+                "UPDATE messages SET attachments = CAST(? AS BLOB) WHERE id = 1",
+                &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
+            )
+            .unwrap();
+            drop(conn);
+            let result = scrub_snapshot(&db, preset);
+            assert_eq!(result.is_ok(), succeeds, "preset={preset:?}");
+            if let Err(error) = result {
+                assert!(!error.to_string().contains(PRIVATE_ATTACHMENT));
+            }
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let rows = conn.query_sync(
+                "SELECT typeof(attachments) AS storage_type, CAST(attachments AS TEXT) AS value FROM messages WHERE id = 1",
+                &[],
+            ).unwrap();
+            let strict = matches!(preset, ScrubPreset::Strict);
+            assert_eq!(
+                rows[0].get_named::<String>("storage_type").unwrap(),
+                if strict { "text" } else { "blob" }
+            );
+            assert_eq!(
+                rows[0].get_named::<String>("value").unwrap(),
+                if strict { "[]" } else { PRIVATE_ATTACHMENT }
+            );
+        }
+    }
+
+    #[test]
+    fn sharing_scrubs_nonpositive_ids_and_continues_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        for id in [i64::MIN, -1, 0].into_iter().chain(2..=502) {
+            conn.execute_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, attachments) VALUES (?, 1, 1, ?, ?, '[]')",
+                &[
+                    SqlValue::BigInt(id),
+                    SqlValue::Text("Subject sk-abcdef0123456789012345".to_string()),
+                    SqlValue::Text("Body sk-abcdef0123456789012345".to_string()),
+                ],
+            ).unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+        drop(conn);
+        let summary = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+        assert_eq!(summary.secrets_replaced, 1008);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(
+            count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages").unwrap(),
+            505
+        );
+        assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE subject LIKE '%sk-%' OR body_md LIKE '%sk-%'").unwrap(), 0);
+    }
+
+    #[test]
+    fn standard_supports_string_encoded_arrays_and_archive_preserves_invalid_data() {
+        let array = serde_json::json!([{"metadata": {"token": "sk-abcdef0123456789012345"}}]);
+        for raw in [
+            array.to_string(),
+            serde_json::to_string(&array.to_string()).unwrap(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, &raw);
+            scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let metadata: Value =
+                serde_json::from_str(&message_text(&conn, "attachments")).unwrap();
+            assert_eq!(metadata[0]["metadata"]["token"], "[REDACTED]");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        set_attachment_text(&db, PRIVATE_ATTACHMENT);
+        let summary = scrub_snapshot(&db, ScrubPreset::Archive).unwrap();
+        assert_eq!(summary.attachments_cleared, 0);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(message_text(&conn, "attachments"), PRIVATE_ATTACHMENT);
+    }
+
+    fn seed_delivery_signal_scrub_state(db: &Path) {
+        seed_shared_mailbox_scrub_state(db);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_delivery_signal_receipts (\
+             message_id INTEGER NOT NULL REFERENCES messages(id), \
+             agent_id INTEGER NOT NULL REFERENCES agents(id), \
+             delivery_route TEXT NOT NULL, signal_path_digest TEXT NOT NULL, \
+             observed_ts INTEGER NOT NULL, \
+             PRIMARY KEY(message_id, agent_id, delivery_route))",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_delivery_signal_receipts VALUES \
+             (1, 1, 'inbox', 'private-route-one', 1700000000000001), \
+             (1, 1, 'notification', 'private-route-two', 1700000000000002), \
+             (1, 2, 'notification', 'private-route-three', 1700000000000003)",
+        )
+        .unwrap();
+    }
+
+    type DeliverySignalScrubRow = (i64, i64, String, String, i64);
+
+    fn delivery_signal_scrub_rows(conn: &Conn) -> Vec<DeliverySignalScrubRow> {
+        conn.query_sync(
+            "SELECT message_id, agent_id, delivery_route, signal_path_digest, observed_ts \
+             FROM message_delivery_signal_receipts \
+             ORDER BY message_id, agent_id, delivery_route",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get_named("message_id").unwrap(),
+                row.get_named("agent_id").unwrap(),
+                row.get_named("delivery_route").unwrap(),
+                row.get_named("signal_path_digest").unwrap(),
+                row.get_named("observed_ts").unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sharing_scrub_removes_signal_activity_but_archive_preserves_exact_rows() {
+        for preset in [
+            ScrubPreset::Standard,
+            ScrubPreset::Strict,
+            ScrubPreset::Archive,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_delivery_signal_scrub_state(&db);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let original = delivery_signal_scrub_rows(&conn);
+            assert_eq!(original.len(), 3);
+            drop(conn);
+            for _ in 0..2 {
+                scrub_snapshot(&db, preset).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let actual = delivery_signal_scrub_rows(&conn);
+                if preset == ScrubPreset::Archive {
+                    assert_eq!(actual, original, "private archive signal fidelity");
+                } else {
+                    assert!(actual.is_empty(), "signal activity survived {preset:?}");
+                }
+                assert_eq!(
+                    count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages").unwrap(),
+                    1
+                );
+                assert!(
+                    conn.query_sync("PRAGMA foreign_key_check", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signal_cleanup_refusal_rolls_back_the_entire_sharing_scrub() {
+        for preset in [ScrubPreset::Standard, ScrubPreset::Strict] {
+            for failure in ["view", "ignore", "abort"] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                seed_delivery_signal_scrub_state(&db);
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let original = delivery_signal_scrub_rows(&conn);
+                let sql = match failure {
+                    "view" => {
+                        "ALTER TABLE message_delivery_signal_receipts RENAME TO retained_signals; \
+                         CREATE VIEW message_delivery_signal_receipts AS SELECT * FROM retained_signals"
+                    }
+                    "ignore" => {
+                        "CREATE TRIGGER refuse_signal_cleanup BEFORE DELETE ON \
+                         message_delivery_signal_receipts BEGIN SELECT RAISE(IGNORE); END"
+                    }
+                    _ => {
+                        "CREATE TRIGGER refuse_signal_cleanup BEFORE DELETE ON \
+                         message_delivery_signal_receipts BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+                    }
+                };
+                conn.execute_raw(sql).unwrap();
+                drop(conn);
+                let error = scrub_snapshot(&db, preset).unwrap_err();
+                if failure == "view" {
+                    assert!(error.to_string().contains("must be a table"));
+                } else if failure == "ignore" {
+                    assert!(error.to_string().contains("was not cleared"));
+                }
+                assert!(!error.to_string().contains("private-route-"));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                assert_eq!(delivery_signal_scrub_rows(&conn), original);
+                assert_eq!(message_text(&conn, "body_md"), "Hello world");
+                assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+                for (table, expected) in [
+                    ("message_recipients", 1),
+                    ("project_mailbox_deliveries", 1),
+                    ("project_mailbox_receipts", 2),
+                    ("idempotency_keys", 2),
+                    ("proof_gate_consumed_nonces", 1),
+                    ("inbox_delivery_events", 1),
+                ] {
+                    assert_eq!(
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}"))
+                            .unwrap(),
+                        expected,
+                        "rollback: {preset:?}, {failure}, {table}"
+                    );
+                }
+                assert_eq!(
+                    count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1")
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    fn seed_private_runtime_state(db: &Path) {
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE idempotency_keys (project_id INTEGER NOT NULL, tool TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, PRIMARY KEY (project_id, tool, idempotency_key))").unwrap();
+        conn.execute_raw("CREATE TABLE proof_gate_consumed_nonces (issuer_key TEXT NOT NULL, nonce TEXT NOT NULL, retain_until INTEGER NOT NULL, consumed_at INTEGER NOT NULL, PRIMARY KEY (issuer_key, nonce))").unwrap();
+        conn.execute_raw("CREATE TABLE inbox_delivery_events (seq INTEGER PRIMARY KEY, project_id INTEGER, agent_id INTEGER, message_id INTEGER, kind TEXT, delivered_ts INTEGER)").unwrap();
+        conn.execute_raw("ALTER TABLE messages ADD COLUMN archive_metadata_json TEXT")
+            .unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET archive_metadata_json = ?",
+            &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
+        )
+        .unwrap();
+        for project_id in [1, 999] {
+            conn.execute_sync(
+                "INSERT INTO idempotency_keys VALUES (?, 'send_message', 'private-retry-key', 'fingerprint', ?, 1, 999999999)",
+                &[SqlValue::BigInt(project_id), SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
+            ).unwrap();
+        }
+        conn.execute_raw(
+            "INSERT INTO proof_gate_consumed_nonces VALUES ('issuer', 'private-nonce', 99, 1)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO inbox_delivery_events VALUES (1, 1, 1, 1, 'bcc', 1)")
+            .unwrap();
+    }
+
+    #[test]
+    fn registration_token_cleanup_covers_imported_case_and_preserves_private_archives() {
+        for column in ["registration_token", "REGISTRATION_TOKEN", "Registration_Token"] {
+            for preset in [ScrubPreset::Standard, ScrubPreset::Strict, ScrubPreset::Archive] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                conn.execute_raw(&format!(
+                    "ALTER TABLE agents ADD COLUMN {column} TEXT; \
+                     UPDATE agents SET {column} = 'opaque-credential-sentinel' WHERE id = 1"
+                ))
+                .unwrap();
+                drop(conn);
+                scrub_snapshot(&db, preset).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT registration_token AS token FROM agents WHERE id = 1", &[])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get_named::<Option<String>>("token").unwrap().as_deref(),
+                    if preset == ScrubPreset::Archive {
+                        Some("opaque-credential-sentinel")
+                    } else {
+                        None
+                    },
+                    "column={column}, preset={preset:?}"
+                );
+                drop(conn);
+                // Published Archive exports still call this independent cleanup.
+                // Verify final state, not the driver's affected-row accounting.
+                for _ in 0..2 {
+                    clear_registration_tokens(&db).unwrap();
+                    let conn = Conn::open_file(db.display().to_string()).unwrap();
+                    assert!(conn
+                        .query_sync("SELECT 1 FROM agents WHERE registration_token IS NOT NULL", &[])
+                        .unwrap()
+                        .is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registration_token_cleanup_refusal_restores_all_credential_and_scrub_state() {
+        for preset in [None, Some(ScrubPreset::Standard), Some(ScrubPreset::Strict)] {
+            for refusal in ["ignore", "abort", "restore"] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                conn.execute_raw(
+                    "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+                     INSERT INTO agents(id, project_id, name) VALUES (2, 1, 'SecondAgent'); \
+                     UPDATE agents SET registration_token = 'opaque-credential-sentinel'; \
+                     UPDATE messages SET ack_required = 1; \
+                     UPDATE message_recipients SET read_ts = 'read-before', ack_ts = 'ack-before'"
+                )
+                .unwrap();
+                let trigger = match refusal {
+                    "ignore" => "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(IGNORE); END",
+                    "abort" => "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+                    _ => "CREATE TRIGGER refuse_token_cleanup AFTER UPDATE OF registration_token ON agents WHEN NEW.id = 2 AND NEW.registration_token IS NULL BEGIN UPDATE agents SET registration_token = 'opaque-credential-sentinel' WHERE id = 2; END",
+                };
+                conn.execute_raw(trigger).unwrap();
+                drop(conn);
+                let result = if let Some(preset) = preset {
+                    scrub_snapshot(&db, preset).map(|_| ())
+                } else {
+                    clear_registration_tokens(&db).map(|_| ())
+                };
+                let error = result.unwrap_err();
+                assert!(!error.to_string().contains("opaque-credential-sentinel"));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT registration_token AS token FROM agents ORDER BY id", &[])
+                    .unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|row| row.get_named::<String>("token").unwrap()
+                    == "opaque-credential-sentinel"));
+                assert_eq!(message_text(&conn, "body_md"), "Hello world");
+                assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1").unwrap(), 1);
+                assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients WHERE read_ts = 'read-before' AND ack_ts = 'ack-before'").unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn registration_token_cleanup_rejects_a_view_and_allows_proven_legacy_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        assert_eq!(clear_registration_tokens(&db).unwrap(), 0);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
+             UPDATE agents SET registration_token = 'opaque-credential-sentinel'; \
+             ALTER TABLE agents RENAME TO original_agents; \
+             CREATE VIEW agents AS SELECT * FROM original_agents"
+        )
+        .unwrap();
+        drop(conn);
+        let error = clear_registration_tokens(&db).unwrap_err();
+        assert!(error.to_string().contains("must be a table"));
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(
+            conn.query_sync("SELECT registration_token AS token FROM original_agents", &[])
+                .unwrap()[0].get_named::<String>("token").unwrap(),
+            "opaque-credential-sentinel"
+        );
+    }
+
+    #[test]
+    fn later_private_cleanup_failure_restores_already_cleared_registration_tokens() {
+        for preset in [ScrubPreset::Standard, ScrubPreset::Strict] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_shared_mailbox_scrub_state(&db);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "ALTER TABLE agents ADD COLUMN REGISTRATION_TOKEN TEXT; \
+                 UPDATE agents SET REGISTRATION_TOKEN = 'opaque-credential-sentinel'; \
+                 CREATE TRIGGER refuse_receipt_cleanup BEFORE DELETE ON \
+                 project_mailbox_receipts BEGIN SELECT RAISE(IGNORE); END"
+            )
+            .unwrap();
+            drop(conn);
+            let error = scrub_snapshot(&db, preset).unwrap_err();
+            assert!(error.to_string().contains("was not cleared"));
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let tokens = conn
+                .query_sync("SELECT registration_token AS token FROM agents ORDER BY id", &[])
+                .unwrap();
+            assert_eq!(tokens.len(), 2);
+            assert!(tokens.iter().all(|row| row.get_named::<String>("token").unwrap()
+                == "opaque-credential-sentinel"));
+            assert_eq!(message_text(&conn, "body_md"), "Hello world");
+            assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+            assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM project_mailbox_receipts").unwrap(), 2);
+            assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients").unwrap(), 1);
+        }
+    }
+
+    fn seed_shared_mailbox_scrub_state(db: &Path) {
+        seed_private_runtime_state(db);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("PRAGMA foreign_keys = ON").unwrap();
+        for sql in [
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'SharedReader')",
+            "CREATE TABLE project_mailbox_deliveries (message_id INTEGER PRIMARY KEY REFERENCES messages(id), project_id INTEGER NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, delivered_ts INTEGER NOT NULL)",
+            "CREATE TABLE project_mailbox_receipts (message_id INTEGER NOT NULL REFERENCES project_mailbox_deliveries(message_id), agent_id INTEGER NOT NULL REFERENCES agents(id), read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+            "INSERT INTO project_mailbox_deliveries VALUES (1, 1, 'cc', 100)",
+            "INSERT INTO project_mailbox_receipts VALUES (1, 1, 17, 19), (1, 2, NULL, NULL)",
+            "UPDATE message_recipients SET read_ts = 'read-before', ack_ts = 'ack-before'",
+            "UPDATE messages SET ack_required = 1, recipients_json = '{\"to\":[\"TestAgent\"],\"cc\":[\"project:test\"],\"bcc\":[]}' WHERE id = 1",
+        ] {
+            conn.execute_raw(sql).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_mailbox_scrub_preserves_routing_but_not_reader_activity() {
+        for preset in [
+            ScrubPreset::Standard,
+            ScrubPreset::Strict,
+            ScrubPreset::Archive,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_shared_mailbox_scrub_state(&db);
+            let archive = preset == ScrubPreset::Archive;
+            let strict = preset == ScrubPreset::Strict;
+            // Repeat to prove that clearing lazy receipts is idempotent and
+            // cannot re-create them from the preserved delivery or roster.
+            for _ in 0..2 {
+                scrub_snapshot(&db, preset).unwrap();
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                for (table, expected) in [
+                    ("message_recipients", i64::from(!strict)),
+                    ("project_mailbox_deliveries", i64::from(!strict)),
+                    ("project_mailbox_receipts", if archive { 2 } else { 0 }),
+                    ("inbox_delivery_events", i64::from(archive)),
+                ] {
+                    assert_eq!(
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}"))
+                            .unwrap(),
+                        expected,
+                        "preset={preset:?}, table={table}"
+                    );
+                }
+                let routing: Value =
+                    serde_json::from_str(&message_text(&conn, "recipients_json")).unwrap();
+                let expected = if strict {
+                    serde_json::json!({"to": [], "cc": [], "bcc": []})
+                } else {
+                    serde_json::json!({"to": ["TestAgent"], "cc": ["project:test"], "bcc": []})
+                };
+                assert_eq!(routing, expected);
+                if !strict {
+                    let rows = conn.query_sync(
+                        "SELECT kind, delivered_ts FROM project_mailbox_deliveries WHERE message_id = 1", &[],
+                    ).unwrap();
+                    assert_eq!(rows[0].get_named::<String>("kind").unwrap(), "cc");
+                    assert_eq!(rows[0].get_named::<i64>("delivered_ts").unwrap(), 100);
+                    let rows = conn
+                        .query_sync(
+                            "SELECT read_ts, ack_ts FROM message_recipients WHERE message_id = 1",
+                            &[],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        rows[0]
+                            .get_named::<Option<String>>("read_ts")
+                            .unwrap()
+                            .as_deref(),
+                        if archive { Some("read-before") } else { None }
+                    );
+                    assert_eq!(
+                        rows[0]
+                            .get_named::<Option<String>>("ack_ts")
+                            .unwrap()
+                            .as_deref(),
+                        if archive { Some("ack-before") } else { None }
+                    );
+                }
+                if archive {
+                    let rows = conn.query_sync(
+                        "SELECT agent_id, read_ts, ack_ts FROM project_mailbox_receipts ORDER BY agent_id", &[],
+                    ).unwrap();
+                    assert_eq!(rows[0].get_named::<i64>("agent_id").unwrap(), 1);
+                    assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 17);
+                    assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 19);
+                    assert_eq!(rows[1].get_named::<i64>("agent_id").unwrap(), 2);
+                    assert_eq!(rows[1].get_named::<Option<i64>>("read_ts").unwrap(), None);
+                    assert_eq!(rows[1].get_named::<Option<i64>>("ack_ts").unwrap(), None);
+                    assert_eq!(
+                        message_text(&conn, "archive_metadata_json"),
+                        PRIVATE_ATTACHMENT
+                    );
+                }
+                assert!(
+                    conn.query_sync("PRAGMA foreign_key_check", &[])
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_mailbox_cleanup_refusal_rolls_back_all_scrub_mutations() {
+        for (preset, table) in [
+            (ScrubPreset::Standard, "project_mailbox_receipts"),
+            (ScrubPreset::Strict, "project_mailbox_receipts"),
+            (ScrubPreset::Strict, "project_mailbox_deliveries"),
+        ] {
+            for ignored_delete in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = create_fixture_db(dir.path());
+                seed_shared_mailbox_scrub_state(&db);
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                if ignored_delete {
+                    conn.execute_raw(&format!(
+                        "CREATE TRIGGER ignore_shared_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(IGNORE); END",
+                    )).unwrap();
+                } else {
+                    conn.execute_raw(&format!("ALTER TABLE {table} RENAME TO private_original"))
+                        .unwrap();
+                    conn.execute_raw(&format!(
+                        "CREATE VIEW {table} AS SELECT * FROM private_original"
+                    ))
+                    .unwrap();
+                }
+                drop(conn);
+                let error = scrub_snapshot(&db, preset).unwrap_err();
+                assert!(matches!(error, ShareError::Validation { .. }));
+                assert!(error.to_string().contains(if ignored_delete {
+                    "was not cleared"
+                } else {
+                    "must be a table"
+                }));
+                let conn = Conn::open_file(db.display().to_string()).unwrap();
+                for (table, expected) in [
+                    ("message_recipients", 1),
+                    ("project_mailbox_deliveries", 1),
+                    ("project_mailbox_receipts", 2),
+                    ("idempotency_keys", 2),
+                    ("proof_gate_consumed_nonces", 1),
+                    ("inbox_delivery_events", 1),
+                ] {
+                    assert_eq!(
+                        count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}"))
+                            .unwrap(),
+                        expected,
+                        "rollback preset={preset:?}, table={table}"
+                    );
+                }
+                assert_eq!(message_text(&conn, "body_md"), "Hello world");
+                assert_eq!(
+                    message_text(&conn, "archive_metadata_json"),
+                    PRIVATE_ATTACHMENT
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(&message_text(&conn, "recipients_json")).unwrap(),
+                    serde_json::json!({"to": ["TestAgent"], "cc": ["project:test"], "bcc": []})
+                );
+                assert_eq!(
+                    conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                        .unwrap()[0]
+                        .get_named::<i64>("ack_required")
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    conn.query_sync("SELECT human_key FROM projects WHERE id = 1", &[])
+                        .unwrap()[0]
+                        .get_named::<String>("human_key")
+                        .unwrap(),
+                    "/test"
+                );
+                let rows = conn
+                    .query_sync("SELECT read_ts, ack_ts FROM message_recipients", &[])
+                    .unwrap();
+                assert_eq!(
+                    rows[0].get_named::<String>("read_ts").unwrap(),
+                    "read-before"
+                );
+                assert_eq!(rows[0].get_named::<String>("ack_ts").unwrap(), "ack-before");
+                let rows = conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM project_mailbox_receipts WHERE agent_id = 1",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("read_ts").unwrap(), 17);
+                assert_eq!(rows[0].get_named::<i64>("ack_ts").unwrap(), 19);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_scrubbing_clears_private_copies_but_archive_is_lossless() {
+        for preset in [
+            ScrubPreset::Standard,
+            ScrubPreset::Strict,
+            ScrubPreset::Archive,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            seed_private_runtime_state(&db);
+            scrub_snapshot(&db, preset).unwrap();
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let archive = matches!(preset, ScrubPreset::Archive);
+            for (table, original) in [
+                ("idempotency_keys", 2),
+                ("proof_gate_consumed_nonces", 1),
+                ("inbox_delivery_events", 1),
+            ] {
+                assert_eq!(
+                    count_scalar(&conn, &format!("SELECT COUNT(*) AS cnt FROM {table}")).unwrap(),
+                    if archive { original } else { 0 }
+                );
+            }
+            let rows = conn
+                .query_sync(
+                    "SELECT archive_metadata_json FROM messages WHERE id = 1",
+                    &[],
+                )
+                .unwrap();
+            let metadata = rows[0]
+                .get_named::<Option<String>>("archive_metadata_json")
+                .unwrap();
+            assert_eq!(
+                metadata.as_deref(),
+                if archive {
+                    Some(PRIVATE_ATTACHMENT)
+                } else {
+                    None
+                }
+            );
+            if archive {
+                let rows = conn
+                    .query_sync(
+                        "SELECT result_json FROM idempotency_keys ORDER BY project_id",
+                        &[],
+                    )
+                    .unwrap();
+                assert!(rows.iter().all(
+                    |row| row.get_named::<String>("result_json").unwrap() == PRIVATE_ATTACHMENT
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn private_state_inspection_failure_rolls_back_the_entire_scrub() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        set_attachment_text(&db, PRIVATE_ATTACHMENT);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("CREATE TABLE idempotency_keys (result_json TEXT)")
+            .unwrap();
+        conn.execute_sync(
+            "INSERT INTO idempotency_keys VALUES (?)",
+            &[SqlValue::Text(PRIVATE_ATTACHMENT.to_string())],
+        )
+        .unwrap();
+        conn.execute_raw("CREATE VIEW proof_gate_consumed_nonces AS SELECT 1 AS nonce")
+            .unwrap();
+        drop(conn);
+        let error = scrub_snapshot(&db, ScrubPreset::Strict).unwrap_err();
+        assert!(error.to_string().contains("must be a table"));
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        assert_eq!(
+            count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM idempotency_keys").unwrap(),
+            1
+        );
+        assert_eq!(message_text(&conn, "attachments"), PRIVATE_ATTACHMENT);
+        assert_eq!(message_text(&conn, "body_md"), "Hello world");
+        assert_eq!(
+            conn.query_sync("SELECT ack_required FROM messages WHERE id = 1", &[])
+                .unwrap()[0]
+                .get_named::<i64>("ack_required")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn strict_snapshot_pipeline_removes_malformed_attachment_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = create_fixture_db(dir.path());
+        // Large enough to exercise overflow pages, and deliberately not JSON.
+        let private = PRIVATE_ATTACHMENT.repeat(1024);
+        set_attachment_text(&source, &private);
+        let target = dir.path().join("shared.sqlite3");
+        crate::create_snapshot_context(
+            &source,
+            &target,
+            &[],
+            ScrubPreset::Strict,
+            crate::SnapshotPurpose::Publish,
+        )
+        .unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT attachments, body_md FROM messages WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].get_named::<String>("attachments").unwrap(), "[]");
+        assert_eq!(
+            rows[0].get_named::<String>("body_md").unwrap(),
+            "[Message body redacted]"
+        );
+        drop(conn);
+        let bytes = std::fs::read(&target).unwrap();
+        assert!(
+            !bytes
+                .windows(PRIVATE_ATTACHMENT.len())
+                .any(|window| window == PRIVATE_ATTACHMENT.as_bytes())
+        );
+        let source_conn = Conn::open_file(source.display().to_string()).unwrap();
+        assert_eq!(message_text(&source_conn, "attachments"), private);
+    }
+
+    #[test]
+    fn standard_rewrites_shadowed_json_values_in_plain_and_encoded_arrays() {
+        // The last value is public, so the parsed map looks clean even though
+        // the original stored JSON contains private bytes under the same key.
+        let raw = format!(
+            "[{{\"type\":\"file\",\"path\":\"notes.txt\",\"metadata\":{{\"note\":\"{PRIVATE_ATTACHMENT}\",\"note\":\"public\"}}}}]"
+        );
+        for value in [raw.clone(), serde_json::to_string(&raw).unwrap()] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, &value);
+            let summary = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+            assert_eq!(summary.attachments_sanitized, 1);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let text = message_text(&conn, "attachments");
+            assert!(!text.contains(PRIVATE_ATTACHMENT));
+            let parsed: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                parsed,
+                serde_json::json!([{
+                    "type": "file", "path": "notes.txt", "metadata": {"note": "public"}
+                }])
+            );
+            drop(conn);
+            // Normalization is not a perpetual mutation or an inflated count.
+            let again = scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+            assert_eq!(again.attachments_sanitized, 0);
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            assert_eq!(message_text(&conn, "attachments"), text);
+        }
+    }
+
+    #[test]
+    fn standard_canonicalization_preserves_public_metadata_and_archive_bytes() {
+        let raw = "[ { \"type\": \"file\", \"path\": \"notes.txt\", \"metadata\": { \"unicode\": \"\\u03bb\", \"count\": 2, \"nested\": [null, true] } } ]";
+        for preset in [ScrubPreset::Standard, ScrubPreset::Archive] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            set_attachment_text(&db, raw);
+            scrub_snapshot(&db, preset).unwrap();
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let text = message_text(&conn, "attachments");
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap(),
+                serde_json::from_str::<Value>(raw).unwrap()
+            );
+            if matches!(preset, ScrubPreset::Archive) {
+                assert_eq!(text, raw);
+            } else {
+                assert_eq!(
+                    text,
+                    crate::encode_json(&serde_json::from_str::<Value>(raw).unwrap(), "test")
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standard_snapshot_pipeline_does_not_publish_shadowed_private_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = create_fixture_db(dir.path());
+        let raw = format!(
+            "[{{\"metadata\":{{\"note\":\"{}\"}},\"metadata\":{{\"note\":\"public\"}},\"path\":\"notes.txt\"}}]",
+            PRIVATE_ATTACHMENT.repeat(1024)
+        );
+        set_attachment_text(&source, &raw);
+        let target = dir.path().join("shared.sqlite3");
+        crate::create_snapshot_context(
+            &source,
+            &target,
+            &[],
+            ScrubPreset::Standard,
+            crate::SnapshotPurpose::Publish,
+        )
+        .unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(target.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let text = rows[0].get_named::<String>("attachments").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap(),
+            serde_json::json!([{
+                "metadata": {"note": "public"}, "path": "notes.txt"
+            }])
+        );
+        drop(conn);
+        let bytes = std::fs::read(&target).unwrap();
+        assert!(
+            !bytes
+                .windows(PRIVATE_ATTACHMENT.len())
+                .any(|window| window == PRIVATE_ATTACHMENT.as_bytes())
+        );
+        let source_conn = Conn::open_file(source.display().to_string()).unwrap();
+        assert_eq!(message_text(&source_conn, "attachments"), raw);
+    }
+
     #[test]
     fn scrub_text_finds_github_pat() {
         let (result, count) = scrub_text("Token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
         assert_eq!(result, "Token: [REDACTED]");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn scrub_text_finds_secret_assignments() {
+        for (input, expected) in [
+            (
+                "export HTTP_BEARER_TOKEN=Zm9vYmFyYmF6cXV4MTIzNDU2 now",
+                "export [REDACTED] now",
+            ),
+            (
+                "my sender_token: 'Rk9PQkFSQkFaUVVYMTIzNDU2Nzg5MEFCQ0RFRkdISUo'",
+                "my [REDACTED]'",
+            ),
+            (
+                r#"{"api_key": "abcdEFGH12345678ijkl"}"#,
+                r#"{"[REDACTED]"}"#,
+            ),
+        ] {
+            let (result, count) = scrub_text(input);
+            assert_eq!(result, expected, "input: {input}");
+            assert_eq!(count, 1, "input: {input}");
+        }
+        // Not secrets: the name does not end in a secret word, the value is a
+        // short word, or an earlier pattern already redacted it.
+        for input in [
+            "token_count = 12345678901234567890",
+            "the sender token: required",
+            "the KEY=VALUE pattern",
+        ] {
+            assert_eq!(scrub_text(input), (input.to_string(), 0), "input: {input}");
+        }
+        assert_eq!(
+            scrub_text("Token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"),
+            ("Token: [REDACTED]".to_string(), 1)
+        );
     }
 
     #[test]
@@ -1216,6 +2467,23 @@ mod tests {
                 .get_named::<Option<String>>("registration_token")
                 .unwrap();
             assert_eq!(token.as_deref(), expected_token, "preset={preset:?}");
+            drop(conn);
+
+            // A share export publishes the bundle, so the token goes even under
+            // the lossless archive preset.
+            let removed = clear_registration_tokens(&db).unwrap();
+            assert_eq!(removed, i64::from(expected_token.is_some()));
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            let rows = conn
+                .query_sync("SELECT registration_token FROM agents WHERE id = 1", &[])
+                .unwrap();
+            assert_eq!(
+                rows[0]
+                    .get_named::<Option<String>>("registration_token")
+                    .unwrap(),
+                None,
+                "published bundles carry no tokens, preset={preset:?}"
+            );
         }
     }
 
@@ -1381,36 +2649,42 @@ mod tests {
     }
 
     #[test]
-    fn strict_scrub_removes_recipient_derived_inbox_stats() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = create_fixture_db(dir.path());
-        let conn = Conn::open_file(db.display().to_string()).unwrap();
-        conn.execute_raw(
-            "CREATE TABLE inbox_stats (
-                agent_id INTEGER PRIMARY KEY,
-                total_count INTEGER NOT NULL DEFAULT 0,
-                unread_count INTEGER NOT NULL DEFAULT 0,
-                ack_pending_count INTEGER NOT NULL DEFAULT 0,
-                last_message_ts INTEGER
-            )",
-        )
-        .unwrap();
-        conn.execute_raw(
-            "INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
-             VALUES (1, 4, 2, 1, 12345)",
-        )
-        .unwrap();
-
-        scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
-
-        let rows = conn
-            .query_sync("SELECT COUNT(*) AS cnt FROM inbox_stats", &[])
+    fn scrubbed_read_state_takes_its_inbox_stats_aggregates_with_it() {
+        // Standard clears read/ack state and strict drops recipients; both must
+        // drop the per-agent unread/ack-pending counts derived from them. The
+        // lossless archive preset keeps them.
+        for (preset, expected_rows) in [
+            (ScrubPreset::Standard, 0),
+            (ScrubPreset::Strict, 0),
+            (ScrubPreset::Archive, 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "CREATE TABLE inbox_stats (
+                    agent_id INTEGER PRIMARY KEY,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                    last_message_ts INTEGER
+                )",
+            )
             .unwrap();
-        let remaining: i64 = rows[0].get_named("cnt").unwrap_or(0);
-        assert_eq!(
-            remaining, 0,
-            "strict export must not leak recipient-derived inbox aggregates"
-        );
+            conn.execute_raw(
+                "INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+                 VALUES (1, 4, 2, 1, 12345)",
+            )
+            .unwrap();
+
+            scrub_snapshot(&db, preset).unwrap();
+
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS cnt FROM inbox_stats", &[])
+                .unwrap();
+            let remaining: i64 = rows[0].get_named("cnt").unwrap_or(0);
+            assert_eq!(remaining, expected_rows, "preset={preset:?}");
+        }
     }
 
     #[test]
@@ -1724,6 +2998,41 @@ mod tests {
             "both non-message-field secrets should be counted, got {}",
             summary.secrets_replaced
         );
+    }
+
+    #[test]
+    fn scoped_out_project_paths_are_redacted_in_kept_messages() {
+        // `--project test` deleted the other project before the scrub ran;
+        // a kept message that mentions its path must not ship it.
+        let body_after = |scoped_out: &[(String, String)]| {
+            let dir = tempfile::tempdir().unwrap();
+            let db = create_fixture_db(dir.path());
+            let conn = Conn::open_file(db.display().to_string()).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET body_md = 'Compare with /home/alice/clients/acme-merger/plan.md' \
+                 WHERE id = 1",
+            )
+            .unwrap();
+            scrub_snapshot_redacting(&db, ScrubPreset::Standard, scoped_out).unwrap();
+            let rows = conn
+                .query_sync("SELECT body_md FROM messages WHERE id = 1", &[])
+                .unwrap();
+            rows[0].get_named::<String>("body_md").unwrap()
+        };
+
+        let redacted = body_after(&[(
+            "acme-merger".to_string(),
+            "/home/alice/clients/acme-merger".to_string(),
+        )]);
+        assert!(
+            !redacted.contains("/home/alice/clients/acme-merger"),
+            "{redacted}"
+        );
+        assert!(redacted.contains("plan.md"), "{redacted}");
+
+        // Without the scoped-out list the path survives (the old behaviour).
+        let kept = body_after(&[]);
+        assert!(kept.contains("/home/alice/clients/acme-merger"), "{kept}");
     }
 
     #[test]

@@ -8,25 +8,30 @@
 //! - [`ExplorerQuery`] describes what to fetch (direction, sort, group, filters).
 //! - [`fetch_explorer_page`] runs the query and returns [`ExplorerPage`].
 //! - All queries work across projects when `project_id` is `None`.
+//! - Identity resolution, counts, receipts and body hydration share one snapshot.
+//! - Only the final page loads bodies. Candidate metadata is merged in bounded windows.
 
 #[cfg(test)]
 #[path = "mail_explorer_regression_tests.rs"]
 mod regression_tests;
+#[path = "mail_explorer_shared.rs"]
+mod shared;
+#[cfg(test)]
+#[path = "mail_explorer_snapshot_tests.rs"]
+mod snapshot_tests;
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::DbConn;
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::tracking::record_query;
 
-use asupersync::{Cx, Outcome};
+use asupersync::{CancelReason, Cx, Outcome};
 use sqlmodel_core::{Row as SqlRow, Value};
 use sqlmodel_query::raw_query;
-
-// ────────────────────────────────────────────────────────────────────
-// Types
-// ────────────────────────────────────────────────────────────────────
 
 /// Direction filter for the explorer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -96,7 +101,7 @@ pub struct ExplorerEntry {
     pub importance: String,
     pub ack_required: bool,
     pub created_ts: i64,
-    /// For inbound messages: "to", "cc", or "bcc".
+    /// For inbound messages: "to", "cc", "bcc", or "project".
     pub kind: Option<String>,
     /// Whether the recipient has read this message.
     pub read_ts: Option<i64>,
@@ -153,7 +158,9 @@ pub struct ExplorerPage {
     pub stats: ExplorerStats,
 }
 
-/// Aggregate stats for the current query.
+/// Direction and actionable counts cover all matching deliveries, independent
+/// of pagination. Unique-entity counts retain their historical candidate-window
+/// scope; they are not a whole-mailbox census.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExplorerStats {
     pub inbound_count: usize,
@@ -165,37 +172,111 @@ pub struct ExplorerStats {
     pub unique_agents: usize,
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Query execution
-// ────────────────────────────────────────────────────────────────────
+const BODY_LOOKUP_BATCH: usize = 256;
+const READ_SAVEPOINT: &str = "SAVEPOINT am_explorer_read";
+const RELEASE_READ_SAVEPOINT: &str = "RELEASE SAVEPOINT am_explorer_read";
 
-/// Fetch a page of explorer results.
+/// Never return a checkout with an unfinished read scope to the pool, including
+/// when the caller drops the future between queries or a native read unwinds.
+struct ReadCheckout {
+    connection: Option<sqlmodel_pool::PooledConnection<DbConn>>,
+    reusable: bool,
+}
+
+impl Drop for ReadCheckout {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            if self.reusable {
+                drop(connection);
+            } else if let Err(error) = connection.detach().close_without_checkpoint_sync() {
+                tracing::warn!(%error, "mail explorer failed checkout retirement");
+            }
+        }
+    }
+}
+
+fn cancelled<T>(cx: &Cx) -> Outcome<T, DbError> {
+    Outcome::Cancelled(
+        cx.cancel_reason()
+            .unwrap_or_else(|| CancelReason::user("mail explorer read cancelled")),
+    )
+}
+
+/// Fetch a page of explorer results in one read snapshot.
 ///
-/// This is the primary entry point for all inbox/outbox exploration.
+/// Resolving a viewer, counting its mail and hydrating the selected messages
+/// must not observe different generations or different read/ack receipts.
+/// No bodies are returned from candidate queries; only the final global page
+/// hydrates them. Text filtering may still inspect bodies inside the database.
 ///
 /// # Errors
-///
-/// Returns `DbError` on database or pool errors.
+/// Returns `DbError` on database, projection, snapshot or pool errors.
+/// Cancellation is never a partial successful page.
 pub async fn fetch_explorer_page(
     cx: &Cx,
     pool: &DbPool,
     query: &ExplorerQuery,
 ) -> Outcome<ExplorerPage, DbError> {
-    let timer = std::time::Instant::now();
-    // Validate before any database access: overflow must not become a negative
-    // SQLite LIMIT (which means unlimited) or a panic while slicing the page.
     if let Err(error) = candidate_limit(query) {
         return Outcome::Err(error);
     }
-
-    // Resolve agent_id across projects
-    let agent_ids = match resolve_agent_ids(cx, pool, &query.agent_name, query.project_id).await {
-        Outcome::Ok(ids) => ids,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    if cx.checkpoint().is_err() {
+        return cancelled(cx);
+    }
+    let timer = std::time::Instant::now();
+    let connection = match map_pool_outcome(pool.acquire(cx).await) {
+        Outcome::Ok(connection) => connection,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
+    let mut checkout = ReadCheckout {
+        connection: Some(connection),
+        reusable: false,
+    };
+    let conn = &**checkout
+        .connection
+        .as_ref()
+        .expect("live explorer checkout");
+    if cx.checkpoint().is_err() {
+        return cancelled(cx);
+    }
+    if let Err(error) = conn.execute_raw(READ_SAVEPOINT) {
+        return Outcome::Err(DbError::Sqlite(error.to_string()));
+    }
+    let result = fetch_page_in_snapshot(cx, conn, query).await;
+    // Cleanup must not inherit the request's cancelled budget. A failed
+    // release, source error or unwind retires this checkout rather than pooling
+    // a connection that could retain a snapshot of an obsolete mailbox.
+    let released = conn.execute_raw(RELEASE_READ_SAVEPOINT);
+    record_query(
+        "mail_explorer",
+        u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX),
+    );
+    if cx.checkpoint().is_err() {
+        return cancelled(cx);
+    }
+    match (result, released) {
+        (Outcome::Ok(page), Ok(())) => {
+            checkout.reusable = true;
+            Outcome::Ok(page)
+        }
+        (Outcome::Ok(_), Err(error)) => Outcome::Err(DbError::Sqlite(error.to_string())),
+        (other, _) => other,
+    }
+}
 
+async fn fetch_page_in_snapshot(
+    cx: &Cx,
+    conn: &DbConn,
+    query: &ExplorerQuery,
+) -> Outcome<ExplorerPage, DbError> {
+    let agent_ids = match resolve_agent_ids(cx, conn, &query.agent_name, query.project_id).await {
+        Outcome::Ok(ids) => ids,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
     if agent_ids.is_empty() {
         return Outcome::Ok(ExplorerPage {
             entries: Vec::new(),
@@ -204,137 +285,133 @@ pub async fn fetch_explorer_page(
             stats: ExplorerStats::default(),
         });
     }
-
-    // Compute total counts independently of `limit` so pagination metadata is stable.
-    let total_inbound = if query.direction == Direction::Outbound {
-        0
-    } else {
-        match count_inbound(cx, pool, &agent_ids, query).await {
-            Outcome::Ok(v) => v,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+    let shared_mailbox = match shared::schema_available(conn) {
+        Ok(available) => available,
+        Err(error) => return Outcome::Err(error),
     };
-    let total_outbound = if query.direction == Direction::Inbound {
-        0
-    } else {
-        match count_outbound(cx, pool, &agent_ids, query).await {
-            Outcome::Ok(v) => v,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+    let window_limit = match candidate_limit(query).and_then(|limit| {
+        usize::try_from(limit).map_err(|_| DbError::invalid("pagination", "limit exceeds usize"))
+    }) {
+        Ok(limit) => limit,
+        Err(error) => return Outcome::Err(error),
     };
-    let total_count = match total_inbound.checked_add(total_outbound) {
+    let mut candidates = Vec::new();
+    let mut observed = StatsAccumulator::default();
+    let mut totals = DeliveryCounts::default();
+    for &(project, agent) in &agent_ids {
+        for inbound in [true, false] {
+            if (inbound && query.direction == Direction::Outbound)
+                || (!inbound && query.direction == Direction::Inbound)
+            {
+                continue;
+            }
+            let (source, conditions, params) =
+                lane_query(project, agent, query, shared_mailbox, inbound);
+            let counts = match count_lane(cx, conn, &source, &conditions, &params, inbound).await {
+                Outcome::Ok(counts) => counts,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            if let Err(error) = totals.add(counts, inbound) {
+                return Outcome::Err(error);
+            }
+            if window_limit == 0 || counts.total == 0 {
+                continue;
+            }
+            let sql = candidate_sql(&source, &conditions, query, shared_mailbox, inbound);
+            let rows = match map_sql_outcome(raw_query(cx, conn, &sql, &params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
+            if rows.len() > window_limit {
+                return Outcome::Err(DbError::Internal(
+                    "explorer candidate query exceeded its limit".into(),
+                ));
+            }
+            for row in &rows {
+                let entry = match if inbound {
+                    map_inbound_row(row)
+                } else {
+                    map_outbound_row(row)
+                } {
+                    Ok(entry) => entry,
+                    Err(error) => return Outcome::Err(error),
+                };
+                observed.observe(&entry);
+                candidates.push(entry);
+            }
+            // Each lane contributes at most offset + limit rows. Retain just
+            // that many after every merge, not one body-bearing window per
+            // project. The same total order is used by SQL and this merge.
+            sort_entries(&mut candidates, query.sort);
+            candidates.truncate(window_limit);
+            if cx.checkpoint().is_err() {
+                return cancelled(cx);
+            }
+        }
+    }
+    let total_count = match totals.inbound.checked_add(totals.outbound) {
         Some(total) => total,
-        None => {
-            return Outcome::Err(DbError::Serialization(
-                "mail explorer total count exceeds usize".to_string(),
-            ));
-        }
+        None => return Outcome::Err(count_overflow()),
     };
-
-    // Fetch inbound and/or outbound entries
-    let mut all_entries = Vec::new();
-
-    if query.direction != Direction::Outbound {
-        match fetch_inbound(cx, pool, &agent_ids, query).await {
-            Outcome::Ok(entries) => all_entries.extend(entries),
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+    let mut stats = observed.finish();
+    stats.inbound_count = totals.inbound;
+    stats.outbound_count = totals.outbound;
+    stats.unread_count = totals.unread;
+    stats.pending_ack_count = totals.pending_ack;
+    // Move the selected rows; do not clone discarded prefixes or payloads.
+    let mut entries: Vec<_> = candidates
+        .into_iter()
+        .skip(query.offset)
+        .take(query.limit)
+        .collect();
+    match hydrate_page_bodies(cx, conn, &mut entries).await {
+        Outcome::Ok(()) => {}
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     }
-
-    if query.direction != Direction::Inbound {
-        match fetch_outbound(cx, pool, &agent_ids, query).await {
-            Outcome::Ok(entries) => all_entries.extend(entries),
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
-    }
-
-    // Compute stats before filtering/sorting.
-    // Note: `compute_stats` runs over the fetched entries (which are bounded by SQL LIMITs),
-    // but inbound/outbound totals are forced to be correct for pagination metadata.
-    let mut stats = compute_stats(&all_entries);
-    stats.inbound_count = total_inbound;
-    stats.outbound_count = total_outbound;
-
-    // Sort
-    sort_entries(&mut all_entries, query.sort);
-
-    // Apply offset + limit
-    let start = query.offset.min(all_entries.len());
-    let end = start.saturating_add(query.limit).min(all_entries.len());
-    let page_entries: Vec<ExplorerEntry> = all_entries[start..end].to_vec();
-
-    // Group if requested
     let groups = if query.group == GroupMode::None {
         Vec::new()
     } else {
-        build_groups(&page_entries, query.group)
+        build_groups(&entries, query.group)
     };
-
-    record_query(
-        "mail_explorer",
-        u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX),
-    );
-
     Outcome::Ok(ExplorerPage {
-        entries: page_entries,
+        entries,
         groups,
         total_count,
         stats,
     })
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: resolve agent IDs
-// ────────────────────────────────────────────────────────────────────
-
 /// (`project_id`, `agent_id`) pairs for the named agent across projects.
 type AgentIds = Vec<(i64, i64)>;
 
 async fn resolve_agent_ids(
     cx: &Cx,
-    pool: &DbPool,
+    conn: &DbConn,
     agent_name: &str,
     project_id: Option<i64>,
 ) -> Outcome<AgentIds, DbError> {
     let (sql, params) = project_id.map_or_else(
-        || {
-            (
-                "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 COLLATE NOCASE"
-                    .to_string(),
-                vec![Value::Text(agent_name.to_string())],
-            )
-        },
-        |pid| {
-            (
-                "SELECT a.project_id, a.id FROM agents a \
-                 WHERE a.name = ?1 COLLATE NOCASE AND a.project_id = ?2"
-                    .to_string(),
-                vec![Value::Text(agent_name.to_string()), Value::BigInt(pid)],
-            )
-        },
+        || (
+            "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 COLLATE NOCASE".to_string(),
+            vec![Value::Text(agent_name.to_string())],
+        ),
+        |pid| (
+            "SELECT a.project_id, a.id FROM agents a WHERE a.name = ?1 COLLATE NOCASE AND a.project_id = ?2".to_string(),
+            vec![Value::Text(agent_name.to_string()), Value::BigInt(pid)],
+        ),
     );
-
-    let conn = match map_pool_outcome(pool.acquire(cx).await) {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    let rows = match map_sql_outcome(raw_query(cx, conn, &sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
-        Outcome::Ok(r) => r,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
     match rows
         .iter()
         .map(map_agent_row)
@@ -345,274 +422,217 @@ async fn resolve_agent_ids(
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: count helpers (stable pagination metadata)
-// ────────────────────────────────────────────────────────────────────
-
-async fn count_inbound(
-    cx: &Cx,
-    pool: &DbPool,
-    agent_ids: &AgentIds,
+fn lane_query(
+    project: i64,
+    agent: i64,
     query: &ExplorerQuery,
-) -> Outcome<usize, DbError> {
-    if agent_ids.is_empty() {
-        return Outcome::Ok(0);
-    }
-
-    let conn = match map_pool_outcome(pool.acquire(cx).await) {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    shared_mailbox: bool,
+    inbound: bool,
+) -> (String, String, Vec<Value>) {
+    let source = if inbound {
+        shared::inbound_source(shared_mailbox)
+    } else {
+        "messages m"
     };
-
-    let mut total: usize = 0;
-    for &(pid, aid) in agent_ids {
-        let mut conditions = vec![
-            "r.agent_id = ?1".to_string(),
-            "m.project_id = ?2".to_string(),
-        ];
-        let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
-        apply_filters(&mut conditions, &mut params, query, true);
-        let where_clause = conditions.join(" AND ");
-
-        let sql = format!(
-            "SELECT COUNT(DISTINCT m.id) AS cnt \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             WHERE {where_clause}"
-        );
-        let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
-            Outcome::Ok(r) => r,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-        let count = match map_count_rows(&rows) {
-            Ok(count) => count,
-            Err(error) => return Outcome::Err(error),
-        };
-        total = match total.checked_add(count) {
-            Some(total) => total,
-            None => {
-                return Outcome::Err(DbError::Serialization(
-                    "mail explorer total count exceeds usize".to_string(),
-                ));
-            }
-        };
-    }
-
-    Outcome::Ok(total)
+    let mut conditions = vec![
+        if inbound {
+            "r.agent_id = ?1"
+        } else {
+            "m.sender_id = ?1"
+        }
+        .to_string(),
+        "m.project_id = ?2".to_string(),
+    ];
+    let mut params = vec![Value::BigInt(agent), Value::BigInt(project)];
+    apply_filters(&mut conditions, &mut params, query, inbound);
+    (source.to_string(), conditions.join(" AND "), params)
 }
 
-async fn count_outbound(
-    cx: &Cx,
-    pool: &DbPool,
-    agent_ids: &AgentIds,
-    query: &ExplorerQuery,
-) -> Outcome<usize, DbError> {
-    if agent_ids.is_empty() {
-        return Outcome::Ok(0);
-    }
-
-    let conn = match map_pool_outcome(pool.acquire(cx).await) {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let mut total: usize = 0;
-    for &(pid, aid) in agent_ids {
-        let mut conditions = vec![
-            "m.sender_id = ?1".to_string(),
-            "m.project_id = ?2".to_string(),
-        ];
-        let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
-        apply_filters(&mut conditions, &mut params, query, false);
-        let where_clause = conditions.join(" AND ");
-
-        let sql = format!(
-            "SELECT COUNT(DISTINCT m.id) AS cnt \
-             FROM messages m \
-             WHERE {where_clause}"
-        );
-        let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
-            Outcome::Ok(r) => r,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
-        let count = match map_count_rows(&rows) {
-            Ok(count) => count,
-            Err(error) => return Outcome::Err(error),
-        };
-        total = match total.checked_add(count) {
-            Some(total) => total,
-            None => {
-                return Outcome::Err(DbError::Serialization(
-                    "mail explorer total count exceeds usize".to_string(),
-                ));
-            }
-        };
-    }
-
-    Outcome::Ok(total)
+#[derive(Default, Clone, Copy)]
+struct LaneCounts {
+    total: usize,
+    unread: usize,
+    pending_ack: usize,
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: fetch inbound messages
-// ────────────────────────────────────────────────────────────────────
+#[derive(Default)]
+struct DeliveryCounts {
+    inbound: usize,
+    outbound: usize,
+    unread: usize,
+    pending_ack: usize,
+}
 
-async fn fetch_inbound(
-    cx: &Cx,
-    pool: &DbPool,
-    agent_ids: &AgentIds,
-    query: &ExplorerQuery,
-) -> Outcome<Vec<ExplorerEntry>, DbError> {
-    if agent_ids.is_empty() {
-        return Outcome::Ok(Vec::new());
-    }
+fn count_overflow() -> DbError {
+    DbError::Serialization("mail explorer total count exceeds usize".to_string())
+}
 
-    let conn = match map_pool_outcome(pool.acquire(cx).await) {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let mut all_entries = Vec::new();
-
-    for &(pid, aid) in agent_ids {
-        let mut conditions = vec![
-            "r.agent_id = ?1".to_string(),
-            "m.project_id = ?2".to_string(),
-        ];
-        let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
-
-        apply_filters(&mut conditions, &mut params, query, true);
-
-        let where_clause = conditions.join(" AND ");
-
-        let sql = format!(
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-             m.importance, m.ack_required, m.created_ts, \
-             r.kind, r.read_ts, r.ack_ts, \
-             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
-             COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(a_recip.name), ''), '[unknown-agent-' || mr2.agent_id || ']')), '') AS to_agents \
-             FROM message_recipients r \
-             JOIN messages m ON m.id = r.message_id \
-             LEFT JOIN agents s ON s.id = m.sender_id \
-             LEFT JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id AND mr2.kind IN ('to', 'cc') \
-             LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id \
-             WHERE {where_clause} \
-             GROUP BY m.id \
-             ORDER BY {order_by} \
-             LIMIT {limit}",
-            order_by = sql_order_by(query.sort, true),
-            limit = match candidate_limit(query) {
-                Ok(limit) => limit,
-                Err(error) => return Outcome::Err(error),
-            }
-        );
-
-        let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
-            Outcome::Ok(r) => r,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+impl DeliveryCounts {
+    fn add(&mut self, counts: LaneCounts, inbound: bool) -> Result<(), DbError> {
+        let total = if inbound {
+            &mut self.inbound
+        } else {
+            &mut self.outbound
         };
+        *total = total.checked_add(counts.total).ok_or_else(count_overflow)?;
+        self.unread = self
+            .unread
+            .checked_add(counts.unread)
+            .ok_or_else(count_overflow)?;
+        self.pending_ack = self
+            .pending_ack
+            .checked_add(counts.pending_ack)
+            .ok_or_else(count_overflow)?;
+        Ok(())
+    }
+}
 
-        for row in &rows {
-            match map_inbound_row(row) {
-                Ok(entry) => all_entries.push(entry),
+fn count_sql(source: &str, conditions: &str, inbound: bool) -> String {
+    let actionable = if inbound {
+        "COUNT(DISTINCT CASE WHEN r.read_ts IS NULL THEN m.id END) AS unread, \
+         COUNT(DISTINCT CASE WHEN m.ack_required <> 0 AND r.ack_ts IS NULL THEN m.id END) AS pending_ack"
+    } else {
+        "0 AS unread, 0 AS pending_ack"
+    };
+    format!("SELECT COUNT(DISTINCT m.id) AS cnt, {actionable} FROM {source} WHERE {conditions}")
+}
+
+async fn count_lane(
+    cx: &Cx,
+    conn: &DbConn,
+    source: &str,
+    conditions: &str,
+    params: &[Value],
+    inbound: bool,
+) -> Outcome<LaneCounts, DbError> {
+    let sql = count_sql(source, conditions, inbound);
+    let rows = match map_sql_outcome(raw_query(cx, conn, &sql, params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let decoded: Result<LaneCounts, DbError> = (|| {
+        let total = map_count_rows(&rows)?;
+        let row = &rows[0];
+        let decode = |name: &str| {
+            let value = row.get_named::<i64>(name).map_err(explorer_decode_error)?;
+            usize::try_from(value).map_err(|_| count_overflow())
+        };
+        Ok(LaneCounts {
+            total,
+            unread: decode("unread")?,
+            pending_ack: decode("pending_ack")?,
+        })
+    })();
+    match decoded {
+        Ok(counts) => Outcome::Ok(counts),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+fn candidate_sql(
+    source: &str,
+    conditions: &str,
+    query: &ExplorerQuery,
+    shared_mailbox: bool,
+    inbound: bool,
+) -> String {
+    let recipient_join = shared::recipient_join(shared_mailbox);
+    let to_agents = shared::recipient_projection(shared_mailbox, inbound);
+    let receipt_columns = if inbound {
+        "r.kind, r.read_ts, r.ack_ts,"
+    } else {
+        ""
+    };
+    let direct_join = if inbound {
+        "LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id AND mr2.kind IN ('to', 'cc') \
+         LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id"
+    } else {
+        "LEFT JOIN message_recipients mr ON mr.message_id = m.id \
+         LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id"
+    };
+    // Pagination was checked before pool admission. This builder is private
+    // and shares that validated query; no user input is interpolated into SQL.
+    let limit = candidate_limit(query).expect("validated explorer pagination");
+    format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, '' AS body_md, \
+         m.importance, m.ack_required, m.created_ts, {receipt_columns} \
+         COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
+         COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
+         {to_agents} AS to_agents FROM {source} \
+         LEFT JOIN agents s ON s.id = m.sender_id \
+         LEFT JOIN projects p ON p.id = m.project_id \
+         {recipient_join} {direct_join} WHERE {conditions} \
+         GROUP BY m.id ORDER BY {order_by} LIMIT {limit}",
+        order_by = sql_order_by(query.sort, inbound),
+    )
+}
+
+async fn hydrate_page_bodies(
+    cx: &Cx,
+    conn: &DbConn,
+    entries: &mut [ExplorerEntry],
+) -> Outcome<(), DbError> {
+    let ids: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.message_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut bodies = HashMap::new();
+    for chunk in ids.chunks(BODY_LOOKUP_BATCH) {
+        let (sql, params) = crate::sync::inbox::lookup_query(
+            "messages",
+            "id, project_id, created_ts, body_md",
+            chunk,
+        );
+        let rows = match map_sql_outcome(raw_query(cx, conn, &sql, &params).await) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        for row in rows {
+            let decoded: Result<_, DbError> = (|| {
+                Ok((
+                    row.get_named::<i64>("id").map_err(explorer_decode_error)?,
+                    (
+                        row.get_named::<i64>("project_id")
+                            .map_err(explorer_decode_error)?,
+                        row.get_named::<i64>("created_ts")
+                            .map_err(explorer_decode_error)?,
+                        row.get_named::<String>("body_md")
+                            .map_err(explorer_decode_error)?,
+                    ),
+                ))
+            })();
+            let (id, body) = match decoded {
+                Ok(value) => value,
                 Err(error) => return Outcome::Err(error),
+            };
+            if chunk.binary_search(&id).is_err() || bodies.insert(id, body).is_some() {
+                return Outcome::Err(DbError::Internal(
+                    "unrequested or duplicate explorer body".into(),
+                ));
             }
         }
     }
-
-    Outcome::Ok(all_entries)
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Internal: fetch outbound messages
-// ────────────────────────────────────────────────────────────────────
-
-async fn fetch_outbound(
-    cx: &Cx,
-    pool: &DbPool,
-    agent_ids: &AgentIds,
-    query: &ExplorerQuery,
-) -> Outcome<Vec<ExplorerEntry>, DbError> {
-    if agent_ids.is_empty() {
-        return Outcome::Ok(Vec::new());
-    }
-
-    let conn = match map_pool_outcome(pool.acquire(cx).await) {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let mut all_entries = Vec::new();
-
-    for &(pid, aid) in agent_ids {
-        let mut conditions = vec![
-            "m.sender_id = ?1".to_string(),
-            "m.project_id = ?2".to_string(),
-        ];
-        let mut params: Vec<Value> = vec![Value::BigInt(aid), Value::BigInt(pid)];
-
-        apply_filters(&mut conditions, &mut params, query, false);
-
-        let where_clause = conditions.join(" AND ");
-
-        let sql = format!(
-            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-             m.importance, m.ack_required, m.created_ts, \
-             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
-             COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(a_recip.name), ''), '[unknown-agent-' || mr.agent_id || ']')), '') AS to_agents \
-             FROM messages m \
-             LEFT JOIN agents s ON s.id = m.sender_id \
-             LEFT JOIN projects p ON p.id = m.project_id \
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id \
-             LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
-             WHERE {where_clause} \
-             GROUP BY m.id \
-             ORDER BY {order_by} \
-             LIMIT {limit}",
-            order_by = sql_order_by(query.sort, false),
-            limit = match candidate_limit(query) {
-                Ok(limit) => limit,
-                Err(error) => return Outcome::Err(error),
-            }
-        );
-
-        let rows = match map_sql_outcome(raw_query(cx, &*conn, &sql, &params).await) {
-            Outcome::Ok(r) => r,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
+    for entry in entries {
+        let Some((project, created, body)) = bodies.get(&entry.message_id) else {
+            return Outcome::Err(DbError::Internal(
+                "explorer body disappeared inside its snapshot".into(),
+            ));
         };
-
-        for row in &rows {
-            match map_outbound_row(row) {
-                Ok(entry) => all_entries.push(entry),
-                Err(error) => return Outcome::Err(error),
-            }
+        if *project != entry.project_id || *created != entry.created_ts {
+            return Outcome::Err(DbError::Internal(
+                "explorer body identity changed inside its snapshot".into(),
+            ));
         }
+        entry.body_md.clone_from(body);
     }
-
-    Outcome::Ok(all_entries)
+    Outcome::Ok(())
 }
-
-// ────────────────────────────────────────────────────────────────────
-// Internal: filter application
-// ────────────────────────────────────────────────────────────────────
 
 fn apply_filters(
     conditions: &mut Vec<String>,
@@ -621,8 +641,6 @@ fn apply_filters(
     inbound: bool,
 ) {
     let mut idx = params.len() + 1;
-
-    // Importance filter
     if !query.importance_filter.is_empty() {
         let placeholders: Vec<String> = query
             .importance_filter
@@ -636,39 +654,20 @@ fn apply_filters(
             .collect();
         conditions.push(format!("m.importance IN ({})", placeholders.join(",")));
     }
-
-    // Ack filter
     match query.ack_filter {
         AckFilter::All => {}
         AckFilter::PendingAck => {
             conditions.push("m.ack_required = 1".to_string());
-            if inbound {
-                conditions.push("r.ack_ts IS NULL".to_string());
-            } else {
-                // Outbound rows do not carry per-recipient ack state.
-                conditions.push("0".to_string());
-            }
+            conditions.push(if inbound { "r.ack_ts IS NULL" } else { "0" }.to_string());
         }
         AckFilter::Acknowledged => {
             conditions.push("m.ack_required = 1".to_string());
-            if inbound {
-                conditions.push("r.ack_ts IS NOT NULL".to_string());
-            } else {
-                // Outbound rows do not carry per-recipient ack state.
-                conditions.push("0".to_string());
-            }
+            conditions.push(if inbound { "r.ack_ts IS NOT NULL" } else { "0" }.to_string());
         }
         AckFilter::Unread => {
-            if inbound {
-                conditions.push("r.read_ts IS NULL".to_string());
-            } else {
-                // Outbound rows do not carry per-recipient read state.
-                conditions.push("0".to_string());
-            }
+            conditions.push(if inbound { "r.read_ts IS NULL" } else { "0" }.to_string());
         }
     }
-
-    // Text filter (LIKE fallback)
     if !query.text_filter.is_empty() {
         let escaped = query
             .text_filter
@@ -682,13 +681,6 @@ fn apply_filters(
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: row mapping
-// ────────────────────────────────────────────────────────────────────
-
-// Missing or mistyped database fields are not an empty mailbox, a normal
-// priority, or an unread receipt. Preserve real SQL NULLs, but fail the whole
-// projection when its schema/values cannot be decoded.
 fn explorer_decode_error(error: sqlmodel_core::Error) -> DbError {
     DbError::Serialization(format!(
         "invalid mail explorer database projection: {error}"
@@ -762,13 +754,7 @@ fn map_outbound_row(row: &SqlRow) -> Result<ExplorerEntry, DbError> {
     })
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: sorting
-// ────────────────────────────────────────────────────────────────────
-
-/// Each project/direction must select its best offset + limit candidates using
-/// the SAME order as the final merge. Sorting a newest-only subset afterward
-/// loses old, urgent and alphabetically earlier messages permanently.
+/// SQL and the merge use the same total order before applying any candidate limit.
 fn sql_order_by(mode: SortMode, inbound: bool) -> &'static str {
     match mode {
         SortMode::DateDesc => "m.created_ts DESC, m.id DESC",
@@ -776,7 +762,6 @@ fn sql_order_by(mode: SortMode, inbound: bool) -> &'static str {
         SortMode::ImportanceDesc => {
             "CASE m.importance COLLATE BINARY WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, m.created_ts DESC, m.id DESC"
         }
-        // SQLite NOCASE and the merge comparator both fold ASCII only.
         SortMode::AgentAlpha if inbound => {
             "sender_name COLLATE NOCASE ASC, m.created_ts DESC, m.id DESC"
         }
@@ -832,8 +817,6 @@ fn sort_entries(entries: &mut [ExplorerEntry], mode: SortMode) {
                     b.message_id.cmp(&a.message_id)
                 }
             })
-            // Self-addressed mail can appear once in each direction. Give it
-            // stable page membership independently of project iteration order.
             .then_with(|| {
                 let rank = |direction| match direction {
                     Direction::Inbound => 0_u8,
@@ -855,15 +838,9 @@ fn importance_rank(imp: &str) -> u8 {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: grouping
-// ────────────────────────────────────────────────────────────────────
-
 fn build_groups(entries: &[ExplorerEntry], mode: GroupMode) -> Vec<ExplorerGroup> {
-    use std::collections::BTreeMap;
-
-    let mut map: BTreeMap<String, Vec<ExplorerEntry>> = BTreeMap::new();
-
+    let mut map: std::collections::BTreeMap<String, Vec<ExplorerEntry>> =
+        std::collections::BTreeMap::new();
     for entry in entries {
         let key = match mode {
             GroupMode::None => unreachable!(),
@@ -882,7 +859,6 @@ fn build_groups(entries: &[ExplorerEntry], mode: GroupMode) -> Vec<ExplorerGroup
         };
         map.entry(key).or_default().push(entry.clone());
     }
-
     map.into_iter()
         .map(|(key, entries)| {
             let count = entries.len();
@@ -902,82 +878,76 @@ fn build_groups(entries: &[ExplorerEntry], mode: GroupMode) -> Vec<ExplorerGroup
         .collect()
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Internal: stats
-// ────────────────────────────────────────────────────────────────────
+/// Keeps the existing candidate-scoped distinct statistics without keeping
+/// every candidate message. Full-query actionable counts come from SQL.
+#[derive(Default)]
+struct StatsAccumulator {
+    counts: ExplorerStats,
+    projects: HashSet<i64>,
+    threads: HashSet<String>,
+    agents: HashSet<String>,
+}
 
-fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
-    use std::collections::HashSet;
-
-    let mut projects = HashSet::new();
-    let mut threads = HashSet::new();
-    let mut agents = HashSet::new();
-    let mut inbound = 0usize;
-    let mut outbound = 0usize;
-    let mut unread = 0usize;
-    let mut pending_ack = 0usize;
-
-    for e in entries {
-        projects.insert(e.project_id);
-        if let Some(ref tid) = e.thread_id {
-            threads.insert(tid.clone());
+impl StatsAccumulator {
+    fn observe(&mut self, entry: &ExplorerEntry) {
+        self.projects.insert(entry.project_id);
+        if let Some(thread) = &entry.thread_id {
+            self.threads.insert(thread.clone());
         }
-        collect_agent_names(&mut agents, &e.sender_name);
-        collect_agent_names(&mut agents, &e.to_agents);
-
-        if e.direction == Direction::Inbound {
-            inbound += 1;
-            if e.read_ts.is_none() {
-                unread += 1;
+        collect_agent_names(&mut self.agents, &entry.sender_name);
+        collect_agent_names(&mut self.agents, &entry.to_agents);
+        if entry.direction == Direction::Inbound {
+            self.counts.inbound_count += 1;
+            if entry.read_ts.is_none() {
+                self.counts.unread_count += 1;
             }
-            if e.ack_required && e.ack_ts.is_none() {
-                pending_ack += 1;
+            if entry.ack_required && entry.ack_ts.is_none() {
+                self.counts.pending_ack_count += 1;
             }
         } else {
-            outbound += 1;
+            self.counts.outbound_count += 1;
         }
     }
 
-    ExplorerStats {
-        inbound_count: inbound,
-        outbound_count: outbound,
-        unread_count: unread,
-        pending_ack_count: pending_ack,
-        unique_threads: threads.len(),
-        unique_projects: projects.len(),
-        unique_agents: agents.len(),
+    fn finish(mut self) -> ExplorerStats {
+        self.counts.unique_projects = self.projects.len();
+        self.counts.unique_threads = self.threads.len();
+        self.counts.unique_agents = self.agents.len();
+        self.counts
     }
 }
 
-fn collect_agent_names(agents: &mut std::collections::HashSet<String>, names_csv: &str) {
+#[cfg(test)]
+fn compute_stats(entries: &[ExplorerEntry]) -> ExplorerStats {
+    let mut stats = StatsAccumulator::default();
+    for entry in entries {
+        stats.observe(entry);
+    }
+    stats.finish()
+}
+
+fn collect_agent_names(agents: &mut HashSet<String>, names_csv: &str) {
     for raw in names_csv.split(',') {
         let name = raw.trim();
-        if !name.is_empty() {
+        if !name.is_empty() && crate::project_mailbox::parse_project_mailbox_address(name).is_none()
+        {
             agents.insert(name.to_string());
         }
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────
-
 fn map_sql_outcome<T>(out: Outcome<T, sqlmodel_core::Error>) -> Outcome<T, DbError> {
     match out {
-        Outcome::Ok(v) => Outcome::Ok(v),
-        Outcome::Err(e) => Outcome::Err(DbError::Sqlite(e.to_string())),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Ok(value) => Outcome::Ok(value),
+        Outcome::Err(error) => Outcome::Err(DbError::Sqlite(error.to_string())),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
     }
 }
 
 fn map_pool_outcome<T>(out: Outcome<T, sqlmodel_core::Error>) -> Outcome<T, DbError> {
     map_sql_outcome(out)
 }
-
-// ────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -987,17 +957,14 @@ mod tests {
     fn direction_default_is_all() {
         assert_eq!(Direction::default(), Direction::All);
     }
-
     #[test]
     fn sort_mode_default_is_date_desc() {
         assert_eq!(SortMode::default(), SortMode::DateDesc);
     }
-
     #[test]
     fn group_mode_default_is_none() {
         assert_eq!(GroupMode::default(), GroupMode::None);
     }
-
     #[test]
     fn ack_filter_default_is_all() {
         assert_eq!(AckFilter::default(), AckFilter::All);
@@ -1045,9 +1012,9 @@ mod tests {
             test_entry_with_importance(3, 300, "high"),
         ];
         sort_entries(&mut entries, SortMode::ImportanceDesc);
-        assert_eq!(entries[0].message_id, 2); // urgent
-        assert_eq!(entries[1].message_id, 3); // high
-        assert_eq!(entries[2].message_id, 1); // normal
+        assert_eq!(entries[0].message_id, 2);
+        assert_eq!(entries[1].message_id, 3);
+        assert_eq!(entries[2].message_id, 1);
     }
 
     #[test]
@@ -1068,12 +1035,10 @@ mod tests {
         e1.read_ts = None;
         e1.ack_required = true;
         e1.ack_ts = None;
-
         let mut e2 = test_entry(2, 200, Direction::Inbound);
         e2.read_ts = Some(150);
         e2.ack_required = true;
         e2.ack_ts = Some(160);
-
         let stats = compute_stats(&[e1, e2]);
         assert_eq!(stats.unread_count, 1);
         assert_eq!(stats.pending_ack_count, 1);
@@ -1087,7 +1052,6 @@ mod tests {
         e2.project_slug = "project-b".to_string();
         let mut e3 = test_entry(3, 300, Direction::Inbound);
         e3.project_slug = "project-a".to_string();
-
         let groups = build_groups(&[e1, e2, e3], GroupMode::Project);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].key, "project-a");
@@ -1104,10 +1068,8 @@ mod tests {
         e2.thread_id = None;
         let mut e3 = test_entry(3, 300, Direction::Inbound);
         e3.thread_id = Some("thread-1".to_string());
-
         let groups = build_groups(&[e1, e2, e3], GroupMode::Thread);
         assert_eq!(groups.len(), 2);
-        // BTreeMap ordering: "(no thread)" < "thread-1"
         assert_eq!(groups[0].key, "(no thread)");
         assert_eq!(groups[0].count, 1);
         assert_eq!(groups[1].key, "thread-1");
@@ -1122,7 +1084,6 @@ mod tests {
         e2.to_agents = "BlueLake".to_string();
         let mut e3 = test_entry(3, 300, Direction::Inbound);
         e3.sender_name = "RedFox".to_string();
-
         let groups = build_groups(&[e1, e2, e3], GroupMode::Agent);
         assert_eq!(groups.len(), 2);
     }
@@ -1163,7 +1124,7 @@ mod tests {
         apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 2);
         assert!(conditions[1].contains("m.importance IN"));
-        assert_eq!(params.len(), 3); // 1 original + 2 importance
+        assert_eq!(params.len(), 3);
     }
 
     #[test]
@@ -1177,15 +1138,12 @@ mod tests {
         apply_filters(&mut conditions, &mut params, &query, true);
         assert_eq!(conditions.len(), 2);
         assert!(conditions[1].contains("LIKE"));
-        // Check that % was escaped
         if let Value::Text(ref s) = params[1] {
             assert!(s.contains("hello\\%world"));
         } else {
             panic!("expected text param");
         }
     }
-
-    // ── Test helpers ────────────────────────────────────────────
 
     fn test_entry(id: i64, ts: i64, direction: Direction) -> ExplorerEntry {
         ExplorerEntry {
@@ -1214,8 +1172,6 @@ mod tests {
         }
     }
 
-    // ── New tests: sorting ─────────────────────────────────────
-
     #[test]
     fn sort_entries_agent_alpha() {
         let mut entries = vec![
@@ -1236,10 +1192,9 @@ mod tests {
             },
         ];
         sort_entries(&mut entries, SortMode::AgentAlpha);
-        // AlphaWolf < MidLake < ZuluFox (case-insensitive)
-        assert_eq!(entries[0].message_id, 2); // AlphaWolf
-        assert_eq!(entries[1].message_id, 3); // MidLake
-        assert_eq!(entries[2].message_id, 1); // ZuluFox
+        assert_eq!(entries[0].message_id, 2);
+        assert_eq!(entries[1].message_id, 3);
+        assert_eq!(entries[2].message_id, 1);
     }
 
     #[test]
@@ -1257,9 +1212,8 @@ mod tests {
             },
         ];
         sort_entries(&mut entries, SortMode::AgentAlpha);
-        // Same agent name → tiebreak by date descending (newer first)
-        assert_eq!(entries[0].message_id, 2); // ts=300
-        assert_eq!(entries[1].message_id, 1); // ts=100
+        assert_eq!(entries[0].message_id, 2);
+        assert_eq!(entries[1].message_id, 1);
     }
 
     #[test]
@@ -1271,10 +1225,9 @@ mod tests {
         ];
         let mut entries = entries_before;
         sort_entries(&mut entries, SortMode::ImportanceDesc);
-        // All urgent → tiebreak by date descending
-        assert_eq!(entries[0].message_id, 2); // ts=300
-        assert_eq!(entries[1].message_id, 3); // ts=200
-        assert_eq!(entries[2].message_id, 1); // ts=100
+        assert_eq!(entries[0].message_id, 2);
+        assert_eq!(entries[1].message_id, 3);
+        assert_eq!(entries[2].message_id, 1);
     }
 
     #[test]
@@ -1283,8 +1236,6 @@ mod tests {
         sort_entries(&mut entries, SortMode::DateDesc);
         assert!(entries.is_empty());
     }
-
-    // ── New tests: apply_filters ────────────────────────────────
 
     #[test]
     fn apply_filters_ack_pending() {
@@ -1389,11 +1340,9 @@ mod tests {
             ..Default::default()
         };
         apply_filters(&mut conditions, &mut params, &query, true);
-        // Should have: base + importance IN + LIKE
         assert_eq!(conditions.len(), 3);
         assert!(conditions[1].contains("m.importance IN"));
         assert!(conditions[2].contains("LIKE"));
-        // params: base + "urgent" + "%auth%"
         assert_eq!(params.len(), 3);
     }
 
@@ -1406,8 +1355,6 @@ mod tests {
         assert_eq!(conditions.len(), 1);
         assert_eq!(params.len(), 1);
     }
-
-    // ── New tests: compute_stats ────────────────────────────────
 
     #[test]
     fn compute_stats_empty() {
@@ -1427,21 +1374,18 @@ mod tests {
         e1.project_id = 10;
         e1.sender_name = "RedFox".to_string();
         e1.thread_id = Some("t1".to_string());
-
         let mut e2 = test_entry(2, 200, Direction::Outbound);
         e2.project_id = 20;
         e2.sender_name = "BlueLake".to_string();
-        e2.thread_id = Some("t1".to_string()); // same thread
-
+        e2.thread_id = Some("t1".to_string());
         let mut e3 = test_entry(3, 300, Direction::Inbound);
-        e3.project_id = 10; // same project as e1
-        e3.sender_name = "RedFox".to_string(); // same agent as e1
+        e3.project_id = 10;
+        e3.sender_name = "RedFox".to_string();
         e3.thread_id = Some("t2".to_string());
-
         let stats = compute_stats(&[e1, e2, e3]);
-        assert_eq!(stats.unique_projects, 2); // 10, 20
-        assert_eq!(stats.unique_threads, 2); // t1, t2
-        assert_eq!(stats.unique_agents, 3); // RedFox, BlueLake, OtherAgent
+        assert_eq!(stats.unique_projects, 2);
+        assert_eq!(stats.unique_threads, 2);
+        assert_eq!(stats.unique_agents, 3);
     }
 
     #[test]
@@ -1456,20 +1400,15 @@ mod tests {
     #[test]
     fn compute_stats_outbound_not_counted_as_unread() {
         let e = test_entry(1, 100, Direction::Outbound);
-        // Outbound message with read_ts=None should NOT count as unread
         let stats = compute_stats(&[e]);
         assert_eq!(stats.unread_count, 0);
         assert_eq!(stats.outbound_count, 1);
     }
 
-    // ── New tests: build_groups ─────────────────────────────────
-
     #[test]
     fn build_groups_empty() {
-        let groups = build_groups(&[], GroupMode::Project);
-        assert!(groups.is_empty());
+        assert!(build_groups(&[], GroupMode::Project).is_empty());
     }
-
     #[test]
     fn build_groups_label_format() {
         let mut e = test_entry(1, 100, Direction::Inbound);
@@ -1479,7 +1418,6 @@ mod tests {
         assert_eq!(groups[0].label, "Project: my-project");
         assert_eq!(groups[0].key, "my-project");
     }
-
     #[test]
     fn build_groups_thread_label_format() {
         let mut e = test_entry(1, 100, Direction::Inbound);
@@ -1487,7 +1425,6 @@ mod tests {
         let groups = build_groups(&[e], GroupMode::Thread);
         assert_eq!(groups[0].label, "Thread: bd-123");
     }
-
     #[test]
     fn build_groups_agent_label_format() {
         let mut e = test_entry(1, 100, Direction::Inbound);
@@ -1495,8 +1432,6 @@ mod tests {
         let groups = build_groups(&[e], GroupMode::Agent);
         assert_eq!(groups[0].label, "Agent: RedFox");
     }
-
-    // ── New tests: serde roundtrips ─────────────────────────────
 
     #[test]
     fn direction_serde_roundtrip() {
@@ -1506,7 +1441,6 @@ mod tests {
             assert_eq!(parsed, dir);
         }
     }
-
     #[test]
     fn sort_mode_serde_roundtrip() {
         for mode in [
@@ -1520,7 +1454,6 @@ mod tests {
             assert_eq!(parsed, mode);
         }
     }
-
     #[test]
     fn group_mode_serde_roundtrip() {
         for mode in [
@@ -1534,7 +1467,6 @@ mod tests {
             assert_eq!(parsed, mode);
         }
     }
-
     #[test]
     fn ack_filter_serde_roundtrip() {
         for filter in [
@@ -1548,7 +1480,6 @@ mod tests {
             assert_eq!(parsed, filter);
         }
     }
-
     #[test]
     fn explorer_entry_serde_roundtrip() {
         let entry = test_entry(42, 1_000_000, Direction::Inbound);
@@ -1557,7 +1488,6 @@ mod tests {
         assert_eq!(parsed.message_id, 42);
         assert_eq!(parsed.created_ts, 1_000_000);
     }
-
     #[test]
     fn explorer_stats_default() {
         let stats = ExplorerStats::default();
@@ -1569,7 +1499,6 @@ mod tests {
         assert_eq!(stats.unique_projects, 0);
         assert_eq!(stats.unique_agents, 0);
     }
-
     #[test]
     fn explorer_page_serde_roundtrip() {
         let page = ExplorerPage {
@@ -1590,13 +1519,10 @@ mod tests {
         assert_eq!(parsed.groups.len(), 1);
         assert_eq!(parsed.groups[0].count, 1);
     }
-
-    // ── New tests: importance_rank ──────────────────────────────
-
     #[test]
     fn importance_rank_unknown_returns_zero() {
         assert_eq!(importance_rank(""), 0);
         assert_eq!(importance_rank("critical"), 0);
-        assert_eq!(importance_rank("URGENT"), 0); // case-sensitive
+        assert_eq!(importance_rank("URGENT"), 0);
     }
 }
