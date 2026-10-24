@@ -5834,23 +5834,111 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Index just past the `}` matching the `{` at `open`. Braces inside
-    /// string/char literals are not special-cased; the scanned blocks keep
-    /// them balanced.
+    /// comments and string, raw-string and char literals do not count: the
+    /// server's test module holds unbalanced ones (JSON fragments), and a
+    /// module that never closes is not stripped at all.
     fn matching_brace_end(source: &str, open: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
         let mut depth = 0usize;
-        for (offset, ch) in source[open..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
+        let mut at = open;
+        while at < bytes.len() {
+            at = match bytes[at] {
+                b'{' => {
+                    depth += 1;
+                    at + 1
+                }
+                b'}' => {
                     depth = depth.checked_sub(1)?;
                     if depth == 0 {
-                        return Some(open + offset + 1);
+                        return Some(at + 1);
+                    }
+                    at + 1
+                }
+                b'/' if bytes.get(at + 1) == Some(&b'/') => source[at..]
+                    .find('\n')
+                    .map_or(bytes.len(), |line| at + line),
+                b'/' if bytes.get(at + 1) == Some(&b'*') => block_comment_end(bytes, at)?,
+                b'"' => string_end(bytes, at + 1)?,
+                b'r' if opens_raw_literal(bytes, at) => {
+                    raw_string_end(source, at + 1).unwrap_or(at + 1)
+                }
+                b'\'' => char_literal_end(source, at).unwrap_or(at + 1),
+                _ => at + 1,
+            };
+        }
+        None
+    }
+
+    /// `r` at `at` starts a raw string (`r"`, `r#"`, `br"`) or a raw
+    /// identifier, not the tail of an identifier such as `bar`.
+    fn opens_raw_literal(bytes: &[u8], at: usize) -> bool {
+        let ends_identifier = at.checked_sub(1).is_some_and(|prev| {
+            let byte = bytes[prev];
+            (byte.is_ascii_alphanumeric() || byte == b'_') && byte != b'b'
+        });
+        !ends_identifier && matches!(bytes.get(at + 1), Some(b'"' | b'#'))
+    }
+
+    /// Past the `*/` closing the (nesting) block comment opened at `at`.
+    fn block_comment_end(bytes: &[u8], mut at: usize) -> Option<usize> {
+        let mut nesting = 0usize;
+        while at + 1 < bytes.len() {
+            match (bytes[at], bytes[at + 1]) {
+                (b'/', b'*') => {
+                    nesting += 1;
+                    at += 2;
+                }
+                (b'*', b'/') => {
+                    nesting -= 1;
+                    at += 2;
+                    if nesting == 0 {
+                        return Some(at);
                     }
                 }
-                _ => {}
+                _ => at += 1,
             }
         }
         None
+    }
+
+    /// Past the unescaped `"` at or after `at`.
+    fn string_end(bytes: &[u8], mut at: usize) -> Option<usize> {
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b'"' => return Some(at + 1),
+                _ => at += 1,
+            }
+        }
+        None
+    }
+
+    /// Past a raw string whose hashes/quote start at `at` (just after `r`),
+    /// or `None` when `r#` is a raw identifier rather than a string.
+    fn raw_string_end(source: &str, at: usize) -> Option<usize> {
+        let hashes = source[at..].bytes().take_while(|b| *b == b'#').count();
+        let body = at + hashes;
+        if source.as_bytes().get(body) != Some(&b'"') {
+            return None;
+        }
+        let close = format!("\"{}", "#".repeat(hashes));
+        source[body + 1..]
+            .find(&close)
+            .map(|end| body + 1 + end + close.len())
+    }
+
+    /// Past the char literal opening at `at`, or `None` for a lifetime/label.
+    fn char_literal_end(source: &str, at: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        if bytes.get(at + 1) == Some(&b'\\') {
+            // Skip the escaped character itself (it may be a quote), then
+            // the rest of the escape (`\u{7b}`) up to the closing quote.
+            let escaped = at + 2 + source[at + 2..].chars().next()?.len_utf8();
+            return source[escaped..].find('\'').map(|end| escaped + end + 1);
+        }
+        let ch = source[at + 1..].chars().next()?;
+        let close = at + 1 + ch.len_utf8();
+        (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
     }
 
     /// `source` without the item that starts at `header` (through the `}`
@@ -6179,6 +6267,31 @@ mod tests {
         assert_eq!(
             raw_rereads(&names, &sources),
             vec![("FOO_KNOB".to_string(), "a.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_module_stripping_skips_braces_in_literals_and_comments() {
+        let source = r##"fn before() { var("KEEP_BEFORE"); }
+#[cfg(test)]
+mod tests {
+    const OPEN: &str = "{\"jsonrpc\"";
+    const RAW: &str = r#"}"{"#;
+    const BYTE: u8 = b'{';
+    const ESC: char = '\u{7b}';
+    const QUOTE: char = '\'';
+    fn life<'a>(x: &'a str) -> &'a str { x } // }
+    /* { /* } */ */
+    fn read() { var("TEST_ONLY"); }
+}
+fn after() { var("KEEP_AFTER"); }
+"##;
+        let stripped = strip_inline_test_modules(source);
+        assert!(stripped.contains("KEEP_BEFORE"), "{stripped}");
+        assert!(!stripped.contains("TEST_ONLY"), "{stripped}");
+        assert!(
+            stripped.contains("KEEP_AFTER"),
+            "the module must end at its own brace: {stripped}"
         );
     }
 
