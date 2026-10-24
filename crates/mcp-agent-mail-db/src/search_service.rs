@@ -886,7 +886,9 @@ async fn canonicalize_semantic_results(
     }
     #[cfg(feature = "hybrid")]
     if let Some((source, epoch)) = proof.source.as_ref() {
-        let Some(expected_generation) = source.generation_for_epoch(pool, *epoch) else {
+        let SemanticSourceGeneration::Current(expected_generation) =
+            source.generation_for_epoch(pool, *epoch)
+        else {
             return Outcome::Ok(Vec::new());
         };
         let conn = match pool.acquire(cx).await {
@@ -2019,6 +2021,14 @@ struct SemanticSource {
     index: Arc<RwLock<VectorIndex>>,
 }
 
+/// An unavailable source is distinct from a current legacy source that has
+/// not yet persisted a generation token.
+#[cfg(feature = "hybrid")]
+enum SemanticSourceGeneration {
+    Unavailable,
+    Current(Option<String>),
+}
+
 #[cfg(feature = "hybrid")]
 impl SemanticSource {
     fn bind_pool(&self, pool: &DbPool) -> bool {
@@ -2055,19 +2065,22 @@ impl SemanticSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.active_pool_key.as_deref() == Some(pool.engine_identity_key().as_str())
             && semantic_source_file_identity(pool)
-                .ok()
-                .is_some_and(|current| state.file_identity.as_ref() == Some(&current)))
+                .is_ok_and(|current| state.file_identity.as_ref() == Some(&current)))
         .then_some(state.epoch)
     }
 
-    fn generation_for_epoch(&self, pool: &DbPool, epoch: u64) -> Option<Option<String>> {
+    fn generation_for_epoch(&self, pool: &DbPool, epoch: u64) -> SemanticSourceGeneration {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (state.epoch == epoch
-            && state.active_pool_key.as_deref() == Some(pool.engine_identity_key().as_str()))
-        .then(|| state.generation.clone())
+        if state.epoch == epoch
+            && state.active_pool_key.as_deref() == Some(pool.engine_identity_key().as_str())
+        {
+            SemanticSourceGeneration::Current(state.generation.clone())
+        } else {
+            SemanticSourceGeneration::Unavailable
+        }
     }
 
     fn is_foreign_to_pool(&self, pool: &DbPool) -> bool {
@@ -3385,6 +3398,8 @@ impl TwoTierBridge {
             let index = self.index();
             let hits = index.search_fast(&embedding, limit);
             let proof = self.proof_for_scored(&hits);
+            // Keep vectors and their input witnesses in one index observation.
+            drop(index);
             (hits, proof)
         };
         #[allow(clippy::cast_possible_truncation)]

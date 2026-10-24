@@ -4179,10 +4179,11 @@ impl FileLock {
                 break;
             }
 
-            if self.path.exists() && self.cleanup_if_stale()? {
-                // Stale lock quarantined; retry immediately with a fresh lock path.
-                attempts += 1;
-                continue;
+            if self.path.exists() {
+                // Reclaiming an abandoned artifact is preparation for this
+                // attempt, not contention. A zero-timeout caller must still
+                // get its first real open/flock attempt on the fresh path.
+                self.cleanup_if_stale()?;
             }
 
             // Try to create and exclusively lock the file
@@ -9279,12 +9280,13 @@ fn collect_canonical_message_paths_with_id(
     messages_root: &Path,
     message_id: i64,
     matches: &mut Vec<PathBuf>,
-) {
+) -> Result<()> {
     let wanted_ids = HashSet::from([message_id]);
-    let index = collect_canonical_message_id_index(messages_root, &wanted_ids);
+    let index = collect_canonical_message_id_index(messages_root, &wanted_ids)?;
     if let Some(paths) = index.get(&message_id) {
         matches.extend(paths.iter().cloned());
     }
+    Ok(())
 }
 
 /// Stat identity of a canonical message file; see [`CanonicalIdCache`].
@@ -9363,8 +9365,9 @@ fn unix_time_ns(time: SystemTime) -> i128 {
 fn collect_canonical_message_id_index(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
-) -> HashMap<i64, Vec<PathBuf>> {
-    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW).0
+) -> Result<HashMap<i64, Vec<PathBuf>>> {
+    collect_canonical_message_id_index_with_window(messages_root, wanted_ids, RACY_STAMP_WINDOW)
+        .map(|(index, _parsed)| index)
 }
 
 /// The id index for `wanted_ids`, and how many files had to be parsed.
@@ -9372,24 +9375,33 @@ fn collect_canonical_message_id_index_with_window(
     messages_root: &Path,
     wanted_ids: &HashSet<i64>,
     racy_window: Duration,
-) -> (HashMap<i64, Vec<PathBuf>>, usize) {
+) -> Result<(HashMap<i64, Vec<PathBuf>>, usize)> {
     let mut index = HashMap::new();
     let mut parsed = 0_usize;
     if wanted_ids.is_empty() {
-        return (index, parsed);
+        return Ok((index, parsed));
     }
-    if !path_is_nonsymlink_dir(messages_root) {
-        return (index, parsed);
+    if path_existing_prefix_has_symlink(messages_root)? {
+        return Err(StorageError::InvalidPath(format!(
+            "canonical message directory must not include symlinks: {}",
+            messages_root.display()
+        )));
     }
-    // `read_message_file` refuses every file under a symlinked prefix, so no
-    // file can match; cached ids must not be served through one either.
-    if path_existing_prefix_has_symlink(messages_root).unwrap_or(true) {
-        return (index, parsed);
+    match fs::symlink_metadata(messages_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(StorageError::InvalidPath(format!(
+                "canonical message root is not a directory: {}",
+                messages_root.display()
+            )));
+        }
+        // A newly initialized project has no message namespace yet.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((index, parsed));
+        }
+        Err(error) => return Err(error.into()),
     }
-
-    let Ok(year_entries) = fs::read_dir(messages_root) else {
-        return (index, parsed);
-    };
+    let year_entries = fs::read_dir(messages_root)?;
     let cache = {
         let mut caches = CANONICAL_ID_CACHES
             .lock()
@@ -9401,59 +9413,52 @@ fn collect_canonical_message_id_index_with_window(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let racy_window_ns = i128::try_from(racy_window.as_nanos()).unwrap_or(i128::MAX);
     let mut seen = HashSet::with_capacity(cache.files.len());
-    for year_entry in year_entries.flatten() {
+    for year_entry in year_entries {
+        let year_entry = year_entry?;
         let year_path = year_entry.path();
-        let Ok(year_type) = year_entry.file_type() else {
-            continue;
-        };
-        if !year_type.is_dir() || year_type.is_symlink() {
-            continue;
-        }
         let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
+        if !year_entry.file_type()?.is_dir() {
+            return Err(StorageError::InvalidPath(format!(
+                "canonical message year is not a regular directory: {}",
+                year_path.display()
+            )));
+        }
 
-        let Ok(month_entries) = fs::read_dir(&year_path) else {
-            continue;
-        };
-        for month_entry in month_entries.flatten() {
+        for month_entry in fs::read_dir(&year_path)? {
+            let month_entry = month_entry?;
             let month_path = month_entry.path();
-            let Ok(month_type) = month_entry.file_type() else {
-                continue;
-            };
-            if !month_type.is_dir() || month_type.is_symlink() {
-                continue;
-            }
             let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             if month_name.len() != 2 || !month_name.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
+            if !month_entry.file_type()?.is_dir() {
+                return Err(StorageError::InvalidPath(format!(
+                    "canonical message month is not a regular directory: {}",
+                    month_path.display()
+                )));
+            }
 
-            let Ok(file_entries) = fs::read_dir(&month_path) else {
-                continue;
-            };
-            for file_entry in file_entries.flatten() {
+            for file_entry in fs::read_dir(&month_path)? {
+                let file_entry = file_entry?;
                 let file_path = file_entry.path();
-                let Ok(file_type) = file_entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_file()
-                    || file_type.is_symlink()
-                    || file_path.extension().is_none_or(|ext| ext != "md")
-                {
+                if file_path.extension().is_none_or(|ext| ext != "md") {
                     continue;
                 }
-
-                let stamp = file_entry
-                    .metadata()
-                    .ok()
-                    .as_ref()
-                    .and_then(message_file_stamp);
+                let metadata = fs::symlink_metadata(&file_path)?;
+                if !metadata.file_type().is_file() {
+                    return Err(StorageError::InvalidPath(format!(
+                        "canonical message is not a regular file: {}",
+                        file_path.display()
+                    )));
+                }
+                let stamp = message_file_stamp(&metadata);
                 seen.insert(file_path.clone());
                 let cached = stamp.and_then(|stamp| {
                     cache
@@ -9467,11 +9472,26 @@ fn collect_canonical_message_id_index_with_window(
                 } else {
                     parsed += 1;
                     let parsed_at_ns = unix_time_ns(SystemTime::now());
-                    let Ok((frontmatter, _body)) = read_message_file(&file_path) else {
-                        // Never cache a failed read: it may be transient.
-                        cache.files.remove(&file_path);
-                        continue;
+                    let (frontmatter, _body) = match read_message_file_inner(&file_path, true) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            // A failed read is not evidence that the id is free.
+                            cache.files.remove(&file_path);
+                            return Err(error);
+                        }
                     };
+                    let after = fs::symlink_metadata(&file_path)?;
+                    if !after.file_type().is_file() || message_file_stamp(&after) != stamp {
+                        cache.files.remove(&file_path);
+                        return Err(StorageError::LockContention {
+                            message: format!(
+                                "canonical message changed during identity inspection: {}",
+                                file_path.display()
+                            ),
+                        });
+                    }
+                    // Legacy messages without a positive integer id remain
+                    // readable; their destination bytes are checked separately.
                     let id = frontmatter.get("id").and_then(serde_json::Value::as_i64);
                     if let Some(stamp) = stamp {
                         cache.files.insert(
@@ -9498,7 +9518,50 @@ fn collect_canonical_message_id_index_with_window(
         }
     }
     cache.files.retain(|path, _| seen.contains(path));
-    (index, parsed)
+    Ok((index, parsed))
+}
+
+/// A missing immutable copy may be created. Every existing copy must be a
+/// regular, non-symlinked file with exactly the requested bytes, irrespective
+/// of whether its envelope contains a usable message id. Return the checked
+/// handle so a publication retry can sync the existing file before success.
+fn existing_immutable_message_copy(
+    path: &Path,
+    expected: &[u8],
+    for_sync: bool,
+) -> Result<Option<fs::File>> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(StorageError::InvalidPath(format!(
+            "refusing to write through symlinked message path: {}",
+            path.display()
+        )));
+    }
+    // FlushFileBuffers requires write access on Windows. Compare bytes on
+    // that same no-follow handle before accepting an idempotent replay.
+    let opened = if for_sync && cfg!(windows) {
+        mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path)
+    } else {
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(path)
+    };
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let expected_len = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+    let mut content = Vec::with_capacity(expected.len().min(64 * 1024));
+    if file.metadata()?.len() == expected_len {
+        (&file)
+            .take(expected_len.saturating_add(1))
+            .read_to_end(&mut content)?;
+        if content == expected {
+            return Ok(Some(file));
+        }
+    }
+    Err(StorageError::InvalidPath(format!(
+        "immutable message copy already exists at {}; refusing to overwrite it with different content",
+        path.display()
+    )))
 }
 
 fn reject_canonical_message_id_collision_against_matches(
@@ -9509,14 +9572,24 @@ fn reject_canonical_message_id_collision_against_matches(
 ) -> Result<()> {
     for existing_path in matches {
         if existing_path == target_path {
-            let existing_content = fs::read_to_string(existing_path)?;
-            if existing_content == target_content {
-                continue;
-            }
-            return Err(StorageError::InvalidPath(format!(
-                "canonical message id {message_id} already exists at {}; refusing to overwrite it with different content",
-                existing_path.display()
-            )));
+            let _existing =
+                existing_immutable_message_copy(existing_path, target_content.as_bytes(), false)
+                    .map_err(|error| match error {
+                        StorageError::InvalidPath(message) => StorageError::InvalidPath(format!(
+                            "canonical message id {message_id}: {message}"
+                        )),
+                        other => other,
+                    })?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "canonical message disappeared during identity inspection: {}",
+                                existing_path.display()
+                            ),
+                        )
+                    })?;
+            continue;
         }
 
         return Err(StorageError::InvalidPath(format!(
@@ -9541,7 +9614,7 @@ fn reject_canonical_message_id_collision(
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
     let mut matches = Vec::new();
-    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches);
+    collect_canonical_message_paths_with_id(&messages_root, message_id, &mut matches)?;
     reject_canonical_message_id_collision_against_matches(
         message_id,
         &matches,
@@ -9588,10 +9661,7 @@ fn collect_existing_batch_message_ids(
     }
 
     let messages_root = archive_project_root_checked(archive)?.join("messages");
-    Ok(collect_canonical_message_id_index(
-        &messages_root,
-        &wanted_ids,
-    ))
+    collect_canonical_message_id_index(&messages_root, &wanted_ids)
 }
 
 #[cfg(test)]
@@ -9601,6 +9671,8 @@ std::thread_local! {
     static MESSAGE_PUBLICATION_AFTER_DEFER_TEST_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static MESSAGE_PUBLICATION_BEFORE_WRITE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -9769,25 +9841,6 @@ fn message_paths_for_bundle(
     Ok((paths, created, timestamp_str))
 }
 
-fn reject_message_bundle_archive_collision_from_index(
-    existing_ids: &HashMap<i64, Vec<PathBuf>>,
-    archive: &ProjectArchive,
-    message: &serde_json::Value,
-    body_md: &str,
-    sender: &str,
-    recipients: &[String],
-) -> Result<()> {
-    let (paths, _created, _timestamp_str) =
-        message_paths_for_bundle(archive, message, sender, recipients)?;
-    let full_content = render_message_bundle_content(message, body_md)?;
-    reject_canonical_message_id_collision_from_index(
-        existing_ids,
-        message,
-        &paths.canonical,
-        &full_content,
-    )
-}
-
 fn append_message_bundle_files(
     archive: &ProjectArchive,
     entry: MessageBundleBatchEntry<'_>,
@@ -9798,7 +9851,7 @@ fn append_message_bundle_files(
     let mut writes = StagedArchiveWrites::default();
     let mut targets = Vec::new();
     prepared.stage(&mut writes, &mut targets)?;
-    writes.publish()?;
+    writes.publish_immutable_messages()?;
     record_published_paths(archive, &targets, rel_paths)?;
     finish_message_bundle(
         archive,
@@ -9810,7 +9863,7 @@ fn append_message_bundle_files(
 }
 
 /// One message's canonical, outbox and inbox copies, rendered and checked for
-/// a canonical-id collision but not yet written.
+/// canonical-id and destination-content conflicts but not yet written.
 struct PreparedMessageBundle {
     paths: MessageArchivePaths,
     full_content: String,
@@ -9820,20 +9873,35 @@ struct PreparedMessageBundle {
 }
 
 impl PreparedMessageBundle {
+    fn copies(&self) -> impl Iterator<Item = (&Path, &str)> {
+        let inbox_content = self.inbox_content.as_deref().unwrap_or(&self.full_content);
+        [
+            (self.paths.canonical.as_path(), self.full_content.as_str()),
+            (self.paths.outbox.as_path(), self.full_content.as_str()),
+        ]
+        .into_iter()
+        .chain(
+            self.paths
+                .inbox
+                .iter()
+                .map(move |path| (path.as_path(), inbox_content)),
+        )
+    }
+
+    fn check_existing_copies(&self) -> Result<()> {
+        for (path, content) in self.copies() {
+            let _existing = existing_immutable_message_copy(path, content.as_bytes(), false)?;
+        }
+        Ok(())
+    }
+
     /// Stage the canonical, outbox and inbox copies, in that order, into
     /// `writes` (creating parent directories), and record their targets.
     fn stage(&self, writes: &mut StagedArchiveWrites, targets: &mut Vec<PathBuf>) -> Result<()> {
-        let inbox_content = self.inbox_content.as_deref().unwrap_or(&self.full_content);
-        let copies = [
-            (&self.paths.canonical, self.full_content.as_str()),
-            (&self.paths.outbox, self.full_content.as_str()),
-        ]
-        .into_iter()
-        .chain(self.paths.inbox.iter().map(|path| (path, inbox_content)));
-        for (path, content) in copies {
+        for (path, content) in self.copies() {
             ensure_parent_dir(path)?;
-            writes.add(path.clone(), content.as_bytes())?;
-            targets.push(path.clone());
+            writes.add(path.to_path_buf(), content.as_bytes())?;
+            targets.push(path.to_path_buf());
         }
         Ok(())
     }
@@ -9880,12 +9948,14 @@ fn prepare_message_bundle_files(
         reject_canonical_message_id_collision(archive, message, &paths.canonical, &full_content)?;
     }
 
-    Ok(PreparedMessageBundle {
+    let prepared = PreparedMessageBundle {
         paths,
         full_content,
         inbox_content,
         timestamp_str,
-    })
+    };
+    prepared.check_existing_copies()?;
+    Ok(prepared)
 }
 
 /// After a message's files are published: append it to its thread digest and
@@ -10065,15 +10135,26 @@ pub fn write_message_batch_bundle(
         archive,
         || collect_existing_batch_message_ids(archive, entries),
         |existing_message_ids| {
-            for entry in entries {
-                reject_message_bundle_archive_collision_from_index(
-                    &existing_message_ids,
-                    archive,
-                    entry.message,
-                    entry.body_md,
-                    entry.sender,
-                    entry.recipients,
-                )?;
+            // Check every destination before creating even the first staged
+            // file. Legacy id-less entries can also collide with each other.
+            let bundles = entries
+                .iter()
+                .map(|entry| {
+                    prepare_message_bundle_files(archive, *entry, Some(&existing_message_ids))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut destinations = HashMap::new();
+            for bundle in &bundles {
+                for (path, content) in bundle.copies() {
+                    if let Some(previous) = destinations.insert(path, content)
+                        && previous != content
+                    {
+                        return Err(StorageError::InvalidPath(format!(
+                            "message batch contains conflicting content for {}; refusing partial archive write",
+                            path.display()
+                        )));
+                    }
+                }
             }
 
             // Stage the whole batch and sync its files in groups rather than one
@@ -10084,13 +10165,11 @@ pub fn write_message_batch_bundle(
                 let mut writes = StagedArchiveWrites::default();
                 let mut targets = Vec::new();
                 let mut published = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    let bundle =
-                        prepare_message_bundle_files(archive, *entry, Some(&existing_message_ids))?;
+                for bundle in &bundles {
                     bundle.stage(&mut writes, &mut targets)?;
-                    published.push((bundle.paths.canonical, bundle.timestamp_str));
+                    published.push((&bundle.paths.canonical, &bundle.timestamp_str));
                 }
-                writes.publish()?;
+                writes.publish_immutable_messages()?;
                 record_published_paths(archive, &targets, &mut rel_paths)?;
                 entries
                     .iter()
@@ -10099,8 +10178,8 @@ pub fn write_message_batch_bundle(
                         finish_message_bundle(
                             archive,
                             *entry,
-                            &canonical,
-                            &timestamp_str,
+                            canonical,
+                            timestamp_str,
                             &mut rel_paths,
                         )
                     })
@@ -12881,6 +12960,13 @@ pub fn get_timeline_commits(
 ///
 /// Returns `(frontmatter_json, body_markdown)`.
 pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
+    read_message_file_inner(path, false)
+}
+
+fn read_message_file_inner(
+    path: &Path,
+    require_complete_frontmatter: bool,
+) -> Result<(serde_json::Value, String)> {
     if path_existing_prefix_has_symlink(path)? {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -12909,7 +12995,22 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
         )));
     }
 
-    let content = fs::read_to_string(path)?;
+    let bytes =
+        mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(path, 50 * 1024 * 1024)?;
+    let content = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    // Public readers retain legacy body-only behavior. A canonical identity
+    // proof cannot treat a crash-truncated envelope as evidence of no id.
+    if require_complete_frontmatter
+        && content
+            .strip_prefix("---json\n")
+            .is_some_and(|rest| !rest.contains("\n---\n"))
+    {
+        return Err(StorageError::InvalidPath(format!(
+            "unterminated canonical message frontmatter: {}",
+            path.display()
+        )));
+    }
 
     // Parse ---json frontmatter
     if let Some(rest) = content.strip_prefix("---json\n")
@@ -14170,6 +14271,56 @@ impl StagedArchiveWrites {
                 return Err(err.into());
             }
         }
+        Ok(())
+    }
+
+    /// Publish immutable message copies without replacing an existing name.
+    /// The earlier batch preflight catches known conflicts before staging;
+    /// no-clobber persistence also protects a target appearing after that
+    /// check. Identical retries keep the existing inode and sync its bytes.
+    fn publish_immutable_messages(mut self) -> Result<()> {
+        self.sync()?;
+        let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+            return Ok(());
+        };
+        let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        #[cfg(test)]
+        if let Some(hook) =
+            MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK.with(|slot| slot.borrow_mut().take())
+        {
+            hook();
+        }
+        for (tmp_path, path) in &self.staged {
+            if path_existing_prefix_has_symlink(path)? {
+                return Err(StorageError::InvalidPath(format!(
+                    "refusing to write through symlinked message path: {}",
+                    path.display()
+                )));
+            }
+            let staged = tempfile::TempPath::try_from_path(tmp_path.clone())?;
+            match staged.persist_noclobber(path) {
+                Ok(()) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let expected = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                        &error.path,
+                        fs::symlink_metadata(&error.path)?.len(),
+                    )?;
+                    let existing = existing_immutable_message_copy(path, &expected, true)?
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "message copy disappeared during publication: {}",
+                                    path.display()
+                                ),
+                            )
+                        })?;
+                    existing.sync_data()?;
+                }
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        // Drop cleans any temp links left by a platform's no-clobber fallback.
         Ok(())
     }
 }
@@ -16647,11 +16798,11 @@ mod tests {
         let wanted = HashSet::from([1, 2, 3, 9]);
 
         let (first, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 3);
         assert_eq!(names(&first, 2), ["b__2.md"]);
         let (second, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0, "unchanged files must be served from the cache");
         assert_eq!(second, first);
 
@@ -16659,14 +16810,14 @@ mod tests {
         // keep reporting id 2 and miss a collision on id 9.
         write("b__2.md", 9, "b, rewritten under another id");
         let (rewritten, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 1);
         assert!(names(&rewritten, 2).is_empty());
         assert_eq!(names(&rewritten, 9), ["b__2.md"]);
 
         fs::remove_file(month.join("c__3.md")).unwrap();
         let (deleted, parsed) =
-            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO);
+            collect_canonical_message_id_index_with_window(&root, &wanted, Duration::ZERO).unwrap();
         assert_eq!(parsed, 0);
         assert!(names(&deleted, 3).is_empty());
 
@@ -16675,7 +16826,8 @@ mod tests {
             &root,
             &wanted,
             Duration::from_secs(3600),
-        );
+        )
+        .unwrap();
         assert_eq!(parsed, 2);
     }
 
@@ -16726,6 +16878,423 @@ mod tests {
             .expect("canonical file");
         let (_frontmatter, body) = read_message_file(&canonical_path).unwrap();
         assert_eq!(body, "first body");
+    }
+
+    #[test]
+    fn message_publication_preserves_existing_canonical_evidence() {
+        for batch in [false, true] {
+            for existing in [
+                "---json\n{\"id\": 999}\n---\n\nother message",
+                "---json\n{broken json\n---\n\noriginal evidence",
+                "legacy message without frontmatter",
+                "---json\n{\"subject\": \"legacy\"}\n---\n\noriginal evidence",
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "proj").unwrap();
+                let message = serde_json::json!({
+                    "id": 43,
+                    "subject": "Stable path",
+                    "created_ts": "2026-01-15T10:00:00Z",
+                    "project": "proj",
+                });
+                let recipients = vec!["RecipientAgent".to_string()];
+                let (paths, _, _) =
+                    message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients)
+                        .unwrap();
+                fs::create_dir_all(paths.canonical.parent().unwrap()).unwrap();
+                fs::write(&paths.canonical, existing).unwrap();
+
+                let result = if batch {
+                    write_message_batch_bundle(
+                        &archive,
+                        &config,
+                        &[MessageBundleBatchEntry {
+                            message: &message,
+                            body_md: "replacement body",
+                            sender: "SenderAgent",
+                            recipients: &recipients,
+                            extra_paths: &[],
+                        }],
+                        None,
+                    )
+                } else {
+                    write_message_bundle(
+                        &archive,
+                        &config,
+                        &message,
+                        "replacement body",
+                        "SenderAgent",
+                        &recipients,
+                        &[],
+                        None,
+                    )
+                };
+
+                assert!(result.is_err(), "batch={batch} must preserve {existing:?}");
+                assert_eq!(fs::read_to_string(&paths.canonical).unwrap(), existing);
+                assert!(!paths.outbox.exists());
+                assert!(paths.inbox.iter().all(|path| !path.exists()));
+            }
+        }
+    }
+
+    #[test]
+    fn message_batch_preflights_every_mailbox_destination() {
+        for block_inbox in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "proj").unwrap();
+            let first = serde_json::json!({
+                "id": 901,
+                "subject": "First new message",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+            });
+            let second = serde_json::json!({
+                "id": 902,
+                "subject": "Second blocked message",
+                "created_ts": "2026-01-15T10:01:00Z",
+                "project": "proj",
+            });
+            let recipients = vec!["RecipientAgent".to_string()];
+            let (first_paths, _, _) =
+                message_paths_for_bundle(&archive, &first, "SenderAgent", &recipients).unwrap();
+            let (second_paths, _, _) =
+                message_paths_for_bundle(&archive, &second, "SenderAgent", &recipients).unwrap();
+            let blocked = if block_inbox {
+                &second_paths.inbox[0]
+            } else {
+                &second_paths.outbox
+            };
+            fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+            fs::write(blocked, "mailbox evidence must survive").unwrap();
+            let entries = [&first, &second].map(|message| MessageBundleBatchEntry {
+                message,
+                body_md: "new body",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            });
+
+            write_message_batch_bundle(&archive, &config, &entries, None)
+                .expect_err("a conflict in a later mailbox must reject the whole batch");
+
+            assert_eq!(
+                fs::read_to_string(blocked).unwrap(),
+                "mailbox evidence must survive"
+            );
+            assert!(!first_paths.canonical.exists());
+            assert!(!first_paths.outbox.exists());
+            assert!(first_paths.inbox.iter().all(|path| !path.exists()));
+            assert!(!second_paths.canonical.exists());
+            assert!(staged_temp_files(blocked.parent().unwrap()).is_empty());
+        }
+    }
+
+    #[test]
+    fn message_publication_fails_closed_on_unreadable_canonical_identity() {
+        for batch in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "proj").unwrap();
+            let damaged = archive.root.join("messages/2025/12/damaged.md");
+            fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+            let damaged_content = if batch {
+                "---json\n{\"id\": 903, \"subject\": \"truncated evidence\"}"
+            } else {
+                "---json\n{damaged envelope\n---\n\nevidence"
+            };
+            fs::write(&damaged, damaged_content).unwrap();
+            let message = serde_json::json!({
+                "id": 903,
+                "subject": "No incomplete identity proof",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+            });
+            let recipients = vec!["RecipientAgent".to_string()];
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+            let result = if batch {
+                write_message_batch_bundle(
+                    &archive,
+                    &config,
+                    &[MessageBundleBatchEntry {
+                        message: &message,
+                        body_md: "new body",
+                        sender: "SenderAgent",
+                        recipients: &recipients,
+                        extra_paths: &[],
+                    }],
+                    None,
+                )
+            } else {
+                write_message_bundle(
+                    &archive,
+                    &config,
+                    &message,
+                    "new body",
+                    "SenderAgent",
+                    &recipients,
+                    &[],
+                    None,
+                )
+            };
+            assert!(
+                result.is_err(),
+                "batch={batch} must fail an incomplete identity scan"
+            );
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            assert_eq!(fs::read_to_string(&damaged).unwrap(), damaged_content);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn message_publication_rejects_symlinked_canonical_shards() {
+        use std::os::unix::fs::symlink;
+
+        for symlink_month in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let archive = ensure_archive(&config, "proj").unwrap();
+            let outside = TempDir::new().unwrap();
+            fs::write(outside.path().join("evidence.md"), "must survive").unwrap();
+            let shard = if symlink_month {
+                archive.root.join("messages/2025/12")
+            } else {
+                archive.root.join("messages/2025")
+            };
+            fs::create_dir_all(shard.parent().unwrap()).unwrap();
+            symlink(outside.path(), &shard).unwrap();
+            let message = serde_json::json!({
+                "id": 904,
+                "subject": "No skipped canonical shard",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+            });
+            let recipients = vec!["RecipientAgent".to_string()];
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "new body",
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .expect_err("a canonical date shard cannot be silently skipped");
+
+            assert!(!paths.canonical.exists());
+            assert!(!paths.outbox.exists());
+            assert!(paths.inbox.iter().all(|path| !path.exists()));
+            assert_eq!(
+                fs::read_to_string(outside.path().join("evidence.md")).unwrap(),
+                "must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn message_publication_keeps_idempotent_legacy_and_bcc_replays() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let legacy = archive.root.join("messages/2025/12/legacy-body.md");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "legacy body without an envelope").unwrap();
+        let recipients = vec!["VisibleAgent".to_string(), "HiddenAgent".to_string()];
+        for id in [None, Some(0), Some(905)] {
+            let mut message = serde_json::json!({
+                "subject": format!("Replay {id:?}"),
+                "created_ts": "2026-01-15T10:00:00Z",
+                "project": "proj",
+                "to": ["VisibleAgent"],
+                "bcc": ["HiddenAgent"],
+            });
+            if let Some(id) = id {
+                message["id"] = id.into();
+            }
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "same body",
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .unwrap();
+            write_message_batch_bundle(
+                &archive,
+                &config,
+                &[MessageBundleBatchEntry {
+                    message: &message,
+                    body_md: "same body",
+                    sender: "SenderAgent",
+                    recipients: &recipients,
+                    extra_paths: &[],
+                }],
+                None,
+            )
+            .expect("identical messages including legacy IDs are valid retries");
+            let (paths, _, _) =
+                message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+            let full_content = render_message_bundle_content(&message, "same body").unwrap();
+            assert_eq!(fs::read_to_string(&paths.canonical).unwrap(), full_content);
+            assert_eq!(fs::read_to_string(&paths.outbox).unwrap(), full_content);
+            for inbox in &paths.inbox {
+                let (frontmatter, body) = read_message_file(inbox).unwrap();
+                assert_eq!(frontmatter["bcc"], serde_json::json!([]));
+                assert_eq!(body, "same body");
+            }
+        }
+    }
+
+    #[test]
+    fn message_publication_never_clobbers_a_target_appearing_after_preflight() {
+        for batch in [false, true] {
+            for identical in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let config = test_config(tmp.path());
+                let archive = ensure_archive(&config, "proj").unwrap();
+                let message = serde_json::json!({
+                    "id": 906,
+                    "subject": "Target appeared during publication",
+                    "created_ts": "2026-01-15T10:00:00Z",
+                    "project": "proj",
+                });
+                let recipients = vec!["RecipientAgent".to_string()];
+                let (paths, _, _) =
+                    message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients)
+                        .unwrap();
+                let full_content = render_message_bundle_content(&message, "same body").unwrap();
+                let late_content = if identical {
+                    full_content.clone()
+                } else {
+                    "evidence that appeared after preflight".to_string()
+                };
+                let late_path = paths.canonical.clone();
+                let injected_content = late_content.clone();
+                let injected = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&injected);
+                #[cfg(unix)]
+                let late_inode = Arc::new(AtomicU64::new(0));
+                #[cfg(unix)]
+                let injected_inode = Arc::clone(&late_inode);
+                MESSAGE_PUBLICATION_BEFORE_PERSIST_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        assert!(
+                            !late_path.exists(),
+                            "preflight observed a missing destination"
+                        );
+                        assert!(
+                            !staged_temp_files(late_path.parent().unwrap()).is_empty(),
+                            "inject the target after files have been staged and synced"
+                        );
+                        fs::write(&late_path, injected_content).unwrap();
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt as _;
+                            injected_inode
+                                .store(fs::metadata(&late_path).unwrap().ino(), Ordering::Release);
+                        }
+                        observed.store(true, Ordering::Release);
+                    }));
+                });
+
+                let result = if batch {
+                    write_message_batch_bundle(
+                        &archive,
+                        &config,
+                        &[MessageBundleBatchEntry {
+                            message: &message,
+                            body_md: "same body",
+                            sender: "SenderAgent",
+                            recipients: &recipients,
+                            extra_paths: &[],
+                        }],
+                        None,
+                    )
+                } else {
+                    write_message_bundle(
+                        &archive,
+                        &config,
+                        &message,
+                        "same body",
+                        "SenderAgent",
+                        &recipients,
+                        &[],
+                        None,
+                    )
+                };
+                assert!(injected.load(Ordering::Acquire));
+                assert_eq!(fs::read_to_string(&paths.canonical).unwrap(), late_content);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    assert_eq!(
+                        fs::metadata(&paths.canonical).unwrap().ino(),
+                        late_inode.load(Ordering::Acquire),
+                        "publication must retain an existing copy's inode"
+                    );
+                }
+                if identical {
+                    result.expect("a late identical copy is a safe idempotent publication");
+                    assert_eq!(fs::read_to_string(&paths.outbox).unwrap(), full_content);
+                    for inbox in &paths.inbox {
+                        assert_eq!(fs::read_to_string(inbox).unwrap(), full_content);
+                    }
+                } else {
+                    result.expect_err("a late conflicting copy must never be overwritten");
+                    assert!(!paths.outbox.exists());
+                    assert!(paths.inbox.iter().all(|path| !path.exists()));
+                }
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(&paths.inbox)
+                {
+                    assert!(staged_temp_files(path.parent().unwrap()).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn message_batch_rejects_conflicting_legacy_destinations_before_staging() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let message = serde_json::json!({
+            "subject": "Shared legacy path",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "project": "proj",
+        });
+        let recipients = vec!["RecipientAgent".to_string()];
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message, "SenderAgent", &recipients).unwrap();
+        let entries = ["first body", "conflicting body"].map(|body_md| MessageBundleBatchEntry {
+            message: &message,
+            body_md,
+            sender: "SenderAgent",
+            recipients: &recipients,
+            extra_paths: &[],
+        });
+
+        write_message_batch_bundle(&archive, &config, &entries, None)
+            .expect_err("legacy messages sharing a destination must agree before publication");
+
+        assert!(!paths.canonical.exists());
+        assert!(!paths.outbox.exists());
+        assert!(paths.inbox.iter().all(|path| !path.exists()));
+        assert!(!paths.canonical.parent().unwrap().exists());
     }
 
     #[test]
@@ -21767,7 +22336,8 @@ mod tests {
                 &archive.root.join("messages"),
                 42,
                 &mut missing_paths,
-            );
+            )
+            .unwrap();
             assert!(missing_paths.is_empty());
         }
         println!("{COMPLETED}");
@@ -22005,7 +22575,8 @@ mod tests {
             &archive.root.join("messages"),
             8081,
             &mut canonical_paths,
-        );
+        )
+        .unwrap();
         assert_eq!(canonical_paths, vec![paths.canonical]);
     }
 
