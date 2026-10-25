@@ -1575,6 +1575,52 @@ pub enum DirectArchiveWrite {
     Failed(StorageError),
 }
 
+/// How long a direct (request-path) archive write waits for the publication
+/// fence before it is refused.
+///
+/// GH#351 rules out the unbounded `ARCHIVE_PUBLICATION_FENCE.lock()` on a
+/// request thread, because a writer stalled on a slow disk can hold the fence
+/// for minutes. A single try-lock, though, refused the write whenever any
+/// writer held the fence even for a rename. At 60-agent swarm load about 91% of
+/// reservation grants then left the artifact the pre-commit guard reads to
+/// reconcile-on-read, which breaks the GH#178 durable-on-return contract.
+/// Within this budget short holds are waited out; a stalled holder still
+/// refuses the write well inside the 30 s client deadline.
+///
+/// 5 s, not 500 ms: on a loaded host, drain and coalescer holds routinely
+/// outlast 500 ms. In fb25 (paired-concurrent, 60 agents per arm), refusals
+/// per 1,000 grants were 61.7 at 500 ms vs 3.8 at 5 s (P6), and 169.6 vs 34.9
+/// (P2). The cost is longer-held dispatch threads at extreme saturation:
+/// docs/evidence/release_smoke/2026-10-23_fb25-fence-admission-levers_ab.json.
+const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Longest pause between two direct fence admission attempts. It also bounds
+/// how long a cancelled caller can keep waiting.
+const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(10);
+
+/// Admit a direct write to the publication fence. Contention is retried with a
+/// doubling pause until [`DIRECT_FENCE_ADMISSION_BUDGET`] runs out; every
+/// attempt checks `cancelled` first, and any other error returns at once.
+fn admit_direct_publication(
+    path: &Path,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<ArchiveMutationGuard> {
+    let deadline = Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET;
+    let mut pause = Duration::from_micros(200);
+    loop {
+        let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
+            Err(error @ StorageError::LockContention { .. }) => error,
+            admitted_or_failed => return admitted_or_failed,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(contention);
+        }
+        std::thread::sleep(pause.min(remaining));
+        pause = (pause * 2).min(DIRECT_FENCE_ADMISSION_MAX_PAUSE);
+    }
+}
+
 /// Write an archive op synchronously and directly on the caller thread,
 /// honoring disk-critical backpressure.
 ///
@@ -1606,15 +1652,15 @@ fn write_op_sync_direct_with_cancel(
 
     // GH#351: direct request-path publication must never enter the blocking
     // ARCHIVE_PUBLICATION_FENCE.lock() path. Admit through the same native
-    // mutation guard used by recovery: try_lock first, preserve the existing
-    // fence -> epoch -> filesystem ordering, and refuse contention before any
-    // mutation bookkeeping changes. wbq_execute_op's guards are then nested on
-    // this thread and therefore reuse this already-held publication window.
-    let _publication =
-        match ArchiveMutationGuard::try_begin_repair(write_op_storage_root(op), &mut cancelled) {
-            Ok(guard) => guard,
-            Err(error) => return DirectArchiveWrite::Failed(error),
-        };
+    // mutation guard used by recovery, retried within a bounded budget:
+    // preserve the existing fence -> epoch -> filesystem ordering, and refuse
+    // contention before any mutation bookkeeping changes. wbq_execute_op's
+    // guards are then nested on this thread and therefore reuse this
+    // already-held publication window.
+    let _publication = match admit_direct_publication(write_op_storage_root(op), &mut cancelled) {
+        Ok(guard) => guard,
+        Err(error) => return DirectArchiveWrite::Failed(error),
+    };
 
     let started = Instant::now();
     let result = wbq_execute_op(op, "archive-direct");
@@ -24215,6 +24261,156 @@ mod tests {
                 .iter()
                 .all(|row| row.archive_key != key),
             "a host-pressure skip must not feed the per-archive circuit breaker"
+        );
+    }
+
+    /// Hold the publication fence on a helper thread until `release` fires.
+    fn hold_publication_fence() -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            let _ = release_rx.recv();
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        (release_tx, holder)
+    }
+
+    fn direct_clear_signal_op(tmp: &TempDir, slug: &str) -> WriteOp {
+        WriteOp::ClearSignal {
+            config: test_config(tmp.path()),
+            project_slug: slug.to_string(),
+            agent_name: "DirectFenceAgent".to_string(),
+        }
+    }
+
+    /// A direct write waits out a short fence hold and lands (GH#178). A
+    /// single try-lock refuses it instead, which left most reservation
+    /// artifacts to reconcile-on-read under swarm load.
+    #[test]
+    fn write_op_sync_direct_waits_out_a_short_fence_hold() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-short-hold");
+        let (release, holder) = hold_publication_fence();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            release.send(()).expect("release the fence");
+        });
+
+        let started = Instant::now();
+        let result = write_op_sync_direct(&op);
+        let waited = started.elapsed();
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        assert!(
+            waited >= Duration::from_millis(30),
+            "the write must have waited for the held fence: {waited:?}"
+        );
+    }
+
+    /// A fence held for 1.5 s is waited out and the write lands. On a loaded
+    /// host, drain and coalescer holds of that length are routine (fb25), and
+    /// the former 500 ms budget refused them as reservation archive outages.
+    #[test]
+    fn write_op_sync_direct_waits_out_a_multi_second_fence_hold() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-long-hold");
+        let (release, holder) = hold_publication_fence();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_500));
+            release.send(()).expect("release the fence");
+        });
+
+        let started = Instant::now();
+        let result = write_op_sync_direct(&op);
+        let waited = started.elapsed();
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+
+        assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+        assert!(
+            waited >= Duration::from_millis(1_400),
+            "the write must have waited for the held fence: {waited:?}"
+        );
+    }
+
+    /// A stalled holder (GH#351) still refuses the direct write, within the
+    /// admission budget rather than until the holder lets go.
+    #[test]
+    fn write_op_sync_direct_refuses_a_stalled_fence_within_its_budget() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-stalled-hold");
+        let (release, holder) = hold_publication_fence();
+
+        // On a helper thread with a deadline, so a regression to an unbounded
+        // wait fails instead of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = write_op_sync_direct(&op);
+            done_tx
+                .send((result, started.elapsed()))
+                .expect("report the outcome");
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(10));
+        release.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        writer.join().expect("writer thread");
+
+        let (result, waited) = outcome.expect("the direct write must give up on a stalled fence");
+        assert!(
+            matches!(
+                result,
+                DirectArchiveWrite::Failed(StorageError::LockContention { .. })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            waited >= DIRECT_FENCE_ADMISSION_BUDGET,
+            "refused before its budget ran out: {waited:?}"
+        );
+        assert!(
+            waited < DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(2),
+            "waited far past its budget: {waited:?}"
+        );
+    }
+
+    /// Cancellation ends the admission wait at the next attempt.
+    #[test]
+    fn write_op_sync_direct_cancellation_ends_the_fence_wait() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-cancelled-wait");
+        let (release, holder) = hold_publication_fence();
+
+        let mut checks = 0;
+        let started = Instant::now();
+        let result = write_op_sync_direct_with_cancel(&op, || {
+            checks += 1;
+            checks > 2
+        });
+        let waited = started.elapsed();
+        release.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+
+        assert!(
+            matches!(
+                &result,
+                DirectArchiveWrite::Failed(StorageError::Io(error))
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ),
+            "{result:?}"
+        );
+        assert!(
+            waited < DIRECT_FENCE_ADMISSION_BUDGET / 2,
+            "a cancelled caller must not sit out the budget: {waited:?}"
         );
     }
 

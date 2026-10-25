@@ -1,0 +1,126 @@
+{
+ "experiment": "kp48: main 05af6966 + the 5 s direct fence admission budget vs published v0.3.39, paired-concurrent; descriptive (not a gate)",
+ "rule": "scratchpad kp48_rule.txt, written ~04:00Z before the binary built; FROZEN 2026-10-25T06:49:43Z: kp48 am sha256 f6a4a1b9b408178c9e49148fd3f827edbe22e285055e023e3bc97e04cd402860; INC aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805",
+ "tree": "origin/main 05af6966 + gate fix (landed as 078faca2) + the 5 s budget change + experiment-only KP48 fence-hold instrumentation (never landed)",
+ "harness": "paced_swarm.py, 60 agents/arm, 3 projects, 300 s, P6; host load 7-14",
+ "windows": [
+  {
+   "window": 1,
+   "start_order": [
+    "MAIN",
+    "INC"
+   ],
+   "start": "2026-10-25T06:49:43Z",
+   "load_start": "7.41 7.25 5.45",
+   "end": "2026-10-25T06:55:08Z",
+   "exits": "MAIN=0 INC=0",
+   "min_free_kb": 542958784,
+   "valid": true,
+   "load_end": "9.75 9.30 6.93",
+   "arms": {
+    "MAIN": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.135,
+     "reserve_p99_s": 2.177,
+     "send_ok": 3000,
+     "send_p50_s": 0.125,
+     "send_p99_s": 6.816,
+     "non_reservation_errors": 0
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 1.635,
+     "reserve_p99_s": 15.396,
+     "send_ok": 2999,
+     "send_p50_s": 0.14,
+     "send_p99_s": 5.848,
+     "non_reservation_errors": 1
+    }
+   }
+  },
+  {
+   "window": 2,
+   "start_order": [
+    "INC",
+    "MAIN"
+   ],
+   "start": "2026-10-25T06:55:08Z",
+   "load_start": "9.75 9.30 6.93",
+   "end": "2026-10-25T07:00:30Z",
+   "exits": "INC=0 MAIN=0",
+   "min_free_kb": 539147168,
+   "valid": true,
+   "load_end": "14.10 12.97 9.25",
+   "arms": {
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.43,
+     "reserve_p99_s": 12.094,
+     "send_ok": 3000,
+     "send_p50_s": 0.132,
+     "send_p99_s": 2.446,
+     "non_reservation_errors": 0
+    },
+    "MAIN": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.131,
+     "reserve_p99_s": 0.945,
+     "send_ok": 3000,
+     "send_p50_s": 0.122,
+     "send_p99_s": 1.103,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 3,
+   "start_order": [
+    "MAIN",
+    "INC"
+   ],
+   "start": "2026-10-25T07:00:30Z",
+   "load_start": "14.10 12.97 9.25",
+   "end": "2026-10-25T07:05:54Z",
+   "exits": "MAIN=0 INC=0",
+   "min_free_kb": 536846540,
+   "valid": true,
+   "load_end": "14.18 13.51 10.55",
+   "arms": {
+    "MAIN": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.135,
+     "reserve_p99_s": 1.871,
+     "send_ok": 3000,
+     "send_p50_s": 0.127,
+     "send_p99_s": 1.49,
+     "non_reservation_errors": 0
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 1.511,
+     "reserve_p99_s": 13.532,
+     "send_ok": 3000,
+     "send_p50_s": 0.144,
+     "send_p99_s": 5.871,
+     "non_reservation_errors": 1
+    }
+   }
+  }
+ ],
+ "pooled_reservation_errors_per_1000": {
+  "MAIN": 0.0,
+  "INC": 0.0
+ },
+ "pooled_sends_ok": {
+  "MAIN": 9000,
+  "INC": 8999
+ },
+ "fence_holds_main": "30 KP48 windows: total hold 454.5 s; no hold >= 2 s (max 672 ms, reservation_reconcile.rs:565); four lib.rs sites (1693, 9844, 9862, 7796) carry 94% of hold time with max 139-267 ms; canonical-ID walk (outside the fence since 4d8f646f) max 34 ms",
+ "reading": "Under the frozen reading (MAIN <= 10/1000): the reservation release blocker is cleared for this metric at this host load. The heavily loaded case (b5c28 ran at load 17-47 on the older base 3bfab5b4) is not re-measured on 05af6966."
+}

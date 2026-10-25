@@ -225,10 +225,13 @@ mod tests {
         };
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        // The owner must outlast the writer's whole admission budget, so the
+        // refusal comes from the budget, never from the owner timing out.
+        let owner_patience = crate::DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(15);
         let owner = std::thread::spawn(move || {
             crate::with_archive_snapshot_publication_fence(|| {
                 ready_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(5))
+                release_rx.recv_timeout(owner_patience)
             })
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -259,8 +262,8 @@ mod tests {
             "busy direct writer must fail with publication-fence contention"
         );
         assert!(
-            elapsed < Duration::from_secs(1),
-            "busy direct writer blocked for {elapsed:?}"
+            elapsed < crate::DIRECT_FENCE_ADMISSION_BUDGET + Duration::from_secs(2),
+            "busy direct writer blocked past its admission budget: {elapsed:?}"
         );
         assert!(still_held, "writer returned only after the owner released");
     }

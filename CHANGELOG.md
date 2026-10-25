@@ -42,7 +42,7 @@ workspace test suite is not green on `main` (see Known issues).
   `file_reservation_paths`, `renew_file_reservations` and the macros that call them return this
   recoverable error when the reservation's archive artifact, the file the pre-commit guard reads,
   cannot be confirmed on disk:
-  - the archive publication fence or the project's archive lock was busy;
+  - the archive publication fence stayed busy for 5 s, or the project's archive lock was busy;
   - the write failed or was refused;
   - disk pressure is critical.
 
@@ -163,10 +163,18 @@ workspace test suite is not green on `main` (see Known issues).
 
 ### Known issues
 
-- **Reservations are refused under load.** The direct write of a grant's artifact does not wait for
-  the archive publication fence, so while another archive writer holds it the call fails at once with
-  `RESERVATION_ARCHIVE_UNAVAILABLE` (`detail` ends in `publication fence busy`). The lease stays held
-  in the database until it is released or expires. A bounded wait is not on `main` yet (br-9ott5).
+- **Reservations can be refused when the archive fence is held longer than 5 s.**
+  - **Why.** A grant's artifact write waits at most 5 s for the archive publication fence, then
+    fails with `RESERVATION_ARCHIVE_UNAVAILABLE` (`detail` ends in `publication fence busy`). The
+    lease stays held in the database until it is released or expires.
+  - **On `main` at 3bfab5b4,** before 4d8f646f moved the canonical-ID scan out of the fence, paced
+    60-agent runs on a heavily loaded host (load 17–47) refused about 12% of grants. v0.3.39 refused
+    0.08% there: it waits without limit, but its reservation p99 reached 25 s.
+  - **On `main` at 05af6966 with the 5 s wait,** three paired runs at host load 7–14 refused none of
+    2,658 grants (v0.3.39: none). Reservation p99 was 0.9–2.2 s, against 12.1–15.4 s for v0.3.39.
+    No fence hold reached 2 s.
+  - **Not yet re-measured:** the heavily loaded case on the newer base.
+  - **Tracked in** br-9ott5 and br-kp1in.47.
 - **Swarm load.** Archive convergence after load and write-behind progress are still open
   (br-9ott5, br-kp1in.13, br-kp1in.35). Several changes below shorten how long background work holds
   the archive fence, but they cite no swarm-scale measurement.
@@ -182,11 +190,11 @@ workspace test suite is not green on `main` (see Known issues).
 - **Grants and renewals report a failed archive publication instead of succeeding.**
   - **When it is written.** A grant or renewal writes its `id-<id>-g<generation>.json` artifact
     before it returns.
-  - **Admission.** That write tries the process-wide archive publication fence once instead of
-    waiting for it, and a cancelled request stops before anything is published (3f550ad1,
-    fdbfce4f).
-  - **The error.** A busy fence, a failed write or critical disk pressure ends the call with
-    `RESERVATION_ARCHIVE_UNAVAILABLE`. It carries:
+  - **Admission.** That write waits at most 5 s for the process-wide archive publication fence,
+    retrying with a pause of at most 10 ms, so shorter holds are waited out. A stalled holder still
+    refuses within the budget, and a cancelled request stops waiting (3f550ad1, fdbfce4f).
+  - **The error.** A fence that stays busy, a failed write or critical disk pressure ends the call
+    with `RESERVATION_ARCHIVE_UNAVAILABLE`. It carries:
     - `db_committed: true` and `guard_coverage_confirmed: false`;
     - `committed_reservation_ids` and `current_reservation_ids`;
     - `do_not_edit`, the requested paths;
@@ -200,9 +208,22 @@ workspace test suite is not green on `main` (see Known issues).
     it on owner, path, mode, expiry and generation (fdece065).
   - **Releases.** Releases and force-releases still succeed, and retry a failed release artifact in
     the background.
-  - In paced 60-agent runs on `main` at baea07e2, about half of the grants failed this way even
-    below saturation (513 per 1,000 at a 6 s period). Later commits shorten some fence holds; this
-    has not been re-measured on its own. See Known issues.
+  - **Measured refusals per 1,000 grants**, paced 60-agent runs below saturation (6 s period):
+
+    | Run | No wait | 500 ms wait | 5 s wait | v0.3.39 |
+    |---|---|---|---|---|
+    | `main` at baea07e2 (fl23) | 513 | 13.2 | | |
+    | Older base (fb25) | | 61.7 | 3.8 | 11.3 |
+    | `main` at 3bfab5b4 (b5c28, 3 windows) | | 271.3 | 120.0 | 0.8 |
+    | `main` at 05af6966 (kp48, 3 windows) | | | 0.0 | 0.0 |
+
+    - Within each run the arms ran concurrently on one host. The runs differ in base and host load:
+      b5c28 ran at load 17–47, kp48 at 7–14.
+    - The 5 s budget landed by owner decision. In fb25 at saturation it cost more 30 s
+      `send_message` timeouts.
+    - Receipts: `docs/evidence/release_smoke/2026-10-22_fl23-l2-on-fg_ab.json`,
+      `2026-10-23_fb25-fence-admission-levers_ab.json`, `2026-10-24_b5c28-fence-budget-confirmation_ab.json`
+      and `2026-10-25_kp48-main-b5-vs-v0339_ab.json`. See Known issues.
 - **A late reservation write cannot undo a newer one.** Before renaming a generation-stamped artifact
   into place, the writer reads the published one under the fence and the project's archive lock. It
   refuses the whole batch, changing no file, if the batch would:

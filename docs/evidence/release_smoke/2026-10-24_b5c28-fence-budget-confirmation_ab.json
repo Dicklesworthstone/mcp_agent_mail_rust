@@ -1,0 +1,266 @@
+{
+ "experiment": "b5c28: confirmation of the B5 owner decision (direct-publication fence admission budget 5 s vs 500 ms) on current main, paired-concurrent",
+ "rule": "scratchpad b5c28_rule.txt, written ~01:25Z before the binary built; FROZEN 2026-10-24T02:44:50Z before any run",
+ "tree": "origin/main 3bfab5b4 + L2 + a budget-only env knob AM_ARCHIVE_DIRECT_FENCE_BUDGET_MS (scaffolding, never landed; the landing tree uses the constant)",
+ "bins": {
+  "b5c28": "08e1918bb04db7bd96944b19ee27ad90e8f40e23bf421d8a5bac3c70c0e53741",
+  "INC_v0.3.39": "aeb222d8efbc9199cc00bb93f1875bca672ded4daabaaf0e6d990f04b34d5805"
+ },
+ "arms_env": {
+  "L2": "budget 500 ms",
+  "B5": "budget 5000 ms",
+  "INC": "published v0.3.39 (waits for the fence without limit)"
+ },
+ "harness": "paced_swarm.py, 60 agents/arm, 3 projects, 300 s; arms concurrent on one host (load 17-47)",
+ "windows": [
+  {
+   "window": 1,
+   "period_s": 6,
+   "start_order": [
+    "L2",
+    "B5",
+    "INC"
+   ],
+   "start": "2026-10-24T02:44:50Z",
+   "load_start": "17.33 21.39 20.94",
+   "end": "2026-10-24T02:50:57Z",
+   "exits": "L2=0 B5=0 INC=0",
+   "min_free_kb": 80739052,
+   "foreign_cpu_samples": 11,
+   "valid": true,
+   "load_end": "31.56 34.44 27.50",
+   "arms": {
+    "L2": {
+     "reserve_n": 886,
+     "reserve_errors": 189,
+     "reserve_p50_s": 0.529,
+     "reserve_p99_s": 3.482,
+     "send_ok": 3000,
+     "send_p50_s": 2.047,
+     "send_p99_s": 16.123,
+     "non_reservation_errors": 2
+    },
+    "B5": {
+     "reserve_n": 886,
+     "reserve_errors": 64,
+     "reserve_p50_s": 1.776,
+     "reserve_p99_s": 12.394,
+     "send_ok": 3000,
+     "send_p50_s": 0.249,
+     "send_p99_s": 14.369,
+     "non_reservation_errors": 0
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 1,
+     "reserve_p50_s": 1.958,
+     "reserve_p99_s": 13.57,
+     "send_ok": 2999,
+     "send_p50_s": 2.222,
+     "send_p99_s": 20.089,
+     "non_reservation_errors": 1
+    }
+   }
+  },
+  {
+   "window": 2,
+   "period_s": 6,
+   "start_order": [
+    "B5",
+    "INC",
+    "L2"
+   ],
+   "start": "2026-10-24T02:50:57Z",
+   "load_start": "31.56 34.44 27.50",
+   "end": "2026-10-24T02:58:02Z",
+   "exits": "B5=0 INC=0 L2=0",
+   "min_free_kb": 35405136,
+   "foreign_cpu_samples": 8,
+   "valid": true,
+   "load_end": "29.85 40.11 33.34",
+   "arms": {
+    "B5": {
+     "reserve_n": 886,
+     "reserve_errors": 235,
+     "reserve_p50_s": 4.785,
+     "reserve_p99_s": 19.289,
+     "send_ok": 3000,
+     "send_p50_s": 0.223,
+     "send_p99_s": 7.859,
+     "non_reservation_errors": 4
+    },
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 1,
+     "reserve_p50_s": 3.431,
+     "reserve_p99_s": 25.323,
+     "send_ok": 3000,
+     "send_p50_s": 0.925,
+     "send_p99_s": 7.88,
+     "non_reservation_errors": 3
+    },
+    "L2": {
+     "reserve_n": 886,
+     "reserve_errors": 402,
+     "reserve_p50_s": 0.905,
+     "reserve_p99_s": 6.471,
+     "send_ok": 3000,
+     "send_p50_s": 2.633,
+     "send_p99_s": 11.829,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 3,
+   "period_s": 6,
+   "start_order": [
+    "INC",
+    "L2",
+    "B5"
+   ],
+   "start": "2026-10-24T02:58:02Z",
+   "load_start": "29.85 40.11 33.34",
+   "end": "2026-10-24T03:03:50Z",
+   "exits": "INC=0 L2=0 B5=0",
+   "min_free_kb": 30220056,
+   "foreign_cpu_samples": 8,
+   "valid": true,
+   "load_end": "29.90 36.49 34.20",
+   "arms": {
+    "INC": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 2.432,
+     "reserve_p99_s": 9.677,
+     "send_ok": 3000,
+     "send_p50_s": 0.365,
+     "send_p99_s": 15.521,
+     "non_reservation_errors": 2
+    },
+    "L2": {
+     "reserve_n": 886,
+     "reserve_errors": 130,
+     "reserve_p50_s": 0.218,
+     "reserve_p99_s": 2.255,
+     "send_ok": 3000,
+     "send_p50_s": 0.169,
+     "send_p99_s": 14.806,
+     "non_reservation_errors": 2
+    },
+    "B5": {
+     "reserve_n": 886,
+     "reserve_errors": 20,
+     "reserve_p50_s": 0.271,
+     "reserve_p99_s": 9.874,
+     "send_ok": 3000,
+     "send_p50_s": 0.155,
+     "send_p99_s": 14.799,
+     "non_reservation_errors": 1
+    }
+   }
+  },
+  {
+   "window": 4,
+   "period_s": 2,
+   "start_order": [
+    "L2",
+    "B5"
+   ],
+   "start": "2026-10-24T03:03:51Z",
+   "load_start": "29.90 36.49 34.20",
+   "end": "2026-10-24T03:14:31Z",
+   "exits": "L2=0 B5=0",
+   "min_free_kb": 50667192,
+   "foreign_cpu_samples": 16,
+   "valid": true,
+   "load_end": "22.42 28.78 31.75",
+   "arms": {
+    "L2": {
+     "reserve_n": 2633,
+     "reserve_errors": 1737,
+     "reserve_p50_s": 1.131,
+     "reserve_p99_s": 2.505,
+     "send_ok": 9000,
+     "send_p50_s": 2.183,
+     "send_p99_s": 7.821,
+     "non_reservation_errors": 1
+    },
+    "B5": {
+     "reserve_n": 2633,
+     "reserve_errors": 523,
+     "reserve_p50_s": 5.66,
+     "reserve_p99_s": 15.066,
+     "send_ok": 9000,
+     "send_p50_s": 0.168,
+     "send_p99_s": 7.731,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 5,
+   "period_s": 2,
+   "start_order": [
+    "B5",
+    "L2"
+   ],
+   "start": "2026-10-24T03:14:31Z",
+   "load_start": "22.42 28.78 31.75",
+   "end": "2026-10-24T03:25:25Z",
+   "exits": "B5=0 L2=0",
+   "min_free_kb": 48505264,
+   "foreign_cpu_samples": 18,
+   "valid": true,
+   "load_end": "35.15 33.89 32.52",
+   "arms": {
+    "B5": {
+     "reserve_n": 2633,
+     "reserve_errors": 547,
+     "reserve_p50_s": 6.075,
+     "reserve_p99_s": 15.12,
+     "send_ok": 9000,
+     "send_p50_s": 0.169,
+     "send_p99_s": 5.754,
+     "non_reservation_errors": 0
+    },
+    "L2": {
+     "reserve_n": 2633,
+     "reserve_errors": 1914,
+     "reserve_p50_s": 1.173,
+     "reserve_p99_s": 2.55,
+     "send_ok": 9000,
+     "send_p50_s": 2.236,
+     "send_p99_s": 4.979,
+     "non_reservation_errors": 1
+    }
+   }
+  }
+ ],
+ "pooled_p6_reservation_errors_per_1000": {
+  "L2": 271.3,
+  "B5": 120.0,
+  "INC": 0.8
+ },
+ "pooled_p2_reservation_errors_per_1000": {
+  "L2": 693.3,
+  "B5": 203.2
+ },
+ "pooled_p6_sends_ok": {
+  "L2": 9000,
+  "B5": 9000,
+  "INC": 8999
+ },
+ "pooled_non_reservation_errors": {
+  "p6_L2": 4,
+  "p6_B5": 5,
+  "p6_INC": 6,
+  "p2_L2": 2,
+  "p2_B5": 0
+ },
+ "criteria": {
+  "B5/L2 reservation errors <= 0.5 (or both <= 5/1000)": "PASS (0.442)",
+  "B5 sends ok >= 0.95x L2": "PASS (1.000)"
+ },
+ "verdict": "CONFIRMED: B5 lands per the owner decision. Even so, main + B5 refuses about 12% of reservations below saturation where v0.3.39 refused 0.08% (v0.3.39's reservation p99 reached 25 s). Every B5 refusal logged 'publication fence busy'."
+}
