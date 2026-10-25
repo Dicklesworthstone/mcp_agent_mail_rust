@@ -1033,6 +1033,7 @@ fn refuse_untrusted_or_tripped_recovery_breaker(
     primary_path: &Path,
     action: &str,
 ) -> Result<(), SqlError> {
+    ensure_primary_not_multiply_linked(primary_path, action)?;
     if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
         return Ok(());
     }
@@ -1326,6 +1327,7 @@ pub fn recovery_breaker_fingerprint(
 #[allow(clippy::result_large_err)]
 fn preflight_missing_primary_pool_breaker_authority(primary_path: &Path) -> Result<(), SqlError> {
     validate_sqlite_target_path(primary_path, "pool initialization target")?;
+    ensure_primary_not_multiply_linked(primary_path, "pool initialization")?;
     if crate::recovery_breaker::RecoveryBreakerBypassGuard::is_active() {
         return Ok(());
     }
@@ -1389,9 +1391,27 @@ where
     validate_sqlite_target_path(primary_path, "recovery admission target").map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
+    ensure_primary_not_multiply_linked(primary_path, action).map_err(|error| {
+        AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
+    })?;
+    let primary_anchor = AnchoredRecoveryParent::capture(primary_path, "recovery admission target")
+        .map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                error,
+            )
+        })?;
     let normalized_primary = normalize_sqlite_identity_path_lossless(primary_path);
     if let Some(active_path) = RecoveryAdmissionDepthGuard::active_path() {
         if active_path == normalized_primary {
+            #[cfg(test)]
+            run_recovery_admission_after_validation_hook(primary_path);
+            primary_anchor.verify_unchanged(action).map_err(|error| {
+                AutomaticRecoveryRunError::admission(
+                    AutomaticRecoveryAdmissionFailureKind::Other,
+                    error,
+                )
+            })?;
             return operation().map_err(AutomaticRecoveryRunError::Operation);
         }
         return Err(AutomaticRecoveryRunError::admission(
@@ -1439,6 +1459,11 @@ where
         }
         Some(attempt_started_unix)
     };
+    #[cfg(test)]
+    run_recovery_admission_after_validation_hook(primary_path);
+    primary_anchor.verify_unchanged(action).map_err(|error| {
+        AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
+    })?;
     let _breaker_file_lock = crate::recovery_breaker::try_acquire_file_lock(primary_path)
         .map_err(|error| {
             AutomaticRecoveryRunError::admission(
@@ -1449,6 +1474,9 @@ where
                 )),
             )
         })?;
+    primary_anchor.verify_unchanged(action).map_err(|error| {
+        AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
+    })?;
 
     // br-acusl: durable non-convergence circuit breaker. The in-process
     // admission below (single-flight + backoff + window suppression) is
@@ -1535,6 +1563,12 @@ where
             breaker_config,
             attempt_started_unix,
         );
+        primary_anchor.verify_unchanged(action).map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                error,
+            )
+        })?;
         crate::recovery_breaker::store(primary_path, &armed).map_err(|error| {
             AutomaticRecoveryRunError::admission(
                 AutomaticRecoveryAdmissionFailureKind::Other,
@@ -1556,14 +1590,16 @@ where
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
             Ok(result) => result,
             Err(payload) => {
-                armed.db_fingerprint = recovery_breaker_fingerprint(primary_path, None);
-                armed.last_failure_unix = now_unix();
-                if let Err(error) = crate::recovery_breaker::store(primary_path, &armed) {
-                    tracing::error!(
-                        path = %primary_path.display(),
-                        %error,
-                        "could not retarget crashed recovery; durable unfinished marker remains authoritative"
-                    );
+                if primary_anchor.verify_parent_only(action).is_ok() {
+                    armed.db_fingerprint = recovery_breaker_fingerprint(primary_path, None);
+                    armed.last_failure_unix = now_unix();
+                    if let Err(error) = crate::recovery_breaker::store(primary_path, &armed) {
+                        tracing::error!(
+                            path = %primary_path.display(),
+                            %error,
+                            "could not retarget crashed recovery; durable unfinished marker remains authoritative"
+                        );
+                    }
                 }
                 std::panic::resume_unwind(payload);
             }
@@ -1576,6 +1612,12 @@ where
     }
     match operation_result {
         Ok(value) => {
+            primary_anchor.verify_parent_only(action).map_err(|error| {
+                AutomaticRecoveryRunError::admission(
+                    AutomaticRecoveryAdmissionFailureKind::Other,
+                    error,
+                )
+            })?;
             recovery_admission().report_success(primary_path);
             let cleared = crate::recovery_breaker::cleared_state(&recovery_breaker_fingerprint(
                 primary_path,
@@ -1601,6 +1643,17 @@ where
             Ok(value)
         }
         Err(error) => {
+            primary_anchor
+                .verify_parent_only(action)
+                .map_err(|parent_error| {
+                    AutomaticRecoveryRunError::admission(
+                        AutomaticRecoveryAdmissionFailureKind::Other,
+                        SqlError::Custom(format!(
+                            "{error}; additionally, recovery parent authority for {} changed during execution: {parent_error}",
+                            primary_path.display()
+                        )),
+                    )
+                })?;
             recovery_admission().report_failure(primary_path, &error.to_string());
             let failure_unix = now_unix();
             let terminal_fingerprint = recovery_breaker_fingerprint(primary_path, None);
@@ -6084,7 +6137,7 @@ impl DbPoolAuthority {
 }
 
 #[derive(Debug)]
-pub(crate) struct FrozenDirectoryAuthority {
+struct FrozenDirectoryAuthority {
     target_path: PathBuf,
     authority_name: &'static str,
     expect_directory_leaf: bool,
@@ -7111,7 +7164,7 @@ fn run_pool_sqlite_path_after_validation_hook(context: &'static str, sqlite_path
 }
 
 #[cfg(test)]
-pub(crate) fn with_pool_storage_root_after_validation_hook<R>(
+fn with_pool_storage_root_after_validation_hook<R>(
     hook: impl FnOnce(&'static str, &Path) + 'static,
     body: impl FnOnce() -> R,
 ) -> R {
@@ -7131,7 +7184,7 @@ pub(crate) fn with_pool_storage_root_after_validation_hook<R>(
 }
 
 #[cfg(test)]
-pub(crate) fn with_pool_sqlite_path_after_validation_hook<R>(
+fn with_pool_sqlite_path_after_validation_hook<R>(
     hook: impl FnOnce(&'static str, &Path) + 'static,
     body: impl FnOnce() -> R,
 ) -> R {
@@ -8674,6 +8727,678 @@ fn is_macos_temp_firmlink(link: &Path, resolved: &Path) -> bool {
     mcp_agent_mail_core::disk::is_platform_temp_firmlink(link, resolved)
 }
 
+#[allow(clippy::result_large_err)]
+fn ensure_primary_not_multiply_linked(primary_path: &Path, context: &str) -> Result<(), SqlError> {
+    if primary_path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        match std::fs::symlink_metadata(primary_path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.nlink() != 1 => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: live database {} has {} hard links and aliases the live database across multiple pathnames; recovery requires an exclusively owned file generation",
+                    primary_path.display(),
+                    metadata.nlink()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: failed to inspect recovery primary {}: {error}",
+                    primary_path.display()
+                )));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = context;
+    Ok(())
+}
+
+#[cfg(test)]
+type RecoveryAdmissionHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+type RecoveryPromotionHook = Box<dyn FnOnce(&Path, &Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static RECOVERY_ADMISSION_AFTER_VALIDATION_HOOK: std::cell::RefCell<Option<RecoveryAdmissionHook>> =
+        std::cell::RefCell::new(None);
+    static RECOVERY_PROMOTION_AFTER_VALIDATION_HOOK: std::cell::RefCell<Option<RecoveryPromotionHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_recovery_admission_after_validation_hook(primary_path: &Path) {
+    let hook = RECOVERY_ADMISSION_AFTER_VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(primary_path);
+    }
+}
+
+#[cfg(test)]
+fn run_recovery_promotion_after_validation_hook(primary_path: &Path, candidate_path: &Path) {
+    let hook = RECOVERY_PROMOTION_AFTER_VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(primary_path, candidate_path);
+    }
+}
+
+#[cfg(test)]
+fn with_recovery_admission_after_validation_hook<R>(
+    hook: impl FnOnce(&Path) + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            RECOVERY_ADMISSION_AFTER_VALIDATION_HOOK.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+    RECOVERY_ADMISSION_AFTER_VALIDATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _guard = ResetGuard;
+    body()
+}
+
+#[cfg(test)]
+fn with_recovery_promotion_after_validation_hook<R>(
+    hook: impl FnOnce(&Path, &Path) + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            RECOVERY_PROMOTION_AFTER_VALIDATION_HOOK.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+    RECOVERY_PROMOTION_AFTER_VALIDATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _guard = ResetGuard;
+    body()
+}
+
+#[cfg(unix)]
+struct AnchoredRecoveryParent {
+    target_path: PathBuf,
+    parent_path: PathBuf,
+    file_name: std::ffi::OsString,
+    parent_dir: std::fs::File,
+    parent_stat: rustix::fs::Stat,
+    initial_leaf_stat: Option<rustix::fs::Stat>,
+}
+
+#[cfg(unix)]
+impl AnchoredRecoveryParent {
+    fn same_inode(first: &rustix::fs::Stat, second: &rustix::fs::Stat) -> bool {
+        first.st_dev == second.st_dev
+            && first.st_ino == second.st_ino
+            && rustix::fs::FileType::from_raw_mode(first.st_mode)
+                == rustix::fs::FileType::from_raw_mode(second.st_mode)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn open_no_follow_directory_from_root(
+        dir_path: &Path,
+        label: &str,
+    ) -> Result<(std::fs::File, rustix::fs::Stat), SqlError> {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+
+        let dir_flags = OFlags::RDONLY
+            | OFlags::DIRECTORY
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC;
+        let mut current_fd =
+            openat(rustix::fs::CWD, "/", dir_flags, Mode::empty()).map_err(|error| {
+                SqlError::Custom(format!(
+                    "failed to open root directory while anchoring {label} {}: {error}",
+                    dir_path.display()
+                ))
+            })?;
+        let mut current_stat = fstat(&current_fd).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to stat root directory while anchoring {label} {}: {error}",
+                dir_path.display()
+            ))
+        })?;
+        let mut current_path = PathBuf::from("/");
+
+        for component in dir_path.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(SqlError::Custom(format!(
+                        "refusing {label} {} because parent directory contains '..' traversal",
+                        dir_path.display()
+                    )));
+                }
+                Component::Normal(segment) => {
+                    current_path.push(segment);
+                    let entry_stat = statat(&current_fd, segment, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|error| {
+                            SqlError::Custom(format!(
+                                "failed to inspect {label} {} at {}: {error}",
+                                dir_path.display(),
+                                current_path.display()
+                            ))
+                        })?;
+                    if FileType::from_raw_mode(entry_stat.st_mode) == FileType::Symlink {
+                        if let Ok(resolved) = std::fs::canonicalize(&current_path)
+                            && is_macos_temp_firmlink(&current_path, &resolved)
+                        {
+                            let (resolved_file, resolved_stat) =
+                                Self::open_no_follow_directory_from_root(&resolved, label)?;
+                            current_fd = std::os::fd::OwnedFd::from(resolved_file);
+                            current_stat = resolved_stat;
+                            current_path = resolved;
+                            continue;
+                        }
+                        return Err(SqlError::Custom(format!(
+                            "refusing {label} {} because it traverses symlinked path {}",
+                            dir_path.display(),
+                            current_path.display()
+                        )));
+                    }
+                    if FileType::from_raw_mode(entry_stat.st_mode) != FileType::Directory {
+                        return Err(SqlError::Custom(format!(
+                            "refusing {label} {} because {} is not a directory",
+                            dir_path.display(),
+                            current_path.display()
+                        )));
+                    }
+                    let next_fd = openat(&current_fd, segment, dir_flags, Mode::empty()).map_err(
+                        |error| {
+                            SqlError::Custom(format!(
+                                "failed to open directory {} while anchoring {label} {}: {error}",
+                                current_path.display(),
+                                dir_path.display()
+                            ))
+                        },
+                    )?;
+                    let next_stat = fstat(&next_fd).map_err(|error| {
+                        SqlError::Custom(format!(
+                            "failed to fstat directory {} while anchoring {label} {}: {error}",
+                            current_path.display(),
+                            dir_path.display()
+                        ))
+                    })?;
+                    if !Self::same_inode(&entry_stat, &next_stat) {
+                        return Err(SqlError::Custom(format!(
+                            "refusing {label} {} because directory {} changed identity during open",
+                            dir_path.display(),
+                            current_path.display()
+                        )));
+                    }
+                    current_fd = next_fd;
+                    current_stat = next_stat;
+                }
+            }
+        }
+
+        Ok((std::fs::File::from(current_fd), current_stat))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn capture(path: &Path, label: &str) -> Result<Self, SqlError> {
+        use rustix::fs::{AtFlags, FileType, statat};
+
+        validate_sqlite_target_path(path, label)?;
+        let anchored = sqlite_validation_anchor(path)?;
+        let file_name = anchored
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                SqlError::Custom(format!(
+                    "{label} {} does not have a leaf file name",
+                    path.display()
+                ))
+            })?
+            .to_os_string();
+        let parent_path = anchored
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                SqlError::Custom(format!(
+                    "{label} {} does not have a parent directory",
+                    path.display()
+                ))
+            })?
+            .to_path_buf();
+        let (parent_dir, parent_stat) =
+            Self::open_no_follow_directory_from_root(&parent_path, label)?;
+        let initial_leaf_stat = match statat(&parent_dir, &file_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(leaf_stat) => {
+                if FileType::from_raw_mode(leaf_stat.st_mode) == FileType::Symlink {
+                    return Err(SqlError::Custom(format!(
+                        "refusing {label} {} because it traverses symlinked path {}",
+                        path.display(),
+                        anchored.display()
+                    )));
+                }
+                if FileType::from_raw_mode(leaf_stat.st_mode) == FileType::RegularFile
+                    && leaf_stat.st_nlink != 1
+                {
+                    return Err(SqlError::Custom(format!(
+                        "{label}: {} has {} hard links and aliases the live database; recovery requires an exclusively owned file generation",
+                        path.display(),
+                        leaf_stat.st_nlink
+                    )));
+                }
+                Some(leaf_stat)
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => None,
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to inspect {label} {} in parent directory {}: {error}",
+                    path.display(),
+                    parent_path.display()
+                )));
+            }
+        };
+
+        Ok(Self {
+            target_path: path.to_path_buf(),
+            parent_path,
+            file_name,
+            parent_dir,
+            parent_stat,
+            initial_leaf_stat,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_parent_only(&self, context: &str) -> Result<(), SqlError> {
+        let fd_stat = rustix::fs::fstat(&self.parent_dir).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to fstat anchored parent directory for {}: {error}",
+                self.target_path.display()
+            ))
+        })?;
+        if !Self::same_inode(&fd_stat, &self.parent_stat) || fd_stat.st_nlink == 0 {
+            return Err(SqlError::Custom(format!(
+                "{context}: anchored parent directory for {} was unlinked or replaced after validation",
+                self.target_path.display()
+            )));
+        }
+        let (_current_dir, current_stat) =
+            Self::open_no_follow_directory_from_root(&self.parent_path, context)?;
+        if !Self::same_inode(&current_stat, &self.parent_stat) {
+            return Err(SqlError::Custom(format!(
+                "{context}: parent directory {} for {} changed identity after validation",
+                self.parent_path.display(),
+                self.target_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_unchanged(&self, context: &str) -> Result<(), SqlError> {
+        use rustix::fs::{AtFlags, FileType, statat};
+
+        self.verify_parent_only(context)?;
+        let current_leaf = statat(&self.parent_dir, &self.file_name, AtFlags::SYMLINK_NOFOLLOW);
+        match (self.initial_leaf_stat.as_ref(), current_leaf) {
+            (Some(expected), Ok(actual)) => {
+                if FileType::from_raw_mode(actual.st_mode) == FileType::Symlink {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: {} was replaced by a symlink after validation",
+                        self.target_path.display()
+                    )));
+                }
+                if !Self::same_inode(expected, &actual) {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: {} changed inode identity after validation",
+                        self.target_path.display()
+                    )));
+                }
+                if FileType::from_raw_mode(actual.st_mode) == FileType::RegularFile
+                    && actual.st_nlink != 1
+                {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: {} has {} hard links and aliases the live database; recovery requires an exclusively owned file generation",
+                        self.target_path.display(),
+                        actual.st_nlink
+                    )));
+                }
+                Ok(())
+            }
+            (Some(_), Err(error)) => Err(SqlError::Custom(format!(
+                "{context}: {} disappeared or became unreadable after validation: {error}",
+                self.target_path.display()
+            ))),
+            (None, Err(error)) if error == rustix::io::Errno::NOENT => Ok(()),
+            (None, Ok(_)) => Err(SqlError::Custom(format!(
+                "{context}: {} was unexpectedly created after validation",
+                self.target_path.display()
+            ))),
+            (None, Err(error)) => Err(SqlError::Custom(format!(
+                "{context}: failed to inspect {} after validation: {error}",
+                self.target_path.display()
+            ))),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn open_verified_leaf(
+        &self,
+        access_flags: rustix::fs::OFlags,
+        context: &str,
+    ) -> Result<std::fs::File, SqlError> {
+        use rustix::fs::{FileType, Mode, OFlags, fcntl_getfl, fcntl_setfl, fstat, openat};
+
+        self.verify_unchanged(context)?;
+        let expected = self.initial_leaf_stat.as_ref().ok_or_else(|| {
+            SqlError::Custom(format!(
+                "{context}: expected existing regular file at {}",
+                self.target_path.display()
+            ))
+        })?;
+        let fd = openat(
+            &self.parent_dir,
+            &self.file_name,
+            access_flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to open anchored leaf {}: {error}",
+                self.target_path.display()
+            ))
+        })?;
+        let opened_stat = fstat(&fd).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to fstat anchored leaf {}: {error}",
+                self.target_path.display()
+            ))
+        })?;
+        if FileType::from_raw_mode(opened_stat.st_mode) != FileType::RegularFile
+            || !Self::same_inode(expected, &opened_stat)
+        {
+            return Err(SqlError::Custom(format!(
+                "{context}: {} changed identity while opening anchored leaf",
+                self.target_path.display()
+            )));
+        }
+        if opened_stat.st_nlink != 1 {
+            return Err(SqlError::Custom(format!(
+                "{context}: {} has {} hard links and aliases the live database; recovery requires an exclusively owned file generation",
+                self.target_path.display(),
+                opened_stat.st_nlink
+            )));
+        }
+        if let Ok(flags) = fcntl_getfl(&fd)
+            && flags.contains(OFlags::NONBLOCK)
+        {
+            let _ = fcntl_setfl(&fd, flags - OFlags::NONBLOCK);
+        }
+        Ok(std::fs::File::from(fd))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn open_regular_read_only(&self, context: &str) -> Result<std::fs::File, SqlError> {
+        self.open_verified_leaf(rustix::fs::OFlags::RDONLY, context)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn open_regular_read_write(&self, context: &str) -> Result<std::fs::File, SqlError> {
+        self.open_verified_leaf(rustix::fs::OFlags::RDWR, context)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn sync_parent(&self, context: &str) -> Result<(), SqlError> {
+        self.parent_dir.sync_all().map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to sync anchored recovery parent directory {}: {error}",
+                self.parent_path.display()
+            ))
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn rename_noreplace_between_parents(
+        from_parent: &std::fs::File,
+        from_name: &std::ffi::OsStr,
+        to_parent: &std::fs::File,
+        to_name: &std::ffi::OsStr,
+        context: &str,
+    ) -> Result<(), SqlError> {
+        use rustix::fs::{AtFlags, RenameFlags, renameat, renameat_with, statat};
+
+        match statat(to_parent, to_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: refusing no-replace rename because destination leaf {} is already occupied",
+                    Path::new(to_name).display()
+                )));
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "{context}: failed to inspect destination leaf {} before rename: {error}",
+                    Path::new(to_name).display()
+                )));
+            }
+        }
+        match renameat_with(
+            from_parent,
+            from_name,
+            to_parent,
+            to_name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error == rustix::io::Errno::NOSYS || error == rustix::io::Errno::INVAL =>
+            {
+                match statat(to_parent, to_name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(_) => {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: refusing no-replace rename because destination leaf {} became occupied",
+                            Path::new(to_name).display()
+                        )));
+                    }
+                    Err(err) if err == rustix::io::Errno::NOENT => {}
+                    Err(err) => {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: failed to recheck destination leaf {}: {err}",
+                            Path::new(to_name).display()
+                        )));
+                    }
+                }
+                renameat(from_parent, from_name, to_parent, to_name).map_err(|rename_error| {
+                    SqlError::Custom(format!(
+                        "{context}: failed to rename anchored leaf {} -> {}: {rename_error}",
+                        Path::new(from_name).display(),
+                        Path::new(to_name).display()
+                    ))
+                })
+            }
+            Err(error) => Err(SqlError::Custom(format!(
+                "{context}: failed to rename anchored leaf {} -> {}: {error}",
+                Path::new(from_name).display(),
+                Path::new(to_name).display()
+            ))),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn quarantine_self_to(&self, quarantined_source: &Path) -> Result<(), SqlError> {
+        let context = "quarantine live database";
+        self.verify_unchanged(context)?;
+        let quarantined_name = quarantined_source
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                SqlError::Custom(format!(
+                    "{context}: quarantine path {} has no leaf file name",
+                    quarantined_source.display()
+                ))
+            })?;
+        Self::rename_noreplace_between_parents(
+            &self.parent_dir,
+            &self.file_name,
+            &self.parent_dir,
+            quarantined_name,
+            context,
+        )?;
+        self.sync_parent(context)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn activate_into(
+        &self,
+        dest_anchor: &Self,
+        candidate_path: &Path,
+        primary_path: &Path,
+    ) -> Result<(), SqlError> {
+        use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+
+        let context = "activate reconstructed candidate";
+        self.verify_unchanged(context)?;
+        dest_anchor.verify_parent_only(context)?;
+        Self::rename_noreplace_between_parents(
+            &self.parent_dir,
+            &self.file_name,
+            &dest_anchor.parent_dir,
+            &dest_anchor.file_name,
+            context,
+        )
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to activate reconstructed sqlite candidate {} into {}: {error}",
+                candidate_path.display(),
+                primary_path.display()
+            ))
+        })?;
+        let activated_fd = openat(
+            &dest_anchor.parent_dir,
+            &dest_anchor.file_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            SqlError::Custom(format!(
+                "reconstructed sqlite candidate {} was renamed into {}, but opening the activated file failed: {error}",
+                candidate_path.display(),
+                primary_path.display()
+            ))
+        })?;
+        let activated_stat = fstat(&activated_fd).map_err(|error| {
+            SqlError::Custom(format!(
+                "reconstructed sqlite candidate {} was renamed into {}, but stating the activated file failed: {error}",
+                candidate_path.display(),
+                primary_path.display()
+            ))
+        })?;
+        if let Some(expected_candidate) = self.initial_leaf_stat.as_ref()
+            && (FileType::from_raw_mode(activated_stat.st_mode) != FileType::RegularFile
+                || !Self::same_inode(expected_candidate, &activated_stat)
+                || activated_stat.st_nlink != 1)
+        {
+            return Err(SqlError::Custom(format!(
+                "reconstructed sqlite candidate {} was renamed into {}, but the activated inode did not match the verified candidate",
+                candidate_path.display(),
+                primary_path.display()
+            )));
+        }
+        let activated_file = std::fs::File::from(activated_fd);
+        activated_file.sync_all().map_err(|error| {
+            SqlError::Custom(format!(
+                "reconstructed sqlite candidate {} was renamed into {}, but syncing the activated file failed: {error}",
+                candidate_path.display(),
+                primary_path.display()
+            ))
+        })?;
+        dest_anchor.sync_parent(context)?;
+        if !Self::same_inode(&self.parent_stat, &dest_anchor.parent_stat) {
+            self.sync_parent(context)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+struct AnchoredRecoveryParent {
+    target_path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl AnchoredRecoveryParent {
+    #[allow(clippy::result_large_err)]
+    fn capture(path: &Path, label: &str) -> Result<Self, SqlError> {
+        validate_sqlite_target_path(path, label)?;
+        Ok(Self {
+            target_path: path.to_path_buf(),
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_parent_only(&self, context: &str) -> Result<(), SqlError> {
+        validate_sqlite_target_path(&self.target_path, context)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_unchanged(&self, context: &str) -> Result<(), SqlError> {
+        validate_sqlite_target_path(&self.target_path, context)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn open_regular_read_only(&self, context: &str) -> Result<std::fs::File, SqlError> {
+        self.verify_unchanged(context)?;
+        mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.target_path).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to open {}: {error}",
+                self.target_path.display()
+            ))
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn open_regular_read_write(&self, context: &str) -> Result<std::fs::File, SqlError> {
+        self.verify_unchanged(context)?;
+        mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&self.target_path)
+            .map_err(|error| {
+                SqlError::Custom(format!(
+                    "{context}: failed to open {} read-write: {error}",
+                    self.target_path.display()
+                ))
+            })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn quarantine_self_to(&self, quarantined_source: &Path) -> Result<(), SqlError> {
+        rename_noreplace_preserving_source(&self.target_path, quarantined_source).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to quarantine live database {} as {}: {error}",
+                self.target_path.display(),
+                quarantined_source.display()
+            ))
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn activate_into(
+        &self,
+        _dest_anchor: &Self,
+        candidate_path: &Path,
+        primary_path: &Path,
+    ) -> Result<(), SqlError> {
+        activate_reconstruction_candidate(candidate_path, primary_path)
+    }
+}
+
 pub struct CanonicalSnapshotTempDir {
     guard: tempfile::TempDir,
     canonical_path: PathBuf,
@@ -9382,6 +10107,7 @@ fn open_sqlite_file_with_configured_pragmas(sqlite_path: &str) -> Result<DbConn,
     Ok(conn)
 }
 
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
 async fn initialize_sqlite_file_once(
     cx: &Cx,
@@ -16985,6 +17711,7 @@ pub fn quarantine_reconstruction_candidate_path(
     Ok(Some(quarantined))
 }
 
+#[cfg(not(unix))]
 #[allow(clippy::result_large_err)]
 fn activate_reconstruction_candidate(
     candidate_path: &Path,
@@ -17360,6 +18087,14 @@ where
             )),
         ));
     }
+    ensure_primary_not_multiply_linked(primary_path, "recovery candidate promotion")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    let primary_anchor =
+        AnchoredRecoveryParent::capture(primary_path, "recovery promotion destination")
+            .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    let candidate_anchor =
+        AnchoredRecoveryParent::capture(candidate_path, "recovery promotion candidate")
+            .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
     let source_existed = is_real_file(primary_path);
     if !sqlite_recovery_candidate_passes_full_integrity_check(candidate_path)
         .map_err(ReconstructionCandidateFailure::before_receipt_commit)?
@@ -17371,10 +18106,16 @@ where
             )),
         ));
     }
-    let candidate_file =
-        mcp_agent_mail_core::disk::open_regular_file_for_permission_change_no_follow(
-            candidate_path,
-        )
+    #[cfg(test)]
+    run_recovery_promotion_after_validation_hook(primary_path, candidate_path);
+    primary_anchor
+        .verify_unchanged("recovery candidate promotion")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    candidate_anchor
+        .verify_unchanged("recovery candidate promotion")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    let candidate_file = candidate_anchor
+        .open_regular_read_only("recovery candidate promotion")
         .map_err(|error| {
             ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
                 "failed to open recovery candidate {} for secure permission normalization: {error}",
@@ -17382,13 +18123,28 @@ where
             )))
         })?;
     if source_existed {
-        let primary_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(primary_path)
+        let primary_file = primary_anchor
+            .open_regular_read_only("recovery candidate promotion")
             .map_err(|error| {
                 ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
                     "failed to open live database {} for recovery identity verification: {error}",
                     primary_path.display()
                 )))
             })?;
+        let primary_link_count = recovery_file_link_count(&primary_file).map_err(|error| {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "failed to prove exclusive filesystem ownership of live database {}: {error}",
+                primary_path.display()
+            )))
+        })?;
+        if primary_link_count != 1 {
+            return Err(ReconstructionCandidateFailure::before_receipt_commit(
+                SqlError::Custom(format!(
+                    "live database {} has {primary_link_count} hard links and aliases the live database; promotion requires an exclusively owned file generation",
+                    primary_path.display()
+                )),
+            ));
+        }
         let primary_identity = same_file::Handle::from_file(primary_file).map_err(|error| {
             ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
                 "failed to inspect open live database identity for {}: {error}",
@@ -17439,24 +18195,23 @@ where
             )))
         },
     )?;
+    let candidate_sync = candidate_anchor
+        .open_regular_read_write("recovery candidate promotion")
+        .map_err(|error| {
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
+                "failed to reopen secured recovery candidate {} for durability sync: {error}",
+                candidate_path.display()
+            )))
+        })?;
     drop(candidate_file);
-    let candidate_sync = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(
-        candidate_path,
-    )
-    .map_err(|error| {
-        ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
-            "failed to reopen secured recovery candidate {} for durability sync: {error}",
-            candidate_path.display()
-        )))
-    })?;
     candidate_sync.sync_all().map_err(|error| {
         ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
             "failed to sync secured recovery candidate {} before promotion: {error}",
             candidate_path.display()
         )))
     })?;
-    drop(candidate_sync);
-    let candidate_bytes = std::fs::metadata(candidate_path)
+    let candidate_bytes = candidate_sync
+        .metadata()
         .map_err(|error| {
             ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
                 "failed to stat recovery candidate {}: {error}",
@@ -17464,6 +18219,7 @@ where
             )))
         })?
         .len();
+    drop(candidate_sync);
     ensure_recovery_disk_headroom(
         primary_path,
         candidate_bytes,
@@ -17504,6 +18260,12 @@ where
     // since it may carry committed frames the receipt must account for.
     quarantine_non_regular_sidecar_objects(primary_path, timestamp)
         .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    primary_anchor
+        .verify_unchanged("recovery candidate promotion")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
+    candidate_anchor
+        .verify_unchanged("recovery candidate promotion")
+        .map_err(ReconstructionCandidateFailure::before_receipt_commit)?;
     let prepared = crate::forensics::prepare_recovery_receipt(
         storage_root,
         primary_path,
@@ -17522,11 +18284,19 @@ where
             )),
         ));
     }
+    if let Err(error) = primary_anchor
+        .verify_unchanged("recovery candidate promotion")
+        .and_then(|()| candidate_anchor.verify_unchanged("recovery candidate promotion"))
+    {
+        return Err(abort_prepared_recovery_after_safe_rollback(
+            &prepared, error,
+        ));
+    }
 
     let quarantined_source =
         source_existed.then(|| unique_recovery_quarantine_path(primary_path, timestamp));
     if let Some(quarantined_source) = quarantined_source.as_ref()
-        && let Err(error) = rename_noreplace_preserving_source(primary_path, quarantined_source)
+        && let Err(error) = primary_anchor.quarantine_self_to(quarantined_source)
     {
         return Err(abort_prepared_recovery_after_safe_rollback(
             &prepared,
@@ -17551,7 +18321,9 @@ where
         ));
     }
 
-    if let Err(error) = activate_reconstruction_candidate(candidate_path, primary_path) {
+    if let Err(error) =
+        candidate_anchor.activate_into(&primary_anchor, candidate_path, primary_path)
+    {
         return Err(rollback_and_abort_recovery_promotion(
             primary_path,
             candidate_path,
@@ -25242,6 +26014,198 @@ mod tests {
         );
         crate::forensics::verify_recovery_receipt_state(dir.path(), &primary)
             .expect("rejection before receipt admission must not degrade readiness");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_admission_and_promotion_reject_hard_linked_primary_aliases() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary_a = dir.path().join("storage-a.sqlite3");
+        let primary_b = dir.path().join("storage-b.sqlite3");
+        let candidate = dir.path().join("storage-a.sqlite3.candidate");
+        write_marker_db(&primary_a, "shared-live-generation");
+        write_marker_db(&candidate, "fresh-candidate-generation");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o400))
+            .expect("plant read-only candidate mode");
+        std::fs::hard_link(&primary_a, &primary_b).expect("hard-link primary_b to primary_a");
+
+        recovery_admission().reset();
+        let op_called = std::cell::Cell::new(false);
+        let admission_err = with_recovery_admission(&primary_a, "test recovery", || {
+            op_called.set(true);
+            Ok(())
+        })
+        .expect_err("admission must reject a multiply-linked primary database");
+        assert!(
+            admission_err.to_string().contains("has 2 hard links"),
+            "unexpected admission error: {admission_err}"
+        );
+        assert!(
+            !op_called.get(),
+            "operation body must not run for an aliased primary"
+        );
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&primary_a))
+                .is_err(),
+            "rejecting an aliased primary must not create breaker authority"
+        );
+
+        let promo_err = promote_recovery_candidate(&primary_a, &candidate, dir.path())
+            .expect_err("promotion must reject a multiply-linked primary database");
+        assert!(
+            promo_err.to_string().contains("has 2 hard links"),
+            "unexpected promotion error: {promo_err}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary_a).as_deref(),
+            Some("shared-live-generation")
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary_b).as_deref(),
+            Some("shared-live-generation")
+        );
+        assert_eq!(
+            sqlite_marker_value(&candidate).as_deref(),
+            Some("fresh-candidate-generation")
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("candidate metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400,
+            "rejection must happen before candidate permission normalization"
+        );
+        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary_a)
+            .expect("aliased primary rejection must not create a recovery receipt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_admission_and_promotion_abort_on_post_validation_parent_swap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let live_dir = root.path().join("live");
+        let decoy_dir = root.path().join("decoy");
+        let displaced_dir = root.path().join("live-displaced");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+
+        let primary = live_dir.join("storage.sqlite3");
+        let decoy_primary = decoy_dir.join("storage.sqlite3");
+        write_marker_db(&primary, "authentic-primary");
+        write_marker_db(&decoy_primary, "decoy-primary");
+
+        recovery_admission().reset();
+        let admission_op_ran = std::cell::Cell::new(false);
+        let live_dir_for_hook = live_dir.clone();
+        let decoy_dir_for_hook = decoy_dir.clone();
+        let displaced_for_hook = displaced_dir.clone();
+        let admission_err = with_recovery_admission_after_validation_hook(
+            move |_path| {
+                std::fs::rename(&live_dir_for_hook, &displaced_for_hook)
+                    .expect("displace validated live directory");
+                std::fs::rename(&decoy_dir_for_hook, &live_dir_for_hook)
+                    .expect("swap decoy directory into live path");
+            },
+            || {
+                with_recovery_admission(&primary, "test recovery", || {
+                    admission_op_ran.set(true);
+                    Ok(())
+                })
+            },
+        )
+        .expect_err("admission must abort when parent directory is swapped after validation");
+        assert!(
+            admission_err.to_string().contains("changed identity"),
+            "unexpected admission error: {admission_err}"
+        );
+        assert!(
+            !admission_op_ran.get(),
+            "operation body must not run after parent swap"
+        );
+        assert!(
+            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&primary))
+                .is_err(),
+            "swapped decoy directory must not receive breaker sidecar writes"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("decoy-primary"),
+            "decoy primary must remain untouched"
+        );
+        assert_eq!(
+            sqlite_marker_value(&displaced_dir.join("storage.sqlite3")).as_deref(),
+            Some("authentic-primary"),
+            "authentic primary in displaced directory must remain intact"
+        );
+
+        // Restore directory layout for the promotion parent-swap check.
+        std::fs::rename(&live_dir, &decoy_dir).unwrap();
+        std::fs::rename(&displaced_dir, &live_dir).unwrap();
+
+        let candidate = live_dir.join("storage.sqlite3.candidate");
+        let decoy_candidate = decoy_dir.join("storage.sqlite3.candidate");
+        write_marker_db(&candidate, "authentic-candidate");
+        write_marker_db(&decoy_candidate, "decoy-candidate");
+        std::fs::set_permissions(&decoy_candidate, std::fs::Permissions::from_mode(0o400))
+            .expect("plant read-only decoy candidate mode");
+
+        let live_dir_for_promo = live_dir.clone();
+        let decoy_dir_for_promo = decoy_dir.clone();
+        let displaced_for_promo = displaced_dir.clone();
+        let promo_err = with_recovery_promotion_after_validation_hook(
+            move |_primary, _candidate| {
+                std::fs::rename(&live_dir_for_promo, &displaced_for_promo)
+                    .expect("displace validated live directory before promotion");
+                std::fs::rename(&decoy_dir_for_promo, &live_dir_for_promo)
+                    .expect("swap decoy directory into live path before promotion");
+            },
+            || {
+                promote_recovery_candidate_with_finalizer(
+                    &primary,
+                    &candidate,
+                    root.path(),
+                    "20261017_000000_000",
+                    crate::forensics::finalize_recovery_receipt,
+                )
+            },
+        )
+        .expect_err("promotion must abort when parent directory is swapped after validation");
+        assert!(
+            promo_err.to_string().contains("changed identity"),
+            "unexpected promotion error: {promo_err}"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("decoy candidate metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400,
+            "decoy candidate must not be chmodded after parent swap"
+        );
+        assert_eq!(
+            sqlite_marker_value(&primary).as_deref(),
+            Some("decoy-primary"),
+            "decoy primary must not be quarantined or overwritten"
+        );
+        assert_eq!(
+            sqlite_marker_value(&displaced_dir.join("storage.sqlite3")).as_deref(),
+            Some("authentic-primary"),
+            "authentic primary must remain intact"
+        );
+        assert_eq!(
+            sqlite_marker_value(&displaced_dir.join("storage.sqlite3.candidate")).as_deref(),
+            Some("authentic-candidate"),
+            "authentic candidate must remain intact"
+        );
+        crate::forensics::verify_recovery_receipt_state(root.path(), &primary)
+            .expect("parent swap rejection must not create or leave a pending receipt");
     }
 
     #[test]
