@@ -223,10 +223,9 @@ pub fn clear_registration_tokens(snapshot_path: &Path) -> Result<i64, ShareError
             message: "cannot begin registration-token cleanup".to_string(),
         })?;
     let result = clear_registration_tokens_from_conn(&conn).and_then(|cleared| {
-        conn.execute_raw("COMMIT")
-            .map_err(|_| ShareError::Sqlite {
-                message: "cannot commit registration-token cleanup".to_string(),
-            })?;
+        conn.execute_raw("COMMIT").map_err(|_| ShareError::Sqlite {
+            message: "cannot commit registration-token cleanup".to_string(),
+        })?;
         Ok(cleared)
     });
     if result.is_err() {
@@ -1613,7 +1612,10 @@ mod tests {
                 let conn = Conn::open_file(db.display().to_string()).unwrap();
                 assert_eq!(delivery_signal_scrub_rows(&conn), original);
                 assert_eq!(message_text(&conn, "body_md"), "Hello world");
-                assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
+                assert_eq!(
+                    message_text(&conn, "archive_metadata_json"),
+                    PRIVATE_ATTACHMENT
+                );
                 for (table, expected) in [
                     ("message_recipients", 1),
                     ("project_mailbox_deliveries", 1),
@@ -1630,8 +1632,11 @@ mod tests {
                     );
                 }
                 assert_eq!(
-                    count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1")
-                        .unwrap(),
+                    count_scalar(
+                        &conn,
+                        "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1"
+                    )
+                    .unwrap(),
                     1
                 );
             }
@@ -1666,8 +1671,16 @@ mod tests {
 
     #[test]
     fn registration_token_cleanup_covers_imported_case_and_preserves_private_archives() {
-        for column in ["registration_token", "REGISTRATION_TOKEN", "Registration_Token"] {
-            for preset in [ScrubPreset::Standard, ScrubPreset::Strict, ScrubPreset::Archive] {
+        for column in [
+            "registration_token",
+            "REGISTRATION_TOKEN",
+            "Registration_Token",
+        ] {
+            for preset in [
+                ScrubPreset::Standard,
+                ScrubPreset::Strict,
+                ScrubPreset::Archive,
+            ] {
                 let dir = tempfile::tempdir().unwrap();
                 let db = create_fixture_db(dir.path());
                 let conn = Conn::open_file(db.display().to_string()).unwrap();
@@ -1680,10 +1693,16 @@ mod tests {
                 scrub_snapshot(&db, preset).unwrap();
                 let conn = Conn::open_file(db.display().to_string()).unwrap();
                 let rows = conn
-                    .query_sync("SELECT registration_token AS token FROM agents WHERE id = 1", &[])
+                    .query_sync(
+                        "SELECT registration_token AS token FROM agents WHERE id = 1",
+                        &[],
+                    )
                     .unwrap();
                 assert_eq!(
-                    rows[0].get_named::<Option<String>>("token").unwrap().as_deref(),
+                    rows[0]
+                        .get_named::<Option<String>>("token")
+                        .unwrap()
+                        .as_deref(),
                     if preset == ScrubPreset::Archive {
                         Some("opaque-credential-sentinel")
                     } else {
@@ -1697,10 +1716,14 @@ mod tests {
                 for _ in 0..2 {
                     clear_registration_tokens(&db).unwrap();
                     let conn = Conn::open_file(db.display().to_string()).unwrap();
-                    assert!(conn
-                        .query_sync("SELECT 1 FROM agents WHERE registration_token IS NOT NULL", &[])
+                    assert!(
+                        conn.query_sync(
+                            "SELECT 1 FROM agents WHERE registration_token IS NOT NULL",
+                            &[]
+                        )
                         .unwrap()
-                        .is_empty());
+                        .is_empty()
+                    );
                 }
             }
         }
@@ -1718,13 +1741,19 @@ mod tests {
                      INSERT INTO agents(id, project_id, name) VALUES (2, 1, 'SecondAgent'); \
                      UPDATE agents SET registration_token = 'opaque-credential-sentinel'; \
                      UPDATE messages SET ack_required = 1; \
-                     UPDATE message_recipients SET read_ts = 'read-before', ack_ts = 'ack-before'"
+                     UPDATE message_recipients SET read_ts = 'read-before', ack_ts = 'ack-before'",
                 )
                 .unwrap();
                 let trigger = match refusal {
-                    "ignore" => "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(IGNORE); END",
-                    "abort" => "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(ABORT, 'blocked'); END",
-                    _ => "CREATE TRIGGER refuse_token_cleanup AFTER UPDATE OF registration_token ON agents WHEN NEW.id = 2 AND NEW.registration_token IS NULL BEGIN UPDATE agents SET registration_token = 'opaque-credential-sentinel' WHERE id = 2; END",
+                    "ignore" => {
+                        "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(IGNORE); END"
+                    }
+                    "abort" => {
+                        "CREATE TRIGGER refuse_token_cleanup BEFORE UPDATE OF registration_token ON agents WHEN OLD.id = 2 BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+                    }
+                    _ => {
+                        "CREATE TRIGGER refuse_token_cleanup AFTER UPDATE OF registration_token ON agents WHEN NEW.id = 2 AND NEW.registration_token IS NULL BEGIN UPDATE agents SET registration_token = 'opaque-credential-sentinel' WHERE id = 2; END"
+                    }
                 };
                 conn.execute_raw(trigger).unwrap();
                 drop(conn);
@@ -1737,13 +1766,26 @@ mod tests {
                 assert!(!error.to_string().contains("opaque-credential-sentinel"));
                 let conn = Conn::open_file(db.display().to_string()).unwrap();
                 let rows = conn
-                    .query_sync("SELECT registration_token AS token FROM agents ORDER BY id", &[])
+                    .query_sync(
+                        "SELECT registration_token AS token FROM agents ORDER BY id",
+                        &[],
+                    )
                     .unwrap();
                 assert_eq!(rows.len(), 2);
-                assert!(rows.iter().all(|row| row.get_named::<String>("token").unwrap()
-                    == "opaque-credential-sentinel"));
+                assert!(
+                    rows.iter()
+                        .all(|row| row.get_named::<String>("token").unwrap()
+                            == "opaque-credential-sentinel")
+                );
                 assert_eq!(message_text(&conn, "body_md"), "Hello world");
-                assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1").unwrap(), 1);
+                assert_eq!(
+                    count_scalar(
+                        &conn,
+                        "SELECT COUNT(*) AS cnt FROM messages WHERE ack_required = 1"
+                    )
+                    .unwrap(),
+                    1
+                );
                 assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients WHERE read_ts = 'read-before' AND ack_ts = 'ack-before'").unwrap(), 1);
             }
         }
@@ -1759,7 +1801,7 @@ mod tests {
             "ALTER TABLE agents ADD COLUMN registration_token TEXT; \
              UPDATE agents SET registration_token = 'opaque-credential-sentinel'; \
              ALTER TABLE agents RENAME TO original_agents; \
-             CREATE VIEW agents AS SELECT * FROM original_agents"
+             CREATE VIEW agents AS SELECT * FROM original_agents",
         )
         .unwrap();
         drop(conn);
@@ -1767,8 +1809,13 @@ mod tests {
         assert!(error.to_string().contains("must be a table"));
         let conn = Conn::open_file(db.display().to_string()).unwrap();
         assert_eq!(
-            conn.query_sync("SELECT registration_token AS token FROM original_agents", &[])
-                .unwrap()[0].get_named::<String>("token").unwrap(),
+            conn.query_sync(
+                "SELECT registration_token AS token FROM original_agents",
+                &[]
+            )
+            .unwrap()[0]
+                .get_named::<String>("token")
+                .unwrap(),
             "opaque-credential-sentinel"
         );
     }
@@ -1784,7 +1831,7 @@ mod tests {
                 "ALTER TABLE agents ADD COLUMN REGISTRATION_TOKEN TEXT; \
                  UPDATE agents SET REGISTRATION_TOKEN = 'opaque-credential-sentinel'; \
                  CREATE TRIGGER refuse_receipt_cleanup BEFORE DELETE ON \
-                 project_mailbox_receipts BEGIN SELECT RAISE(IGNORE); END"
+                 project_mailbox_receipts BEGIN SELECT RAISE(IGNORE); END",
             )
             .unwrap();
             drop(conn);
@@ -1792,15 +1839,32 @@ mod tests {
             assert!(error.to_string().contains("was not cleared"));
             let conn = Conn::open_file(db.display().to_string()).unwrap();
             let tokens = conn
-                .query_sync("SELECT registration_token AS token FROM agents ORDER BY id", &[])
+                .query_sync(
+                    "SELECT registration_token AS token FROM agents ORDER BY id",
+                    &[],
+                )
                 .unwrap();
             assert_eq!(tokens.len(), 2);
-            assert!(tokens.iter().all(|row| row.get_named::<String>("token").unwrap()
-                == "opaque-credential-sentinel"));
+            assert!(tokens.iter().all(
+                |row| row.get_named::<String>("token").unwrap() == "opaque-credential-sentinel"
+            ));
             assert_eq!(message_text(&conn, "body_md"), "Hello world");
-            assert_eq!(message_text(&conn, "archive_metadata_json"), PRIVATE_ATTACHMENT);
-            assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM project_mailbox_receipts").unwrap(), 2);
-            assert_eq!(count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients").unwrap(), 1);
+            assert_eq!(
+                message_text(&conn, "archive_metadata_json"),
+                PRIVATE_ATTACHMENT
+            );
+            assert_eq!(
+                count_scalar(
+                    &conn,
+                    "SELECT COUNT(*) AS cnt FROM project_mailbox_receipts"
+                )
+                .unwrap(),
+                2
+            );
+            assert_eq!(
+                count_scalar(&conn, "SELECT COUNT(*) AS cnt FROM message_recipients").unwrap(),
+                1
+            );
         }
     }
 

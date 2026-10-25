@@ -1157,20 +1157,29 @@ mod tests {
     fn source_read_panics_retire_the_reader_and_leave_repairable_mail() {
         for after_projection in [false, true] {
             fixture(|cx, pool, config| {
-                let failed = with_source_connection(cx, pool, |conn| -> Result<PreparedMessage, ReconcileFailure> {
-                    conn.execute_raw("PRAGMA query_only = ON").unwrap();
-                    assert_eq!(query_only(conn), 1);
-                    if after_projection {
-                        let prepared = read_source(901, |sql, params| {
-                            conn.query_sync(sql, params)
-                                .map_err(ReconcileFailure::source_unavailable)
-                        })?;
-                        assert_eq!(prepared.body, "Keep this body.");
-                    }
-                    panic!("private-source-panic-payload");
-                });
-                let failure = failed.err().expect("a panic must not publish a source projection");
-                assert!(failure.transient, "the bounded retry lane must retain this ID");
+                let failed = with_source_connection(
+                    cx,
+                    pool,
+                    |conn| -> Result<PreparedMessage, ReconcileFailure> {
+                        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+                        assert_eq!(query_only(conn), 1);
+                        if after_projection {
+                            let prepared = read_source(901, |sql, params| {
+                                conn.query_sync(sql, params)
+                                    .map_err(ReconcileFailure::source_unavailable)
+                            })?;
+                            assert_eq!(prepared.body, "Keep this body.");
+                        }
+                        panic!("private-source-panic-payload");
+                    },
+                );
+                let failure = failed
+                    .err()
+                    .expect("a panic must not publish a source projection");
+                assert!(
+                    failure.transient,
+                    "the bounded retry lane must retain this ID"
+                );
                 assert!(failure.detail.contains("panicked"));
                 assert!(!failure.detail.contains("private-source-panic-payload"));
                 let conn = outcome(block_on(pool.acquire(cx))).unwrap();

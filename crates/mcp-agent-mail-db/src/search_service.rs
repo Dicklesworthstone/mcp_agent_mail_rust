@@ -10349,7 +10349,8 @@ mod tests {
             if !self.is_ready() {
                 return HashEmbedder::new().embed(text);
             }
-            if let Some((path, statements)) = self.on_first_embedding.lock().unwrap().take() {
+            let first_embedding = self.on_first_embedding.lock().unwrap().take();
+            if let Some((path, statements)) = first_embedding {
                 let conn = crate::guard_db_conn(
                     crate::DbConn::open_file(&path).unwrap(),
                     "in-flight history edit fixture",
@@ -10435,7 +10436,8 @@ mod tests {
     fn manual_semantic_history_bridge(embedder: Arc<FixedSemanticTestEmbedder>) -> SemanticBridge {
         let bridge = SemanticBridge::new_with_embedder(VectorIndexConfig::default(), embedder);
         bridge.refresh_worker.shutdown();
-        if let Some(worker) = bridge.worker.lock().unwrap().take() {
+        let worker = bridge.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
             worker.join().unwrap();
         }
         bridge
