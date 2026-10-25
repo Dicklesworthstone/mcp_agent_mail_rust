@@ -1000,12 +1000,17 @@ impl SearchRolloutConfig {
     /// Applies kill switch degradation (e.g., Hybrid -> Lexical if semantic disabled).
     #[must_use]
     pub fn effective_engine(&self, surface: &str) -> SearchEngine {
-        let base = self
-            .surface_overrides
+        self.allowed_engine(self.configured_engine(surface))
+    }
+
+    /// The engine configured for `surface` (its override, else the global
+    /// engine) before the kill switches are applied.
+    #[must_use]
+    pub fn configured_engine(&self, surface: &str) -> SearchEngine {
+        self.surface_overrides
             .get(surface)
             .copied()
-            .unwrap_or(self.engine);
-        self.allowed_engine(base)
+            .unwrap_or(self.engine)
     }
 
     /// `engine` with the kill switches applied: while semantic search is

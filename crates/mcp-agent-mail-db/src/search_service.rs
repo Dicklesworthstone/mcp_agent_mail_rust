@@ -272,10 +272,20 @@ fn engine_for(
     options: &SearchOptions,
     rollout: &mcp_agent_mail_core::config::SearchRolloutConfig,
 ) -> SearchEngine {
-    options.search_engine.map_or_else(
-        || rollout.effective_engine(options.surface.unwrap_or_default()),
-        |requested| rollout.allowed_engine(requested),
-    )
+    engine_resolution(options, rollout).0
+}
+
+/// [`engine_for`], plus whether the semantic kill switch changed the engine
+/// that was asked for (a semantic, hybrid or auto request run lexical).
+fn engine_resolution(
+    options: &SearchOptions,
+    rollout: &mcp_agent_mail_core::config::SearchRolloutConfig,
+) -> (SearchEngine, bool) {
+    let wanted = options
+        .search_engine
+        .unwrap_or_else(|| rollout.configured_engine(options.surface.unwrap_or_default()));
+    let engine = rollout.allowed_engine(wanted);
+    (engine, engine != wanted)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4425,6 +4435,7 @@ async fn maybe_apply_hybrid_rerank(
     };
 
     if !config.enabled {
+        global_metrics().search.record_rerank_killswitch();
         return audit;
     }
     if candidate_count < config.min_candidates {
@@ -5150,7 +5161,13 @@ pub async fn execute_search(
     let (hinted, assistance) = apply_query_hints(cx, pool, query).await;
     let query = hinted.as_ref().unwrap_or(query);
     let product_sql_budget = product_sql_budget_state(cx, query);
-    let engine = engine_for_text_fields(resolve_search_engine(options), query);
+    let (resolved_engine, kill_switched) =
+        engine_resolution(options, &mcp_agent_mail_core::Config::get().search_rollout);
+    if kill_switched {
+        // Counted once per executed query (the cache key resolves it again).
+        global_metrics().search.record_semantic_killswitch();
+    }
+    let engine = engine_for_text_fields(resolved_engine, query);
     let needs_lexical_freshness = matches!(
         engine,
         SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
@@ -6111,6 +6128,30 @@ mod tests {
                 "{options:?}"
             );
         }
+
+        // br-q12li: a resolution reports the kill switch only when it changed
+        // the engine that was asked for.
+        for options in [
+            opts(None, None),
+            opts(None, Some("search_messages")),
+            opts(Some(SearchEngine::Semantic), None),
+        ] {
+            assert_eq!(
+                engine_resolution(&options, &killed),
+                (SearchEngine::Lexical, true),
+                "{options:?}"
+            );
+        }
+        assert_eq!(
+            engine_resolution(&opts(Some(SearchEngine::Lexical), None), &killed),
+            (SearchEngine::Lexical, false),
+            "a lexical request is not a kill-switch hit"
+        );
+        assert_eq!(
+            engine_resolution(&opts(None, Some("search_messages")), &enabled),
+            (SearchEngine::Hybrid, false),
+            "an allowed semantic-capable engine is not a kill-switch hit"
+        );
     }
 
     /// GH#227: message ingestion must invalidate the process-wide search
@@ -6731,6 +6772,98 @@ mod tests {
         }
         crate::search_v3::reset_bridge_for_tests();
         reset_lexical_bootstrap_tracking();
+    }
+
+    /// br-q12li: "Semantic kill-switch hits" in `am doctor` and robot output
+    /// never moved. An executed query that asked for a semantic-capable engine
+    /// while semantic search is disabled counts exactly once (the cache key
+    /// resolves the engine a second time and must not count), and a lexical
+    /// query does not count.
+    #[cfg(feature = "tantivy-engine")]
+    #[test]
+    fn executed_semantic_request_under_the_kill_switch_counts_one_hit() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !mcp_agent_mail_core::Config::get()
+                .search_rollout
+                .semantic_enabled,
+            "semantic search is opt-in by default"
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        reset_lexical_bootstrap_tracking();
+        crate::search_v3::reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let pool = temp_file_pool(root.path(), "killswitch.sqlite3");
+        let hits = || global_metrics().snapshot().search.semantic_killswitch_hits;
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = crate::queries::ensure_project(&cx, &pool, "/search-killswitch")
+                .await
+                .into_result()
+                .unwrap();
+            let project_id = project.id.unwrap();
+            let query = SearchQuery::messages("osprey", project_id);
+            for (engine, expected) in [
+                (SearchEngine::Hybrid, 1),
+                (SearchEngine::Lexical, 0),
+                (SearchEngine::Semantic, 1),
+            ] {
+                let options = SearchOptions {
+                    search_engine: Some(engine),
+                    ..Default::default()
+                };
+                let before = hits();
+                execute_search(&cx, &pool, &query, &options)
+                    .await
+                    .into_result()
+                    .unwrap();
+                assert_eq!(hits() - before, expected, "{engine:?}");
+            }
+        });
+        crate::search_v3::reset_bridge_for_tests();
+        reset_lexical_bootstrap_tracking();
+    }
+
+    /// br-q12li: "Rerank kill-switch hits" never moved. A hybrid result set
+    /// that reaches the rerank stage while `AM_SEARCH_RERANK_ENABLED` is off
+    /// (the default) counts one hit and is left unreranked.
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn rerank_stage_under_the_kill_switch_counts_one_hit() {
+        assert!(
+            std::env::var_os(AM_SEARCH_RERANK_ENABLED_ENV).is_none(),
+            "this test needs the default (disabled) rerank switch"
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let mut merged: Vec<SearchResult> = (1..=8)
+            .map(|id| SearchResult {
+                doc_kind: DocKind::Message,
+                id,
+                project_id: Some(1),
+                ..SearchResult::default()
+            })
+            .collect();
+        let hits = || global_metrics().snapshot().search.rerank_killswitch_hits;
+        let before = hits();
+        let audit = runtime.block_on(async {
+            let cx = Cx::for_testing();
+            maybe_apply_hybrid_rerank(&cx, &SearchQuery::messages("osprey", 1), &mut merged).await
+        });
+        assert_eq!(hits() - before, 1);
+        assert!(!audit.enabled);
+        assert!(!audit.attempted);
+        assert_eq!(audit.outcome, "disabled");
+        assert_eq!(
+            merged.iter().map(|result| result.id).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>(),
+            "a disabled reranker leaves the order alone"
+        );
     }
 
     /// br-ekdk1: the step before the result cache only observes the source
