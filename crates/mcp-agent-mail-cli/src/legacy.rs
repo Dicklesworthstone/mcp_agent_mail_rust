@@ -2208,6 +2208,10 @@ fn resolve_legacy_authorities(
 }
 
 fn process_env_value_for_legacy(key: &str) -> CliResult<Option<String>> {
+    #[cfg(test)]
+    if TEST_LEGACY_IGNORE_PROCESS_ENV.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
     match std::env::var(key) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -2324,6 +2328,18 @@ fn parse_env_file_map(text: &str) -> BTreeMap<String, String> {
     out
 }
 
+#[cfg(test)]
+type LegacyEnvAuthorityReadHook = dyn FnMut(&Path, Option<&str>) -> std::io::Result<()>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LEGACY_IGNORE_PROCESS_ENV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_LEGACY_USER_ENV_CANDIDATES: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_LEGACY_ENV_AFTER_READ_HOOK: std::cell::RefCell<Option<Box<LegacyEnvAuthorityReadHook>>> =
+        std::cell::RefCell::new(None);
+}
+
 fn capture_legacy_env_snapshot(
     search_root: &Path,
     needs_database_authority: bool,
@@ -2332,13 +2348,28 @@ fn capture_legacy_env_snapshot(
     if !needs_database_authority && !needs_storage_authority {
         return Ok(LegacyEnvSnapshot::default());
     }
+    #[cfg(test)]
+    let user_candidates = TEST_LEGACY_USER_ENV_CANDIDATES
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(user_env_authority_candidates);
+    #[cfg(not(test))]
     let user_candidates = user_env_authority_candidates();
     capture_legacy_env_snapshot_with_reader(
         search_root,
         &user_candidates,
         needs_database_authority,
         needs_storage_authority,
-        read_env_authority_text,
+        |path| {
+            let observed = read_env_authority_text(path)?;
+            #[cfg(test)]
+            TEST_LEGACY_ENV_AFTER_READ_HOOK.with(|slot| -> std::io::Result<()> {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(path, observed.as_deref())?;
+                }
+                Ok(())
+            })?;
+            Ok(observed)
+        },
     )
 }
 
@@ -2432,6 +2463,19 @@ fn require_unchanged_env_authority(
 
 fn resolve_search_root(search_root: Option<PathBuf>) -> PathBuf {
     let root = search_root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if std::fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if let (Some(parent), Some(name)) = (root.parent(), root.file_name()) {
+            let resolved_parent = if parent.as_os_str().is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            } else {
+                parent
+                    .canonicalize()
+                    .unwrap_or_else(|_| parent.to_path_buf())
+            };
+            return resolved_parent.join(name);
+        }
+        return root;
+    }
     root.canonicalize().unwrap_or(root)
 }
 
@@ -3622,6 +3666,352 @@ mod tests {
                 .to_string()
                 .contains("unsafe legacy environment authority")
         );
+    }
+
+    fn with_isolated_legacy_env_authorities_for_test<R>(
+        user_candidates: Vec<PathBuf>,
+        after_read: impl FnMut(&Path, Option<&str>) -> std::io::Result<()> + 'static,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                TEST_LEGACY_IGNORE_PROCESS_ENV.with(|flag| flag.set(false));
+                TEST_LEGACY_USER_ENV_CANDIDATES.with(|slot| *slot.borrow_mut() = None);
+                TEST_LEGACY_ENV_AFTER_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+
+        TEST_LEGACY_IGNORE_PROCESS_ENV.with(|flag| flag.set(true));
+        TEST_LEGACY_USER_ENV_CANDIDATES.with(|slot| *slot.borrow_mut() = Some(user_candidates));
+        TEST_LEGACY_ENV_AFTER_READ_HOOK
+            .with(|slot| *slot.borrow_mut() = Some(Box::new(after_read)));
+        let _guard = ResetGuard;
+        f()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_import_plan_rejects_project_leaf_and_parent_swaps_with_zero_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let moved_project = tmp.path().join("project-bound");
+        fs::create_dir(&project).unwrap();
+        let source_db = project.join("source.sqlite3");
+        fs::write(&source_db, b"sqlite").unwrap();
+        let source_storage = project.join("source-storage");
+        fs::create_dir_all(source_storage.join("projects")).unwrap();
+        let target_db = tmp.path().join("target.sqlite3");
+        let target_storage = tmp.path().join("target-storage");
+
+        // 1. Project leaf swap during import plan capture.
+        let project_env = project.join(".env");
+        fs::write(
+            &project_env,
+            format!(
+                "DATABASE_URL=sqlite:///{}\nSTORAGE_ROOT={}\n",
+                source_db.display(),
+                source_storage.display()
+            ),
+        )
+        .unwrap();
+        let leaf_swapped = std::cell::Cell::new(false);
+        let project_env_for_hook = project_env.clone();
+        let leaf_swap_err = with_isolated_legacy_env_authorities_for_test(
+            Vec::new(),
+            move |path, observed| {
+                if path == project_env_for_hook && observed.is_some() && !leaf_swapped.replace(true)
+                {
+                    let replacement = path.with_file_name(".env.swapped");
+                    fs::write(
+                        &replacement,
+                        "DATABASE_URL=sqlite:///./redirected.sqlite3\nSTORAGE_ROOT=./redirected-storage\n",
+                    )?;
+                    fs::rename(&replacement, path)?;
+                }
+                Ok(())
+            },
+            || {
+                build_import_plan(&ImportOptions {
+                    auto: false,
+                    search_root: Some(project.clone()),
+                    db: None,
+                    storage_root: None,
+                    target_db: Some(target_db.clone()),
+                    target_storage_root: Some(target_storage.clone()),
+                    dry_run: false,
+                    yes: true,
+                })
+            },
+        )
+        .expect_err("project leaf swap during plan capture must fail closed");
+        assert!(
+            leaf_swap_err
+                .to_string()
+                .contains("changed while capturing"),
+            "unexpected error: {leaf_swap_err}"
+        );
+        assert!(!target_db.exists());
+        assert!(!target_storage.exists());
+
+        // 2. Project parent swap during import plan capture, plus symlinked search_root refusal.
+        fs::write(
+            &project_env,
+            format!(
+                "DATABASE_URL=sqlite:///{}\nSTORAGE_ROOT={}\n",
+                source_db.display(),
+                source_storage.display()
+            ),
+        )
+        .unwrap();
+        let parent_swapped = std::cell::Cell::new(false);
+        let project_for_hook = project.clone();
+        let moved_project_for_hook = moved_project.clone();
+        let project_env_for_parent_hook = project_env.clone();
+        let parent_swap_err = with_isolated_legacy_env_authorities_for_test(
+            Vec::new(),
+            move |path, observed| {
+                if path == project_env_for_parent_hook
+                    && observed.is_some()
+                    && !parent_swapped.replace(true)
+                {
+                    fs::rename(&project_for_hook, &moved_project_for_hook)?;
+                    symlink(&moved_project_for_hook, &project_for_hook)?;
+                }
+                Ok(())
+            },
+            || {
+                build_import_plan(&ImportOptions {
+                    auto: false,
+                    search_root: Some(project.clone()),
+                    db: None,
+                    storage_root: None,
+                    target_db: Some(target_db.clone()),
+                    target_storage_root: Some(target_storage.clone()),
+                    dry_run: false,
+                    yes: true,
+                })
+            },
+        )
+        .expect_err("project parent swap during plan capture must fail closed");
+        assert!(
+            parent_swap_err
+                .to_string()
+                .contains("unsafe legacy environment authority"),
+            "unexpected error: {parent_swap_err}"
+        );
+        assert!(!target_db.exists());
+        assert!(!target_storage.exists());
+
+        // 3. Even a pre-existing symlinked search_root is rejected because resolve_search_root
+        // preserves the leaf symlink for O_NOFOLLOW parent validation.
+        let symlink_root_err = with_isolated_legacy_env_authorities_for_test(
+            Vec::new(),
+            |_path, _observed| Ok(()),
+            || {
+                build_import_plan(&ImportOptions {
+                    auto: false,
+                    search_root: Some(project.clone()),
+                    db: None,
+                    storage_root: None,
+                    target_db: Some(target_db.clone()),
+                    target_storage_root: Some(target_storage.clone()),
+                    dry_run: false,
+                    yes: true,
+                })
+            },
+        )
+        .expect_err("symlinked search_root must not bypass no-follow parent check");
+        assert!(
+            symlink_root_err
+                .to_string()
+                .contains("unsafe legacy environment authority"),
+            "unexpected error: {symlink_root_err}"
+        );
+        assert!(!target_db.exists());
+        assert!(!target_storage.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_import_plan_rejects_user_leaf_and_parent_swaps_and_invalid_authorities_without_fallback()
+     {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let source_db = project.join("source.sqlite3");
+        fs::write(&source_db, b"sqlite").unwrap();
+        let source_storage = project.join("source-storage");
+        fs::create_dir_all(source_storage.join("projects")).unwrap();
+        let target_db = tmp.path().join("target.sqlite3");
+        let target_storage = tmp.path().join("target-storage");
+
+        let user_dir = tmp.path().join("user-config");
+        let moved_user_dir = tmp.path().join("user-config-bound");
+        let fallback_dir = tmp.path().join("user-fallback");
+        fs::create_dir(&user_dir).unwrap();
+        fs::create_dir(&fallback_dir).unwrap();
+        let primary_user_env = user_dir.join("config.env");
+        let fallback_user_env = fallback_dir.join(".env");
+        let valid_env_body = format!(
+            "DATABASE_URL=sqlite:///{}\nSTORAGE_ROOT={}\n",
+            source_db.display(),
+            source_storage.display()
+        );
+        fs::write(&primary_user_env, &valid_env_body).unwrap();
+        fs::write(&fallback_user_env, &valid_env_body).unwrap();
+
+        // 1. User leaf swap during plan capture refuses without falling back to fallback_user_env.
+        let user_leaf_swapped = std::cell::Cell::new(false);
+        let primary_for_leaf_hook = primary_user_env.clone();
+        let leaf_swap_err = with_isolated_legacy_env_authorities_for_test(
+            vec![primary_user_env.clone(), fallback_user_env.clone()],
+            move |path, observed| {
+                if path == primary_for_leaf_hook
+                    && observed.is_some()
+                    && !user_leaf_swapped.replace(true)
+                {
+                    let replacement = path.with_file_name("config.env.swapped");
+                    fs::write(
+                        &replacement,
+                        "DATABASE_URL=sqlite:///./redirected.sqlite3\nSTORAGE_ROOT=./redirected-storage\n",
+                    )?;
+                    fs::rename(&replacement, path)?;
+                }
+                Ok(())
+            },
+            || {
+                build_import_plan(&ImportOptions {
+                    auto: false,
+                    search_root: Some(project.clone()),
+                    db: None,
+                    storage_root: None,
+                    target_db: Some(target_db.clone()),
+                    target_storage_root: Some(target_storage.clone()),
+                    dry_run: false,
+                    yes: true,
+                })
+            },
+        )
+        .expect_err("user leaf swap must fail closed without falling back");
+        assert!(
+            leaf_swap_err
+                .to_string()
+                .contains("changed while capturing"),
+            "unexpected error: {leaf_swap_err}"
+        );
+        assert!(!target_db.exists());
+        assert!(!target_storage.exists());
+
+        // 2. Non-regular (directory) higher-precedence user authority refuses without fallback.
+        let retired_primary = user_dir.join("config.env.retired-regular");
+        fs::rename(&primary_user_env, &retired_primary).unwrap();
+        fs::create_dir(&primary_user_env).unwrap();
+        let dir_err = with_isolated_legacy_env_authorities_for_test(
+            vec![primary_user_env.clone(), fallback_user_env.clone()],
+            |_path, _observed| Ok(()),
+            || {
+                build_import_plan(&ImportOptions {
+                    auto: false,
+                    search_root: Some(project.clone()),
+                    db: None,
+                    storage_root: None,
+                    target_db: Some(target_db.clone()),
+                    target_storage_root: Some(target_storage.clone()),
+                    dry_run: false,
+                    yes: true,
+                })
+            },
+        )
+        .expect_err("directory user authority must fail closed without fallback");
+        assert!(
+            dir_err
+                .to_string()
+                .contains("unsafe legacy environment authority"),
+            "unexpected error: {dir_err}"
+        );
+        assert!(!target_db.exists());
+        assert!(!target_storage.exists());
+
+        let retired_dir = user_dir.join("config.env.retired-dir");
+        fs::rename(&primary_user_env, &retired_dir).unwrap();
+        fs::rename(&retired_primary, &primary_user_env).unwrap();
+        fs::write(&primary_user_env, &valid_env_body).unwrap();
+
+        // 3. Unreadable (0o000) higher-precedence user authority refuses without fallback when non-root.
+        if nix::unistd::geteuid().as_raw() != 0 {
+            fs::set_permissions(&primary_user_env, fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable_err = with_isolated_legacy_env_authorities_for_test(
+                vec![primary_user_env.clone(), fallback_user_env.clone()],
+                |_path, _observed| Ok(()),
+                || {
+                    build_import_plan(&ImportOptions {
+                        auto: false,
+                        search_root: Some(project.clone()),
+                        db: None,
+                        storage_root: None,
+                        target_db: Some(target_db.clone()),
+                        target_storage_root: Some(target_storage.clone()),
+                        dry_run: false,
+                        yes: true,
+                    })
+                },
+            )
+            .expect_err("unreadable user authority must fail closed without fallback");
+            fs::set_permissions(&primary_user_env, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                unreadable_err
+                    .to_string()
+                    .contains("unsafe legacy environment authority"),
+                "unexpected error: {unreadable_err}"
+            );
+            assert!(!target_db.exists());
+            assert!(!target_storage.exists());
+        }
+
+        // 4. User parent swap during plan capture refuses without fallback.
+        let user_parent_swapped = std::cell::Cell::new(false);
+        let primary_for_parent_hook = primary_user_env.clone();
+        let user_dir_for_hook = user_dir.clone();
+        let moved_user_dir_for_hook = moved_user_dir.clone();
+        let parent_swap_err = with_isolated_legacy_env_authorities_for_test(
+            vec![primary_user_env, fallback_user_env],
+            move |path, observed| {
+                if path == primary_for_parent_hook
+                    && observed.is_some()
+                    && !user_parent_swapped.replace(true)
+                {
+                    fs::rename(&user_dir_for_hook, &moved_user_dir_for_hook)?;
+                    symlink(&moved_user_dir_for_hook, &user_dir_for_hook)?;
+                }
+                Ok(())
+            },
+            || {
+                build_import_plan(&ImportOptions {
+                    auto: false,
+                    search_root: Some(project.clone()),
+                    db: None,
+                    storage_root: None,
+                    target_db: Some(target_db.clone()),
+                    target_storage_root: Some(target_storage.clone()),
+                    dry_run: false,
+                    yes: true,
+                })
+            },
+        )
+        .expect_err("user parent swap must fail closed without fallback");
+        assert!(
+            parent_swap_err
+                .to_string()
+                .contains("unsafe legacy environment authority"),
+            "unexpected error: {parent_swap_err}"
+        );
+        assert!(!target_db.exists());
+        assert!(!target_storage.exists());
     }
 
     #[test]
