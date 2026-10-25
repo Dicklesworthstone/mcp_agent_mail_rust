@@ -1194,26 +1194,38 @@ fn sqlite_path_requires_lock_neutral_fingerprint(path: &Path) -> bool {
 /// commit, or generation replacement changes it without sacrificing locks.
 #[must_use]
 fn lock_neutral_sqlite_generation_fingerprint(path: &Path) -> String {
+    lock_neutral_sqlite_generation_fingerprint_with_observer(path, || {})
+}
+
+#[must_use]
+fn lock_neutral_sqlite_generation_fingerprint_with_observer(
+    path: &Path,
+    mut between_passes: impl FnMut(),
+) -> String {
     use sha2::Digest as _;
 
-    fn hash_metadata(
+    const SUFFIXES: [&str; 8] = [
+        "",
+        "-journal",
+        "-wal",
+        "-shm",
+        "-wal-cert",
+        "-wal-cert-head",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+    ];
+
+    fn encode_metadata(
         hasher: &mut sha2::Sha256,
         label: &[u8],
-        path: &Path,
-    ) -> Result<Option<u64>, ()> {
+        metadata: Option<&std::fs::Metadata>,
+    ) {
         hasher.update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(label);
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                hasher.update([0]);
-                return Ok(None);
-            }
-            Err(_) => return Err(()),
+        let Some(metadata) = metadata else {
+            hasher.update([0]);
+            return;
         };
-        if !metadata.file_type().is_file() {
-            return Err(());
-        }
         hasher.update([1]);
         hasher.update(metadata.len().to_le_bytes());
         hasher.update([u8::from(metadata.permissions().readonly())]);
@@ -1245,36 +1257,119 @@ fn lock_neutral_sqlite_generation_fingerprint(path: &Path) -> String {
         {
             use std::os::windows::fs::MetadataExt as _;
 
-            // volume_serial_number()/file_index() are still unstable
-            // (windows_by_handle) and cannot be used without a feature gate,
-            // so the generation witness hashes only the stable metadata
-            // fields; the length and modification timestamps hashed above
-            // already capture content-change signals.
             hasher.update(metadata.file_attributes().to_le_bytes());
             hasher.update(metadata.creation_time().to_le_bytes());
             hasher.update(metadata.last_write_time().to_le_bytes());
         }
+    }
 
-        Ok(Some(metadata.len()))
+    fn metadata_matches(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+        if before.len() != after.len()
+            || before.permissions().readonly() != after.permissions().readonly()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            if before.dev() != after.dev()
+                || before.ino() != after.ino()
+                || before.mode() != after.mode()
+                || before.nlink() != after.nlink()
+                || before.mtime() != after.mtime()
+                || before.mtime_nsec() != after.mtime_nsec()
+                || before.ctime() != after.ctime()
+                || before.ctime_nsec() != after.ctime_nsec()
+            {
+                return false;
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if before.file_attributes() != after.file_attributes()
+                || before.creation_time() != after.creation_time()
+                || before.last_write_time() != after.last_write_time()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn inspect_member(path: &Path, suffix: &str) -> Result<Option<std::fs::Metadata>, ()> {
+        let member_path = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            sqlite_sidecar_path(path, suffix)
+        };
+        match std::fs::symlink_metadata(&member_path) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata)),
+            Ok(_) => Err(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_before = match std::fs::symlink_metadata(parent_path) {
+        Ok(metadata) if metadata.file_type().is_dir() => metadata,
+        Ok(_) => return "unreadable".to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return "missing".to_string();
+        }
+        Err(_) => return "unreadable".to_string(),
+    };
+
+    let mut first_pass = Vec::with_capacity(SUFFIXES.len());
+    for suffix in SUFFIXES {
+        let Ok(member) = inspect_member(path, suffix) else {
+            return "unreadable".to_string();
+        };
+        first_pass.push(member);
+    }
+
+    between_passes();
+
+    let Ok(parent_after) = std::fs::symlink_metadata(parent_path) else {
+        return "unreadable".to_string();
+    };
+    if !parent_after.file_type().is_dir() {
+        return "unreadable".to_string();
+    }
+    #[cfg(unix)]
+    if parent_before.dev() != parent_after.dev() || parent_before.ino() != parent_after.ino() {
+        return "unreadable".to_string();
+    }
+
+    for (suffix, before) in SUFFIXES.into_iter().zip(&first_pass) {
+        let Ok(after) = inspect_member(path, suffix) else {
+            return "unreadable".to_string();
+        };
+        match (before.as_ref(), after.as_ref()) {
+            (None, None) => {}
+            (Some(before), Some(after)) if metadata_matches(before, after) => {}
+            _ => return "unreadable".to_string(),
+        }
+    }
+
+    if first_pass.iter().all(Option::is_none) {
+        return "missing".to_string();
     }
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"mcp-agent-mail-lock-neutral-sqlite-generation-v1\0");
-    let main_len = match hash_metadata(&mut hasher, b"main", path) {
-        Ok(Some(len)) => len,
-        Ok(None) => return "missing".to_string(),
-        Err(()) => return "unreadable".to_string(),
-    };
-    for suffix in ["-journal", "-wal", "-wal-cert", "-wal-cert-head"] {
-        if hash_metadata(
-            &mut hasher,
-            suffix.as_bytes(),
-            &sqlite_sidecar_path(path, suffix),
-        )
-        .is_err()
-        {
-            return "unreadable".to_string();
-        }
+    let main_len = first_pass[0].as_ref().map_or(0, std::fs::Metadata::len);
+    for (suffix, metadata) in SUFFIXES.into_iter().zip(&first_pass) {
+        let label = if suffix.is_empty() {
+            b"main".as_slice()
+        } else {
+            suffix.as_bytes()
+        };
+        encode_metadata(&mut hasher, label, metadata.as_ref());
     }
     let digest = hex::encode(hasher.finalize());
     format!(
@@ -12100,6 +12195,7 @@ fn apply_classified_sqlite_family_cleanup_with_hook<F>(
 where
     F: FnMut(&Path),
 {
+    let parent_anchor = AnchoredRecoveryParent::capture(db_path, "SQLite-family cleanup")?;
     let plan = classify_sqlite_family_cleanup(db_path)?;
     if plan.is_empty() {
         return Ok(SqliteFamilyCleanupOutcome::NotNeeded);
@@ -12119,6 +12215,9 @@ where
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
         before_move(&witness.path);
+        if let Err(error) = parent_anchor.verify_parent_only("SQLite-family cleanup") {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
@@ -12131,6 +12230,9 @@ where
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
         before_move(&witness.path);
+        if let Err(error) = parent_anchor.verify_parent_only("SQLite-family cleanup") {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
@@ -12143,6 +12245,9 @@ where
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
         before_move(&witness.path);
+        if let Err(error) = parent_anchor.verify_parent_only("SQLite-family cleanup") {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         let reason = if wal {
             "companion WAL is classified for quarantine"
         } else {
@@ -12160,6 +12265,9 @@ where
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
         before_move(&witness.path);
+        if let Err(error) = parent_anchor.verify_parent_only("SQLite-family cleanup") {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
@@ -14111,6 +14219,8 @@ fn quarantine_sqlite_sidecars_after_checkpoint_with_hook<F>(
 where
     F: FnMut(&Path),
 {
+    let parent_anchor =
+        AnchoredRecoveryParent::capture(primary_path, "checkpoint sidecar cleanup")?;
     refuse_sqlite_family_cleanup_while_owned(primary_path)?;
     let sidecars = classify_sqlite_sidecars_after_checkpoint(primary_path)?;
     let mut quarantine_nonce = None;
@@ -14120,6 +14230,9 @@ where
             return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
         }
         before_move(&witness.path);
+        if let Err(error) = parent_anchor.verify_parent_only("checkpoint sidecar cleanup") {
+            return Err(rollback_prior_sqlite_cleanup_moves(&moved, error));
+        }
         quarantine_sqlite_cleanup_sidecar_or_rollback(
             witness,
             &mut quarantine_nonce,
@@ -17483,18 +17596,109 @@ fn stage_backup_restore_candidate(
     primary_path: &Path,
     timestamp: &str,
 ) -> Result<PathBuf, SqlError> {
-    let restore_candidate = restore_candidate_path(primary_path, timestamp);
-    if let Err(error) = copy_file_without_overwrite(backup_path, &restore_candidate) {
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            cleanup_sqlite_candidate_artifact(&restore_candidate);
-        }
-        return Err(SqlError::Custom(format!(
+    stage_backup_restore_candidate_with_hook(backup_path, primary_path, timestamp, |_| {})
+}
+
+fn stage_backup_restore_candidate_with_hook<F>(
+    backup_path: &Path,
+    primary_path: &Path,
+    timestamp: &str,
+    mut before_copy: F,
+) -> Result<PathBuf, SqlError>
+where
+    F: FnMut(&Path),
+{
+    let parent_anchor =
+        AnchoredRecoveryParent::capture(primary_path, "sqlite backup restore staging")?;
+    let source_witness = SqliteFileWitness::capture_regular(backup_path).map_err(|error| {
+        let candidate = restore_candidate_path(primary_path, timestamp);
+        SqlError::Custom(format!(
             "failed to stage sqlite backup {} into {}: {error}",
             backup_path.display(),
-            restore_candidate.display()
-        )));
+            candidate.display()
+        ))
+    })?;
+
+    for collision in 0..=9_999_u32 {
+        let suffix = if collision == 0 {
+            format!(".restoring-{timestamp}")
+        } else {
+            format!(".restoring-{timestamp}-{collision:02}")
+        };
+        let restore_candidate = sqlite_path_with_file_name_suffix(
+            primary_path,
+            &suffix,
+            &format!("storage.sqlite3{suffix}"),
+        );
+        if sqlite_candidate_artifact_conflicts(&restore_candidate) {
+            continue;
+        }
+        before_copy(&restore_candidate);
+        parent_anchor.verify_parent_only("sqlite backup restore staging")?;
+        let current_source = SqliteFileWitness::capture_regular(backup_path).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to stage sqlite backup {} into {}: {error}",
+                backup_path.display(),
+                restore_candidate.display()
+            ))
+        })?;
+        if !source_witness.same_generation(&current_source) {
+            return Err(SqlError::Custom(format!(
+                "failed to stage sqlite backup {} into {}: source changed identity or bytes before copy",
+                backup_path.display(),
+                restore_candidate.display()
+            )));
+        }
+        match copy_file_without_overwrite(backup_path, &restore_candidate) {
+            Ok(()) => {
+                let after_source =
+                    SqliteFileWitness::capture_regular(backup_path).map_err(|error| {
+                        cleanup_sqlite_candidate_artifact(&restore_candidate);
+                        SqlError::Custom(format!(
+                            "failed to stage sqlite backup {} into {}: {error}",
+                            backup_path.display(),
+                            restore_candidate.display()
+                        ))
+                    })?;
+                let staged_witness = SqliteFileWitness::capture_regular(&restore_candidate)
+                    .map_err(|error| {
+                        cleanup_sqlite_candidate_artifact(&restore_candidate);
+                        SqlError::Custom(format!(
+                            "failed to stage sqlite backup {} into {}: {error}",
+                            backup_path.display(),
+                            restore_candidate.display()
+                        ))
+                    })?;
+                if !source_witness.same_generation(&after_source)
+                    || staged_witness.len != source_witness.len
+                    || staged_witness.sha256 != source_witness.sha256
+                {
+                    cleanup_sqlite_candidate_artifact(&restore_candidate);
+                    return Err(SqlError::Custom(format!(
+                        "failed to stage sqlite backup {} into {}: source changed identity or bytes during copy",
+                        backup_path.display(),
+                        restore_candidate.display()
+                    )));
+                }
+                sync_recovery_parent(&restore_candidate)?;
+                return Ok(restore_candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                cleanup_sqlite_candidate_artifact(&restore_candidate);
+                return Err(SqlError::Custom(format!(
+                    "failed to stage sqlite backup {} into {}: {error}",
+                    backup_path.display(),
+                    restore_candidate.display()
+                )));
+            }
+        }
     }
-    Ok(restore_candidate)
+    Err(SqlError::Custom(format!(
+        "failed to stage sqlite backup {} for {}: all collision-safe candidate destinations were occupied",
+        backup_path.display(),
+        primary_path.display()
+    )))
 }
 
 #[allow(clippy::result_large_err)]
@@ -17533,19 +17737,29 @@ fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
         "rejected-{}",
         chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
     );
-    let quarantine = sqlite_cleanup_quarantine_path(candidate, &nonce, 0);
-    match rename_noreplace_preserving_source(candidate, &quarantine) {
-        Ok(()) => tracing::warn!(
-            path = %candidate.display(),
-            quarantine = %quarantine.display(),
-            "preserved rejected standalone SQLite staging artifact under a quarantine name"
-        ),
-        Err(error) => tracing::warn!(
-            path = %candidate.display(),
-            quarantine = %quarantine.display(),
-            %error,
-            "failed to quarantine rejected standalone SQLite staging artifact; source remains in place"
-        ),
+    for collision in 0..=9_999 {
+        let quarantine = sqlite_cleanup_quarantine_path(candidate, &nonce, collision);
+        match rename_noreplace_preserving_source(candidate, &quarantine) {
+            Ok(()) => {
+                let _ = sync_recovery_parent(&quarantine);
+                tracing::warn!(
+                    path = %candidate.display(),
+                    quarantine = %quarantine.display(),
+                    "preserved rejected standalone SQLite staging artifact under a quarantine name"
+                );
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    quarantine = %quarantine.display(),
+                    %error,
+                    "failed to quarantine rejected standalone SQLite staging artifact; source remains in place"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -17561,24 +17775,6 @@ fn reconstruction_quarantine_path(
         format!(".{reason}-{timestamp}-{collision:02}")
     };
     sqlite_path_with_file_name_suffix(primary_path, &suffix, &format!("storage.sqlite3{suffix}"))
-}
-
-#[allow(clippy::result_large_err)]
-fn allocate_reconstruction_quarantine_path(
-    primary_path: &Path,
-    reason: &str,
-    timestamp: &str,
-) -> Result<PathBuf, SqlError> {
-    for collision in 0..=9_999 {
-        let candidate = reconstruction_quarantine_path(primary_path, reason, timestamp, collision);
-        if !sqlite_candidate_artifact_conflicts(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    Err(SqlError::Custom(format!(
-        "failed to allocate a collision-free {reason} quarantine path for {}",
-        primary_path.display()
-    )))
 }
 
 #[allow(clippy::result_large_err)]
@@ -17639,6 +17835,26 @@ pub fn quarantine_reconstruction_candidate_path(
     reason: &str,
     timestamp: &str,
 ) -> Result<Option<PathBuf>, SqlError> {
+    quarantine_reconstruction_candidate_path_with_hook(
+        candidate_path,
+        primary_path,
+        reason,
+        timestamp,
+        |_| {},
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_reconstruction_candidate_path_with_hook<F>(
+    candidate_path: &Path,
+    primary_path: &Path,
+    reason: &str,
+    timestamp: &str,
+    mut before_move: F,
+) -> Result<Option<PathBuf>, SqlError>
+where
+    F: FnMut(&Path),
+{
     if !path_is_occupied(candidate_path) {
         return Ok(None);
     }
@@ -17653,19 +17869,86 @@ pub fn quarantine_reconstruction_candidate_path(
         )));
     }
 
-    let quarantined = allocate_reconstruction_quarantine_path(primary_path, reason, timestamp)?;
-    let mut planned_moves = vec![(candidate_path.to_path_buf(), quarantined.clone())];
-    planned_moves.extend(
-        SQLITE_RECOVERY_SIDECAR_SUFFIXES
-            .iter()
-            .filter_map(|suffix| {
-                let source = sqlite_sidecar_path(candidate_path, suffix);
-                path_is_occupied(&source)
-                    .then(|| (source, sqlite_sidecar_path(&quarantined, suffix)))
-            }),
-    );
+    let parent_anchor =
+        AnchoredRecoveryParent::capture(candidate_path, "quarantine reconstruction candidate")?;
+    let candidate_witness = if is_real_file(candidate_path) {
+        Some(
+            SqliteFileWitness::capture_regular(candidate_path).map_err(|error| {
+                SqlError::Custom(format!(
+                    "failed to witness reconstructed SQLite candidate {} before quarantine: {error}",
+                    candidate_path.display()
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
 
-    let mut completed_moves = Vec::with_capacity(planned_moves.len());
+    let mut quarantined_primary = None;
+    for collision in 0..=9_999 {
+        let candidate = reconstruction_quarantine_path(primary_path, reason, timestamp, collision);
+        if sqlite_candidate_artifact_conflicts(&candidate) {
+            continue;
+        }
+        before_move(&candidate);
+        parent_anchor.verify_unchanged("quarantine reconstruction candidate")?;
+        if let Some(ref witness) = candidate_witness {
+            let current = SqliteFileWitness::capture_regular(candidate_path).map_err(|error| {
+                SqlError::Custom(format!(
+                    "reconstructed SQLite candidate {} disappeared or became unreadable before quarantine: {error}",
+                    candidate_path.display()
+                ))
+            })?;
+            if !witness.same_generation(&current) {
+                return Err(SqlError::Custom(format!(
+                    "reconstructed SQLite candidate {} changed identity or bytes before quarantine; refusing to move an unclassified generation",
+                    candidate_path.display()
+                )));
+            }
+        }
+        match rename_noreplace_preserving_source(candidate_path, &candidate) {
+            Ok(()) => {
+                if let Some(ref witness) = candidate_witness {
+                    let moved_ok = SqliteFileWitness::capture_regular(&candidate)
+                        .is_ok_and(|observed| witness.same_generation(&observed));
+                    if !moved_ok {
+                        let _ = rename_noreplace_preserving_source(&candidate, candidate_path);
+                        let _ = sync_recovery_parent(candidate_path);
+                        return Err(SqlError::Custom(format!(
+                            "reconstructed SQLite candidate {} changed identity or bytes during quarantine; restored raced artifact",
+                            candidate_path.display()
+                        )));
+                    }
+                }
+                quarantined_primary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to quarantine reconstructed SQLite artifact {} as {} without replacement: {error}; earlier family moves were rolled back",
+                    candidate_path.display(),
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    let quarantined = quarantined_primary.ok_or_else(|| {
+        SqlError::Custom(format!(
+            "failed to allocate a collision-free {reason} quarantine path for {}",
+            primary_path.display()
+        ))
+    })?;
+    let planned_moves: Vec<(PathBuf, PathBuf)> = SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .filter_map(|suffix| {
+            let source = sqlite_sidecar_path(candidate_path, suffix);
+            path_is_occupied(&source).then(|| (source, sqlite_sidecar_path(&quarantined, suffix)))
+        })
+        .collect();
+
+    let mut completed_moves = Vec::with_capacity(planned_moves.len() + 1);
+    completed_moves.push((candidate_path.to_path_buf(), quarantined.clone()));
     for (source, target) in planned_moves {
         if let Err(error) = rename_noreplace_preserving_source(&source, &target) {
             let rollback = rollback_quarantined_candidate_moves(&completed_moves);
@@ -18775,16 +19058,30 @@ fn restore_quarantined_sidecar(
             "rollback-conflict-{}",
             chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
         );
-        let conflict_quarantine = sqlite_cleanup_quarantine_path(&live_path, &nonce, 0);
-        rename_noreplace_preserving_source(&live_path, &conflict_quarantine).map_err(
-            |error| {
-                SqlError::Custom(format!(
-                    "failed to preserve newly appeared sidecar {} at {} before restoring the original: {error}",
-                    live_path.display(),
-                    conflict_quarantine.display()
-                ))
-            },
-        )?;
+        let mut preserved = None;
+        for collision in 0..=9_999 {
+            let conflict_quarantine = sqlite_cleanup_quarantine_path(&live_path, &nonce, collision);
+            match rename_noreplace_preserving_source(&live_path, &conflict_quarantine) {
+                Ok(()) => {
+                    preserved = Some(conflict_quarantine);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(SqlError::Custom(format!(
+                        "failed to preserve newly appeared sidecar {} at {} before restoring the original: {error}",
+                        live_path.display(),
+                        conflict_quarantine.display()
+                    )));
+                }
+            }
+        }
+        let conflict_quarantine = preserved.ok_or_else(|| {
+            SqlError::Custom(format!(
+                "failed to preserve newly appeared sidecar {} because all collision-safe quarantine paths were occupied",
+                live_path.display()
+            ))
+        })?;
         tracing::warn!(
             path = %live_path.display(),
             quarantine = %conflict_quarantine.display(),
@@ -40184,6 +40481,228 @@ mod tests {
                 .to_string()
                 .contains("refusing to cross database authority"),
             "unexpected snapshot error: {snapshot_err}"
+        );
+    }
+
+    #[test]
+    fn lock_neutral_sqlite_generation_fingerprint_covers_all_eight_members_and_refuses_drift() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+
+        assert_eq!(recovery_breaker_fingerprint(&db_path, None), "missing");
+
+        // Missing primary with present namespace sidecar must not report "missing".
+        let ns_gate = sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate");
+        let ns_use = sqlite_sidecar_path(&db_path, "-fsqlite-ns-use");
+        std::fs::write(&ns_gate, b"gate-v1").expect("write ns-gate");
+        std::fs::write(&ns_use, b"use-v1").expect("write ns-use");
+        let sidecar_only_fp = recovery_breaker_fingerprint(&db_path, None);
+        assert!(
+            sidecar_only_fp.starts_with("0:fdc10ce1"),
+            "sidecar-only Franken family must not report missing: {sidecar_only_fp}"
+        );
+
+        std::fs::write(&db_path, b"primary-v1").expect("write primary");
+        let mut previous = recovery_breaker_fingerprint(&db_path, None);
+        assert!(previous.starts_with("10:fdc10ce1"));
+
+        for (suffix, payload) in [
+            ("-journal", b"journal-v1".as_slice()),
+            ("-wal", b"wal-v1".as_slice()),
+            ("-shm", b"shm-v1".as_slice()),
+            ("-wal-cert", b"cert-v1".as_slice()),
+            ("-wal-cert-head", b"cert-head-v1".as_slice()),
+            ("-fsqlite-ns-gate", b"gate-v2-longer".as_slice()),
+            ("-fsqlite-ns-use", b"use-v2-longer".as_slice()),
+        ] {
+            let member = sqlite_sidecar_path(&db_path, suffix);
+            std::fs::write(&member, payload).expect("update sidecar member");
+            let current = recovery_breaker_fingerprint(&db_path, None);
+            assert_ne!(
+                current, previous,
+                "lock-neutral fingerprint must change when {suffix} changes"
+            );
+            previous = current;
+        }
+
+        // Concurrent drift between the two metadata passes must report "unreadable".
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let drifted = lock_neutral_sqlite_generation_fingerprint_with_observer(&db_path, || {
+            std::fs::write(&shm_path, b"shm-drifted-between-passes")
+                .expect("mutate shm between metadata passes");
+        });
+        assert_eq!(drifted, "unreadable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_artifact_publication_retries_collisions_and_refuses_pathname_swaps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        std::fs::write(&backup, b"authoritative-backup-bytes").expect("write backup");
+        let timestamp = "20260824_120000_000";
+
+        // 1. Deterministic collision injection during backup staging:
+        // plant a sentinel at the initial candidate path inside `before_copy`
+        // (after `sqlite_candidate_artifact_conflicts` passed).
+        let first_candidate = restore_candidate_path(&primary, timestamp);
+        let mut planted = false;
+        let staged =
+            stage_backup_restore_candidate_with_hook(&backup, &primary, timestamp, |candidate| {
+                if !planted && candidate == first_candidate {
+                    std::fs::write(candidate, b"raced-in-restore-sentinel")
+                        .expect("plant raced restore sentinel");
+                    planted = true;
+                }
+            })
+            .expect("backup staging must retry on AlreadyExists");
+        assert!(planted, "collision hook must fire");
+        assert_eq!(
+            std::fs::read(&first_candidate).expect("read sentinel"),
+            b"raced-in-restore-sentinel",
+            "sentinel destination bytes must survive untouched"
+        );
+        assert_eq!(
+            staged,
+            dir.path()
+                .join("storage.sqlite3.restoring-20260824_120000_000-01")
+        );
+        assert_eq!(
+            std::fs::read(&staged).expect("read staged backup"),
+            b"authoritative-backup-bytes"
+        );
+
+        // 2. Pathname swap on backup source after witness capture is refused.
+        let swapped_backup = dir.path().join("storage.sqlite3.bak.swapped");
+        let swap_err = stage_backup_restore_candidate_with_hook(
+            &backup,
+            &primary,
+            "20260824_120000_001",
+            |_candidate| {
+                std::fs::rename(&backup, &swapped_backup).expect("move backup aside");
+                std::fs::write(&backup, b"forged-backup-bytes").expect("plant forged backup");
+            },
+        )
+        .expect_err("source pathname swap must be refused");
+        assert!(
+            swap_err
+                .to_string()
+                .contains("source changed identity or bytes"),
+            "unexpected source swap error: {swap_err}"
+        );
+        assert!(
+            !dir.path()
+                .join("storage.sqlite3.restoring-20260824_120000_001")
+                .exists(),
+            "refused source swap must not publish a restore candidate"
+        );
+
+        // 3. Deterministic collision injection during reconstruction candidate quarantine.
+        let recon_candidate = dir
+            .path()
+            .join("storage.sqlite3.reconstructing-20260824_120000_002");
+        std::fs::write(&recon_candidate, b"reconstructed-candidate-bytes")
+            .expect("write recon candidate");
+        let first_quarantine =
+            reconstruction_quarantine_path(&primary, "reconstruct-failed", timestamp, 0);
+        let mut recon_planted = false;
+        let quarantined = quarantine_reconstruction_candidate_path_with_hook(
+            &recon_candidate,
+            &primary,
+            "reconstruct-failed",
+            timestamp,
+            |target| {
+                if !recon_planted && target == first_quarantine {
+                    std::fs::write(target, b"raced-in-quarantine-sentinel")
+                        .expect("plant quarantine sentinel");
+                    recon_planted = true;
+                }
+            },
+        )
+        .expect("quarantine must retry on AlreadyExists")
+        .expect("quarantined path");
+        assert!(recon_planted, "quarantine collision hook must fire");
+        assert_eq!(
+            std::fs::read(&first_quarantine).expect("read quarantine sentinel"),
+            b"raced-in-quarantine-sentinel"
+        );
+        assert_eq!(
+            quarantined,
+            reconstruction_quarantine_path(&primary, "reconstruct-failed", timestamp, 1)
+        );
+        assert_eq!(
+            std::fs::read(&quarantined).expect("read quarantined candidate"),
+            b"reconstructed-candidate-bytes"
+        );
+
+        // 4. Pathname swap on reconstruction candidate before move is refused.
+        std::fs::write(&recon_candidate, b"original-candidate-bytes")
+            .expect("write recon candidate");
+        let moved_aside_candidate = dir.path().join("recon.moved-aside");
+        let recon_swap_err = quarantine_reconstruction_candidate_path_with_hook(
+            &recon_candidate,
+            &primary,
+            "reconstruct-failed",
+            "20260824_120000_003",
+            |_target| {
+                std::fs::rename(&recon_candidate, &moved_aside_candidate)
+                    .expect("move candidate aside");
+                std::fs::write(&recon_candidate, b"raced-replacement-candidate")
+                    .expect("write replacement candidate");
+            },
+        )
+        .expect_err("candidate pathname swap must be refused");
+        assert!(
+            recon_swap_err
+                .to_string()
+                .contains("changed inode identity")
+                || recon_swap_err.to_string().contains("changed identity"),
+            "unexpected candidate swap error: {recon_swap_err}"
+        );
+        assert_eq!(
+            std::fs::read(&recon_candidate).expect("replacement stays in place"),
+            b"raced-replacement-candidate"
+        );
+        assert_eq!(
+            std::fs::read(&moved_aside_candidate).expect("original stays intact"),
+            b"original-candidate-bytes"
+        );
+
+        // 5. Parent directory swap during sidecar cleanup is refused before mutating foreign directory.
+        let tenant_dir = dir.path().join("cleanup-tenant");
+        let foreign_dir = dir.path().join("cleanup-foreign");
+        std::fs::create_dir_all(&tenant_dir).expect("create tenant dir");
+        std::fs::create_dir_all(&foreign_dir).expect("create foreign dir");
+        let tenant_db = tenant_dir.join("storage.sqlite3");
+        let tenant_wal = sqlite_sidecar_path(&tenant_db, "-wal");
+        let foreign_wal_seed = sqlite_sidecar_path(&foreign_dir.join("storage.sqlite3"), "-wal");
+        std::fs::write(&tenant_db, b"tenant-db").expect("write tenant db");
+        std::fs::write(&tenant_wal, b"truncated-wal").expect("write tenant truncated wal");
+        std::fs::write(&foreign_wal_seed, b"foreign-wal-must-not-move").expect("write foreign wal");
+        let orig_tenant_dir = dir.path().join("cleanup-tenant.orig");
+        let hook_tenant_dir = tenant_dir.clone();
+        let hook_foreign_dir = foreign_dir.clone();
+        let cleanup_swap_err =
+            apply_classified_sqlite_family_cleanup_with_hook(&tenant_db, move |_sidecar| {
+                if !orig_tenant_dir.exists() {
+                    std::fs::rename(&hook_tenant_dir, &orig_tenant_dir)
+                        .expect("move tenant dir aside");
+                    std::fs::rename(&hook_foreign_dir, &hook_tenant_dir)
+                        .expect("swap real foreign dir into tenant path");
+                }
+            })
+            .expect_err("parent directory swap during sidecar cleanup must be refused");
+        assert!(
+            cleanup_swap_err.to_string().contains("parent directory")
+                && cleanup_swap_err
+                    .to_string()
+                    .contains("changed identity after validation"),
+            "unexpected cleanup parent swap error: {cleanup_swap_err}"
+        );
+        assert_eq!(
+            std::fs::read(&tenant_wal).expect("foreign wal at swapped path untouched"),
+            b"foreign-wal-must-not-move"
         );
     }
 }

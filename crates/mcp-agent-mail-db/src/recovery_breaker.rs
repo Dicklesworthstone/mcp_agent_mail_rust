@@ -127,6 +127,10 @@ impl RecoveryBreakerState {
                         hash.starts_with("fdc10ce1")
                     })
             })
+            || (fingerprint
+                .split_once(':')
+                .is_some_and(|(_, hash)| hash.starts_with("fdc10ce1"))
+                && family_fingerprint_parts(&self.db_fingerprint).is_some())
     }
 }
 
@@ -505,31 +509,98 @@ fn fingerprint_db_with_observer(db_path: &Path, observed: impl FnMut(&Path, u64)
     }
     #[cfg(not(unix))]
     {
-        fingerprint_single_file(&path, observed)
+        fingerprint_non_unix_family(&path, observed).unwrap_or_else(|_| "unreadable".to_string())
     }
 }
 
 #[cfg(not(unix))]
-fn fingerprint_single_file(path: &Path, mut observed: impl FnMut(&Path, u64)) -> String {
-    match std::fs::symlink_metadata(path) {
+struct NonUnixFingerprintMember {
+    member_path: PathBuf,
+    source: Option<(std::fs::File, std::fs::Metadata, same_file::Handle)>,
+}
+
+#[cfg(not(unix))]
+fn fingerprint_non_unix_family(
+    path: &Path,
+    mut observed: impl FnMut(&Path, u64),
+) -> std::io::Result<String> {
+    const SUFFIXES: [&str; 8] = [
+        "",
+        "-journal",
+        "-wal",
+        "-shm",
+        "-wal-cert",
+        "-wal-cert-head",
+        "-fsqlite-ns-gate",
+        "-fsqlite-ns-use",
+    ];
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("fingerprint primary has no parent"))?;
+    match std::fs::symlink_metadata(parent_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return "missing".to_string();
+            return Ok("missing".to_string());
         }
-        Ok(metadata) if metadata.is_file() => {}
-        _ => return "unreadable".to_string(),
+        Ok(metadata) if metadata.is_dir() => {}
+        _ => {
+            return Err(std::io::Error::other(
+                "fingerprint parent is not a directory",
+            ));
+        }
     }
-    let mut capture = || -> std::io::Result<String> {
-        let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
-        let before = file.metadata()?;
-        let identity = same_file::Handle::from_file(file.try_clone()?)?;
-        let limit = before.len().checked_add(1).ok_or_else(|| {
-            std::io::Error::other("fingerprint input exceeds the bounded read contract")
-        })?;
-        let mut reader = (&mut file).take(limit);
-        let mut hasher = sha2::Sha256::new();
+    let mut members = Vec::with_capacity(SUFFIXES.len());
+    for suffix in SUFFIXES {
+        let mut member_os = path.as_os_str().to_os_string();
+        member_os.push(suffix);
+        let member_path = PathBuf::from(member_os);
+        let source = match std::fs::symlink_metadata(&member_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(metadata) if metadata.is_file() => {
+                let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&member_path)?;
+                let before = file.metadata()?;
+                if !before.is_file() {
+                    return Err(std::io::Error::other(
+                        "fingerprint family member is not a regular file",
+                    ));
+                }
+                let identity = same_file::Handle::from_file(file.try_clone()?)?;
+                Some((file, before, identity))
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "fingerprint family member is not a regular file",
+                ));
+            }
+        };
+        members.push(NonUnixFingerprintMember {
+            member_path,
+            source,
+        });
+    }
+
+    let mut family = sha2::Sha256::new();
+    family.update(b"mcp-agent-mail-offline-family-v1\0");
+    let mut main = "missing".to_string();
+    let mut present = false;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for (suffix, member) in SUFFIXES.into_iter().zip(&mut members) {
+        family.update((suffix.len() as u64).to_le_bytes());
+        family.update(suffix.as_bytes());
+        let Some((file, before, _)) = member.source.as_mut() else {
+            family.update([0]);
+            continue;
+        };
+        present = true;
+        family.update([1]);
+        family.update(before.len().to_le_bytes());
+        let limit = before
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("fingerprint member too large"))?;
+        let mut reader = (&mut *file).take(limit);
+        let mut content = sha2::Sha256::new();
         let mut read_bytes = 0_u64;
-        let mut buffer = vec![0_u8; 64 * 1024];
-        observed(path, 0);
+        observed(&member.member_path, 0);
         loop {
             let count = match reader.read(&mut buffer) {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -540,26 +611,52 @@ fn fingerprint_single_file(path: &Path, mut observed: impl FnMut(&Path, u64)) ->
             }
             read_bytes = read_bytes
                 .checked_add(count as u64)
-                .ok_or_else(|| std::io::Error::other("fingerprint read length overflow"))?;
-            hasher.update(&buffer[..count]);
-            observed(path, read_bytes);
+                .ok_or_else(|| std::io::Error::other("fingerprint length overflow"))?;
+            content.update(&buffer[..count]);
+            observed(&member.member_path, read_bytes);
         }
-        if read_bytes != before.len() || !fingerprint_metadata_matches(&before, &file.metadata()?) {
+        if read_bytes != before.len() || !fingerprint_metadata_matches(before, &file.metadata()?) {
             return Err(std::io::Error::other(
-                "fingerprint source changed while reading",
+                "fingerprint family changed while streaming",
             ));
         }
-        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
-        if !fingerprint_metadata_matches(&before, &current.metadata()?)
-            || same_file::Handle::from_file(current)? != identity
-        {
-            return Err(std::io::Error::other("fingerprint source pathname changed"));
+        let digest = content.finalize();
+        if suffix.is_empty() {
+            main = format!("{read_bytes}:{}", hex::encode(digest));
         }
-        Ok(format!("{read_bytes}:{}", hex::encode(hasher.finalize())))
-    };
-    // Disappearance after starting a read is uncertainty, not a new missing
-    // generation. All observation errors retain existing failure history.
-    capture().unwrap_or_else(|_| "unreadable".to_string())
+        family.update(digest);
+    }
+
+    for member in &members {
+        match (
+            &member.source,
+            std::fs::symlink_metadata(&member.member_path),
+        ) {
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            (Some((file, before, identity)), Ok(_)) => {
+                let current =
+                    mcp_agent_mail_core::disk::open_regular_file_no_follow(&member.member_path)?;
+                if !fingerprint_metadata_matches(before, &file.metadata()?)
+                    || !fingerprint_metadata_matches(before, &current.metadata()?)
+                    || same_file::Handle::from_file(current)? != *identity
+                {
+                    return Err(std::io::Error::other(
+                        "fingerprint family changed after streaming",
+                    ));
+                }
+            }
+            _ => {
+                return Err(std::io::Error::other(
+                    "fingerprint family changed after streaming",
+                ));
+            }
+        }
+    }
+    if present {
+        Ok(format!("family1:{main}:{}", hex::encode(family.finalize())))
+    } else {
+        Ok("missing".to_string())
+    }
 }
 
 /// Open the resolved parent component-by-component, retaining its directory
