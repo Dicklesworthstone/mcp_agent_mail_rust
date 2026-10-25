@@ -607,6 +607,51 @@ fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
         .set(oldest_fence_wait_start(waits));
 }
 
+/// Direct (request-path) writers currently retrying the publication fence
+/// (see [`admit_direct_publication`]).
+static DIRECT_FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Longest a blocking fence acquirer gives way to waiting direct writers.
+///
+/// The fence is a plain `Mutex`. A writer that releases it and takes it again
+/// at once (the WBQ drain between batches, the commit coalescer between
+/// commits) beats a direct writer that sleeps between attempts. At swarm
+/// saturation those back-to-back holds keep the fence busy about 97% of the
+/// time while no single hold reaches 250 ms (kp48), so direct writers ran out
+/// their whole admission budget (br-9ott5). A short pause at each blocking
+/// acquisition lets a waiting direct write in, and bounds the delay to
+/// background work.
+const DIRECT_WAITER_GIVE_WAY: Duration = Duration::from_millis(5);
+
+/// Registers one direct writer as waiting for the fence while alive.
+struct DirectFenceWaiter;
+
+impl DirectFenceWaiter {
+    fn register() -> Self {
+        DIRECT_FENCE_WAITERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for DirectFenceWaiter {
+    fn drop(&mut self) {
+        DIRECT_FENCE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Before a blocking acquisition, wait up to [`DIRECT_WAITER_GIVE_WAY`] for
+/// waiting direct writers to take and release the fence. One atomic load when
+/// none is waiting.
+fn give_way_to_direct_writers() {
+    if DIRECT_FENCE_WAITERS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let deadline = Instant::now() + DIRECT_WAITER_GIVE_WAY;
+    while DIRECT_FENCE_WAITERS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -617,6 +662,7 @@ impl FenceLease {
     #[track_caller]
     fn acquire() -> Self {
         let site = std::panic::Location::caller();
+        give_way_to_direct_writers();
         let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -1595,23 +1641,29 @@ pub enum DirectArchiveWrite {
 const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 
 /// Longest pause between two direct fence admission attempts. It also bounds
-/// how long a cancelled caller can keep waiting.
-const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(10);
+/// how long a cancelled caller can keep waiting, and it is shorter than
+/// [`DIRECT_WAITER_GIVE_WAY`], so a waiting writer notices the opening that
+/// blocking acquirers leave it.
+const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
 /// Admit a direct write to the publication fence. Contention is retried with a
 /// doubling pause until [`DIRECT_FENCE_ADMISSION_BUDGET`] runs out; every
 /// attempt checks `cancelled` first, and any other error returns at once.
+/// While it retries, the writer is registered so blocking acquirers give way
+/// to it ([`give_way_to_direct_writers`]).
 fn admit_direct_publication(
     path: &Path,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<ArchiveMutationGuard> {
     let deadline = Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET;
     let mut pause = Duration::from_micros(200);
+    let mut waiting = None;
     loop {
         let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
             Err(error @ StorageError::LockContention { .. }) => error,
             admitted_or_failed => return admitted_or_failed,
         };
+        waiting.get_or_insert_with(DirectFenceWaiter::register);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(contention);
@@ -24411,6 +24463,94 @@ mod tests {
         assert!(
             waited < DIRECT_FENCE_ADMISSION_BUDGET / 2,
             "a cancelled caller must not sit out the budget: {waited:?}"
+        );
+    }
+
+    /// While a direct writer is registered as waiting, a blocking acquisition
+    /// first gives way for [`DIRECT_WAITER_GIVE_WAY`]; with no waiter it does
+    /// not pause at all (br-9ott5). This pins the mechanism deterministically:
+    /// the timing-based test below can pass by luck without it.
+    #[test]
+    fn blocking_fence_acquisition_gives_way_only_while_a_direct_writer_waits() {
+        let idle_started = Instant::now();
+        give_way_to_direct_writers();
+        let idle = idle_started.elapsed();
+        assert!(
+            idle < Duration::from_micros(2_500),
+            "no waiter, so no pause: {idle:?}"
+        );
+
+        let waiter = DirectFenceWaiter::register();
+        let started = Instant::now();
+        give_way_to_direct_writers();
+        let paused = started.elapsed();
+        drop(waiter);
+        // A fixed floor as well as the constant: a zero window must fail here.
+        assert!(
+            paused >= Duration::from_millis(4) && paused >= DIRECT_WAITER_GIVE_WAY,
+            "a waiting direct writer must get the give-way window: {paused:?}"
+        );
+        assert!(
+            paused < DIRECT_WAITER_GIVE_WAY + Duration::from_millis(200),
+            "the give-way pause is bounded: {paused:?}"
+        );
+        assert_eq!(DIRECT_FENCE_WAITERS.load(Ordering::Acquire), 0);
+    }
+
+    /// A writer that releases the fence and takes it straight back, as the WBQ
+    /// drain does between batches, must not starve direct writes: blocking
+    /// acquirers give way to registered direct writers (br-9ott5), so a direct
+    /// write lands at the next release, within a few milliseconds. Without
+    /// that it lands only when a poll happens to hit the release gap: in
+    /// practice hundreds of milliseconds, or not within its budget.
+    #[test]
+    fn write_op_sync_direct_lands_against_a_writer_that_retakes_the_fence() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let barger = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut first_hold = Some(held_tx);
+                while !stop.load(Ordering::Acquire) {
+                    let guard = ArchiveMutationGuard::begin();
+                    if let Some(held) = first_hold.take() {
+                        held.send(()).expect("report the first hold");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                    drop(guard);
+                }
+            })
+        };
+        held_rx.recv().expect("fence held");
+
+        let outcomes = (0..10)
+            .map(|attempt| {
+                let op = direct_clear_signal_op(&tmp, &format!("direct-retaken-{attempt}"));
+                let started = Instant::now();
+                let result = write_op_sync_direct(&op);
+                (result, started.elapsed())
+            })
+            .collect::<Vec<_>>();
+        stop.store(true, Ordering::Release);
+        barger.join().expect("barging thread");
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|(result, _)| matches!(result, DirectArchiveWrite::Written)),
+            "{outcomes:?}"
+        );
+        let mut waits = outcomes
+            .iter()
+            .map(|(_, waited)| *waited)
+            .collect::<Vec<_>>();
+        waits.sort();
+        // The median tolerates a few scheduling outliers on a loaded host.
+        assert!(
+            waits[waits.len() / 2] < Duration::from_millis(50),
+            "direct writes must land at the next release, not by luck: {waits:?}"
         );
     }
 

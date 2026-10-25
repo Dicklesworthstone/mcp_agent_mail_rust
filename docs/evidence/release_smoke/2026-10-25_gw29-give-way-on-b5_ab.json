@@ -1,0 +1,222 @@
+{
+ "experiment": "gw29: give-way to waiting direct writers (blocking fence acquirers pause up to 5 ms while a direct writer waits; direct poll 1 ms) on top of B5, paired-concurrent vs main beb193c5",
+ "rule": "scratchpad gw29_rule.txt, written ~07:35Z before either binary built; FROZEN 2026-10-25T09:09:19Z: BASE 285186d261bae8cdb292f1aba266fedc9093abd9984236458fd2ff942b427c1e; GW 60730e791dfb65382d7eaaa9b607e37605e2e20dc8364f68ea08bdd55b76be82",
+ "arms": {
+  "BASE": "release build of exact main beb193c5",
+  "GW": "release build of 08f1f27c + the give-way change (production code identical to the landing diff)"
+ },
+ "harness": "paced_swarm.py, 60 agents/arm, 3 projects, 300 s; P2 x3 then P6 x2; host load 8-17",
+ "windows": [
+  {
+   "window": 1,
+   "period_s": 2,
+   "start_order": [
+    "BASE",
+    "GW"
+   ],
+   "start": "2026-10-25T09:09:19Z",
+   "load_start": "10.15 7.97 7.76",
+   "end": "2026-10-25T09:20:11Z",
+   "exits": "BASE=0 GW=0",
+   "min_free_kb": 408084756,
+   "valid": true,
+   "load_end": "15.21 17.50 13.84",
+   "arms": {
+    "BASE": {
+     "reserve_n": 2633,
+     "reserve_errors": 535,
+     "reserve_p50_s": 5.616,
+     "reserve_p99_s": 14.914,
+     "send_ok": 9000,
+     "send_p50_s": 0.155,
+     "send_p99_s": 7.157,
+     "non_reservation_errors": 1
+    },
+    "GW": {
+     "reserve_n": 2633,
+     "reserve_errors": 194,
+     "reserve_p50_s": 4.007,
+     "reserve_p99_s": 11.998,
+     "send_ok": 9000,
+     "send_p50_s": 0.178,
+     "send_p99_s": 6.614,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 2,
+   "period_s": 2,
+   "start_order": [
+    "GW",
+    "BASE"
+   ],
+   "start": "2026-10-25T09:20:11Z",
+   "load_start": "15.21 17.50 13.84",
+   "end": "2026-10-25T09:30:56Z",
+   "exits": "GW=0 BASE=0",
+   "min_free_kb": 459567788,
+   "valid": true,
+   "load_end": "10.15 15.59 15.44",
+   "arms": {
+    "GW": {
+     "reserve_n": 2633,
+     "reserve_errors": 220,
+     "reserve_p50_s": 3.838,
+     "reserve_p99_s": 11.879,
+     "send_ok": 9000,
+     "send_p50_s": 0.171,
+     "send_p99_s": 8.372,
+     "non_reservation_errors": 0
+    },
+    "BASE": {
+     "reserve_n": 2633,
+     "reserve_errors": 537,
+     "reserve_p50_s": 5.646,
+     "reserve_p99_s": 15.092,
+     "send_ok": 9000,
+     "send_p50_s": 0.144,
+     "send_p99_s": 7.803,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 3,
+   "period_s": 2,
+   "start_order": [
+    "BASE",
+    "GW"
+   ],
+   "start": "2026-10-25T09:30:56Z",
+   "load_start": "10.15 15.59 15.44",
+   "end": "2026-10-25T09:41:09Z",
+   "exits": "BASE=0 GW=0",
+   "min_free_kb": 452701672,
+   "valid": true,
+   "load_end": "8.96 13.62 14.84",
+   "arms": {
+    "BASE": {
+     "reserve_n": 2633,
+     "reserve_errors": 531,
+     "reserve_p50_s": 5.479,
+     "reserve_p99_s": 14.857,
+     "send_ok": 8999,
+     "send_p50_s": 0.142,
+     "send_p99_s": 3.801,
+     "non_reservation_errors": 2
+    },
+    "GW": {
+     "reserve_n": 2633,
+     "reserve_errors": 184,
+     "reserve_p50_s": 3.756,
+     "reserve_p99_s": 11.145,
+     "send_ok": 9000,
+     "send_p50_s": 0.17,
+     "send_p99_s": 4.776,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 4,
+   "period_s": 6,
+   "start_order": [
+    "GW",
+    "BASE"
+   ],
+   "start": "2026-10-25T09:41:09Z",
+   "load_start": "8.96 13.62 14.84",
+   "end": "2026-10-25T09:46:22Z",
+   "exits": "GW=0 BASE=0",
+   "min_free_kb": 451514472,
+   "valid": true,
+   "load_end": "8.38 10.25 13.02",
+   "arms": {
+    "GW": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.112,
+     "reserve_p99_s": 0.555,
+     "send_ok": 3000,
+     "send_p50_s": 0.113,
+     "send_p99_s": 1.038,
+     "non_reservation_errors": 0
+    },
+    "BASE": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.129,
+     "reserve_p99_s": 2.236,
+     "send_ok": 3000,
+     "send_p50_s": 0.117,
+     "send_p99_s": 3.229,
+     "non_reservation_errors": 0
+    }
+   }
+  },
+  {
+   "window": 5,
+   "period_s": 6,
+   "start_order": [
+    "BASE",
+    "GW"
+   ],
+   "start": "2026-10-25T09:46:22Z",
+   "load_start": "8.38 10.25 13.02",
+   "end": "2026-10-25T09:51:34Z",
+   "exits": "BASE=0 GW=0",
+   "min_free_kb": 443647788,
+   "valid": true,
+   "load_end": "7.98 9.83 12.15",
+   "arms": {
+    "BASE": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.137,
+     "reserve_p99_s": 3.068,
+     "send_ok": 3000,
+     "send_p50_s": 0.123,
+     "send_p99_s": 4.086,
+     "non_reservation_errors": 0
+    },
+    "GW": {
+     "reserve_n": 886,
+     "reserve_errors": 0,
+     "reserve_p50_s": 0.12,
+     "reserve_p99_s": 1.812,
+     "send_ok": 3000,
+     "send_p50_s": 0.122,
+     "send_p99_s": 3.731,
+     "non_reservation_errors": 2
+    }
+   }
+  }
+ ],
+ "pooled_reservation_errors_per_1000": {
+  "p2_BASE": 202.9,
+  "p2_GW": 75.7,
+  "p6_GW": 0.0,
+  "p6_BASE": 0.0
+ },
+ "pooled_sends_ok": {
+  "p2_BASE": 26999,
+  "p2_GW": 27000,
+  "p6_GW": 6000,
+  "p6_BASE": 6000
+ },
+ "pooled_non_reservation_errors": {
+  "p2_BASE": 3,
+  "p2_GW": 0,
+  "p6_GW": 2,
+  "p6_BASE": 0
+ },
+ "criteria": {
+  "primary P2 GW <= 10/1000 or <= 0.5x BASE": "PASS (75.7 vs 202.9, 0.373x)",
+  "sends ok >= 0.95x (P2, P6)": "PASS (1.000, 1.000)",
+  "non-reservation errors P2 <= BASE + 0.5% of calls": "PASS (0 vs 3)",
+  "median P2 send p99 <= 1.25x": "PASS (6.61 vs 7.16 s)",
+  "P6 reservation errors <= BASE + 5": "PASS (0.0 vs 0.0)"
+ },
+ "verdict": "WIN under the frozen rule. Not a fix for br-9ott5: GW still refuses 7.6% of grants at P2 against that bead's 1% probe level."
+}
