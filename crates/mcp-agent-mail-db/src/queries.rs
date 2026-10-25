@@ -2549,6 +2549,7 @@ async fn fetch_durable_atc_experience_by_id(
 
 fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbConn, DbError> {
     pool.validated_sqlite_path("fresh file-backed connection")?;
+    pool.verify_sqlite_authority("fresh file-backed connection")?;
     let conn = crate::DbConn::open_file(pool.sqlite_path())
         .map_err(|error| DbError::Sqlite(error.to_string()))?;
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
@@ -7946,12 +7947,10 @@ pub async fn create_message(
     // generation racing an older pool. The archive seed is the allocator's
     // once-per-process scan; it only matters before pool warmup has repaired
     // the durable floor in this process.
-    let id_allocator = pool.message_id_allocator();
-    let storage_root = match pool.validated_storage_root("message creation archive allocator") {
-        Ok(storage_root) => storage_root,
-        Err(error) => return Outcome::Err(error),
-    };
-    let archive_seed = match id_allocator.archive_seed(cx, storage_root).await {
+    let archive_seed = match pool
+        .archive_seed(cx, "message creation archive allocator")
+        .await
+    {
         Outcome::Ok(seed) => seed,
         Outcome::Err(error) => return Outcome::Err(error),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
@@ -8440,17 +8439,17 @@ async fn create_message_with_recipients_impl(
             }
         } else {
             // No key can replay, so preserve the ordinary one-transaction path.
-            let storage_root =
-                match pool.validated_storage_root("message creation archive allocator") {
-                    Ok(root) => root,
-                    Err(error) => return Outcome::Err(error),
-                };
-            Some(match id_allocator.archive_seed(cx, storage_root).await {
-                Outcome::Ok(seed) => seed,
-                Outcome::Err(error) => return Outcome::Err(error),
-                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            })
+            Some(
+                match pool
+                    .archive_seed(cx, "message creation archive allocator")
+                    .await
+                {
+                    Outcome::Ok(seed) => seed,
+                    Outcome::Err(error) => return Outcome::Err(error),
+                    Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                },
+            )
         };
         let (created_outcome, conn) = loop {
             match run_with_mvcc_retry(cx, "create_message_with_recipients", || async {
@@ -8499,15 +8498,9 @@ async fn create_message_with_recipients_impl(
                     // The key check found a fresh request and rolled back.
                     // Scan without holding transaction/page authority, then
                     // repeat the authoritative check in the insert transaction.
-                    let storage_root =
-                        match pool.validated_storage_root("message creation archive allocator") {
-                            Ok(root) => root,
-                            Err(error) => return Outcome::Err(error),
-                        };
                     archive_seed = Some(
                         match pool
-                            .message_id_allocator()
-                            .archive_seed(cx, storage_root)
+                            .archive_seed(cx, "message creation archive allocator")
                             .await
                         {
                             Outcome::Ok(seed) => seed,

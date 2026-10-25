@@ -1185,10 +1185,11 @@ fn sanitize_search_index_owner(value: &str) -> String {
 
 fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
     pool.validated_sqlite_path("lexical search database selection")?;
+    pool.verify_sqlite_authority("lexical search database selection")?;
     let shared = pool
         .validated_storage_root("lexical search index selection")?
         .join("search_index");
-    if shared.join("backfill_state.json").exists() || shared.join("meta.json").exists() {
+    if pool.has_shared_search_index_markers("lexical search index selection")? {
         return Ok(shared);
     }
     Ok(stable_direct_surface_index_dir(pool))
@@ -1263,15 +1264,13 @@ struct LexicalBackfillStateStats {
     max_id: u64,
 }
 
-fn read_lexical_backfill_state_file(
+fn parse_lexical_backfill_state_bytes(
+    raw: &[u8],
     path: &std::path::Path,
-) -> Result<Option<LexicalBackfillStateFile>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let state = serde_json::from_str::<LexicalBackfillStateFile>(&raw)
+) -> Result<LexicalBackfillStateFile, String> {
+    let raw = std::str::from_utf8(raw)
+        .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
+    let state = serde_json::from_str::<LexicalBackfillStateFile>(raw)
         .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
     if state.schema_version != 1 {
         return Err(format!(
@@ -1280,7 +1279,37 @@ fn read_lexical_backfill_state_file(
             path.display()
         ));
     }
-    Ok(Some(state))
+    Ok(state)
+}
+
+fn read_lexical_backfill_state_file(
+    path: &std::path::Path,
+) -> Result<Option<LexicalBackfillStateFile>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    parse_lexical_backfill_state_bytes(&raw, path).map(Some)
+}
+
+fn read_lexical_backfill_state_for_pool(
+    pool: &DbPool,
+    index_dir: &std::path::Path,
+) -> Result<Option<LexicalBackfillStateFile>, String> {
+    let state_path = index_dir.join("backfill_state.json");
+    if index_dir == pool.storage_root().join("search_index") {
+        let raw = pool
+            .read_shared_search_index_file("backfill_state.json", "lexical backfill health probe")
+            .map_err(|err| format!("cannot read {}: {err}", state_path.display()))?;
+        return raw
+            .as_deref()
+            .map(|bytes| parse_lexical_backfill_state_bytes(bytes, &state_path))
+            .transpose();
+    }
+    pool.verify_search_index_open_authority(index_dir, "lexical backfill health probe")
+        .map_err(|err| format!("cannot read {}: {err}", state_path.display()))?;
+    read_lexical_backfill_state_file(&state_path)
 }
 
 /// How the process-global lexical index relates to one pool's database.
@@ -1426,8 +1455,7 @@ fn lexical_backfill_health_with_affinity(
     }
 
     let backfill_marker_present = has_run_lexical_backfill(&sqlite_key).unwrap_or(false);
-    let state_path = index_dir.join("backfill_state.json");
-    let state = match read_lexical_backfill_state_file(&state_path) {
+    let state = match read_lexical_backfill_state_for_pool(pool, &index_dir) {
         Ok(state) => state,
         Err(error) => {
             return (
@@ -1784,6 +1812,8 @@ pub fn refresh_live_lexical_index(pool: &DbPool) -> Result<(), DbError> {
             .lock()
             .map_err(|error| DbError::Sqlite(format!("search bootstrap lock poisoned: {error}")))?;
         let sqlite_key = sqlite_key_for_pool(pool);
+        pool.verify_sqlite_authority("live lexical index refresh")?;
+        pool.verify_search_index_open_authority(&index_dir, "live lexical index refresh")?;
         if let Err(error) = crate::search_v3::backfill_read_only_live(
             &lexical_backfill_database_url(pool),
             &index_dir,
@@ -1805,10 +1835,14 @@ fn run_lexical_backfill_for_pool(pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
+    pool.verify_sqlite_authority("lexical search backfill")?;
     let sqlite_key = sqlite_key_for_pool(pool);
     let db_url = lexical_backfill_database_url(pool);
-    let backfill =
-        || crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()));
+    let backfill = || {
+        pool.verify_sqlite_authority("lexical search backfill")
+            .map_err(|err| err.to_string())?;
+        crate::search_v3::backfill_from_db_as(&db_url, Some(pool.search_identity_path()))
+    };
     #[cfg(feature = "tantivy-engine")]
     let result = crate::search_v3::with_backfill_source_retry(backfill);
     // The feature-disabled bridge already defines a no-op backfill. It has no
@@ -1824,6 +1858,7 @@ fn observe_live_lexical_source(pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
     }
+    pool.verify_sqlite_authority("lexical source observation")?;
     #[cfg(feature = "tantivy-engine")]
     crate::search_v3::observe_live_source_revision(&lexical_backfill_database_url(pool))
         .map_err(|err| map_bridge_bootstrap_error(&err))?;
@@ -1867,6 +1902,8 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     }
 
     let result: Result<bool, String> = (|| {
+        pool.verify_search_index_open_authority(&index_dir, "lexical search bridge open")
+            .map_err(|err| err.to_string())?;
         crate::search_v3::init_or_switch_bridge(&index_dir)?;
 
         if pool.sqlite_path() == ":memory:" {

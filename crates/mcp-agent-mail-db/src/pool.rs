@@ -3025,6 +3025,7 @@ pub struct DbPool {
     /// retirement. `None` is the `:memory:` sentinel.
     sqlite_identity: Option<PathBuf>,
     sqlite_path: String,
+    sqlite_authority: Option<Arc<FrozenDirectoryAuthority>>,
     /// Frozen archive-root identity (deepest existing prefix canonicalized).
     /// Registry keys, init gates, and identity digests use this.
     storage_root: PathBuf,
@@ -3032,6 +3033,7 @@ pub struct DbPool {
     /// followed). Archive recovery, reconcile, and allocator scans use this,
     /// so a symlinked storage root is still refused as archive authority.
     storage_root_alias: PathBuf,
+    storage_root_authority: Arc<FrozenDirectoryAuthority>,
     /// Per-transaction ceiling for raw ATC experience rows in the isolated
     /// telemetry sidecar. Captured when the pool is created so the hot write
     /// path does not reparse process configuration for every experience.
@@ -3075,10 +3077,12 @@ pub struct DbPool {
 struct DbPoolAuthority {
     sqlite_identity: Option<PathBuf>,
     sqlite_path: String,
+    sqlite_authority: Option<Arc<FrozenDirectoryAuthority>>,
     /// Frozen archive-root identity (see [`DbPool::storage_root`]).
     storage_root: PathBuf,
     /// The configured archive-root spelling (see [`DbPool::storage_root_alias`]).
     storage_root_alias: PathBuf,
+    storage_root_authority: Arc<FrozenDirectoryAuthority>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3392,6 +3396,7 @@ impl DbPool {
         busy_timeout_ms: u64,
     ) -> DbResult<crate::DbConnGuard> {
         self.validated_sqlite_path(context)?;
+        self.verify_sqlite_authority(context)?;
         let conn = crate::guard_db_conn(
             open_sqlite_file_with_lock_retry(&self.sqlite_path)
                 .map_err(|error| DbError::Sqlite(format!("{context}: open failed: {error}")))?,
@@ -3462,8 +3467,10 @@ impl DbPool {
             engine_generation: cache_generation,
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
+            sqlite_authority: authority.sqlite_authority,
             storage_root: authority.storage_root,
             storage_root_alias: authority.storage_root_alias,
+            storage_root_authority: authority.storage_root_authority,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3521,8 +3528,10 @@ impl DbPool {
             engine_generation: cache_generation,
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
+            sqlite_authority: authority.sqlite_authority,
             storage_root: authority.storage_root,
             storage_root_alias: authority.storage_root_alias,
+            storage_root_authority: authority.storage_root_authority,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3642,17 +3651,63 @@ impl DbPool {
     ///
     /// Returns [`DbError::InvalidArgument`] when the path now resolves through
     /// a different authority than the one frozen at pool construction.
-    pub(crate) fn validated_sqlite_path(&self, context: &'static str) -> DbResult<&Path> {
-        validate_frozen_sqlite_open_authority(
+    pub(crate) fn verify_sqlite_authority(&self, context: &'static str) -> DbResult<()> {
+        validate_frozen_sqlite_open_authority_with_descriptor(
             &self.sqlite_path,
             self.sqlite_identity.as_deref(),
+            self.sqlite_authority.as_deref(),
             context,
         )
         .map_err(|error| DbError::InvalidArgument {
             field: "database_url",
             message: error.to_string(),
-        })?;
-        Ok(Path::new(&self.sqlite_path))
+        })
+    }
+
+    pub(crate) fn verify_sqlite_sibling_file(
+        &self,
+        sibling_path: &Path,
+        context: &'static str,
+    ) -> DbResult<()> {
+        if let Some(authority) = self.sqlite_authority.as_deref()
+            && let Some(file_name) = sibling_path.file_name()
+        {
+            authority
+                .verify_sibling_file_in_parent(file_name, context)
+                .map_err(|error| DbError::InvalidArgument {
+                    field: "database_url",
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_storage_root_authority(&self, context: &'static str) -> DbResult<()> {
+        verify_frozen_storage_root_with_descriptor(
+            &self.storage_root,
+            &self.storage_root_alias,
+            &self.storage_root_authority,
+            context,
+        )
+        .map_err(|error| DbError::InvalidArgument {
+            field: "storage_root",
+            message: error.to_string(),
+        })
+    }
+
+    /// Return the frozen SQLite authority after proving its path has not
+    /// become an alias for a different filesystem identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::InvalidArgument`] when the path now resolves through
+    /// a different authority than the one frozen at pool construction.
+    pub(crate) fn validated_sqlite_path(&self, context: &'static str) -> DbResult<&Path> {
+        self.verify_sqlite_authority(context)?;
+        let path = Path::new(&self.sqlite_path);
+        #[cfg(test)]
+        run_pool_sqlite_path_after_validation_hook(context, path);
+        Ok(path)
     }
 
     /// Return the derived ATC sidecar path after validating both its mailbox
@@ -3667,6 +3722,7 @@ impl DbPool {
         context: &'static str,
     ) -> DbResult<Option<String>> {
         self.validated_sqlite_path(context)?;
+        self.verify_sqlite_authority(context)?;
         let Some(atc_path) = self.atc_sqlite_path() else {
             return Ok(None);
         };
@@ -3675,6 +3731,7 @@ impl DbPool {
                 field: "database_url",
                 message: error.to_string(),
             })?;
+        self.verify_sqlite_sibling_file(Path::new(&atc_path), context)?;
         Ok(Some(atc_path))
     }
 
@@ -3691,18 +3748,114 @@ impl DbPool {
     /// through a different filesystem authority (for example, because a
     /// missing leaf was replaced with a symlink after pool construction).
     pub(crate) fn validated_storage_root(&self, context: &'static str) -> DbResult<&Path> {
-        validate_frozen_storage_root_authority(&self.storage_root, context).map_err(|error| {
-            DbError::InvalidArgument {
+        self.verify_storage_root_authority(context)?;
+        #[cfg(test)]
+        run_pool_storage_root_after_validation_hook(context, &self.storage_root_alias);
+        Ok(&self.storage_root_alias)
+    }
+
+    /// Inspect `storage_root/search_index` markers (`backfill_state.json` or
+    /// `meta.json`) through the pool's no-follow directory descriptor
+    /// authority (`br-xzgcj`).
+    pub(crate) fn has_shared_search_index_markers(&self, context: &'static str) -> DbResult<bool> {
+        self.verify_sqlite_authority(context)?;
+        self.verify_storage_root_authority(context)?;
+        self.storage_root_authority
+            .has_search_index_markers(context)
+            .map_err(|error| DbError::InvalidArgument {
                 field: "storage_root",
                 message: error.to_string(),
-            }
-        })?;
-        validate_frozen_storage_root_alias(&self.storage_root_alias, &self.storage_root, context)
+            })
+    }
+
+    /// Read `storage_root/search_index/<file_name>` through the pool's
+    /// no-follow directory descriptor authority (`br-xzgcj`).
+    pub(crate) fn read_shared_search_index_file(
+        &self,
+        file_name: &str,
+        context: &'static str,
+    ) -> DbResult<Option<Vec<u8>>> {
+        self.verify_sqlite_authority(context)?;
+        self.verify_storage_root_authority(context)?;
+        self.storage_root_authority
+            .read_search_index_file(file_name, context)
             .map_err(|error| DbError::InvalidArgument {
-            field: "storage_root",
-            message: error.to_string(),
-        })?;
-        Ok(&self.storage_root_alias)
+                field: "storage_root",
+                message: error.to_string(),
+            })
+    }
+
+    /// Re-verify database and storage-root authorities immediately before
+    /// opening or refreshing the lexical search index at `index_dir`
+    /// (`br-xzgcj`).
+    pub(crate) fn verify_search_index_open_authority(
+        &self,
+        index_dir: &Path,
+        context: &'static str,
+    ) -> DbResult<()> {
+        self.verify_sqlite_authority(context)?;
+        self.verify_storage_root_authority(context)?;
+        if index_dir == self.storage_root_alias.join("search_index")
+            || index_dir == self.storage_root.join("search_index")
+        {
+            self.storage_root_authority
+                .verify_search_index_subdir(context)
+                .map_err(|error| DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Compute or retrieve the process-wide archive seed for this pool after
+    /// verifying the bound storage-root descriptor both before and after any
+    /// on-disk archive scan (`br-xzgcj`).
+    pub(crate) async fn archive_seed(
+        &self,
+        cx: &Cx,
+        context: &'static str,
+    ) -> Outcome<i64, DbError> {
+        let storage_root = match self.validated_storage_root(context) {
+            Ok(root) => root.to_path_buf(),
+            Err(error) => return Outcome::Err(error),
+        };
+        if let Err(error) = self.verify_storage_root_authority(context) {
+            return Outcome::Err(error);
+        }
+        let storage_root_identity = self.storage_root.clone();
+        let storage_root_alias = self.storage_root_alias.clone();
+        let storage_root_authority = Arc::clone(&self.storage_root_authority);
+        self.message_id_allocator
+            .archive_seed_with(cx, || async move {
+                if let Err(error) = verify_frozen_storage_root_with_descriptor(
+                    &storage_root_identity,
+                    &storage_root_alias,
+                    &storage_root_authority,
+                    context,
+                ) {
+                    return Outcome::Err(DbError::InvalidArgument {
+                        field: "storage_root",
+                        message: error.to_string(),
+                    });
+                }
+                let scanned = crate::id_floor::scan_archive_floor(cx, storage_root).await;
+                if matches!(scanned, Outcome::Ok(_))
+                    && let Err(error) = verify_frozen_storage_root_with_descriptor(
+                        &storage_root_identity,
+                        &storage_root_alias,
+                        &storage_root_authority,
+                        context,
+                    )
+                {
+                    return Outcome::Err(DbError::InvalidArgument {
+                        field: "storage_root",
+                        message: error.to_string(),
+                    });
+                }
+                scanned
+            })
+            .await
     }
 
     #[must_use]
@@ -3812,9 +3965,12 @@ impl DbPool {
     #[allow(clippy::too_many_lines)]
     async fn acquire_once(&self, cx: &Cx) -> Outcome<PooledConnection<DbConn>, SqlError> {
         let start = Instant::now();
-        if let Err(error) =
-            validate_frozen_storage_root_authority(&self.storage_root, "pooled connection checkout")
-        {
+        if let Err(error) = verify_frozen_storage_root_with_descriptor(
+            &self.storage_root,
+            &self.storage_root_alias,
+            &self.storage_root_authority,
+            "pooled connection checkout",
+        ) {
             let dur_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
                 .unwrap_or(u64::MAX);
             let metrics = mcp_agent_mail_core::global_metrics();
@@ -3822,12 +3978,14 @@ impl DbPool {
             metrics.db.pool_acquire_latency_us.record(dur_us);
             metrics.db.pool_acquire_errors_total.inc();
             self.stats_sampler.maybe_sample(&self.pool);
-            return Outcome::Err(error);
+            return Outcome::Err(SqlError::Custom(error.to_string()));
         }
         let sqlite_path = self.sqlite_path.clone();
         let sqlite_identity = self.sqlite_identity.clone();
+        let sqlite_authority = self.sqlite_authority.clone();
         let storage_root = self.storage_root.clone();
         let storage_root_alias = self.storage_root_alias.clone();
+        let storage_root_authority = Arc::clone(&self.storage_root_authority);
         let init_sql = self.init_sql.clone();
         let run_migrations = self.run_migrations;
         let skip_startup_init = self.skip_startup_init;
@@ -3839,6 +3997,7 @@ impl DbPool {
             .acquire(cx, || {
                 let sqlite_path = sqlite_path.clone();
                 let sqlite_identity = sqlite_identity.clone();
+                let sqlite_authority = sqlite_authority.clone();
                 let storage_root = storage_root.clone();
                 // Archive recovery and reconcile see the configured spelling,
                 // never the resolved identity: a symlinked storage root must
@@ -3846,12 +4005,14 @@ impl DbPool {
                 // the init gate only.
                 let storage_root_alias = storage_root_alias.clone();
                 let storage_root_for_recovery = storage_root_alias.clone();
+                let storage_root_authority = Arc::clone(&storage_root_authority);
                 let init_sql = init_sql.clone();
                 let cx2 = cx2.clone();
                 async move {
-                    if let Err(error) = validate_frozen_sqlite_open_authority(
+                    if let Err(error) = validate_frozen_sqlite_open_authority_with_descriptor(
                         &sqlite_path,
                         sqlite_identity.as_deref(),
+                        sqlite_authority.as_deref(),
                         "pooled connection open",
                     ) {
                         return Outcome::Err(error);
@@ -3862,6 +4023,11 @@ impl DbPool {
                         && let Err(e) = ensure_sqlite_parent_dir_exists(&sqlite_path)
                     {
                         return Outcome::Err(e);
+                    }
+                    if let Some(authority) = sqlite_authority.as_deref()
+                        && let Err(error) = authority.verify("pooled connection parent creation")
+                    {
+                        return Outcome::Err(error);
                     }
 
                     // For file-backed DBs, run DB-wide init (journal mode, migrations) once
@@ -3893,11 +4059,13 @@ impl DbPool {
                                     gate: &init_gate,
                                     success: false,
                                 };
-                                let init_out = initialize_sqlite_file_once(
+                                let init_out = initialize_sqlite_file_once_with_authorities(
                                     &cx2,
                                     &sqlite_path,
                                     run_migrations,
                                     &storage_root_alias,
+                                    sqlite_authority.as_deref(),
+                                    Some(&storage_root_authority),
                                 )
                                 .await;
                                 match init_out {
@@ -3917,9 +4085,10 @@ impl DbPool {
                     // leaf. Revalidate immediately before the engine open so
                     // an independently inserted symlink cannot inherit this
                     // pool's frozen authority between init and checkout.
-                    if let Err(error) = validate_frozen_sqlite_open_authority(
+                    if let Err(error) = validate_frozen_sqlite_open_authority_with_descriptor(
                         &sqlite_path,
                         sqlite_identity.as_deref(),
+                        sqlite_authority.as_deref(),
                         "pooled connection post-init open",
                     ) {
                         return Outcome::Err(error);
@@ -3932,6 +4101,12 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else if open_mode == DbPoolOpenMode::QueryOnlyStrict {
+                        if let Some(authority) = sqlite_authority.as_deref()
+                            && let Err(error) =
+                                authority.verify("strict query-only pool connection")
+                        {
+                            return Outcome::Err(error);
+                        }
                         match open_guarded_read_only_franken_existing_file(
                             Path::new(&sqlite_path),
                             "strict query-only pool connection",
@@ -3940,9 +4115,11 @@ impl DbPool {
                             Err(e) => return Outcome::Err(e),
                         }
                     } else {
-                        match open_sqlite_file_with_recovery_and_storage_root(
+                        match open_sqlite_file_with_recovery_and_authorities(
                             &sqlite_path,
                             &storage_root_for_recovery,
+                            sqlite_authority.as_deref(),
+                            Some(&storage_root_authority),
                         ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
@@ -4008,23 +4185,30 @@ impl DbPool {
                         // pool reconciles against ITS archive (env-derived root can alias a
                         // different mailbox or skip archive reconstruction — see the
                         // DbPoolConfig::storage_root doc-comment).
-                        if let Err(recovery_err) = recover_sqlite_file_with_storage_root(
-                            Path::new(&sqlite_path),
-                            &storage_root_for_recovery,
-                        ) {
+                        if let Err(recovery_err) =
+                            recover_sqlite_file_with_storage_root_and_authorities(
+                                Path::new(&sqlite_path),
+                                &storage_root_for_recovery,
+                                sqlite_authority.as_deref(),
+                                Some(&storage_root_authority),
+                            )
+                        {
                             return Outcome::Err(recovery_err);
                         }
 
-                        if let Err(error) = validate_frozen_sqlite_open_authority(
+                        if let Err(error) = validate_frozen_sqlite_open_authority_with_descriptor(
                             &sqlite_path,
                             sqlite_identity.as_deref(),
+                            sqlite_authority.as_deref(),
                             "pooled connection post-recovery open",
                         ) {
                             return Outcome::Err(error);
                         }
-                        conn = match open_sqlite_file_with_recovery_and_storage_root(
+                        conn = match open_sqlite_file_with_recovery_and_authorities(
                             &sqlite_path,
                             &storage_root_for_recovery,
+                            sqlite_authority.as_deref(),
+                            Some(&storage_root_authority),
                         ) {
                             Ok(c) => c,
                             Err(e) => return Outcome::Err(e),
@@ -4161,11 +4345,13 @@ impl DbPool {
         cycle: &str,
     ) -> DbResult<bool> {
         let sqlite_path = self.validated_sqlite_path("integrity pre-open classification")?;
+        self.verify_sqlite_authority("integrity pre-open classification")?;
         cleanup_truncated_wal_sidecar(sqlite_path).map_err(|error| {
             DbError::Sqlite(format!(
                 "{cycle}: pre-open SQLite-family cleanup failed: {error}"
             ))
         })?;
+        self.verify_sqlite_authority("integrity pre-open classification")?;
 
         let breaker_requires_source_neutral_proof = match crate::recovery_breaker::load(sqlite_path)
         {
@@ -4180,6 +4366,7 @@ impl DbPool {
             return Ok(false);
         }
 
+        self.verify_sqlite_authority("integrity pre-open classification")?;
         sqlite_file_is_healthy_without_family_cleanup(sqlite_path)
             .map(|healthy| !healthy)
             .map_err(|error| {
@@ -4235,6 +4422,7 @@ impl DbPool {
         )?;
         let run_live_check = || -> DbResult<integrity::IntegrityCheckResult> {
             self.validated_sqlite_path("startup integrity live open")?;
+            self.verify_sqlite_authority("startup integrity live open")?;
             let conn = crate::guard_db_conn(
                 match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                     Ok(conn) => conn,
@@ -4249,10 +4437,15 @@ impl DbPool {
                             error = %e,
                             "startup integrity check failed to open sqlite file; attempting auto-recovery"
                         );
-                        recover_sqlite_file_with_storage_root(sqlite_path, storage_root).map_err(
-                            |re| DbError::Sqlite(format!("startup recovery failed: {re}")),
-                        )?;
+                        recover_sqlite_file_with_storage_root_and_authorities(
+                            sqlite_path,
+                            storage_root,
+                            self.sqlite_authority.as_deref(),
+                            Some(&self.storage_root_authority),
+                        )
+                        .map_err(|re| DbError::Sqlite(format!("startup recovery failed: {re}")))?;
                         self.validated_sqlite_path("startup integrity post-recovery open")?;
+                        self.verify_sqlite_authority("startup integrity post-recovery open")?;
                         open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                             DbError::Sqlite(format!(
                                 "startup integrity check: open failed after recovery: {reopen}"
@@ -4284,11 +4477,16 @@ impl DbPool {
                     // Close connection before attempting restore (Windows/locking safety)
                     drop(conn);
 
-                    if let Err(e) = recover_sqlite_file_with_storage_root(sqlite_path, storage_root)
-                    {
+                    if let Err(e) = recover_sqlite_file_with_storage_root_and_authorities(
+                        sqlite_path,
+                        storage_root,
+                        self.sqlite_authority.as_deref(),
+                        Some(&self.storage_root_authority),
+                    ) {
                         return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                     }
                     self.validated_sqlite_path("startup integrity post-recovery open")?;
+                    self.verify_sqlite_authority("startup integrity post-recovery open")?;
 
                     // Re-open and re-verify. Route post-recovery through the same
                     // canonical fallback: if the bespoke probe's false-positive was
@@ -4320,13 +4518,19 @@ impl DbPool {
                     drop(conn);
 
                     if let Err(recovery_error) =
-                        recover_sqlite_file_with_storage_root(sqlite_path, storage_root)
+                        recover_sqlite_file_with_storage_root_and_authorities(
+                            sqlite_path,
+                            storage_root,
+                            self.sqlite_authority.as_deref(),
+                            Some(&self.storage_root_authority),
+                        )
                     {
                         return Err(DbError::Sqlite(format!(
                             "startup recovery failed: {recovery_error}"
                         )));
                     }
                     self.validated_sqlite_path("startup integrity post-recovery open")?;
+                    self.verify_sqlite_authority("startup integrity post-recovery open")?;
 
                     let conn = crate::guard_db_conn(
                         open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
@@ -4384,7 +4588,10 @@ impl DbPool {
             return Ok(None);
         }
         let storage_root = self.validated_storage_root("message-id floor archive scan")?;
+        self.verify_storage_root_authority("message-id floor archive scan")?;
         let archive_max = crate::id_floor::max_message_id_in_archive(storage_root)?;
+        self.verify_storage_root_authority("message-id floor archive scan")?;
+        self.verify_sqlite_authority("message-id floor database authority")?;
         if archive_max.is_none() {
             return Ok(None);
         }
@@ -4431,6 +4638,7 @@ impl DbPool {
         phase: &str,
     ) -> DbResult<integrity::IntegrityCheckResult> {
         self.validated_sqlite_path("quick integrity canonical fallback")?;
+        self.verify_sqlite_authority("quick integrity canonical fallback")?;
         let proven_orphans = RefCell::new(None);
         reconcile_with_canonical_proving_orphans(
             integrity::quick_check(conn),
@@ -4438,13 +4646,26 @@ impl DbPool {
             phase,
             &self.sqlite_path,
             || {
+                if let Err(error) =
+                    self.verify_sqlite_authority("quick integrity canonical fallback")
+                {
+                    return Err(SqlError::Custom(error.to_string()));
+                }
                 sqlite_canonical_file_check_proving_orphans(
                     Path::new(&self.sqlite_path),
                     integrity::CheckKind::Quick,
                     &proven_orphans,
                 )
             },
-            || canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, phase),
+            || {
+                if self
+                    .verify_sqlite_authority("quick integrity canonical fallback")
+                    .is_err()
+                {
+                    return false;
+                }
+                canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, phase)
+            },
             |primary_details| proven_orphans_explaining_primary(&proven_orphans, primary_details),
         )
     }
@@ -4492,6 +4713,8 @@ impl DbPool {
             self.integrity_family_requires_preopen_admission(false, "full integrity check")?;
         let raw_conn = if requires_preopen_admission {
             with_recovery_mutation_admission(sqlite_path, "full integrity pre-open", || {
+                self.verify_sqlite_authority("full integrity pre-open")
+                    .map_err(|error| SqlError::Custom(error.to_string()))?;
                 open_sqlite_file_with_lock_retry(&self.sqlite_path)
             })
             .map_err(|error| {
@@ -4500,6 +4723,7 @@ impl DbPool {
                 ))
             })?
         } else {
+            self.verify_sqlite_authority("full integrity live open")?;
             match open_sqlite_file_with_lock_retry(&self.sqlite_path) {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -4513,10 +4737,17 @@ impl DbPool {
                         error = %e,
                         "full integrity check failed to open sqlite file; attempting auto-recovery"
                     );
-                    recover_sqlite_file_with_storage_root(sqlite_path, storage_root).map_err(
-                        |re| DbError::Sqlite(format!("full integrity recovery failed: {re}")),
-                    )?;
+                    recover_sqlite_file_with_storage_root_and_authorities(
+                        sqlite_path,
+                        storage_root,
+                        self.sqlite_authority.as_deref(),
+                        Some(&self.storage_root_authority),
+                    )
+                    .map_err(|re| {
+                        DbError::Sqlite(format!("full integrity recovery failed: {re}"))
+                    })?;
                     self.validated_sqlite_path("full integrity post-recovery open")?;
+                    self.verify_sqlite_authority("full integrity post-recovery open")?;
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|reopen| {
                         DbError::Sqlite(format!(
                             "full integrity check: open failed after recovery: {reopen}"
@@ -4527,6 +4758,7 @@ impl DbPool {
         };
         let conn = crate::guard_db_conn(raw_conn, "full integrity check connection");
         self.validated_sqlite_path("full integrity canonical fallback")?;
+        self.verify_sqlite_authority("full integrity canonical fallback")?;
 
         let proven_orphans = RefCell::new(None);
         reconcile_with_canonical_proving_orphans(
@@ -4535,13 +4767,26 @@ impl DbPool {
             "full-cycle",
             &self.sqlite_path,
             || {
+                if let Err(error) =
+                    self.verify_sqlite_authority("full integrity canonical fallback")
+                {
+                    return Err(SqlError::Custom(error.to_string()));
+                }
                 sqlite_canonical_file_check_proving_orphans(
                     Path::new(&self.sqlite_path),
                     integrity::CheckKind::Full,
                     &proven_orphans,
                 )
             },
-            || canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, "full-cycle"),
+            || {
+                if self
+                    .verify_sqlite_authority("full integrity canonical fallback")
+                    .is_err()
+                {
+                    return false;
+                }
+                canonical_mailbox_is_schema_only_for_reconcile(&self.sqlite_path, "full-cycle")
+            },
             |primary_details| proven_orphans_explaining_primary(&proven_orphans, primary_details),
         )
     }
@@ -4557,6 +4802,7 @@ impl DbPool {
             return Ok(Vec::new());
         }
         let sqlite_path = self.validated_sqlite_path("consistency probe")?;
+        self.verify_sqlite_authority("consistency probe")?;
         if !sqlite_path.exists() {
             return Ok(Vec::new());
         }
@@ -4749,6 +4995,7 @@ impl DbPool {
             return Ok(0);
         }
         self.validated_sqlite_path("passive wal checkpoint")?;
+        self.verify_sqlite_authority("passive wal checkpoint")?;
         let conn = crate::guard_db_conn(
             open_sqlite_file_with_lock_retry(&self.sqlite_path)
                 .map_err(|e| DbError::Sqlite(format!("passive checkpoint: open failed: {e}")))?,
@@ -4786,6 +5033,7 @@ impl DbPool {
             return Ok(None);
         }
         let primary = self.validated_sqlite_path("proactive backup")?;
+        self.verify_sqlite_authority("proactive backup")?;
         if !primary.exists() {
             return Ok(None);
         }
@@ -4805,6 +5053,7 @@ impl DbPool {
             return Ok(None);
         }
         let primary = self.validated_sqlite_path("proactive backup")?;
+        self.verify_sqlite_authority("proactive backup")?;
         if !primary.exists() {
             return Ok(None);
         }
@@ -4815,6 +5064,7 @@ impl DbPool {
         let mut before_export = Some(before_export);
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
+        self.verify_sqlite_sibling_file(&bak_path, "proactive backup destination")?;
         if !sqlite_recovery_candidate_is_standalone(&bak_path) {
             // A backup with companions is not the verified generation, and the
             // retained witness keeps the backup open: drop it first, or the
@@ -4845,6 +5095,7 @@ impl DbPool {
                 bak_path.display()
             )));
         }
+        self.verify_sqlite_sibling_file(&bak_path, "proactive backup destination")?;
         let existing_backup = match std::fs::symlink_metadata(&bak_path) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 let observed = SqliteFileWitness::capture_standalone(&bak_path)?;
@@ -4896,6 +5147,7 @@ impl DbPool {
             })?
             .len();
         let wal_path = sqlite_sidecar_path(primary, "-wal");
+        self.verify_sqlite_sibling_file(&wal_path, "proactive backup WAL inspection")?;
         let wal_bytes = match std::fs::symlink_metadata(&wal_path) {
             Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
             Ok(_) => {
@@ -4919,9 +5171,12 @@ impl DbPool {
         if let Some(admit) = before_export.take() {
             admit()?;
         }
+        self.verify_sqlite_authority("proactive backup staging")?;
+        self.verify_sqlite_sibling_file(&bak_path, "proactive backup staging")?;
         let (staged_directory, staged_backup) = create_proactive_backup_stage(primary, &bak_path)?;
         let staged_authority =
             match SqliteFileWitness::capture_standalone(&staged_backup).and_then(|witness| {
+                self.verify_sqlite_authority("proactive backup stage validation")?;
                 validate_proactive_backup_stage(primary, &staged_backup)?;
                 witness.verify(&staged_backup)?;
                 Ok(witness)
@@ -4945,6 +5200,16 @@ impl DbPool {
             )));
         }
         if let Err(error) = authority.revalidate(primary) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "{error}; proactive-backup stage {} was preserved before rotation",
+                preserved.display()
+            )));
+        }
+        if let Err(error) = self
+            .verify_sqlite_authority("proactive backup rotation")
+            .and_then(|()| self.verify_sqlite_sibling_file(&bak_path, "proactive backup rotation"))
+        {
             let preserved = staged_directory.preserve();
             return Err(DbError::Sqlite(format!(
                 "{error}; proactive-backup stage {} was preserved before rotation",
@@ -4981,6 +5246,18 @@ impl DbPool {
             )));
         }
         if let Err(error) = authority.revalidate(primary) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "{error}; proactive-backup stage {} and the previously rotated generation were preserved without publication",
+                preserved.display()
+            )));
+        }
+        if let Err(error) = self
+            .verify_sqlite_authority("proactive backup publication")
+            .and_then(|()| {
+                self.verify_sqlite_sibling_file(&bak_path, "proactive backup publication")
+            })
+        {
             let preserved = staged_directory.preserve();
             return Err(DbError::Sqlite(format!(
                 "{error}; proactive-backup stage {} and the previously rotated generation were preserved without publication",
@@ -5038,6 +5315,18 @@ impl DbPool {
             ))
         })?;
         if let Err(error) = authority.revalidate(primary) {
+            let preserved = staged_directory.preserve();
+            return Err(DbError::Sqlite(format!(
+                "{error}; proactive backup was published, but authority is uncertain; stage {} and the previous generation were preserved",
+                preserved.display()
+            )));
+        }
+        if let Err(error) = self
+            .verify_sqlite_authority("proactive backup verification")
+            .and_then(|()| {
+                self.verify_sqlite_sibling_file(&bak_path, "proactive backup verification")
+            })
+        {
             let preserved = staged_directory.preserve();
             return Err(DbError::Sqlite(format!(
                 "{error}; proactive backup was published, but authority is uncertain; stage {} and the previous generation were preserved",
@@ -5178,6 +5467,7 @@ impl DbPool {
             return Ok(None);
         }
         let primary = self.validated_sqlite_path("verified snapshot")?;
+        self.verify_sqlite_authority("verified snapshot")?;
         let db = &mcp_agent_mail_core::global_metrics().db;
 
         // Verify the live DB is fully clean before trusting it as a snapshot.
@@ -5194,6 +5484,7 @@ impl DbPool {
             );
             return Ok(None);
         }
+        self.verify_sqlite_authority("verified snapshot admission")?;
 
         // Refresh the .bak (reuses staged-copy + validate + atomic-swap). A zero
         // max-age forces a fresh copy of the just-verified database.
@@ -5206,6 +5497,8 @@ impl DbPool {
         else {
             return Ok(None);
         };
+        self.verify_sqlite_authority("verified snapshot metadata")?;
+        self.verify_sqlite_sibling_file(&bak, "verified snapshot metadata")?;
 
         let created_us = mcp_agent_mail_core::timestamps::now_micros();
         let meta =
@@ -5254,6 +5547,8 @@ impl DbPool {
         }
         let primary_path = self.validated_sqlite_path("runtime corruption recovery")?;
         let storage_root = self.validated_storage_root("runtime corruption archive recovery")?;
+        self.verify_sqlite_authority("runtime corruption recovery")?;
+        self.verify_storage_root_authority("runtime corruption archive recovery")?;
 
         if RECOVERY_IN_PROGRESS
             .compare_exchange(
@@ -5340,7 +5635,12 @@ impl DbPool {
         // does not retry the same parser-only-rejected query.
         let bespoke_parser_only_trigger = on_disk_healthy;
 
-        match recover_sqlite_file_with_storage_root(primary_path, storage_root) {
+        match recover_sqlite_file_with_storage_root_and_authorities(
+            primary_path,
+            storage_root,
+            self.sqlite_authority.as_deref(),
+            Some(&self.storage_root_authority),
+        ) {
             Ok(()) => {
                 self.retire_runtime_state_after_recovery(trigger_error);
                 if bespoke_parser_only_trigger {
@@ -5395,7 +5695,9 @@ impl DbPool {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PoolCacheKey {
     sqlite_identity: Option<PathBuf>,
+    sqlite_chain: Option<Vec<(u64, u64)>>,
     storage_root_identity: PathBuf,
+    storage_root_chain: Vec<(u64, u64)>,
     min_connections: usize,
     max_connections: usize,
     acquire_timeout_ms: u64,
@@ -5748,26 +6050,1139 @@ impl DbPoolAuthority {
         let configured_sqlite_path = config.sqlite_path()?;
         let selected_sqlite_path =
             resolve_sqlite_path_with_absolute_fallback(&configured_sqlite_path);
-        let (sqlite_identity, sqlite_path) = if selected_sqlite_path == ":memory:" {
-            (None, ":memory:".to_string())
+        let (sqlite_identity, sqlite_path, sqlite_authority) = if selected_sqlite_path == ":memory:"
+        {
+            (None, ":memory:".to_string(), None)
         } else {
             let absolute_alias =
                 absolute_lexical_authority_path(Path::new(&selected_sqlite_path), "database_url")?;
             let identity = normalize_sqlite_identity_path_buf(&absolute_alias);
             let open_path = sqlite_open_path_for_identity(&absolute_alias, &identity)?;
-            (Some(identity), open_path)
+            let authority =
+                FrozenDirectoryAuthority::resolve(&identity, "database", false, "database_url")?;
+            (Some(identity), open_path, Some(Arc::new(authority)))
         };
         let storage_root_alias =
             absolute_lexical_authority_path(&config.resolved_storage_root(), "storage_root")?;
         let storage_root = normalize_sqlite_identity_path_buf(&storage_root_alias);
+        let storage_root_authority = Arc::new(FrozenDirectoryAuthority::resolve(
+            &storage_root,
+            "archive",
+            true,
+            "storage_root",
+        )?);
 
         Ok(Self {
             sqlite_identity,
             sqlite_path,
+            sqlite_authority,
             storage_root,
             storage_root_alias,
+            storage_root_authority,
         })
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct FrozenDirectoryAuthority {
+    target_path: PathBuf,
+    authority_name: &'static str,
+    expect_directory_leaf: bool,
+    #[cfg(unix)]
+    anchor_dir: std::fs::File,
+    #[cfg(unix)]
+    ancestor_chain: Vec<(PathBuf, (u64, u64))>,
+    #[cfg(unix)]
+    unresolved_suffix: Vec<std::ffi::OsString>,
+    #[cfg(unix)]
+    latched_suffix_dirs: Mutex<Vec<(u64, u64)>>,
+}
+
+impl FrozenDirectoryAuthority {
+    #[must_use]
+    fn existing_chain_ids(&self) -> Vec<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            self.ancestor_chain.iter().map(|(_, id)| *id).collect()
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
+    fn open_no_follow_directory_from_root(
+        dir_path: &Path,
+        label: &str,
+    ) -> Result<(std::fs::File, rustix::fs::Stat), SqlError> {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+
+        let dir_flags = OFlags::RDONLY
+            | OFlags::DIRECTORY
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC;
+        let mut current_fd =
+            openat(rustix::fs::CWD, "/", dir_flags, Mode::empty()).map_err(|error| {
+                SqlError::Custom(format!(
+                    "failed to open root directory while anchoring {label} {}: {error}",
+                    dir_path.display()
+                ))
+            })?;
+        let mut current_stat = fstat(&current_fd).map_err(|error| {
+            SqlError::Custom(format!(
+                "failed to stat root directory while anchoring {label} {}: {error}",
+                dir_path.display()
+            ))
+        })?;
+        let mut current_path = PathBuf::from("/");
+
+        for component in dir_path.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(SqlError::Custom(format!(
+                        "refusing {label} {} because parent directory contains '..' traversal",
+                        dir_path.display()
+                    )));
+                }
+                Component::Normal(segment) => {
+                    current_path.push(segment);
+                    let entry_stat = statat(&current_fd, segment, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(|error| {
+                            SqlError::Custom(format!(
+                                "failed to inspect {label} {} at {}: {error}",
+                                dir_path.display(),
+                                current_path.display()
+                            ))
+                        })?;
+                    if FileType::from_raw_mode(entry_stat.st_mode) == FileType::Symlink {
+                        if let Ok(resolved) = std::fs::canonicalize(&current_path)
+                            && is_macos_temp_firmlink(&current_path, &resolved)
+                        {
+                            let (resolved_file, resolved_stat) =
+                                Self::open_no_follow_directory_from_root(&resolved, label)?;
+                            current_fd = std::os::fd::OwnedFd::from(resolved_file);
+                            current_stat = resolved_stat;
+                            current_path = resolved;
+                            continue;
+                        }
+                        return Err(SqlError::Custom(format!(
+                            "refusing {label} {} because it traverses symlinked path {}",
+                            dir_path.display(),
+                            current_path.display()
+                        )));
+                    }
+                    if FileType::from_raw_mode(entry_stat.st_mode) != FileType::Directory {
+                        return Err(SqlError::Custom(format!(
+                            "refusing {label} {} because {} is not a directory",
+                            dir_path.display(),
+                            current_path.display()
+                        )));
+                    }
+                    let next_fd = openat(&current_fd, segment, dir_flags, Mode::empty()).map_err(
+                        |error| {
+                            SqlError::Custom(format!(
+                                "failed to open directory {} while anchoring {label} {}: {error}",
+                                current_path.display(),
+                                dir_path.display()
+                            ))
+                        },
+                    )?;
+                    let next_stat = fstat(&next_fd).map_err(|error| {
+                        SqlError::Custom(format!(
+                            "failed to fstat directory {} while anchoring {label} {}: {error}",
+                            current_path.display(),
+                            dir_path.display()
+                        ))
+                    })?;
+                    if entry_stat.st_dev != next_stat.st_dev
+                        || entry_stat.st_ino != next_stat.st_ino
+                        || FileType::from_raw_mode(entry_stat.st_mode)
+                            != FileType::from_raw_mode(next_stat.st_mode)
+                    {
+                        return Err(SqlError::Custom(format!(
+                            "refusing {label} {} because directory {} changed identity during open",
+                            dir_path.display(),
+                            current_path.display()
+                        )));
+                    }
+                    current_fd = next_fd;
+                    current_stat = next_stat;
+                }
+            }
+        }
+
+        Ok((std::fs::File::from(current_fd), current_stat))
+    }
+
+    fn resolve(
+        target_path: &Path,
+        authority_name: &'static str,
+        expect_directory_leaf: bool,
+        field: &'static str,
+    ) -> DbResult<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+
+            let dir_flags = OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC;
+            let root_fd =
+                openat(rustix::fs::CWD, "/", dir_flags, Mode::empty()).map_err(|error| {
+                    DbError::InvalidArgument {
+                        field,
+                        message: format!(
+                            "failed to open root directory while freezing {authority_name} authority {}: {error}",
+                            target_path.display()
+                        ),
+                    }
+                })?;
+            let root_stat = fstat(&root_fd).map_err(|error| DbError::InvalidArgument {
+                field,
+                message: format!(
+                    "failed to stat root directory while freezing {authority_name} authority {}: {error}",
+                    target_path.display()
+                ),
+            })?;
+            let mut anchor_dir = std::fs::File::from(root_fd);
+            let mut ancestor_chain =
+                vec![(PathBuf::from("/"), (root_stat.st_dev, root_stat.st_ino))];
+            let mut unresolved_suffix = Vec::new();
+            let mut current_path = PathBuf::from("/");
+
+            let segments = target_path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(segment) => Some(segment.to_os_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let dir_segment_limit = if expect_directory_leaf {
+                segments.len()
+            } else {
+                segments.len().saturating_sub(1)
+            };
+
+            let mut missing_started = false;
+            for (idx, segment) in segments.into_iter().enumerate() {
+                current_path.push(&segment);
+                if missing_started || idx >= dir_segment_limit {
+                    unresolved_suffix.push(segment);
+                    continue;
+                }
+                match statat(&anchor_dir, &segment, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(entry_stat) => {
+                        let file_type = FileType::from_raw_mode(entry_stat.st_mode);
+                        if file_type == FileType::Symlink {
+                            if let Ok(resolved) = std::fs::canonicalize(&current_path)
+                                && is_macos_temp_firmlink(&current_path, &resolved)
+                            {
+                                let (resolved_file, resolved_stat) =
+                                    Self::open_no_follow_directory_from_root(
+                                        &resolved,
+                                        authority_name,
+                                    )
+                                    .map_err(|error| {
+                                        DbError::InvalidArgument {
+                                            field,
+                                            message: error.to_string(),
+                                        }
+                                    })?;
+                                anchor_dir = resolved_file;
+                                ancestor_chain.push((
+                                    resolved.clone(),
+                                    (resolved_stat.st_dev, resolved_stat.st_ino),
+                                ));
+                                current_path = resolved;
+                                continue;
+                            }
+                            return Err(DbError::InvalidArgument {
+                                field,
+                                message: format!(
+                                    "refusing {authority_name} authority {} because it traverses symlinked path {}; refusing to cross {authority_name} authority",
+                                    target_path.display(),
+                                    current_path.display()
+                                ),
+                            });
+                        }
+                        if file_type != FileType::Directory {
+                            return Err(DbError::InvalidArgument {
+                                field,
+                                message: format!(
+                                    "refusing {authority_name} authority {} because {} is not a directory; refusing to cross {authority_name} authority",
+                                    target_path.display(),
+                                    current_path.display()
+                                ),
+                            });
+                        }
+                        let next_fd =
+                            openat(&anchor_dir, &segment, dir_flags, Mode::empty()).map_err(
+                                |error| DbError::InvalidArgument {
+                                    field,
+                                    message: format!(
+                                        "failed to open directory {} while freezing {authority_name} authority {}: {error}",
+                                        current_path.display(),
+                                        target_path.display()
+                                    ),
+                                },
+                            )?;
+                        let next_stat = fstat(&next_fd).map_err(|error| DbError::InvalidArgument {
+                            field,
+                            message: format!(
+                                "failed to fstat directory {} while freezing {authority_name} authority {}: {error}",
+                                current_path.display(),
+                                target_path.display()
+                            ),
+                        })?;
+                        if next_stat.st_dev != entry_stat.st_dev
+                            || next_stat.st_ino != entry_stat.st_ino
+                            || FileType::from_raw_mode(next_stat.st_mode) != FileType::Directory
+                        {
+                            return Err(DbError::InvalidArgument {
+                                field,
+                                message: format!(
+                                    "{authority_name} directory {} changed identity while freezing {}; refusing to cross {authority_name} authority",
+                                    current_path.display(),
+                                    target_path.display()
+                                ),
+                            });
+                        }
+                        anchor_dir = std::fs::File::from(next_fd);
+                        ancestor_chain
+                            .push((current_path.clone(), (next_stat.st_dev, next_stat.st_ino)));
+                    }
+                    Err(rustix::io::Errno::NOENT) => {
+                        missing_started = true;
+                        unresolved_suffix.push(segment);
+                    }
+                    Err(error) => {
+                        return Err(DbError::InvalidArgument {
+                            field,
+                            message: format!(
+                                "failed to inspect {authority_name} authority {} at {}: {error}",
+                                target_path.display(),
+                                current_path.display()
+                            ),
+                        });
+                    }
+                }
+            }
+
+            Ok(Self {
+                target_path: target_path.to_path_buf(),
+                authority_name,
+                expect_directory_leaf,
+                anchor_dir,
+                ancestor_chain,
+                unresolved_suffix,
+                latched_suffix_dirs: Mutex::new(Vec::new()),
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = field;
+            Ok(Self {
+                target_path: target_path.to_path_buf(),
+                authority_name,
+                expect_directory_leaf,
+            })
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn verify(&self, context: &'static str) -> Result<(), SqlError> {
+        #[cfg(unix)]
+        {
+            let _ = self.verify_and_open_leaf_parent_or_dir(context)?;
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            validate_frozen_authority_leaf_not_symlink(
+                &self.target_path,
+                context,
+                self.authority_name,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
+    fn verify_and_open_leaf_parent_or_dir(
+        &self,
+        context: &'static str,
+    ) -> Result<Option<std::fs::File>, SqlError> {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+
+        let dir_flags = OFlags::RDONLY
+            | OFlags::DIRECTORY
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC;
+
+        // 1. Verify the frozen existing ancestor chain from `/` down to `anchor_dir`.
+        let root_fd = openat(rustix::fs::CWD, "/", dir_flags, Mode::empty()).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to open root directory while verifying {} authority {}: {error}; refusing to cross {} authority",
+                self.authority_name,
+                self.target_path.display(),
+                self.authority_name
+            ))
+        })?;
+        let root_stat = fstat(&root_fd).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: failed to stat root directory while verifying {} authority {}: {error}; refusing to cross {} authority",
+                self.authority_name,
+                self.target_path.display(),
+                self.authority_name
+            ))
+        })?;
+        if let Some((_, expected_root)) = self.ancestor_chain.first()
+            && (root_stat.st_dev, root_stat.st_ino) != *expected_root
+        {
+            return Err(SqlError::Custom(format!(
+                "{context}: root directory identity changed while verifying {} authority {}; refusing to cross {} authority",
+                self.authority_name,
+                self.target_path.display(),
+                self.authority_name
+            )));
+        }
+        let mut walk_fd = std::fs::File::from(root_fd);
+        let mut prev_path = PathBuf::from("/");
+        for (ancestor_path, expected_id) in self.ancestor_chain.iter().skip(1) {
+            let rel = ancestor_path
+                .strip_prefix(&prev_path)
+                .unwrap_or(ancestor_path.as_path());
+            for component in rel.components() {
+                let Component::Normal(segment) = component else {
+                    continue;
+                };
+                let entry_stat = statat(&walk_fd, segment, AtFlags::SYMLINK_NOFOLLOW).map_err(
+                    |error| {
+                        SqlError::Custom(format!(
+                            "{context}: frozen {} ancestor {} at {} is no longer reachable ({error}); refusing to cross {} authority",
+                            self.authority_name,
+                            self.target_path.display(),
+                            ancestor_path.display(),
+                            self.authority_name
+                        ))
+                    },
+                )?;
+                let file_type = FileType::from_raw_mode(entry_stat.st_mode);
+                if file_type == FileType::Symlink {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: frozen {} ancestor {} is now a symbolic link; refusing to cross {} authority",
+                        self.authority_name,
+                        ancestor_path.display(),
+                        self.authority_name
+                    )));
+                }
+                if file_type != FileType::Directory {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: frozen {} ancestor {} is no longer a directory; refusing to cross {} authority",
+                        self.authority_name,
+                        ancestor_path.display(),
+                        self.authority_name
+                    )));
+                }
+                let next_fd = openat(&walk_fd, segment, dir_flags, Mode::empty()).map_err(
+                    |error| {
+                        SqlError::Custom(format!(
+                            "{context}: cannot open frozen {} ancestor {}: {error}; refusing to cross {} authority",
+                            self.authority_name,
+                            ancestor_path.display(),
+                            self.authority_name
+                        ))
+                    },
+                )?;
+                let next_stat = fstat(&next_fd).map_err(|error| {
+                    SqlError::Custom(format!(
+                        "{context}: cannot stat frozen {} ancestor {}: {error}; refusing to cross {} authority",
+                        self.authority_name,
+                        ancestor_path.display(),
+                        self.authority_name
+                    ))
+                })?;
+                if (next_stat.st_dev, next_stat.st_ino) != (entry_stat.st_dev, entry_stat.st_ino) {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: frozen {} ancestor {} changed concurrently during verification; refusing to cross {} authority",
+                        self.authority_name,
+                        ancestor_path.display(),
+                        self.authority_name
+                    )));
+                }
+                walk_fd = std::fs::File::from(next_fd);
+            }
+            let walk_stat = fstat(&walk_fd).map_err(|error| {
+                SqlError::Custom(format!(
+                    "{context}: cannot stat frozen {} ancestor {}: {error}; refusing to cross {} authority",
+                    self.authority_name,
+                    ancestor_path.display(),
+                    self.authority_name
+                ))
+            })?;
+            if (walk_stat.st_dev, walk_stat.st_ino) != *expected_id {
+                return Err(SqlError::Custom(format!(
+                    "{context}: frozen {} ancestor {} was replaced with a different directory inode; refusing to cross {} authority",
+                    self.authority_name,
+                    ancestor_path.display(),
+                    self.authority_name
+                )));
+            }
+            prev_path.clone_from(ancestor_path);
+        }
+
+        let anchor_live_stat = fstat(&self.anchor_dir).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot stat retained {} anchor descriptor for {}: {error}; refusing to cross {} authority",
+                self.authority_name,
+                self.target_path.display(),
+                self.authority_name
+            ))
+        })?;
+        let walk_final_stat = fstat(&walk_fd).map_err(|error| {
+            SqlError::Custom(format!(
+                "{context}: cannot stat verified {} anchor path for {}: {error}; refusing to cross {} authority",
+                self.authority_name,
+                self.target_path.display(),
+                self.authority_name
+            ))
+        })?;
+        if (anchor_live_stat.st_dev, anchor_live_stat.st_ino)
+            != (walk_final_stat.st_dev, walk_final_stat.st_ino)
+            || anchor_live_stat.st_nlink == 0
+        {
+            return Err(SqlError::Custom(format!(
+                "{context}: retained {} anchor directory for {} no longer matches the live directory tree; refusing to cross {} authority",
+                self.authority_name,
+                self.target_path.display(),
+                self.authority_name
+            )));
+        }
+
+        // 2. Walk `unresolved_suffix` from `anchor_dir`.
+        let dir_suffix_len = if self.expect_directory_leaf {
+            self.unresolved_suffix.len()
+        } else {
+            self.unresolved_suffix.len().saturating_sub(1)
+        };
+        let mut latched = self
+            .latched_suffix_dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut current_dir = walk_fd;
+        let mut current_path = prev_path;
+        let mut all_dirs_present = true;
+
+        for (idx, segment) in self
+            .unresolved_suffix
+            .iter()
+            .take(dir_suffix_len)
+            .enumerate()
+        {
+            current_path.push(segment);
+            match statat(&current_dir, segment, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(entry_stat) => {
+                    let file_type = FileType::from_raw_mode(entry_stat.st_mode);
+                    if file_type == FileType::Symlink {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: frozen {} path {} is now a symbolic link; refusing to cross {} authority",
+                            self.authority_name,
+                            current_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                    if file_type != FileType::Directory {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: frozen {} path {} is not a directory; refusing to cross {} authority",
+                            self.authority_name,
+                            current_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                    let next_fd = openat(&current_dir, segment, dir_flags, Mode::empty()).map_err(
+                        |error| {
+                            SqlError::Custom(format!(
+                                "{context}: cannot open {} directory {}: {error}; refusing to cross {} authority",
+                                self.authority_name,
+                                current_path.display(),
+                                self.authority_name
+                            ))
+                        },
+                    )?;
+                    let next_stat = fstat(&next_fd).map_err(|error| {
+                        SqlError::Custom(format!(
+                            "{context}: cannot stat {} directory {}: {error}; refusing to cross {} authority",
+                            self.authority_name,
+                            current_path.display(),
+                            self.authority_name
+                        ))
+                    })?;
+                    if (next_stat.st_dev, next_stat.st_ino)
+                        != (entry_stat.st_dev, entry_stat.st_ino)
+                        || FileType::from_raw_mode(next_stat.st_mode) != FileType::Directory
+                    {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: {} directory {} changed identity during verification; refusing to cross {} authority",
+                            self.authority_name,
+                            current_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                    let observed_id = (next_stat.st_dev, next_stat.st_ino);
+                    if let Some(expected_id) = latched.get(idx).copied() {
+                        if observed_id != expected_id {
+                            return Err(SqlError::Custom(format!(
+                                "{context}: frozen {} directory {} was replaced with a different directory inode; refusing to cross {} authority",
+                                self.authority_name,
+                                current_path.display(),
+                                self.authority_name
+                            )));
+                        }
+                    } else if idx == latched.len() {
+                        latched.push(observed_id);
+                    }
+                    current_dir = std::fs::File::from(next_fd);
+                }
+                Err(rustix::io::Errno::NOENT) => {
+                    if idx < latched.len() {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: previously materialized {} directory {} was removed or moved aside; refusing to cross {} authority",
+                            self.authority_name,
+                            current_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                    all_dirs_present = false;
+                    break;
+                }
+                Err(error) => {
+                    return Err(SqlError::Custom(format!(
+                        "{context}: cannot inspect frozen {} path {}: {error}; refusing to cross {} authority",
+                        self.authority_name,
+                        current_path.display(),
+                        self.authority_name
+                    )));
+                }
+            }
+        }
+        drop(latched);
+
+        if !self.expect_directory_leaf && all_dirs_present {
+            if let Some(leaf_name) = self.unresolved_suffix.last() {
+                let leaf_path = current_path.join(leaf_name);
+                match statat(&current_dir, leaf_name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(entry_stat) => {
+                        let file_type = FileType::from_raw_mode(entry_stat.st_mode);
+                        if file_type == FileType::Symlink {
+                            return Err(SqlError::Custom(format!(
+                                "{context}: frozen {} path {} is now a symbolic link; refusing to cross {} authority",
+                                self.authority_name,
+                                leaf_path.display(),
+                                self.authority_name
+                            )));
+                        }
+                        if file_type != FileType::RegularFile {
+                            return Err(SqlError::Custom(format!(
+                                "{context}: frozen {} path {} is not a regular file; refusing to cross {} authority",
+                                self.authority_name,
+                                leaf_path.display(),
+                                self.authority_name
+                            )));
+                        }
+                        if entry_stat.st_nlink != 1 {
+                            return Err(SqlError::Custom(format!(
+                                "{context}: frozen {} path {} has {} hard links; refusing to cross {} authority",
+                                self.authority_name,
+                                leaf_path.display(),
+                                entry_stat.st_nlink,
+                                self.authority_name
+                            )));
+                        }
+                    }
+                    Err(rustix::io::Errno::NOENT) => {}
+                    Err(error) => {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: cannot inspect frozen {} path {}: {error}; refusing to cross {} authority",
+                            self.authority_name,
+                            leaf_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                }
+            }
+            return Ok(Some(current_dir));
+        }
+
+        if self.expect_directory_leaf && all_dirs_present {
+            return Ok(Some(current_dir));
+        }
+
+        Ok(None)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn verify_sibling_file_in_parent(
+        &self,
+        sibling_name: &std::ffi::OsStr,
+        context: &'static str,
+    ) -> Result<(), SqlError> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType, statat};
+
+            let Some(parent_dir) = self.verify_and_open_leaf_parent_or_dir(context)? else {
+                return Ok(());
+            };
+            let sibling_path = self
+                .target_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(sibling_name);
+            match statat(&parent_dir, sibling_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(entry_stat) => {
+                    let file_type = FileType::from_raw_mode(entry_stat.st_mode);
+                    if file_type == FileType::Symlink {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: {} must not be a symlink; refusing to cross {} authority",
+                            sibling_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                    if file_type != FileType::RegularFile {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: {} exists but is not a file; refusing to cross {} authority",
+                            sibling_path.display(),
+                            self.authority_name
+                        )));
+                    }
+                    if entry_stat.st_nlink != 1 {
+                        return Err(SqlError::Custom(format!(
+                            "{context}: {} has {} hard links; refusing to cross {} authority",
+                            sibling_path.display(),
+                            entry_stat.st_nlink,
+                            self.authority_name
+                        )));
+                    }
+                    Ok(())
+                }
+                Err(rustix::io::Errno::NOENT) => Ok(()),
+                Err(error) => Err(SqlError::Custom(format!(
+                    "{context}: cannot inspect {} in frozen {} parent directory: {error}; refusing to cross {} authority",
+                    sibling_path.display(),
+                    self.authority_name,
+                    self.authority_name
+                ))),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let sibling_path = self
+                .target_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(sibling_name);
+            validate_frozen_authority_leaf_not_symlink(&sibling_path, context, self.authority_name)
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn open_verified_directory(
+        &self,
+        context: &'static str,
+    ) -> Result<Option<std::fs::File>, SqlError> {
+        debug_assert!(self.expect_directory_leaf);
+        self.verify_and_open_leaf_parent_or_dir(context)
+    }
+
+    pub(crate) fn has_search_index_markers(&self, context: &'static str) -> DbResult<bool> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+
+            let Some(root_dir) = self.open_verified_directory(context).map_err(|error| {
+                DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: error.to_string(),
+                }
+            })?
+            else {
+                return Ok(false);
+            };
+            let dir_flags = OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC;
+            let search_index_dir = match statat(
+                &root_dir,
+                "search_index",
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => {
+                    let ft = FileType::from_raw_mode(stat.st_mode);
+                    if ft == FileType::Symlink {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index under {} is a symbolic link; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    if ft != FileType::Directory {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index under {} is not a directory; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    openat(&root_dir, "search_index", dir_flags, Mode::empty()).map_err(|error| {
+                        DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: cannot open search_index under {}: {error}; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        }
+                    })?
+                }
+                Err(rustix::io::Errno::NOENT) => return Ok(false),
+                Err(error) => {
+                    return Err(DbError::InvalidArgument {
+                        field: "storage_root",
+                        message: format!(
+                            "{context}: cannot inspect search_index under {}: {error}; refusing to cross archive authority",
+                            self.target_path.display()
+                        ),
+                    });
+                }
+            };
+
+            let mut found_marker = false;
+            for marker in ["backfill_state.json", "meta.json"] {
+                match statat(&search_index_dir, marker, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => {
+                        let ft = FileType::from_raw_mode(stat.st_mode);
+                        if ft == FileType::Symlink {
+                            return Err(DbError::InvalidArgument {
+                                field: "storage_root",
+                                message: format!(
+                                    "{context}: search_index/{marker} under {} is a symbolic link; refusing to cross archive authority",
+                                    self.target_path.display()
+                                ),
+                            });
+                        }
+                        if ft == FileType::RegularFile {
+                            found_marker = true;
+                        }
+                    }
+                    Err(rustix::io::Errno::NOENT) => {}
+                    Err(error) => {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: cannot inspect search_index/{marker} under {}: {error}; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(found_marker)
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.verify(context)
+                .map_err(|error| DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: error.to_string(),
+                })?;
+            let index_dir = self.target_path.join("search_index");
+            Ok(index_dir.join("backfill_state.json").is_file()
+                || index_dir.join("meta.json").is_file())
+        }
+    }
+
+    pub(crate) fn read_search_index_file(
+        &self,
+        file_name: &str,
+        context: &'static str,
+    ) -> DbResult<Option<Vec<u8>>> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+
+            let Some(root_dir) = self.open_verified_directory(context).map_err(|error| {
+                DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: error.to_string(),
+                }
+            })?
+            else {
+                return Ok(None);
+            };
+            let dir_flags = OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC;
+            let search_index_dir = match statat(
+                &root_dir,
+                "search_index",
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => {
+                    let ft = FileType::from_raw_mode(stat.st_mode);
+                    if ft == FileType::Symlink {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index under {} is a symbolic link; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    if ft != FileType::Directory {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index under {} is not a directory; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    openat(&root_dir, "search_index", dir_flags, Mode::empty()).map_err(|error| {
+                        DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: cannot open search_index under {}: {error}; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        }
+                    })?
+                }
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => {
+                    return Err(DbError::InvalidArgument {
+                        field: "storage_root",
+                        message: format!(
+                            "{context}: cannot inspect search_index under {}: {error}; refusing to cross archive authority",
+                            self.target_path.display()
+                        ),
+                    });
+                }
+            };
+
+            let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            match statat(&search_index_dir, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => {
+                    let ft = FileType::from_raw_mode(stat.st_mode);
+                    if ft == FileType::Symlink {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index/{file_name} under {} is a symbolic link; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    if ft != FileType::RegularFile {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index/{file_name} under {} is not a regular file; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    let fd =
+                        openat(&search_index_dir, file_name, file_flags, Mode::empty()).map_err(
+                            |error| DbError::InvalidArgument {
+                                field: "storage_root",
+                                message: format!(
+                                    "{context}: cannot open search_index/{file_name} under {}: {error}; refusing to cross archive authority",
+                                    self.target_path.display()
+                                ),
+                            },
+                        )?;
+                    let opened_stat = fstat(&fd).map_err(|error| DbError::InvalidArgument {
+                        field: "storage_root",
+                        message: format!(
+                            "{context}: cannot stat opened search_index/{file_name} under {}: {error}; refusing to cross archive authority",
+                            self.target_path.display()
+                        ),
+                    })?;
+                    if FileType::from_raw_mode(opened_stat.st_mode) != FileType::RegularFile
+                        || opened_stat.st_nlink != 1
+                    {
+                        return Err(DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: search_index/{file_name} under {} is not an unaliased regular file; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        });
+                    }
+                    let mut file = std::fs::File::from(fd);
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| {
+                        DbError::InvalidArgument {
+                            field: "storage_root",
+                            message: format!(
+                                "{context}: cannot read search_index/{file_name} under {}: {error}; refusing to cross archive authority",
+                                self.target_path.display()
+                            ),
+                        }
+                    })?;
+                    Ok(Some(bytes))
+                }
+                Err(rustix::io::Errno::NOENT) => Ok(None),
+                Err(error) => Err(DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: format!(
+                        "{context}: cannot inspect search_index/{file_name} under {}: {error}; refusing to cross archive authority",
+                        self.target_path.display()
+                    ),
+                }),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.verify(context)
+                .map_err(|error| DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: error.to_string(),
+                })?;
+            let path = self.target_path.join("search_index").join(file_name);
+            match std::fs::read(&path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(DbError::Io(error)),
+            }
+        }
+    }
+
+    pub(crate) fn verify_search_index_subdir(&self, context: &'static str) -> DbResult<()> {
+        let _ = self.has_search_index_markers(context)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+type PoolAuthorityValidationHook = Box<dyn FnOnce(&'static str, &Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static POOL_STORAGE_ROOT_AFTER_VALIDATION_HOOK: std::cell::RefCell<Option<PoolAuthorityValidationHook>> =
+        std::cell::RefCell::new(None);
+    static POOL_SQLITE_PATH_AFTER_VALIDATION_HOOK: std::cell::RefCell<Option<PoolAuthorityValidationHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_pool_storage_root_after_validation_hook(context: &'static str, storage_root: &Path) {
+    let hook = POOL_STORAGE_ROOT_AFTER_VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(context, storage_root);
+    }
+}
+
+#[cfg(test)]
+fn run_pool_sqlite_path_after_validation_hook(context: &'static str, sqlite_path: &Path) {
+    let hook = POOL_SQLITE_PATH_AFTER_VALIDATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(context, sqlite_path);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_pool_storage_root_after_validation_hook<R>(
+    hook: impl FnOnce(&'static str, &Path) + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            POOL_STORAGE_ROOT_AFTER_VALIDATION_HOOK.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+    POOL_STORAGE_ROOT_AFTER_VALIDATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _guard = ResetGuard;
+    body()
+}
+
+#[cfg(test)]
+pub(crate) fn with_pool_sqlite_path_after_validation_hook<R>(
+    hook: impl FnOnce(&'static str, &Path) + 'static,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            POOL_SQLITE_PATH_AFTER_VALIDATION_HOOK.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+    POOL_SQLITE_PATH_AFTER_VALIDATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    let _guard = ResetGuard;
+    body()
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_frozen_sqlite_open_authority_with_descriptor(
+    sqlite_path: &str,
+    sqlite_identity: Option<&Path>,
+    sqlite_authority: Option<&FrozenDirectoryAuthority>,
+    context: &'static str,
+) -> Result<(), SqlError> {
+    validate_frozen_sqlite_open_authority(sqlite_path, sqlite_identity, context)?;
+    #[cfg(test)]
+    if sqlite_path != ":memory:" {
+        run_pool_sqlite_path_after_validation_hook(context, Path::new(sqlite_path));
+    }
+    if let Some(authority) = sqlite_authority {
+        authority.verify(context)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn verify_frozen_storage_root_with_descriptor(
+    storage_root: &Path,
+    storage_root_alias: &Path,
+    storage_root_authority: &FrozenDirectoryAuthority,
+    context: &'static str,
+) -> Result<(), SqlError> {
+    if storage_root_alias == storage_root {
+        validate_frozen_storage_root_authority(storage_root, context)?;
+    } else {
+        validate_frozen_storage_root_alias(storage_root_alias, storage_root, context)?;
+    }
+    #[cfg(test)]
+    run_pool_storage_root_after_validation_hook(context, storage_root_alias);
+    storage_root_authority.verify(context)
 }
 
 #[allow(clippy::result_large_err)]
@@ -5900,7 +7315,12 @@ fn pool_cache_key_from_authority(
 ) -> PoolCacheKey {
     PoolCacheKey {
         sqlite_identity: authority.sqlite_identity.clone(),
+        sqlite_chain: authority
+            .sqlite_authority
+            .as_ref()
+            .map(|auth| auth.existing_chain_ids()),
         storage_root_identity: authority.storage_root.clone(),
+        storage_root_chain: authority.storage_root_authority.existing_chain_ids(),
         min_connections,
         max_connections,
         acquire_timeout_ms,
@@ -7884,15 +9304,36 @@ fn open_sqlite_file_with_recovery_and_storage_root(
     sqlite_path: &str,
     storage_root: &Path,
 ) -> Result<DbConn, SqlError> {
+    open_sqlite_file_with_recovery_and_authorities(sqlite_path, storage_root, None, None)
+}
+
+#[allow(clippy::result_large_err)]
+fn open_sqlite_file_with_recovery_and_authorities(
+    sqlite_path: &str,
+    storage_root: &Path,
+    sqlite_authority: Option<&FrozenDirectoryAuthority>,
+    storage_root_authority: Option<&FrozenDirectoryAuthority>,
+) -> Result<DbConn, SqlError> {
     if sqlite_path == ":memory:" {
         let conn = DbConn::open_memory()?;
         conn.execute_raw(schema::PRAGMA_CONN_SETTINGS_SQL)?;
         return Ok(conn);
     }
+    if let Some(authority) = sqlite_authority {
+        authority.verify("sqlite recovery open precheck")?;
+    }
     ensure_sqlite_parent_dir_exists(sqlite_path)?;
+    if let Some(authority) = sqlite_authority {
+        authority.verify("sqlite recovery open parent ready")?;
+    }
 
     match open_sqlite_file_with_configured_pragmas(sqlite_path) {
-        Ok(conn) => Ok(conn),
+        Ok(conn) => {
+            if let Some(authority) = sqlite_authority {
+                authority.verify("sqlite recovery open postcheck")?;
+            }
+            Ok(conn)
+        }
         Err(primary_err) => {
             let primary_msg = primary_err.to_string();
 
@@ -7911,7 +9352,15 @@ fn open_sqlite_file_with_recovery_and_storage_root(
                 return Err(primary_err);
             }
 
-            recover_sqlite_file_with_storage_root(Path::new(sqlite_path), storage_root)?;
+            recover_sqlite_file_with_storage_root_and_authorities(
+                Path::new(sqlite_path),
+                storage_root,
+                sqlite_authority,
+                storage_root_authority,
+            )?;
+            if let Some(authority) = sqlite_authority {
+                authority.verify("sqlite reopen after recovery")?;
+            }
             open_sqlite_file_with_configured_pragmas(sqlite_path).map_err(|reopen_err| {
                 SqlError::Custom(format!(
                     "cannot open sqlite at {sqlite_path}: {primary_err}; reopen after recovery failed: {reopen_err}"
@@ -7940,7 +9389,39 @@ async fn initialize_sqlite_file_once(
     run_migrations: bool,
     storage_root: &Path,
 ) -> Outcome<(), SqlError> {
+    initialize_sqlite_file_once_with_authorities(
+        cx,
+        sqlite_path,
+        run_migrations,
+        storage_root,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn initialize_sqlite_file_once_with_authorities(
+    cx: &Cx,
+    sqlite_path: &str,
+    run_migrations: bool,
+    storage_root: &Path,
+    sqlite_authority: Option<&FrozenDirectoryAuthority>,
+    storage_root_authority: Option<&FrozenDirectoryAuthority>,
+) -> Outcome<(), SqlError> {
     let path = Path::new(sqlite_path);
+    if sqlite_path != ":memory:" {
+        if let Some(authority) = sqlite_authority
+            && let Err(error) = authority.verify("sqlite init preflight")
+        {
+            return Outcome::Err(error);
+        }
+        if let Some(authority) = storage_root_authority
+            && let Err(error) = authority.verify("sqlite init archive preflight")
+        {
+            return Outcome::Err(error);
+        }
+    }
     // A missing primary is normally fresh-start authority, but an adjacent
     // breaker sidecar remains durable authority for that exact pathname.
     // Consult it before archive inventory, fresh creation, or any engine open.
@@ -7966,10 +9447,30 @@ async fn initialize_sqlite_file_once(
     // Reconcile archive-backed state before first init so every entrypoint,
     // not just the server startup probe, preserves durable message IDs when a
     // DB is missing or stale relative to the archive.
-    if sqlite_path != ":memory:"
-        && let Err(err) = reconcile_archive_state_before_init(path, storage_root)
-    {
-        return Outcome::Err(err);
+    if sqlite_path != ":memory:" {
+        if let Some(authority) = sqlite_authority
+            && let Err(error) = authority.verify("sqlite init archive reconcile precheck")
+        {
+            return Outcome::Err(error);
+        }
+        if let Some(authority) = storage_root_authority
+            && let Err(error) = authority.verify("sqlite init archive reconcile precheck")
+        {
+            return Outcome::Err(error);
+        }
+        if let Err(err) = reconcile_archive_state_before_init(path, storage_root) {
+            return Outcome::Err(err);
+        }
+        if let Some(authority) = sqlite_authority
+            && let Err(error) = authority.verify("sqlite init archive reconcile postcheck")
+        {
+            return Outcome::Err(error);
+        }
+        if let Some(authority) = storage_root_authority
+            && let Err(error) = authority.verify("sqlite init archive reconcile postcheck")
+        {
+            return Outcome::Err(error);
+        }
     }
 
     // The sidecar classifier above catches damaged WAL/SHM, but a corrupt
@@ -7983,7 +9484,12 @@ async fn initialize_sqlite_file_once(
         match sqlite_file_is_healthy_without_family_cleanup(path) {
             Ok(true) => {}
             Ok(false) => {
-                if let Err(error) = recover_sqlite_file_with_storage_root(path, storage_root) {
+                if let Err(error) = recover_sqlite_file_with_storage_root_and_authorities(
+                    path,
+                    storage_root,
+                    sqlite_authority,
+                    storage_root_authority,
+                ) {
                     return Outcome::Err(error);
                 }
             }
@@ -7991,8 +9497,29 @@ async fn initialize_sqlite_file_once(
         }
     }
 
+    if sqlite_path != ":memory:" {
+        if let Some(authority) = sqlite_authority
+            && let Err(error) = authority.verify("sqlite init migration precheck")
+        {
+            return Outcome::Err(error);
+        }
+        if let Some(authority) = storage_root_authority
+            && let Err(error) = authority.verify("sqlite init migration precheck")
+        {
+            return Outcome::Err(error);
+        }
+    }
+
     match run_sqlite_init_once(cx, sqlite_path, run_migrations).await {
-        ok @ Outcome::Ok(()) => ok,
+        ok @ Outcome::Ok(()) => {
+            if sqlite_path != ":memory:"
+                && let Some(authority) = sqlite_authority
+                && let Err(error) = authority.verify("sqlite init postcheck")
+            {
+                return Outcome::Err(error);
+            }
+            ok
+        }
         non_err @ (Outcome::Cancelled(_) | Outcome::Panicked(_)) => non_err,
         Outcome::Err(first_err) => {
             if !should_retry_sqlite_init_error(&first_err) {
@@ -8008,7 +9535,12 @@ async fn initialize_sqlite_file_once(
                             "sqlite init failed and health probes detected corruption; attempting automatic recovery"
                         );
                         if let Err(recover_err) =
-                            recover_sqlite_file_with_storage_root(path, storage_root)
+                            recover_sqlite_file_with_storage_root_and_authorities(
+                                path,
+                                storage_root,
+                                sqlite_authority,
+                                storage_root_authority,
+                            )
                         {
                             if !should_retry_sqlite_init_error(&recover_err) {
                                 return Outcome::Err(recover_err);
@@ -8047,6 +9579,12 @@ async fn initialize_sqlite_file_once(
                     .await;
             }
 
+            if sqlite_path != ":memory:"
+                && let Some(authority) = sqlite_authority
+                && let Err(error) = authority.verify("sqlite init retry precheck")
+            {
+                return Outcome::Err(error);
+            }
             run_sqlite_init_once(cx, sqlite_path, run_migrations).await
         }
     }
@@ -11974,10 +13512,18 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
 }
 
 #[allow(clippy::result_large_err)]
-fn recover_sqlite_file_with_storage_root(
+fn recover_sqlite_file_with_storage_root_and_authorities(
     primary_path: &Path,
     storage_root_path: &Path,
+    sqlite_authority: Option<&FrozenDirectoryAuthority>,
+    storage_root_authority: Option<&FrozenDirectoryAuthority>,
 ) -> Result<(), SqlError> {
+    if let Some(authority) = sqlite_authority {
+        authority.verify("sqlite recovery preflight")?;
+    }
+    if let Some(authority) = storage_root_authority {
+        authority.verify("sqlite archive recovery preflight")?;
+    }
     // Capture pre-recovery snapshot before any mutation.
     let snapshot =
         crate::forensics::capture_pre_recovery_snapshot(primary_path, "automatic-recovery")
@@ -11992,12 +13538,24 @@ fn recover_sqlite_file_with_storage_root(
         recovery_lock_active = snapshot.recovery_lock_active,
         "pre-recovery snapshot captured"
     );
-    if is_real_directory(storage_root_path)
+    let outcome = if is_real_directory(storage_root_path)
         && archive_storage_root_is_authoritative_for_sqlite_path(storage_root_path, primary_path)
     {
-        return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
+        if let Some(authority) = storage_root_authority {
+            authority.verify("sqlite archive recovery execution")?;
+        }
+        ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path)
+    } else {
+        ensure_sqlite_file_healthy(primary_path)
+    };
+    outcome?;
+    if let Some(authority) = sqlite_authority {
+        authority.verify("sqlite recovery postcheck")?;
     }
-    ensure_sqlite_file_healthy(primary_path)
+    if let Some(authority) = storage_root_authority {
+        authority.verify("sqlite archive recovery postcheck")?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -17466,9 +19024,13 @@ fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
     let guard = cache.read();
 
+    let expected_chain = authority.storage_root_authority.existing_chain_ids();
     let mut candidate: Option<Arc<Pool<DbConn>>> = None;
     for (key, weak) in guard.iter() {
-        if key.sqlite_identity.is_some() || key.storage_root_identity != authority.storage_root {
+        if key.sqlite_identity.is_some()
+            || key.storage_root_identity != authority.storage_root
+            || key.storage_root_chain != expected_chain
+        {
             continue;
         }
         let Some(shared_pool) = weak.upgrade() else {
@@ -37419,5 +38981,245 @@ mod tests {
         // Nobody holds this fresh file open; this process is excluded by pid even
         // if it briefly touched it. On non-Linux the scan is a stub => also empty.
         assert_eq!(foreign_db_file_holders(&db), [] as [ForeignDbFileHolder; 0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_seed_and_floor_advance_reject_post_validation_storage_root_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tenant_dir = dir.path().join("tenant");
+        let storage_root = tenant_dir.join("archive");
+        let db_dir = tenant_dir.join("db");
+        std::fs::create_dir_all(storage_root.join("projects/p1/messages/2026/10"))
+            .expect("create tenant archive");
+        std::fs::create_dir_all(&db_dir).expect("create tenant db dir");
+        let db_path = db_dir.join("storage.sqlite3");
+
+        let foreign_dir = dir.path().join("foreign");
+        let foreign_storage = foreign_dir.join("archive");
+        let foreign_msgs = foreign_storage.join("projects/p1/messages/2026/10");
+        std::fs::create_dir_all(&foreign_msgs).expect("create foreign archive");
+        std::fs::write(
+            foreign_msgs.join("2026-10-17T00-00-00Z__foreign__98765.md"),
+            "---\nid: 98765\n---\nforeign",
+        )
+        .expect("write foreign archive message");
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        // 1. Leaf swap right after `validated_storage_root` returns.
+        let leaf_orig = tenant_dir.join("archive.orig");
+        let leaf_storage = storage_root.clone();
+        let leaf_foreign = foreign_storage.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = Cx::for_testing();
+        let leaf_err = with_pool_storage_root_after_validation_hook(
+            move |context, _path| {
+                if context == "message creation archive allocator" && !leaf_orig.exists() {
+                    std::fs::rename(&leaf_storage, &leaf_orig).expect("move storage_root aside");
+                    symlink(&leaf_foreign, &leaf_storage).expect("symlink storage_root to foreign");
+                }
+            },
+            || runtime.block_on(pool.archive_seed(&cx, "message creation archive allocator")),
+        )
+        .into_result()
+        .expect_err("leaf swap after validation must fail archive_seed");
+        assert!(
+            leaf_err
+                .to_string()
+                .contains("refusing to cross archive authority"),
+            "unexpected leaf swap error: {leaf_err}"
+        );
+        assert_eq!(
+            pool.message_id_allocator()
+                .cached_archive_seed()
+                .expect("allocator not poisoned"),
+            None,
+            "failed archive scan must not cache foreign archive floor"
+        );
+
+        let moved_leaf = tenant_dir.join("archive.moved_symlink");
+        std::fs::rename(&storage_root, &moved_leaf).expect("move symlink aside");
+        std::fs::rename(tenant_dir.join("archive.orig"), &storage_root)
+            .expect("restore original storage_root");
+
+        // Ensure the SQLite file exists before testing floor advance.
+        std::fs::write(&db_path, b"").expect("touch db file for floor advance preflight");
+
+        // 2. Ancestor swap right after `validated_storage_root` returns.
+        let ancestor_orig = dir.path().join("tenant.orig");
+        let ancestor_target = tenant_dir.clone();
+        let ancestor_foreign = foreign_dir.clone();
+        let ancestor_err = with_pool_storage_root_after_validation_hook(
+            move |context, _path| {
+                if context == "message-id floor archive scan" && !ancestor_orig.exists() {
+                    std::fs::rename(&ancestor_target, &ancestor_orig).expect("move tenant aside");
+                    symlink(&ancestor_foreign, &ancestor_target)
+                        .expect("symlink tenant to foreign");
+                }
+            },
+            || pool.advance_message_id_floor_from_archive(),
+        )
+        .expect_err("ancestor swap after validation must fail floor advance");
+        assert!(
+            ancestor_err
+                .to_string()
+                .contains("refusing to cross archive authority"),
+            "unexpected ancestor swap error: {ancestor_err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_index_selection_and_open_reject_post_validation_search_index_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("tenant/archive");
+        let db_path = dir.path().join("tenant/db/storage.sqlite3");
+        std::fs::create_dir_all(&storage_root).expect("create storage_root");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+
+        let foreign_index = dir.path().join("foreign/search_index");
+        std::fs::create_dir_all(&foreign_index).expect("create foreign index");
+        std::fs::write(foreign_index.join("meta.json"), "{}").expect("write foreign meta.json");
+        std::fs::write(
+            foreign_index.join("backfill_state.json"),
+            r#"{"schema_version":1,"db_path":"/tmp/foreign.sqlite3","updated_at_micros":1}"#,
+        )
+        .expect("write foreign backfill_state.json");
+
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let hook_storage = storage_root.clone();
+        let hook_foreign = foreign_index.clone();
+        let health = with_pool_storage_root_after_validation_hook(
+            move |context, _path| {
+                if context == "lexical search index selection" {
+                    let link_path = hook_storage.join("search_index");
+                    if !link_path.exists() && link_path.symlink_metadata().is_err() {
+                        symlink(&hook_foreign, &link_path)
+                            .expect("symlink search_index after validation");
+                    }
+                }
+            },
+            || crate::search_service::lexical_backfill_health(&pool),
+        );
+        assert_eq!(health.state, "unavailable");
+        let reason = health.stale_reason.expect("unavailable health has reason");
+        assert!(
+            reason.contains("refusing to cross archive authority"),
+            "unexpected lexical health reason: {reason}"
+        );
+
+        let open_err = pool
+            .verify_search_index_open_authority(
+                &storage_root.join("search_index"),
+                "lexical search index open",
+            )
+            .expect_err("symlinked search_index must be rejected before bridge open");
+        assert!(
+            open_err
+                .to_string()
+                .contains("refusing to cross archive authority"),
+            "unexpected search_index open error: {open_err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pool_acquire_and_backup_snapshot_reject_post_validation_sqlite_parent_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tenant_db_dir = dir.path().join("tenant/db");
+        let storage_root = dir.path().join("tenant/archive");
+        let foreign_db_dir = dir.path().join("foreign/db");
+        std::fs::create_dir_all(&tenant_db_dir).expect("create tenant db dir");
+        std::fs::create_dir_all(&storage_root).expect("create storage_root");
+        std::fs::create_dir_all(&foreign_db_dir).expect("create foreign db dir");
+
+        let db_path = tenant_db_dir.join("storage.sqlite3");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool without eager open");
+
+        // Swap the sqlite parent directory right after string validation
+        // succeeds during first acquire.
+        let orig_db_dir = dir.path().join("tenant/db.orig");
+        let hook_tenant_db = tenant_db_dir.clone();
+        let hook_foreign_db = foreign_db_dir.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = Cx::for_testing();
+        let acquire_err = with_pool_sqlite_path_after_validation_hook(
+            move |context, _path| {
+                if context == "pooled connection open" && !orig_db_dir.exists() {
+                    std::fs::rename(&hook_tenant_db, &orig_db_dir).expect("move db dir aside");
+                    symlink(&hook_foreign_db, &hook_tenant_db).expect("symlink db dir to foreign");
+                }
+            },
+            || runtime.block_on(pool.acquire(&cx)),
+        )
+        .into_result()
+        .err()
+        .expect("first acquire must reject post-validation sqlite parent swap");
+        assert!(
+            acquire_err
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected acquire error: {acquire_err}"
+        );
+        assert!(
+            !foreign_db_dir.join("storage.sqlite3").exists(),
+            "foreign db directory must never receive a database file"
+        );
+
+        let backup_err = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect_err("proactive backup must reject swapped sqlite parent");
+        assert!(
+            backup_err
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected backup error: {backup_err}"
+        );
+
+        let snapshot_err = pool
+            .create_verified_snapshot()
+            .expect_err("verified snapshot must reject swapped sqlite parent");
+        assert!(
+            snapshot_err
+                .to_string()
+                .contains("refusing to cross database authority"),
+            "unexpected snapshot error: {snapshot_err}"
+        );
     }
 }

@@ -1038,7 +1038,7 @@ fn cancellation_reason(cx: &Cx, context: &'static str) -> Option<CancelReason> {
     )
 }
 
-async fn scan_archive_floor(cx: &Cx, storage_root: PathBuf) -> Outcome<i64, DbError> {
+pub(crate) async fn scan_archive_floor(cx: &Cx, storage_root: PathBuf) -> Outcome<i64, DbError> {
     if let Some(reason) = cancellation_reason(cx, "message id archive scan cancelled") {
         return Outcome::Cancelled(reason);
     }
@@ -1164,7 +1164,11 @@ impl MessageIdAllocator {
         .await
     }
 
-    async fn archive_seed_with<F, Fut>(&self, cx: &Cx, archive_scan: F) -> Outcome<i64, DbError>
+    pub(crate) async fn archive_seed_with<F, Fut>(
+        &self,
+        cx: &Cx,
+        archive_scan: F,
+    ) -> Outcome<i64, DbError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Outcome<i64, DbError>>,
