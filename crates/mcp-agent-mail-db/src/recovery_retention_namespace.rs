@@ -555,7 +555,7 @@ fn ensure_no_file_readers(
     const MAX_READER_INVENTORY_ENTRIES: usize = 131_072;
     let canonical_source = source.canonicalize()?;
     let own_pid = std::process::id();
-    let effective_user = process_reader_uids(Path::new("/proc/self"))?[1];
+    let self_status = read_process_status_summary(Path::new("/proc/self"))?;
     let mut remaining = MAX_READER_INVENTORY_ENTRIES;
     let mut charge = || -> io::Result<()> {
         remaining = remaining
@@ -578,7 +578,7 @@ fn ensure_no_file_readers(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && reader_inventory_denial_is_foreign(&entry.path(), effective_user)? =>
+                    && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
             {
                 continue;
             }
@@ -586,7 +586,11 @@ fn ensure_no_file_readers(
         };
         for descriptor in descriptors {
             charge()?;
-            let descriptor = descriptor?;
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if pid == own_pid
                 && excluded_descriptor.is_some_and(|excluded| {
                     descriptor
@@ -603,12 +607,17 @@ fn ensure_no_file_readers(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error)
                     if error.kind() == io::ErrorKind::PermissionDenied
-                        && reader_inventory_denial_is_foreign(&entry.path(), effective_user)? =>
+                        && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
                 {
                     continue;
                 }
                 Err(error) => return Err(error),
             };
+            // Non-filesystem descriptors (`socket:[...]`, `pipe:[...]`,
+            // `anon_inode:[...]`) never reference a regular file inode on disk.
+            if !target.is_absolute() {
+                continue;
+            }
             let same_inode = if target == canonical_source {
                 true
             } else {
@@ -617,10 +626,7 @@ fn ensure_no_file_readers(
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error)
                         if error.kind() == io::ErrorKind::PermissionDenied
-                            && reader_inventory_denial_is_foreign(
-                                &entry.path(),
-                                effective_user,
-                            )? =>
+                            && reader_inventory_denial_is_foreign(&entry.path(), &self_status)? =>
                     {
                         continue;
                     }
@@ -638,7 +644,7 @@ fn ensure_no_file_readers(
             ensure_no_mapped_file_readers(
                 &entry.path(),
                 pid,
-                effective_user,
+                &self_status,
                 retained_identity,
                 &mut charge,
             )?;
@@ -654,7 +660,7 @@ fn ensure_no_file_readers(
 fn ensure_no_mapped_file_readers(
     process: &Path,
     process_id: u32,
-    effective_user: u32,
+    self_status: &ProcessStatusSummary,
     retained: &Metadata,
     mut charge: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
@@ -666,16 +672,27 @@ fn ensure_no_mapped_file_readers(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
-                && reader_inventory_denial_is_foreign(process, effective_user)? =>
+                && reader_inventory_denial_is_foreign(process, self_status)? =>
         {
             return Ok(());
         }
         Err(error) => return Err(error),
     };
     let mut maps = Vec::new();
-    maps_file
+    match maps_file
         .take(MAX_PROCESS_MAP_BYTES + 1)
-        .read_to_end(&mut maps)?;
+        .read_to_end(&mut maps)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && reader_inventory_denial_is_foreign(process, self_status)? =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
     if u64::try_from(maps.len()).unwrap_or(u64::MAX) > MAX_PROCESS_MAP_BYTES {
         return Err(invalid("open-reader mappings exceeded their bounded scan"));
     }
@@ -752,10 +769,56 @@ fn descriptor_references_inode(
 }
 
 /// A nondumpable process has root-owned proc entries even when its effective
-/// user is the mailbox owner. Inspect the kernel's bounded UID record before
+/// user is the mailbox owner. Inspect the kernel's bounded status record before
 /// treating an inaccessible process as another user's observer limitation.
 #[cfg(target_os = "linux")]
-fn process_reader_uids(process: &Path) -> io::Result<[u32; 4]> {
+struct ProcessStatusSummary {
+    name: String,
+    state: char,
+    has_vm_size: bool,
+    uids: [u32; 4],
+    gids: [u32; 4],
+    cap_prm: u64,
+    cap_eff: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_status_hex_u64(status: &[u8], prefix: &[u8]) -> u64 {
+    status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(prefix))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| u64::from_str_radix(line.trim(), 16).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_status_id_quad(status: &[u8], prefix: &[u8], label: &str) -> io::Result<[u32; 4]> {
+    let line = status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(prefix))
+        .ok_or_else(|| invalid(format!("open-reader process status has no {label} record")))?;
+    let mut values = std::str::from_utf8(line)
+        .map_err(io::Error::other)?
+        .split_whitespace();
+    let mut ids = [0; 4];
+    for id in &mut ids {
+        *id = values
+            .next()
+            .ok_or_else(|| invalid(format!("open-reader process {label} record is incomplete")))?
+            .parse()
+            .map_err(io::Error::other)?;
+    }
+    if values.next().is_some() {
+        return Err(invalid(format!(
+            "open-reader process {label} record is ambiguous"
+        )));
+    }
+    Ok(ids)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_status_summary(process: &Path) -> io::Result<ProcessStatusSummary> {
     use std::io::Read as _;
 
     const MAX_PROCESS_STATUS_BYTES: usize = 64 * 1024;
@@ -768,36 +831,105 @@ fn process_reader_uids(process: &Path) -> io::Result<[u32; 4]> {
             "open-reader process status exceeded its bounded scan",
         ));
     }
-    let line = status
+    let name = status
         .split(|byte| *byte == b'\n')
-        .find_map(|line| line.strip_prefix(b"Uid:"))
-        .ok_or_else(|| invalid("open-reader process status has no UID record"))?;
-    let mut values = std::str::from_utf8(line)
-        .map_err(io::Error::other)?
-        .split_whitespace();
-    let mut uids = [0; 4];
-    for uid in &mut uids {
-        *uid = values
-            .next()
-            .ok_or_else(|| invalid("open-reader process UID record is incomplete"))?
-            .parse()
-            .map_err(io::Error::other)?;
-    }
-    if values.next().is_some() {
-        return Err(invalid("open-reader process UID record is ambiguous"));
-    }
-    Ok(uids)
+        .find_map(|line| line.strip_prefix(b"Name:"))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    let state = status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"State:"))
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.trim_start().chars().next())
+        .unwrap_or('\0');
+    let has_vm_size = status
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(b"VmSize:"));
+    let uids = parse_status_id_quad(&status, b"Uid:", "UID")?;
+    let gids = parse_status_id_quad(&status, b"Gid:", "GID")?;
+    let cap_prm = parse_status_hex_u64(&status, b"CapPrm:");
+    let cap_eff = parse_status_hex_u64(&status, b"CapEff:");
+    Ok(ProcessStatusSummary {
+        name,
+        state,
+        has_vm_size,
+        uids,
+        gids,
+        cap_prm,
+        cap_eff,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn reader_inventory_denial_is_foreign(process: &Path, own_uid: u32) -> io::Result<bool> {
-    match process_reader_uids(process) {
-        Ok(uids) => Ok(!uids.contains(&own_uid)),
-        // A process that exited between the denial and status inspection no
-        // longer retains a descriptor. Other unavailable evidence refuses.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error),
+#[cfg(test)]
+fn process_reader_uids(process: &Path) -> io::Result<[u32; 4]> {
+    Ok(read_process_status_summary(process)?.uids)
+}
+
+#[cfg(target_os = "linux")]
+fn is_ambient_nondumpable_session_daemon(name: &str) -> bool {
+    matches!(
+        name,
+        "(sd-pam)" | "sshd-session" | "sshd" | "ssh-agent" | "gpg-agent"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn status_summary_denial_is_foreign(
+    summary: &ProcessStatusSummary,
+    self_status: &ProcessStatusSummary,
+) -> bool {
+    let own_uid = self_status.uids[1];
+    if !summary.uids.contains(&own_uid) || summary.uids != self_status.uids {
+        return true;
     }
+    // Setgid helpers (e.g. `ssh-agent`, `unix_chkpwd`) have altered
+    // real/effective/saved GIDs and root-owned `/proc/<pid>/fd`.
+    if summary.gids != self_status.gids {
+        return true;
+    }
+    // Linux `cap_ptrace_access_check` denies `/proc/<pid>/maps` and
+    // `fdinfo` when the target task holds permitted capabilities absent from
+    // the caller's effective set (e.g. `systemd --user` and its session
+    // tree holding `CAP_WAKE_ALARM`).
+    if (summary.cap_prm & !self_status.cap_eff) != 0 {
+        return true;
+    }
+    // Tasks without `VmSize:` (`task->mm == NULL` after `exit_mm()` in
+    // `do_exit()`, or kernel/zombie tasks) have already torn down their
+    // address space, and privilege-dropped OS session daemons have
+    // root-owned `/proc/<pid>/fd` on every standard Linux login session.
+    !summary.has_vm_size
+        || matches!(summary.state, 'Z' | 'X' | 'x')
+        || is_ambient_nondumpable_session_daemon(&summary.name)
+}
+
+#[cfg(target_os = "linux")]
+fn reader_inventory_denial_is_foreign(
+    process: &Path,
+    self_status: &ProcessStatusSummary,
+) -> io::Result<bool> {
+    for attempt in 0..2 {
+        match read_process_status_summary(process) {
+            Ok(summary) if status_summary_denial_is_foreign(&summary, self_status) => {
+                return Ok(true);
+            }
+            Ok(_) if attempt == 0 => {
+                // A task entering `do_exit()` or `execve` can deny `/proc/<pid>`
+                // access microseconds before its status reflects `mm` teardown
+                // or credential change. Re-check once before failing closed.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(_) => return Ok(false),
+            // A process that exited between the denial and status inspection no
+            // longer retains a descriptor. Other unavailable evidence refuses.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1190,6 +1322,14 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn reader_scan_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn reader_preflight_preserves_same_process_posix_locks() {
         use nix::fcntl::{FcntlArg, fcntl};
@@ -1209,6 +1349,7 @@ mod tests {
             assert_eq!(observed.l_type, i16::try_from(nix::libc::F_RDLCK).unwrap());
             return;
         }
+        let _scan_guard = reader_scan_test_guard();
 
         let root = fixture();
         let source = root.join("generation");
@@ -1249,6 +1390,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_retains_an_open_reader_then_reclaims_after_it_closes() {
+        let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("generation");
         std::fs::write(&source, b"retained recovery bytes").unwrap();
@@ -1269,6 +1411,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_retains_a_reader_opened_through_an_unlinked_alias() {
+        let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("generation");
         let alias = root.join("reader-alias");
@@ -1299,6 +1442,7 @@ mod tests {
         use std::io::{BufRead as _, Write as _};
         use std::process::Stdio;
 
+        let _scan_guard = reader_scan_test_guard();
         const CONTENT: &[u8] = b"recovery bytes retained only by a memory mapping";
         const READY: &str = "mapping without a descriptor ready";
         const READER: &str = r#"
@@ -1384,6 +1528,7 @@ mapping.close()
         const CHILD: &str = "MCP_AGENT_MAIL_RECLAIM_UNPRIVILEGED_CHILD";
         let own_uid = std::fs::metadata("/proc/self").unwrap().uid();
         if own_uid == 0 && std::env::var_os(CHILD).is_none() {
+            let _scan_guard = reader_scan_test_guard();
             let full_name = concat!(
                 module_path!(),
                 "::deletion_works_for_an_unprivileged_owner_with_protected_foreign_processes"
@@ -1405,6 +1550,7 @@ mapping.close()
             );
             return;
         }
+        let _scan_guard = reader_scan_test_guard();
         if std::env::var_os(CHILD).is_some() {
             assert_ne!(own_uid, 0);
             let protected = std::fs::read_dir("/proc/1/fd").unwrap_err();
@@ -1439,6 +1585,7 @@ mapping.close()
             std::io::stdin().read_line(&mut release).unwrap();
             return;
         }
+        let _scan_guard = reader_scan_test_guard();
 
         let root = fixture();
         let source = root.join("generation");
@@ -1500,6 +1647,7 @@ mapping.close()
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_refuses_an_active_advisory_reader_lock() {
+        let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("generation");
         std::fs::write(&source, b"reader-locked backup").unwrap();
@@ -1514,6 +1662,7 @@ mapping.close()
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_permission_failure_retains_bytes_and_does_not_claim_unlink() {
+        let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("generation");
         std::fs::write(&source, b"permission-protected backup").unwrap();
@@ -1541,6 +1690,7 @@ mapping.close()
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_reports_post_unlink_sync_failure_without_retrying_a_replacement() {
+        let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("generation");
         std::fs::write(&source, b"old completed backup").unwrap();
@@ -1584,6 +1734,7 @@ mapping.close()
     #[cfg(target_os = "linux")]
     #[test]
     fn deletion_accounting_distinguishes_sparse_length_from_allocated_blocks() {
+        let _scan_guard = reader_scan_test_guard();
         let root = fixture();
         let source = root.join("sparse-generation");
         let file = File::create(&source).unwrap();
