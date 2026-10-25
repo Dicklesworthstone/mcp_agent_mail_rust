@@ -22489,6 +22489,98 @@ fn migrate_format_needs_conversion_attempt(
     format.needs_migration() || migrate_format_requires_force(format)
 }
 
+fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
+    db_path: &Path,
+    database_url: &str,
+) -> CliResult<()> {
+    let context = "migration format detection";
+    let franken_admitted = mcp_agent_mail_db::pool::is_franken_admitted_family(db_path, context)
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context}: cannot open DB at {} read-only: {error}",
+                db_path.display()
+            ))
+        })?;
+    if franken_admitted {
+        return Ok(());
+    }
+
+    let sqlite_activity_path = resolve_mailbox_activity_sqlite_path(database_url)?;
+    let storage_root = resolve_mailbox_activity_storage_root(None);
+    let ownership =
+        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_activity_path, &storage_root);
+
+    let mut lock_candidates = vec![
+        (
+            "sqlite_activity_lock",
+            PathBuf::from(&ownership.sqlite_lock_path),
+        ),
+        (
+            "sqlite_activity_lock",
+            sqlite_sidecar_path(db_path, ".activity.lock"),
+        ),
+    ];
+    if should_lock_mailbox_storage_root(&sqlite_activity_path, &storage_root, None)
+        || should_lock_mailbox_storage_root(db_path, &storage_root, None)
+    {
+        lock_candidates.push((
+            "storage_activity_lock",
+            PathBuf::from(&ownership.storage_lock_path),
+        ));
+    }
+
+    let mut seen_lock_paths = std::collections::BTreeSet::new();
+    for (lock_name, lock_path) in lock_candidates {
+        if !seen_lock_paths.insert(lock_path.clone()) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(CliError::Other(format!(
+                    "{context}: refusing non-regular {lock_name} artifact {}",
+                    lock_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CliError::Other(format!(
+                    "{context}: failed to inspect {lock_name} {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        }
+        if let Some(mode) = infer_lock_mode_by_try_lock(&lock_path) {
+            return Err(CliError::Other(format!(
+                "Resource is temporarily busy. {context} refuses canonical SQLite open on sidecarless database {} while {lock_name} {} is held ({mode}). Safe next command: `am doctor locks --json` (read-only).",
+                db_path.display(),
+                lock_path.display()
+            )));
+        }
+    }
+
+    let recovery_lock = mcp_agent_mail_db::pool::inspect_mailbox_recovery_lock(db_path);
+    if recovery_lock.active {
+        return Err(CliError::Other(format!(
+            "Resource is temporarily busy. {context} refuses canonical SQLite open on sidecarless database {} while recovery lock {} is active ({}). Safe next command: `am doctor locks --json` (read-only).",
+            db_path.display(),
+            recovery_lock.lock_path,
+            recovery_lock.detail
+        )));
+    }
+
+    if ownership.blocks_mutation() {
+        return Err(CliError::Other(format!(
+            "Resource is temporarily busy. {context} refuses canonical SQLite open on sidecarless database {} while mailbox ownership is active ({:?}: {}). Safe next command: `am doctor locks --json` (read-only).",
+            db_path.display(),
+            ownership.disposition,
+            ownership.detail
+        )));
+    }
+
+    Ok(())
+}
+
 fn handle_migrate_cmd(
     check: bool,
     rollback: bool,
@@ -22534,6 +22626,7 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
+    ensure_sidecarless_sqlite_family_offline_for_format_detection(&db_path, &cfg.database_url)?;
     let (format_conn, opened_path) =
         open_live_sqlite_read_only(&resolved_path, "migration format detection")?;
     resolved_path = opened_path;
@@ -54587,6 +54680,313 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             quarantine_count, 0,
             "migrate --check should not mutate or quarantine the corrupt database"
+        );
+    }
+
+    #[test]
+    fn migrate_check_and_convert_sidecarless_legacy_text_database() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("legacy-text.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text).expect("open canonical");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("set delete journal mode");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('legacy-proj', '/tmp/legacy-proj', '2026-01-15T10:30:00Z');",
+            )
+            .expect("insert legacy text timestamp row");
+        drop(canonical);
+
+        assert!(
+            !mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
+                .expect("inspect namespace shape"),
+            "canonical-seeded database must start sidecarless"
+        );
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(true, false, false, None)
+                    .expect("migrate --check must succeed on sidecarless legacy text DB");
+
+                for suffix in [
+                    "-fsqlite-ns-gate",
+                    "-fsqlite-ns-use",
+                    "-wal",
+                    "-shm",
+                    "-journal",
+                    ".activity.lock",
+                ] {
+                    let sidecar = sqlite_sidecar_path(&db_path, suffix);
+                    assert!(
+                        !sidecar.exists(),
+                        "migrate --check must not materialize sidecar {}",
+                        sidecar.display()
+                    );
+                }
+
+                handle_migrate_cmd(false, false, false, Some(backup_dir.clone()))
+                    .expect("migrate must convert sidecarless legacy text DB");
+            },
+        );
+
+        let backup_count = std::fs::read_dir(&backup_dir)
+            .expect("read backup dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            backup_count, 1,
+            "migrate should create one pre-conversion backup for legacy TEXT timestamps"
+        );
+
+        let (conn, _opened_path) =
+            open_live_sqlite_read_only(&db_path_text, "post-migrate verification")
+                .expect("reopen migrated db read-only");
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) AS ty, created_at FROM projects WHERE slug = 'legacy-proj'",
+                &[],
+            )
+            .expect("query migrated project");
+        assert_eq!(rows.len(), 1);
+        let ty: String = rows[0].get_named("ty").expect("ty");
+        let created_at: i64 = rows[0].get_named("created_at").expect("created_at");
+        assert_eq!(ty, "integer");
+        assert!(
+            created_at > 0,
+            "converted timestamp must be positive micros"
+        );
+    }
+
+    #[test]
+    fn migrate_check_and_run_sidecarless_canonical_integer_database_is_noop() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical-int.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let backup_dir = dir.path().join("backups");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text).expect("open canonical");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("set delete journal mode");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('int-proj', '/tmp/int-proj', 1736937000000000);",
+            )
+            .expect("insert integer timestamp row");
+        drop(canonical);
+
+        assert!(
+            !mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
+                .expect("inspect namespace shape"),
+            "canonical-seeded integer database must start sidecarless"
+        );
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(true, false, false, Some(backup_dir.clone()))
+                    .expect("migrate --check must succeed on sidecarless integer DB");
+                handle_migrate_cmd(false, false, false, Some(backup_dir.clone()))
+                    .expect("migrate must succeed as no-op conversion on sidecarless integer DB");
+            },
+        );
+
+        let backup_count = std::fs::read_dir(&backup_dir)
+            .expect("read backup dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(
+            backup_count, 0,
+            "integer-timestamp database should not create a timestamp-conversion backup"
+        );
+    }
+
+    #[test]
+    fn migrate_check_preserves_same_process_writer_lock_on_franken_admitted_database() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("franken-live-writer.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let writer = mcp_agent_mail_db::DbConn::open_file(&db_path_text).expect("open franken db");
+        writer
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        writer
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('live-proj', '/tmp/live-proj', 1736937000000000);",
+            )
+            .expect("insert project");
+        assert!(
+            mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
+                .expect("inspect namespace shape"),
+            "FrankenSQLite database must carry a complete namespace sidecar pair"
+        );
+
+        writer
+            .execute_raw(
+                "BEGIN IMMEDIATE; \
+                 UPDATE projects SET human_key = '/tmp/live-proj-locked' WHERE slug = 'live-proj';",
+            )
+            .expect("begin immediate write transaction");
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_migrate_cmd(true, false, false, None).expect(
+                    "migrate --check must succeed via bound FrankenSQLite read-only connection",
+                );
+            },
+        );
+
+        let contender =
+            mcp_agent_mail_db::DbConn::open_file(&db_path_text).expect("open contender");
+        contender
+            .execute_raw("PRAGMA busy_timeout = 0;")
+            .expect("set zero busy timeout");
+        let conflict = contender.execute_raw("BEGIN IMMEDIATE;");
+        assert!(
+            conflict.is_err(),
+            "same-process writer lock must remain intact after migrate --check"
+        );
+
+        writer.execute_raw("ROLLBACK;").expect("rollback writer");
+        contender
+            .execute_raw("BEGIN IMMEDIATE; ROLLBACK;")
+            .expect("contender should acquire write lock after rollback");
+    }
+
+    #[test]
+    fn migrate_format_detection_refuses_incomplete_namespace_and_active_owner_on_sidecarless_db() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("sidecarless-guarded.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let quarantine_dir = dir.path().join("quarantine");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
+
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_text).expect("open canonical");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("set delete journal mode");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init base schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('guarded-proj', '/tmp/guarded-proj', '2026-01-15T10:30:00Z');",
+            )
+            .expect("insert legacy text row");
+        drop(canonical);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+
+        // 1. Holding an active mailbox activity lock on a sidecarless DB must fail closed
+        // before canonical SQLite opens the file.
+        let activity_guard = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+            &db_path,
+            mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+        )
+        .expect("acquire activity lock");
+        let busy_err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_cmd(true, false, false, None),
+        )
+        .expect_err("sidecarless DB with active activity lock must fail closed");
+        assert!(
+            is_resource_busy_cli_error(&busy_err),
+            "expected busy error when activity lock is held, got: {busy_err}"
+        );
+        assert!(
+            busy_err
+                .to_string()
+                .contains("refuses canonical SQLite open on sidecarless database"),
+            "unexpected error detail: {busy_err}"
+        );
+        drop(activity_guard);
+        let lock_artifact = sqlite_sidecar_path(&db_path, ".activity.lock");
+        if lock_artifact.exists() {
+            std::fs::rename(&lock_artifact, quarantine_dir.join("retired.activity.lock"))
+                .expect("quarantine lock artifact");
+        }
+
+        // 2. An incomplete FrankenSQLite namespace sidecar pair must fail closed.
+        let half_gate = sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate");
+        std::fs::write(&half_gate, b"half-admitted").expect("write half namespace gate");
+        let half_err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_cmd(true, false, false, None),
+        )
+        .expect_err("incomplete namespace pair must fail closed");
+        assert!(
+            half_err
+                .to_string()
+                .contains("incomplete FrankenSQLite namespace sidecar pair"),
+            "unexpected incomplete-namespace error: {half_err}"
         );
     }
 
