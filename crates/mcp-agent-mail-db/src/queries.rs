@@ -7947,6 +7947,10 @@ pub async fn create_message(
     // generation racing an older pool. The archive seed is the allocator's
     // once-per-process scan; it only matters before pool warmup has repaired
     // the durable floor in this process.
+    let id_allocator = pool.message_id_allocator();
+    if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+        return Outcome::Err(error);
+    }
     let archive_seed = match pool
         .archive_seed(cx, "message creation archive allocator")
         .await
@@ -7958,6 +7962,9 @@ pub async fn create_message(
     };
 
     let row = match run_with_mvcc_retry(cx, "create_message", || async {
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            return Outcome::Err(error);
+        }
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -7971,6 +7978,12 @@ pub async fn create_message(
             &tracked,
             elect_message_id_in_tx(cx, &tracked, archive_seed).await
         );
+        run_after_message_id_election_hook(message_id);
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            tracked.retire_on_drop();
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(error);
+        }
 
         // Insert message with an explicit id (mcp_agent_mail#176).
         let sql = "INSERT INTO messages \
@@ -8010,7 +8023,16 @@ pub async fn create_message(
             attachments: attachments.to_string(),
         };
 
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            tracked.retire_on_drop();
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(error);
+        }
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            tracked.retire_on_drop();
+            return Outcome::Err(error);
+        }
         Outcome::Ok(row)
     })
     .await
@@ -8049,6 +8071,61 @@ pub async fn create_message(
 /// Returns an id strictly greater than the durable sequence, the live
 /// `MAX(messages.id)`, and the archive seed. Exhausting the positive i64
 /// row-id range fails closed with the whole transaction rolled back.
+fn ensure_message_id_allocator_live(
+    allocator: &crate::id_floor::MessageIdAllocator,
+) -> std::result::Result<(), DbError> {
+    if allocator.is_retired() {
+        return Err(DbError::Internal(
+            "message id allocator was retired after database recovery".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+type AfterMessageIdElectionHook = std::sync::Arc<dyn Fn(i64) + Send + Sync>;
+
+static AFTER_MESSAGE_ID_ELECTION_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<AfterMessageIdElectionHook>>,
+> = std::sync::OnceLock::new();
+
+fn run_after_message_id_election_hook(elected_id: i64) {
+    let hook = AFTER_MESSAGE_ID_ELECTION_HOOK.get().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    });
+    if let Some(hook) = hook {
+        hook(elected_id);
+    }
+}
+
+#[doc(hidden)]
+pub struct AfterMessageIdElectionHookGuard;
+
+impl Drop for AfterMessageIdElectionHookGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = AFTER_MESSAGE_ID_ELECTION_HOOK.get() {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn install_after_message_id_election_hook_for_test<F>(
+    hook: F,
+) -> AfterMessageIdElectionHookGuard
+where
+    F: Fn(i64) + Send + Sync + 'static,
+{
+    let slot = AFTER_MESSAGE_ID_ELECTION_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(hook));
+    AfterMessageIdElectionHookGuard
+}
+
 async fn elect_message_id_in_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
@@ -8430,6 +8507,9 @@ async fn create_message_with_recipients_impl(
         // inside the retried transaction, so a rolled-back attempt never
         // burns an id.
         let id_allocator = pool.message_id_allocator();
+        if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+            return Outcome::Err(error);
+        }
         let mut archive_seed = if idempotency.is_some() {
             // Warm keyed sends need only the authoritative insert transaction;
             // this lookup performs no archive validation or filesystem work.
@@ -8453,6 +8533,9 @@ async fn create_message_with_recipients_impl(
         };
         let (created_outcome, conn) = loop {
             match run_with_mvcc_retry(cx, "create_message_with_recipients", || async {
+                if let Err(error) = ensure_message_id_allocator_live(&id_allocator) {
+                    return Outcome::Err(error);
+                }
                 let conn = match acquire_conn(cx, pool).await {
                     Outcome::Ok(c) => c,
                     Outcome::Err(e) => return Outcome::Err(e),
@@ -8463,6 +8546,7 @@ async fn create_message_with_recipients_impl(
                 match create_message_with_recipients_tx(
                     cx,
                     &tracked,
+                    &id_allocator,
                     project_id,
                     sender_id,
                     subject,
@@ -8786,6 +8870,7 @@ const INSERT_MESSAGE_RECIPIENT_SQL: &str = "INSERT INTO message_recipients \
 async fn create_message_with_recipients_tx(
     cx: &Cx,
     tracked: &TrackedConnection<'_>,
+    id_allocator: &crate::id_floor::MessageIdAllocator,
     project_id: i64,
     sender_id: i64,
     subject: &str,
@@ -8874,6 +8959,12 @@ async fn create_message_with_recipients_tx(
         tracked,
         elect_message_id_in_tx(cx, tracked, archive_seed).await
     );
+    run_after_message_id_election_hook(message_id);
+    if let Err(error) = ensure_message_id_allocator_live(id_allocator) {
+        tracked.retire_on_drop();
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(error);
+    }
     if reply_to == Some(message_id) {
         rollback_tx(cx, tracked).await;
         return Outcome::Err(DbError::InvalidArgument {
@@ -9150,8 +9241,17 @@ async fn create_message_with_recipients_tx(
         );
     }
 
+    if let Err(error) = ensure_message_id_allocator_live(id_allocator) {
+        tracked.retire_on_drop();
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(error);
+    }
     // COMMIT (single fsync)
     try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
+    if let Err(error) = ensure_message_id_allocator_live(id_allocator) {
+        tracked.retire_on_drop();
+        return Outcome::Err(error);
+    }
 
     Outcome::Ok(Some(IdempotentOutcome::Fresh(row)))
 }

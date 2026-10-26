@@ -5909,7 +5909,7 @@ const LIVE_QUERY_ONLY_POOL_CACHE_CAPACITY: usize = 4;
 /// sized pools may point at the same file, and any surviving file descriptor
 /// could keep serving pre-recovery numeric ids.
 fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
-    let retired_pools = {
+    let mut retired_pools = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
@@ -5949,18 +5949,30 @@ fn retire_cached_runtime_state_after_recovery(identity: &Path, trigger: &str) {
         pools
     };
 
+    let message_id_allocator_invalidated = invalidate_file_message_id_allocator(identity);
     let retired_generations = {
         let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
         let guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
-        retired_pools
+        for entry in guard.values() {
+            if entry.allocator.is_retired()
+                && let Some(pool) = entry.pool.upgrade()
+                && !retired_pools
+                    .iter()
+                    .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &pool))
+            {
+                retired_pools.push(pool);
+            }
+        }
+        let generations = retired_pools
             .iter()
             .filter_map(|pool| {
                 let key = Arc::as_ptr(pool) as usize;
                 guard.get(&key).map(|entry| entry.cache_generation)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        drop(guard);
+        generations
     };
-    let message_id_allocator_invalidated = invalidate_file_message_id_allocator(identity);
 
     for pool in &retired_pools {
         pool.close();
@@ -24680,6 +24692,199 @@ mod tests {
                 .expect("join replacement allocator"),
             Outcome::Ok(0)
         ));
+    }
+
+    #[test]
+    fn in_flight_pre_recovery_create_message_cannot_commit_or_publish_after_takeover() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let candidate = dir.path().join("storage.sqlite3.recovery-candidate");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+
+        let old_pool = create_pool(&cfg).expect("create pre-recovery pool");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let (project_id, sender_id, recipient_id) = runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let project = crate::queries::ensure_project(&cx, &old_pool, "/tmp/br-sa58k-recovery")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = crate::queries::register_agent(
+                &cx,
+                &old_pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = crate::queries::register_agent(
+                &cx,
+                &old_pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let baseline = crate::queries::create_message(
+                &cx,
+                &old_pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "baseline before recovery",
+                "body",
+                None,
+                "normal",
+                false,
+                "{}",
+            )
+            .await
+            .into_result()
+            .expect("create baseline message");
+            assert_eq!(baseline.id, Some(1));
+            let conn = old_pool.acquire(&cx).await.into_result().expect("acquire");
+            conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+                .expect("checkpoint baseline into primary");
+            drop(conn);
+            (
+                project_id,
+                sender.id.expect("sender id"),
+                recipient.id.expect("recipient id"),
+            )
+        });
+
+        std::fs::copy(&primary, &candidate).expect("stage recovery candidate from baseline");
+
+        let (elected_tx, elected_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let hook_guard = crate::queries::install_after_message_id_election_hook_for_test({
+            let release_rx = Arc::clone(&release_rx);
+            move |elected_id| {
+                elected_tx
+                    .send(elected_id)
+                    .expect("report elected pre-recovery id");
+                release_rx
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .recv()
+                    .expect("wait for recovery takeover to complete");
+            }
+        });
+
+        let writer_pool = old_pool.clone();
+        let writer_handle = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build writer runtime");
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("writer context");
+                crate::queries::create_message_with_recipients(
+                    &cx,
+                    &writer_pool,
+                    project_id,
+                    sender_id,
+                    "stale pre-recovery message",
+                    "must never commit or publish after takeover",
+                    None,
+                    "normal",
+                    false,
+                    "{}",
+                    &[(recipient_id, "to")],
+                )
+                .await
+            })
+        });
+
+        let pre_recovery_elected_id = elected_rx
+            .recv()
+            .expect("in-flight writer must elect an id before takeover");
+        assert_eq!(pre_recovery_elected_id, 2);
+
+        promote_recovery_candidate(&primary, &candidate, &storage_root)
+            .expect("promote recovery candidate while pre-recovery election is in flight");
+        drop(hook_guard);
+        release_tx
+            .send(())
+            .expect("release in-flight pre-recovery writer after takeover");
+
+        let stale_outcome = writer_handle.join().expect("join pre-recovery writer");
+        assert!(
+            matches!(
+                stale_outcome,
+                Outcome::Err(ref error) if error.to_string().contains("retired after database recovery")
+            ),
+            "in-flight pre-recovery write must fail closed after takeover, got: {stale_outcome:?}"
+        );
+
+        let replacement_pool = create_pool(&cfg).expect("open replacement pool");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let post_error = crate::queries::create_message(
+                &cx,
+                &old_pool,
+                project_id,
+                sender_id,
+                "second attempt on retired pool",
+                "body",
+                None,
+                "normal",
+                false,
+                "{}",
+            )
+            .await;
+            assert!(matches!(
+                post_error,
+                Outcome::Err(ref error) if error.to_string().contains("retired after database recovery")
+            ));
+
+            let authoritative = crate::queries::create_message_with_recipients(
+                &cx,
+                &replacement_pool,
+                project_id,
+                sender_id,
+                "post-recovery authoritative message",
+                "body",
+                None,
+                "normal",
+                false,
+                "{}",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("replacement pool must elect cleanly");
+            assert_eq!(authoritative.id, Some(2));
+
+            let loaded = crate::queries::get_message(&cx, &replacement_pool, 2)
+                .await
+                .into_result()
+                .expect("load message 2 from replacement generation");
+            assert_eq!(loaded.subject, "post-recovery authoritative message");
+        });
     }
 
     #[test]
