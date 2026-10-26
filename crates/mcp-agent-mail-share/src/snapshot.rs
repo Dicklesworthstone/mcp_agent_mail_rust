@@ -1110,8 +1110,68 @@ pub fn create_snapshot_context(
     scrub_preset: crate::ScrubPreset,
     purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
+    create_snapshot_context_with_observer(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        &mut |_| {},
+    )
+}
+
+/// A bounded, content-free description of work in the snapshot pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhase {
+    /// Create the private database copy through the appropriate source engine.
+    Snapshot,
+    /// Resolve project selectors and remove out-of-scope rows from the copy.
+    Filter,
+    /// Apply the preset and publication-specific credential redaction.
+    Scrub,
+    /// Rebuild storage, search indexes, materialized views, and statistics.
+    Finalize,
+}
+
+/// Phase boundaries only: no database paths, selectors, SQL, or mailbox data.
+///
+/// A failed phase emits `Started` but not `Finished`; the returned error keeps
+/// its existing type and is handled by the caller. Observers should perform
+/// only bounded diagnostic work and must not mutate snapshot state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhaseEvent {
+    Started(SnapshotPhase),
+    Finished(SnapshotPhase),
+}
+
+/// Prepare a live-mailbox snapshot while observing its phase boundaries.
+///
+/// Uses exactly the same guarded source and scrub policy as
+/// [`create_snapshot_context`]. Observation does not enable any extra reads of
+/// the source, release locks, or expose row contents to the observer.
+///
+/// # Errors
+///
+/// Returns the original [`ShareError`] if snapshot creation, project filtering,
+/// scrubbing, or finalization fails. No later phase is started on failure.
+pub fn create_snapshot_context_with_observer(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut dyn FnMut(SnapshotPhaseEvent),
+) -> Result<SnapshotContext, ShareError> {
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Snapshot));
     create_sqlite_snapshot(source, snapshot_path, true)?;
-    finish_snapshot_context(snapshot_path, project_filters, scrub_preset, purpose)
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Snapshot));
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        observer,
+    )
 }
 
 /// What a snapshot is for.
@@ -1142,8 +1202,44 @@ pub fn create_private_canonical_snapshot_context(
     scrub_preset: crate::ScrubPreset,
     purpose: SnapshotPurpose,
 ) -> Result<SnapshotContext, ShareError> {
+    create_private_canonical_snapshot_context_with_observer(
+        source,
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        &mut |_| {},
+    )
+}
+
+/// Prepare a private canonical snapshot while observing its phase boundaries.
+///
+/// The source exclusivity requirement of
+/// [`create_private_canonical_snapshot_context`] still applies. Events carry
+/// only the fixed phase name and whether it started or finished.
+///
+/// # Errors
+///
+/// Returns the original [`ShareError`] if snapshot creation, project filtering,
+/// scrubbing, or finalization fails. A failed phase never emits `Finished`.
+pub fn create_private_canonical_snapshot_context_with_observer(
+    source: &Path,
+    snapshot_path: &Path,
+    project_filters: &[String],
+    scrub_preset: crate::ScrubPreset,
+    purpose: SnapshotPurpose,
+    observer: &mut dyn FnMut(SnapshotPhaseEvent),
+) -> Result<SnapshotContext, ShareError> {
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Snapshot));
     create_private_canonical_sqlite_snapshot(source, snapshot_path, true)?;
-    finish_snapshot_context(snapshot_path, project_filters, scrub_preset, purpose)
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Snapshot));
+    finish_snapshot_context(
+        snapshot_path,
+        project_filters,
+        scrub_preset,
+        purpose,
+        observer,
+    )
 }
 
 fn finish_snapshot_context(
@@ -1151,7 +1247,9 @@ fn finish_snapshot_context(
     project_filters: &[String],
     scrub_preset: crate::ScrubPreset,
     purpose: SnapshotPurpose,
+    observer: &mut dyn FnMut(SnapshotPhaseEvent),
 ) -> Result<SnapshotContext, ShareError> {
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Filter));
     // Scoping deletes the other projects first; keep their paths so the scrub
     // still redacts them where kept rows mention them.
     let all_project_paths = if project_filters.is_empty() {
@@ -1160,6 +1258,8 @@ fn finish_snapshot_context(
         crate::scope::project_paths_before_scope(snapshot_path)?
     };
     let mut scope = crate::apply_project_scope(snapshot_path, project_filters)?;
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Filter));
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Scrub));
     let mut scrub_summary =
         crate::scrub::scrub_snapshot_redacting(snapshot_path, scrub_preset, &all_project_paths)?;
     if purpose == SnapshotPurpose::Publish {
@@ -1171,7 +1271,10 @@ fn finish_snapshot_context(
     if !matches!(scrub_preset, crate::ScrubPreset::Archive) {
         crate::scrub::redact_scope_project_human_keys(&mut scope);
     }
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub));
+    observer(SnapshotPhaseEvent::Started(SnapshotPhase::Finalize));
     let finalize = crate::finalize_export_db(snapshot_path)?;
+    observer(SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize));
 
     Ok(SnapshotContext {
         snapshot_path: snapshot_path.to_path_buf(),
@@ -1281,6 +1384,164 @@ mod tests {
             )
         })
         .collect()
+    }
+
+    const SNAPSHOT_SUCCESS_EVENTS: [SnapshotPhaseEvent; 8] = [
+        SnapshotPhaseEvent::Started(SnapshotPhase::Snapshot),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Snapshot),
+        SnapshotPhaseEvent::Started(SnapshotPhase::Filter),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Filter),
+        SnapshotPhaseEvent::Started(SnapshotPhase::Scrub),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Scrub),
+        SnapshotPhaseEvent::Started(SnapshotPhase::Finalize),
+        SnapshotPhaseEvent::Finished(SnapshotPhase::Finalize),
+    ];
+
+    #[test]
+    fn snapshot_observer_reports_real_pipeline_and_preserves_private_metadata() {
+        for live in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.sqlite3");
+            let snapshot = dir.path().join("snapshot.sqlite3");
+            let original = if live {
+                let conn = DbConn::open_file(source.display().to_string()).unwrap();
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            } else {
+                let conn = private_source(&source);
+                seed_reply_metadata_source(&conn, false);
+                reply_metadata(&conn)
+            };
+            let mut events = Vec::new();
+            let context = if live {
+                create_snapshot_context_with_observer(
+                    &source,
+                    &snapshot,
+                    &["reply-copy".to_string()],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            } else {
+                create_private_canonical_snapshot_context_with_observer(
+                    &source,
+                    &snapshot,
+                    &["reply-copy".to_string()],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            }
+            .unwrap();
+            assert_eq!(events, SNAPSHOT_SUCCESS_EVENTS);
+            assert_eq!(context.scope.projects.len(), 1);
+            assert_eq!(context.scope.remaining.messages, 6);
+            assert_eq!(reply_metadata(&private_source(&snapshot)), original);
+            let unchanged = if live {
+                reply_metadata(&DbConn::open_file(source.display().to_string()).unwrap())
+            } else {
+                reply_metadata(&private_source(&source))
+            };
+            assert_eq!(
+                unchanged, original,
+                "observation must not mutate the source"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_observer_does_not_finish_or_advance_after_snapshot_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sqlite3");
+        let snapshot = dir.path().join("snapshot.sqlite3");
+        for live in [false, true] {
+            let mut events = Vec::new();
+            let result = if live {
+                create_snapshot_context_with_observer(
+                    &missing,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            } else {
+                create_private_canonical_snapshot_context_with_observer(
+                    &missing,
+                    &snapshot,
+                    &[],
+                    crate::ScrubPreset::Archive,
+                    SnapshotPurpose::PrivateArchive,
+                    &mut |event| events.push(event),
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(ShareError::SnapshotSourceNotFound { .. })
+            ));
+            assert_eq!(events, SNAPSHOT_SUCCESS_EVENTS[..1]);
+            assert!(!snapshot.exists());
+            assert!(!missing.exists());
+        }
+    }
+
+    #[test]
+    fn snapshot_observer_attributes_unknown_project_to_filter_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let snapshot = dir.path().join("snapshot.sqlite3");
+        seed_reply_metadata_source(&private_source(&source), false);
+        let original = reply_metadata(&private_source(&source));
+        let mut events = Vec::new();
+        let error = create_private_canonical_snapshot_context_with_observer(
+            &source,
+            &snapshot,
+            &["unknown-private-project".to_string()],
+            crate::ScrubPreset::Archive,
+            SnapshotPurpose::PrivateArchive,
+            &mut |event| events.push(event),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ShareError::ScopeIdentifierNotFound { .. }));
+        assert_eq!(events, SNAPSHOT_SUCCESS_EVENTS[..3]);
+        assert_eq!(reply_metadata(&private_source(&source)), original);
+    }
+
+    #[test]
+    fn snapshot_observer_stops_at_failing_scrub_or_finalize_phase() {
+        for (phase, expected_events) in [
+            (SnapshotPhase::Scrub, &SNAPSHOT_SUCCESS_EVENTS[..5]),
+            (SnapshotPhase::Finalize, &SNAPSHOT_SUCCESS_EVENTS[..7]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.sqlite3");
+            let snapshot = dir.path().join("snapshot.sqlite3");
+            let preserved = dir.path().join("snapshot-before-failure.sqlite3");
+            seed_reply_metadata_source(&private_source(&source), false);
+            let original = reply_metadata(&private_source(&source));
+            let mut events = Vec::new();
+            let error = create_private_canonical_snapshot_context_with_observer(
+                &source,
+                &snapshot,
+                &[],
+                crate::ScrubPreset::Archive,
+                SnapshotPurpose::PrivateArchive,
+                &mut |event| {
+                    events.push(event);
+                    if event == SnapshotPhaseEvent::Started(phase) {
+                        // Disposable-fixture fault: preserve the copy, then
+                        // make the next real phase encounter a non-file path.
+                        std::fs::rename(&snapshot, &preserved).unwrap();
+                        std::fs::create_dir(&snapshot).unwrap();
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, ShareError::Validation { .. }));
+            assert_eq!(events, expected_events);
+            assert!(preserved.is_file(), "keep the failure evidence intact");
+            assert_eq!(reply_metadata(&private_source(&source)), original);
+        }
     }
 
     #[test]
