@@ -25350,6 +25350,258 @@ mod tests {
     }
 
     #[test]
+    fn pooled_connections_enforce_cache_budget_residency_and_journal_size_limit_wal_cap() {
+        fn read_cache_stats(conn: &DbConn) -> std::collections::BTreeMap<String, i64> {
+            conn.query_sync("PRAGMA fsqlite.cache_stats;", &[])
+                .expect("query fsqlite.cache_stats")
+                .into_iter()
+                .filter_map(|row| {
+                    let name = row.get_as::<String>(0).ok()?;
+                    let value = row.get_as::<i64>(1).ok()?;
+                    Some((name, value))
+                })
+                .collect()
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("cache-and-journal-live.sqlite3");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let database_url = format!("sqlite:///{}", db_path.display());
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        // 1. Seed ~6.4 MiB of payload (~1,600 4-KiB pages) and checkpoint into main DB.
+        {
+            let seed_pool = DbPool::new(&DbPoolConfig {
+                database_url: database_url.clone(),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                cache_budget_kb: 16_384,
+                ..Default::default()
+            })
+            .expect("create seed pool");
+            runtime.block_on(async {
+                let conn = seed_pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("acquire seed conn");
+                conn.execute_raw(
+                    "CREATE TABLE IF NOT EXISTS bulk_pages (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+                )
+                .expect("create bulk_pages table");
+                let payload = "x".repeat(8_000);
+                conn.execute_raw("BEGIN IMMEDIATE;")
+                    .expect("begin seed txn");
+                for id in 0..800_i64 {
+                    conn.execute_sync(
+                        "INSERT INTO bulk_pages (id, payload) VALUES (?1, ?2)",
+                        &[
+                            sqlmodel_core::Value::BigInt(id),
+                            sqlmodel_core::Value::Text(payload.clone()),
+                        ],
+                    )
+                    .expect("insert bulk row");
+                }
+                conn.execute_raw("COMMIT;").expect("commit seed txn");
+                conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .expect("truncate checkpoint after seed");
+            });
+        }
+
+        // 2. Tight pool: max_connections=2, cache_budget_kb=4096 => PRAGMA cache_size = -2048 (512 4-KiB pages).
+        {
+            let tight_pool = DbPool::new(&DbPoolConfig {
+                database_url: database_url.clone(),
+                min_connections: 1,
+                max_connections: 2,
+                warmup_connections: 0,
+                cache_budget_kb: 4_096,
+                ..Default::default()
+            })
+            .expect("create tight pool");
+            runtime.block_on(async {
+                let conn = tight_pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("acquire tight conn");
+                assert_eq!(
+                    read_pragma_i64(&conn, "PRAGMA cache_size;", "cache_size")
+                        .expect("read tight cache_size"),
+                    -2_048
+                );
+                let rows = conn
+                    .query_sync("SELECT SUM(LENGTH(payload)) FROM bulk_pages", &[])
+                    .expect("scan bulk_pages on tight conn");
+                assert_eq!(rows[0].get_as::<i64>(0).expect("sum length"), 6_400_000);
+
+                let stats = read_cache_stats(&conn);
+                let cached_pages = *stats.get("cached_pages").expect("cached_pages metric");
+                let eviction_count = *stats.get("eviction_count").expect("eviction_count metric");
+                let admit_count = *stats.get("admit_count").expect("admit_count metric");
+                assert!(
+                    admit_count > 512,
+                    "full scan must admit >512 pages: stats={stats:?}"
+                );
+                assert!(
+                    cached_pages <= 512,
+                    "tight cache_budget_kb (512-page per-conn cap) must bound resident pages <= 512, got {cached_pages} (stats={stats:?})"
+                );
+                assert!(
+                    eviction_count > 0,
+                    "tight cache_budget_kb must evict pages during >512-page scan: stats={stats:?}"
+                );
+            });
+        }
+
+        // 3. Generous pool: max_connections=1, cache_budget_kb=16384 => PRAGMA cache_size = -16384 (4,096 pages).
+        //    Verify that lowering PRAGMA cache_size on a warm connection immediately trims resident pages,
+        //    and run the negative control for journal_size_limit (-1 leaves WAL > 1 MiB after passive autocheckpoint).
+        let wal_unbounded_bytes = {
+            let generous_pool = DbPool::new(&DbPoolConfig {
+                database_url: database_url.clone(),
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                cache_budget_kb: 16_384,
+                ..Default::default()
+            })
+            .expect("create generous pool");
+            generous_pool
+                .set_journal_size_limit(524_288)
+                .expect("set 512 KiB journal_size_limit");
+            runtime.block_on(async {
+                let conn = generous_pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("acquire generous conn");
+                assert_eq!(
+                    read_pragma_i64(&conn, "PRAGMA cache_size;", "cache_size")
+                        .expect("read generous cache_size"),
+                    -16_384
+                );
+                assert_eq!(
+                    read_pragma_i64(&conn, "PRAGMA journal_size_limit;", "journal_size_limit")
+                        .expect("read journal_size_limit"),
+                    524_288
+                );
+                let rows = conn
+                    .query_sync("SELECT SUM(LENGTH(payload)) FROM bulk_pages", &[])
+                    .expect("scan bulk_pages on generous conn");
+                assert_eq!(rows[0].get_as::<i64>(0).expect("sum length"), 6_400_000);
+
+                let stats_before = read_cache_stats(&conn);
+                let cached_before = *stats_before
+                    .get("cached_pages")
+                    .expect("cached_pages before trim");
+                assert!(
+                    cached_before > 512,
+                    "generous cache_budget_kb must retain >512 pages after full scan, got {cached_before} (stats={stats_before:?})"
+                );
+
+                // Dynamically shrink cache_size to -1024 KiB (256 pages) and verify immediate trim.
+                conn.execute_raw("PRAGMA cache_size = -1024;")
+                    .expect("shrink cache_size to -1024 KiB");
+                let stats_after = read_cache_stats(&conn);
+                let cached_after = *stats_after
+                    .get("cached_pages")
+                    .expect("cached_pages after trim");
+                assert!(
+                    cached_after <= 256,
+                    "shrinking PRAGMA cache_size to -1024 KiB must immediately trim resident pages <= 256, got {cached_after} (stats={stats_after:?})"
+                );
+
+                // Negative control for journal_size_limit: with journal_size_limit = -1 (unbounded)
+                // and wal_autocheckpoint = 32 pages, committing ~400 pages (~1.6 MiB) runs a
+                // passive autocheckpoint that leaves the on-disk -wal file > 1 MiB.
+                conn.execute_raw("PRAGMA journal_size_limit = -1; PRAGMA wal_autocheckpoint = 32;")
+                    .expect("configure unbounded journal_size_limit with wal_autocheckpoint=32");
+                let update_payload = "y".repeat(8_000);
+                conn.execute_raw("BEGIN IMMEDIATE;")
+                    .expect("begin unbounded wal txn");
+                for id in 0..200_i64 {
+                    conn.execute_sync(
+                        "UPDATE bulk_pages SET payload = ?1 WHERE id = ?2",
+                        &[
+                            sqlmodel_core::Value::Text(update_payload.clone()),
+                            sqlmodel_core::Value::BigInt(id),
+                        ],
+                    )
+                    .expect("update bulk row (unbounded)");
+                }
+                conn.execute_raw("COMMIT;")
+                    .expect("commit unbounded wal txn");
+                let wal_unbounded_bytes = std::fs::metadata(&wal_path)
+                    .expect("wal metadata after unbounded commit")
+                    .len();
+                assert!(
+                    wal_unbounded_bytes > 1_000_000,
+                    "unbounded journal_size_limit (-1) should leave WAL > 1 MiB after passive autocheckpoint, got {wal_unbounded_bytes}"
+                );
+                wal_unbounded_bytes
+            })
+        };
+
+        // 4. Positive control for journal_size_limit: a pool configured with a 64 KiB
+        //    journal_size_limit (set_journal_size_limit(65_536)) promotes autocheckpoint to
+        //    Truncate when the WAL exceeds the byte cap, reclaiming the on-disk -wal file.
+        {
+            let bounded_pool = DbPool::new(&DbPoolConfig {
+                database_url,
+                min_connections: 1,
+                max_connections: 1,
+                warmup_connections: 0,
+                cache_budget_kb: 16_384,
+                ..Default::default()
+            })
+            .expect("create bounded journal_size_limit pool");
+            bounded_pool
+                .set_journal_size_limit(65_536)
+                .expect("set pool journal_size_limit to 64 KiB");
+            runtime.block_on(async {
+                let conn = bounded_pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("acquire bounded conn");
+                assert_eq!(
+                    read_pragma_i64(&conn, "PRAGMA journal_size_limit;", "journal_size_limit")
+                        .expect("read bounded journal_size_limit"),
+                    65_536
+                );
+                conn.execute_raw("PRAGMA wal_autocheckpoint = 32;")
+                    .expect("set wal_autocheckpoint = 32");
+                let update_payload_z = "z".repeat(8_000);
+                conn.execute_raw("BEGIN IMMEDIATE;")
+                    .expect("begin bounded wal txn");
+                for id in 200..400_i64 {
+                    conn.execute_sync(
+                        "UPDATE bulk_pages SET payload = ?1 WHERE id = ?2",
+                        &[
+                            sqlmodel_core::Value::Text(update_payload_z.clone()),
+                            sqlmodel_core::Value::BigInt(id),
+                        ],
+                    )
+                    .expect("update bulk row (bounded)");
+                }
+                conn.execute_raw("COMMIT;").expect("commit bounded wal txn");
+                let wal_bounded_bytes =
+                    std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+                assert!(
+                    wal_bounded_bytes <= 65_536,
+                    "PRAGMA journal_size_limit (65536) must promote autocheckpoint to Truncate and bound on-disk WAL <= 64 KiB, got {wal_bounded_bytes} bytes (was {wal_unbounded_bytes})"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn per_connection_pragmas_omit_db_wide_journal_mode() {
         assert!(
             !schema::PRAGMA_CONN_SETTINGS_SQL.contains("journal_mode"),
