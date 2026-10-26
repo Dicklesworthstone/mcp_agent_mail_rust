@@ -3935,9 +3935,7 @@ fn spawn_tui_readiness_warmup(
 /// the installer (br-5mnkl). Overridable via `STARTUP_READINESS_BIND_TIMEOUT_SECS`.
 fn startup_readiness_bind_deadline() -> Duration {
     Duration::from_secs(parse_startup_readiness_bind_deadline_secs(
-        std::env::var("STARTUP_READINESS_BIND_TIMEOUT_SECS")
-            .ok()
-            .as_deref(),
+        mcp_agent_mail_core::config::env_value("STARTUP_READINESS_BIND_TIMEOUT_SECS").as_deref(),
     ))
 }
 
@@ -9419,7 +9417,9 @@ const DEFAULT_FULL_REDRAW_MAX_SECS: f64 = 30.0;
 /// Wall-clock bound between forced physical full redraws (see
 /// [`stable_tui_diff_config`]), from `AM_TUI_FULL_REDRAW_MAX_SECS`.
 fn full_redraw_max_interval_from_env() -> Option<Duration> {
-    full_redraw_max_interval_from(std::env::var("AM_TUI_FULL_REDRAW_MAX_SECS").ok().as_deref())
+    full_redraw_max_interval_from(
+        mcp_agent_mail_core::config::env_value("AM_TUI_FULL_REDRAW_MAX_SECS").as_deref(),
+    )
 }
 
 /// Parse floating-point seconds. Unset or unparseable falls back to

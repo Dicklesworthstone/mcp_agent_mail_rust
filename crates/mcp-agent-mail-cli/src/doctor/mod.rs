@@ -1956,7 +1956,7 @@ fn build_git_detect_inputs() -> Option<fixers::known_bad_git_no_override::Detect
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let system_git_version = git_version_text_from_stdout(&raw);
-    let am_git_binary_env = std::env::var("AM_GIT_BINARY").ok();
+    let am_git_binary_env = mcp_agent_mail_core::config::infra_env_value("AM_GIT_BINARY");
     let am_git_binary_version = am_git_binary_env
         .as_deref()
         .and_then(|path| Command::new(path).arg("--version").output().ok())
