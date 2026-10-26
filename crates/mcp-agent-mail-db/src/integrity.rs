@@ -315,6 +315,11 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
     ) {
         Ok(conn) => conn,
         Err(error) => {
+            if !crate::error::classify_db_error_message(&error.to_string()).safe_to_retry {
+                mcp_agent_mail_core::global_metrics()
+                    .corruption
+                    .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::OpenFailure);
+            }
             return MailboxIntegrityVerdict {
                 status: MailboxIntegrityStatus::Broken,
                 metrics: metrics_before,
@@ -954,8 +959,21 @@ where
 {
     let start = std::time::Instant::now();
     let rows: Vec<Row> =
-        probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind)
-            .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
+        probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind).map_err(
+            |error| {
+                if crate::error::contains_fts_index_corruption(&error) {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+                }
+                if crate::error::contains_foreign_key_inconsistency(&error) {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
+                }
+                DbError::Sqlite(format!("{kind} failed: {error}"))
+            },
+        )?;
 
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
@@ -1020,6 +1038,22 @@ pub fn evaluate_check_rows(
         mcp_agent_mail_core::global_metrics()
             .corruption
             .record_detection(source);
+        if details
+            .iter()
+            .any(|detail| crate::error::contains_fts_index_corruption(detail))
+        {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+        }
+        if details
+            .iter()
+            .any(|detail| crate::error::contains_foreign_key_inconsistency(detail))
+        {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
+        }
     }
 
     let result = IntegrityCheckResult {
@@ -2839,5 +2873,100 @@ mod tests {
         );
         assert!(message.contains("idx_agents_last_active_id_desc"));
         assert!(message.contains("GH#214"));
+    }
+
+    #[test]
+    fn all_five_additional_corruption_detection_sources_record_live_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // 1. OpenFailure: inspect_mailbox_integrity on a corrupt file that cannot open as SQLite
+        let corrupt_db = dir.path().join("corrupt_open.sqlite3");
+        std::fs::write(&corrupt_db, b"not a valid sqlite header at all!!").expect("write garbage");
+        let open_before = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .open_failures_total;
+        let verdict = inspect_mailbox_integrity(&corrupt_db, CheckKind::Quick);
+        assert_eq!(verdict.status, MailboxIntegrityStatus::Broken);
+        let open_after = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .open_failures_total;
+        assert!(
+            open_after > open_before,
+            "inspect_mailbox_integrity on unopenable DB must increment open_failures_total ({open_before} -> {open_after})"
+        );
+
+        // 2. WalShmMismatch: truncated WAL sidecar classification
+        let wal_db = dir.path().join("wal_drift.sqlite3");
+        let conn = DbConn::open_file(wal_db.display().to_string()).expect("open wal_db");
+        conn.execute_raw("PRAGMA journal_mode = WAL; CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .expect("setup wal_db");
+        drop(conn);
+        let wal_sidecar = dir.path().join("wal_drift.sqlite3-wal");
+        std::fs::write(&wal_sidecar, [0x11_u8; 8]).expect("write truncated 8-byte wal");
+        let wal_before = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .wal_shm_mismatch_total;
+        let classification = crate::wal_classify::classify_wal_sidecar(&wal_db);
+        assert!(classification.state.is_damaged());
+        let wal_after = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .wal_shm_mismatch_total;
+        assert!(
+            wal_after > wal_before,
+            "damaged WAL sidecar classification must increment wal_shm_mismatch_total ({wal_before} -> {wal_after})"
+        );
+
+        // 3. SchemaSmoke: validate_startup_schema_gate on an empty DB missing required tables
+        let empty_conn = DbConn::open_memory().expect("open empty memory db");
+        let schema_before = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .schema_smoke_failures_total;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+        let gate_outcome = runtime.block_on(crate::schema::validate_startup_schema_gate(
+            &cx,
+            &empty_conn,
+        ));
+        assert!(matches!(gate_outcome, asupersync::Outcome::Err(_)));
+        let schema_after = mcp_agent_mail_core::global_metrics()
+            .corruption
+            .snapshot()
+            .schema_smoke_failures_total;
+        assert!(
+            schema_after > schema_before,
+            "validate_startup_schema_gate failure must increment schema_smoke_failures_total ({schema_before} -> {schema_after})"
+        );
+
+        // 4 + 5. FtsCheck and FkCheck via evaluate_check_rows
+        let fts_fk_before = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+        let fts_row = Row::new(
+            vec!["integrity_check".to_string()],
+            vec![sqlmodel_core::Value::Text(
+                "malformed inverted index for FTS5 table fts_messages".to_string(),
+            )],
+        );
+        let fk_row = Row::new(
+            vec!["integrity_check".to_string()],
+            vec![sqlmodel_core::Value::Text(
+                "foreign_key_check reported orphaned recipient row".to_string(),
+            )],
+        );
+        let _ = evaluate_check_rows(&[fts_row, fk_row], CheckKind::Full, 10);
+        let fts_fk_after = mcp_agent_mail_core::global_metrics().corruption.snapshot();
+        assert!(
+            fts_fk_after.fts_check_failures_total > fts_fk_before.fts_check_failures_total,
+            "FTS integrity failure must increment fts_check_failures_total"
+        );
+        assert!(
+            fts_fk_after.fk_check_failures_total > fts_fk_before.fk_check_failures_total,
+            "FK integrity failure must increment fk_check_failures_total"
+        );
     }
 }

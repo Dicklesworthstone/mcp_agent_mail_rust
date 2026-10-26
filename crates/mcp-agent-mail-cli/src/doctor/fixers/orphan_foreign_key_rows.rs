@@ -193,6 +193,9 @@ fn detect_one(candidate: &super::DoctorDbReadCandidate) -> Option<OrphanForeignK
     if rows.is_empty() {
         return None;
     }
+    mcp_agent_mail_core::global_metrics()
+        .corruption
+        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
     let mut by_child_table: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_parent_table: BTreeMap<String, usize> = BTreeMap::new();
     let mut sample: Vec<OrphanRow> = Vec::new();

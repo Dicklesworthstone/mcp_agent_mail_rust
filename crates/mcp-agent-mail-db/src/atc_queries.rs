@@ -1327,6 +1327,13 @@ fn retention_compact_with_conn(
     }
     conn.rollup_execute_sync("COMMIT", &[])
         .map_err(|error| DbError::Sqlite(format!("retention_compact commit: {error}")))?;
+    if let Ok(deleted) = &result
+        && *deleted > 0
+    {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_retention_deleted(u64::try_from(*deleted).unwrap_or(u64::MAX));
+    }
     result
 }
 
@@ -1539,6 +1546,13 @@ fn enforce_experience_row_ceiling_with_conn(
     }
     conn.rollup_execute_sync("COMMIT", &[])
         .map_err(|error| DbError::Sqlite(format!("atc experience ceiling commit: {error}")))?;
+    if let Ok(evicted) = &result
+        && *evicted > 0
+    {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_retention_deleted(u64::try_from(*evicted).unwrap_or(u64::MAX));
+    }
     result
 }
 
@@ -2593,7 +2607,15 @@ mod tests {
 
         run_refresh(&pool, now, now.max(1));
         let before_rollups = fetch_rollups(&pool);
+        let deleted_before = mcp_agent_mail_core::global_metrics()
+            .atc
+            .snapshot()
+            .retention_rows_deleted_total;
         let summary = run_retention_compact(&pool, max_age_micros, true);
+        let deleted_after = mcp_agent_mail_core::global_metrics()
+            .atc
+            .snapshot()
+            .retention_rows_deleted_total;
         let after_rollups = fetch_rollups(&pool);
         let replayed = run_replay(&pool, SequenceRange::default());
         let ids = replayed
@@ -2603,6 +2625,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(summary.deleted_rows, 2);
+        assert!(
+            deleted_after >= deleted_before + 2,
+            "retention_compact must increment global_metrics().atc.retention_rows_deleted_total ({deleted_before} -> {deleted_after})"
+        );
         assert!(summary.preserved_rollups);
         assert_eq!(before_rollups, after_rollups);
         assert_eq!(ids, vec![3, 4]);
@@ -2664,10 +2690,22 @@ mod tests {
         }
 
         // cap=10 -> target=9; total=14 -> evict the 5 oldest terminal rows.
+        let deleted_before = mcp_agent_mail_core::global_metrics()
+            .atc
+            .snapshot()
+            .retention_rows_deleted_total;
         let evicted = enforce_experience_row_ceiling(&pool, 10).expect("ceiling sweep");
+        let deleted_after = mcp_agent_mail_core::global_metrics()
+            .atc
+            .snapshot()
+            .retention_rows_deleted_total;
         assert_eq!(
             evicted, 5,
             "should evict total(14) - target(9) oldest terminal rows"
+        );
+        assert!(
+            deleted_after >= deleted_before + 5,
+            "enforce_experience_row_ceiling must increment global_metrics().atc.retention_rows_deleted_total ({deleted_before} -> {deleted_after})"
         );
 
         let remaining: Vec<u64> = run_replay(&pool, SequenceRange::default())

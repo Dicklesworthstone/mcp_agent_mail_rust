@@ -3602,6 +3602,9 @@ pub async fn validate_startup_schema_gate<C: Connection>(
     if problems.is_empty() {
         Outcome::Ok(())
     } else {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::SchemaSmoke);
         Outcome::Err(format_schema_gate_failure(&problems))
     }
 }

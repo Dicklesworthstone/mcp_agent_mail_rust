@@ -265,6 +265,9 @@ pub fn wal_sidecar_is_truncation_artifact(wal_path: &Path) -> bool {
     if len < SQLITE_WAL_HEADER_BYTES {
         // 1..=31 bytes: a partial header that cannot even be read — SQLite
         // surfaces this as "WAL file too small for header".
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::WalShmMismatch);
         return true;
     }
     // Exactly the 32-byte header: a removable artifact ONLY when the magic /
@@ -272,10 +275,16 @@ pub fn wal_sidecar_is_truncation_artifact(wal_path: &Path) -> bool {
     // A valid engine-written header is a benign frameless idle WAL that the
     // engine opens and checkpoints without error (proven by
     // `engine_opens_and_checkpoints_a_32_byte_header_only_wal`).
-    !matches!(
+    let is_artifact = !matches!(
         read_wal_header(wal_path).map(|header| wal_header_verdict(&header)),
         Some(WalHeaderVerdict::Valid)
-    )
+    );
+    if is_artifact {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::WalShmMismatch);
+    }
+    is_artifact
 }
 
 /// Classify a database's WAL/SHM sidecars from the filesystem alone.
@@ -303,6 +312,9 @@ pub fn classify_wal_sidecar(primary: &Path) -> WalSidecarClassification {
     // Symlinked sidecars are a safety hazard regardless of content: never follow
     // them. Check before any size/content read so we never dereference one.
     if is_symlink(&wal_path) || is_symlink(&shm_path) {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::WalShmMismatch);
         return WalSidecarClassification {
             state: WalSidecarState::Symlink,
             wal_bytes: 0,
@@ -320,6 +332,9 @@ pub fn classify_wal_sidecar(primary: &Path) -> WalSidecarClassification {
 
     // Orphan: a sidecar lingers without its primary database.
     if !primary_exists && (sidecars.wal_exists || sidecars.shm_exists) {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::WalShmMismatch);
         return WalSidecarClassification {
             state: WalSidecarState::Orphan,
             wal_bytes,
@@ -387,14 +402,20 @@ pub fn classify_wal_sidecar(primary: &Path) -> WalSidecarClassification {
         }
     };
 
-    WalSidecarClassification {
+    let classification = WalSidecarClassification {
         state,
         wal_bytes,
         shm_bytes,
         wal_mtime_drift_secs: drift,
         live_writer_present: false,
         detail,
+    };
+    if classification.state.is_damaged() || classification.has_significant_mtime_drift() {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::WalShmMismatch);
     }
+    classification
 }
 
 /// The safe action for a classification.

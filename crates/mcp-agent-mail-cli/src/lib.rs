@@ -8506,8 +8506,15 @@ fn doctor_legacy_fts_reads_ok_franken(conn: &mcp_agent_mail_db::DbConn) -> bool 
     .into_iter()
     .all(|table| {
         let quoted = table.replace('"', "\"\"");
-        conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
-            .is_ok()
+        let ok = conn
+            .query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+            .is_ok();
+        if !ok {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+        }
+        ok
     })
 }
 
@@ -8544,8 +8551,15 @@ fn doctor_index_repair_offline_canonical_is_healthy(db_path: &Path) -> bool {
             .into_iter()
             .all(|table| {
                 let quoted = table.replace('"', "\"\"");
-                conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
-                    .is_ok()
+                let ok = conn
+                    .query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+                    .is_ok();
+                if !ok {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+                }
+                ok
             })
 }
 
@@ -28929,6 +28943,11 @@ fn doctor_foreign_key_violations_from_rows(
     for row in rows {
         violations.push(doctor_foreign_key_violation_from_row(&row)?);
     }
+    if !violations.is_empty() {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
+    }
     Ok(violations)
 }
 
@@ -31996,10 +32015,30 @@ fn server_write_mode_probe(health: Option<&serde_json::Value>) -> (&'static str,
             "live server health reported no write mode".to_string(),
         );
     };
+    let retry_suffix = health
+        .and_then(|h| h.get("mvcc_retries"))
+        .map(|retries| {
+            let retries_last_min = retries
+                .get("retries_last_minute")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let retries_total = retries
+                .get("retries_total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let exhausted_total = retries
+                .get("exhausted_total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                " (mvcc_retries_last_minute={retries_last_min}, mvcc_retries_total={retries_total}, exhausted_total={exhausted_total})"
+            )
+        })
+        .unwrap_or_default();
     match mode {
         "mvcc_concurrent" => (
             "ok",
-            "autocommit writes pinned to MVCC concurrent".to_string(),
+            format!("autocommit writes pinned to MVCC concurrent{retry_suffix}"),
         ),
         "" | "not_observed" => (
             "skip",
@@ -32007,7 +32046,9 @@ fn server_write_mode_probe(health: Option<&serde_json::Value>) -> (&'static str,
         ),
         other => (
             "degraded",
-            format!("autocommit write mode is {other}; the runtime pins mvcc_concurrent"),
+            format!(
+                "autocommit write mode is {other}; the runtime pins mvcc_concurrent{retry_suffix}"
+            ),
         ),
     }
 }
@@ -32231,17 +32272,28 @@ where
     let required = ["projects", "agents", "messages", "message_recipients"];
     let rows =
         query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-            .map_err(|e| CliError::Other(format!("failed to inspect sqlite schema: {e}")))?;
+            .map_err(|e| {
+                mcp_agent_mail_core::global_metrics()
+                    .corruption
+                    .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::SchemaSmoke);
+                CliError::Other(format!("failed to inspect sqlite schema: {e}"))
+            })?;
     let present = rows
         .into_iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
         .collect::<std::collections::BTreeSet<_>>();
 
-    Ok(required
+    let missing: Vec<String> = required
         .into_iter()
         .filter(|name| !present.contains(*name))
         .map(str::to_string)
-        .collect())
+        .collect();
+    if !missing.is_empty() {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::SchemaSmoke);
+    }
+    Ok(missing)
 }
 
 fn doctor_required_tables(
@@ -33489,6 +33541,11 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
                 // Only an independently classified corruption error from the
                 // explicitly offline canonical authority may confirm damage.
                 if let Some(detail) = error.offline_corruption_detail() {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(
+                            mcp_agent_mail_core::CorruptionDetectionSource::OpenFailure,
+                        );
                     return DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
                         "guarded offline canonical open reported corruption: {detail}"
                     ));
@@ -33572,6 +33629,9 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     if let Some(fts_table) = doctor_legacy_fts_tables_canonical(conn).first() {
         let quoted = fts_table.replace('"', "\"\"");
         if let Err(error) = conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[]) {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
             let fts_authority = doctor_demote_logical_export_corruption(
                 logical_export,
                 doctor_classify_canonical_probe_error(
@@ -62332,6 +62392,21 @@ startup_timeout_sec = 42
             "skip"
         );
         assert_eq!(server_write_mode_probe(None).0, "skip");
+        let with_retries = serde_json::json!({
+            "sqlite_autocommit_write_mode": "mvcc_concurrent",
+            "mvcc_retries": {
+                "retries_last_minute": 3,
+                "retries_total": 12,
+                "exhausted_total": 0
+            }
+        });
+        let (status, detail) = server_write_mode_probe(Some(&with_retries));
+        assert_eq!(status, "ok");
+        assert!(
+            detail.contains("mvcc_retries_last_minute=3")
+                && detail.contains("mvcc_retries_total=12"),
+            "{detail}"
+        );
     }
 
     #[test]

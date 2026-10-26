@@ -6474,6 +6474,9 @@ fn merge_salvaged_database(
                 ))
             })?;
         if !foreign_key_failures.is_empty() {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
             return Err(DbError::Sqlite(format!(
                 "reconstruct salvage: post-merge foreign_key_check reported {} violation(s); refusing promotion",
                 foreign_key_failures.len()
