@@ -695,7 +695,7 @@ wrapping on overflow.
 | `archive_metadata` | Prepare the existing archive metadata |
 | `zip_writing` | Write and compress ZIP members, then finish the ZIP |
 | `storage_enumeration` | Walk the existing storage selection and sort members |
-| `publication` | Atomically rename the completed temporary ZIP into place |
+| `publication` | Sync the completed ZIP, publish without replacing an existing destination, and sync parent directories on Unix |
 
 `zip_writing` can appear before and after `storage_enumeration`: the existing
 save order writes metadata and the snapshot before enumerating the storage
@@ -777,3 +777,18 @@ temporary ZIP. This check resolves relative paths and directory aliases; the
 output directory must differ from the mailbox storage root. The dedicated
 SQLite snapshot is still included; the embedded
 live database and its sidecars remain excluded from the storage payload.
+
+
+### Completed archive publication
+
+On Unix, new archive ZIPs are created with owner-only permissions because the
+lossless preset includes registration credentials and private mail. Save syncs
+the completed ZIP before publication and uses an atomic no-replace move: a
+competing backup, directory, or dangling symlink at the chosen destination
+cannot be overwritten. Parent directory updates are synced on Unix; Windows
+retains the file flush and atomic no-replace move.
+
+If publication or its durability check fails, the command reports failure
+and retains its staging directory for inspection. A destination already
+published is preserved. The error identifies both locations; inspect them
+before retrying instead of assuming that no archive was created.

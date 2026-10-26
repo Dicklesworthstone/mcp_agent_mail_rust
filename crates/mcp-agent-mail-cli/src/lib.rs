@@ -56772,6 +56772,76 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[test]
+    fn archive_zip_creation_refuses_to_replace_existing_content() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("archive.zip");
+        let mut file = create_archive_zip_file(&path).unwrap();
+        file.write_all(b"private archive").unwrap();
+        drop(file);
+        let error = create_archive_zip_file(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"private archive");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "private mail must not be group/world-readable"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_publication_never_clobbers_a_concurrent_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged.zip");
+        let destination = root.path().join("archive.zip");
+        std::fs::write(&staged, b"new archive").unwrap();
+        // A competing save occupies the name after filename selection.
+        std::fs::write(&destination, b"previous archive").unwrap();
+        let error = publish_archive_zip(&staged, &destination, &ArchiveDiagnostics::disabled())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous archive");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new archive");
+        let free_destination = root.path().join("archive-2.zip");
+        let bytes =
+            publish_archive_zip(&staged, &free_destination, &ArchiveDiagnostics::disabled())
+                .unwrap();
+        assert_eq!(bytes, 11);
+        assert_eq!(std::fs::read(&free_destination).unwrap(), b"new archive");
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous archive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_publication_refuses_a_dangling_destination_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged.zip");
+        let destination = root.path().join("archive.zip");
+        let missing = root.path().join("missing.zip");
+        std::fs::write(&staged, b"new archive").unwrap();
+        std::os::unix::fs::symlink(&missing, &destination).unwrap();
+        let error = publish_archive_zip(&staged, &destination, &ArchiveDiagnostics::disabled())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_link(&destination).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new archive");
+    }
+
     // -----------------------------------------------------------------------
     // Clear-and-reset-everything integration-ish tests
     // -----------------------------------------------------------------------
@@ -86943,10 +87013,7 @@ fn archive_save_state_internal(
     use zip::write::SimpleFileOptions;
 
     diagnostics.start(ArchivePhase::Zip);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_zip_path)?;
+    let file = create_archive_zip_file(&temp_zip_path)?;
     let mut zip = zip::ZipWriter::new(file);
     let fixed_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
         .map_err(|e| CliError::Other(format!("zip time error: {e}")))?;
@@ -87007,7 +87074,20 @@ fn archive_save_state_internal(
     }
     diagnostics.finish();
 
-    let size_bytes = publish_archive_zip(&temp_zip_path, &destination, diagnostics)?;
+    let size_bytes = match publish_archive_zip(&temp_zip_path, &destination, diagnostics) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // Preserve completed work on a collision or uncertain durability.
+            // If rename already succeeded, its destination is never removed.
+            let retained_stage = zip_dir.keep();
+            return Err(CliError::Other(format!(
+                "archive publication to {} was not confirmed: {error}; inspect the destination \
+                 and retained staging directory {} before retrying",
+                destination.display(),
+                retained_stage.display(),
+            )));
+        }
+    };
     let projects_desc = if projects.is_empty() {
         vec!["all".to_string()]
     } else {
@@ -87029,20 +87109,41 @@ fn archive_save_state_internal(
     Ok(destination)
 }
 
+fn create_archive_zip_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The lossless preset retains registration tokens and private mail.
+        // Set the mode before writing bytes, including before publication.
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn publish_archive_zip(
     temp_zip_path: &Path,
     destination: &Path,
     diagnostics: &ArchiveDiagnostics,
 ) -> CliResult<u64> {
     diagnostics.start(ArchivePhase::Publish);
-    // Keep publication on the existing same-filesystem atomic rename path.
-    std::fs::rename(temp_zip_path, destination)?;
-    let size_bytes = std::fs::metadata(destination).map(|metadata| metadata.len());
-    if let Ok(bytes) = size_bytes {
-        diagnostics.archive_bytes(bytes);
-    }
+    // The finished central directory and payload must reach disk before the
+    // public name. Write access is needed for FlushFileBuffers on Windows.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp_zip_path)?;
+    file.sync_all()?;
+    let size_bytes = file.metadata()?.len();
+    drop(file);
+    // A free name observed before compression is only a hint: another save
+    // may have published it meanwhile, or it may be a dangling symlink.
+    mcp_agent_mail_db::pool::rename_noreplace_preserving_source(temp_zip_path, destination)?;
+    sync_startup_artifact_parents(temp_zip_path, destination)?;
+    diagnostics.archive_bytes(size_bytes);
     diagnostics.finish();
-    Ok(size_bytes.unwrap_or(0))
+    Ok(size_bytes)
 }
 
 #[allow(dead_code)]
