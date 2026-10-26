@@ -5424,6 +5424,743 @@ fn file_reservations_soon_returns_expiring() {
     );
 }
 
+// GH#368: the supported server-read mode must use the real MCP resource without
+// opening a new local database connection. All state and child servers here are
+// private fixtures; these tests never discover or restart an operator's mailbox.
+const RESERVATION_READ_TEST_TOKEN: &str = "gh368-private-reservation-read-token";
+
+fn reservation_read_fixture() -> (TestEnv, String, String) {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let slug = mcp_agent_mail_core::slugify(&project);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_project(&conn, 1, &slug, &project);
+    insert_agent(&conn, 1, 1, "RusticGlen", "test", "test");
+    insert_agent(&conn, 2, 1, "BlueLake", "test", "test");
+    let future = 4_102_444_800_000_000_i64;
+    for (id, agent, path, exclusive, expiry) in [
+        (1, 1, "src/**", true, future),
+        (2, 2, "src/lib.rs", true, future + 60_000_000),
+        (3, 2, "docs/**", false, future + 120_000_000),
+        (4, 1, "expired/**", true, 1_704_067_300_000_000),
+        (5, 1, "legacy-released/**", true, future),
+        (6, 1, "ledger-released/**", true, future),
+    ] {
+        insert_file_reservation(&conn, id, 1, agent, path, exclusive, expiry);
+        conn.execute_sync(
+            "UPDATE file_reservations SET created_ts = ? WHERE id = ?",
+            &[
+                SqlValue::BigInt(1_704_067_200_000_000 + id),
+                SqlValue::BigInt(id),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts = 1704067400000000 WHERE id = 5; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         VALUES (6, 1704067400000000);",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    (env, project, slug)
+}
+
+fn reservation_read_env(env: &TestEnv, port: u16, database_url: &str) -> Vec<(String, String)> {
+    let mut vars = env.isolated_env();
+    vars.extend([
+        ("AM_INTERFACE_MODE".into(), "cli".into()),
+        ("DATABASE_URL".into(), database_url.into()),
+        ("HTTP_PORT".into(), port.to_string()),
+        (
+            "HTTP_BEARER_TOKEN".into(),
+            RESERVATION_READ_TEST_TOKEN.into(),
+        ),
+        (
+            "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED".into(),
+            "false".into(),
+        ),
+        ("AM_ATC_ENABLED".into(), "false".into()),
+        ("FILE_RESERVATIONS_CLEANUP_ENABLED".into(), "false".into()),
+        (
+            "AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED".into(),
+            "false".into(),
+        ),
+        ("RUST_LOG".into(), "error".into()),
+        ("NO_COLOR".into(), "1".into()),
+    ]);
+    vars
+}
+
+fn reservation_read_success(out: &Output) -> &str {
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::str::from_utf8(&out.stdout).expect("UTF-8 CLI output")
+}
+
+fn reservation_read_failed_closed(out: &Output) {
+    assert!(
+        !out.status.success(),
+        "read unexpectedly succeeded: {out:?}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "failed read emitted authoritative-looking data: {out:?}"
+    );
+    assert!(
+        !out.stderr.is_empty(),
+        "failed read needs an actionable error"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(RESERVATION_READ_TEST_TOKEN),
+        "bearer token must not appear in diagnostics"
+    );
+}
+
+fn reservation_read_stable_json(mut value: Value) -> Value {
+    // Compare all durable output fields. Check, then remove only wall-clock
+    // relative values; the two commands run at different instants.
+    fn strip_clock(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("granted_ts") {
+                    for key in ["remaining_seconds", "granted_age_seconds"] {
+                        assert!(
+                            map.get(key).is_some_and(Value::is_i64),
+                            "missing {key}: {map:?}"
+                        );
+                        map.remove(key);
+                    }
+                    map.remove("remaining");
+                    map.remove("granted_at");
+                }
+                for child in map.values_mut() {
+                    strip_clock(child);
+                }
+            }
+            Value::Array(rows) => rows.iter_mut().for_each(strip_clock),
+            _ => {}
+        }
+    }
+    let object = value.as_object_mut().unwrap();
+    object.remove("_meta");
+    object.remove("_alerts");
+    object.remove("reservation_read_attestation");
+    strip_clock(&mut value);
+    value
+}
+
+fn reservation_read_stable_text(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("reservation_read_attestation:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct ReservationReadServer(std::process::Child);
+
+impl Drop for ReservationReadServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn reservation_read_start_server(env: &TestEnv, port: u16) -> ReservationReadServer {
+    let log_path = env.tmp.path().join("gh368-private-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let child = Command::new(am_bin())
+        .env_clear()
+        .envs(reservation_read_env(env, port, &env.database_url()))
+        .current_dir(env.hostile_repo())
+        .args([
+            "serve-http",
+            "--no-tui",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .expect("start private MCP server");
+    let mut server = ReservationReadServer(child);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            return server;
+        }
+        assert!(
+            Instant::now() < deadline && server.0.try_wait().unwrap().is_none(),
+            "private server did not bind: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn reservation_reads_direct_and_real_server_preserve_output_without_local_admission() {
+    let (env, project, slug) = reservation_read_fixture();
+    let active_uri = format!("resource://file_reservations/{slug}?active_only=true");
+    let history_uri =
+        format!("resource://file_reservations/{slug}?active_only=false&limit=2&offset=1");
+    let cases = [
+        vec!["reservations", "--project", &project, "--all", "--json"],
+        vec![
+            "robot",
+            "reservations",
+            "--project",
+            &project,
+            "--agent",
+            "BlueLake",
+            "--json",
+        ],
+        vec![
+            "robot",
+            "navigate",
+            &active_uri,
+            "--project",
+            &project,
+            "--json",
+        ],
+        vec![
+            "robot",
+            "navigate",
+            &history_uri,
+            "--project",
+            &project,
+            "--json",
+        ],
+        vec!["file_reservations", "active", &project],
+        vec!["file_reservations", "active", &project, "--limit", "1"],
+        vec!["file_reservations", "list", &project],
+        vec!["file_reservations", "list", &project, "--all"],
+        vec!["file_reservations", "soon", &project],
+        vec!["file_reservations", "conflicts", &project, "src/lib.rs"],
+    ];
+    let direct_env = reservation_read_env(&env, 1, &env.database_url());
+    let before_db = file_snapshot(&env.db_path);
+    let direct: Vec<_> = cases
+        .iter()
+        .map(|args| {
+            let out = run_am_hermetic(&direct_env, Some(env.hostile_repo()), args);
+            reservation_read_success(&out);
+            out
+        })
+        .collect();
+    let data: Value = serde_json::from_slice(&direct[0].stdout).unwrap();
+    let paths: Vec<_> = data["all_active"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["src/**", "src/lib.rs", "docs/**"]);
+    assert_eq!(data["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        file_snapshot(&env.db_path),
+        before_db,
+        "direct reads changed mailbox bytes"
+    );
+
+    let port = unused_loopback_port();
+    let mut server = reservation_read_start_server(&env, port);
+    // Deliberately unusable local storage: --server has to reach the real MCP
+    // resource, not a canonical-SQLite bypass or an accidentally working open.
+    let unavailable_db = env.tmp.path().join("unopenable.sqlite3");
+    std::fs::write(&unavailable_db, b"GH368: this is not a SQLite database\n").unwrap();
+    let unavailable_url = format!("sqlite:///{}", unavailable_db.display());
+    let server_env = reservation_read_env(&env, port, &unavailable_url);
+    let before_unavailable = file_snapshot(&unavailable_db);
+    for (args, direct) in cases.iter().zip(&direct) {
+        let mut server_args = args.clone();
+        server_args.push("--server");
+        let remote = run_am_hermetic(&server_env, Some(env.hostile_repo()), &server_args);
+        let remote_text = reservation_read_success(&remote);
+        if args.contains(&"--json") {
+            let local: Value = serde_json::from_slice(&direct.stdout).unwrap();
+            let remote: Value = serde_json::from_str(remote_text).unwrap();
+            assert_eq!(remote["_meta"]["project"], slug);
+            assert_eq!(
+                reservation_read_stable_json(remote),
+                reservation_read_stable_json(local),
+                "{args:?}"
+            );
+        } else {
+            assert_eq!(
+                reservation_read_stable_text(remote_text),
+                reservation_read_stable_text(std::str::from_utf8(&direct.stdout).unwrap()),
+                "{args:?}"
+            );
+        }
+    }
+    assert_eq!(file_snapshot(&unavailable_db), before_unavailable);
+    for suffix in ["-wal", "-shm", ".fsqlite-shm", ".fsqlite-wal"] {
+        assert!(!PathBuf::from(format!("{}{suffix}", unavailable_db.display())).exists());
+    }
+
+    // A failed direct read remains a failure: the CLI never silently changes
+    // authority, repairs the local database, or reports an empty reservation set.
+    let direct_failure = run_am_hermetic(&server_env, Some(env.hostile_repo()), &cases[0]);
+    reservation_read_failed_closed(&direct_failure);
+    assert_eq!(file_snapshot(&unavailable_db), before_unavailable);
+    for token in ["", "wrong-token"] {
+        // Keep a readable local database here: authentication rejection must
+        // not be hidden by a successful fallback to that database.
+        let mut unauthorized_env = reservation_read_env(&env, port, &env.database_url());
+        unauthorized_env.push(("HTTP_BEARER_TOKEN".into(), token.into()));
+        let unauthorized = run_am_hermetic(
+            &unauthorized_env,
+            Some(env.hostile_repo()),
+            &[
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+        );
+        reservation_read_failed_closed(&unauthorized);
+    }
+    let unknown = run_am_hermetic(
+        &server_env,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            "gh368-nonexistent-project",
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    reservation_read_failed_closed(&unknown);
+    assert!(
+        server.0.try_wait().unwrap().is_none(),
+        "read probes stopped the owned server"
+    );
+    drop(server);
+    let offline_env = reservation_read_env(&env, port, &env.database_url());
+    let offline = run_am_hermetic(
+        &offline_env,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    reservation_read_failed_closed(&offline);
+}
+
+/// Scripted transport faults complement the real-server test above. The peer
+/// only accepts authenticated resources/read requests, never tools/call.
+struct ReservationReadPeer {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ReservationReadPeer {
+    fn start(mut reply: impl FnMut(&Value) -> Value + Send + 'static) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_requests = requests.clone();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !worker_stop.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() < deadline
+            {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept private peer request: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /mcp/ HTTP/1.1"), "{line}");
+                let mut content_len = None;
+                let mut authorized = false;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.split_once(':').expect("HTTP header");
+                    if key.eq_ignore_ascii_case("content-length") {
+                        content_len = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                    if key.eq_ignore_ascii_case("authorization") {
+                        authorized =
+                            value.trim() == format!("Bearer {RESERVATION_READ_TEST_TOKEN}");
+                    }
+                }
+                assert!(authorized, "resource reader omitted its bearer token");
+                let size = content_len.expect("content-length");
+                assert!(size < 64 * 1024, "unbounded test request");
+                let mut body = vec![0; size];
+                reader.read_exact(&mut body).unwrap();
+                drop(reader);
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["method"], "resources/read");
+                worker_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let body = reply(&request).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        Self {
+            port,
+            stop,
+            requests,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ReservationReadPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let result = worker.join();
+            if !thread::panicking() {
+                result.expect("scripted resource peer");
+            }
+        }
+    }
+}
+
+fn reservation_read_resource_reply(request: &Value, payload: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": request["id"],
+        "result": {"contents": [{"uri": request["params"]["uri"], "mimeType": "application/json", "text": payload.to_string()}]}
+    })
+}
+
+#[test]
+fn reservation_server_reads_reject_untrusted_identity_envelopes_and_rows() {
+    for failure in [
+        "project-mismatch",
+        "changed-project",
+        "wrong-id",
+        "wrong-uri",
+        "invalid-json",
+        "missing-released",
+        "invalid-exclusive",
+        "invalid-timestamp",
+        "full-page",
+        "rpc-error",
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let mut project_reads = 0;
+        let peer = ReservationReadPeer::start(move |request| {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            if uri.starts_with("resource://project/") {
+                project_reads += 1;
+                let mut descriptor = json!({"id": 1, "slug": "gh368-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]});
+                if failure == "project-mismatch" {
+                    descriptor["human_key"] = json!("/unrelated/project");
+                } else if failure == "changed-project" && project_reads > 1 {
+                    descriptor["created_at"] = json!("2025-01-01T00:00:00Z");
+                }
+                return reservation_read_resource_reply(request, descriptor);
+            }
+            assert!(uri.starts_with("resource://file_reservations/gh368-project?"));
+            let mut row = json!({"id": 1, "agent": "RusticGlen", "path_pattern": "src/**", "exclusive": true, "reason": "gh368", "created_ts": "2024-01-01T00:00:00Z", "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null});
+            match failure {
+                "missing-released" => {
+                    row.as_object_mut().unwrap().remove("released_ts");
+                }
+                "invalid-exclusive" => row["exclusive"] = json!("true"),
+                "invalid-timestamp" => row["expires_ts"] = json!("not-a-time"),
+                _ => {}
+            }
+            let rows = if failure == "full-page" {
+                (1..=250)
+                    .map(|id| {
+                        let mut row = row.clone();
+                        row["id"] = json!(id);
+                        row
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![row]
+            };
+            let mut reply = reservation_read_resource_reply(request, json!(rows));
+            match failure {
+                "wrong-id" => reply["id"] = json!("another-request"),
+                "wrong-uri" => {
+                    reply["result"]["contents"][0]["uri"] =
+                        json!("resource://file_reservations/another-project")
+                }
+                "invalid-json" => reply["result"]["contents"][0]["text"] = json!("[{truncated"),
+                "rpc-error" => {
+                    reply = json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "database is busy (recovery in progress)"}})
+                }
+                _ => {}
+            }
+            reply
+        });
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &[
+                "reservations",
+                "--project",
+                &project,
+                "--all",
+                "--json",
+                "--server",
+            ],
+        );
+        eprintln!("GH368 negative scenario: {failure}");
+        reservation_read_failed_closed(&out);
+        let expected_reads = match failure {
+            "project-mismatch" => 1,
+            "changed-project" => 3,
+            _ => 2,
+        };
+        assert_eq!(
+            peer.requests.load(std::sync::atomic::Ordering::Relaxed),
+            expected_reads,
+            "{failure} must fail at the intended resource boundary, not earlier CLI setup"
+        );
+        assert!(
+            !env.db_path.exists(),
+            "server read created a local database"
+        );
+        assert!(
+            snapshot_tree(&env.storage_root).is_empty(),
+            "server read changed the local archive"
+        );
+    }
+}
+
+#[test]
+fn reservation_server_reads_accept_verified_empty_results_and_preserve_navigation_pages() {
+    let env = TestEnv::new();
+    let project = env
+        .hostile_repo
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
+    let expected_project = project.clone();
+    let mut reservation_reads = 0;
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            json!({"id": 1, "slug": "gh368-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert!(uri.starts_with("resource://file_reservations/gh368-project?"));
+            assert!(
+                uri.contains("&limit=250&offset=0&"),
+                "unexpected page: {uri}"
+            );
+            reservation_reads += 1;
+            if reservation_reads == 1 {
+                json!([])
+            } else {
+                // The MCP resource returns ascending creation order. Native
+                // navigate uses descending creation order, then applies its
+                // page. Passing limit/offset straight through selects the
+                // wrong leases even if the JSON shape remains the same.
+                json!((1..=9).map(|id| json!({
+                    "id": id, "agent": "RusticGlen", "path_pattern": format!("page-{id}/**"),
+                    "exclusive": id % 2 == 0, "reason": "gh368",
+                    "created_ts": format!("2024-01-{id:02}T00:00:00Z"),
+                    "expires_ts": "2100-01-01T00:00:00Z", "released_ts": null
+                })).collect::<Vec<_>>())
+            }
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let vars = reservation_read_env(&env, peer.port, &env.database_url());
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(data["all_active"], json!([]));
+    assert_eq!(data["reservation_read_attestation"]["source"], "mcp_server");
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "robot",
+            "navigate",
+            "resource://file_reservations/gh368-project?active_only=true&limit=2&offset=7",
+            "--project",
+            &project,
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    let rows = data["data"]["reservations"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "an explicitly requested full page is valid");
+    assert_eq!(rows[0]["path"], "page-2/**");
+    assert_eq!(rows[1]["path"], "page-1/**");
+    assert_eq!(rows[0]["exclusive"], true);
+    assert_eq!(rows[1]["exclusive"], false);
+    assert!(
+        rows.iter()
+            .all(|row| row["expires_ts"].is_i64() && row["released"] == false)
+    );
+    assert!(!env.db_path.exists());
+    assert!(snapshot_tree(&env.storage_root).is_empty());
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 6);
+}
+
+#[test]
+fn reservation_server_navigation_rejects_conflicting_project_selectors() {
+    for uri in [
+        "resource://file_reservations/different-project?active_only=true",
+        "resource://file_reservations/gh368-project?active_only=true&project=different-project",
+    ] {
+        let env = TestEnv::new();
+        let project = env
+            .hostile_repo
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string();
+        let expected_project = project.clone();
+        let peer = ReservationReadPeer::start(move |request| {
+            let payload = if request["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("resource://project/")
+            {
+                json!({"id": 1, "slug": "gh368-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+            } else {
+                json!([])
+            };
+            reservation_read_resource_reply(request, payload)
+        });
+        let out = run_am_hermetic(
+            &reservation_read_env(&env, peer.port, &env.database_url()),
+            Some(env.hostile_repo()),
+            &[
+                "robot",
+                "navigate",
+                uri,
+                "--project",
+                &project,
+                "--json",
+                "--server",
+            ],
+        );
+        reservation_read_failed_closed(&out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("project"));
+        assert!(!env.db_path.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reservation_server_reads_escape_project_paths_and_use_explicit_client_token() {
+    let env = TestEnv::new();
+    let project_path = env.hostile_repo.join("query +%#?é");
+    std::fs::create_dir_all(&project_path).unwrap();
+    let project = project_path.canonicalize().unwrap().display().to_string();
+    let expected_project = project.clone();
+    let peer = ReservationReadPeer::start(move |request| {
+        let uri = request["params"]["uri"].as_str().unwrap();
+        let payload = if uri.starts_with("resource://project/") {
+            for encoded in ["%2F", "%20", "%2B", "%25", "%23", "%3F", "%C3%A9"] {
+                assert!(
+                    uri.contains(encoded),
+                    "project component lost {encoded}: {uri}"
+                );
+            }
+            assert!(uri.ends_with("?format=json"));
+            assert_eq!(
+                uri.matches('?').count(),
+                1,
+                "project data became URI query syntax"
+            );
+            json!({"id": 1, "slug": "gh368-escaped-project", "human_key": expected_project, "created_at": "2024-01-01T00:00:00Z", "agents": [{"id": 1, "name": "RusticGlen", "project_id": 1}]})
+        } else {
+            assert!(uri.starts_with("resource://file_reservations/gh368-escaped-project?"));
+            json!([])
+        };
+        reservation_read_resource_reply(request, payload)
+    });
+    let mut vars = reservation_read_env(&env, peer.port, &env.database_url());
+    vars.push(("HTTP_BEARER_TOKEN".into(), "unused-server-setting".into()));
+    vars.push((
+        "AGENT_MAIL_TOKEN".into(),
+        RESERVATION_READ_TEST_TOKEN.into(),
+    ));
+    let out = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &[
+            "reservations",
+            "--project",
+            &project,
+            "--all",
+            "--json",
+            "--server",
+        ],
+    );
+    let data: Value = serde_json::from_str(reservation_read_success(&out)).unwrap();
+    assert_eq!(data["all_active"], json!([]));
+    assert_eq!(data["_meta"]["project"], "gh368-escaped-project");
+    assert_eq!(peer.requests.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert!(!env.db_path.exists());
+}
+
 // ---- Acks ----
 
 #[test]
