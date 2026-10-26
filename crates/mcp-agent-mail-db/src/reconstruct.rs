@@ -7058,16 +7058,31 @@ fn apply_delta_in_transaction(
         collect_message_files_with_ids(&messages_dir, missing, &mut project_files)?;
         let existing = conn
             .query_sync(
-                "SELECT id FROM projects WHERE slug = ?",
+                "SELECT id, human_key FROM projects WHERE slug = ?",
                 &[Value::Text(slug.clone())],
             )
             .map_err(|e| {
                 DbError::Sqlite(format!("incremental apply: inspect project {slug}: {e}"))
             })?;
-        if project_files.is_empty() && !existing.is_empty() {
-            continue;
-        }
-        if existing.is_empty() {
+        let human_key = read_project_human_key(project_path, slug, &mut stats);
+        if let Some(existing_row) = existing.first() {
+            let existing_human_key =
+                existing_row.get_named::<String>("human_key").map_err(|e| {
+                    DbError::Sqlite(format!(
+                        "incremental apply: read project {slug} human_key: {e}"
+                    ))
+                })?;
+            if !is_synthetic_project_placeholder(slug, &human_key)
+                && existing_human_key.trim() != human_key.trim()
+            {
+                return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
+                    "archive project {slug} human_key conflicts with existing database project"
+                )));
+            }
+            if project_files.is_empty() {
+                continue;
+            }
+        } else {
             projects_added += 1;
             if projects_added > max_projects {
                 return Ok(ArchiveDeltaApplyOutcome::NotApplicable(format!(
@@ -7077,7 +7092,6 @@ fn apply_delta_in_transaction(
         }
         projects_visited += 1;
         let now = crate::now_micros();
-        let human_key = read_project_human_key(project_path, slug, &mut stats);
         conn.execute_sync(
             "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
             &[
