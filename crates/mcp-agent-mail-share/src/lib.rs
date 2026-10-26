@@ -49,8 +49,11 @@ pub use prompt::{WizardConfig, WizardOutcome, format_json_output, run_interactiv
 pub use scope::{ProjectRecord, ProjectScopeResult, RemainingCounts, apply_project_scope};
 pub use scrub::{ScrubSummary, scan_for_secrets, scrub_snapshot};
 pub use snapshot::{
-    SnapshotContext, SnapshotPhase, SnapshotPhaseEvent, SnapshotProgress, SnapshotProgressPhase,
-    SnapshotPurpose, create_private_canonical_snapshot_context,
+    FullArchiveObserver, FullArchiveProgress, FullArchiveProgressState, SnapshotContext,
+    SnapshotPhase, SnapshotPhaseEvent, SnapshotProgress, SnapshotProgressPhase, SnapshotPurpose,
+    create_full_archive_snapshot_with_progress,
+    create_private_canonical_full_archive_snapshot_with_progress,
+    create_private_canonical_snapshot_context,
     create_private_canonical_snapshot_context_with_observer,
     create_private_canonical_snapshot_context_with_progress,
     create_private_canonical_sqlite_snapshot, create_snapshot_context,

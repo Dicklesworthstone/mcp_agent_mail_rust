@@ -637,7 +637,7 @@ saved baseline file you can compare later.
 For release-signoff performance work, capture the baseline on a machine that is
 not already saturated by other agent builds.
 
-## 16. Save and diagnose a private mailbox archive [stateful]
+## 16. Save and diagnose a private mailbox archive [read-only preview; stateful save]
 
 **Goal:** Complete a restorable backup within an existing maintenance window,
 and identify the expensive phase when it does not finish. These observations
@@ -657,7 +657,7 @@ cargo build --locked --release -p mcp-agent-mail-cli --features portable --bin a
 
 If `CARGO_TARGET_DIR` is customized, use the binary from that directory.
 Confirm that help lists `--progress`, `--diagnostics`, `--compression-level`,
-and `--exclude-recovery`. Help does not create an archive. Use that exact
+`--exclude-recovery`, and `--dry-run`. Help does not create an archive. Use that exact
 binary for the examples below, keeping the existing command's project
 selectors, working directory, mailbox configuration, and timeout.
 
@@ -694,16 +694,47 @@ records; other error or warning diagnostics may also appear on stderr.
 summary remain on stdout. `--diagnostics` is a separate, optional stream that
 is off by default. It can be combined with any progress mode.
 
+### Preview the selected storage [read-only]
+
+Use the same mailbox configuration and working directory as the scheduled job:
+
+```bash
+am archive save --dry-run
+am archive save --dry-run --exclude-recovery
+```
+
+The preview reads filesystem metadata without opening SQLite, acquiring
+mailbox activity locks, creating a snapshot, compressing files, or writing an
+archive. It reports regular-file counts and bytes, selected recovery-copy totals,
+selected and excluded bytes, and the selected compression level. A running
+service can change the files during the scan. These totals are not a
+compressed-size forecast, an integrity check, or a measurement of snapshot CPU
+time. A large omitted-byte total does not establish which phase caused an
+earlier timeout.
+
+The preview does not validate attachment references against a database
+snapshot; an actual save performs that check before applying the optional
+recovery-copy exclusion. Run the preview before the maintenance window while
+retaining the supervised stop/save/restart procedure and bounded timeout for
+the real backup.
+
 ### Interpreting the phases
 
 | Progress phase | Diagnostic phase | Work being measured |
 |----------------|------------------|---------------------|
 | `prepare`, `mailbox_lock` | `prepare` | Validate arguments and paths, then acquire mailbox activity locks before reading the source |
 | `source_reconciliation` | `snapshot_source` | Compare the live database with the canonical archive and, if needed, reconstruct a private source; this may traverse archives and execute SQL before the main snapshot copy |
-| `snapshot_copy` | `snapshot` | Read one consistent source transaction and build a private canonical SQLite database, including committed WAL rows through the owning engine; this is SQL extraction rather than a raw main-file copy |
-| `snapshot_scope` | `filter` | Apply project selection to the private snapshot |
+| `snapshot_prepare` | `snapshot` | Validate paths and prepare private staging for an unscoped lossless image |
+| `snapshot_source_open` | `snapshot` | Open the resolved source through its guarded read-only engine |
+| `snapshot_full_copy` | `snapshot` | Copy the full primary database, including committed WAL state, into a fresh private SQLite image |
+| `snapshot_neutralize` | `snapshot` | Settle only the private image and retire its engine handoff sidecars |
+| `snapshot_validate` | `snapshot` | Check the private image and gather mailbox counts |
+| `snapshot_publish` | `snapshot` | Publish the completed private SQLite image to the save's staging location |
+| `snapshot_copy` | `snapshot` | Read one consistent engine-owned transaction into a selected projection for a scoped or scrubbed export |
+| `snapshot_scope` | `filter` | Apply project selection to a projected snapshot when requested |
 | `snapshot_scrub` | `scrub` | Apply the selected scrub policy; the default `archive` preset preserves private recovery state |
-| `snapshot_compact` | `finalize` | Produce the standalone snapshot that will be restored; private archives omit the static share viewer's FTS indexes and materialized tables |
+| `snapshot_compact` | `finalize` | Produce the standalone projected snapshot; private backups build no additional viewer FTS indexes or materialized tables |
+| `recovery_exclusion_check` | `archive_metadata` | Check the optional recovery-copy policy against the primary database path and both attachment path fields |
 | `metadata` | `archive_metadata` | Read snapshot metadata and prepare archive metadata |
 | `storage_inventory` | `storage_enumeration` | Enumerate selected regular storage files and their sizes, including recovery history |
 | `compress_snapshot`, `compress_storage`, `finalize_zip` | `zip_writing` | Write metadata, snapshot, and storage payloads, then finish the ZIP central directory |
@@ -713,6 +744,9 @@ is off by default. It can be combined with any progress mode.
 Storage inventory precedes ZIP writing. The diagnostic `zip_writing` phase is
 one continuous occurrence across the three finer compression/finalization
 phases, followed by `archive_verification` and then `publication`.
+The unscoped lossless image uses `snapshot_prepare` through
+`snapshot_publish`, all under the coarse `snapshot` diagnostic. Project filters
+or other scrub presets use the projected copy/scope/scrub/compact path.
 
 Elapsed phase time measures this invocation. It is not an estimate of the
 remaining maintenance window. A single SQL operation can take time between
@@ -720,10 +754,14 @@ progress callbacks; the last phase identifies where to investigate, while
 process CPU and I/O samples help determine whether work is continuing.
 Progress records carry `schema_version: 1`, the phase, a state such as
 `started`, `progress`, `completed`, `cancelled`, or `failed`, and elapsed times.
-File/byte counters reset for each phase; snapshot `rows_copied` counts rows in
-the named table. `recovery_files` and `recovery_bytes` distinguish top-level
-`doctor/` history from the rest of the selected storage. Retain completed
-records to compare totals across phases. Verification reads payloads again;
+File/byte counters reset for each phase; projected snapshot `rows_copied` counts
+rows in the named table. A native full copy can spend time inside one database
+statement without per-table row counts. `recovery_files` and `recovery_bytes`
+count selected regular files beneath only `doctor/forensics/` and
+`doctor/reclaimable/`; they do not classify the whole `doctor/` tree. Omitted
+files contribute to `excluded_files` and `excluded_bytes` in metadata and the
+dry-run report. Retain completed records to compare totals across phases.
+Verification reads payloads again;
 its phase-local byte count is verification work, not additional archive input.
 The `snapshot_bytes` and `archive_bytes` fields are size gauges retained across
 phase changes.
@@ -839,7 +877,7 @@ an unrequested repair or reconstruct operation.
 
 ### Recovery history, compression, and verification
 
-Compression settings range from `0` through `9`; the default remains `9`.
+Compression settings range from `0` through `9`; the default is `6`.
 `--compression-level 1` trades a larger ZIP for less compression work, level `0`
 uses uncompressed ZIP storage, and levels `1` through `9` use deflate with
 increasing compression effort. Compare
@@ -860,21 +898,62 @@ not prove they caused a timeout, and age or a filename containing `reclaimable`
 is not sufficient proof that they can be omitted. ZIP64 supports large
 individual recovery files as well as archives with many members.
 
-The existing opt-in `--exclude-recovery` option omits only top-level
-`STORAGE_ROOT/doctor/` from the ZIP without modifying its source. A project's
-nested `doctor/` directory remains selected. The mailbox snapshot, messages,
-attachments, reservations, identities, and Git history remain restorable, but
-the archive intentionally lacks that top-level forensic recovery evidence.
-Do not use this option when the backup must preserve complete recovery history.
+`--exclude-recovery` is an explicit opt-in policy; its visible alias is
+`--exclude-recovery-artifacts`. Both omit only the exact
+`STORAGE_ROOT/doctor/forensics/` and `STORAGE_ROOT/doctor/reclaimable/` trees
+from the new ZIP. They do not prune, move, or delete source evidence or alter
+existing backups. Retain the original generations or make a separate evidence
+backup when they are still needed for investigation or rollback. Do not select
+this policy when the backup must preserve complete recovery history.
+
+The rest of `doctor/` remains included. In particular,
+`doctor/backlog_dead_letter.jsonl` can contain serialized writes that have not
+been applied to the archive, and `doctor/reservation-reconcile.json` records
+reconciliation progress. `doctor/archive-quarantine/`, `doctor/quarantine/`,
+recovery receipts, unknown files, `.archive_backlog/`, regular message and
+attachment files, and Git history remain covered by the normal storage
+traversal. A project's nested `doctor/` directory and similarly named paths
+such as `doctor/forensics-extra/` are also retained. Do not replace the narrow
+policy with a blanket `doctor/` exclusion.
+
+Save refuses exclusion if the configured primary database or either attachment
+path (`path` or `original_path`) in the selected snapshot points into an
+omitted tree. The check handles normalized paths and filesystem aliases.
+Unreadable attachment metadata also prevents exclusion because safety cannot
+be established. Rerun without the flag to retain those files. These checks do
+not establish that historical evidence is no longer needed for a separate
+investigation or rollback.
+
 Recovery bytes already stored in Git objects may still be included; exclusion
 is not an erasure or redaction policy. Metadata records the compression level,
-recovery-history policy, and omitted storage paths. These settings do not
-change the scrub preset or restore command.
+recovery-history policy, omitted storage paths, and selected/excluded byte
+counts. These settings do not change the scrub preset or restore command.
 
 The automatically excluded output subtree prevents recursive backup growth.
 The dedicated SQLite snapshot remains included, while the embedded live
 database and its sidecars are excluded from the storage payload. Storage
-symlinks are not dereferenced.
+symlinks are not dereferenced. Snapshot staging lives beneath the excluded
+output directory, and any private source staging within storage is explicitly
+omitted. If no regular storage files are selected, an explicit `storage_repo/`
+directory entry preserves the restore format and is checked by ZIP verification.
+
+For a complete private mailbox backup, use the default `archive` scrub preset
+without `--project`. This path preserves the resolved primary database's full
+schema and data, including additional application tables, columns, indexes,
+triggers, and identity state outside the share viewer's schema. Project filters
+and other scrub presets intentionally produce selected or sanitized database
+projections. Archive metadata records `database.source_kind`: if it is
+`ArchiveSnapshot`, source resolution first reconstructed the mailbox from
+storage, so the existing reconstruction limits still apply to that resolved
+source. The full-image guarantee concerns the primary database; separate
+runtime telemetry such as an external `atc.sqlite3` is not added automatically.
+
+The current FrankenSQLite implementation materializes the database row image
+in memory during `VACUUM INTO`; this is not a constant-memory snapshot algorithm.
+Measure memory as well as elapsed time for a representative replica. ZIP
+compression streams the separate storage files through bounded buffers. Source
+authority changes during the native copy can still cause a safe refusal, so
+the existing mailbox quiescence procedure remains necessary.
 
 The `archive` preset is intended for a private backup and preserves sensitive
 mailbox state. `--project` scopes the SQLite snapshot, while the selected storage
@@ -895,6 +974,11 @@ no-replace move: a competing backup, directory, or dangling symlink at the
 chosen destination cannot be overwritten. The completed file is flushed before
 the move, and parent directory updates are synced on Unix. Windows retains the
 file flush and atomic no-replace move.
+
+Before verification succeeds, a handled failure or cooperative cancellation
+cleans up partial temporary ZIP output. Forced termination can still leave
+unpublished temporary files. Source recovery evidence and existing good
+archives are not removed by this cleanup.
 
 If publication or its durability check fails, save reports failure and retains
 the verified ZIP's staging directory for inspection. An already-published

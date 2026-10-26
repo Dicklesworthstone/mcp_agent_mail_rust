@@ -188,11 +188,17 @@ impl ArchiveDiagnostics {
         let phase = match event.phase {
             "prepare" | "mailbox_lock" => ArchivePhase::Prepare,
             "source_reconciliation" => ArchivePhase::SnapshotSource,
-            "snapshot_copy" => ArchivePhase::Snapshot,
+            "snapshot_copy"
+            | "snapshot_prepare"
+            | "snapshot_source_open"
+            | "snapshot_full_copy"
+            | "snapshot_neutralize"
+            | "snapshot_validate"
+            | "snapshot_publish" => ArchivePhase::Snapshot,
             "snapshot_scope" => ArchivePhase::Filter,
             "snapshot_scrub" => ArchivePhase::Scrub,
             "snapshot_compact" | "snapshot_viewer" => ArchivePhase::Finalize,
-            "metadata" => ArchivePhase::Metadata,
+            "metadata" | "recovery_exclusion_check" => ArchivePhase::Metadata,
             "storage_inventory" => ArchivePhase::Enumerate,
             "compress_snapshot" | "compress_storage" | "finalize_zip" => ArchivePhase::Zip,
             "verify_zip" => ArchivePhase::Verify,
