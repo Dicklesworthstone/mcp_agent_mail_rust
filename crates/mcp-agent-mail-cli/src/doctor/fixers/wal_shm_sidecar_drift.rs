@@ -285,6 +285,16 @@ pub fn detect(inputs: &DetectInputs) -> Vec<WalShmSidecarDriftFinding> {
         }
 
         if !signals.is_empty() {
+            if !signals
+                .iter()
+                .any(|s| matches!(s, Signal::HeaderOnlyWal { .. }))
+            {
+                mcp_agent_mail_core::global_metrics()
+                    .corruption
+                    .record_detection(
+                        mcp_agent_mail_core::CorruptionDetectionSource::WalShmMismatch,
+                    );
+            }
             out.push(WalShmSidecarDriftFinding {
                 db_path: db.clone(),
                 signals,

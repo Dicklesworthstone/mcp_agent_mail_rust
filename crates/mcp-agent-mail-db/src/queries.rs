@@ -2800,8 +2800,9 @@ fn append_atc_experience_file_backed(
         // safety boundary. Enforce the configured ceiling before this insert
         // commits so a burst cannot recreate the historic unbounded-growth
         // incident during the sweep interval.
+        let mut evicted = 0;
         if inserted > 0 && pool.atc_experience_max_rows() > 0 {
-            let evicted = crate::atc_queries::enforce_experience_row_ceiling_in_transaction(
+            evicted = crate::atc_queries::enforce_experience_row_ceiling_in_transaction(
                 &conn,
                 pool.atc_experience_max_rows(),
             )?;
@@ -2813,13 +2814,19 @@ fn append_atc_experience_file_backed(
                 );
             }
         }
-        commit_canonical_atc_write_tx(&conn)
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok::<usize, DbError>(evicted)
     })();
     if write_result.is_err() {
         rollback_canonical_atc_write_tx(&conn);
     }
     close_canonical_db_conn(conn, "canonical ATC append connection");
-    write_result?;
+    let evicted = write_result?;
+    if evicted > 0 {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_retention_deleted(u64::try_from(evicted).unwrap_or(u64::MAX));
+    }
 
     canonical_fetch_atc_experience_by_decision_effect(pool, decision_id, effect_id)?.ok_or_else(
         || {

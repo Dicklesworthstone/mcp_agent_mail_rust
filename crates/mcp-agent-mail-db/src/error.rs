@@ -1299,7 +1299,7 @@ fn contains_engine_probe_limitation(msg: &str) -> bool {
         || (lower.contains("internal error") && !contains_main_db_corruption(msg))
 }
 
-fn contains_foreign_key_inconsistency(msg: &str) -> bool {
+pub(crate) fn contains_foreign_key_inconsistency(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("foreign key check")
         || lower.contains("foreign_key_check")
@@ -1310,7 +1310,7 @@ fn contains_foreign_key_inconsistency(msg: &str) -> bool {
         || lower.contains("orphaned recipient")
 }
 
-fn contains_fts_index_corruption(msg: &str) -> bool {
+pub(crate) fn contains_fts_index_corruption(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     (lower.contains("fts") || lower.contains("search index"))
         && (lower.contains("corrupt")

@@ -10184,6 +10184,10 @@ fn open_sqlite_file_with_recovery_and_authorities(
                 return Err(primary_err);
             }
 
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::OpenFailure);
+
             recover_sqlite_file_with_storage_root_and_authorities(
                 Path::new(sqlite_path),
                 storage_root,

@@ -8476,8 +8476,15 @@ fn doctor_legacy_fts_reads_ok_franken(conn: &mcp_agent_mail_db::DbConn) -> bool 
     .into_iter()
     .all(|table| {
         let quoted = table.replace('"', "\"\"");
-        conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
-            .is_ok()
+        let ok = conn
+            .query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+            .is_ok();
+        if !ok {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+        }
+        ok
     })
 }
 
@@ -8514,8 +8521,15 @@ fn doctor_index_repair_offline_canonical_is_healthy(db_path: &Path) -> bool {
             .into_iter()
             .all(|table| {
                 let quoted = table.replace('"', "\"\"");
-                conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
-                    .is_ok()
+                let ok = conn
+                    .query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+                    .is_ok();
+                if !ok {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
+                }
+                ok
             })
 }
 
@@ -28865,6 +28879,11 @@ fn doctor_foreign_key_violations_from_rows(
     for row in rows {
         violations.push(doctor_foreign_key_violation_from_row(&row)?);
     }
+    if !violations.is_empty() {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FkCheck);
+    }
     Ok(violations)
 }
 
@@ -32167,17 +32186,28 @@ where
     let required = ["projects", "agents", "messages", "message_recipients"];
     let rows =
         query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-            .map_err(|e| CliError::Other(format!("failed to inspect sqlite schema: {e}")))?;
+            .map_err(|e| {
+                mcp_agent_mail_core::global_metrics()
+                    .corruption
+                    .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::SchemaSmoke);
+                CliError::Other(format!("failed to inspect sqlite schema: {e}"))
+            })?;
     let present = rows
         .into_iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
         .collect::<std::collections::BTreeSet<_>>();
 
-    Ok(required
+    let missing: Vec<String> = required
         .into_iter()
         .filter(|name| !present.contains(*name))
         .map(str::to_string)
-        .collect())
+        .collect();
+    if !missing.is_empty() {
+        mcp_agent_mail_core::global_metrics()
+            .corruption
+            .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::SchemaSmoke);
+    }
+    Ok(missing)
 }
 
 fn doctor_required_tables(
@@ -33425,6 +33455,11 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
                 // Only an independently classified corruption error from the
                 // explicitly offline canonical authority may confirm damage.
                 if let Some(detail) = error.offline_corruption_detail() {
+                    mcp_agent_mail_core::global_metrics()
+                        .corruption
+                        .record_detection(
+                            mcp_agent_mail_core::CorruptionDetectionSource::OpenFailure,
+                        );
                     return DoctorCanonicalCrossCheck::ConfirmsCorruption(format!(
                         "guarded offline canonical open reported corruption: {detail}"
                     ));
@@ -33508,6 +33543,9 @@ fn doctor_canonical_double_probe(resolved: &Path) -> DoctorCanonicalCrossCheck {
     if let Some(fts_table) = doctor_legacy_fts_tables_canonical(conn).first() {
         let quoted = fts_table.replace('"', "\"\"");
         if let Err(error) = conn.query_sync(&format!("SELECT count(*) FROM \"{quoted}\""), &[]) {
+            mcp_agent_mail_core::global_metrics()
+                .corruption
+                .record_detection(mcp_agent_mail_core::CorruptionDetectionSource::FtsCheck);
             let fts_authority = doctor_demote_logical_export_corruption(
                 logical_export,
                 doctor_classify_canonical_probe_error(
