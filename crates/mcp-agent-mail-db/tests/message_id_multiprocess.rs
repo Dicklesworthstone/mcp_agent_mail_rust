@@ -450,3 +450,182 @@ fn verify_after_crashes(db_path: &Path, acknowledged: &[(i64, String)]) {
         );
     });
 }
+
+/// br-sa58k gap 2: an in-flight pre-recovery `create_message_with_recipients`
+/// that has already elected a message id on the old database generation before
+/// recovery takeover cannot commit or return success to publish beside the
+/// replacement generation after takeover.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn in_flight_pre_recovery_create_message_cannot_publish_after_takeover() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let primary = dir.path().join("storage.sqlite3");
+    let candidate = dir.path().join("storage.sqlite3.recovery-candidate");
+    let storage_root = dir.path().join("storage");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    let cfg = DbPoolConfig {
+        database_url: format!("sqlite:///{}", primary.display()),
+        storage_root: Some(storage_root.clone()),
+        run_migrations: true,
+        min_connections: 1,
+        max_connections: 1,
+        warmup_connections: 0,
+        ..Default::default()
+    };
+
+    let old_pool = create_pool(&cfg).expect("create pre-recovery pool");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build parent runtime");
+    let (project_id, sender_id, recipient_id) = runtime.block_on(async {
+        let cx = Cx::current().expect("runtime context");
+        let project = queries::ensure_project(&cx, &old_pool, PROJECT_KEY)
+            .await
+            .into_result()
+            .expect("ensure project");
+        let project_id = project.id.expect("project id");
+        let sender = queries::register_agent(
+            &cx,
+            &old_pool,
+            project_id,
+            "BlueLake",
+            "codex-cli",
+            "test",
+            None,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("register sender");
+        let recipient = queries::register_agent(
+            &cx,
+            &old_pool,
+            project_id,
+            "GreenStone",
+            "codex-cli",
+            "test",
+            None,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("register recipient");
+        let baseline = queries::create_message(
+            &cx,
+            &old_pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "baseline before recovery",
+            "body",
+            None,
+            "normal",
+            false,
+            "{}",
+        )
+        .await
+        .into_result()
+        .expect("create baseline message");
+        assert_eq!(baseline.id, Some(1));
+        let conn = old_pool.acquire(&cx).await.into_result().expect("acquire");
+        conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint baseline into primary");
+        drop(conn);
+        (
+            project_id,
+            sender.id.expect("sender id"),
+            recipient.id.expect("recipient id"),
+        )
+    });
+
+    std::fs::copy(&primary, &candidate).expect("stage recovery candidate from baseline");
+
+    let (elected_tx, elected_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+    let hook_guard = queries::install_after_message_id_election_hook_for_test({
+        let release_rx = std::sync::Arc::clone(&release_rx);
+        move |elected_id| {
+            elected_tx
+                .send(elected_id)
+                .expect("report elected pre-recovery id");
+            release_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("wait for recovery takeover");
+        }
+    });
+
+    let writer_handle = std::thread::spawn(move || {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build writer runtime");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("writer context");
+            queries::create_message_with_recipients(
+                &cx,
+                &old_pool,
+                project_id,
+                sender_id,
+                "stale pre-recovery message",
+                "must never publish beside replacement generation",
+                None,
+                "normal",
+                false,
+                "{}",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+        })
+    });
+
+    let pre_recovery_elected_id = elected_rx
+        .recv()
+        .expect("in-flight writer must elect an id before takeover");
+    assert_eq!(pre_recovery_elected_id, 2);
+
+    mcp_agent_mail_db::pool::promote_recovery_candidate(&primary, &candidate, &storage_root)
+        .expect("promote recovery candidate while pre-recovery election is in flight");
+    drop(hook_guard);
+    release_tx
+        .send(())
+        .expect("release in-flight pre-recovery writer after takeover");
+
+    let stale_result = writer_handle.join().expect("join pre-recovery writer");
+    let stale_error = stale_result.expect_err("in-flight pre-recovery write must fail closed");
+    assert!(
+        format!("{stale_error:?}").contains("retired after database recovery"),
+        "unexpected error: {stale_error:?}"
+    );
+
+    let replacement_pool = create_pool(&cfg).expect("open replacement pool");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("runtime context");
+        let authoritative = queries::create_message_with_recipients(
+            &cx,
+            &replacement_pool,
+            project_id,
+            sender_id,
+            "post-recovery authoritative message",
+            "body",
+            None,
+            "normal",
+            false,
+            "{}",
+            &[(recipient_id, "to")],
+        )
+        .await
+        .into_result()
+        .expect("replacement pool must elect cleanly");
+        assert_eq!(authoritative.id, Some(2));
+
+        let loaded = queries::get_message(&cx, &replacement_pool, 2)
+            .await
+            .into_result()
+            .expect("load message 2 from replacement generation");
+        assert_eq!(loaded.subject, "post-recovery authoritative message");
+    });
+}

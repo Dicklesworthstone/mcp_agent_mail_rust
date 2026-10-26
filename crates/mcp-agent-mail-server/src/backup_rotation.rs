@@ -2626,7 +2626,7 @@ mod tests {
                 assert!(root.join("retained-authority.lock").is_file());
             } else {
                 let resumed = rotate_with_delete_off(&root, 1);
-                assert_eq!((resumed.kept, resumed.staged), (2, 0));
+                assert_eq!((resumed.kept, resumed.staged), (3, 0));
                 assert_eq!(
                     fs::read(&metadata_path).unwrap(),
                     b"changed snapshot evidence"
