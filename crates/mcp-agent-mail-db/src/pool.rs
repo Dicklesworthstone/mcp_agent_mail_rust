@@ -18028,6 +18028,7 @@ fn activate_reconstruction_candidate(
 struct ReconstructionCandidateFailure {
     error: SqlError,
     finalized_receipt_committed: bool,
+    receipt_durability_proven: bool,
 }
 
 impl ReconstructionCandidateFailure {
@@ -18035,6 +18036,7 @@ impl ReconstructionCandidateFailure {
         Self {
             error,
             finalized_receipt_committed: false,
+            receipt_durability_proven: false,
         }
     }
 }
@@ -18166,9 +18168,18 @@ fn abort_prepared_recovery_after_safe_rollback(
             ReconstructionCandidateFailure::before_receipt_commit(error)
         }
         Err(abort_error) => {
-            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(format!(
-                "{error}; rollback restored the previous database generation, but aborting its pending recovery receipt failed: {abort_error}; readiness remains fail-closed"
-            )))
+            let message = match abort_error.stage() {
+                crate::forensics::RecoveryReceiptAbortStage::BeforeAbortMove => format!(
+                    "{error}; rollback restored the previous database generation, but aborting its pending recovery receipt failed: {abort_error}; readiness remains fail-closed"
+                ),
+                crate::forensics::RecoveryReceiptAbortStage::AbortMovedDirectoryUnsynced {
+                    aborted_path,
+                } => format!(
+                    "{error}; rollback restored the previous database generation and moved the pending recovery receipt to {}, but syncing the receipts directory failed: {abort_error}",
+                    aborted_path.display()
+                ),
+            };
+            ReconstructionCandidateFailure::before_receipt_commit(SqlError::Custom(message))
         }
     }
 }
@@ -18259,7 +18270,9 @@ fn promote_recovery_candidate_admitted(
         crate::forensics::finalize_recovery_receipt,
     ) {
         Ok(()) => Ok(()),
-        Err(failure) if failure.finalized_receipt_committed => {
+        Err(failure)
+            if failure.finalized_receipt_committed && failure.receipt_durability_proven =>
+        {
             tracing::error!(
                 primary = %primary_path.display(),
                 error = %failure.error,
@@ -18618,16 +18631,24 @@ where
     }
 
     if let Err(error) = finalize_receipt(&prepared) {
-        if !error.promotion_marker_committed() {
-            return Err(rollback_and_abort_recovery_promotion(
-                primary_path,
-                candidate_path,
-                quarantined_source.as_deref(),
-                timestamp,
-                &prepared,
-                SqlError::Custom(error.to_string()),
-            ));
-        }
+        let stage_detail = match error.publication_stage() {
+            crate::forensics::RecoveryReceiptPublicationStage::BeforeMarkerMove => {
+                return Err(rollback_and_abort_recovery_promotion(
+                    primary_path,
+                    candidate_path,
+                    quarantined_source.as_deref(),
+                    timestamp,
+                    &prepared,
+                    SqlError::Custom(error.to_string()),
+                ));
+            }
+            crate::forensics::RecoveryReceiptPublicationStage::MarkerMovedDirectoryUnsynced => {
+                "receipt parent-directory sync failed after marker rename"
+            }
+            crate::forensics::RecoveryReceiptPublicationStage::DirectorySyncedVerificationFailed => {
+                "post-rename receipt durability/verification failed"
+            }
+        };
         retire_cached_runtime_state_after_recovery(
             primary_path,
             "receipt committed with post-rename verification failure",
@@ -18635,10 +18656,11 @@ where
         let _ = crate::reconstruct::recreate_atc_sidecar_schema(primary_path);
         return Err(ReconstructionCandidateFailure {
             error: SqlError::Custom(format!(
-                "recovery candidate {} is live and its finalized receipt marker was committed, but post-rename receipt durability/verification failed: {error}; retaining the promoted generation",
+                "recovery candidate {} is live and its finalized receipt marker was committed, but {stage_detail}: {error}; retaining the promoted generation",
                 primary_path.display()
             )),
             finalized_receipt_committed: true,
+            receipt_durability_proven: false,
         });
     }
 
@@ -18650,6 +18672,7 @@ where
                 primary_path.display()
             )),
             finalized_receipt_committed: true,
+            receipt_durability_proven: true,
         });
     }
     tracing::warn!(
@@ -18749,6 +18772,7 @@ where
                             failure.error
                         )),
                         finalized_receipt_committed: failure.finalized_receipt_committed,
+                        receipt_durability_proven: failure.receipt_durability_proven,
                     };
                     Err(preserve_failed_reconstruction_candidate(
                         &candidate_path,
@@ -31189,6 +31213,7 @@ mod tests {
         )
         .expect_err("injected post-rename receipt failure must surface");
         assert!(failure.finalized_receipt_committed);
+        assert!(!failure.receipt_durability_proven);
         assert!(
             primary.exists(),
             "promoted archive candidate must stay live"

@@ -76,28 +76,97 @@ pub(crate) struct PreparedRecoveryReceipt {
     receipt_bytes_sha256: String,
 }
 
-/// Finalization error annotated with whether the `.json` promotion marker has
-/// already replaced `.pending`, making rollback unsafe.
+/// Stage reached when receipt finalization fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryReceiptPublicationStage {
+    /// Failed before `.pending` was renamed to `.json`; caller must roll back
+    /// the candidate and abort the `.pending` intent.
+    BeforeMarkerMove,
+    /// `.pending` was renamed to `.json`, reaching the namespace point of no
+    /// return, but the parent-directory durability sync failed.
+    MarkerMovedDirectoryUnsynced,
+    /// `.pending` was renamed to `.json` and the parent directory was synced,
+    /// but post-sync chain or in-database marker verification failed.
+    DirectorySyncedVerificationFailed,
+}
+
+/// Finalization error annotated with the exact publication stage reached.
 ///
-/// Callers may restore the old database only when this is `false`. Once the
-/// marker rename succeeds, restoring the old database would make a valid
-/// finalized receipt attest the wrong live generation. A `true` value records
-/// the namespace point of no return; a later parent-directory sync or
-/// verification failure can still mean durability was not fully proven.
+/// Callers may restore the old database only when
+/// [`Self::promotion_marker_committed`] is `false`
+/// ([`RecoveryReceiptPublicationStage::BeforeMarkerMove`]). Once the marker
+/// rename succeeds, restoring the old database would make a finalized receipt
+/// attest the wrong live generation.
 #[derive(Debug)]
 pub(crate) struct RecoveryReceiptFinalizeError {
     error: SqlError,
-    promotion_marker_committed: bool,
+    publication_stage: RecoveryReceiptPublicationStage,
 }
 
 impl RecoveryReceiptFinalizeError {
     #[must_use]
+    pub(crate) const fn publication_stage(&self) -> RecoveryReceiptPublicationStage {
+        self.publication_stage
+    }
+
+    #[cfg(test)]
+    #[must_use]
     pub(crate) const fn promotion_marker_committed(&self) -> bool {
-        self.promotion_marker_committed
+        !matches!(
+            self.publication_stage,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove
+        )
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn directory_durability_synced(&self) -> bool {
+        matches!(
+            self.publication_stage,
+            RecoveryReceiptPublicationStage::DirectorySyncedVerificationFailed
+        )
     }
 }
 
 impl std::fmt::Display for RecoveryReceiptFinalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Stage reached when aborting a `.pending` recovery receipt fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryReceiptAbortStage {
+    /// `.pending` was not renamed and still blocks readiness admission.
+    BeforeAbortMove,
+    /// `.pending` was renamed to `aborted_path`, consuming the singleton
+    /// pending filename, before the parent-directory sync failed.
+    AbortMovedDirectoryUnsynced { aborted_path: PathBuf },
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveryReceiptAbortError {
+    error: SqlError,
+    stage: RecoveryReceiptAbortStage,
+}
+
+impl RecoveryReceiptAbortError {
+    #[must_use]
+    pub(crate) const fn stage(&self) -> &RecoveryReceiptAbortStage {
+        &self.stage
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn pending_marker_consumed(&self) -> bool {
+        matches!(
+            self.stage,
+            RecoveryReceiptAbortStage::AbortMovedDirectoryUnsynced { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for RecoveryReceiptAbortError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.error.fmt(f)
     }
@@ -2344,27 +2413,50 @@ fn pending_recovery_receipt_paths(receipts_dir: &Path) -> Result<Vec<PathBuf>, S
 /// before activation), an atomic no-replace move to `.aborted` records that
 /// terminal outcome without deleting forensic evidence and releases singleton
 /// admission for a future recovery.
-fn abort_pending_recovery_receipt_path(pending_path: &Path) -> Result<PathBuf, SqlError> {
-    abort_pending_recovery_receipt_path_with_mover(
+fn abort_pending_recovery_receipt_path(
+    pending_path: &Path,
+) -> Result<PathBuf, RecoveryReceiptAbortError> {
+    abort_pending_recovery_receipt_path_with_mover_and_sync(
         pending_path,
         crate::pool::rename_noreplace_preserving_source,
+        sync_recovery_directory,
     )
 }
 
+#[cfg(test)]
 fn abort_pending_recovery_receipt_path_with_mover<M>(
     pending_path: &Path,
-    mut move_noreplace: M,
-) -> Result<PathBuf, SqlError>
+    move_noreplace: M,
+) -> Result<PathBuf, RecoveryReceiptAbortError>
 where
     M: FnMut(&Path, &Path) -> std::io::Result<()>,
 {
-    let receipts_dir = pending_path.parent().ok_or_else(|| {
-        recovery_receipt_error(
-            "abort parent resolution",
-            pending_path,
-            "pending receipt has no parent directory",
-        )
-    })?;
+    abort_pending_recovery_receipt_path_with_mover_and_sync(
+        pending_path,
+        move_noreplace,
+        sync_recovery_directory,
+    )
+}
+
+fn abort_pending_recovery_receipt_path_with_mover_and_sync<M, S>(
+    pending_path: &Path,
+    mut move_noreplace: M,
+    sync_dir: S,
+) -> Result<PathBuf, RecoveryReceiptAbortError>
+where
+    M: FnMut(&Path, &Path) -> std::io::Result<()>,
+    S: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let receipts_dir = pending_path
+        .parent()
+        .ok_or_else(|| RecoveryReceiptAbortError {
+            error: recovery_receipt_error(
+                "abort parent resolution",
+                pending_path,
+                "pending receipt has no parent directory",
+            ),
+            stage: RecoveryReceiptAbortStage::BeforeAbortMove,
+        })?;
     let aborted_at_us = mcp_agent_mail_core::timestamps::now_micros();
     for suffix in 0_u32..10_000 {
         let aborted_path = receipts_dir.join(format!(
@@ -2373,8 +2465,15 @@ where
         ));
         match move_noreplace(pending_path, &aborted_path) {
             Ok(()) => {
-                sync_recovery_directory(receipts_dir).map_err(|error| {
-                    recovery_receipt_error("abort directory sync", receipts_dir, error)
+                sync_dir(receipts_dir).map_err(|error| RecoveryReceiptAbortError {
+                    error: recovery_receipt_error(
+                        "abort directory sync after consuming pending marker",
+                        &aborted_path,
+                        error,
+                    ),
+                    stage: RecoveryReceiptAbortStage::AbortMovedDirectoryUnsynced {
+                        aborted_path: aborted_path.clone(),
+                    },
                 })?;
                 return Ok(aborted_path);
             }
@@ -2383,19 +2482,21 @@ where
             // singleton pending name and therefore keeps readiness fail-closed.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
-                return Err(recovery_receipt_error(
-                    "abort no-replace rename",
-                    &aborted_path,
-                    error,
-                ));
+                return Err(RecoveryReceiptAbortError {
+                    error: recovery_receipt_error("abort no-replace rename", &aborted_path, error),
+                    stage: RecoveryReceiptAbortStage::BeforeAbortMove,
+                });
             }
         }
     }
-    Err(recovery_receipt_error(
-        "abort filename allocation",
-        receipts_dir,
-        "exhausted 10,000 aborted receipt suffixes",
-    ))
+    Err(RecoveryReceiptAbortError {
+        error: recovery_receipt_error(
+            "abort filename allocation",
+            receipts_dir,
+            "exhausted 10,000 aborted receipt suffixes",
+        ),
+        stage: RecoveryReceiptAbortStage::BeforeAbortMove,
+    })
 }
 
 fn verify_recovery_receipt_document(
@@ -3466,10 +3567,19 @@ pub(crate) fn prepare_recovery_receipt(
                 );
                 Err(error)
             }
-            Err(abort_error) => Err(SqlError::Custom(format!(
-                "{error}; additionally failed to durably abort singleton recovery intent {}: {abort_error}; readiness remains fail-closed",
-                pending_path.display()
-            ))),
+            Err(abort_error) => match abort_error.stage() {
+                RecoveryReceiptAbortStage::BeforeAbortMove => Err(SqlError::Custom(format!(
+                    "{error}; additionally failed to abort singleton recovery intent {}: {abort_error}; readiness remains fail-closed",
+                    pending_path.display()
+                ))),
+                RecoveryReceiptAbortStage::AbortMovedDirectoryUnsynced { aborted_path } => {
+                    Err(SqlError::Custom(format!(
+                        "{error}; singleton recovery intent {} was moved to {}, but syncing the receipts directory failed: {abort_error}",
+                        pending_path.display(),
+                        aborted_path.display()
+                    )))
+                }
+            },
         },
     }
 }
@@ -3477,11 +3587,11 @@ pub(crate) fn prepare_recovery_receipt(
 /// Durably mark a prepared, uncommitted promotion as aborted.
 ///
 /// Call this only after proving the old database generation is again the live
-/// authority. If this operation fails, the `.pending` intent deliberately
-/// remains and readiness stays fail-closed.
+/// authority. If this operation fails before the rename, the `.pending` intent
+/// deliberately remains and readiness stays fail-closed.
 pub(crate) fn abort_recovery_receipt(
     prepared: &PreparedRecoveryReceipt,
-) -> Result<PathBuf, SqlError> {
+) -> Result<PathBuf, RecoveryReceiptAbortError> {
     abort_pending_recovery_receipt_path(&prepared.pending_path)
 }
 
@@ -3490,45 +3600,50 @@ pub(crate) fn abort_recovery_receipt(
 pub(crate) fn finalize_recovery_receipt(
     prepared: &PreparedRecoveryReceipt,
 ) -> Result<(), RecoveryReceiptFinalizeError> {
-    finalize_recovery_receipt_with_post_rename(prepared, |receipts_dir, document| {
-        sync_recovery_directory(receipts_dir)
-            .map_err(|error| recovery_receipt_error("directory sync", receipts_dir, error))?;
-        let chain = verify_finalized_recovery_receipt_chain(receipts_dir)?.ok_or_else(|| {
-            recovery_receipt_error(
-                "final chain-tip check",
-                receipts_dir,
-                "finalized receipt chain is unexpectedly empty",
-            )
-        })?;
-        if chain.tip_bytes_sha256 != prepared.receipt_bytes_sha256
-            || chain.latest.body.receipt_id != document.body.receipt_id
-        {
-            return Err(recovery_receipt_error(
-                "final chain-tip check",
-                &prepared.final_path,
-                format!(
-                    "chain tip {} / {} does not match finalized receipt {} / {}",
-                    chain.tip_bytes_sha256,
-                    chain.latest.body.receipt_id,
-                    prepared.receipt_bytes_sha256,
-                    document.body.receipt_id
-                ),
-            ));
-        }
-        verify_live_recovery_marker(Path::new(&document.body.db_path), document)
-    })
+    finalize_recovery_receipt_with_mover_sync_and_verify(
+        prepared,
+        crate::pool::rename_noreplace_preserving_source,
+        sync_recovery_directory,
+        |receipts_dir, document| {
+            let chain =
+                verify_finalized_recovery_receipt_chain(receipts_dir)?.ok_or_else(|| {
+                    recovery_receipt_error(
+                        "final chain-tip check",
+                        receipts_dir,
+                        "finalized receipt chain is unexpectedly empty",
+                    )
+                })?;
+            if chain.tip_bytes_sha256 != prepared.receipt_bytes_sha256
+                || chain.latest.body.receipt_id != document.body.receipt_id
+            {
+                return Err(recovery_receipt_error(
+                    "final chain-tip check",
+                    &prepared.final_path,
+                    format!(
+                        "chain tip {} / {} does not match finalized receipt {} / {}",
+                        chain.tip_bytes_sha256,
+                        chain.latest.body.receipt_id,
+                        prepared.receipt_bytes_sha256,
+                        document.body.receipt_id
+                    ),
+                ));
+            }
+            verify_live_recovery_marker(Path::new(&document.body.db_path), document)
+        },
+    )
 }
 
 fn recovery_finalize_error(
     error: SqlError,
-    promotion_marker_committed: bool,
+    publication_stage: RecoveryReceiptPublicationStage,
 ) -> RecoveryReceiptFinalizeError {
     RecoveryReceiptFinalizeError {
         error,
-        promotion_marker_committed,
+        publication_stage,
     }
 }
 
+#[cfg(test)]
 fn finalize_recovery_receipt_with_post_rename<F>(
     prepared: &PreparedRecoveryReceipt,
     post_rename: F,
@@ -3543,6 +3658,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn finalize_recovery_receipt_with_mover_and_post_rename<M, F>(
     prepared: &PreparedRecoveryReceipt,
     move_noreplace: M,
@@ -3552,10 +3668,29 @@ where
     M: FnOnce(&Path, &Path) -> std::io::Result<()>,
     F: FnOnce(&Path, &RecoveryReceiptDocument) -> Result<(), SqlError>,
 {
+    finalize_recovery_receipt_with_mover_sync_and_verify(
+        prepared,
+        move_noreplace,
+        sync_recovery_directory,
+        post_rename,
+    )
+}
+
+fn finalize_recovery_receipt_with_mover_sync_and_verify<M, S, V>(
+    prepared: &PreparedRecoveryReceipt,
+    move_noreplace: M,
+    sync_dir: S,
+    verify_after_sync: V,
+) -> Result<(), RecoveryReceiptFinalizeError>
+where
+    M: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    S: FnOnce(&Path) -> std::io::Result<()>,
+    V: FnOnce(&Path, &RecoveryReceiptDocument) -> Result<(), SqlError>,
+{
     let bytes = std::fs::read(&prepared.pending_path).map_err(|error| {
         recovery_finalize_error(
             recovery_receipt_error("pending read", &prepared.pending_path, error),
-            false,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove,
         )
     })?;
     let actual_hash = recovery_sha256(&bytes);
@@ -3569,11 +3704,13 @@ where
                     prepared.receipt_bytes_sha256
                 ),
             ),
-            false,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove,
         ));
     }
-    let document = verify_recovery_receipt_document(&prepared.pending_path, &bytes)
-        .map_err(|error| recovery_finalize_error(error, false))?;
+    let document =
+        verify_recovery_receipt_document(&prepared.pending_path, &bytes).map_err(|error| {
+            recovery_finalize_error(error, RecoveryReceiptPublicationStage::BeforeMarkerMove)
+        })?;
     if document.body.receipt_id.is_empty() {
         return Err(recovery_finalize_error(
             recovery_receipt_error(
@@ -3581,7 +3718,7 @@ where
                 &prepared.pending_path,
                 "empty receipt id",
             ),
-            false,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove,
         ));
     }
     let receipts_dir = prepared.final_path.parent().ok_or_else(|| {
@@ -3591,11 +3728,12 @@ where
                 &prepared.final_path,
                 "final receipt has no parent directory",
             ),
-            false,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove,
         )
     })?;
-    let current_chain = verify_finalized_recovery_receipt_chain(receipts_dir)
-        .map_err(|error| recovery_finalize_error(error, false))?;
+    let current_chain = verify_finalized_recovery_receipt_chain(receipts_dir).map_err(|error| {
+        recovery_finalize_error(error, RecoveryReceiptPublicationStage::BeforeMarkerMove)
+    })?;
     let current_tip = current_chain
         .as_ref()
         .map(|chain| chain.tip_bytes_sha256.as_str());
@@ -3609,16 +3747,18 @@ where
                     document.body.previous_receipt_bytes_sha256, current_tip
                 ),
             ),
-            false,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove,
         ));
     }
     // The candidate has already been activated by the caller. Prove its
     // in-database marker matches these exact receipt bytes before committing
     // the filename transition.
-    verify_live_recovery_marker(Path::new(&document.body.db_path), &document)
-        .map_err(|error| recovery_finalize_error(error, false))?;
-    verify_live_recovery_candidate_snapshot(Path::new(&document.body.db_path), &document)
-        .map_err(|error| recovery_finalize_error(error, false))?;
+    verify_live_recovery_marker(Path::new(&document.body.db_path), &document).map_err(|error| {
+        recovery_finalize_error(error, RecoveryReceiptPublicationStage::BeforeMarkerMove)
+    })?;
+    verify_live_recovery_candidate_snapshot(Path::new(&document.body.db_path), &document).map_err(
+        |error| recovery_finalize_error(error, RecoveryReceiptPublicationStage::BeforeMarkerMove),
+    )?;
     move_noreplace(&prepared.pending_path, &prepared.final_path).map_err(|error| {
         let context = if error.kind() == std::io::ErrorKind::AlreadyExists {
             "promotion-marker destination collision"
@@ -3627,13 +3767,25 @@ where
         };
         recovery_finalize_error(
             recovery_receipt_error(context, &prepared.final_path, error),
-            false,
+            RecoveryReceiptPublicationStage::BeforeMarkerMove,
         )
     })?;
     // The atomic no-replace move is the namespace point of no return. Any
     // subsequent error must leave the activated candidate in place; callers
-    // use the typed flag to avoid rolling it back beneath a finalized receipt.
-    post_rename(receipts_dir, &document).map_err(|error| recovery_finalize_error(error, true))
+    // use the publication stage to distinguish an unsynced directory from a
+    // post-sync verification failure without rolling back beneath `.json`.
+    sync_dir(receipts_dir).map_err(|error| {
+        recovery_finalize_error(
+            recovery_receipt_error("directory sync", receipts_dir, error),
+            RecoveryReceiptPublicationStage::MarkerMovedDirectoryUnsynced,
+        )
+    })?;
+    verify_after_sync(receipts_dir, &document).map_err(|error| {
+        recovery_finalize_error(
+            error,
+            RecoveryReceiptPublicationStage::DirectorySyncedVerificationFailed,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3648,6 +3800,22 @@ pub(crate) fn finalize_recovery_receipt_with_injected_post_rename_failure(
 }
 
 #[cfg(test)]
+pub(crate) fn finalize_recovery_receipt_with_injected_directory_sync_failure(
+    prepared: &PreparedRecoveryReceipt,
+) -> Result<(), RecoveryReceiptFinalizeError> {
+    finalize_recovery_receipt_with_mover_sync_and_verify(
+        prepared,
+        crate::pool::rename_noreplace_preserving_source,
+        |_receipts_dir| {
+            Err(std::io::Error::other(
+                "injected post-rename directory sync failure",
+            ))
+        },
+        |_receipts_dir, _document| Ok(()),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn finalize_recovery_receipt_with_injected_pre_rename_failure(
     prepared: &PreparedRecoveryReceipt,
 ) -> Result<(), RecoveryReceiptFinalizeError> {
@@ -3657,7 +3825,7 @@ pub(crate) fn finalize_recovery_receipt_with_injected_pre_rename_failure(
             &prepared.pending_path,
             "injected before promotion marker commit",
         ),
-        false,
+        RecoveryReceiptPublicationStage::BeforeMarkerMove,
     ))
 }
 
@@ -5527,11 +5695,78 @@ mod tests {
         let error = finalize_recovery_receipt_with_injected_post_rename_failure(&prepared)
             .expect_err("post-rename failure must be surfaced");
         assert!(error.promotion_marker_committed());
+        assert!(error.directory_durability_synced());
+        assert_eq!(
+            error.publication_stage(),
+            super::RecoveryReceiptPublicationStage::DirectorySyncedVerificationFailed
+        );
         assert!(prepared.final_path.exists());
         assert!(!prepared.pending_path.exists());
         assert!(primary.exists(), "activated candidate must remain live");
         verify_recovery_receipt_state(&storage_root, &primary)
             .expect("finalized bytes and live marker remain consistent after injected failure");
+    }
+
+    #[test]
+    fn recovery_receipt_directory_sync_failure_reports_unsynced_marker_stage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("prepare receipt");
+        std::fs::rename(&candidate, &primary).expect("activate candidate");
+        let error =
+            super::finalize_recovery_receipt_with_injected_directory_sync_failure(&prepared)
+                .expect_err("directory sync failure must be surfaced");
+        assert!(error.promotion_marker_committed());
+        assert!(!error.directory_durability_synced());
+        assert_eq!(
+            error.publication_stage(),
+            super::RecoveryReceiptPublicationStage::MarkerMovedDirectoryUnsynced
+        );
+        assert!(prepared.final_path.exists());
+        assert!(!prepared.pending_path.exists());
+    }
+
+    #[test]
+    fn recovery_receipt_abort_directory_sync_failure_reports_consumed_pending_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite3");
+        let candidate = dir.path().join("candidate.sqlite3");
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("mail-root");
+        seed_recovery_receipt_db(&source, true);
+        seed_recovery_receipt_db(&candidate, true);
+
+        let prepared = prepare_recovery_receipt(&storage_root, &primary, Some(&source), &candidate)
+            .expect("prepare receipt");
+        let pending_bytes = std::fs::read(&prepared.pending_path).expect("read pending bytes");
+        let error = super::abort_pending_recovery_receipt_path_with_mover_and_sync(
+            &prepared.pending_path,
+            crate::pool::rename_noreplace_preserving_source,
+            |_receipts_dir| {
+                Err(std::io::Error::other(
+                    "injected abort directory sync failure",
+                ))
+            },
+        )
+        .expect_err("abort directory sync failure must surface");
+        assert!(error.pending_marker_consumed());
+        let super::RecoveryReceiptAbortStage::AbortMovedDirectoryUnsynced { aborted_path } =
+            error.stage()
+        else {
+            panic!("expected AbortMovedDirectoryUnsynced stage");
+        };
+        assert!(!prepared.pending_path.exists());
+        assert_eq!(
+            std::fs::read(aborted_path).expect("read aborted receipt"),
+            pending_bytes
+        );
     }
 
     #[test]
