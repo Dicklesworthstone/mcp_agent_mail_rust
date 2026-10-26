@@ -9,6 +9,8 @@ This document answers a different question than the existing rollout docs:
 - This plan decides which beads belong together in the next few releases so we
   do not ship unrelated risk at the same time.
 
+> **Reality note (2026-10-26):** The `v0.2.x`–`v0.5.0` version bands in the table below are retained from the original planning taxonomy. Actual releases shipped along the `v0.3.3x` point-release train (`v0.3.33` through `v0.3.39` and subsequent `v0.3.x` releases; see `CHANGELOG.md`), while the risk-separation rules below (keeping docs/UX cleanup, storage/archive durability work, and gated ATC rollout in separate waves) remain the active sequencing policy.
+
 ## Planning Rules
 
 1. Keep documentation-truth changes separate from risky runtime changes.
