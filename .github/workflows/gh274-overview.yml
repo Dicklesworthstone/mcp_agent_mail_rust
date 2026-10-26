@@ -1,13 +1,7 @@
+# Historical one-shot validation workflow (br-kp1in.27); retained pending RULE 1 removal approval.
 name: Native overview regression and benchmark
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - crates/mcp-agent-mail-cli/src/robot.rs
-      - crates/mcp-agent-mail-cli/src/robot_commands.rs
-      - crates/mcp-agent-mail-cli/src/robot/**
-      - .github/workflows/gh274-overview.yml
   workflow_dispatch:
 
 permissions:

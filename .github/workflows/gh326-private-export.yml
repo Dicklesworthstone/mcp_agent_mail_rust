@@ -1,3 +1,4 @@
+# Historical one-shot patch-landing workflow (br-kp1in.27); retained pending RULE 1 removal approval.
 name: GH326 private export integration
 
 # Applies only the two fixed, reviewed patches. It never opens a PR, force
@@ -5,14 +6,7 @@ name: GH326 private export integration
 # The owner-only issue command provides an explicit invocation route when
 # connector-created pushes do not start Actions. Comment text is never executed.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'patches/gh326-private-export/**'
-      - '.github/workflows/gh326-private-export.yml'
   workflow_dispatch:
-  issue_comment:
-    types: [created]
 
 permissions:
   contents: read

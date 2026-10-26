@@ -1,17 +1,7 @@
+# Historical one-shot validation workflow (br-kp1in.27); retained pending RULE 1 removal approval.
 name: Installer exit status
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - install.sh
-      - tests/installer/test_install_exit_status.sh
-      - .github/workflows/installer-exit.yml
-  pull_request:
-    paths:
-      - install.sh
-      - tests/installer/test_install_exit_status.sh
-      - .github/workflows/installer-exit.yml
   workflow_dispatch:
 
 permissions:
